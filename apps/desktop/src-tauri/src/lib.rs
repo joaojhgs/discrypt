@@ -488,7 +488,7 @@ pub fn command_health() -> CommandHealth {
     });
     let state = app_state();
     CommandHealth {
-        snapshot_ready: snapshot.schema_version == 1
+        snapshot_ready: snapshot.schema_version >= 1
             && snapshot.devices.len() >= 2
             && snapshot
                 .servers
