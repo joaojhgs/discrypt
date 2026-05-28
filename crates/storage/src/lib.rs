@@ -3,7 +3,94 @@ pub use content_keys::KeyState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
+
+/// App-store persistence errors.
+#[derive(Debug, thiserror::Error)]
+pub enum AppStoreError {
+    /// Underlying filesystem operation failed.
+    #[error("app store I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// In-memory store lock was poisoned.
+    #[error("app store lock poisoned")]
+    LockPoisoned,
+}
+
+/// Byte-oriented local app-state store used by the core AppService.
+///
+/// The core crate owns the typed schema; storage owns durable byte persistence so
+/// migrations can be tested without coupling UI state to React fixtures.
+pub trait AppStore: Clone + Send + Sync + 'static {
+    /// Load the serialized app state, if initialized.
+    fn load_app_state(&mut self) -> Result<Option<Vec<u8>>, AppStoreError>;
+
+    /// Save the serialized app state durably.
+    fn save_app_state(&mut self, bytes: &[u8]) -> Result<(), AppStoreError>;
+}
+
+/// Deterministic in-memory app store for tests and harnesses.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryAppStore {
+    bytes: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl AppStore for MemoryAppStore {
+    fn load_app_state(&mut self) -> Result<Option<Vec<u8>>, AppStoreError> {
+        self.bytes
+            .lock()
+            .map_err(|_| AppStoreError::LockPoisoned)
+            .map(|guard| guard.clone())
+    }
+
+    fn save_app_state(&mut self, bytes: &[u8]) -> Result<(), AppStoreError> {
+        let mut guard = self.bytes.lock().map_err(|_| AppStoreError::LockPoisoned)?;
+        *guard = Some(bytes.to_vec());
+        Ok(())
+    }
+}
+
+/// File-backed local app store for native shells.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileAppStore {
+    path: PathBuf,
+}
+
+impl FileAppStore {
+    /// Create a file-backed app store at an explicit path.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Return the backing file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AppStore for FileAppStore {
+    fn load_app_state(&mut self) -> Result<Option<Vec<u8>>, AppStoreError> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(AppStoreError::Io(error)),
+        }
+    }
+
+    fn save_app_state(&mut self, bytes: &[u8]) -> Result<(), AppStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, &self.path)?;
+        Ok(())
+    }
+}
 
 /// Deterministic key for an author's sent-log entry.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -773,6 +860,38 @@ impl SecureDeleteSimulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_app_store_round_trips_app_state_bytes() {
+        let mut store = MemoryAppStore::default();
+        assert_eq!(store.load_app_state().expect("load"), None);
+        store
+            .save_app_state(br#"{"schema_version":2}"#)
+            .expect("save");
+        assert_eq!(
+            store.load_app_state().expect("reload"),
+            Some(br#"{"schema_version":2}"#.to_vec())
+        );
+    }
+
+    #[test]
+    fn file_app_store_round_trips_app_state_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "discrypt-app-store-{}-{}.json",
+            std::process::id(),
+            "roundtrip"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = FileAppStore::new(&path);
+        store
+            .save_app_state(br#"{"schema_version":2}"#)
+            .expect("save");
+        assert_eq!(
+            store.load_app_state().expect("reload"),
+            Some(br#"{"schema_version":2}"#.to_vec())
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn backup_excludes_content_keys() {
