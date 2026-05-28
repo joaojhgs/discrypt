@@ -224,6 +224,396 @@ impl LocalStore {
     }
 }
 
+
+/// Persisted application state schema version.
+pub const APP_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Local account identity persisted by the application store.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppIdentityState {
+    /// Stable local user id.
+    pub user_id: String,
+    /// User-visible display name.
+    pub display_name: String,
+    /// Backend-owned friend code/QR payload.
+    pub friend_code: String,
+    /// Current local device id.
+    pub device_id: String,
+    /// Pairwise safety number copy surfaced by the UI.
+    pub safety_number: String,
+    /// Explicit out-of-band verification flag.
+    pub safety_verified: bool,
+}
+
+impl AppIdentityState {
+    /// Build identity state for persistence-backed command snapshots.
+    #[must_use]
+    pub fn new(
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        friend_code: impl Into<String>,
+        device_id: impl Into<String>,
+        safety_number: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            display_name: display_name.into(),
+            friend_code: friend_code.into(),
+            device_id: device_id.into(),
+            safety_number: safety_number.into(),
+            safety_verified: false,
+        }
+    }
+}
+
+/// User preference state that must survive restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppPreferencesState {
+    /// UI theme identifier.
+    pub theme: String,
+    /// Active UI template identifier.
+    pub active_template: String,
+    /// Default retention preset for new channels/messages.
+    pub retention_preset: String,
+}
+
+impl Default for AppPreferencesState {
+    fn default() -> Self {
+        Self {
+            theme: "system".to_owned(),
+            active_template: "command-center".to_owned(),
+            retention_preset: "7 days".to_owned(),
+        }
+    }
+}
+
+/// Group/server state persisted for command-backed UI navigation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppGroupState {
+    /// Stable group id.
+    pub group_id: String,
+    /// User-visible group/server label.
+    pub name: String,
+    /// Local user's role label.
+    pub role: String,
+    /// Current MLS epoch facade.
+    pub epoch: u64,
+    /// Channels belonging to this group.
+    pub channels: Vec<AppChannelState>,
+}
+
+impl AppGroupState {
+    /// Create an empty group/server.
+    #[must_use]
+    pub fn new(group_id: impl Into<String>, name: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            group_id: group_id.into(),
+            name: name.into(),
+            role: role.into(),
+            epoch: 1,
+            channels: Vec::new(),
+        }
+    }
+}
+
+/// Channel state persisted under a group/server.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppChannelState {
+    /// Stable channel id.
+    pub channel_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// User-visible channel name.
+    pub name: String,
+    /// Channel kind string shared with command DTOs (`text` or `voice`).
+    pub kind: String,
+    /// Retention status copy derived from preferences/governance.
+    pub retention_status: String,
+}
+
+impl AppChannelState {
+    /// Create channel state.
+    #[must_use]
+    pub fn new(
+        channel_id: impl Into<String>,
+        group_id: impl Into<String>,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        retention_status: impl Into<String>,
+    ) -> Self {
+        Self {
+            channel_id: channel_id.into(),
+            group_id: group_id.into(),
+            name: name.into(),
+            kind: kind.into(),
+            retention_status: retention_status.into(),
+        }
+    }
+}
+
+/// Persisted encrypted message record. Plaintext and content keys are never fields here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppMessageState {
+    /// Stable message id.
+    pub message_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// Parent channel id.
+    pub channel_id: String,
+    /// Author/device label.
+    pub author_id: String,
+    /// Monotonic author sequence.
+    pub sequence: u64,
+    /// MLS epoch used for the ciphertext.
+    pub epoch: u64,
+    /// Ciphertext bytes only.
+    pub ciphertext: Vec<u8>,
+    /// Deterministic timestamp used by harnesses and UI ordering.
+    pub sent_at_ms: u64,
+}
+
+impl AppMessageState {
+    /// Create a ciphertext-only message record.
+    #[must_use]
+    pub fn new(
+        message_id: impl Into<String>,
+        group_id: impl Into<String>,
+        channel_id: impl Into<String>,
+        author_id: impl Into<String>,
+        sequence: u64,
+        epoch: u64,
+        ciphertext: Vec<u8>,
+        sent_at_ms: u64,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            group_id: group_id.into(),
+            channel_id: channel_id.into(),
+            author_id: author_id.into(),
+            sequence,
+            epoch,
+            ciphertext,
+            sent_at_ms,
+        }
+    }
+}
+
+/// Invite/admission flow state persisted for restart-safe admin UX.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppInviteState {
+    /// Stable invite id.
+    pub invite_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// Expiry copy or timestamp string from the admission layer.
+    pub expires: String,
+    /// Max-use copy.
+    pub max_use: String,
+    /// Password-gate posture copy. No offline verifier secret is stored here.
+    pub password_gate: String,
+    /// Revocation flag.
+    pub revoked: bool,
+}
+
+/// Voice session state persisted for command-backed voice controls.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppVoiceSessionState {
+    /// Stable voice session id.
+    pub session_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// Parent voice channel id.
+    pub channel_id: String,
+    /// Current connection route label.
+    pub route: String,
+    /// Whether local user is joined.
+    pub joined: bool,
+    /// Whether local microphone is muted.
+    pub muted: bool,
+}
+
+/// Complete application state persisted by `AppStore`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppState {
+    /// Persisted schema version.
+    pub schema_version: u32,
+    /// Local account identity.
+    pub identity: AppIdentityState,
+    /// User preferences.
+    pub preferences: AppPreferencesState,
+    /// Groups with channels.
+    pub groups: Vec<AppGroupState>,
+    /// Ciphertext-only messages.
+    pub messages: Vec<AppMessageState>,
+    /// Invite flow state.
+    pub invites: Vec<AppInviteState>,
+    /// Voice session state.
+    pub voice_sessions: Vec<AppVoiceSessionState>,
+}
+
+impl AppState {
+    /// Construct app state with defaults and no product entities.
+    #[must_use]
+    pub fn new(identity: AppIdentityState) -> Self {
+        Self {
+            schema_version: APP_STATE_SCHEMA_VERSION,
+            identity,
+            preferences: AppPreferencesState::default(),
+            groups: Vec::new(),
+            messages: Vec::new(),
+            invites: Vec::new(),
+            voice_sessions: Vec::new(),
+        }
+    }
+}
+
+/// Application store errors.
+#[derive(Debug, thiserror::Error)]
+pub enum AppStoreError {
+    /// File I/O failed.
+    #[error("app store I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// Serialization failed.
+    #[error("app store serialization failed: {0}")]
+    Serde(#[from] serde_json::Error),
+    /// The persisted envelope failed integrity validation or decryption.
+    #[error("app store envelope is corrupt or authenticated with the wrong key")]
+    CorruptEnvelope,
+    /// The persisted schema version is unsupported.
+    #[error("unsupported app state schema version {0}")]
+    UnsupportedVersion(u32),
+}
+
+/// Store boundary for application state persistence.
+pub trait AppStore {
+    /// Load state from storage.
+    fn load(&self) -> Result<AppState, AppStoreError>;
+    /// Save state to storage.
+    fn save(&self, state: &AppState) -> Result<(), AppStoreError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SealedAppStateEnvelope {
+    schema_version: u32,
+    nonce: [u8; 16],
+    ciphertext: Vec<u8>,
+    tag: [u8; 32],
+}
+
+/// File-backed app store with a sealed local envelope.
+#[derive(Clone, Debug)]
+pub struct FileAppStore {
+    path: std::path::PathBuf,
+    key: [u8; 32],
+}
+
+impl FileAppStore {
+    /// Create a file app store rooted at an exact state-file path.
+    #[must_use]
+    pub fn new(path: impl Into<std::path::PathBuf>, key: [u8; 32]) -> Self {
+        Self { path: path.into(), key }
+    }
+
+    /// Return the exact persistence path.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AppStore for FileAppStore {
+    fn load(&self) -> Result<AppState, AppStoreError> {
+        let bytes = std::fs::read(&self.path)?;
+        let envelope: SealedAppStateEnvelope = serde_json::from_slice(&bytes)?;
+        if envelope.schema_version != APP_STATE_SCHEMA_VERSION {
+            return Err(AppStoreError::UnsupportedVersion(envelope.schema_version));
+        }
+        let plaintext = open_app_state_envelope(&self.key, &envelope)?;
+        let state: AppState = serde_json::from_slice(&plaintext)?;
+        if state.schema_version != APP_STATE_SCHEMA_VERSION {
+            return Err(AppStoreError::UnsupportedVersion(state.schema_version));
+        }
+        Ok(state)
+    }
+
+    fn save(&self, state: &AppState) -> Result<(), AppStoreError> {
+        if state.schema_version != APP_STATE_SCHEMA_VERSION {
+            return Err(AppStoreError::UnsupportedVersion(state.schema_version));
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let plaintext = serde_json::to_vec(state)?;
+        let envelope = seal_app_state_envelope(&self.key, &plaintext);
+        let encoded = serde_json::to_vec_pretty(&envelope)?;
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, encoded)?;
+        std::fs::rename(tmp, &self.path)?;
+        Ok(())
+    }
+}
+
+fn seal_app_state_envelope(key: &[u8; 32], plaintext: &[u8]) -> SealedAppStateEnvelope {
+    let nonce = app_state_nonce(key, plaintext);
+    let ciphertext = xor_keystream(key, &nonce, plaintext);
+    let tag = app_state_tag(key, &nonce, &ciphertext);
+    SealedAppStateEnvelope {
+        schema_version: APP_STATE_SCHEMA_VERSION,
+        nonce,
+        ciphertext,
+        tag,
+    }
+}
+
+fn open_app_state_envelope(
+    key: &[u8; 32],
+    envelope: &SealedAppStateEnvelope,
+) -> Result<Vec<u8>, AppStoreError> {
+    if app_state_tag(key, &envelope.nonce, &envelope.ciphertext) != envelope.tag {
+        return Err(AppStoreError::CorruptEnvelope);
+    }
+    Ok(xor_keystream(key, &envelope.nonce, &envelope.ciphertext))
+}
+
+fn app_state_nonce(key: &[u8; 32], plaintext: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest([b"discrypt-app-store-nonce".as_slice(), key, plaintext].concat());
+    let mut nonce = [0; 16];
+    nonce.copy_from_slice(&digest[..16]);
+    nonce
+}
+
+fn app_state_tag(key: &[u8; 32], nonce: &[u8; 16], ciphertext: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(
+        [
+            b"discrypt-app-store-tag".as_slice(),
+            key,
+            nonce.as_slice(),
+            ciphertext,
+        ]
+        .concat(),
+    );
+    let mut tag = [0; 32];
+    tag.copy_from_slice(&digest);
+    tag
+}
+
+fn xor_keystream(key: &[u8; 32], nonce: &[u8; 16], bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for (chunk_idx, chunk) in bytes.chunks(32).enumerate() {
+        let block = Sha256::digest(
+            [
+                b"discrypt-app-store-stream".as_slice(),
+                key,
+                nonce.as_slice(),
+                &(chunk_idx as u64).to_be_bytes(),
+            ]
+            .concat(),
+        );
+        out.extend(chunk.iter().zip(block.iter()).map(|(byte, mask)| byte ^ mask));
+    }
+    out
+}
+
 /// Sealed account-continuity backup (no content keys).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountBackup {
