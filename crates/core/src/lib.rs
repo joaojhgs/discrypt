@@ -2,8 +2,10 @@
 use admission::Invite;
 use mls_core::{GroupState, Identity};
 use serde::{Deserialize, Serialize};
-use storage::{AppStore, AppStoreError, MemoryAppStore};
-use thiserror::Error;
+use storage::{
+    AppChannelState, AppGroupState, AppIdentityState, AppInviteState, AppMessageState,
+    AppPreferencesState, AppState, AppStore, AppStoreError, AppVoiceSessionState,
+};
 
 /// Room summary returned to UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -215,6 +217,375 @@ pub struct AppSnapshot {
     pub connectivity: ConnectivityView,
     /// Mandatory security copy.
     pub security_copy: SecurityCopyView,
+}
+
+
+/// Create/update preferences request shared by Tauri commands and tests.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdatePreferencesRequest {
+    /// UI theme identifier.
+    pub theme: String,
+    /// UI template identifier.
+    pub active_template: String,
+    /// Default retention preset.
+    pub retention_preset: String,
+}
+
+/// Create group/server request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateGroupRequest {
+    /// Stable group id.
+    pub group_id: String,
+    /// User-visible group name.
+    pub name: String,
+    /// Local user's role label.
+    pub role: String,
+}
+
+/// Create channel request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateChannelRequest {
+    /// Parent group id.
+    pub group_id: String,
+    /// Stable channel id.
+    pub channel_id: String,
+    /// User-visible channel name.
+    pub name: String,
+    /// Text or voice kind.
+    pub kind: ChannelKind,
+    /// Retention copy derived from preferences/governance.
+    pub retention_status: String,
+}
+
+/// Create invite request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateInviteRequest {
+    /// Stable invite id.
+    pub invite_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// Expiry copy or timestamp string.
+    pub expires: String,
+    /// Max-use copy.
+    pub max_use: String,
+    /// Password-gate posture copy. Never include an offline verifier secret.
+    pub password_gate: String,
+}
+
+/// Persist encrypted text request. This command DTO intentionally has no plaintext field.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SendMessageRequest {
+    /// Stable message id.
+    pub message_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// Parent channel id.
+    pub channel_id: String,
+    /// Author/device label.
+    pub author_id: String,
+    /// Monotonic author sequence.
+    pub sequence: u64,
+    /// MLS epoch used for encryption.
+    pub epoch: u64,
+    /// Ciphertext bytes only.
+    pub ciphertext: Vec<u8>,
+    /// Deterministic timestamp for harness ordering.
+    pub sent_at_ms: u64,
+}
+
+/// Start or join voice session request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartVoiceSessionRequest {
+    /// Stable voice session id.
+    pub session_id: String,
+    /// Parent group id.
+    pub group_id: String,
+    /// Parent voice channel id.
+    pub channel_id: String,
+    /// Current route label.
+    pub route: String,
+}
+
+/// App-service errors.
+#[derive(Debug, thiserror::Error)]
+pub enum AppServiceError {
+    /// Store boundary failed.
+    #[error(transparent)]
+    Store(#[from] AppStoreError),
+    /// Referenced group does not exist.
+    #[error("group not found: {0}")]
+    GroupNotFound(String),
+    /// Referenced channel does not exist.
+    #[error("channel not found: {0}")]
+    ChannelNotFound(String),
+}
+
+/// Persistence-backed application service used by Tauri commands and headless tests.
+#[derive(Clone, Debug)]
+pub struct AppService<S> {
+    store: S,
+    state: AppState,
+}
+
+impl<S> AppService<S>
+where
+    S: AppStore,
+{
+    /// Create a service from freshly bootstrapped state.
+    pub fn bootstrap(store: S, state: AppState) -> Result<Self, AppServiceError> {
+        store.save(&state)?;
+        Ok(Self { store, state })
+    }
+
+    /// Load a service from persistent storage.
+    pub fn load(store: S) -> Result<Self, AppServiceError> {
+        let state = store.load()?;
+        Ok(Self { store, state })
+    }
+
+    /// Borrow current app state.
+    #[must_use]
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// Save and return a command snapshot view.
+    pub fn snapshot(&self) -> AppSnapshot {
+        snapshot_from_state(&self.state)
+    }
+
+    /// Update restart-persistent user preferences.
+    pub fn update_preferences(
+        &mut self,
+        request: UpdatePreferencesRequest,
+    ) -> Result<AppPreferencesState, AppServiceError> {
+        self.state.preferences = AppPreferencesState {
+            theme: request.theme,
+            active_template: request.active_template,
+            retention_preset: request.retention_preset,
+        };
+        self.persist()?;
+        Ok(self.state.preferences.clone())
+    }
+
+    /// Create or replace a group/server.
+    pub fn create_group(&mut self, request: CreateGroupRequest) -> Result<AppGroupState, AppServiceError> {
+        let group = AppGroupState::new(request.group_id.clone(), request.name, request.role);
+        upsert_by(&mut self.state.groups, group.clone(), |g| &g.group_id, &request.group_id);
+        self.persist()?;
+        Ok(group)
+    }
+
+    /// Create or replace a channel under an existing group.
+    pub fn create_channel(
+        &mut self,
+        request: CreateChannelRequest,
+    ) -> Result<AppChannelState, AppServiceError> {
+        let group = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+            .ok_or_else(|| AppServiceError::GroupNotFound(request.group_id.clone()))?;
+        let kind = match request.kind {
+            ChannelKind::Text => "text",
+            ChannelKind::Voice => "voice",
+        };
+        let channel = AppChannelState::new(
+            request.channel_id.clone(),
+            request.group_id,
+            request.name,
+            kind,
+            request.retention_status,
+        );
+        upsert_by(&mut group.channels, channel.clone(), |c| &c.channel_id, &request.channel_id);
+        self.persist()?;
+        Ok(channel)
+    }
+
+    /// Create or replace an invite flow record.
+    pub fn create_invite(&mut self, request: CreateInviteRequest) -> Result<AppInviteState, AppServiceError> {
+        if !self.state.groups.iter().any(|group| group.group_id == request.group_id) {
+            return Err(AppServiceError::GroupNotFound(request.group_id));
+        }
+        let invite = AppInviteState {
+            invite_id: request.invite_id.clone(),
+            group_id: request.group_id,
+            expires: request.expires,
+            max_use: request.max_use,
+            password_gate: request.password_gate,
+            revoked: false,
+        };
+        upsert_by(&mut self.state.invites, invite.clone(), |i| &i.invite_id, &request.invite_id);
+        self.persist()?;
+        Ok(invite)
+    }
+
+    /// Store ciphertext-only message state.
+    pub fn send_message(&mut self, request: SendMessageRequest) -> Result<AppMessageState, AppServiceError> {
+        self.ensure_channel(&request.group_id, &request.channel_id)?;
+        let message = AppMessageState::new(
+            request.message_id.clone(),
+            request.group_id,
+            request.channel_id,
+            request.author_id,
+            request.sequence,
+            request.epoch,
+            request.ciphertext,
+            request.sent_at_ms,
+        );
+        upsert_by(&mut self.state.messages, message.clone(), |m| &m.message_id, &request.message_id);
+        self.persist()?;
+        Ok(message)
+    }
+
+    /// Start/join a voice session and persist voice controls.
+    pub fn start_voice_session(
+        &mut self,
+        request: StartVoiceSessionRequest,
+    ) -> Result<AppVoiceSessionState, AppServiceError> {
+        self.ensure_channel(&request.group_id, &request.channel_id)?;
+        let session = AppVoiceSessionState {
+            session_id: request.session_id.clone(),
+            group_id: request.group_id,
+            channel_id: request.channel_id,
+            route: request.route,
+            joined: true,
+            muted: false,
+        };
+        upsert_by(
+            &mut self.state.voice_sessions,
+            session.clone(),
+            |s| &s.session_id,
+            &request.session_id,
+        );
+        self.persist()?;
+        Ok(session)
+    }
+
+    /// Update persisted mute state for an active voice session.
+    pub fn set_voice_muted(
+        &mut self,
+        session_id: &str,
+        muted: bool,
+    ) -> Result<AppVoiceSessionState, AppServiceError> {
+        let Some(index) = self
+            .state
+            .voice_sessions
+            .iter()
+            .position(|session| session.session_id == session_id)
+        else {
+            return Err(AppServiceError::ChannelNotFound(session_id.to_owned()));
+        };
+        self.state.voice_sessions[index].muted = muted;
+        let session = self.state.voice_sessions[index].clone();
+        self.persist()?;
+        Ok(session)
+    }
+
+    /// Verify the persisted safety number exactly and persist the explicit flag.
+    pub fn verify_safety_number(
+        &mut self,
+        request: SafetyVerificationRequest,
+    ) -> Result<SafetyVerificationResult, AppServiceError> {
+        let verified = request.friend_id == self.state.identity.friend_code
+            && request.provided == self.state.identity.safety_number;
+        self.state.identity.safety_verified = verified;
+        self.persist()?;
+        Ok(SafetyVerificationResult {
+            verified,
+            message: if verified {
+                "Safety number verified; MITM risk accepted by explicit user comparison".to_owned()
+            } else {
+                "Safety number mismatch; do not trust this device or DM".to_owned()
+            },
+        })
+    }
+
+    fn ensure_channel(&self, group_id: &str, channel_id: &str) -> Result<(), AppServiceError> {
+        let group = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| AppServiceError::GroupNotFound(group_id.to_owned()))?;
+        if group.channels.iter().any(|channel| channel.channel_id == channel_id) {
+            Ok(())
+        } else {
+            Err(AppServiceError::ChannelNotFound(channel_id.to_owned()))
+        }
+    }
+
+    fn persist(&self) -> Result<(), AppServiceError> {
+        self.store.save(&self.state)?;
+        Ok(())
+    }
+}
+
+fn upsert_by<T, F>(items: &mut Vec<T>, item: T, key: F, target: &str)
+where
+    F: Fn(&T) -> &String,
+{
+    if let Some(index) = items.iter().position(|existing| key(existing) == target) {
+        items[index] = item;
+    } else {
+        items.push(item);
+    }
+}
+
+/// Build default persistence-backed state for fixtures and first launch.
+#[must_use]
+pub fn default_app_state() -> AppState {
+    let mut state = AppState::new(AppIdentityState::new(
+        "alice",
+        "Alice",
+        FIXTURE_BOB_FRIEND_CODE,
+        "alice-laptop",
+        FIXTURE_BOB_SAFETY_NUMBER,
+    ));
+    state.preferences = AppPreferencesState::default();
+    let mut group = AppGroupState::new("discrypt-lab", "discrypt lab", "owner");
+    group.channels = vec![
+        AppChannelState::new(
+            "general",
+            "discrypt-lab",
+            "#general",
+            "text",
+            "7 day default; older messages lock, not vanish",
+        ),
+        AppChannelState::new(
+            "ops",
+            "discrypt-lab",
+            "#ops",
+            "text",
+            "shorten is retroactive; lengthen is future-only",
+        ),
+        AppChannelState::new(
+            "voice-lobby",
+            "discrypt-lab",
+            "Voice Lobby",
+            "voice",
+            "SFrame media; relays carry ciphertext only",
+        ),
+    ];
+    state.groups.push(group);
+    state.invites.push(AppInviteState {
+        invite_id: "fixture-invite".to_owned(),
+        group_id: "discrypt-lab".to_owned(),
+        expires: "Invite expires and can be revoked".to_owned(),
+        max_use: "Max-use is enforced before MLS admission".to_owned(),
+        password_gate: "Password rooms use OPAQUE/PAKE or an online authorized helper; no offline verifier".to_owned(),
+        revoked: false,
+    });
+    state.voice_sessions.push(AppVoiceSessionState {
+        session_id: "voice-lobby-session".to_owned(),
+        group_id: "discrypt-lab".to_owned(),
+        channel_id: "voice-lobby".to_owned(),
+        route: "STUN → peer relay overlay → TURN".to_owned(),
+        joined: false,
+        muted: false,
+    });
+    state
 }
 
 /// Safety-number verification request from UI.
@@ -650,7 +1021,89 @@ pub fn summarize(group: &GroupState) -> RoomSummary {
 /// Build the deterministic command snapshot used by Tauri and the E2E harness.
 #[must_use]
 pub fn app_snapshot() -> AppSnapshot {
-    seed_state().snapshot
+    snapshot_from_state(&default_app_state())
+}
+
+fn snapshot_from_state(state: &AppState) -> AppSnapshot {
+    AppSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        friend: FriendView {
+            alias: "Bob".to_owned(),
+            friend_code: FIXTURE_BOB_FRIEND_CODE.to_owned(),
+            safety_number: FIXTURE_BOB_SAFETY_NUMBER.to_owned(),
+            verified: false,
+        },
+        devices: vec![
+            DeviceView {
+                device_id: "alice-laptop".to_owned(),
+                leaf_index: 1,
+                local: true,
+                authorized: true,
+            },
+            DeviceView {
+                device_id: "alice-phone".to_owned(),
+                leaf_index: 2,
+                local: false,
+                authorized: true,
+            },
+        ],
+        servers: vec![ServerView {
+            name: "discrypt lab".to_owned(),
+            role: "owner".to_owned(),
+            channels: vec![
+                ChannelView {
+                    name: "#general".to_owned(),
+                    kind: ChannelKind::Text,
+                    retention_status: "7 day default; older messages lock, not vanish".to_owned(),
+                },
+                ChannelView {
+                    name: "#ops".to_owned(),
+                    kind: ChannelKind::Text,
+                    retention_status: "shorten is retroactive; lengthen is future-only".to_owned(),
+                },
+                ChannelView {
+                    name: "Voice Lobby".to_owned(),
+                    kind: ChannelKind::Voice,
+                    retention_status: "SFrame media; relays carry ciphertext only".to_owned(),
+                },
+            ],
+        }],
+        invite: InviteFlowView {
+            expires: "Invite expires and can be revoked".to_owned(),
+            max_use: "Max-use is enforced before MLS admission".to_owned(),
+            password_gate: "Password rooms use OPAQUE/PAKE or an online authorized helper; no offline verifier".to_owned(),
+            welcome_required: "Final admission still requires an authorized MLS Welcome/add".to_owned(),
+        },
+        retention: RetentionSettingsView {
+            presets: vec![
+                "1 hour".to_owned(),
+                "24 hours".to_owned(),
+                "7 days".to_owned(),
+                "30 days".to_owned(),
+                "90 days".to_owned(),
+                "custom".to_owned(),
+                "warned unlimited / never-lock".to_owned(),
+            ],
+            selected: "7 days".to_owned(),
+            unlimited_warning: "Unlimited keeps local keys longer and weakens lock behavior; opt in explicitly".to_owned(),
+            transition_copy: "Shortening re-locks older messages retroactively; lengthening applies only to future messages".to_owned(),
+        },
+        voice: VoiceRoomView {
+            route: "STUN → peer relay overlay → TURN".to_owned(),
+            relay_copy: "Relays see SFrame ciphertext only and active tamper is rejected".to_owned(),
+            android_path: "Android uses encoded transforms when available, otherwise the native webrtc-rs contingency".to_owned(),
+        },
+        connectivity: ConnectivityView {
+            fallback_chain: "STUN → relay-overlay → TURN; owner endpoints may override defaults".to_owned(),
+            metadata_copy: "Content-private and metadata-minimizing, not metadata-anonymous".to_owned(),
+            push_copy: "Android FCM wake is content-free and carries no room, sender, or message body".to_owned(),
+        },
+        security_copy: SecurityCopyView {
+            metadata: "Passive infrastructure can see IPs and timing; discrypt does not claim anonymity".to_owned(),
+            deletion: "Deleted on your online devices now; pending on offline devices until they reconnect".to_owned(),
+            malicious_member: "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient".to_owned(),
+        },
+    }
 }
 
 /// Verify an out-of-band safety-number comparison against a deterministic snapshot.
