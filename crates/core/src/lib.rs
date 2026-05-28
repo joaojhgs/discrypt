@@ -217,7 +217,6 @@ pub struct AppSnapshot {
     pub security_copy: SecurityCopyView,
 }
 
-
 /// Safety-number verification request from UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SafetyVerificationRequest {
@@ -475,9 +474,11 @@ impl<S: AppStore> AppService<S> {
             .iter()
             .position(|server| server.name == server_name)
             .or_else(|| (!self.state.snapshot.servers.is_empty()).then_some(0))
-            .ok_or_else(|| AppServiceError::InvalidCommand(
-                "no server available for channel creation".to_owned(),
-            ))?;
+            .ok_or_else(|| {
+                AppServiceError::InvalidCommand(
+                    "no server available for channel creation".to_owned(),
+                )
+            })?;
         let server = &mut self.state.snapshot.servers[server_index];
         if !server.channels.iter().any(|channel| channel.name == name) {
             server.channels.push(ChannelView {
@@ -907,34 +908,28 @@ mod tests {
     }
 
     #[test]
-    fn app_service_persists_mutations_across_restart() {
+    fn app_service_persists_mutations_across_restart() -> Result<(), AppServiceError> {
         let store = MemoryAppStore::default();
-        let mut service = AppService::load_or_seed(store.clone()).expect("seed service");
-        let snapshot = service
-            .create_channel(CreateChannelRequest {
-                server_name: "discrypt lab".to_owned(),
-                name: "secure-room".to_owned(),
-                kind: ChannelKind::Text,
-            })
-            .expect("create channel");
+        let mut service = AppService::load_or_seed(store.clone())?;
+        let snapshot = service.create_channel(CreateChannelRequest {
+            server_name: "discrypt lab".to_owned(),
+            name: "secure-room".to_owned(),
+            kind: ChannelKind::Text,
+        })?;
         assert!(snapshot.servers[0]
             .channels
             .iter()
             .any(|channel| channel.name == "#secure-room"));
-        service
-            .save_preferences(SavePreferencesRequest {
-                theme_id: "ocean-contrast".to_owned(),
-                template_id: "compact-ops".to_owned(),
-            })
-            .expect("save preferences");
-        service
-            .verify_safety_number(SafetyVerificationRequest {
-                friend_id: snapshot.friend.friend_code,
-                provided: snapshot.friend.safety_number,
-            })
-            .expect("verify safety");
+        service.save_preferences(SavePreferencesRequest {
+            theme_id: "ocean-contrast".to_owned(),
+            template_id: "compact-ops".to_owned(),
+        })?;
+        service.verify_safety_number(SafetyVerificationRequest {
+            friend_id: snapshot.friend.friend_code,
+            provided: snapshot.friend.safety_number,
+        })?;
 
-        let reloaded = AppService::load_or_seed(store).expect("reload service");
+        let reloaded = AppService::load_or_seed(store)?;
         let reloaded_snapshot = reloaded.snapshot();
         assert!(reloaded_snapshot.friend.verified);
         assert_eq!(reloaded_snapshot.preferences.theme_id, "ocean-contrast");
@@ -942,39 +937,35 @@ mod tests {
             .channels
             .iter()
             .any(|channel| channel.name == "#secure-room"));
+        Ok(())
     }
 
     #[test]
-    fn voice_and_message_commands_are_snapshot_backed() {
-        let mut service = in_memory_app_service().expect("service");
-        let muted = service
-            .set_self_mute(SelfMuteRequest { muted: true })
-            .expect("mute");
+    fn voice_and_message_commands_are_snapshot_backed() -> Result<(), AppServiceError> {
+        let mut service = in_memory_app_service()?;
+        let muted = service.set_self_mute(SelfMuteRequest { muted: true })?;
         assert!(muted
             .voice_session
             .participants
             .iter()
             .any(|participant| participant.id == "alice" && participant.muted));
-        let volume = service
-            .set_speaker_volume(SpeakerVolumeRequest {
-                participant_id: "bob".to_owned(),
-                volume: 41,
-            })
-            .expect("volume");
+        let volume = service.set_speaker_volume(SpeakerVolumeRequest {
+            participant_id: "bob".to_owned(),
+            volume: 41,
+        })?;
         assert!(volume
             .voice_session
             .participants
             .iter()
             .any(|participant| participant.id == "bob" && participant.volume == 41));
-        let text = service
-            .send_message(SendMessageRequest {
-                channel: "#general".to_owned(),
-                body: "hello command-backed timeline".to_owned(),
-            })
-            .expect("message");
+        let text = service.send_message(SendMessageRequest {
+            channel: "#general".to_owned(),
+            body: "hello command-backed timeline".to_owned(),
+        })?;
         assert!(text
             .messages
             .iter()
             .any(|message| message.body == "hello command-backed timeline"));
+        Ok(())
     }
 }

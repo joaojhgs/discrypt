@@ -462,32 +462,6 @@ pub struct AppMessageState {
     pub sent_at_ms: u64,
 }
 
-impl AppMessageState {
-    /// Create a ciphertext-only message record.
-    #[must_use]
-    pub fn new(
-        message_id: impl Into<String>,
-        group_id: impl Into<String>,
-        channel_id: impl Into<String>,
-        author_id: impl Into<String>,
-        sequence: u64,
-        epoch: u64,
-        ciphertext: Vec<u8>,
-        sent_at_ms: u64,
-    ) -> Self {
-        Self {
-            message_id: message_id.into(),
-            group_id: group_id.into(),
-            channel_id: channel_id.into(),
-            author_id: author_id.into(),
-            sequence,
-            epoch,
-            ciphertext,
-            sent_at_ms,
-        }
-    }
-}
-
 /// Invite/admission flow state persisted for restart-safe admin UX.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppInviteState {
@@ -707,20 +681,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_app_store_round_trips_app_state_bytes() {
+    fn memory_app_store_round_trips_app_state_bytes() -> Result<(), AppStoreError> {
         let mut store = MemoryAppStore::default();
-        assert_eq!(store.load_app_state().expect("load"), None);
-        store
-            .save_app_state(br#"{"schema_version":2}"#)
-            .expect("save");
+        assert_eq!(store.load_app_state()?, None);
+        store.save_app_state(br#"{"schema_version":2}"#)?;
         assert_eq!(
-            store.load_app_state().expect("reload"),
+            store.load_app_state()?,
             Some(br#"{"schema_version":2}"#.to_vec())
         );
+        Ok(())
     }
 
     #[test]
-    fn file_app_store_round_trips_app_state_bytes() {
+    fn file_app_store_round_trips_app_state_bytes() -> Result<(), AppStoreError> {
         let path = std::env::temp_dir().join(format!(
             "discrypt-app-store-{}-{}.json",
             std::process::id(),
@@ -728,14 +701,13 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let mut store = FileAppStore::new(&path);
-        store
-            .save_app_state(br#"{"schema_version":2}"#)
-            .expect("save");
+        store.save_app_state(br#"{"schema_version":2}"#)?;
         assert_eq!(
-            store.load_app_state().expect("reload"),
+            store.load_app_state()?,
             Some(br#"{"schema_version":2}"#.to_vec())
         );
         let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
