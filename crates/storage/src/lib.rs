@@ -462,6 +462,32 @@ pub struct AppMessageState {
     pub sent_at_ms: u64,
 }
 
+impl AppMessageState {
+    /// Create a ciphertext-only message record.
+    #[must_use]
+    pub fn new(
+        message_id: impl Into<String>,
+        group_id: impl Into<String>,
+        channel_id: impl Into<String>,
+        author_id: impl Into<String>,
+        sequence: u64,
+        epoch: u64,
+        ciphertext: Vec<u8>,
+        sent_at_ms: u64,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            group_id: group_id.into(),
+            channel_id: channel_id.into(),
+            author_id: author_id.into(),
+            sequence,
+            epoch,
+            ciphertext,
+            sent_at_ms,
+        }
+    }
+}
+
 /// Invite/admission flow state persisted for restart-safe admin UX.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppInviteState {
@@ -529,161 +555,6 @@ impl AppState {
             voice_sessions: Vec::new(),
         }
     }
-}
-
-/// Application store errors.
-#[derive(Debug, thiserror::Error)]
-pub enum AppStoreError {
-    /// File I/O failed.
-    #[error("app store I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    /// Serialization failed.
-    #[error("app store serialization failed: {0}")]
-    Serde(#[from] serde_json::Error),
-    /// The persisted envelope failed integrity validation or decryption.
-    #[error("app store envelope is corrupt or authenticated with the wrong key")]
-    CorruptEnvelope,
-    /// The persisted schema version is unsupported.
-    #[error("unsupported app state schema version {0}")]
-    UnsupportedVersion(u32),
-}
-
-/// Store boundary for application state persistence.
-pub trait AppStore {
-    /// Load state from storage.
-    fn load(&self) -> Result<AppState, AppStoreError>;
-    /// Save state to storage.
-    fn save(&self, state: &AppState) -> Result<(), AppStoreError>;
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SealedAppStateEnvelope {
-    schema_version: u32,
-    nonce: [u8; 16],
-    ciphertext: Vec<u8>,
-    tag: [u8; 32],
-}
-
-/// File-backed app store with a sealed local envelope.
-#[derive(Clone, Debug)]
-pub struct FileAppStore {
-    path: std::path::PathBuf,
-    key: [u8; 32],
-}
-
-impl FileAppStore {
-    /// Create a file app store rooted at an exact state-file path.
-    #[must_use]
-    pub fn new(path: impl Into<std::path::PathBuf>, key: [u8; 32]) -> Self {
-        Self {
-            path: path.into(),
-            key,
-        }
-    }
-
-    /// Return the exact persistence path.
-    #[must_use]
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
-
-impl AppStore for FileAppStore {
-    fn load(&self) -> Result<AppState, AppStoreError> {
-        let bytes = std::fs::read(&self.path)?;
-        let envelope: SealedAppStateEnvelope = serde_json::from_slice(&bytes)?;
-        if envelope.schema_version != APP_STATE_SCHEMA_VERSION {
-            return Err(AppStoreError::UnsupportedVersion(envelope.schema_version));
-        }
-        let plaintext = open_app_state_envelope(&self.key, &envelope)?;
-        let state: AppState = serde_json::from_slice(&plaintext)?;
-        if state.schema_version != APP_STATE_SCHEMA_VERSION {
-            return Err(AppStoreError::UnsupportedVersion(state.schema_version));
-        }
-        Ok(state)
-    }
-
-    fn save(&self, state: &AppState) -> Result<(), AppStoreError> {
-        if state.schema_version != APP_STATE_SCHEMA_VERSION {
-            return Err(AppStoreError::UnsupportedVersion(state.schema_version));
-        }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let plaintext = serde_json::to_vec(state)?;
-        let envelope = seal_app_state_envelope(&self.key, &plaintext);
-        let encoded = serde_json::to_vec_pretty(&envelope)?;
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, encoded)?;
-        std::fs::rename(tmp, &self.path)?;
-        Ok(())
-    }
-}
-
-fn seal_app_state_envelope(key: &[u8; 32], plaintext: &[u8]) -> SealedAppStateEnvelope {
-    let nonce = app_state_nonce(key, plaintext);
-    let ciphertext = xor_keystream(key, &nonce, plaintext);
-    let tag = app_state_tag(key, &nonce, &ciphertext);
-    SealedAppStateEnvelope {
-        schema_version: APP_STATE_SCHEMA_VERSION,
-        nonce,
-        ciphertext,
-        tag,
-    }
-}
-
-fn open_app_state_envelope(
-    key: &[u8; 32],
-    envelope: &SealedAppStateEnvelope,
-) -> Result<Vec<u8>, AppStoreError> {
-    if app_state_tag(key, &envelope.nonce, &envelope.ciphertext) != envelope.tag {
-        return Err(AppStoreError::CorruptEnvelope);
-    }
-    Ok(xor_keystream(key, &envelope.nonce, &envelope.ciphertext))
-}
-
-fn app_state_nonce(key: &[u8; 32], plaintext: &[u8]) -> [u8; 16] {
-    let digest = Sha256::digest([b"discrypt-app-store-nonce".as_slice(), key, plaintext].concat());
-    let mut nonce = [0; 16];
-    nonce.copy_from_slice(&digest[..16]);
-    nonce
-}
-
-fn app_state_tag(key: &[u8; 32], nonce: &[u8; 16], ciphertext: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(
-        [
-            b"discrypt-app-store-tag".as_slice(),
-            key,
-            nonce.as_slice(),
-            ciphertext,
-        ]
-        .concat(),
-    );
-    let mut tag = [0; 32];
-    tag.copy_from_slice(&digest);
-    tag
-}
-
-fn xor_keystream(key: &[u8; 32], nonce: &[u8; 16], bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    for (chunk_idx, chunk) in bytes.chunks(32).enumerate() {
-        let block = Sha256::digest(
-            [
-                b"discrypt-app-store-stream".as_slice(),
-                key,
-                nonce.as_slice(),
-                &(chunk_idx as u64).to_be_bytes(),
-            ]
-            .concat(),
-        );
-        out.extend(
-            chunk
-                .iter()
-                .zip(block.iter())
-                .map(|(byte, mask)| byte ^ mask),
-        );
-    }
-    out
 }
 
 /// Sealed account-continuity backup (no content keys).
@@ -952,126 +823,5 @@ mod tests {
                 content_keys_restored: false,
             }) if room_memberships == vec!["room".to_owned()]
         ));
-    }
-
-    #[test]
-    fn app_store_persists_full_state_across_restart_without_plaintext_or_keys(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let path = unique_store_path("restart");
-        let key = [13; 32];
-        let mut state = AppState::new(AppIdentityState::new(
-            "alice",
-            "Alice",
-            "friend:bob",
-            "alice-laptop",
-            "1111 2222",
-        ));
-        state.preferences = AppPreferencesState {
-            theme: "dark".to_owned(),
-            active_template: "compact-ops".to_owned(),
-            retention_preset: "24 hours".to_owned(),
-        };
-        let mut group = AppGroupState::new("group-1", "Ops", "admin");
-        group.channels.push(AppChannelState::new(
-            "general",
-            "group-1",
-            "#general",
-            "text",
-            "24 hour retention",
-        ));
-        state.groups.push(group);
-        state.messages.push(AppMessageState {
-            message_id: "m-1".to_owned(),
-            group_id: "group-1".to_owned(),
-            channel_id: "general".to_owned(),
-            author_id: "alice-laptop".to_owned(),
-            sequence: 1,
-            epoch: 7,
-            ciphertext: b"ciphertext-only".to_vec(),
-            sent_at_ms: 42,
-        });
-        state.invites.push(AppInviteState {
-            invite_id: "invite-1".to_owned(),
-            group_id: "group-1".to_owned(),
-            expires: "tomorrow".to_owned(),
-            max_use: "1".to_owned(),
-            password_gate: "OPAQUE/PAKE online helper".to_owned(),
-            revoked: false,
-        });
-        state.voice_sessions.push(AppVoiceSessionState {
-            session_id: "voice-1".to_owned(),
-            group_id: "group-1".to_owned(),
-            channel_id: "general".to_owned(),
-            route: "STUN → relay".to_owned(),
-            joined: true,
-            muted: true,
-        });
-
-        let store = FileAppStore::new(&path, key);
-        store.save(&state)?;
-        let bytes = std::fs::read(&path)?;
-        assert!(!contains_window(&bytes, b"meet at dawn"));
-        assert!(!contains_window(&bytes, &key));
-        assert!(!contains_window(&bytes, b"ciphertext-only"));
-
-        let restarted = FileAppStore::new(&path, key).load()?;
-        assert_eq!(restarted, state);
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
-
-    #[test]
-    fn app_store_rejects_corrupted_envelope_and_wrong_key() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let path = unique_store_path("corrupt");
-        let key = [21; 32];
-        let store = FileAppStore::new(&path, key);
-        let state = AppState::new(AppIdentityState::new(
-            "alice",
-            "Alice",
-            "friend:bob",
-            "alice-laptop",
-            "1111 2222",
-        ));
-        store.save(&state)?;
-
-        let wrong_key = FileAppStore::new(&path, [22; 32]).load();
-        assert!(matches!(wrong_key, Err(AppStoreError::CorruptEnvelope)));
-
-        let raw = std::fs::read(&path)?;
-        let mut value: serde_json::Value = serde_json::from_slice(&raw)?;
-        let bytes = value
-            .get_mut("ciphertext")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| std::io::Error::other("missing ciphertext array"))?;
-        let first = bytes
-            .first()
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| std::io::Error::other("missing first ciphertext byte"))?;
-        bytes[0] = serde_json::Value::from((first ^ 1) as u8);
-        let encoded = serde_json::to_vec(&value)?;
-        std::fs::write(&path, encoded)?;
-
-        let corrupted = FileAppStore::new(&path, key).load();
-        assert!(matches!(corrupted, Err(AppStoreError::CorruptEnvelope)));
-        let _ = std::fs::remove_file(path);
-        Ok(())
-    }
-
-    fn unique_store_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "discrypt-app-store-{label}-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos())
-        ))
-    }
-
-    fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
-        !needle.is_empty()
-            && haystack
-                .windows(needle.len())
-                .any(|window| window == needle)
     }
 }
