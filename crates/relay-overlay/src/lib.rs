@@ -1,4 +1,6 @@
 //! Adaptive relay overlay foundations.
+pub mod integrity;
+
 use serde::{Deserialize, Serialize};
 
 /// Relay candidate metrics.
