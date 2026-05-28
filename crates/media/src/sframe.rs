@@ -514,6 +514,23 @@ mod tests {
     }
 
     #[test]
+    fn key_debug_and_protected_frame_do_not_expose_raw_secret_or_plaintext(
+    ) -> Result<(), MediaError> {
+        let b = binding(b"kid-redaction", 8, "alice-desktop");
+        let key = derive_media_key(&[8; 32], &b)?;
+        let debug = format!("{key:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret media"));
+
+        let frame = protect_frame(&key, &b, 0, b"secret media")?;
+        let serialized = serde_json::to_vec(&frame).map_err(|_| MediaError::AuthenticationFailed)?;
+        assert!(!serialized
+            .windows(b"secret media".len())
+            .any(|window| window == b"secret media"));
+        Ok(())
+    }
+
+    #[test]
     fn registry_rejects_duplicate_kid_binding() -> Result<(), MediaError> {
         let first = binding(b"kid-conflict", 1, "laptop");
         let second = binding(b"kid-conflict", 2, "phone");

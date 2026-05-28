@@ -6,6 +6,10 @@
 //! contracts without opening real sockets.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Transport address or provider URI.
@@ -26,6 +30,12 @@ pub enum TransportError {
     /// A concrete transport path is unavailable.
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// Local socket I/O failed.
+    #[error("local socket I/O failed: {0}")]
+    Io(String),
+    /// A conformance gate caught caller-supplied plaintext in relay-visible bytes.
+    #[error("relay-visible payload contains forbidden plaintext")]
+    PlaintextLeak,
     /// Every Phase-6 fallback leg failed under the simulated NAT condition.
     #[error("no viable STUN, relay-overlay, or TURN path")]
     NoViablePath,
@@ -211,6 +221,183 @@ impl ConnectivityPlan {
             }
         })
     }
+
+    /// Build an honest route report for UI/diagnostic surfaces.
+    #[must_use]
+    pub fn route_report(&self) -> RouteReport {
+        RouteReport {
+            selected: self.selected,
+            endpoint: self.endpoint.clone(),
+            attempted_legs: self.attempts.iter().map(|attempt| attempt.leg).collect(),
+            ciphertext_only_relay_legs: self.relay_legs_ciphertext_only(),
+            limitation: "deterministic local-process conformance only; not a production NAT/pcap proof"
+                .to_owned(),
+        }
+    }
+}
+
+/// Honest route report surfaced by harnesses and command-backed UI gates.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteReport {
+    /// Winning leg selected by the fallback planner.
+    pub selected: FallbackLeg,
+    /// Winning endpoint or route descriptor.
+    pub endpoint: Endpoint,
+    /// Attempted legs in order.
+    pub attempted_legs: Vec<FallbackLeg>,
+    /// Whether relay-overlay/TURN legs are marked ciphertext-only.
+    pub ciphertext_only_relay_legs: bool,
+    /// Honest limitation copy for deterministic local tests.
+    pub limitation: String,
+}
+
+impl RouteReport {
+    /// True when the report is ordered and includes the local-test limitation.
+    #[must_use]
+    pub fn honest_and_ordered(&self) -> bool {
+        let expected = [
+            FallbackLeg::Stun,
+            FallbackLeg::RelayOverlay,
+            FallbackLeg::Turn,
+        ];
+        self.attempted_legs
+            .iter()
+            .enumerate()
+            .all(|(index, leg)| expected.get(index) == Some(leg))
+            && self.limitation.contains("local-process")
+            && self.ciphertext_only_relay_legs
+    }
+}
+
+/// Result of a socket-backed local-process adapter conformance run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalProcessConformance {
+    /// Loopback socket endpoint used by the adapter.
+    pub endpoint: Endpoint,
+    /// Route report for the simulated NAT condition.
+    pub route_report: RouteReport,
+    /// Whether the ciphertext payload was delivered byte-for-byte.
+    pub ciphertext_delivered: bool,
+    /// Whether a caller-supplied plaintext sample was rejected before socket send.
+    pub plaintext_rejected: bool,
+    /// Number of bytes delivered over the local socket.
+    pub delivered_len: usize,
+}
+
+impl LocalProcessConformance {
+    /// True when socket delivery, plaintext rejection, and route reporting all pass.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.ciphertext_delivered && self.plaintext_rejected && self.route_report.honest_and_ordered()
+    }
+}
+
+/// Loopback TCP adapter used to prove local-process transport conformance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalProcessSocketAdapter {
+    config: ConnectivityConfig,
+    nat: SimulatedNat,
+    forbidden_plaintext: Vec<u8>,
+}
+
+impl LocalProcessSocketAdapter {
+    /// Create a local adapter bound to a fallback configuration and NAT scenario.
+    #[must_use]
+    pub fn new(
+        config: ConnectivityConfig,
+        nat: SimulatedNat,
+        forbidden_plaintext: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            config,
+            nat,
+            forbidden_plaintext: forbidden_plaintext.into(),
+        }
+    }
+
+    /// Run one loopback socket conformance delivery with ciphertext-only checks.
+    pub fn run_conformance(
+        &self,
+        ciphertext: &[u8],
+    ) -> Result<LocalProcessConformance, TransportError> {
+        if ciphertext.is_empty() {
+            return Err(TransportError::Unavailable("empty ciphertext".to_owned()));
+        }
+        let plaintext_rejected = self.rejects_plaintext_sample()?;
+        self.ensure_ciphertext_only(ciphertext)?;
+
+        let plan = ConnectivityPlanner::plan(&self.config, self.nat)?;
+        let route_report = plan.route_report();
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(io_error)?;
+        listener
+            .set_nonblocking(false)
+            .map_err(io_error)?;
+        let address = listener.local_addr().map_err(io_error)?;
+        let expected_len = ciphertext.len();
+
+        let receiver = thread::spawn(move || -> Result<Vec<u8>, TransportError> {
+            let (mut stream, _peer) = listener.accept().map_err(io_error)?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(io_error)?;
+            let mut len_bytes = [0u8; 4];
+            stream.read_exact(&mut len_bytes).map_err(io_error)?;
+            let len = u32::from_be_bytes(len_bytes) as usize;
+            let mut bytes = vec![0u8; len];
+            stream.read_exact(&mut bytes).map_err(io_error)?;
+            Ok(bytes)
+        });
+
+        let mut stream = TcpStream::connect(address).map_err(io_error)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(io_error)?;
+        stream
+            .write_all(&(ciphertext.len() as u32).to_be_bytes())
+            .map_err(io_error)?;
+        stream.write_all(ciphertext).map_err(io_error)?;
+        stream.flush().map_err(io_error)?;
+
+        let delivered = receiver
+            .join()
+            .map_err(|_| TransportError::Io("local socket receiver panicked".to_owned()))??;
+        let endpoint = Endpoint::new(format!("tcp://{address}"));
+
+        Ok(LocalProcessConformance {
+            endpoint,
+            route_report,
+            ciphertext_delivered: delivered == ciphertext && delivered.len() == expected_len,
+            plaintext_rejected,
+            delivered_len: delivered.len(),
+        })
+    }
+
+    fn rejects_plaintext_sample(&self) -> Result<bool, TransportError> {
+        if self.forbidden_plaintext.is_empty() {
+            return Ok(true);
+        }
+        match self.ensure_ciphertext_only(&self.forbidden_plaintext) {
+            Err(TransportError::PlaintextLeak) => Ok(true),
+            Err(error) => Err(error),
+            Ok(()) => Ok(false),
+        }
+    }
+
+    fn ensure_ciphertext_only(&self, payload: &[u8]) -> Result<(), TransportError> {
+        if !self.forbidden_plaintext.is_empty()
+            && payload
+                .windows(self.forbidden_plaintext.len())
+                .any(|window| window == self.forbidden_plaintext.as_slice())
+        {
+            Err(TransportError::PlaintextLeak)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn io_error(error: std::io::Error) -> TransportError {
+    TransportError::Io(error.to_string())
 }
 
 /// Stateless Phase-6 fallback planner.
@@ -312,6 +499,29 @@ mod tests {
 
         assert_eq!(stun.endpoint, Endpoint::new("stun:owner.example:3478"));
         assert_eq!(turn.endpoint, Endpoint::new("turns:owner.example:5349"));
+        Ok(())
+    }
+
+    #[test]
+    fn route_report_is_honest_about_local_process_limitations() -> Result<(), TransportError> {
+        let config = ConnectivityConfig::default();
+        let report = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?.route_report();
+        assert_eq!(report.selected, FallbackLeg::RelayOverlay);
+        assert!(report.honest_and_ordered());
+        assert!(report.limitation.contains("not a production NAT/pcap proof"));
+        Ok(())
+    }
+
+    #[test]
+    fn socket_adapter_delivers_ciphertext_and_rejects_plaintext() -> Result<(), TransportError> {
+        let adapter = LocalProcessSocketAdapter::new(
+            ConnectivityConfig::default(),
+            SimulatedNat::overlay_only(),
+            b"hello plaintext".to_vec(),
+        );
+        let report = adapter.run_conformance(b"sframe-like ciphertext bytes")?;
+        assert!(report.ready());
+        assert_eq!(report.delivered_len, b"sframe-like ciphertext bytes".len());
         Ok(())
     }
 }
