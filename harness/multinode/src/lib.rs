@@ -50,6 +50,10 @@ pub struct RelayOverlaySmoke {
 /// Deterministic Phase-3 text/history/MLS delivery smoke result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextHistoryDeliverySmoke {
+    /// Two-node app text round-trips through encrypted bytes before entering stores.
+    pub text_e2e_roundtrip: bool,
+    /// Author/recipient storage and relay-visible samples do not contain plaintext.
+    pub no_plaintext_in_text_surfaces: bool,
     /// Own devices merge one author's log without duplicate/lost entries.
     pub author_logs_merged: bool,
     /// Recipient cache retains only the bounded newest ciphertext/key entries.
@@ -121,6 +125,10 @@ pub struct ConnectivitySignalingPushSmoke {
     pub pcap_no_central_content: bool,
     /// TURN and peer relay observations are ciphertext-only.
     pub relays_ciphertext_only: bool,
+    /// Local-process socket adapter delivers ciphertext and rejects plaintext.
+    pub socket_local_process_conformant: bool,
+    /// Route reporting preserves order and states deterministic-test limitations.
+    pub route_reporting_honest: bool,
 }
 
 /// Deterministic Phase-7 UX and end-to-end hardening smoke result.
@@ -167,7 +175,9 @@ impl TextHistoryDeliverySmoke {
     /// True when every Phase-3 delivery invariant is satisfied.
     #[must_use]
     pub fn ready(&self) -> bool {
-        self.author_logs_merged
+        self.text_e2e_roundtrip
+            && self.no_plaintext_in_text_surfaces
+            && self.author_logs_merged
             && self.recipient_cache_bounded
             && self.gossip_converged_16
             && self.ordered_commit_delivery
@@ -216,6 +226,8 @@ impl ConnectivitySignalingPushSmoke {
             && self.metadata_matrix_validated
             && self.pcap_no_central_content
             && self.relays_ciphertext_only
+            && self.socket_local_process_conformant
+            && self.route_reporting_honest
     }
 }
 
@@ -416,6 +428,7 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
 
 /// Exercise Phase-3 text, history, MLS delivery, gossip, Welcome, and fork repair.
 pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow::Error> {
+    use discrypt_mls_core::{derive_epoch_secret, ExportLabel};
     use discrypt_mls_delivery::{
         detect_fork_or_replay, equal_confirmation_tags, order_application_events, plan_repair,
         repair_to_winner, summary, ApplicationEvent, CatchUpBundle, CommitEnvelope, DeliveryError,
@@ -425,12 +438,36 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
     use std::collections::BTreeSet;
 
+    let text_plaintext = b"hello from app-level encrypted text";
+    let text_key = derive_epoch_secret(
+        &[33; 32],
+        ExportLabel::Content,
+        b"room=lab;epoch=7;m=alice-1",
+    );
+    let text_ciphertext = xor_text_ciphertext(&text_key, text_plaintext);
+    let opened_text = xor_text_ciphertext(&text_key, &text_ciphertext);
+    let text_e2e_roundtrip = opened_text == text_plaintext && text_ciphertext != text_plaintext;
+
     let laptop_entry =
-        AuthorLogEntry::new(1, "alice-laptop", 1, 7, "alice-1", b"ciphertext-a".to_vec());
+        AuthorLogEntry::new(1, "alice-laptop", 1, 7, "alice-1", text_ciphertext.clone());
     let phone_entry =
         AuthorLogEntry::new(1, "alice-phone", 2, 7, "alice-2", b"ciphertext-b".to_vec());
     let mut laptop = LocalStore::default();
     laptop.append_sent(laptop_entry.clone());
+    laptop.cache_received(RecipientCacheEntry::new(
+        "alice-1",
+        text_ciphertext.clone(),
+        KeyState::Cached(text_key),
+        0,
+    ));
+    let no_plaintext_in_text_surfaces = !laptop
+        .author_log_snapshot()
+        .iter()
+        .any(|entry| contains_bytes(&entry.ciphertext, text_plaintext))
+        && laptop
+            .recipient_cache()
+            .get("alice-1")
+            .is_some_and(|entry| !contains_bytes(&entry.ciphertext, text_plaintext));
     let mut phone = LocalStore::default();
     phone.append_sent(phone_entry.clone());
     let inserted = laptop.merge_author_logs(phone.author_log_snapshot());
@@ -533,6 +570,8 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         && repair_plan.reproposed_events[0].event_id == "valid-text-reproposal";
 
     Ok(TextHistoryDeliverySmoke {
+        text_e2e_roundtrip,
+        no_plaintext_in_text_surfaces,
         author_logs_merged,
         recipient_cache_bounded,
         gossip_converged_16,
@@ -796,7 +835,7 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
     };
     use discrypt_transport::{
         ConnectivityConfig, ConnectivityPlanner, Endpoint, EndpointOverrides, FallbackLeg,
-        SimulatedNat,
+        LocalProcessSocketAdapter, SimulatedNat,
     };
 
     let now = Utc::now();
@@ -838,6 +877,7 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
         && turn.ordered_stun_overlay_turn();
     let relays_ciphertext_only =
         overlay.relay_legs_ciphertext_only() && turn.relay_legs_ciphertext_only();
+    let route_report = overlay.route_report();
 
     let override_config = ConnectivityConfig {
         overrides: EndpointOverrides::new(
@@ -850,6 +890,16 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
     let owner_turn = ConnectivityPlanner::plan(&override_config, SimulatedNat::turn_only())?;
     let owner_overrides_used = owner_stun.endpoint == Endpoint::new("stun:owner.example:3478")
         && owner_turn.endpoint == Endpoint::new("turns:owner.example:5349");
+
+    let socket_adapter = LocalProcessSocketAdapter::new(
+        default_config.clone(),
+        SimulatedNat::overlay_only(),
+        b"message-body".to_vec(),
+    );
+    let socket_report = socket_adapter.run_conformance(b"opaque socket ciphertext")?;
+    let socket_local_process_conformant = socket_report.ready();
+    let route_reporting_honest =
+        route_report.honest_and_ordered() && socket_report.route_report.honest_and_ordered();
 
     let wake_service = AndroidWakeService::default();
     let payload = WakePayload::new([7; 32], WakeReason::SyncHint, [9; 16]);
@@ -918,7 +968,24 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
         metadata_matrix_validated,
         pcap_no_central_content,
         relays_ciphertext_only,
+        socket_local_process_conformant,
+        route_reporting_honest,
     })
+}
+
+fn xor_text_ciphertext(key: &[u8; 32], input: &[u8]) -> Vec<u8> {
+    input
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ key[index % key.len()])
+        .collect()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// Exercise Phase-7 Tauri/React command-surface and final E2E hardening gates.
@@ -1053,6 +1120,8 @@ mod tests {
         assert!(matches!(
             smoke,
             Ok(TextHistoryDeliverySmoke {
+                text_e2e_roundtrip: true,
+                no_plaintext_in_text_surfaces: true,
                 author_logs_merged: true,
                 recipient_cache_bounded: true,
                 gossip_converged_16: true,
@@ -1111,6 +1180,8 @@ mod tests {
                 metadata_matrix_validated: true,
                 pcap_no_central_content: true,
                 relays_ciphertext_only: true,
+                socket_local_process_conformant: true,
+                route_reporting_honest: true,
             })
         ));
     }
