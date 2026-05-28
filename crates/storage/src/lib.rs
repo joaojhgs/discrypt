@@ -224,7 +224,6 @@ impl LocalStore {
     }
 }
 
-
 /// Persisted application state schema version.
 pub const APP_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -305,7 +304,11 @@ pub struct AppGroupState {
 impl AppGroupState {
     /// Create an empty group/server.
     #[must_use]
-    pub fn new(group_id: impl Into<String>, name: impl Into<String>, role: impl Into<String>) -> Self {
+    pub fn new(
+        group_id: impl Into<String>,
+        name: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Self {
         Self {
             group_id: group_id.into(),
             name: name.into(),
@@ -511,7 +514,10 @@ impl FileAppStore {
     /// Create a file app store rooted at an exact state-file path.
     #[must_use]
     pub fn new(path: impl Into<std::path::PathBuf>, key: [u8; 32]) -> Self {
-        Self { path: path.into(), key }
+        Self {
+            path: path.into(),
+            key,
+        }
     }
 
     /// Return the exact persistence path.
@@ -609,7 +615,12 @@ fn xor_keystream(key: &[u8; 32], nonce: &[u8; 16], bytes: &[u8]) -> Vec<u8> {
             ]
             .concat(),
         );
-        out.extend(chunk.iter().zip(block.iter()).map(|(byte, mask)| byte ^ mask));
+        out.extend(
+            chunk
+                .iter()
+                .zip(block.iter())
+                .map(|(byte, mask)| byte ^ mask),
+        );
     }
     out
 }
