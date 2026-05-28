@@ -1,7 +1,8 @@
 use discrypt_core::summarize;
 use discrypt_mls_core::GroupState;
 use discrypt_multinode_harness::{
-    media_security_smoke, relay_overlay_smoke, retention_shred_smoke, text_history_delivery_smoke,
+    governance_admission_smoke, media_security_smoke, relay_overlay_smoke, retention_shred_smoke,
+    text_history_delivery_smoke,
 };
 
 fn main() {
@@ -12,9 +13,10 @@ fn main() {
         relay_overlay_smoke(),
         text_history_delivery_smoke(),
         retention_shred_smoke(),
+        governance_admission_smoke(),
     ) {
-        (Ok(media), Ok(overlay), Ok(text), Ok(retention)) => println!(
-            "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} overlay_hops={} overlay_failover={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={}",
+        (Ok(media), Ok(overlay), Ok(text), Ok(retention), Ok(governance)) => println!(
+            "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} overlay_hops={} overlay_failover={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={}",
             summary.room_id,
             summary.epoch,
             summary.members,
@@ -42,22 +44,33 @@ fn main() {
             retention.cross_device_shred_sync,
             retention.live_key_membership_rate_limit_decoy,
             retention.secure_delete_negative,
-            retention.recovery_cannot_resurrect_content_keys
+            retention.recovery_cannot_resurrect_content_keys,
+            governance.governance_ordered_signed,
+            governance.governance_rejects_invalid_authority,
+            governance.removed_admin_cannot_win,
+            governance.invite_controls_enforced,
+            governance.password_and_welcome_gate,
+            governance.recovery_trust_model,
+            governance.abuse_controls_enforced
         ),
-        (Err(error), _, _, _) => {
+        (Err(error), _, _, _, _) => {
             eprintln!("discrypt multinode harness media smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, Err(error), _, _) => {
+        (_, Err(error), _, _, _) => {
             eprintln!("discrypt multinode harness relay overlay smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, Err(error), _) => {
+        (_, _, Err(error), _, _) => {
             eprintln!("discrypt multinode harness text history smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, Err(error)) => {
+        (_, _, _, Err(error), _) => {
             eprintln!("discrypt multinode harness retention/shred smoke failed: {error}");
+            std::process::exit(1);
+        }
+        (_, _, _, _, Err(error)) => {
+            eprintln!("discrypt multinode harness governance/admission smoke failed: {error}");
             std::process::exit(1);
         }
     }

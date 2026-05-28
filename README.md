@@ -12,6 +12,8 @@ Phase 3 text/history delivery foundations cover per-author sent-log merge, bound
 
 Phase 4 retention/shred/live-key foundations cover required retention presets, shorten-retroactive/lengthen-future semantics, lock-not-vanish placeholders, cross-device tombstone sync, membership-gated/rate-limited live-key responses with decoys, secure-delete simulation, and account-continuity backups that exclude content keys.
 
+Phase 5 governance/admission/recovery/abuse foundations cover signed epoch-bound governance ordering, authority checks, removed-admin race rejection, invite expiry/revoke/max-use, PAKE/helper-only password admission, account-continuity recovery trust material, and invite/spam/freeload abuse controls.
+
 ## Commands
 
 ```sh
@@ -46,6 +48,16 @@ cd apps/ui && npm ci && npm run typecheck && npm run build && npm audit --audit-
 - `harness/multinode::media_security_smoke` exercises passive relay opacity, replay rejection, and active tamper rejection.
 
 See [`docs/phase-1-media-security-review.md`](docs/phase-1-media-security-review.md) for the G002 evidence matrix and production-hardening notes.
+
+## Phase 5 governance/admission/recovery/abuse slice
+
+- `crates/mls-core/src/governance.rs` models signed epoch-bound governance events, canonical ordering, role authority, and removed-admin race rejection.
+- `crates/admission/src/lib.rs` enforces invite expiry/revoke/max-use and rejects offline-copyable password verifiers in favor of OPAQUE/PAKE or an online authorized helper plus final MLS Welcome/add.
+- `crates/storage/src/lib.rs` models account-continuity recovery with explicit no-material failure and no archival content-key restoration.
+- `crates/abuse/src/lib.rs` supplies deterministic invite/spam rate limits and relay freeload penalties.
+- `harness/multinode::governance_admission_smoke` exercises AC-GOV/AC3/AC-RECOVERY/AC-ABUSE foundations.
+
+See [`docs/phase-5-governance-admission-recovery-abuse.md`](docs/phase-5-governance-admission-recovery-abuse.md) for the G006 evidence matrix and production-hardening notes.
 
 ## Phase 4 retention/shred/live-key slice
 

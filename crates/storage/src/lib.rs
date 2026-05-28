@@ -252,6 +252,61 @@ pub fn seal_account_backup(
     }
 }
 
+/// Recovery material available to a user.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RecoveryMaterial {
+    /// Existing authorized device participates.
+    ExistingDevice { device_id: String },
+    /// User-held recovery code.
+    RecoveryCode { code_hash: [u8; 32] },
+    /// Sealed account-continuity backup.
+    SealedBackup(AccountBackup),
+    /// No remaining trust material.
+    None,
+}
+
+/// Recovery errors.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RecoveryError {
+    /// No authorized device, recovery code, or backup exists.
+    #[error("account recovery requires trust material")]
+    NoTrustMaterial,
+}
+
+/// Account-continuity recovery result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountRecovery {
+    /// Identity/device-set continuity is restored.
+    pub account_access_restored: bool,
+    /// Room memberships restored.
+    pub room_memberships: Vec<String>,
+    /// Device count from continuity material.
+    pub device_count: usize,
+    /// Content keys are deliberately not restored.
+    pub content_keys_restored: bool,
+}
+
+/// Recover account continuity without restoring archival content keys.
+pub fn recover_account(material: RecoveryMaterial) -> Result<AccountRecovery, RecoveryError> {
+    match material {
+        RecoveryMaterial::None => Err(RecoveryError::NoTrustMaterial),
+        RecoveryMaterial::ExistingDevice { .. } | RecoveryMaterial::RecoveryCode { .. } => {
+            Ok(AccountRecovery {
+                account_access_restored: true,
+                room_memberships: Vec::new(),
+                device_count: 1,
+                content_keys_restored: false,
+            })
+        }
+        RecoveryMaterial::SealedBackup(backup) => Ok(AccountRecovery {
+            account_access_restored: true,
+            room_memberships: backup.room_memberships,
+            device_count: backup.device_count,
+            content_keys_restored: false,
+        }),
+    }
+}
+
 /// In-memory secure-delete simulator for enumerated local stores.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SecureDeleteSimulator {
@@ -384,5 +439,24 @@ mod tests {
         sim.secure_delete(["db.sqlite", "db.sqlite-wal", "key.store"]);
         assert!(!sim.contains_material(b"content-key"));
         assert!(sim.deleted_all(["db.sqlite", "db.sqlite-wal", "key.store"]));
+    }
+
+    #[test]
+    fn recovery_requires_material_and_never_restores_content_keys() {
+        assert_eq!(
+            recover_account(RecoveryMaterial::None),
+            Err(RecoveryError::NoTrustMaterial)
+        );
+        let backup = seal_account_backup(&[1; 32], vec!["room".into()], 2);
+        let recovered = recover_account(RecoveryMaterial::SealedBackup(backup));
+        assert!(matches!(
+            recovered,
+            Ok(AccountRecovery {
+                account_access_restored: true,
+                room_memberships,
+                device_count: 2,
+                content_keys_restored: false,
+            }) if room_memberships == vec!["room".to_owned()]
+        ));
     }
 }

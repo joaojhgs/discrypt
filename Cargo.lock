@@ -316,6 +316,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "discrypt-abuse",
+ "discrypt-admission",
  "discrypt-content-keys",
  "discrypt-core",
  "discrypt-media",

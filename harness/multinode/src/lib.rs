@@ -85,6 +85,25 @@ pub struct RetentionShredSmoke {
     pub recovery_cannot_resurrect_content_keys: bool,
 }
 
+/// Deterministic Phase-5 governance/admission/recovery/abuse smoke result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceAdmissionSmoke {
+    /// Governance events are canonical and signed.
+    pub governance_ordered_signed: bool,
+    /// Unauthorized and out-of-epoch actions are rejected.
+    pub governance_rejects_invalid_authority: bool,
+    /// Removed admin cannot win a same-epoch race.
+    pub removed_admin_cannot_win: bool,
+    /// Invite expiry/revoke/max-use are enforced.
+    pub invite_controls_enforced: bool,
+    /// Password admission rejects offline verifiers and requires Welcome.
+    pub password_and_welcome_gate: bool,
+    /// Recovery requires trust material and excludes content keys.
+    pub recovery_trust_model: bool,
+    /// Abuse controls rate-limit invites/spam and penalize freeloading.
+    pub abuse_controls_enforced: bool,
+}
+
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
@@ -503,6 +522,139 @@ pub fn retention_shred_smoke() -> Result<RetentionShredSmoke, anyhow::Error> {
     })
 }
 
+/// Exercise Phase-5 governance, admission, recovery, and abuse controls.
+pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::Error> {
+    use chrono::{Duration, Utc};
+    use discrypt_abuse::AbuseControls;
+    use discrypt_admission::{AdmissionController, Invite, InviteError, PasswordGate};
+    use discrypt_mls_core::governance::{
+        GovernanceAction, GovernanceError, GovernanceEvent, GovernanceLog, GovernanceState, Role,
+    };
+    use discrypt_storage::{
+        recover_account, seal_account_backup, AccountRecovery, RecoveryError, RecoveryMaterial,
+    };
+
+    let mut log = GovernanceLog::default();
+    let high = GovernanceEvent::signed(10, 9, GovernanceAction::Ban { target: 4 });
+    let low = GovernanceEvent::signed(
+        10,
+        1,
+        GovernanceAction::RevokeInvite {
+            invite_id: "invite-a".into(),
+        },
+    );
+    log.append(high);
+    log.append(low);
+    let governance_ordered_signed =
+        log.events()[0].committer == 1 && log.events().iter().all(GovernanceEvent::signature_valid);
+
+    let mut state = GovernanceState::new(10, 1);
+    let governance_rejects_invalid_authority = state.apply_event(GovernanceEvent::signed(
+        10,
+        2,
+        GovernanceAction::RevokeInvite {
+            invite_id: "bad".into(),
+        },
+    )) == Err(GovernanceError::Unauthorized)
+        && state.apply_event(GovernanceEvent::signed(
+            11,
+            1,
+            GovernanceAction::RevokeInvite {
+                invite_id: "future".into(),
+            },
+        )) == Err(GovernanceError::OutOfEpoch);
+
+    state.apply_event(GovernanceEvent::signed(
+        10,
+        1,
+        GovernanceAction::SetRole {
+            target: 2,
+            role: Role::Admin,
+        },
+    ))?;
+    let race = state.resolve_epoch_events([
+        GovernanceEvent::signed(
+            10,
+            2,
+            GovernanceAction::RevokeInvite {
+                invite_id: "admin-loses".into(),
+            },
+        ),
+        GovernanceEvent::signed(10, 1, GovernanceAction::Ban { target: 2 }),
+    ]);
+    let removed_admin_cannot_win = race == vec![Ok(()), Err(GovernanceError::EvictedCommitter)]
+        && state.is_banned(2)
+        && !state.invite_revoked("admin-loses");
+
+    let now = Utc::now();
+    let mut one_use = Invite::new(b"secret", now + Duration::minutes(1), 1);
+    let first_use = one_use.consume(now) == Ok(());
+    let exhausted = one_use.consume(now) == Err(InviteError::Exhausted);
+    let mut expired = Invite::new(b"secret", now - Duration::seconds(1), 1);
+    let expired_rejected = expired.consume(now) == Err(InviteError::Expired);
+    let mut revoked = Invite::new(b"secret", now + Duration::minutes(1), 1);
+    revoked.revoke();
+    let revoked_rejected = revoked.consume(now) == Err(InviteError::Revoked);
+    let invite_controls_enforced = first_use && exhausted && expired_rejected && revoked_rejected;
+
+    let mut invite = Invite::new(b"secret", now + Duration::minutes(1), 2);
+    let mut offline = AdmissionController::new(
+        PasswordGate::OfflineVerifier {
+            verifier_id: "copyable".into(),
+        },
+        1,
+    );
+    let mut pake = AdmissionController::new(
+        PasswordGate::OnlineAuthorizedHelper {
+            helper_id: "owner-device".into(),
+        },
+        1,
+    );
+    let password_and_welcome_gate =
+        offline.finalize_admission(&mut invite, now, "alice", true, true)
+            == Err(InviteError::OfflineVerifierRejected)
+            && pake.finalize_admission(&mut invite, now, "alice", true, false)
+                == Err(InviteError::WelcomeRequired)
+            && pake.finalize_admission(&mut invite, now, "alice", true, true) == Ok(())
+            && pake.finalize_admission(&mut invite, now, "alice", true, true)
+                == Err(InviteError::PasswordRejected);
+
+    let backup = seal_account_backup(&[8; 32], vec!["room".into()], 2);
+    let recovery_trust_model = recover_account(RecoveryMaterial::None)
+        == Err(RecoveryError::NoTrustMaterial)
+        && matches!(
+            recover_account(RecoveryMaterial::SealedBackup(backup)),
+            Ok(AccountRecovery {
+                account_access_restored: true,
+                room_memberships,
+                device_count: 2,
+                content_keys_restored: false,
+            }) if room_memberships == vec!["room".to_owned()]
+        );
+
+    let mut abuse = AbuseControls::new(1, 2, Duration::minutes(1));
+    let abuse_controls_enforced = abuse.allow_invite("alice", now)
+        && !abuse.allow_invite("alice", now)
+        && abuse.allow_message("alice", now)
+        && abuse.allow_message("alice", now)
+        && !abuse.allow_message("alice", now)
+        && {
+            abuse.record_relay("freeloader", 1, 10);
+            abuse.record_relay("helper", 10, 1);
+            abuse.freeload_penalty("freeloader") > abuse.freeload_penalty("helper")
+        };
+
+    Ok(GovernanceAdmissionSmoke {
+        governance_ordered_signed,
+        governance_rejects_invalid_authority,
+        removed_admin_cannot_win,
+        invite_controls_enforced,
+        password_and_welcome_gate,
+        recovery_trust_model,
+        abuse_controls_enforced,
+    })
+}
+
 /// Backward-compatible boolean smoke for scripts that only need passive relay status.
 pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
     let smoke = media_security_smoke()?;
@@ -581,6 +733,23 @@ mod tests {
                 live_key_membership_rate_limit_decoy: true,
                 secure_delete_negative: true,
                 recovery_cannot_resurrect_content_keys: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn governance_admission_smoke_covers_phase5_gates() {
+        let smoke = governance_admission_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(GovernanceAdmissionSmoke {
+                governance_ordered_signed: true,
+                governance_rejects_invalid_authority: true,
+                removed_admin_cannot_win: true,
+                invite_controls_enforced: true,
+                password_and_welcome_gate: true,
+                recovery_trust_model: true,
+                abuse_controls_enforced: true,
             })
         ));
     }

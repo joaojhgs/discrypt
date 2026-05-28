@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 chrono = { workspace = true }
 anyhow = { workspace = true }
+discrypt-abuse = { path = "../../crates/abuse", version = "0.1.0" }
+discrypt-admission = { path = "../../crates/admission", version = "0.1.0" }
 discrypt-core = { path = "../../crates/core", version = "0.1.0" }
 discrypt-content-keys = { path = "../../crates/content-keys", version = "0.1.0" }
 discrypt-mls-core = { path = "../../crates/mls-core", version = "0.1.0" }
