@@ -1,0 +1,17 @@
+[package]
+name = "discrypt-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }
+admission = { package = "discrypt-admission", path = "../admission", version = "0.1.0" }
+storage = { package = "discrypt-storage", path = "../storage", version = "0.1.0" }
+content_keys = { package = "discrypt-content-keys", path = "../content-keys", version = "0.1.0" }

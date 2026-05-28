@@ -1,0 +1,1 @@
+{"productName":"discrypt","version":"0.1.0","identifier":"dev.discrypt.app","build":{"frontendDist":"../../ui/dist","devUrl":"http://localhost:5173"},"app":{"windows":[{"title":"discrypt","width":1200,"height":800}]}}

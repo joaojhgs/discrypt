@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  android-check:
+    name: android target check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: cargo check --workspace --target aarch64-linux-android
+
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-audit-deny-sbom-v1
+      - name: Install supply-chain tools
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo install cargo-deny --locked || true
+          cargo install cargo-sbom --locked || true
+      - run: cargo audit
+      - run: cargo deny check
+      - run: cargo sbom --output-format spdx_json_2_3 > discrypt.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discrypt-sbom
+          path: discrypt.spdx.json
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm ci
+        working-directory: apps/ui
+      - run: npm run build
+        working-directory: apps/ui
