@@ -1,0 +1,23 @@
+/target/
+/node_modules/
+/apps/ui/node_modules/
+/apps/ui/dist/
+/apps/desktop/src-tauri/target/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Local/runtime-only assistant state
+.claude/settings.local.json
+.omx/state/
+.omx/logs/
+.omx/runtime/
+.omx/metrics.json
+.omx/hud-config.json
+.omx/setup-scope.json
+.omc/sessions/
+.omc/state/
+.omc/.omc/
+.omc/drafts/
