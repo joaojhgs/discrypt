@@ -250,8 +250,8 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
 pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
     mutate_state(|state| {
         state.preferences = UiPreferencesView {
-            theme_id: request.theme_id,
-            template_id: request.template_id,
+            theme_id: request.theme_id.clone(),
+            template_id: request.template_id.clone(),
         };
         state.push_event("preferences.saved", "Theme/template preferences saved");
     })
@@ -488,8 +488,7 @@ pub fn command_health() -> CommandHealth {
     });
     let state = app_state();
     CommandHealth {
-        snapshot_ready: !snapshot.friend.verified
-            && snapshot.schema_version == 1
+        snapshot_ready: snapshot.schema_version == 1
             && snapshot.devices.len() >= 2
             && snapshot
                 .servers
