@@ -230,8 +230,9 @@ impl ConnectivityPlan {
             endpoint: self.endpoint.clone(),
             attempted_legs: self.attempts.iter().map(|attempt| attempt.leg).collect(),
             ciphertext_only_relay_legs: self.relay_legs_ciphertext_only(),
-            limitation: "deterministic local-process conformance only; not a production NAT/pcap proof"
-                .to_owned(),
+            limitation:
+                "deterministic local-process conformance only; not a production NAT/pcap proof"
+                    .to_owned(),
         }
     }
 }
@@ -288,7 +289,9 @@ impl LocalProcessConformance {
     /// True when socket delivery, plaintext rejection, and route reporting all pass.
     #[must_use]
     pub fn ready(&self) -> bool {
-        self.ciphertext_delivered && self.plaintext_rejected && self.route_report.honest_and_ordered()
+        self.ciphertext_delivered
+            && self.plaintext_rejected
+            && self.route_report.honest_and_ordered()
     }
 }
 
@@ -329,9 +332,7 @@ impl LocalProcessSocketAdapter {
         let plan = ConnectivityPlanner::plan(&self.config, self.nat)?;
         let route_report = plan.route_report();
         let listener = TcpListener::bind("127.0.0.1:0").map_err(io_error)?;
-        listener
-            .set_nonblocking(false)
-            .map_err(io_error)?;
+        listener.set_nonblocking(false).map_err(io_error)?;
         let address = listener.local_addr().map_err(io_error)?;
         let expected_len = ciphertext.len();
 
@@ -505,10 +506,13 @@ mod tests {
     #[test]
     fn route_report_is_honest_about_local_process_limitations() -> Result<(), TransportError> {
         let config = ConnectivityConfig::default();
-        let report = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?.route_report();
+        let report =
+            ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?.route_report();
         assert_eq!(report.selected, FallbackLeg::RelayOverlay);
         assert!(report.honest_and_ordered());
-        assert!(report.limitation.contains("not a production NAT/pcap proof"));
+        assert!(report
+            .limitation
+            .contains("not a production NAT/pcap proof"));
         Ok(())
     }
 

@@ -523,7 +523,8 @@ mod tests {
         assert!(!debug.contains("secret media"));
 
         let frame = protect_frame(&key, &b, 0, b"secret media")?;
-        let serialized = serde_json::to_vec(&frame).map_err(|_| MediaError::AuthenticationFailed)?;
+        let serialized =
+            serde_json::to_vec(&frame).map_err(|_| MediaError::AuthenticationFailed)?;
         assert!(!serialized
             .windows(b"secret media".len())
             .any(|window| window == b"secret media"));
