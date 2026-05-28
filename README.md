@@ -14,6 +14,8 @@ Phase 4 retention/shred/live-key foundations cover required retention presets, s
 
 Phase 5 governance/admission/recovery/abuse foundations cover signed epoch-bound governance ordering, authority checks, removed-admin race rejection, invite expiry/revoke/max-use, PAKE/helper-only password admission, account-continuity recovery trust material, and invite/spam/freeload abuse controls.
 
+Phase 6 connectivity/signaling/push/metadata foundations cover content-blind in-memory rendezvous with zero linkage at rest, STUN→relay-overlay→TURN fallback with owner endpoint overrides, content-free Android FCM wake envelopes, and pcap-style metadata matrix assertions.
+
 ## Commands
 
 ```sh
@@ -48,6 +50,16 @@ cd apps/ui && npm ci && npm run typecheck && npm run build && npm audit --audit-
 - `harness/multinode::media_security_smoke` exercises passive relay opacity, replay rejection, and active tamper rejection.
 
 See [`docs/phase-1-media-security-review.md`](docs/phase-1-media-security-review.md) for the G002 evidence matrix and production-hardening notes.
+
+
+## Phase 6 connectivity/signaling/push/metadata slice
+
+- `external/signaling-repository/src/lib.rs` provides the content-blind rendezvous reference server, at-rest inspection records, metadata matrix, and pcap-style audit fixtures.
+- `crates/transport/src/lib.rs` plans strict STUN→relay-overlay→TURN fallback and honors owner/group custom endpoints while marking overlay/TURN as ciphertext-only.
+- `crates/push/src/lib.rs` builds content-free Android FCM wake envelopes with hashed tokens and auditable provider-visible bytes.
+- `harness/multinode::connectivity_signaling_push_smoke` exercises AC13/AC15/AC18/AC-METADATA foundations end-to-end.
+
+See [`docs/phase-6-connectivity-signaling-push-metadata.md`](docs/phase-6-connectivity-signaling-push-metadata.md) for the G007 evidence matrix and production-hardening notes.
 
 ## Phase 5 governance/admission/recovery/abuse slice
 

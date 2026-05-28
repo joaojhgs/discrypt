@@ -323,8 +323,11 @@ dependencies = [
  "discrypt-media",
  "discrypt-mls-core",
  "discrypt-mls-delivery",
+ "discrypt-push",
  "discrypt-relay-overlay",
+ "external-signaling",
  "discrypt-storage",
+ "discrypt-transport",
 ]
 
 [[package]]

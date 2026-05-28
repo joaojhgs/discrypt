@@ -104,6 +104,25 @@ pub struct GovernanceAdmissionSmoke {
     pub abuse_controls_enforced: bool,
 }
 
+/// Deterministic Phase-6 connectivity/signaling/push/metadata smoke result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectivitySignalingPushSmoke {
+    /// Signaling stores only opaque rendezvous data and no durable linkage.
+    pub signaling_zero_linkage_at_rest: bool,
+    /// Simulated NAT activates STUN, overlay, and TURN in the approved order.
+    pub fallback_chain_covered: bool,
+    /// Owner/group endpoint overrides are honored for STUN and TURN.
+    pub owner_overrides_used: bool,
+    /// Android FCM wake envelope is content-free.
+    pub android_wake_content_free: bool,
+    /// Pcap-style events match the approved infrastructure metadata matrix.
+    pub metadata_matrix_validated: bool,
+    /// Pcap-style fixture contains no forbidden content/identity egress.
+    pub pcap_no_central_content: bool,
+    /// TURN and peer relay observations are ciphertext-only.
+    pub relays_ciphertext_only: bool,
+}
+
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
@@ -655,6 +674,144 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
     })
 }
 
+/// Exercise Phase-6 signaling, fallback, push, and metadata audit gates.
+pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSmoke, anyhow::Error>
+{
+    use chrono::{Duration, Utc};
+    use discrypt_push::{
+        contains_content, contains_forbidden_token, AndroidWakeService, WakePayload, WakeReason,
+    };
+    use external_signaling::{
+        AuditFixture, ContentExposure, InfrastructureComponent, MetadataMatrix, PcapEvent,
+        ReferenceSignalingServer, RendezvousBlob, RendezvousKey,
+    };
+    use discrypt_transport::{
+        ConnectivityConfig, ConnectivityPlanner, Endpoint, EndpointOverrides, FallbackLeg,
+        SimulatedNat,
+    };
+
+    let now = Utc::now();
+    let forbidden: [&[u8]; 5] = [
+        b"alice".as_slice(),
+        b"bob".as_slice(),
+        b"room-plaintext".as_slice(),
+        b"message-body".as_slice(),
+        b"topology-link".as_slice(),
+    ];
+
+    let mut signaling = ReferenceSignalingServer::default();
+    let key = RendezvousKey::new(b"opaque-rendezvous-key".to_vec());
+    signaling.publish(
+        key.clone(),
+        RendezvousBlob::new(
+            b"opaque-room-token".to_vec(),
+            b"opaque-endpoint-hint".to_vec(),
+            now + Duration::minutes(5),
+        ),
+        Endpoint::new("198.51.100.9:4242"),
+        now,
+    )?;
+    let signaling_zero_linkage_at_rest =
+        signaling.zero_linkage_at_rest(&forbidden) && !external_signaling::stores_linkage_at_rest();
+    let fetched = signaling.take(&key, now)?;
+    let signaling_content_blind =
+        !external_signaling::contains_any_token(&fetched.visible_bytes(), &forbidden);
+
+    let default_config = ConnectivityConfig::default();
+    let direct = ConnectivityPlanner::plan(&default_config, SimulatedNat::direct())?;
+    let overlay = ConnectivityPlanner::plan(&default_config, SimulatedNat::overlay_only())?;
+    let turn = ConnectivityPlanner::plan(&default_config, SimulatedNat::turn_only())?;
+    let fallback_chain_covered = direct.selected == FallbackLeg::Stun
+        && overlay.selected == FallbackLeg::RelayOverlay
+        && turn.selected == FallbackLeg::Turn
+        && direct.ordered_stun_overlay_turn()
+        && overlay.ordered_stun_overlay_turn()
+        && turn.ordered_stun_overlay_turn();
+    let relays_ciphertext_only =
+        overlay.relay_legs_ciphertext_only() && turn.relay_legs_ciphertext_only();
+
+    let override_config = ConnectivityConfig {
+        overrides: EndpointOverrides::new(
+            Some(Endpoint::new("stun:owner.example:3478")),
+            Some(Endpoint::new("turns:owner.example:5349")),
+        ),
+        ..ConnectivityConfig::default()
+    };
+    let owner_stun = ConnectivityPlanner::plan(&override_config, SimulatedNat::direct())?;
+    let owner_turn = ConnectivityPlanner::plan(&override_config, SimulatedNat::turn_only())?;
+    let owner_overrides_used = owner_stun.endpoint == Endpoint::new("stun:owner.example:3478")
+        && owner_turn.endpoint == Endpoint::new("turns:owner.example:5349");
+
+    let wake_service = AndroidWakeService::default();
+    let payload = WakePayload::new([7; 32], WakeReason::SyncHint, [9; 16]);
+    let push_envelope = wake_service.build_envelope([8; 32], payload.clone())?;
+    let android_wake_content_free =
+        !contains_content(&payload) && !contains_forbidden_token(&push_envelope, &forbidden);
+
+    let mut fixture = AuditFixture::default();
+    fixture.push(PcapEvent {
+        component: InfrastructureComponent::Signaling,
+        content: ContentExposure::None,
+        visible_bytes: fetched.visible_bytes(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    fixture.push(PcapEvent {
+        component: InfrastructureComponent::Stun,
+        content: ContentExposure::None,
+        visible_bytes: b"binding request no app content".to_vec(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    fixture.push(PcapEvent {
+        component: InfrastructureComponent::Turn,
+        content: ContentExposure::CiphertextOnly,
+        visible_bytes: b"sframe ciphertext over turn".to_vec(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    fixture.push(PcapEvent {
+        component: InfrastructureComponent::PushFcm,
+        content: ContentExposure::None,
+        visible_bytes: push_envelope.provider_visible_bytes(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    fixture.push(PcapEvent {
+        component: InfrastructureComponent::PeerRelay,
+        content: ContentExposure::CiphertextOnly,
+        visible_bytes: b"sframe ciphertext over peer relay".to_vec(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    fixture.push(PcapEvent {
+        component: InfrastructureComponent::VolunteerStorageRelay,
+        content: ContentExposure::CiphertextOnly,
+        visible_bytes: b"store-forward ciphertext".to_vec(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    let matrix = MetadataMatrix::approved_v1();
+    let metadata_matrix_validated = fixture.matches_matrix(&matrix);
+    let pcap_no_central_content = fixture.no_forbidden_content_egress(&forbidden);
+
+    Ok(ConnectivitySignalingPushSmoke {
+        signaling_zero_linkage_at_rest: signaling_zero_linkage_at_rest && signaling_content_blind,
+        fallback_chain_covered,
+        owner_overrides_used,
+        android_wake_content_free,
+        metadata_matrix_validated,
+        pcap_no_central_content,
+        relays_ciphertext_only,
+    })
+}
+
 /// Backward-compatible boolean smoke for scripts that only need passive relay status.
 pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
     let smoke = media_security_smoke()?;
@@ -750,6 +907,23 @@ mod tests {
                 password_and_welcome_gate: true,
                 recovery_trust_model: true,
                 abuse_controls_enforced: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn connectivity_signaling_push_smoke_covers_phase6_gates() {
+        let smoke = connectivity_signaling_push_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(ConnectivitySignalingPushSmoke {
+                signaling_zero_linkage_at_rest: true,
+                fallback_chain_covered: true,
+                owner_overrides_used: true,
+                android_wake_content_free: true,
+                metadata_matrix_validated: true,
+                pcap_no_central_content: true,
+                relays_ciphertext_only: true,
             })
         ));
     }
