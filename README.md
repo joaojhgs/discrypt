@@ -16,6 +16,8 @@ Phase 5 governance/admission/recovery/abuse foundations cover signed epoch-bound
 
 Phase 6 connectivity/signaling/push/metadata foundations cover content-blind in-memory rendezvous with zero linkage at rest, STUN→relay-overlay→TURN fallback with owner endpoint overrides, content-free Android FCM wake envelopes, and pcap-style metadata matrix assertions.
 
+Phase 7 UX/E2E hardening adds the serializable command snapshot, native shell command facade, Discord-style React skeleton, final all-phase harness smoke, and honest deletion/metadata/security copy gates.
+
 ## Commands
 
 ```sh
@@ -51,6 +53,16 @@ cd apps/ui && npm ci && npm run typecheck && npm run build && npm audit --audit-
 
 See [`docs/phase-1-media-security-review.md`](docs/phase-1-media-security-review.md) for the G002 evidence matrix and production-hardening notes.
 
+
+
+## Phase 7 UX/E2E hardening slice
+
+- `crates/core/src/lib.rs` exposes the serializable app snapshot and safety-number verification command contracts for native UI wiring.
+- `apps/desktop/src-tauri/src/lib.rs` provides the dependency-light Tauri command facade and command-health smoke.
+- `apps/ui/src/commands.ts`, `main.tsx`, and `styles.css` build a Discord-style shell for friends, servers, channels, voice, invites, devices, retention, connectivity, and honest guarantees.
+- `harness/multinode::ux_e2e_hardening_smoke` rechecks command surface readiness plus all previous phase smokes in one final deterministic E2E gate.
+
+See [`docs/phase-7-ux-e2e-hardening.md`](docs/phase-7-ux-e2e-hardening.md) for the G008 evidence matrix and production-hardening notes.
 
 ## Phase 6 connectivity/signaling/push/metadata slice
 

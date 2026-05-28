@@ -1,3 +1,15 @@
+#[cfg(feature = "tauri-runtime")]
 fn main() {
-    println!("discrypt desktop shell placeholder; Tauri integration lands after command surface stabilizes");
+    discrypt_desktop::run();
+}
+
+#[cfg(not(feature = "tauri-runtime"))]
+fn main() {
+    let snapshot = discrypt_desktop::app_snapshot();
+    println!(
+        "discrypt desktop shell: servers={} devices={} verified_friend={}",
+        snapshot.servers.len(),
+        snapshot.devices.len(),
+        snapshot.friend.verified
+    );
 }

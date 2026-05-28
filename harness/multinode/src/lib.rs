@@ -123,6 +123,115 @@ pub struct ConnectivitySignalingPushSmoke {
     pub relays_ciphertext_only: bool,
 }
 
+/// Deterministic Phase-7 UX and end-to-end hardening smoke result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UxE2eHardeningSmoke {
+    /// Tauri command facade returns the required snapshot and verification commands.
+    pub command_surface_ready: bool,
+    /// React/Discord-style UX model includes servers, text channels, and voice rooms.
+    pub discord_style_model_ready: bool,
+    /// Device management and friend safety-number verification are surfaced.
+    pub verification_and_devices_ready: bool,
+    /// Invite, retention, and deletion flows expose honest copy.
+    pub invite_retention_deletion_ready: bool,
+    /// Connectivity, push, and metadata posture are surfaced.
+    pub connectivity_copy_ready: bool,
+    /// Prior deterministic E2E harness phases still pass through one final smoke.
+    pub all_phase_smokes_ready: bool,
+}
+
+impl MediaSecuritySmoke {
+    /// True when every Phase-1 security invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.passive_relay_cannot_read && self.replay_rejected && self.tamper_rejected
+    }
+}
+
+impl RelayOverlaySmoke {
+    /// True when every Phase-2 relay invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.hop_limit_respected
+            && self.failover_recovered
+            && self.redelivery_replay_rejected
+            && self.store_forward_plaintext_rejected
+            && self.store_forward_ttl_enforced
+            && self.store_forward_fanout_bounded
+            && self.ciphertext_only_media
+            && self.tamper_rejected
+    }
+}
+
+impl TextHistoryDeliverySmoke {
+    /// True when every Phase-3 delivery invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.author_logs_merged
+            && self.recipient_cache_bounded
+            && self.gossip_converged_16
+            && self.ordered_commit_delivery
+            && self.welcome_catchup_live
+            && self.fork_detected_not_silent
+            && self.repair_converged_equal_tags
+            && self.divergent_mls_not_replayed
+    }
+}
+
+impl RetentionShredSmoke {
+    /// True when every Phase-4 retention/shred invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.default_window_locks_old_messages
+            && self.shorten_retro_lengthen_future
+            && self.cross_device_shred_sync
+            && self.live_key_membership_rate_limit_decoy
+            && self.secure_delete_negative
+            && self.recovery_cannot_resurrect_content_keys
+    }
+}
+
+impl GovernanceAdmissionSmoke {
+    /// True when every Phase-5 governance/admission invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.governance_ordered_signed
+            && self.governance_rejects_invalid_authority
+            && self.removed_admin_cannot_win
+            && self.invite_controls_enforced
+            && self.password_and_welcome_gate
+            && self.recovery_trust_model
+            && self.abuse_controls_enforced
+    }
+}
+
+impl ConnectivitySignalingPushSmoke {
+    /// True when every Phase-6 connectivity/signaling invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.signaling_zero_linkage_at_rest
+            && self.fallback_chain_covered
+            && self.owner_overrides_used
+            && self.android_wake_content_free
+            && self.metadata_matrix_validated
+            && self.pcap_no_central_content
+            && self.relays_ciphertext_only
+    }
+}
+
+impl UxE2eHardeningSmoke {
+    /// True when every Phase-7 UX/E2E invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.command_surface_ready
+            && self.discord_style_model_ready
+            && self.verification_and_devices_ready
+            && self.invite_retention_deletion_ready
+            && self.connectivity_copy_ready
+            && self.all_phase_smokes_ready
+    }
+}
+
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
@@ -812,6 +921,84 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
     })
 }
 
+/// Exercise Phase-7 Tauri/React command-surface and final E2E hardening gates.
+pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
+    let snapshot = discrypt_core::app_snapshot();
+    let command_health = discrypt_desktop::command_health();
+    let verification =
+        discrypt_core::verify_safety_number(discrypt_core::SafetyVerificationRequest {
+            friend_id: snapshot.friend.friend_code.clone(),
+            provided: snapshot.friend.safety_number.clone(),
+        });
+
+    let command_surface_ready = command_health.snapshot_ready
+        && command_health.verification_ready
+        && command_health.honest_copy_ready;
+    let discord_style_model_ready = snapshot.servers.iter().any(|server| {
+        server
+            .channels
+            .iter()
+            .any(|channel| matches!(channel.kind, discrypt_core::ChannelKind::Text))
+            && server
+                .channels
+                .iter()
+                .any(|channel| matches!(channel.kind, discrypt_core::ChannelKind::Voice))
+    });
+    let verification_and_devices_ready = !snapshot.friend.verified
+        && verification.verified
+        && !snapshot.friend.safety_number.is_empty()
+        && snapshot.devices.iter().any(|device| device.local)
+        && snapshot
+            .devices
+            .iter()
+            .any(|device| !device.local && device.authorized);
+    let invite_retention_deletion_ready = snapshot.invite.welcome_required.contains("MLS Welcome")
+        && snapshot.invite.password_gate.contains("OPAQUE/PAKE")
+        && snapshot
+            .retention
+            .presets
+            .contains(&"warned unlimited / never-lock".to_owned())
+        && snapshot
+            .security_copy
+            .deletion
+            .contains("pending on offline devices until they reconnect")
+        && snapshot
+            .security_copy
+            .malicious_member
+            .contains("screenshots");
+    let connectivity_copy_ready = snapshot
+        .connectivity
+        .fallback_chain
+        .contains("STUN → relay-overlay → TURN")
+        && snapshot.connectivity.push_copy.contains("content-free")
+        && snapshot
+            .connectivity
+            .metadata_copy
+            .contains("not metadata-anonymous");
+
+    let media = media_security_smoke()?;
+    let overlay = relay_overlay_smoke()?;
+    let text = text_history_delivery_smoke()?;
+    let retention = retention_shred_smoke()?;
+    let governance = governance_admission_smoke()?;
+    let connectivity = connectivity_signaling_push_smoke()?;
+    let all_phase_smokes_ready = media.ready()
+        && overlay.ready()
+        && text.ready()
+        && retention.ready()
+        && governance.ready()
+        && connectivity.ready();
+
+    Ok(UxE2eHardeningSmoke {
+        command_surface_ready,
+        discord_style_model_ready,
+        verification_and_devices_ready,
+        invite_retention_deletion_ready,
+        connectivity_copy_ready,
+        all_phase_smokes_ready,
+    })
+}
+
 /// Backward-compatible boolean smoke for scripts that only need passive relay status.
 pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
     let smoke = media_security_smoke()?;
@@ -924,6 +1111,22 @@ mod tests {
                 metadata_matrix_validated: true,
                 pcap_no_central_content: true,
                 relays_ciphertext_only: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn ux_e2e_hardening_smoke_covers_phase7_gates() {
+        let smoke = ux_e2e_hardening_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(UxE2eHardeningSmoke {
+                command_surface_ready: true,
+                discord_style_model_ready: true,
+                verification_and_devices_ready: true,
+                invite_retention_deletion_ready: true,
+                connectivity_copy_ready: true,
+                all_phase_smokes_ready: true,
             })
         ));
     }

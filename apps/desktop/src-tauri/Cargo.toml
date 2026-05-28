@@ -1,7 +1,22 @@
 [package]
 name = "discrypt-desktop"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+tauri-runtime = ["dep:tauri", "dep:tauri-build"]
 
 [dependencies]
-discrypt-core = { path = "../../../crates/core" }
+discrypt-core = { path = "../../../crates/core", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2.11.2", optional = true, default-features = false }
+
+[build-dependencies]
+tauri-build = { version = "2.5.3", optional = true }
