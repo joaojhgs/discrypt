@@ -11,22 +11,8 @@ import {
   SpeakerLoudIcon,
   SpeakerOffIcon,
 } from '@radix-ui/react-icons';
-import { discryptUiConfig, setupChecklist, ThemeId, TemplateId } from './app-config';
-import {
-  AppSnapshot,
-  ChannelView,
-  VoiceParticipantView,
-  createChannel as createChannelCommand,
-  createGroup,
-  joinGroup,
-  joinVoice,
-  leaveVoice,
-  loadAppSnapshot,
-  savePreferences,
-  setSelfMute,
-  setSpeakerVolume,
-  verifySafetyNumber,
-} from './commands';
+import { activityFeed, discryptUiConfig, initialVoiceRoster, setupChecklist, ThemeId, TemplateId } from './app-config';
+import { AppSnapshot, ChannelView, loadAppSnapshot, verifySafetyNumber } from './commands';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -55,15 +41,7 @@ import './styles.css';
 
 type Workflow = 'setup' | 'join' | 'create-group' | 'channel' | 'voice';
 
-type VoiceParticipant = VoiceParticipantView;
-
-function asThemeId(value: string): ThemeId {
-  return discryptUiConfig.themes.some((theme) => theme.id === value) ? (value as ThemeId) : discryptUiConfig.activeTheme;
-}
-
-function asTemplateId(value: string): TemplateId {
-  return discryptUiConfig.templates.some((template) => template.id === value) ? (value as TemplateId) : discryptUiConfig.activeTemplate;
-}
+type VoiceParticipant = (typeof initialVoiceRoster)[number];
 
 function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
@@ -72,7 +50,12 @@ function App() {
   const [themeId, setThemeId] = useState<ThemeId>(discryptUiConfig.activeTheme);
   const [templateId, setTemplateId] = useState<TemplateId>(discryptUiConfig.activeTemplate);
   const [workflow, setWorkflow] = useState<Workflow>('setup');
+  const [voiceJoined, setVoiceJoined] = useState(true);
+  const [selfMuted, setSelfMuted] = useState(false);
+  const [participants, setParticipants] = useState<VoiceParticipant[]>(initialVoiceRoster);
   const [draftChannel, setDraftChannel] = useState('secure-room');
+  const [localChannels, setLocalChannels] = useState<ChannelView[]>([]);
+  const [groupMode, setGroupMode] = useState<'current' | 'created' | 'joined'>('current');
 
   useEffect(() => {
     let mounted = true;
@@ -80,8 +63,6 @@ function App() {
       .then((loaded) => {
         if (mounted) {
           setSnapshot(loaded);
-          setThemeId(asThemeId(loaded.preferences.theme_id));
-          setTemplateId(asTemplateId(loaded.preferences.template_id));
         }
       })
       .catch((error: unknown) => {
@@ -108,13 +89,10 @@ function App() {
 
   const currentSnapshot = snapshot;
   const activeServer = currentSnapshot.servers[0];
-  const channels = activeServer.channels;
+  const channels = [...activeServer.channels, ...localChannels];
   const textChannels = channels.filter((channel) => channel.kind === 'Text');
   const voiceChannels = channels.filter((channel) => channel.kind === 'Voice');
-  const groupLabel = activeServer.name;
-  const participants = currentSnapshot.voice_session.participants;
-  const voiceJoined = currentSnapshot.voice_session.joined;
-  const selfMuted = participants.find((participant) => participant.id === 'alice')?.muted ?? false;
+  const groupLabel = groupMode === 'created' ? 'private lab' : groupMode === 'joined' ? 'joined enclave' : activeServer.name;
   const verified = currentSnapshot.friend.verified;
   const completedSteps = [
     verified,
@@ -138,74 +116,21 @@ function App() {
     }
   }
 
-  async function handleCreateGroup() {
-    try {
-      setSnapshot(await createGroup({ name: 'private lab', retention: currentSnapshot.retention.selected }));
-      setWorkflow('channel');
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Create group command failed');
+  function createChannel() {
+    const name = draftChannel.trim().replace(/^#/, '') || 'secure-room';
+    if (!localChannels.some((channel) => channel.name === `#${name}`)) {
+      setLocalChannels([...localChannels, { name: `#${name}`, kind: 'Text', retention_status: currentSnapshot.retention.selected }]);
     }
+    setWorkflow('channel');
   }
 
-  async function handleJoinGroup() {
-    try {
-      setSnapshot(await joinGroup({ invite_code: 'invite:joined-enclave' }));
-      setWorkflow('setup');
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Join group command failed');
-    }
+  function setVolume(id: string, value: number[]) {
+    setParticipants((current) => current.map((participant) => (participant.id === id ? { ...participant, volume: value[0] } : participant)));
   }
 
-  async function createChannel() {
-    try {
-      const name = draftChannel.trim().replace(/^#/, '') || 'secure-room';
-      setSnapshot(await createChannelCommand({ server_name: activeServer.name, name, kind: 'Text' }));
-      setWorkflow('channel');
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Create channel command failed');
-    }
-  }
-
-  async function setVolume(id: string, value: number[]) {
-    try {
-      setSnapshot(await setSpeakerVolume({ participant_id: id, volume: value[0] }));
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Speaker volume command failed');
-    }
-  }
-
-  async function toggleSelfMute(checked: boolean) {
-    try {
-      setSnapshot(await setSelfMute({ muted: checked }));
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Mute command failed');
-    }
-  }
-
-  async function setVoiceJoined(joined: boolean) {
-    try {
-      setSnapshot(joined ? await joinVoice() : await leaveVoice());
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Voice session command failed');
-    }
-  }
-
-  async function handleThemeChange(id: ThemeId) {
-    setThemeId(id);
-    try {
-      setSnapshot(await savePreferences({ theme_id: id, template_id: templateId }));
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Preference command failed');
-    }
-  }
-
-  async function handleTemplateChange(id: TemplateId) {
-    setTemplateId(id);
-    try {
-      setSnapshot(await savePreferences({ theme_id: themeId, template_id: id }));
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : 'Preference command failed');
-    }
+  function toggleSelfMute(checked: boolean) {
+    setSelfMuted(checked);
+    setParticipants((current) => current.map((participant) => (participant.id === 'alice' ? { ...participant, muted: checked, speaking: !checked } : participant)));
   }
 
   return (
@@ -239,8 +164,8 @@ function App() {
               groupLabel={groupLabel}
               themeId={themeId}
               templateId={templateId}
-              onThemeChange={handleThemeChange}
-              onTemplateChange={handleTemplateChange}
+              onThemeChange={setThemeId}
+              onTemplateChange={setTemplateId}
             />
             <Tabs value={workflow} onValueChange={(value) => setWorkflow(value as Workflow)} className="mt-5">
               <TabsList className="flex w-full justify-start overflow-x-auto md:w-auto">
@@ -260,10 +185,10 @@ function App() {
                 />
               </TabsContent>
               <TabsContent value="join">
-                <JoinPanel snapshot={snapshot} onJoin={handleJoinGroup} />
+                <JoinPanel snapshot={snapshot} onJoin={() => { setGroupMode('joined'); setWorkflow('setup'); }} />
               </TabsContent>
               <TabsContent value="create-group">
-                <CreateGroupPanel snapshot={snapshot} onCreate={handleCreateGroup} />
+                <CreateGroupPanel snapshot={snapshot} onCreate={() => { setGroupMode('created'); setWorkflow('channel'); }} />
               </TabsContent>
               <TabsContent value="channel">
                 <ChannelPanel
@@ -279,9 +204,9 @@ function App() {
                   participants={participants}
                   voiceJoined={voiceJoined}
                   selfMuted={selfMuted}
-                  setVoiceJoined={(joined) => { void setVoiceJoined(joined); }}
-                  setSelfMuted={(muted) => { void toggleSelfMute(muted); }}
-                  setVolume={(id, value) => { void setVolume(id, value); }}
+                  setVoiceJoined={setVoiceJoined}
+                  setSelfMuted={toggleSelfMute}
+                  setVolume={setVolume}
                 />
               </TabsContent>
             </Tabs>
@@ -293,14 +218,13 @@ function App() {
           completedSteps={completedSteps}
           themeLabel={activeTheme.label}
           templateLabel={activeTemplate.label}
-          activityFeed={snapshot.activity_feed}
         />
         <VoiceDock
           route={snapshot.voice.route}
           voiceJoined={voiceJoined}
           selfMuted={selfMuted}
-          setVoiceJoined={(joined) => { void setVoiceJoined(joined); }}
-          setSelfMuted={(muted) => { void toggleSelfMute(muted); }}
+          setVoiceJoined={setVoiceJoined}
+          setSelfMuted={toggleSelfMute}
           participants={participants}
         />
       </main>

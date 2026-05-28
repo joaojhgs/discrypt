@@ -641,7 +641,6 @@ name = "discrypt-desktop"
 version = "0.1.0"
 dependencies = [
  "discrypt-core",
- "discrypt-storage",
  "serde",
  "serde_json",
  "tauri",
