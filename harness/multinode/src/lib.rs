@@ -47,6 +47,27 @@ pub struct RelayOverlaySmoke {
     pub plaintext: Vec<u8>,
 }
 
+/// Deterministic Phase-3 text/history/MLS delivery smoke result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextHistoryDeliverySmoke {
+    /// Own devices merge one author's log without duplicate/lost entries.
+    pub author_logs_merged: bool,
+    /// Recipient cache retains only the bounded newest ciphertext/key entries.
+    pub recipient_cache_bounded: bool,
+    /// Sixteen peers converge on all author-log gossip items.
+    pub gossip_converged_16: bool,
+    /// Ordered commit delivery accepts forward commits and canonicalizes app events.
+    pub ordered_commit_delivery: bool,
+    /// Welcome and catch-up objects validate admission/catch-up semantics.
+    pub welcome_catchup_live: bool,
+    /// Same-epoch tree divergence is detected rather than silently accepted.
+    pub fork_detected_not_silent: bool,
+    /// Explicit repair converges honest members to equal confirmation tags.
+    pub repair_converged_equal_tags: bool,
+    /// Repair plan refuses to replay invalid divergent MLS commits.
+    pub divergent_mls_not_replayed: bool,
+}
+
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
@@ -229,6 +250,136 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
     })
 }
 
+/// Exercise Phase-3 text, history, MLS delivery, gossip, Welcome, and fork repair.
+pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow::Error> {
+    use discrypt_mls_delivery::{
+        detect_fork_or_replay, equal_confirmation_tags, order_application_events, plan_repair,
+        repair_to_winner, summary, ApplicationEvent, CatchUpBundle, CommitEnvelope, DeliveryError,
+        DeliveryState, ForkEvidence, ForkStatus, WelcomePackage,
+    };
+    use discrypt_relay_overlay::{GossipItem, GossipMesh};
+    use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
+    use std::collections::BTreeSet;
+
+    let laptop_entry =
+        AuthorLogEntry::new(1, "alice-laptop", 1, 7, "alice-1", b"ciphertext-a".to_vec());
+    let phone_entry =
+        AuthorLogEntry::new(1, "alice-phone", 2, 7, "alice-2", b"ciphertext-b".to_vec());
+    let mut laptop = LocalStore::default();
+    laptop.append_sent(laptop_entry.clone());
+    let mut phone = LocalStore::default();
+    phone.append_sent(phone_entry.clone());
+    let inserted = laptop.merge_author_logs(phone.author_log_snapshot());
+    let author_logs_merged = inserted == 1
+        && laptop.author_message_ids()
+            == BTreeSet::from(["alice-1".to_owned(), "alice-2".to_owned()]);
+
+    let mut cache_store = LocalStore::with_recipient_cache_capacity(3);
+    for idx in 0..4 {
+        cache_store.cache_received(RecipientCacheEntry::new(
+            format!("cached-{idx}"),
+            vec![idx as u8, 42],
+            KeyState::Cached([idx as u8; 32]),
+            idx,
+        ));
+    }
+    let recipient_cache_bounded = cache_store.recipient_cache().len() == 3
+        && cache_store.recipient_cache().get("cached-0").is_none()
+        && cache_store.recipient_cache().get("cached-3").is_some();
+
+    let peers = (0..16).map(|idx| format!("peer-{idx}")).collect::<Vec<_>>();
+    let mut mesh = GossipMesh::new(peers.clone());
+    let mut all_entries = Vec::from([laptop_entry, phone_entry]);
+    for idx in 0..16 {
+        all_entries.push(AuthorLogEntry::new(
+            idx,
+            format!("device-{idx}"),
+            1,
+            7,
+            format!("member-{idx}-1"),
+            format!("ciphertext-{idx}").into_bytes(),
+        ));
+    }
+    for (idx, entry) in all_entries.iter().enumerate() {
+        let peer = &peers[idx % peers.len()];
+        mesh.insert(
+            peer,
+            GossipItem::new(
+                entry.author_leaf,
+                entry.sequence,
+                entry.message_id.clone(),
+                &entry.ciphertext,
+            ),
+        );
+    }
+    let _inserted_items = mesh.round();
+    let gossip_converged_16 =
+        mesh.converged() && mesh.known_count("peer-0") == Some(all_entries.len());
+
+    let initial = summary(1, 1, 1);
+    let mut delivery = DeliveryState::new(initial);
+    let unordered_events = vec![
+        ApplicationEvent::new(2, 12, "later-leaf", b"ciphertext-z".to_vec()),
+        ApplicationEvent::new(2, 3, "early-leaf", b"ciphertext-a".to_vec()),
+    ];
+    let commit = CommitEnvelope::new(summary(2, 2, 2), 2, unordered_events);
+    let ordered_commit_delivery = delivery.apply_commit(commit) == Ok(())
+        && delivery.accepted_events().len() == 2
+        && delivery.accepted_events()[0].event_id == "early-leaf";
+
+    let welcome = WelcomePackage::new("room", 15, summary(2, 2, 2), 2_000);
+    let catchup = CatchUpBundle::new(
+        summary(2, 2, 2),
+        Vec::new(),
+        order_application_events(vec![
+            ApplicationEvent::new(2, 9, "b", b"b".to_vec()),
+            ApplicationEvent::new(2, 1, "a", b"a".to_vec()),
+        ]),
+    );
+    let welcome_catchup_live = welcome.validate(1_999) == Ok(())
+        && welcome.validate(2_001) == Err(DeliveryError::WelcomeExpired)
+        && catchup.application_events[0].event_id == "a";
+
+    let remote_fork = summary(2, 9, 2);
+    let status = detect_fork_or_replay(delivery.summary(), &remote_fork);
+    let fork_detected_not_silent = matches!(status, ForkStatus::Diverged(_))
+        && delivery.apply_commit(CommitEnvelope::new(remote_fork, 9, Vec::new()))
+            == Err(DeliveryError::DivergentTree(2));
+    let evidence = match status {
+        ForkStatus::Diverged(evidence) => evidence,
+        _ => ForkEvidence {
+            local: delivery.summary().clone(),
+            remote: summary(2, 9, 2),
+        },
+    };
+    let repair_plan = plan_repair(
+        evidence,
+        &[1, 3, 7, 9],
+        vec![ApplicationEvent::new(
+            2,
+            3,
+            "valid-text-reproposal",
+            b"ciphertext".to_vec(),
+        )],
+    );
+    let repaired = repair_to_winner(16, &repair_plan);
+    let repair_converged_equal_tags = repaired.len() == 16 && equal_confirmation_tags(&repaired);
+    let divergent_mls_not_replayed = !repair_plan.replays_divergent_mls_commits
+        && repair_plan.reproposed_events.len() == 1
+        && repair_plan.reproposed_events[0].event_id == "valid-text-reproposal";
+
+    Ok(TextHistoryDeliverySmoke {
+        author_logs_merged,
+        recipient_cache_bounded,
+        gossip_converged_16,
+        ordered_commit_delivery,
+        welcome_catchup_live,
+        fork_detected_not_silent,
+        repair_converged_equal_tags,
+        divergent_mls_not_replayed,
+    })
+}
+
 /// Backward-compatible boolean smoke for scripts that only need passive relay status.
 pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
     let smoke = media_security_smoke()?;
@@ -274,6 +425,24 @@ mod tests {
                 tamper_rejected: true,
                 plaintext
             }) if plaintext == b"phase2 encoded voice frame"
+        ));
+    }
+
+    #[test]
+    fn text_history_delivery_smoke_covers_phase3_gates() {
+        let smoke = text_history_delivery_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(TextHistoryDeliverySmoke {
+                author_logs_merged: true,
+                recipient_cache_bounded: true,
+                gossip_converged_16: true,
+                ordered_commit_delivery: true,
+                welcome_catchup_live: true,
+                fork_detected_not_silent: true,
+                repair_converged_equal_tags: true,
+                divergent_mls_not_replayed: true,
+            })
         ));
     }
 }

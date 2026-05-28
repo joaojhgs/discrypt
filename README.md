@@ -6,7 +6,9 @@ Phase 0 provides the workspace, crate boundaries, CI, UI shell, and deterministi
 
 Phase 1 adds the media-security boundary: Rust-owned SFrame-like AEAD media protection, sender/device-bound exporter context, transform bridge APIs with no raw JavaScript keys, relay opacity checks, anti-replay, tamper rejection, and Android native media fallback skeletons.
 
-Phase 2 relay-overlay foundations now cover deterministic relay ranking, the `<= 3` hop guard, ciphertext-only relay packets, and multinode media-security smoke coverage. Full G003 acceptance still requires topology construction, failover/redelivery, store-forward TTL/fanout, and lossy deterministic overlay harnesses.
+Phase 2 relay-overlay foundations cover deterministic relay ranking, the `<= 3` hop guard, failover, redelivery/replay rejection, ciphertext-only relay packets, store-forward TTL/fanout, and multinode media-security smoke coverage.
+
+Phase 3 text/history delivery foundations cover per-author sent-log merge, bounded recipient caches, content-blind 16-peer gossip convergence, ordered delivery, expiring Welcome/catch-up, fork/downgrade/replay detection, and explicit repair by rejoin/reproposal without replaying divergent MLS commits.
 
 ## Commands
 
@@ -42,6 +44,15 @@ cd apps/ui && npm ci && npm run typecheck && npm run build && npm audit --audit-
 - `harness/multinode::media_security_smoke` exercises passive relay opacity, replay rejection, and active tamper rejection.
 
 See [`docs/phase-1-media-security-review.md`](docs/phase-1-media-security-review.md) for the G002 evidence matrix and production-hardening notes.
+
+## Phase 3 text/history + MLS delivery slice
+
+- `crates/storage/src/lib.rs` models authoritative per-author logs, deterministic multi-device log merge, and bounded recipient caches for received ciphertext/key state.
+- `crates/relay-overlay/src/gossip.rs` gossips content-blind author-log items and proves 16-peer convergence in deterministic harnesses.
+- `crates/mls-delivery/src/lib.rs` implements canonical event ordering, expiring Welcome/catch-up bundles, fork/downgrade/replay detection, and explicit rejoin/reproposal repair plans that do not replay divergent MLS commits.
+- `harness/multinode::text_history_delivery_smoke` exercises AC4/AC5/AC-MLS-FORK foundations end-to-end.
+
+See [`docs/phase-3-text-history-delivery.md`](docs/phase-3-text-history-delivery.md) for the G004 evidence matrix and production-hardening notes.
 
 ## Phase 2 relay overlay slice
 

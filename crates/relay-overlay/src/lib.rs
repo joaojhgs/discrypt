@@ -6,12 +6,14 @@
 //! store-and-forward.
 
 pub mod failover;
+pub mod gossip;
 pub mod integrity;
 pub mod ranking;
 pub mod redelivery;
 pub mod store_forward;
 pub mod topology;
 
+pub use gossip::{GossipItem, GossipMesh, GossipNode};
 pub use ranking::{rank, score, RelayMetrics};
 pub use topology::hop_limit_ok;
 

@@ -13,5 +13,7 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 discrypt-core = { path = "../../crates/core", version = "0.1.0" }
 discrypt-mls-core = { path = "../../crates/mls-core", version = "0.1.0" }
+discrypt-mls-delivery = { path = "../../crates/mls-delivery", version = "0.1.0" }
+discrypt-storage = { path = "../../crates/storage", version = "0.1.0" }
 discrypt-media = { path = "../../crates/media", version = "0.1.0" }
 discrypt-relay-overlay = { path = "../../crates/relay-overlay", version = "0.1.0" }
