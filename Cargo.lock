@@ -315,6 +315,7 @@ name = "discrypt-multinode-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "discrypt-core",
  "discrypt-media",
  "discrypt-mls-core",

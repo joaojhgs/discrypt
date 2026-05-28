@@ -1,39 +1,26 @@
 //! Adaptive relay overlay foundations.
+//!
+//! The overlay is transport-agnostic and content-blind: it ranks relay peers,
+//! selects bounded-hop routes, reroutes around failures, tracks redelivery and
+//! replay state, and stores only ciphertext envelopes for opportunistic
+//! store-and-forward.
+
+pub mod failover;
 pub mod integrity;
+pub mod ranking;
+pub mod redelivery;
+pub mod store_forward;
+pub mod topology;
 
-use serde::{Deserialize, Serialize};
+pub use ranking::{rank, score, RelayMetrics};
+pub use topology::hop_limit_ok;
 
-/// Relay candidate metrics.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RelayMetrics {
-    pub peer_id: String,
-    pub latency_ms: u32,
-    pub stability: f32,
-    pub battery_cost: f32,
-    pub freeload_penalty: f32,
-}
-#[must_use]
-pub fn score(m: &RelayMetrics) -> f32 {
-    (1000.0 / (m.latency_ms.max(1) as f32)) + m.stability - m.battery_cost - m.freeload_penalty
-}
-#[must_use]
-pub fn rank(mut peers: Vec<RelayMetrics>) -> Vec<RelayMetrics> {
-    peers.sort_by(|a, b| {
-        score(b)
-            .partial_cmp(&score(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    peers
-}
-#[must_use]
-pub fn hop_limit_ok(hops: usize) -> bool {
-    hops <= 3
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn ranks_low_latency_stable_peer() {
+    fn compatibility_exports_rank_and_hop_limit() {
         let peers = rank(vec![
             RelayMetrics {
                 peer_id: "bad".into(),

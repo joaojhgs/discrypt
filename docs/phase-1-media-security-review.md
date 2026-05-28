@@ -27,7 +27,7 @@ G002 implements the Phase 1 media-security slice as a Rust-owned, SFrame-like AE
 - Replace the compact facade with audited RFC-9605 SFrame packet framing while preserving the Rust-owned key and sender-binding contracts.
 - Wire sender-binding authority to the later MLS-signed room-state delivery and fork-repair implementation.
 - Add browser and Android device/runtime tests once Tauri/mobile shells are beyond the Phase 0/1 skeleton.
-- Add lossy-network media E2E tests when relay topology/failover lands in G003.
+- Add lossy-network media E2E tests when relay topology/failover lands in G003; see the Phase 2 follow-up matrix in [`phase-2-relay-overlay-review.md`](phase-2-relay-overlay-review.md).
 
 ## Verification used for G002
 

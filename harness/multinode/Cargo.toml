@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 anyhow = { workspace = true }
 discrypt-core = { path = "../../crates/core", version = "0.1.0" }
 discrypt-mls-core = { path = "../../crates/mls-core", version = "0.1.0" }
