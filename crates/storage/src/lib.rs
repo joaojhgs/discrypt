@@ -252,6 +252,68 @@ pub fn seal_account_backup(
     }
 }
 
+/// In-memory secure-delete simulator for enumerated local stores.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SecureDeleteSimulator {
+    files: BTreeMap<String, Vec<u8>>,
+    deleted_paths: BTreeSet<String>,
+}
+
+impl SecureDeleteSimulator {
+    /// Add a simulated local file or key-store blob.
+    pub fn write(&mut self, path: impl Into<String>, bytes: Vec<u8>) {
+        self.files.insert(path.into(), bytes);
+    }
+
+    /// Snapshot all simulated files before a two-phase destructive operation.
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
+        self.files.clone()
+    }
+
+    /// Restore a previous snapshot, used when shred verification fails.
+    pub fn restore(&mut self, snapshot: BTreeMap<String, Vec<u8>>) {
+        self.files = snapshot;
+        self.deleted_paths.clear();
+    }
+
+    /// Zeroize and remove each enumerated path.
+    pub fn secure_delete<I, S>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for path in paths {
+            let path = path.into();
+            if let Some(mut bytes) = self.files.remove(&path) {
+                bytes.zeroize();
+            }
+            self.deleted_paths.insert(path);
+        }
+    }
+
+    /// True when any retained simulated file still contains the needle.
+    #[must_use]
+    pub fn contains_material(&self, needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && self
+                .files
+                .values()
+                .any(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+    }
+
+    /// True when all paths have been enumerated for deletion.
+    #[must_use]
+    pub fn deleted_all<'a, I>(&self, paths: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        paths
+            .into_iter()
+            .all(|path| self.deleted_paths.contains(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +368,21 @@ mod tests {
         assert_eq!(store.recipient_cache().len(), 2);
         assert!(store.recipient_cache().get("m-0").is_none());
         assert!(store.recipient_cache().get("m-2").is_some());
+    }
+
+    #[test]
+    fn secure_delete_removes_material_and_snapshot_restores_on_failed_verify() {
+        let mut sim = SecureDeleteSimulator::default();
+        sim.write("db.sqlite", b"content-key".to_vec());
+        sim.write("db.sqlite-wal", b"content-key wal".to_vec());
+        sim.write("key.store", b"content-key store".to_vec());
+        let snapshot = sim.snapshot();
+        sim.secure_delete(["db.sqlite", "db.sqlite-wal"]);
+        assert!(sim.contains_material(b"content-key"));
+        sim.restore(snapshot);
+        assert!(sim.contains_material(b"content-key"));
+        sim.secure_delete(["db.sqlite", "db.sqlite-wal", "key.store"]);
+        assert!(!sim.contains_material(b"content-key"));
+        assert!(sim.deleted_all(["db.sqlite", "db.sqlite-wal", "key.store"]));
     }
 }

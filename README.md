@@ -10,6 +10,8 @@ Phase 2 relay-overlay foundations cover deterministic relay ranking, the `<= 3` 
 
 Phase 3 text/history delivery foundations cover per-author sent-log merge, bounded recipient caches, content-blind 16-peer gossip convergence, ordered delivery, expiring Welcome/catch-up, fork/downgrade/replay detection, and explicit repair by rejoin/reproposal without replaying divergent MLS commits.
 
+Phase 4 retention/shred/live-key foundations cover required retention presets, shorten-retroactive/lengthen-future semantics, lock-not-vanish placeholders, cross-device tombstone sync, membership-gated/rate-limited live-key responses with decoys, secure-delete simulation, and account-continuity backups that exclude content keys.
+
 ## Commands
 
 ```sh
@@ -44,6 +46,14 @@ cd apps/ui && npm ci && npm run typecheck && npm run build && npm audit --audit-
 - `harness/multinode::media_security_smoke` exercises passive relay opacity, replay rejection, and active tamper rejection.
 
 See [`docs/phase-1-media-security-review.md`](docs/phase-1-media-security-review.md) for the G002 evidence matrix and production-hardening notes.
+
+## Phase 4 retention/shred/live-key slice
+
+- `crates/content-keys/src/lib.rs` models retention presets, transition semantics, tombstones, cross-device shred sync, and membership-gated live-key responses with rate limits and decoys.
+- `crates/storage/src/lib.rs` models bounded caches, account-continuity backup without content keys, and secure-delete simulation for SQLite/WAL/key-store paths.
+- `harness/multinode::retention_shred_smoke` exercises AC10/AC10b/AC11/AC-PRESENCE/AC-SHRED-PERSIST/AC-RECOVERY foundations in one deterministic scenario.
+
+See [`docs/phase-4-retention-shred-recovery.md`](docs/phase-4-retention-shred-recovery.md) for the G005 evidence matrix and production-hardening notes.
 
 ## Phase 3 text/history + MLS delivery slice
 

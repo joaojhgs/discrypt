@@ -68,6 +68,23 @@ pub struct TextHistoryDeliverySmoke {
     pub divergent_mls_not_replayed: bool,
 }
 
+/// Deterministic Phase-4 retention/shred/live-key/storage smoke result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionShredSmoke {
+    /// Default retention caches fresh messages and locks old placeholders.
+    pub default_window_locks_old_messages: bool,
+    /// Shorten is retroactive while lengthen is future-only.
+    pub shorten_retro_lengthen_future: bool,
+    /// Cross-device shred blocks online devices and pending offline devices after sync.
+    pub cross_device_shred_sync: bool,
+    /// Live-key requests require local membership proof and enforce rate limits.
+    pub live_key_membership_rate_limit_decoy: bool,
+    /// Secure-delete simulator removes key material from SQLite/WAL/key-store paths.
+    pub secure_delete_negative: bool,
+    /// Account-continuity backup excludes content keys and cannot resurrect shredded content.
+    pub recovery_cannot_resurrect_content_keys: bool,
+}
+
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
@@ -380,6 +397,112 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     })
 }
 
+/// Exercise Phase-4 retention, shred, live-key, secure-delete, and recovery negatives.
+pub fn retention_shred_smoke() -> Result<RetentionShredSmoke, anyhow::Error> {
+    use chrono::{Duration, Utc};
+    use discrypt_content_keys::{
+        key_state, CrossDeviceShredState, KeyState, LiveKeyOracle, MembershipProof,
+        RetentionTransition, RetentionWindow,
+    };
+    use discrypt_storage::{seal_account_backup, SecureDeleteSimulator};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let now = Utc::now();
+    let key = [7; 32];
+    let default_window_locks_old_messages = matches!(
+        key_state(
+            now,
+            now - Duration::days(3),
+            RetentionWindow::Days7,
+            key,
+            false,
+        ),
+        KeyState::Cached(_)
+    ) && key_state(
+        now,
+        now - Duration::days(8),
+        RetentionWindow::Days7,
+        key,
+        false,
+    ) == KeyState::Locked;
+
+    let shorten = RetentionTransition {
+        old_window: RetentionWindow::Days7,
+        new_window: RetentionWindow::Hours24,
+        changed_at: now,
+    };
+    let lengthen = RetentionTransition {
+        old_window: RetentionWindow::Hours24,
+        new_window: RetentionWindow::Days7,
+        changed_at: now,
+    };
+    let shorten_retro_lengthen_future =
+        shorten.state_for_message(now, now - Duration::days(2), key, false) == KeyState::Locked
+            && lengthen.state_for_message(now, now - Duration::days(2), key, false)
+                == KeyState::Locked
+            && matches!(
+                lengthen.state_for_message(now, now + Duration::seconds(1), key, false),
+                KeyState::Cached(_)
+            );
+
+    let mut shred = CrossDeviceShredState::default();
+    shred.register_device("laptop", true);
+    shred.register_device("phone", false);
+    shred.shred("m-shred");
+    let phone_pending = shred.pending_on_device("phone", "m-shred");
+    shred.set_online("phone", true);
+    let cross_device_shred_sync = !shred.device_may_serve("laptop", "m-shred")
+        && phone_pending
+        && !shred.pending_on_device("phone", "m-shred")
+        && !shred.device_may_serve("phone", "m-shred");
+
+    let mut members = BTreeMap::new();
+    members.insert(9, BTreeSet::from([1, 2]));
+    let mut oracle = LiveKeyOracle::new(members, 1);
+    let allowed = oracle.request_key(&MembershipProof::new(1, 9, "room"), key);
+    let limited = oracle.request_key(&MembershipProof::new(1, 9, "room"), key);
+    let decoy = oracle.request_key(&MembershipProof::new(99, 9, "room"), key);
+    let live_key_membership_rate_limit_decoy = allowed.authorized
+        && allowed.state == KeyState::Cached(key)
+        && !limited.authorized
+        && limited.state == KeyState::RateLimited
+        && !decoy.authorized
+        && matches!(decoy.state, KeyState::Decoy(_));
+
+    let mut delete = SecureDeleteSimulator::default();
+    delete.write("db.sqlite", b"room content-key plaintext".to_vec());
+    delete.write("db.sqlite-wal", b"wal content-key".to_vec());
+    delete.write("key.store", b"wrapped content-key".to_vec());
+    let snapshot = delete.snapshot();
+    delete.secure_delete(["db.sqlite", "db.sqlite-wal"]);
+    let failed_verify_kept_material = delete.contains_material(b"content-key");
+    delete.restore(snapshot);
+    delete.secure_delete(["db.sqlite", "db.sqlite-wal", "key.store"]);
+    let secure_delete_negative = failed_verify_kept_material
+        && !delete.contains_material(b"content-key")
+        && delete.deleted_all(["db.sqlite", "db.sqlite-wal", "key.store"]);
+
+    let backup = seal_account_backup(&key, vec!["room".to_owned()], 2);
+    let recovery_cannot_resurrect_content_keys = !backup
+        .identity_key_ciphertext
+        .windows(key.len())
+        .any(|window| window == key)
+        && !backup.room_memberships.iter().any(|room| {
+            room.as_bytes()
+                .windows(key.len())
+                .any(|window| window == key)
+        });
+
+    Ok(RetentionShredSmoke {
+        default_window_locks_old_messages,
+        shorten_retro_lengthen_future,
+        cross_device_shred_sync,
+        live_key_membership_rate_limit_decoy,
+        secure_delete_negative,
+        recovery_cannot_resurrect_content_keys,
+    })
+}
+
 /// Backward-compatible boolean smoke for scripts that only need passive relay status.
 pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
     let smoke = media_security_smoke()?;
@@ -442,6 +565,22 @@ mod tests {
                 fork_detected_not_silent: true,
                 repair_converged_equal_tags: true,
                 divergent_mls_not_replayed: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn retention_shred_smoke_covers_phase4_gates() {
+        let smoke = retention_shred_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(RetentionShredSmoke {
+                default_window_locks_old_messages: true,
+                shorten_retro_lengthen_future: true,
+                cross_device_shred_sync: true,
+                live_key_membership_rate_limit_decoy: true,
+                secure_delete_negative: true,
+                recovery_cannot_resurrect_content_keys: true,
             })
         ));
     }
