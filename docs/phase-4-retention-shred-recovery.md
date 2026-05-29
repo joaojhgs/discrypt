@@ -16,6 +16,7 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   - `LiveKeyOracle` checks local epoch membership through a signed Ed25519 device proof
     bound to the epoch group-state commitment, rate-limits authorized signed members,
     and returns decoys for non-members, unregistered signer keys, or invalid proofs.
+    The production constructor derives its allow-list from repaired local MLS group state plus resolved governance state and does not perform an online lookup.
 - `crates/storage/src/lib.rs`
   - `SecureDeleteSimulator` snapshots local stores, supports restore on failed
     verification, and proves SQLite/WAL/key-store paths no longer contain key bytes
@@ -34,7 +35,9 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   pending offline own devices may serve until reconnect, then tombstones block serve.
 - AC-PRESENCE: non-members receive decoys; authorized members must present a signed
   Ed25519 proof at the relevant epoch using a registered signer key bound to the local
-  group-state commitment; over-limit responses do not return keys.
+  group-state commitment; the allow-list is built from repaired local MLS/governance
+  state, and unrepaired epoch mismatches are rejected before any key is served.
+  Over-limit responses do not return keys.
 - AC-SHRED-PERSIST: SQLite/WAL/key-store material is removed in the simulator; failed
   verification can restore the snapshot before final destroy.
 - AC-RECOVERY/AC12 foundation: backups are account-continuity only and do not contain
@@ -46,7 +49,8 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   SQLite/WAL/keychain paths and still carry the plan's OS caveats: swap, crash dumps,
   and filesystem snapshots remain out of absolute control.
 - `LiveKeyOracle` now enforces the signed local proof boundary for live-key requests.
-  Native production integration must feed it verifier keys and group-state commitments
-  from the MLS group state rather than UI-provided claims.
+  Native production integration must feed it current or repaired MLS group state plus
+  resolved governance state; it must not add online membership/presence lookups that
+  would leak which user is asking for an archival key.
 - Cross-device shred remains cooperative; UX must keep the approved copy: deleted on
   online devices now, pending on offline devices until reconnect.

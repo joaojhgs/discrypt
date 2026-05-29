@@ -9,7 +9,7 @@
 pub mod production_status;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use mls_core::{derive_epoch_secret, ExportLabel};
+use mls_core::{derive_epoch_secret, DeviceStatus, ExportLabel, GovernanceState, GroupState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -369,6 +369,25 @@ pub struct LiveKeyResponse {
     pub authorized: bool,
 }
 
+/// Errors while building live-key authorization from local MLS/governance state.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LocalMembershipStateError {
+    /// The MLS group and governance state disagree about the current accepted epoch.
+    #[error("local MLS epoch {group_epoch} does not match governance epoch {governance_epoch}")]
+    EpochMismatch {
+        /// Current MLS group epoch.
+        group_epoch: u64,
+        /// Current governance epoch.
+        governance_epoch: u64,
+    },
+    /// A local MLS member carries an invalid device verifier key.
+    #[error("local member leaf {leaf} has invalid device verifier key")]
+    InvalidDeviceKey {
+        /// Leaf with invalid verifier bytes.
+        leaf: u32,
+    },
+}
+
 /// Membership-gated, rate-limited, decoy-capable live-key oracle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveKeyOracle {
@@ -381,6 +400,52 @@ pub struct LiveKeyOracle {
 }
 
 impl LiveKeyOracle {
+    /// Create an oracle from repaired local MLS group state plus resolved governance state.
+    ///
+    /// This is intentionally local-only: membership is derived from the current local
+    /// OpenMLS/group view intersected with the resolved governance roles and bans. It
+    /// registers verifier keys from active MLS device leaves and performs no online
+    /// lookup that could leak live presence.
+    pub fn from_local_mls_governance_state(
+        group: &GroupState,
+        governance: &GovernanceState,
+        max_requests: usize,
+    ) -> Result<Self, LocalMembershipStateError> {
+        if group.epoch != governance.epoch {
+            return Err(LocalMembershipStateError::EpochMismatch {
+                group_epoch: group.epoch,
+                governance_epoch: governance.epoch,
+            });
+        }
+        let active_members = group
+            .members()
+            .iter()
+            .filter_map(|(leaf, member)| {
+                (member.status == DeviceStatus::Active
+                    && governance.role(*leaf).is_some()
+                    && !governance.is_banned(*leaf))
+                .then_some(*leaf)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut oracle = Self::new(
+            BTreeMap::from([(group.epoch, active_members)]),
+            max_requests,
+        );
+        for (leaf, member) in group.members() {
+            if !oracle
+                .members_by_epoch
+                .get(&group.epoch)
+                .is_some_and(|members| members.contains(leaf))
+            {
+                continue;
+            }
+            let verifier = VerifyingKey::from_bytes(&member.device_key)
+                .map_err(|_| LocalMembershipStateError::InvalidDeviceKey { leaf: *leaf })?;
+            oracle.authorize_member_device(group.epoch, *leaf, &verifier);
+        }
+        Ok(oracle)
+    }
+
     /// Create an oracle from epoch membership.
     #[must_use]
     pub fn new(members_by_epoch: BTreeMap<u64, BTreeSet<u32>>, max_requests: usize) -> Self {
@@ -602,6 +667,130 @@ mod tests {
         let rejected = oracle.request_key(&tampered_signature, key);
         assert!(matches!(rejected.state, KeyState::Decoy(_)));
         assert!(!rejected.authorized);
+        Ok(())
+    }
+
+    #[test]
+    fn live_key_oracle_builds_from_local_repaired_mls_governance_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use mls_core::{DeviceLeaf, GovernanceAction, GovernanceEvent, Role};
+        use uuid::Uuid;
+
+        let owner_signer = SigningKey::from_bytes(&[0x11; 32]);
+        let member_signer = SigningKey::from_bytes(&[0x22; 32]);
+        let removed_signer = SigningKey::from_bytes(&[0x33; 32]);
+        let owner = DeviceLeaf {
+            device_id: Uuid::from_u128(1),
+            leaf_index: 1,
+            identity_key: [0xA1; 32],
+            device_key: owner_signer.verifying_key().to_bytes(),
+            label: "owner".to_owned(),
+            status: DeviceStatus::Active,
+            added_at_epoch: 0,
+            removed_at_epoch: None,
+        };
+        let member = DeviceLeaf {
+            device_id: Uuid::from_u128(2),
+            leaf_index: 2,
+            identity_key: [0xB2; 32],
+            device_key: member_signer.verifying_key().to_bytes(),
+            label: "member".to_owned(),
+            status: DeviceStatus::Active,
+            added_at_epoch: 0,
+            removed_at_epoch: None,
+        };
+        let removed = DeviceLeaf {
+            device_id: Uuid::from_u128(3),
+            leaf_index: 3,
+            identity_key: [0xC3; 32],
+            device_key: removed_signer.verifying_key().to_bytes(),
+            label: "removed".to_owned(),
+            status: DeviceStatus::Active,
+            added_at_epoch: 0,
+            removed_at_epoch: None,
+        };
+        let mut group = GroupState::new("room-local-membership");
+        group.add_leaf(owner.clone())?;
+        group.add_leaf(member.clone())?;
+        group.add_leaf(removed.clone())?;
+        group.remove_leaf(removed.leaf_index)?;
+
+        let mut governance = GovernanceState::new(group.epoch, owner.leaf_index);
+        governance.apply_event(GovernanceEvent::signed_by(
+            group.epoch,
+            owner.leaf_index,
+            GovernanceAction::SetRole {
+                target: member.leaf_index,
+                role: Role::Member,
+            },
+            &owner_signer,
+        ))?;
+        governance.apply_event(GovernanceEvent::signed_by(
+            group.epoch,
+            owner.leaf_index,
+            GovernanceAction::SetRole {
+                target: removed.leaf_index,
+                role: Role::Member,
+            },
+            &owner_signer,
+        ))?;
+
+        let mut oracle = LiveKeyOracle::from_local_mls_governance_state(&group, &governance, 2)?;
+        let commitment = oracle
+            .epoch_group_commitment(group.epoch)
+            .ok_or_else(|| std::io::Error::other("local epoch commitment missing"))?;
+        let key = [0x44; 32];
+        let member_proof = MembershipProof::sign(
+            member.leaf_index,
+            group.epoch,
+            &group.group_id,
+            commitment,
+            &member_signer,
+        );
+        let allowed = oracle.request_key(&member_proof, key);
+        assert_eq!(allowed.state, KeyState::Cached(key));
+        assert!(allowed.authorized);
+
+        let removed_proof = MembershipProof::sign(
+            removed.leaf_index,
+            group.epoch,
+            &group.group_id,
+            commitment,
+            &removed_signer,
+        );
+        let rejected = oracle.request_key(&removed_proof, key);
+        assert!(matches!(rejected.state, KeyState::Decoy(_)));
+        assert!(!rejected.authorized);
+        Ok(())
+    }
+
+    #[test]
+    fn local_membership_state_rejects_unrepaired_epoch_mismatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use mls_core::{DeviceLeaf, GovernanceState};
+        use uuid::Uuid;
+
+        let signer = SigningKey::from_bytes(&[0x55; 32]);
+        let leaf = DeviceLeaf {
+            device_id: Uuid::from_u128(55),
+            leaf_index: 5,
+            identity_key: [0x55; 32],
+            device_key: signer.verifying_key().to_bytes(),
+            label: "leaf".to_owned(),
+            status: DeviceStatus::Active,
+            added_at_epoch: 0,
+            removed_at_epoch: None,
+        };
+        let mut group = GroupState::new("room-mismatch");
+        group.add_leaf(leaf.clone())?;
+        let stale_governance = GovernanceState::new(group.epoch.saturating_sub(1), leaf.leaf_index);
+        assert_eq!(
+            LiveKeyOracle::from_local_mls_governance_state(&group, &stale_governance, 1),
+            Err(LocalMembershipStateError::EpochMismatch {
+                group_epoch: group.epoch,
+                governance_epoch: stale_governance.epoch,
+            })
+        );
         Ok(())
     }
 }

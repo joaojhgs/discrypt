@@ -25,7 +25,10 @@ pub use device_set::{
     DeviceSetError, DeviceStatus, TransparencyEvent,
 };
 pub use exporter::{derive_epoch_secret, ExportLabel};
-pub use governance::{CanonicalEventRef, GovernanceAction, GovernanceEvent, GovernanceLog, Role};
+pub use governance::{
+    CanonicalEventRef, GovernanceAction, GovernanceError, GovernanceEvent, GovernanceLog,
+    GovernanceState, Role,
+};
 pub use group::{GroupState, LeafIndex, MlsCoreError};
 pub use identity::{verifying_key_from_hex, FriendCode, Identity, SafetyNumber};
 pub use openmls_engine::{
