@@ -1566,7 +1566,7 @@ impl PersistedAppState {
     fn apply_account_recovery(&mut self, recovery: &AccountRecovery) {
         if let Some(profile) = &mut self.profile {
             profile.recovery_status = format!(
-                "Account continuity restored for {} room(s) and {} device(s); content keys restored: {}",
+                "Account continuity restored from local placeholder for {} room(s) and {} device(s); content keys restored: {}",
                 recovery.room_memberships.len(),
                 recovery.device_count,
                 recovery.content_keys_restored
