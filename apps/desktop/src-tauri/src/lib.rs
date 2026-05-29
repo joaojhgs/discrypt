@@ -9,10 +9,10 @@
 pub mod production_status;
 use chrono::{Duration, Utc};
 use discrypt_core::{
-    app_snapshot as core_app_snapshot, identity_recovery_verification_smoke, AppSnapshot,
-    ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
-    MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
-    SecurityCopyView, ServerView,
+    app_snapshot as core_app_snapshot, generated_device_view, identity_recovery_verification_smoke,
+    snapshot_safety_number_matches_identity_keys, AppSnapshot, ChannelKind,
+    ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
+    SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
 use discrypt_mls_core::{DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, Identity};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
@@ -1079,12 +1079,7 @@ pub fn metadata_warning() -> String {
 pub fn command_health() -> CommandHealth {
     let state = app_state();
     let identity_verification = identity_recovery_verification_smoke();
-    let verification = SafetyVerificationResult {
-        verified: !state.snapshot.friend.friend_code.is_empty()
-            && !state.snapshot.friend.safety_number.is_empty(),
-        message: "command health checked generated safety-number fields".to_owned(),
-    };
-    let verification_ready = snapshot_safety_number_matches_identity_keys(&verification_snapshot);
+    let verification_ready = snapshot_safety_number_matches_identity_keys(&state.snapshot);
     let honest_copy_ready = state
         .security_copy
         .deletion
@@ -1106,8 +1101,7 @@ pub fn command_health() -> CommandHealth {
             .all(|message| message.status.contains("not claimed"));
     CommandHealth {
         snapshot_ready: state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION,
-        verification_ready: verification.verified
-            && identity_verification.two_profiles_verify_safety_numbers,
+        verification_ready: verification_ready && identity_verification.two_profiles_verify_safety_numbers,
         app_state_ready,
         identity_ready,
         collaboration_ready: collaboration_ready
@@ -1464,16 +1458,13 @@ impl PersistedAppState {
             },
         });
         self.lifecycle = AppLifecycle::Ready;
-        self.identity_seed_hex =
-            new_identity_seed_hex(&display_name, &device_name, self.next_sequence);
-        let identity = self.local_identity();
-        self.device_set = DeviceSet::new();
-        let seed = self.identity_seed_bytes();
-        let device_key = command_device_key(&seed, &device_name, self.next_sequence);
-        let leaf = self
-            .device_set
-            .add_authorized_device(&identity, device_key, &device_name, 1);
-        self.devices = vec![device_view_from_leaf(&leaf, true, true)];
+        self.devices = vec![generated_device_view(
+            &display_name,
+            &device_name,
+            1,
+            true,
+            1,
+        )];
         if self.dms.is_empty() {
             let friend = core_app_snapshot().friend;
             let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);

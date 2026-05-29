@@ -8,7 +8,7 @@
 
 pub mod production_status;
 use admission::Invite;
-use mls_core::{DeviceSet, GroupState, Identity};
+use mls_core::{verifying_key_from_hex, DeviceSet, GroupState, Identity, SafetyNumber};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use storage::{recover_account, AppStore, AppStoreError, MemoryAppStore, RecoveryMaterial};
@@ -754,6 +754,51 @@ pub fn identity_recovery_verification_smoke() -> IdentityRecoveryVerification {
     }
 }
 
+/// Generate a device row with real account and per-device identity keys.
+#[must_use]
+pub fn generated_device_view(
+    account_label: &str,
+    device_label: &str,
+    leaf_index: u32,
+    local: bool,
+    added_at_epoch: u64,
+) -> DeviceView {
+    let account = Identity::generate(account_label);
+    let device = Identity::generate(format!("{account_label} {device_label} device"));
+    DeviceView {
+        device_id: device_id_from_friend_code(account.friend_code().as_str(), device_label),
+        label: device_label.to_owned(),
+        leaf_index,
+        identity_key: hex_encode(account.verifying_key().as_bytes()),
+        device_key: hex_encode(device.verifying_key().as_bytes()),
+        local,
+        authorized: true,
+        revoked: false,
+        added_at_epoch,
+        revoked_at_epoch: None,
+    }
+}
+
+/// Validate that a snapshot safety number matches its local and peer identity keys.
+#[must_use]
+pub fn snapshot_safety_number_matches_identity_keys(snapshot: &AppSnapshot) -> bool {
+    let Some(local_identity_key) = snapshot
+        .devices
+        .iter()
+        .find(|device| device.local && !device.revoked)
+        .and_then(|device| verifying_key_from_hex(&device.identity_key))
+    else {
+        return false;
+    };
+    let Some(peer_identity_key) =
+        mls_core::FriendCode::from_payload(snapshot.friend.friend_code.clone()).verifying_key()
+    else {
+        return false;
+    };
+    SafetyNumber::from_identity_keys(&local_identity_key, &peer_identity_key).as_str()
+        == snapshot.friend.safety_number
+}
+
 /// Build an in-memory app service seeded with the deterministic fixture.
 pub fn in_memory_app_service() -> Result<AppService<MemoryAppStore>, AppServiceError> {
     AppService::load_or_seed(MemoryAppStore::default())
@@ -764,10 +809,6 @@ fn seed_state() -> AppState {
     let peer = Identity::generate("New contact");
     let local_friend_code = local.friend_code();
     let peer_friend_code = peer.friend_code();
-    let local_device_identity = Identity::generate("Alice Desktop device");
-    let peer_device_identity = Identity::generate("New contact primary device");
-    let local_device_id = device_id_from_friend_code(local_friend_code.as_str(), "desktop");
-    let peer_device_id = device_id_from_friend_code(peer_friend_code.as_str(), "primary");
     let safety_number = local
         .safety_number_from_friend_code(&peer_friend_code)
         .unwrap_or_else(|| local.safety_number(&peer.verifying_key()))
@@ -784,11 +825,15 @@ fn seed_state() -> AppState {
             },
             devices: vec![
                 DeviceView {
-                    device_id: local_device_id,
+                    device_id: device_id_from_friend_code(local_friend_code.as_str(), "desktop"),
                     label: "Desktop".to_owned(),
                     leaf_index: 1,
                     identity_key: hex_encode(local.verifying_key().as_bytes()),
-                    device_key: hex_encode(local_device_identity.verifying_key().as_bytes()),
+                    device_key: hex_encode(
+                        Identity::generate("Alice Desktop device")
+                            .verifying_key()
+                            .as_bytes(),
+                    ),
                     local: true,
                     authorized: true,
                     revoked: false,
@@ -796,11 +841,15 @@ fn seed_state() -> AppState {
                     revoked_at_epoch: None,
                 },
                 DeviceView {
-                    device_id: peer_device_id,
+                    device_id: device_id_from_friend_code(peer_friend_code.as_str(), "primary"),
                     label: "Primary".to_owned(),
                     leaf_index: 2,
                     identity_key: hex_encode(peer.verifying_key().as_bytes()),
-                    device_key: hex_encode(peer_device_identity.verifying_key().as_bytes()),
+                    device_key: hex_encode(
+                        Identity::generate("New contact primary device")
+                            .verifying_key()
+                            .as_bytes(),
+                    ),
                     local: false,
                     authorized: true,
                     revoked: false,
