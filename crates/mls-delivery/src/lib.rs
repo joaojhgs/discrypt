@@ -12,6 +12,7 @@
 //! feature matching the claimed runtime capability.
 
 pub mod production_status;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -36,6 +37,12 @@ pub enum DeliveryError {
     /// A repair plan would move to an older epoch.
     #[error("repair target epoch {target} is older than local epoch {local}")]
     StaleRepairTarget { local: u64, target: u64 },
+    /// Text message envelope is malformed or missing required production metadata.
+    #[error("invalid text message envelope: {0}")]
+    InvalidTextMessageEnvelope(String),
+    /// Text message envelope signature verification failed.
+    #[error("text message envelope signature verification failed")]
+    TextMessageSignatureVerificationFailed,
 }
 
 /// Compact state summary exchanged during catch-up.
@@ -95,6 +102,246 @@ pub fn detect_fork_or_replay(local: &EpochSummary, remote: &EpochSummary) -> For
         }),
         Ordering::Equal => ForkStatus::InSync,
     }
+}
+
+/// Current text message envelope schema version.
+pub const TEXT_MESSAGE_ENVELOPE_VERSION: u8 = 1;
+
+/// Retention metadata authenticated with every encrypted text message.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextRetentionMetadata {
+    /// Human/UX policy label that selected the retention behavior.
+    pub policy: String,
+    /// Deterministic creation timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Optional expiry timestamp in milliseconds.
+    pub expires_at_ms: Option<u64>,
+    /// Whether the recipient should delete cached plaintext after first read.
+    pub delete_after_read: bool,
+}
+
+impl TextRetentionMetadata {
+    /// Build retention metadata that can be authenticated by the envelope.
+    #[must_use]
+    pub fn new(
+        policy: impl Into<String>,
+        created_at_ms: u64,
+        expires_at_ms: Option<u64>,
+        delete_after_read: bool,
+    ) -> Self {
+        Self {
+            policy: policy.into(),
+            created_at_ms,
+            expires_at_ms,
+            delete_after_read,
+        }
+    }
+
+    fn validate(&self) -> Result<(), DeliveryError> {
+        if self.policy.trim().is_empty() {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "retention policy is required".to_owned(),
+            ));
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms < self.created_at_ms)
+        {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "retention expiry is before creation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Required unsigned fields for a text message envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextMessageEnvelopeInput {
+    /// MLS epoch that produced the text exporter/content key.
+    pub epoch: u64,
+    /// Sender MLS leaf in the epoch.
+    pub sender_leaf: u32,
+    /// Stable sender device id under the account identity.
+    pub sender_device_id: String,
+    /// Per-author monotonic message sequence.
+    pub sequence: u64,
+    /// Stable message id used by history, receipts, and dedupe.
+    pub message_id: String,
+    /// Authenticated retention/shred metadata for this message.
+    pub retention: TextRetentionMetadata,
+    /// Encrypted text payload bytes. Plaintext must never be embedded here.
+    pub content_ciphertext: Vec<u8>,
+}
+
+/// Authenticated, ciphertext-only text message envelope carried by transport/history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextMessageEnvelope {
+    /// Schema version for forwards-compatible parsing.
+    pub version: u8,
+    /// Content-hiding commitment to the group id; the raw group id is not relay visible.
+    pub group_id_commitment: [u8; 32],
+    /// MLS epoch that produced the text exporter/content key.
+    pub epoch: u64,
+    /// Sender MLS leaf in the epoch.
+    pub sender_leaf: u32,
+    /// Stable sender device id under the account identity.
+    pub sender_device_id: String,
+    /// Per-author monotonic message sequence.
+    pub sequence: u64,
+    /// Stable message id used by history, receipts, and dedupe.
+    pub message_id: String,
+    /// Authenticated retention/shred metadata for this message.
+    pub retention: TextRetentionMetadata,
+    /// Encrypted text payload bytes. Plaintext must never be embedded here.
+    pub content_ciphertext: Vec<u8>,
+    /// Ed25519 signature over the canonical unsigned envelope bytes.
+    pub signature: Vec<u8>,
+}
+
+impl TextMessageEnvelope {
+    /// Create and sign a text message envelope.
+    pub fn sign(
+        group_id: &str,
+        input: TextMessageEnvelopeInput,
+        signing_key: &SigningKey,
+    ) -> Result<Self, DeliveryError> {
+        let mut envelope = Self {
+            version: TEXT_MESSAGE_ENVELOPE_VERSION,
+            group_id_commitment: group_id_commitment(group_id)?,
+            epoch: input.epoch,
+            sender_leaf: input.sender_leaf,
+            sender_device_id: input.sender_device_id,
+            sequence: input.sequence,
+            message_id: input.message_id,
+            retention: input.retention,
+            content_ciphertext: input.content_ciphertext,
+            signature: Vec::new(),
+        };
+        envelope.validate_unsigned()?;
+        envelope.signature = signing_key
+            .sign(&envelope.canonical_unsigned_bytes())
+            .to_bytes()
+            .to_vec();
+        Ok(envelope)
+    }
+
+    /// Verify the group commitment, required metadata, and sender device signature.
+    pub fn verify(
+        &self,
+        group_id: &str,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), DeliveryError> {
+        self.validate_unsigned()?;
+        if self.group_id_commitment != group_id_commitment(group_id)? {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "group commitment mismatch".to_owned(),
+            ));
+        }
+        let signature_bytes: [u8; 64] = self.signature.as_slice().try_into().map_err(|_| {
+            DeliveryError::InvalidTextMessageEnvelope("signature must be 64 bytes".to_owned())
+        })?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify(&self.canonical_unsigned_bytes(), &signature)
+            .map_err(|_| DeliveryError::TextMessageSignatureVerificationFailed)
+    }
+
+    /// Hash used by author-log gossip without exposing ciphertext bytes.
+    #[must_use]
+    pub fn ciphertext_hash(&self) -> [u8; 32] {
+        Sha256::digest(&self.content_ciphertext).into()
+    }
+
+    /// True when the relay/history-visible envelope bytes contain a forbidden plaintext sample.
+    #[must_use]
+    pub fn contains_plaintext_sample(&self, plaintext: &[u8]) -> bool {
+        if plaintext.is_empty() || plaintext.len() > self.content_ciphertext.len() {
+            return false;
+        }
+        self.content_ciphertext
+            .windows(plaintext.len())
+            .any(|window| window == plaintext)
+    }
+
+    /// Canonical unsigned bytes covered by the signature.
+    #[must_use]
+    pub fn canonical_unsigned_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_bytes(&mut out, b"discrypt-text-message-envelope-v1");
+        out.push(self.version);
+        out.extend_from_slice(&self.group_id_commitment);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.sender_leaf.to_be_bytes());
+        push_str(&mut out, &self.sender_device_id);
+        out.extend_from_slice(&self.sequence.to_be_bytes());
+        push_str(&mut out, &self.message_id);
+        push_str(&mut out, &self.retention.policy);
+        out.extend_from_slice(&self.retention.created_at_ms.to_be_bytes());
+        match self.retention.expires_at_ms {
+            Some(expires_at_ms) => {
+                out.push(1);
+                out.extend_from_slice(&expires_at_ms.to_be_bytes());
+            }
+            None => out.push(0),
+        }
+        out.push(u8::from(self.retention.delete_after_read));
+        push_bytes(&mut out, &self.content_ciphertext);
+        out
+    }
+
+    fn validate_unsigned(&self) -> Result<(), DeliveryError> {
+        if self.version != TEXT_MESSAGE_ENVELOPE_VERSION {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(format!(
+                "unsupported version {}",
+                self.version
+            )));
+        }
+        if self.group_id_commitment == [0; 32] {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "group commitment is required".to_owned(),
+            ));
+        }
+        if self.sender_device_id.trim().is_empty() {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "sender device id is required".to_owned(),
+            ));
+        }
+        if self.message_id.trim().is_empty() {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "message id is required".to_owned(),
+            ));
+        }
+        if self.content_ciphertext.is_empty() {
+            return Err(DeliveryError::InvalidTextMessageEnvelope(
+                "content ciphertext is required".to_owned(),
+            ));
+        }
+        self.retention.validate()
+    }
+}
+
+/// Compute the non-reversible group id commitment stored in text envelopes.
+pub fn group_id_commitment(group_id: &str) -> Result<[u8; 32], DeliveryError> {
+    if group_id.trim().is_empty() {
+        return Err(DeliveryError::InvalidTextMessageEnvelope(
+            "group id is required".to_owned(),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-text-group-id-v1");
+    hasher.update((group_id.len() as u64).to_be_bytes());
+    hasher.update(group_id.as_bytes());
+    Ok(hasher.finalize().into())
+}
+
+fn push_str(out: &mut Vec<u8>, value: &str) {
+    push_bytes(out, value.as_bytes());
+}
+
+fn push_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    out.extend_from_slice(value);
 }
 
 /// Application event carried alongside ordered MLS delivery.
@@ -450,6 +697,108 @@ pub fn event_ids(events: &[ApplicationEvent]) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn retention() -> TextRetentionMetadata {
+        TextRetentionMetadata::new("7 day default", 1_000, Some(605_800_000), false)
+    }
+
+    #[test]
+    fn text_message_envelope_authenticates_required_metadata() -> Result<(), DeliveryError> {
+        let signer = signing_key(7);
+        let plaintext = b"hello plaintext";
+        let ciphertext = b"ciphertext:sealed-body".to_vec();
+        let envelope = TextMessageEnvelope::sign(
+            "group/private-lab",
+            TextMessageEnvelopeInput {
+                epoch: 42,
+                sender_leaf: 3,
+                sender_device_id: "alice-laptop".to_owned(),
+                sequence: 9,
+                message_id: "msg-9".to_owned(),
+                retention: retention(),
+                content_ciphertext: ciphertext.clone(),
+            },
+            &signer,
+        )?;
+
+        assert_eq!(envelope.version, TEXT_MESSAGE_ENVELOPE_VERSION);
+        assert_eq!(envelope.epoch, 42);
+        assert_eq!(envelope.sender_leaf, 3);
+        assert_eq!(envelope.sender_device_id, "alice-laptop");
+        assert_eq!(envelope.sequence, 9);
+        assert_eq!(envelope.message_id, "msg-9");
+        assert_ne!(envelope.group_id_commitment, [0; 32]);
+        assert_ne!(
+            envelope.group_id_commitment,
+            group_id_commitment("other-group")?
+        );
+        assert_eq!(envelope.content_ciphertext, ciphertext);
+        assert!(!envelope.contains_plaintext_sample(plaintext));
+        assert_eq!(envelope.signature.len(), 64);
+        envelope.verify("group/private-lab", &signer.verifying_key())
+    }
+
+    #[test]
+    fn text_message_envelope_rejects_tampered_or_missing_fields() -> Result<(), DeliveryError> {
+        let signer = signing_key(8);
+        let envelope = TextMessageEnvelope::sign(
+            "group/private-lab",
+            TextMessageEnvelopeInput {
+                epoch: 7,
+                sender_leaf: 1,
+                sender_device_id: "alice-phone".to_owned(),
+                sequence: 2,
+                message_id: "msg-2".to_owned(),
+                retention: retention(),
+                content_ciphertext: b"ciphertext".to_vec(),
+            },
+            &signer,
+        )?;
+
+        let mut tampered_epoch = envelope.clone();
+        tampered_epoch.epoch = 8;
+        assert_eq!(
+            tampered_epoch.verify("group/private-lab", &signer.verifying_key()),
+            Err(DeliveryError::TextMessageSignatureVerificationFailed)
+        );
+
+        let mut tampered_retention = envelope.clone();
+        tampered_retention.retention.delete_after_read = true;
+        assert_eq!(
+            tampered_retention.verify("group/private-lab", &signer.verifying_key()),
+            Err(DeliveryError::TextMessageSignatureVerificationFailed)
+        );
+
+        assert_eq!(
+            envelope.verify("other-group", &signer.verifying_key()),
+            Err(DeliveryError::InvalidTextMessageEnvelope(
+                "group commitment mismatch".to_owned()
+            ))
+        );
+
+        assert!(matches!(
+            TextMessageEnvelope::sign(
+                "group/private-lab",
+                TextMessageEnvelopeInput {
+                    epoch: 7,
+                    sender_leaf: 1,
+                    sender_device_id: "alice-phone".to_owned(),
+                    sequence: 2,
+                    message_id: "msg-2".to_owned(),
+                    retention: retention(),
+                    content_ciphertext: Vec::new(),
+                },
+                &signer,
+            ),
+            Err(DeliveryError::InvalidTextMessageEnvelope(_))
+        ));
+        Ok(())
+    }
 
     #[test]
     fn orders_events_by_epoch_leaf_and_content_hash() {

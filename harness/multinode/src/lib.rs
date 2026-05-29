@@ -721,7 +721,8 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     use discrypt_mls_delivery::{
         detect_fork_or_replay, equal_confirmation_tags, order_application_events, plan_repair,
         repair_to_winner, summary, ApplicationEvent, CatchUpBundle, CommitEnvelope, DeliveryError,
-        DeliveryState, ForkEvidence, ForkStatus, WelcomePackage,
+        DeliveryState, ForkEvidence, ForkStatus, TextMessageEnvelope, TextMessageEnvelopeInput,
+        TextRetentionMetadata, WelcomePackage,
     };
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
@@ -730,18 +731,40 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     let text_plaintext = b"hello from app-level encrypted text";
     let text_key = derive_epoch_secret(&[33; 32], ExportLabel::Text, b"room=lab;epoch=7;m=alice-1");
     let text_ciphertext = xor_text_ciphertext(&text_key, text_plaintext);
-    let opened_text = xor_text_ciphertext(&text_key, &text_ciphertext);
-    let text_e2e_roundtrip = opened_text == text_plaintext && text_ciphertext != text_plaintext;
+    let text_signing_key = ed25519_dalek::SigningKey::from_bytes(&[77; 32]);
+    let text_envelope = TextMessageEnvelope::sign(
+        "lab",
+        TextMessageEnvelopeInput {
+            epoch: 7,
+            sender_leaf: 1,
+            sender_device_id: "alice-laptop".to_owned(),
+            sequence: 1,
+            message_id: "alice-1".to_owned(),
+            retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
+            content_ciphertext: text_ciphertext.clone(),
+        },
+        &text_signing_key,
+    )?;
+    let opened_text = xor_text_ciphertext(&text_key, &text_envelope.content_ciphertext);
+    let text_e2e_roundtrip = opened_text == text_plaintext
+        && text_envelope.content_ciphertext != text_plaintext
+        && text_envelope.verify("lab", &text_signing_key.verifying_key()) == Ok(());
 
-    let laptop_entry =
-        AuthorLogEntry::new(1, "alice-laptop", 1, 7, "alice-1", text_ciphertext.clone());
+    let laptop_entry = AuthorLogEntry::new(
+        1,
+        "alice-laptop",
+        1,
+        7,
+        "alice-1",
+        text_envelope.content_ciphertext.clone(),
+    );
     let phone_entry =
         AuthorLogEntry::new(1, "alice-phone", 2, 7, "alice-2", b"ciphertext-b".to_vec());
     let mut laptop = LocalStore::default();
     laptop.append_sent(laptop_entry.clone());
     laptop.cache_received(RecipientCacheEntry::new(
         "alice-1",
-        text_ciphertext.clone(),
+        text_envelope.content_ciphertext.clone(),
         KeyState::Cached(text_key),
         0,
     ));
@@ -749,6 +772,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         .author_log_snapshot()
         .iter()
         .any(|entry| contains_bytes(&entry.ciphertext, text_plaintext))
+        && !text_envelope.contains_plaintext_sample(text_plaintext)
         && laptop
             .recipient_cache()
             .get("alice-1")
