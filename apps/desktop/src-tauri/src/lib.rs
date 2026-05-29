@@ -1583,17 +1583,11 @@ impl PersistedAppState {
 
         let local_device = self.devices.first().cloned().unwrap_or_else(|| DeviceView {
             device_id: "desktop".to_owned(),
-            label: "Desktop".to_owned(),
             leaf_index: 1,
-            identity_key: String::new(),
-            device_key: String::new(),
             local: true,
             authorized: true,
-            revoked: false,
-            added_at_epoch: 1,
-            revoked_at_epoch: None,
         });
-        self.devices = vec![local_device.clone()];
+        self.devices = vec![local_device];
         for index in 2..=recovery.device_count.max(1) {
             let device_id = format!("recovered-device-{index}");
             if !self
@@ -1800,6 +1794,64 @@ fn app_store_path_with_env_override(allow_env_override: bool) -> PathBuf {
             .join(APP_STATE_STORE_FILENAME);
     }
     PathBuf::from(APP_STATE_STORE_FILENAME)
+}
+
+fn account_recovery_from_request(request: &RecoverUserRequest) -> AccountRecovery {
+    let rooms = request.recovery_room_memberships.clone();
+    let device_count = request.recovered_device_count.unwrap_or(1).max(1);
+    let recovered = if request.use_sealed_account_backup {
+        let seed: [u8; 32] = Sha256::digest(request.recovery_code.as_bytes()).into();
+        recover_account(RecoveryMaterial::SealedBackup(seal_account_backup(
+            &seed,
+            rooms,
+            device_count,
+        )))
+    } else {
+        RecoveryCodeVerifier::from_code(&request.recovery_code)
+            .and_then(|verifier| {
+                recovery_code_material(
+                    &request.recovery_code,
+                    &verifier,
+                    request.recovery_room_memberships.clone(),
+                    device_count,
+                )
+            })
+            .and_then(recover_account)
+    };
+    recovered.unwrap_or_else(|_| AccountRecovery {
+        room_memberships: Vec::new(),
+        device_count: 1,
+        content_keys_restored: false,
+    })
+}
+
+fn new_identity_seed_hex(display_name: &str, device_name: &str, sequence: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-desktop-identity-seed-v1");
+    hasher.update(display_name.as_bytes());
+    hasher.update(device_name.as_bytes());
+    hasher.update(sequence.to_be_bytes());
+    hasher.update(Uuid::new_v4().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn hex_32(value: &str) -> Option<[u8; 32]> {
+    let decoded = hex::decode(value).ok()?;
+    decoded.try_into().ok()
+}
+
+fn command_device_key(
+    identity_seed: &[u8; 32],
+    label: &str,
+    sequence: u64,
+) -> ed25519_dalek::VerifyingKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-desktop-device-key-v1");
+    hasher.update(identity_seed);
+    hasher.update(label.as_bytes());
+    hasher.update(sequence.to_be_bytes());
+    let key_bytes: [u8; 32] = hasher.finalize().into();
+    SigningKey::from_bytes(&key_bytes).verifying_key()
 }
 
 fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
@@ -2045,11 +2097,9 @@ mod tests {
         assert!(state
             .profile
             .as_ref()
-            .map(|profile| {
-                profile
-                    .recovery_status
-                    .contains("content keys restored: false")
-            })
+            .map(|profile| profile
+                .recovery_status
+                .contains("content keys restored: false"))
             .unwrap_or(false));
         assert!(state
             .events
@@ -2092,6 +2142,85 @@ mod tests {
         assert!(ok.verified);
         assert!(app_snapshot().friend.verified);
         assert!(load_state().friend_verified);
+    }
+
+    #[test]
+    fn device_pairing_payload_commands_accept_and_reject_strings(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("pairing-flow");
+        let initial = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        assert_eq!(initial.devices.len(), 1);
+
+        let payload = create_device_pairing_payload(CreateDevicePairingPayloadRequest {
+            requested_label: "Phone".to_owned(),
+            current_epoch: Some(10),
+            valid_for_epochs: Some(2),
+        });
+        assert!(payload.rejected_reason.is_none());
+        assert!(payload.payload.contains("signature"));
+        assert_eq!(payload.expires_epoch, 12);
+
+        let accepted = accept_device_pairing_payload(AcceptDevicePairingPayloadRequest {
+            payload: payload.payload.clone(),
+            device_name: Some("Phone".to_owned()),
+            current_epoch: Some(11),
+        });
+        assert_eq!(accepted.devices.len(), 2);
+        assert!(accepted
+            .events
+            .iter()
+            .any(|event| event.kind == "device.paired"));
+
+        let expired = accept_device_pairing_payload(AcceptDevicePairingPayloadRequest {
+            payload: payload.payload.clone(),
+            device_name: Some("Tablet".to_owned()),
+            current_epoch: Some(13),
+        });
+        assert_eq!(expired.devices.len(), 2);
+        assert!(expired.events.iter().any(|event| {
+            event.kind == "device.pairing_rejected" && event.summary.contains("expired")
+        }));
+
+        let mut tampered: DevicePairingPayload = serde_json::from_str(&payload.payload)?;
+        tampered.requested_label = "Mallory phone".to_owned();
+        let tampered = serde_json::to_string(&tampered)?;
+        let rejected = accept_device_pairing_payload(AcceptDevicePairingPayloadRequest {
+            payload: tampered,
+            device_name: Some("Mallory".to_owned()),
+            current_epoch: Some(11),
+        });
+        assert_eq!(rejected.devices.len(), 2);
+        assert!(rejected.events.iter().any(|event| {
+            event.kind == "device.pairing_rejected" && event.summary.contains("signature")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_command_composes_with_device_count_without_content_keys() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("pairing-recovery");
+        let state = recover_user(RecoverUserRequest {
+            display_name: "Alice recovered".to_owned(),
+            recovery_code: "paper-coral-falcon".to_owned(),
+            device_name: Some("Recovered desktop".to_owned()),
+            recovery_room_memberships: vec!["Pairing Lab".to_owned()],
+            recovered_device_count: Some(2),
+            use_sealed_account_backup: false,
+        });
+        assert_eq!(state.devices.len(), 2);
+        assert!(state.groups.iter().any(|group| group.name == "Pairing Lab"));
+        assert!(state
+            .profile
+            .as_ref()
+            .map(|profile| profile
+                .recovery_status
+                .contains("content keys restored: false"))
+            .unwrap_or(false));
     }
 
     #[test]
