@@ -22,6 +22,12 @@ use zeroize::Zeroize;
 const ENVELOPE_FORMAT: &str = "discrypt.appdb.encrypted.v1";
 const DEFAULT_WRAPPING_KEY_ID: &str = "local-appdb-wrapping-key-v1";
 
+pub use crate::app_db::{
+    quarantine_corrupt_store, validate_observed_schema, AppDbColumn, AppDbError,
+    AppDbMigrationPlan, AppDbSchema, AppDbTable, MigrationDirection, QuarantinedAppDb,
+    APP_DB_SCHEMA_VERSION, MIN_SUPPORTED_APP_DB_SCHEMA_VERSION, REQUIRED_TABLES,
+};
+
 /// Local keychain boundary used by the encrypted app DB.
 ///
 /// Implementations should store the wrapping key in an OS/platform keychain or
@@ -1111,22 +1117,6 @@ mod tests {
         for required in REQUIRED_TABLES {
             assert!(AppDbSchema::current().table(required).is_some());
         }
-        Ok(())
-    }
-
-    #[test]
-    fn migration_planner_rejects_future_versions_and_noops_current() -> Result<(), AppDbError> {
-        let noop = AppDbMigrationPlan::plan(APP_DB_SCHEMA_VERSION, APP_DB_SCHEMA_VERSION)?;
-        assert_eq!(noop.direction, MigrationDirection::Noop);
-        assert!(noop.is_empty());
-
-        assert!(matches!(
-            AppDbMigrationPlan::plan(APP_DB_SCHEMA_VERSION, APP_DB_SCHEMA_VERSION + 1),
-            Err(AppDbError::UnsupportedFutureVersion {
-                version,
-                current: APP_DB_SCHEMA_VERSION,
-            }) if version == APP_DB_SCHEMA_VERSION + 1
-        ));
         Ok(())
     }
 
