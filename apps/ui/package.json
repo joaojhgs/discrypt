@@ -49,7 +49,8 @@
     "test:abuse-g117": "node ../../scripts/check-abuse-g117.mjs",
     "test:abuse-g118": "node ../../scripts/check-abuse-g118.mjs",
     "test:abuse-g119": "node ../../scripts/check-abuse-g119.mjs",
-    "test:abuse-g120": "node ../../scripts/check-abuse-g120.mjs"
+    "test:abuse-g120": "node ../../scripts/check-abuse-g120.mjs",
+    "test:cargo-deny-g121": "node ../../scripts/check-cargo-deny-g121.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

@@ -92,6 +92,9 @@ user profile state.
 
 Required gates for this decision:
 
+0. `npm --prefix apps/ui run test:cargo-deny-g121` runs the full
+   `cargo deny check --hide-inclusion-graph` policy and fails on advisory,
+   license, wildcard, unknown-registry, or unknown-git violations.
 1. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
    wiring for cargo-audit, cargo-deny, npm audit, SBOM generation, license policy,
    source policy, lockfiles, and reproducibility assumptions.
