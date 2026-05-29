@@ -214,22 +214,16 @@ struct PersistedAppState {
 static APP_STATE: OnceLock<Mutex<PersistedAppState>> = OnceLock::new();
 
 /// Tauri command: return the initial app snapshot for the React shell.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn app_snapshot() -> AppSnapshot {
     with_state(|state| state.snapshot.clone())
 }
 
 /// Tauri command: return the full command-backed app state for the React shell.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn app_state() -> AppStateView {
     with_state(|state| state.to_view())
 }
 
 /// Tauri command: verify a user-confirmed safety-number comparison and persist success.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerificationResult {
     let result = core_verify_safety_number(request);
     if result.verified {
@@ -245,8 +239,6 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
 }
 
 /// Tauri command: save theme/template preferences.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
     mutate_state(|state| {
         state.preferences = UiPreferencesView {
@@ -258,8 +250,6 @@ pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
 }
 
 /// Tauri command: create a local-first group and make it active.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn create_group(request: CreateGroupRequest) -> AppStateView {
     mutate_state(|state| {
         let name = normalize_label(&request.name, "private lab");
@@ -281,8 +271,6 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
 }
 
 /// Tauri command: join a local-first group from an invite.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn join_group(request: JoinGroupRequest) -> AppStateView {
     mutate_state(|state| {
         let name = normalize_label(&request.group_name, "joined enclave");
@@ -302,8 +290,6 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
 }
 
 /// Tauri command: create a channel in the active group.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
     mutate_state(|state| {
         let channel = ChannelView {
@@ -329,8 +315,6 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
 }
 
 /// Tauri command: create an invite for the active group.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
     mutate_state(|state| {
         let sequence = state.next_sequence;
@@ -356,8 +340,6 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
 }
 
 /// Tauri command: append a message to the active local timeline.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn send_message(request: SendMessageRequest) -> AppStateView {
     mutate_state(|state| {
         let body = request.body.trim();
@@ -383,8 +365,6 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
 }
 
 /// Tauri command: join the active voice room.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn join_voice() -> AppStateView {
     mutate_state(|state| {
         state.voice.joined = true;
@@ -401,8 +381,6 @@ pub fn join_voice() -> AppStateView {
 }
 
 /// Tauri command: leave the active voice room.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn leave_voice() -> AppStateView {
     mutate_state(|state| {
         state.voice.joined = false;
@@ -414,8 +392,6 @@ pub fn leave_voice() -> AppStateView {
 }
 
 /// Tauri command: persist local self-mute state.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
     mutate_state(|state| {
         state.voice.self_muted = request.muted;
@@ -438,8 +414,6 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
 }
 
 /// Tauri command: persist a participant speaker volume.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
     mutate_state(|state| {
         let volume = request.volume.min(100);
@@ -457,29 +431,21 @@ pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
 }
 
 /// Tauri command: return recent command-backed app events for polling clients.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn poll_app_events() -> Vec<AppEventView> {
     with_state(|state| state.events.clone())
 }
 
 /// Tauri command: return the mandatory cooperative-deletion warning copy.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn deletion_warning() -> String {
     app_snapshot().security_copy.deletion
 }
 
 /// Tauri command: return the metadata-minimization caveat copy.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn metadata_warning() -> String {
     app_snapshot().security_copy.metadata
 }
 
 /// E2E command-health smoke used by CI and the multinode harness.
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-#[must_use]
 pub fn command_health() -> CommandHealth {
     let snapshot = app_snapshot();
     let verification = verify_safety_number(SafetyVerificationRequest {
@@ -503,38 +469,126 @@ pub fn command_health() -> CommandHealth {
     }
 }
 
-/// Build and type-check the Tauri command handler registration.
+/// Tauri IPC wrappers live in a child module because Tauri 2.11 command macros
+/// export helper macros at crate root for visible commands. Keeping wrappers out
+/// of the crate root avoids helper-name collisions while the public functions
+/// above remain directly testable without the Tauri runtime feature.
 #[cfg(feature = "tauri-runtime")]
-#[must_use]
-pub fn command_handler<R: tauri::Runtime>(
-) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![
-        app_snapshot,
-        app_state,
-        verify_safety_number,
-        save_preferences,
-        create_group,
-        join_group,
-        create_channel,
-        create_invite,
-        send_message,
-        join_voice,
-        leave_voice,
-        set_self_mute,
-        set_speaker_volume,
-        poll_app_events,
-        deletion_warning,
-        metadata_warning,
-        command_health
-    ]
+mod ipc_commands {
+    use super::*;
+
+    #[tauri::command]
+    pub(super) fn app_snapshot() -> AppSnapshot {
+        super::app_snapshot()
+    }
+
+    #[tauri::command]
+    pub(super) fn app_state() -> AppStateView {
+        super::app_state()
+    }
+
+    #[tauri::command]
+    pub(super) fn verify_safety_number(
+        request: SafetyVerificationRequest,
+    ) -> SafetyVerificationResult {
+        super::verify_safety_number(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
+        super::save_preferences(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn create_group(request: CreateGroupRequest) -> AppStateView {
+        super::create_group(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn join_group(request: JoinGroupRequest) -> AppStateView {
+        super::join_group(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn create_channel(request: CreateChannelRequest) -> AppStateView {
+        super::create_channel(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn create_invite(request: CreateInviteRequest) -> AppStateView {
+        super::create_invite(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn send_message(request: SendMessageRequest) -> AppStateView {
+        super::send_message(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn join_voice() -> AppStateView {
+        super::join_voice()
+    }
+
+    #[tauri::command]
+    pub(super) fn leave_voice() -> AppStateView {
+        super::leave_voice()
+    }
+
+    #[tauri::command]
+    pub(super) fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
+        super::set_self_mute(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
+        super::set_speaker_volume(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn poll_app_events() -> Vec<AppEventView> {
+        super::poll_app_events()
+    }
+
+    #[tauri::command]
+    pub(super) fn deletion_warning() -> String {
+        super::deletion_warning()
+    }
+
+    #[tauri::command]
+    pub(super) fn metadata_warning() -> String {
+        super::metadata_warning()
+    }
+
+    #[tauri::command]
+    pub(super) fn command_health() -> CommandHealth {
+        super::command_health()
+    }
 }
 
 /// Run the native Tauri shell with the command surface registered for frontend IPC.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .invoke_handler(command_handler())
+    tauri::Builder::<tauri::Wry>::default()
+        .invoke_handler(tauri::generate_handler![
+            ipc_commands::app_snapshot,
+            ipc_commands::app_state,
+            ipc_commands::verify_safety_number,
+            ipc_commands::save_preferences,
+            ipc_commands::create_group,
+            ipc_commands::join_group,
+            ipc_commands::create_channel,
+            ipc_commands::create_invite,
+            ipc_commands::send_message,
+            ipc_commands::join_voice,
+            ipc_commands::leave_voice,
+            ipc_commands::set_self_mute,
+            ipc_commands::set_speaker_volume,
+            ipc_commands::poll_app_events,
+            ipc_commands::deletion_warning,
+            ipc_commands::metadata_warning,
+            ipc_commands::command_health
+        ])
         .run(tauri::generate_context!())
         .expect("error while running discrypt Tauri application");
 }
