@@ -1183,6 +1183,7 @@ dependencies = [
 name = "discrypt-mls-delivery"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "discrypt-mls-core",
  "ed25519-dalek",
  "hex",

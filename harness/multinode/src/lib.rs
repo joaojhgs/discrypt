@@ -721,8 +721,10 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     use discrypt_mls_delivery::{
         detect_fork_or_replay, equal_confirmation_tags, order_application_events, plan_repair,
         repair_to_winner, summary, ApplicationEvent, CatchUpBundle, CommitEnvelope, DeliveryError,
-        DeliveryState, ForkEvidence, ForkStatus, TextMessageEnvelope, TextMessageEnvelopeInput,
-        TextRetentionMetadata, WelcomePackage,
+        DeliveryState, ForkEvidence, ForkStatus, InMemoryTextAuthorLog, InMemoryTextSendEvents,
+        InMemoryTextTransport, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundPipeline,
+        TextOutboundRequest, TextRetentionMetadata, TextSelectedRoute, TextSendEventKind,
+        WelcomePackage,
     };
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
@@ -745,10 +747,56 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         },
         &text_signing_key,
     )?;
+    let mut outbound_log = InMemoryTextAuthorLog::default();
+    let mut outbound_transport = InMemoryTextTransport::default();
+    let mut outbound_events = InMemoryTextSendEvents::default();
+    let outbound_receipt = TextOutboundPipeline::new(
+        &mut outbound_log,
+        &mut outbound_transport,
+        &mut outbound_events,
+    )
+    .send(
+        TextOutboundRequest {
+            group_id: "lab".to_owned(),
+            channel_id: "general".to_owned(),
+            epoch: 7,
+            sender_leaf: 1,
+            sender_device_id: "alice-laptop".to_owned(),
+            sequence: 2,
+            message_id: "alice-pipeline-2".to_owned(),
+            retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
+            plaintext: text_plaintext.to_vec(),
+            sent_at_ms: 1,
+        },
+        TextSelectedRoute {
+            session_id: "text-session".to_owned(),
+            route_label: "overlay-hop".to_owned(),
+            overlay_hops: 2,
+            ciphertext_only: true,
+        },
+        &text_key,
+        &text_signing_key,
+    )?;
+    let pipeline_send_ready = outbound_log.entries.len() == 1
+        && outbound_transport.frames.len() == 1
+        && outbound_events
+            .events
+            .iter()
+            .map(|event| &event.kind)
+            .collect::<Vec<_>>()
+            == vec![&TextSendEventKind::Pending, &TextSendEventKind::Delivered]
+        && !outbound_receipt
+            .envelope
+            .contains_plaintext_sample(text_plaintext)
+        && outbound_receipt
+            .envelope
+            .verify("lab", &text_signing_key.verifying_key())
+            == Ok(());
     let opened_text = xor_text_ciphertext(&text_key, &text_envelope.content_ciphertext);
     let text_e2e_roundtrip = opened_text == text_plaintext
         && text_envelope.content_ciphertext != text_plaintext
-        && text_envelope.verify("lab", &text_signing_key.verifying_key()) == Ok(());
+        && text_envelope.verify("lab", &text_signing_key.verifying_key()) == Ok(())
+        && pipeline_send_ready;
 
     let laptop_entry = AuthorLogEntry::new(
         1,

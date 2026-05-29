@@ -12,6 +12,8 @@
 //! feature matching the claimed runtime capability.
 
 pub mod production_status;
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +45,15 @@ pub enum DeliveryError {
     /// Text message envelope signature verification failed.
     #[error("text message envelope signature verification failed")]
     TextMessageSignatureVerificationFailed,
+    /// Text payload encryption failed.
+    #[error("text message encryption failed")]
+    TextMessageEncryptionFailed,
+    /// Outbound text route is not ciphertext-only.
+    #[error("text outbound route is not ciphertext-only")]
+    TextOutboundRouteNotCiphertextOnly,
+    /// Outbound text pipeline adapter failed.
+    #[error("text outbound adapter failed: {0}")]
+    TextOutboundAdapter(String),
 }
 
 /// Compact state summary exchanged during catch-up.
@@ -290,6 +301,14 @@ impl TextMessageEnvelope {
         out
     }
 
+    /// Canonical signed bytes carried over text/control transport and durable history.
+    #[must_use]
+    pub fn canonical_signed_bytes(&self) -> Vec<u8> {
+        let mut out = self.canonical_unsigned_bytes();
+        push_bytes(&mut out, &self.signature);
+        out
+    }
+
     fn validate_unsigned(&self) -> Result<(), DeliveryError> {
         if self.version != TEXT_MESSAGE_ENVELOPE_VERSION {
             return Err(DeliveryError::InvalidTextMessageEnvelope(format!(
@@ -342,6 +361,377 @@ fn push_str(out: &mut Vec<u8>, value: &str) {
 fn push_bytes(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(&(value.len() as u64).to_be_bytes());
     out.extend_from_slice(value);
+}
+
+/// Request accepted by the outbound text send pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextOutboundRequest {
+    /// Raw group id kept inside local Rust services; envelope stores only its commitment.
+    pub group_id: String,
+    /// Channel id whose history receives this message.
+    pub channel_id: String,
+    /// MLS epoch used for text exporter/content encryption.
+    pub epoch: u64,
+    /// Sender MLS leaf in the epoch.
+    pub sender_leaf: u32,
+    /// Stable sender device id.
+    pub sender_device_id: String,
+    /// Per-author monotonic sequence.
+    pub sequence: u64,
+    /// Stable message id.
+    pub message_id: String,
+    /// Authenticated retention metadata.
+    pub retention: TextRetentionMetadata,
+    /// Plaintext body that must not cross storage, relay, or UI transport boundaries.
+    pub plaintext: Vec<u8>,
+    /// Deterministic local send timestamp.
+    pub sent_at_ms: u64,
+}
+
+/// Ciphertext-only route selected for outbound text/control data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextSelectedRoute {
+    /// Transport session carrying the frame.
+    pub session_id: String,
+    /// Human/debug route label, such as direct, overlay, or TURN.
+    pub route_label: String,
+    /// Number of overlay hops, if the selected route uses relays.
+    pub overlay_hops: u8,
+    /// True only when every transport/overlay leg is ciphertext-only.
+    pub ciphertext_only: bool,
+}
+
+/// Durable author-log entry persisted after local send encryption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextAuthorLogEnvelope {
+    /// Channel id whose history owns the entry.
+    pub channel_id: String,
+    /// Full signed encrypted envelope.
+    pub envelope: TextMessageEnvelope,
+    /// Deterministic local send timestamp.
+    pub sent_at_ms: u64,
+}
+
+/// Opaque frame handed to text/control transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextOutboundFrame {
+    /// Transport session carrying the frame.
+    pub session_id: String,
+    /// Route label selected by transport/overlay planning.
+    pub route_label: String,
+    /// Canonical signed encrypted envelope bytes.
+    pub payload: Vec<u8>,
+}
+
+/// Send lifecycle event kinds emitted to local UI/command consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextSendEventKind {
+    /// Message was encrypted, persisted, and queued for transport.
+    Pending,
+    /// Message frame was accepted by the selected transport/overlay.
+    Delivered,
+    /// Send failed; see event error text.
+    Error,
+}
+
+/// Local event emitted by the outbound text send pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextSendEvent {
+    /// Message id being reported.
+    pub message_id: String,
+    /// Event kind.
+    pub kind: TextSendEventKind,
+    /// Optional adapter/error text for failed sends.
+    pub error: Option<String>,
+}
+
+impl TextSendEvent {
+    fn pending(message_id: &str) -> Self {
+        Self {
+            message_id: message_id.to_owned(),
+            kind: TextSendEventKind::Pending,
+            error: None,
+        }
+    }
+
+    fn delivered(message_id: &str) -> Self {
+        Self {
+            message_id: message_id.to_owned(),
+            kind: TextSendEventKind::Delivered,
+            error: None,
+        }
+    }
+
+    fn error(message_id: &str, error: &DeliveryError) -> Self {
+        Self {
+            message_id: message_id.to_owned(),
+            kind: TextSendEventKind::Error,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// Result of a successful outbound text send.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextSendReceipt {
+    /// Stable message id.
+    pub message_id: String,
+    /// Signed encrypted envelope persisted and sent.
+    pub envelope: TextMessageEnvelope,
+    /// Route selected for the transport frame.
+    pub route: TextSelectedRoute,
+}
+
+/// Author-log persistence seam used by the outbound text pipeline.
+pub trait TextAuthorLogStore {
+    /// Persist one signed encrypted author-log envelope.
+    fn append_author_log(&mut self, entry: TextAuthorLogEnvelope) -> Result<(), DeliveryError>;
+}
+
+/// Text/control transport seam used by the outbound text pipeline.
+pub trait TextOutboundTransport {
+    /// Send one already-protected text frame over the selected ciphertext-only route.
+    fn send_text_frame(
+        &mut self,
+        route: &TextSelectedRoute,
+        frame: TextOutboundFrame,
+    ) -> Result<(), DeliveryError>;
+}
+
+/// Event sink for local pending/delivered/error send status.
+pub trait TextSendEventSink {
+    /// Emit one local send lifecycle event.
+    fn emit_text_send_event(&mut self, event: TextSendEvent) -> Result<(), DeliveryError>;
+}
+
+/// Production text-send coordinator over storage, transport, and local event seams.
+pub struct TextOutboundPipeline<'a, L, T, E> {
+    author_log: &'a mut L,
+    transport: &'a mut T,
+    events: &'a mut E,
+}
+
+impl<'a, L, T, E> TextOutboundPipeline<'a, L, T, E>
+where
+    L: TextAuthorLogStore,
+    T: TextOutboundTransport,
+    E: TextSendEventSink,
+{
+    /// Bind the pipeline to concrete adapter seams.
+    #[must_use]
+    pub fn new(author_log: &'a mut L, transport: &'a mut T, events: &'a mut E) -> Self {
+        Self {
+            author_log,
+            transport,
+            events,
+        }
+    }
+
+    /// Encrypt, sign, persist, send, and emit lifecycle events for one text message.
+    pub fn send(
+        &mut self,
+        request: TextOutboundRequest,
+        route: TextSelectedRoute,
+        text_exporter_secret: &[u8],
+        signing_key: &SigningKey,
+    ) -> Result<TextSendReceipt, DeliveryError> {
+        let message_id = request.message_id.clone();
+        match self.send_inner(request, route, text_exporter_secret, signing_key) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                let _ = self
+                    .events
+                    .emit_text_send_event(TextSendEvent::error(&message_id, &error));
+                Err(error)
+            }
+        }
+    }
+
+    fn send_inner(
+        &mut self,
+        request: TextOutboundRequest,
+        route: TextSelectedRoute,
+        text_exporter_secret: &[u8],
+        signing_key: &SigningKey,
+    ) -> Result<TextSendReceipt, DeliveryError> {
+        if !route.ciphertext_only {
+            return Err(DeliveryError::TextOutboundRouteNotCiphertextOnly);
+        }
+        let aad = text_message_encryption_aad(&request)?;
+        let content_key = derive_text_message_content_key(text_exporter_secret, &request);
+        let nonce = text_message_nonce(&content_key, &request.message_id, request.sequence);
+        let content_ciphertext =
+            encrypt_text_plaintext(&content_key, &nonce, &aad, &request.plaintext)?;
+        let envelope = TextMessageEnvelope::sign(
+            &request.group_id,
+            TextMessageEnvelopeInput {
+                epoch: request.epoch,
+                sender_leaf: request.sender_leaf,
+                sender_device_id: request.sender_device_id,
+                sequence: request.sequence,
+                message_id: request.message_id.clone(),
+                retention: request.retention,
+                content_ciphertext,
+            },
+            signing_key,
+        )?;
+        self.author_log.append_author_log(TextAuthorLogEnvelope {
+            channel_id: request.channel_id,
+            envelope: envelope.clone(),
+            sent_at_ms: request.sent_at_ms,
+        })?;
+        self.events
+            .emit_text_send_event(TextSendEvent::pending(&request.message_id))?;
+        self.transport.send_text_frame(
+            &route,
+            TextOutboundFrame {
+                session_id: route.session_id.clone(),
+                route_label: route.route_label.clone(),
+                payload: envelope.canonical_signed_bytes(),
+            },
+        )?;
+        self.events
+            .emit_text_send_event(TextSendEvent::delivered(&request.message_id))?;
+        Ok(TextSendReceipt {
+            message_id: request.message_id,
+            envelope,
+            route,
+        })
+    }
+}
+
+/// In-memory author-log adapter for deterministic harnesses and service tests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemoryTextAuthorLog {
+    /// Persisted entries in append order.
+    pub entries: Vec<TextAuthorLogEnvelope>,
+}
+
+impl TextAuthorLogStore for InMemoryTextAuthorLog {
+    fn append_author_log(&mut self, entry: TextAuthorLogEnvelope) -> Result<(), DeliveryError> {
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
+/// In-memory text transport adapter for deterministic harnesses and service tests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemoryTextTransport {
+    /// Frames accepted by transport.
+    pub frames: Vec<TextOutboundFrame>,
+    /// Force next send to fail for error-path verification.
+    pub fail_next: bool,
+}
+
+impl TextOutboundTransport for InMemoryTextTransport {
+    fn send_text_frame(
+        &mut self,
+        route: &TextSelectedRoute,
+        frame: TextOutboundFrame,
+    ) -> Result<(), DeliveryError> {
+        if !route.ciphertext_only {
+            return Err(DeliveryError::TextOutboundRouteNotCiphertextOnly);
+        }
+        if self.fail_next {
+            self.fail_next = false;
+            return Err(DeliveryError::TextOutboundAdapter(
+                "transport send failed".to_owned(),
+            ));
+        }
+        self.frames.push(frame);
+        Ok(())
+    }
+}
+
+/// In-memory event sink for deterministic harnesses and service tests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemoryTextSendEvents {
+    /// Emitted lifecycle events in order.
+    pub events: Vec<TextSendEvent>,
+}
+
+impl TextSendEventSink for InMemoryTextSendEvents {
+    fn emit_text_send_event(&mut self, event: TextSendEvent) -> Result<(), DeliveryError> {
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+/// Derive a text message content-encryption key from Rust-only exporter material.
+#[must_use]
+pub fn derive_text_message_content_key(
+    text_exporter_secret: &[u8],
+    request: &TextOutboundRequest,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"discrypt-text-message-content-key-v1");
+    push_str_for_hash(&mut h, &request.group_id);
+    h.update(request.epoch.to_be_bytes());
+    h.update(request.sender_leaf.to_be_bytes());
+    push_str_for_hash(&mut h, &request.sender_device_id);
+    h.update(request.sequence.to_be_bytes());
+    push_str_for_hash(&mut h, &request.message_id);
+    h.update((text_exporter_secret.len() as u64).to_be_bytes());
+    h.update(text_exporter_secret);
+    h.finalize().into()
+}
+
+fn text_message_encryption_aad(request: &TextOutboundRequest) -> Result<Vec<u8>, DeliveryError> {
+    let mut out = Vec::new();
+    push_bytes(&mut out, b"discrypt-text-message-aad-v1");
+    out.extend_from_slice(&group_id_commitment(&request.group_id)?);
+    out.extend_from_slice(&request.epoch.to_be_bytes());
+    out.extend_from_slice(&request.sender_leaf.to_be_bytes());
+    push_str(&mut out, &request.sender_device_id);
+    out.extend_from_slice(&request.sequence.to_be_bytes());
+    push_str(&mut out, &request.message_id);
+    push_str(&mut out, &request.retention.policy);
+    out.extend_from_slice(&request.retention.created_at_ms.to_be_bytes());
+    match request.retention.expires_at_ms {
+        Some(expires_at_ms) => {
+            out.push(1);
+            out.extend_from_slice(&expires_at_ms.to_be_bytes());
+        }
+        None => out.push(0),
+    }
+    out.push(u8::from(request.retention.delete_after_read));
+    Ok(out)
+}
+
+fn text_message_nonce(content_key: &[u8; 32], message_id: &str, sequence: u64) -> [u8; 12] {
+    let mut h = Sha256::new();
+    h.update(b"discrypt-text-message-nonce-v1");
+    h.update(content_key);
+    h.update(sequence.to_be_bytes());
+    push_str_for_hash(&mut h, message_id);
+    let digest = h.finalize();
+    let mut nonce = [0; 12];
+    nonce.copy_from_slice(&digest[..12]);
+    nonce
+}
+
+fn encrypt_text_plaintext(
+    content_key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, DeliveryError> {
+    let cipher = Aes256Gcm::new_from_slice(content_key)
+        .map_err(|_| DeliveryError::TextMessageEncryptionFailed)?;
+    cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| DeliveryError::TextMessageEncryptionFailed)
+}
+
+fn push_str_for_hash(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 /// Application event carried alongside ordered MLS delivery.
@@ -798,6 +1188,127 @@ mod tests {
             Err(DeliveryError::InvalidTextMessageEnvelope(_))
         ));
         Ok(())
+    }
+
+    fn outbound_request(message_id: &str) -> TextOutboundRequest {
+        TextOutboundRequest {
+            group_id: "group/private-lab".to_owned(),
+            channel_id: "general".to_owned(),
+            epoch: 7,
+            sender_leaf: 1,
+            sender_device_id: "alice-laptop".to_owned(),
+            sequence: 2,
+            message_id: message_id.to_owned(),
+            retention: retention(),
+            plaintext: b"hello plaintext".to_vec(),
+            sent_at_ms: 1_234,
+        }
+    }
+
+    fn selected_route(ciphertext_only: bool) -> TextSelectedRoute {
+        TextSelectedRoute {
+            session_id: "session-text".to_owned(),
+            route_label: "overlay-hop".to_owned(),
+            overlay_hops: 2,
+            ciphertext_only,
+        }
+    }
+
+    #[test]
+    fn outbound_text_pipeline_persists_sends_and_emits_events() -> Result<(), DeliveryError> {
+        let signer = signing_key(9);
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport::default();
+        let mut events = InMemoryTextSendEvents::default();
+        let mut pipeline = TextOutboundPipeline::new(&mut log, &mut transport, &mut events);
+        let receipt = pipeline.send(
+            outbound_request("msg-pipeline"),
+            selected_route(true),
+            b"openmls-text-exporter-secret",
+            &signer,
+        )?;
+
+        assert_eq!(receipt.message_id, "msg-pipeline");
+        assert_eq!(receipt.route.route_label, "overlay-hop");
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].channel_id, "general");
+        assert_eq!(log.entries[0].sent_at_ms, 1_234);
+        assert_eq!(transport.frames.len(), 1);
+        assert_eq!(transport.frames[0].session_id, "session-text");
+        assert_eq!(
+            transport.frames[0].payload,
+            receipt.envelope.canonical_signed_bytes()
+        );
+        assert!(!receipt
+            .envelope
+            .contains_plaintext_sample(b"hello plaintext"));
+        assert_ne!(receipt.envelope.content_ciphertext, b"hello plaintext");
+        receipt
+            .envelope
+            .verify("group/private-lab", &signer.verifying_key())?;
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .map(|event| &event.kind)
+                .collect::<Vec<_>>(),
+            vec![&TextSendEventKind::Pending, &TextSendEventKind::Delivered]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_text_pipeline_emits_error_for_failed_transport() {
+        let signer = signing_key(10);
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport {
+            frames: Vec::new(),
+            fail_next: true,
+        };
+        let mut events = InMemoryTextSendEvents::default();
+        let mut pipeline = TextOutboundPipeline::new(&mut log, &mut transport, &mut events);
+        let result = pipeline.send(
+            outbound_request("msg-error"),
+            selected_route(true),
+            b"openmls-text-exporter-secret",
+            &signer,
+        );
+
+        assert!(matches!(result, Err(DeliveryError::TextOutboundAdapter(_))));
+        assert_eq!(log.entries.len(), 1);
+        assert!(transport.frames.is_empty());
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .map(|event| &event.kind)
+                .collect::<Vec<_>>(),
+            vec![&TextSendEventKind::Pending, &TextSendEventKind::Error]
+        );
+    }
+
+    #[test]
+    fn outbound_text_pipeline_rejects_non_ciphertext_route() {
+        let signer = signing_key(11);
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport::default();
+        let mut events = InMemoryTextSendEvents::default();
+        let mut pipeline = TextOutboundPipeline::new(&mut log, &mut transport, &mut events);
+        let result = pipeline.send(
+            outbound_request("msg-bad-route"),
+            selected_route(false),
+            b"openmls-text-exporter-secret",
+            &signer,
+        );
+
+        assert_eq!(
+            result,
+            Err(DeliveryError::TextOutboundRouteNotCiphertextOnly)
+        );
+        assert!(log.entries.is_empty());
+        assert!(transport.frames.is_empty());
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].kind, TextSendEventKind::Error);
     }
 
     #[test]

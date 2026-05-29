@@ -17,6 +17,7 @@ production-media = ["mls_core/production-media"]
 production-storage = ["mls_core/production-storage"]
 
 [dependencies]
+aes-gcm = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
