@@ -236,6 +236,18 @@ impl PartialOrd for CanonicalEventRef {
     }
 }
 
+/// Order governance events with the single Discrypt application-event comparator:
+/// epoch → committer/author leaf index in the last common accepted tree → signed content hash.
+#[must_use]
+pub fn order_governance_events<I>(events: I) -> Vec<GovernanceEvent>
+where
+    I: IntoIterator<Item = GovernanceEvent>,
+{
+    let mut events = events.into_iter().collect::<Vec<_>>();
+    events.sort_by_key(GovernanceEvent::canonical_ref);
+    events
+}
+
 /// Ordered governance log.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GovernanceLog {
@@ -243,10 +255,9 @@ pub struct GovernanceLog {
 }
 
 impl GovernanceLog {
-    /// Insert then sort by canonical comparator.
+    /// Insert then sort by the canonical last-common-tree comparator.
     pub fn append(&mut self, event: GovernanceEvent) {
-        self.events.push(event);
-        self.events.sort_by_key(GovernanceEvent::canonical_ref);
+        self.events = order_governance_events(self.events.drain(..).chain([event]));
     }
 
     /// Ordered events.
@@ -308,8 +319,7 @@ impl GovernanceState {
     where
         I: IntoIterator<Item = GovernanceEvent>,
     {
-        let mut events = events.into_iter().collect::<Vec<_>>();
-        events.sort_by_key(GovernanceEvent::canonical_ref);
+        let events = order_governance_events(events);
         let evicted_this_epoch = events
             .iter()
             .filter_map(|event| match event.action {
@@ -378,6 +388,94 @@ mod tests {
         log.append(a);
         log.append(b);
         assert_eq!(log.events()[0].committer, 1);
+    }
+
+    #[test]
+    fn canonical_order_uses_epoch_last_common_leaf_then_signed_content_hash() {
+        let signer = SigningKey::generate(&mut OsRng);
+        let first_by_hash = GovernanceEvent::signed_by(
+            8,
+            5,
+            GovernanceAction::RevokeInvite {
+                invite_id: "hash-a".into(),
+            },
+            &signer,
+        );
+        let second_by_hash = GovernanceEvent::signed_by(
+            8,
+            5,
+            GovernanceAction::RevokeInvite {
+                invite_id: "hash-b".into(),
+            },
+            &signer,
+        );
+        let lower_leaf_later_arrival = GovernanceEvent::signed_by(
+            8,
+            2,
+            GovernanceAction::SetRetentionSeconds {
+                author: 2,
+                seconds: Some(120),
+            },
+            &signer,
+        );
+        let future_epoch =
+            GovernanceEvent::signed_by(9, 1, GovernanceAction::Ban { target: 7 }, &signer);
+
+        let mut expected_same_leaf = [first_by_hash.clone(), second_by_hash.clone()];
+        expected_same_leaf.sort_by_key(GovernanceEvent::canonical_ref);
+
+        let ordered = order_governance_events([
+            future_epoch.clone(),
+            second_by_hash.clone(),
+            lower_leaf_later_arrival.clone(),
+            first_by_hash.clone(),
+        ]);
+
+        assert_eq!(ordered[0], lower_leaf_later_arrival);
+        assert_eq!(ordered[1], expected_same_leaf[0]);
+        assert_eq!(ordered[2], expected_same_leaf[1]);
+        assert_eq!(ordered[3], future_epoch);
+        assert!(ordered
+            .windows(2)
+            .all(|pair| pair[0].canonical_ref() <= pair[1].canonical_ref()));
+    }
+
+    #[test]
+    fn canonical_resolution_returns_results_in_comparator_order() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let admin = SigningKey::generate(&mut OsRng);
+        let mut state = GovernanceState::new(10, 1);
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                10,
+                1,
+                GovernanceAction::SetRole {
+                    target: 2,
+                    role: Role::Admin,
+                },
+                &owner,
+            )),
+            Ok(())
+        );
+
+        let results = state.resolve_epoch_events([
+            GovernanceEvent::signed_by(
+                10,
+                2,
+                GovernanceAction::RevokeInvite {
+                    invite_id: "admin-arrived-first".into(),
+                },
+                &admin,
+            ),
+            GovernanceEvent::signed_by(10, 1, GovernanceAction::Ban { target: 2 }, &owner),
+        ]);
+
+        assert_eq!(
+            results,
+            vec![Ok(()), Err(GovernanceError::EvictedCommitter)]
+        );
+        assert!(state.is_banned(2));
+        assert!(!state.invite_revoked("admin-arrived-first"));
     }
 
     #[test]
