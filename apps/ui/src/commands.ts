@@ -175,6 +175,18 @@ export type AppMessageView = {
   sent_at: string;
 };
 
+export type IceTurnServerView = {
+  endpoint: string;
+  credential_declared: boolean;
+  credential_expires_at: string | null;
+};
+
+export type TransportStatusView = {
+  label: string;
+  status: string;
+  detail: string;
+};
+
 export type InviteView = {
   invite_id: string;
   invite_key: string;
@@ -185,6 +197,8 @@ export type InviteView = {
   signaling_trust_fingerprint: string;
   signaling_trust_status: string;
   endpoint_policy: string;
+  ice_stun_servers: string[];
+  ice_turn_servers: IceTurnServerView[];
   expires: string;
   expires_at: string;
   max_use: string;
@@ -251,6 +265,7 @@ export type AppState = {
   events: AppEventView[];
   event_cursor: number;
   last_command_error: CommandErrorView | null;
+  transport_status: TransportStatusView[];
   snapshot: AppSnapshot;
 };
 
@@ -501,6 +516,7 @@ const fallbackState: AppState = {
   ],
   event_cursor: 1,
   last_command_error: null,
+  transport_status: [],
   snapshot: fallbackSnapshot,
 };
 
@@ -562,7 +578,70 @@ function syncSnapshot(state: AppState): AppState {
     .reverse()
     .map((event) => event.summary);
   state.event_cursor = state.events.at(-1)?.sequence ?? 0;
+  state.transport_status = deriveTransportStatus(state);
   return state;
+}
+
+function deriveTransportStatus(state: AppState): TransportStatusView[] {
+  const latestInvite = state.invites.at(-1) ?? null;
+  const hasGroup = state.groups.length > 0;
+  const voiceJoined = Boolean(state.voice_session?.joined);
+  const hasStun = Boolean(latestInvite?.ice_stun_servers.length);
+  const hasTurn = Boolean(latestInvite?.ice_turn_servers.length);
+  const lastError = state.last_command_error;
+  return [
+    {
+      label: "signaling",
+      status: latestInvite ? "signed-endpoint-ready" : "waiting-for-invite",
+      detail: latestInvite
+        ? `Signed endpoint ${latestInvite.signaling_endpoint} with trust fingerprint ${latestInvite.signaling_trust_fingerprint}; no identity-room topology is stored by the signaling service`
+        : "Create or paste an invite before signaling can be used",
+    },
+    {
+      label: "ICE",
+      status: hasStun || hasTurn ? "configured" : "waiting-for-signed-invite",
+      detail: latestInvite
+        ? `${latestInvite.ice_stun_servers.length} STUN and ${latestInvite.ice_turn_servers.length} redacted TURN endpoint(s) parsed from signed invite metadata`
+        : "No ICE server metadata is available until an invite descriptor is present",
+    },
+    {
+      label: "direct",
+      status: voiceJoined ? "media-gated" : "no-direct-proof",
+      detail:
+        "Direct path is only shown as connected after backend state proves it; this command state has no direct route proof yet",
+    },
+    {
+      label: "overlay",
+      status: hasGroup ? "available-policy" : "idle",
+      detail:
+        "Relay-overlay policy is listed as a fallback path; ciphertext-only route proof is required before claiming active relay use",
+    },
+    {
+      label: "TURN",
+      status: hasTurn ? "configured" : "not-configured",
+      detail:
+        "TURN endpoints are redacted from signed invite metadata and are not treated as active without backend route evidence",
+    },
+    {
+      label: "degraded",
+      status: lastError ? "attention" : "clear",
+      detail: lastError
+        ? `Last command issue ${lastError.code}: ${lastError.message}`
+        : "No degraded command state is currently reported",
+    },
+    {
+      label: "reconnecting",
+      status: "idle",
+      detail:
+        "Reconnect orchestration is displayed only when event state reports reconnect attempts",
+    },
+    {
+      label: "failed",
+      status: lastError ? "last-command-error" : "clear",
+      detail: lastError?.recovery_hint ??
+        "No failed transport command is currently reported",
+    },
+  ];
 }
 
 function pushEvent(state: AppState, kind: string, summary: string): void {
@@ -757,12 +836,28 @@ type ParsedInviteMetadata = {
   signalingTrustFingerprint: string;
   signalingTrustStatus: string;
   endpointPolicy: string;
+  iceStunServers: string[];
+  iceTurnServers: IceTurnServerView[];
   expiresAt: string;
   maxUses: number;
 };
 
 function defaultSignalingEndpoint(): string {
   return "https://signaling.discrypt.invalid/v1/rendezvous";
+}
+
+function defaultIceStunServers(): string[] {
+  return ["stun:default.discrypt.invalid:3478"];
+}
+
+function defaultRedactedTurnServers(): IceTurnServerView[] {
+  return [
+    {
+      endpoint: "turns:default.discrypt.invalid:5349",
+      credential_declared: false,
+      credential_expires_at: null,
+    },
+  ];
 }
 
 function productionInviteLink(metadata: ParsedInviteMetadata): string {
@@ -775,6 +870,12 @@ function productionInviteLink(metadata: ParsedInviteMetadata): string {
     exp: metadata.expiresAt,
     max: String(metadata.maxUses),
   });
+  for (const endpoint of metadata.iceStunServers) {
+    query.append("stun", endpoint);
+  }
+  for (const server of metadata.iceTurnServers) {
+    query.append("turn", server.endpoint);
+  }
   return `discrypt://join/v1/${metadata.inviteKey}?${query.toString()}`;
 }
 
@@ -804,6 +905,12 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
     signalingTrustFingerprint,
     signalingTrustStatus,
     endpointPolicy,
+    iceStunServers: params.getAll("stun"),
+    iceTurnServers: params.getAll("turn").map((endpoint) => ({
+      endpoint,
+      credential_declared: true,
+      credential_expires_at: null,
+    })),
     expiresAt: params.get("exp") ?? "",
     maxUses: Number(params.get("max") ?? 1) || 1,
   };
@@ -1306,6 +1413,8 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
           signaling_trust_fingerprint: parsedInvite.signalingTrustFingerprint,
           signaling_trust_status: parsedInvite.signalingTrustStatus,
           endpoint_policy: parsedInvite.endpointPolicy,
+          ice_stun_servers: parsedInvite.iceStunServers,
+          ice_turn_servers: parsedInvite.iceTurnServers,
           expires: "Invite expiry from signed descriptor",
           expires_at: parsedInvite.expiresAt,
           max_use: String(parsedInvite.maxUses),
@@ -1402,6 +1511,8 @@ export async function createInvite(
           endpointPolicy,
           signalingTrustFingerprint,
           signalingTrustStatus: trustStatus,
+          iceStunServers: defaultIceStunServers(),
+          iceTurnServers: defaultRedactedTurnServers(),
           roomSecretHash,
           expiresAt,
           maxUses: parseMaxUses(maxUse),
@@ -1411,6 +1522,8 @@ export async function createInvite(
         signaling_trust_fingerprint: signalingTrustFingerprint,
         signaling_trust_status: trustStatus,
         endpoint_policy: endpointPolicy,
+        ice_stun_servers: defaultIceStunServers(),
+        ice_turn_servers: defaultRedactedTurnServers(),
         expires,
         expires_at: expiresAt,
         max_use: maxUse,

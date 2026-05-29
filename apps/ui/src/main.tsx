@@ -15,6 +15,7 @@ import {
   DirectConversationView,
   GroupView,
   InviteView,
+  TransportStatusView,
   VoiceParticipantView,
   VoiceSessionView,
   RESET_APP_CONFIRMATION_PHRASE,
@@ -599,6 +600,7 @@ function App() {
             Invite ready: {appState.invites.at(-1)?.code}
           </p>
         ) : null}
+        <TransportStatusStrip statuses={appState.transport_status} />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
           {workflow === "setup" ? (
@@ -1223,6 +1225,75 @@ function ConfigSelect({
       </select>
     </label>
   );
+}
+
+function TransportStatusStrip({ statuses }: { statuses: TransportStatusView[] }) {
+  const ordered = statuses.length
+    ? statuses
+    : [
+        {
+          label: "signaling",
+          status: "waiting-for-invite",
+          detail: "Create or paste an invite before signaling can be used",
+        },
+        {
+          label: "ICE",
+          status: "waiting-for-signed-invite",
+          detail: "No ICE server metadata is available until an invite descriptor is present",
+        },
+      ];
+  return (
+    <section
+      aria-label="Backend-derived transport status"
+      className="mx-4 mt-3 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--card)/0.82)] p-3 shadow-sm shadow-black/20 md:mx-6"
+    >
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-sm font-semibold">Transport status</p>
+          <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+            Backend-derived state only; route and media claims stay quiet until
+            command state provides evidence.
+          </p>
+        </div>
+        <Badge variant="outline">honest status</Badge>
+      </div>
+      <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+        {ordered.map((item) => (
+          <div
+            key={item.label}
+            className="min-w-0 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.30)] p-3"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+                {item.label}
+              </span>
+              <Badge variant={transportBadgeVariant(item.status)}>
+                {item.status}
+              </Badge>
+            </div>
+            <p className="mt-2 line-clamp-3 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              {item.detail}
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function transportBadgeVariant(
+  status: string,
+): React.ComponentProps<typeof Badge>["variant"] {
+  if (["configured", "signed-endpoint-ready", "clear"].includes(status)) {
+    return "success";
+  }
+  if (["attention", "last-command-error", "media-gated"].includes(status)) {
+    return "warning";
+  }
+  if (["failed"].includes(status)) {
+    return "warning";
+  }
+  return "secondary";
 }
 
 function WorkflowNav({

@@ -361,6 +361,7 @@ const allowedProductionClaimContext = [
   "facade",
   "release-gated",
   "not connected",
+  "not-connected",
   "not claimed",
   "No relay is active",
   "policy",
@@ -428,6 +429,18 @@ if (!rust.includes("honest_copy_ready")) {
 }
 if (!commands.includes("honest_copy_ready")) {
   failures.push("TS CommandHealth must carry honest_copy_ready for copy gates");
+}
+if (!rust.includes("transport_status: Vec<TransportStatusView>")) {
+  failures.push("Tauri AppStateView must expose backend-derived transport_status");
+}
+if (!commands.includes("transport_status: TransportStatusView[]")) {
+  failures.push("TS AppState must carry backend-derived transport_status");
+}
+if (!main.includes("TransportStatusStrip")) {
+  failures.push("UI must render backend-derived transport statuses");
+}
+if (!main.includes("Backend-derived state only")) {
+  failures.push("transport status UI must explain that connectivity claims require backend evidence");
 }
 if (!main.includes("Danger zone") || !main.includes("resetPhrase !== RESET_APP_CONFIRMATION_PHRASE")) {
   failures.push("UI must gate destructive reset behind the typed danger-zone confirmation phrase");

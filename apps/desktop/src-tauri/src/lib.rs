@@ -370,6 +370,17 @@ pub struct CommandErrorView {
     pub recovery_hint: String,
 }
 
+/// Honest backend-derived transport/connectivity status for UI display.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransportStatusView {
+    /// Surface label such as signaling, ICE, direct, overlay, TURN, degraded, reconnecting, failed.
+    pub label: String,
+    /// Current backend-derived state.
+    pub status: String,
+    /// Human-readable caveat/evidence copy.
+    pub detail: String,
+}
+
 /// Confirmation phrase required before destructive local-state reset.
 pub const RESET_APP_CONFIRMATION_PHRASE: &str = "DELETE LOCAL DISCRYPT STATE";
 
@@ -414,6 +425,9 @@ pub struct AppStateView {
     /// Last typed command error, if the most recent mutation failed validation.
     #[serde(default)]
     pub last_command_error: Option<CommandErrorView>,
+    /// Backend-derived transport/connectivity states for honest UI status surfaces.
+    #[serde(default)]
+    pub transport_status: Vec<TransportStatusView>,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -1803,8 +1817,100 @@ impl PersistedAppState {
             events: self.events.clone(),
             event_cursor: self.latest_event_cursor(),
             last_command_error: self.last_command_error.clone(),
+            transport_status: self.transport_status(),
             snapshot: self.to_snapshot(),
         }
+    }
+
+    fn transport_status(&self) -> Vec<TransportStatusView> {
+        let latest_invite = self.invites.last();
+        let has_group = !self.groups.is_empty();
+        let voice_joined = self
+            .voice_session
+            .as_ref()
+            .map(|session| session.joined)
+            .unwrap_or(false);
+        let has_stun = latest_invite
+            .map(|invite| !invite.ice_stun_servers.is_empty())
+            .unwrap_or(false);
+        let has_turn = latest_invite
+            .map(|invite| !invite.ice_turn_servers.is_empty())
+            .unwrap_or(false);
+        let last_error = self.last_command_error.as_ref();
+        vec![
+            TransportStatusView {
+                label: "signaling".to_owned(),
+                status: latest_invite
+                    .map(|_| "signed-endpoint-ready")
+                    .unwrap_or("waiting-for-invite")
+                    .to_owned(),
+                detail: latest_invite
+                    .map(|invite| {
+                        format!(
+                            "Signed endpoint {} with trust fingerprint {}; no identity-room topology is stored by the signaling service",
+                            invite.signaling_endpoint, invite.signaling_trust_fingerprint
+                        )
+                    })
+                    .unwrap_or_else(|| "Create or paste an invite before signaling can be used".to_owned()),
+            },
+            TransportStatusView {
+                label: "ICE".to_owned(),
+                status: if has_stun || has_turn {
+                    "configured"
+                } else {
+                    "waiting-for-signed-invite"
+                }
+                .to_owned(),
+                detail: latest_invite
+                    .map(|invite| {
+                        format!(
+                            "{} STUN and {} redacted TURN endpoint(s) parsed from signed invite metadata",
+                            invite.ice_stun_servers.len(),
+                            invite.ice_turn_servers.len()
+                        )
+                    })
+                    .unwrap_or_else(|| "No ICE server metadata is available until an invite descriptor is present".to_owned()),
+            },
+            TransportStatusView {
+                label: "direct".to_owned(),
+                status: if voice_joined {
+                    "media-gated"
+                } else {
+                    "no-direct-proof"
+                }
+                .to_owned(),
+                detail: "Direct path is only shown as connected after transport/session state proves it; this command state has no direct route proof yet".to_owned(),
+            },
+            TransportStatusView {
+                label: "overlay".to_owned(),
+                status: if has_group { "available-policy" } else { "idle" }.to_owned(),
+                detail: "Relay-overlay policy is listed as a fallback path; ciphertext-only route proof is required before claiming active relay use".to_owned(),
+            },
+            TransportStatusView {
+                label: "TURN".to_owned(),
+                status: if has_turn { "configured" } else { "not-configured" }.to_owned(),
+                detail: "TURN endpoints are redacted from signed invite metadata and are not treated as active without backend route evidence".to_owned(),
+            },
+            TransportStatusView {
+                label: "degraded".to_owned(),
+                status: last_error.map(|_| "attention").unwrap_or("clear").to_owned(),
+                detail: last_error
+                    .map(|error| format!("Last command issue {}: {}", error.code, error.message))
+                    .unwrap_or_else(|| "No degraded command state is currently reported".to_owned()),
+            },
+            TransportStatusView {
+                label: "reconnecting".to_owned(),
+                status: "idle".to_owned(),
+                detail: "Reconnect orchestration is displayed only when event state reports reconnect attempts".to_owned(),
+            },
+            TransportStatusView {
+                label: "failed".to_owned(),
+                status: last_error.map(|_| "last-command-error").unwrap_or("clear").to_owned(),
+                detail: last_error
+                    .map(|error| error.recovery_hint.clone())
+                    .unwrap_or_else(|| "No failed transport command is currently reported".to_owned()),
+            },
+        ]
     }
 
     fn latest_event_cursor(&self) -> u64 {
@@ -3459,6 +3565,52 @@ mod tests {
 
         assert_eq!(signals, vec![b"opaque-offer".to_vec()]);
         Ok(())
+    }
+
+    #[test]
+    fn transport_status_surfaces_all_connectivity_states() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("transport-status-ui");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Status Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group_id = group.groups[0].group_id.clone();
+        let state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+        });
+        let labels: Vec<_> = state
+            .transport_status
+            .iter()
+            .map(|status| status.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "signaling",
+                "ICE",
+                "direct",
+                "overlay",
+                "TURN",
+                "degraded",
+                "reconnecting",
+                "failed"
+            ]
+        );
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| status.label == "signaling" && status.status == "signed-endpoint-ready"));
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| status.label == "direct" && status.status == "no-direct-proof"));
     }
 
     #[test]
