@@ -6,7 +6,9 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod appdb;
 pub mod production_status;
+pub use appdb::{sqlite_wal_path, AppDbKeychain, EncryptedAppDb, MemoryAppDbKeychain};
 pub use content_keys::KeyState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +27,15 @@ pub enum AppStoreError {
     /// In-memory store lock was poisoned.
     #[error("app store lock poisoned")]
     LockPoisoned,
+    /// Serialized state or encrypted envelope was malformed.
+    #[error("app store serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    /// App DB encryption/decryption failed.
+    #[error("app store crypto error: {0}")]
+    Crypto(&'static str),
+    /// Required keychain wrapping key is unavailable.
+    #[error("app store keychain key missing: {0}")]
+    KeychainMissing(String),
 }
 
 /// Byte-oriented local app-state store used by the core AppService.
