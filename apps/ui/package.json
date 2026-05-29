@@ -23,7 +23,8 @@
     "test:android-gate": "node ../../scripts/check-android-gate.mjs",
     "test:signaling-relay-ops": "node ../../scripts/check-signaling-relay-ops.mjs",
     "test:release-governance": "node ../../scripts/check-release-governance.mjs",
-    "test:release-verification-matrix": "node ../../scripts/check-release-verification-matrix.mjs"
+    "test:release-verification-matrix": "node ../../scripts/check-release-verification-matrix.mjs",
+    "test:security-review-g095": "node ../../scripts/check-security-review-g095.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
