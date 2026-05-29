@@ -1101,7 +1101,8 @@ pub fn command_health() -> CommandHealth {
             .all(|message| message.status.contains("not claimed"));
     CommandHealth {
         snapshot_ready: state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION,
-        verification_ready: verification_ready && identity_verification.two_profiles_verify_safety_numbers,
+        verification_ready: verification_ready
+            && identity_verification.two_profiles_verify_safety_numbers,
         app_state_ready,
         identity_ready,
         collaboration_ready: collaboration_ready

@@ -236,6 +236,14 @@ for (const entry of expectedCommands) {
 const requestTypes = [
   ["CreateUserRequest", ["display_name", "device_name"]],
   ["RecoverUserRequest", ["display_name", "recovery_code", "device_name"]],
+  [
+    "CreateDevicePairingPayloadRequest",
+    ["requested_label", "current_epoch", "valid_for_epochs"],
+  ],
+  [
+    "AcceptDevicePairingPayloadRequest",
+    ["payload", "device_name", "current_epoch"],
+  ],
   ["SavePreferencesRequest", ["theme_id", "template_id"]],
   ["StartDmRequest", ["display_name"]],
   ["CreateGroupRequest", ["name", "retention"]],

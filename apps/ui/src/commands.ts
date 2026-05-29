@@ -797,15 +797,21 @@ export async function recoverUser(
       ensureFallbackReady(displayName, deviceName);
       const recoveredDeviceCount = Math.max(
         1,
-        Math.floor(request.recovered_device_count ?? state.devices.length || 1),
+        Math.floor(request.recovered_device_count ?? (state.devices.length || 1)),
       );
       while (state.devices.length < recoveredDeviceCount) {
         const leafIndex = state.devices.length + 1;
         state.devices.push({
           device_id: `recovered-${leafIndex}-${slugify(deviceName)}`,
+          label: `${deviceName} ${leafIndex}`,
           leaf_index: leafIndex,
+          identity_key: fallbackIdentityKey(),
+          device_key: stableHash(`recovered:${deviceName}:${leafIndex}`),
           local: false,
           authorized: true,
+          revoked: false,
+          added_at_epoch: leafIndex,
+          revoked_at_epoch: null,
         });
       }
       for (const room of request.recovery_room_memberships ?? []) {
@@ -928,9 +934,15 @@ export async function acceptDevicePairingPayload(
         if (!state.devices.some((device) => device.device_id === deviceId)) {
           state.devices.push({
             device_id: deviceId,
+            label,
             leaf_index: state.devices.length + 1,
+            identity_key: fallbackIdentityKey(),
+            device_key: stableHash(`paired:${label}:${state.devices.length + 1}`),
             local: false,
             authorized: true,
+            revoked: false,
+            added_at_epoch: state.events.at(-1)?.sequence ?? 1,
+            revoked_at_epoch: null,
           });
         }
         pushEvent(state, "device.paired", `Authorized paired device ${label}`);
