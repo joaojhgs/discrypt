@@ -11,11 +11,16 @@ import {
 } from "@radix-ui/react-icons";
 import { discryptUiConfig, ThemeId, TemplateId } from "./app-config";
 import {
-  AppChannelView,
-  AppStateView,
-  DmView,
-  GroupView,
-  MessageTarget,
+  activityFeed,
+  discryptUiConfig,
+  setupChecklist,
+  ThemeId,
+  TemplateId,
+} from "./app-config";
+import {
+  AppSnapshot,
+  AppState,
+  ChannelView,
   MessageView,
   VoiceParticipantView,
   VoiceSessionView,
@@ -51,10 +56,24 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { cn } from "@/lib/utils";
 import "./styles.css";
 
-type View = "setup" | "dm" | "group" | "voice";
+type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
+
+type VoiceParticipant = VoiceParticipantView;
+
+function asThemeId(value: string): ThemeId {
+  return discryptUiConfig.themes.some((theme) => theme.id === value)
+    ? (value as ThemeId)
+    : discryptUiConfig.activeTheme;
+}
+
+function asTemplateId(value: string): TemplateId {
+  return discryptUiConfig.templates.some((template) => template.id === value)
+    ? (value as TemplateId)
+    : discryptUiConfig.activeTemplate;
+}
 
 function App() {
-  const [state, setState] = useState<AppStateView | null>(null);
+  const [commandState, setCommandState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [view, setView] = useState<View>("setup");
@@ -67,18 +86,23 @@ function App() {
   const [draftInvite, setDraftInvite] = useState("discrypt://join/local-template");
   const [draftChannel, setDraftChannel] = useState("ops-room");
   const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
+  const [workflow, setWorkflow] = useState<Workflow>('setup');
+  const [draftChannel, setDraftChannel] = useState('secure-room');
+  const [draftMessage, setDraftMessage] = useState('Hello from the command-backed UI');
+  const [draftGroup, setDraftGroup] = useState('private lab');
+  const [draftInvite, setDraftInvite] = useState('invite:joined-enclave');
+  const [draftDisplayName, setDraftDisplayName] = useState('Alice');
+  const [draftDeviceName, setDraftDeviceName] = useState('Desktop');
+  const [draftRecoveryCode, setDraftRecoveryCode] = useState('local recovery placeholder');
+  const [draftDmName, setDraftDmName] = useState('Bob');
 
   useEffect(() => {
     let mounted = true;
     loadAppState()
-      .then((loaded) => {
-        if (!mounted) return;
-        setState(loaded);
-        setSelectedDmId(loaded.active_dm_id ?? loaded.dms[0]?.dm_id ?? null);
-        const group = loaded.groups.find((item) => item.group_id === loaded.active_group_id) ?? loaded.groups[0];
-        setSelectedGroupId(group?.group_id ?? null);
-        setSelectedChannelId(group?.channels.find((channel) => channel.kind === "Text")?.channel_id ?? null);
-        setView(loaded.lifecycle === "ready" ? "dm" : "setup");
+      .then((loaded: AppState) => {
+        if (mounted) {
+          setCommandState(loaded);
+        }
       })
       .catch((error: unknown) => setLoadError(error instanceof Error ? error.message : "Unable to load app state"));
     return () => {
@@ -86,7 +110,7 @@ function App() {
     };
   }, []);
 
-  async function apply(command: Promise<AppStateView>, after?: (next: AppStateView) => void) {
+  async function applyCommand(command: Promise<AppState>, success?: (state: AppState) => void) {
     try {
       setCommandError(null);
       const next = await command;
@@ -104,61 +128,171 @@ function App() {
     return <main className="grid min-h-dvh place-items-center bg-[hsl(var(--background))] p-6 text-[hsl(var(--foreground))]">Loading discrypt…</main>;
   }
 
-  const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === state.preferences.theme_id) ?? discryptUiConfig.themes[1];
-  const activeTemplate = discryptUiConfig.templates.find((template) => template.id === state.preferences.template_id) ?? discryptUiConfig.templates[0];
+  const currentSnapshot = commandState.snapshot;
+  const activeGroup = commandState.active_context?.group_id
+    ? commandState.groups.find((group) => group.group_id === commandState.active_context?.group_id) ?? commandState.groups[0] ?? null
+    : commandState.groups[0] ?? null;
+  const activeServer = currentSnapshot.servers[0] ?? { name: 'No group selected', role: 'local profile', channels: [] };
+  const textChannels = activeServer.channels.filter((channel) => channel.kind === 'Text');
+  const voiceChannels = activeServer.channels.filter((channel) => channel.kind === 'Voice');
+  const activeTextChannel = activeGroup?.channels.find((channel) => channel.kind === 'Text') ?? null;
+  const activeVoiceChannel = activeGroup?.channels.find((channel) => channel.kind === 'Voice') ?? null;
+  const groupLabel = activeGroup?.name ?? 'Local profile';
+  const participants = commandState.voice_session?.participants ?? currentSnapshot.voice_session.participants;
+  const voiceJoined = commandState.voice_session?.joined ?? false;
+  const selfMuted = commandState.voice_session?.self_muted ?? participants.find((participant) => participant.id === 'local-user' || participant.id === 'alice')?.muted ?? false;
+  const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === commandState.preferences.theme_id) ?? discryptUiConfig.themes[0];
+  const activeTemplate = discryptUiConfig.templates.find((template) => template.id === commandState.preferences.template_id) ?? discryptUiConfig.templates[0];
   const themeStyle = activeTheme.cssVars as React.CSSProperties;
+  const completedSteps = [
+    commandState.profile !== null,
+    currentSnapshot.friend.verified,
+    commandState.devices.length >= 1,
+    currentSnapshot.invite.welcome_required.length > 0,
+    currentSnapshot.retention.selected.length > 0,
+  ].filter(Boolean).length;
 
-  if (state.lifecycle !== "ready" || !state.user) {
-    return (
-      <TooltipProvider delayDuration={150}>
-        <main style={themeStyle} className="min-h-dvh bg-[radial-gradient(circle_at_70%_0%,hsl(var(--primary)/0.12),transparent_34rem),hsl(var(--background))] p-6 text-[hsl(var(--foreground))]">
-          <IdentitySetup
-            recoveryCopy={state.recovery_copy}
-            commandError={commandError}
-            onCreate={(display_name, device_name) => apply(createUser({ display_name, device_name }), (next) => {
-              setSelectedDmId(next.active_dm_id ?? next.dms[0]?.dm_id ?? null);
-              setSelectedGroupId(next.active_group_id ?? next.groups[0]?.group_id ?? null);
-              setView("dm");
-            })}
-            onRecover={(display_name, device_name, recovery_code) => apply(recoverUser({ display_name, device_name, recovery_code }), (next) => {
-              setSelectedDmId(next.active_dm_id ?? next.dms[0]?.dm_id ?? null);
-              setSelectedGroupId(next.active_group_id ?? next.groups[0]?.group_id ?? null);
-              setView("dm");
-            })}
-          />
-        </main>
-      </TooltipProvider>
-    );
-  }
-
-  const activeGroup = state.groups.find((group) => group.group_id === selectedGroupId) ?? state.groups[0] ?? null;
-  const textChannels = activeGroup?.channels.filter((channel) => channel.kind === "Text") ?? [];
-  const voiceChannels = activeGroup?.channels.filter((channel) => channel.kind === "Voice") ?? [];
-  const activeTextChannel = textChannels.find((channel) => channel.channel_id === selectedChannelId) ?? textChannels[0] ?? null;
-  const activeDm = state.dms.find((dm) => dm.dm_id === selectedDmId) ?? state.dms[0] ?? null;
-  const activeVoiceSession = state.voice_sessions.find((session) => session.session_id === state.active_voice_session_id) ?? null;
-
-  function messageTarget(): MessageTarget | null {
-    if (view === "dm" && activeDm) return { kind: "dm", dm_id: activeDm.dm_id };
-    if ((view === "group" || view === "voice") && activeGroup && activeTextChannel) {
-      return { kind: "channel", group_id: activeGroup.group_id, channel_id: activeTextChannel.channel_id };
+  async function confirmSafetyNumber() {
+    try {
+      const result = await verifySafetyNumber({
+        friend_id: currentSnapshot.friend.friend_code,
+        provided: currentSnapshot.friend.safety_number,
+      });
+      setVerifyMessage(result.message);
+      if (result.verified) {
+        await applyCommand(loadAppState());
+      }
+    } catch (error: unknown) {
+      setVerifyMessage(`Safety verification command failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
     return null;
   }
 
-  function submitMessage() {
-    const target = messageTarget();
+  function createCommandUser() {
+    void applyCommand(createUser({ display_name: draftDisplayName, device_name: draftDeviceName }), () => setWorkflow('setup'));
+  }
+
+  function recoverCommandUser() {
+    void applyCommand(recoverUser({ display_name: draftDisplayName, device_name: draftDeviceName, recovery_code: draftRecoveryCode }), () => setWorkflow('setup'));
+  }
+
+  function createCommandGroup() {
+    void applyCommand(createGroup({ name: draftGroup, retention: currentSnapshot.retention.selected }), () => setWorkflow('channel'));
+  }
+
+  function joinCommandGroup() {
+    void applyCommand(joinGroup({ invite_code: draftInvite, group_name: draftInvite.includes('enclave') ? 'joined enclave' : 'joined group' }), () => setWorkflow('setup'));
+  }
+
+  function startCommandDm() {
+    void applyCommand(startDm({ display_name: draftDmName }), () => setWorkflow('dm'));
+  }
+
+  function createCommandChannel() {
+    if (!activeGroup) {
+      setCommandError('Create or join a group before adding a channel.');
+      return;
+    }
+    const name = draftChannel.trim().replace(/^#/, '') || 'secure-room';
+    void applyCommand(createChannelCommand({ group_id: activeGroup.group_id, name, kind: 'Text', retention_status: currentSnapshot.retention.selected }), () => setWorkflow('channel'));
+  }
+
+  function sendCommandMessage(channelName: string) {
     const body = draftMessage.trim();
-    if (!target || !body) return;
-    void apply(sendMessage({ target, body }), () => setDraftMessage(""));
+    if (!body) return;
+    if (!activeGroup || !activeTextChannel) {
+      setCommandError('Create a text channel before sending a group message.');
+      return;
+    }
+    void applyCommand(sendMessage({
+      target: { kind: 'channel', dm_id: null, group_id: activeGroup.group_id, channel_id: activeTextChannel.channel_id },
+      body,
+    }), () => setDraftMessage(''));
   }
 
-  function chooseTheme(theme_id: ThemeId) {
-    void apply(savePreferences({ theme_id, template_id: activeTemplate.id }));
+  function sendCommandDm() {
+    const body = draftMessage.trim();
+    const dm = commandState.dms[0];
+    if (!body || !dm) return;
+    void applyCommand(sendMessage({
+      target: { kind: 'dm', dm_id: dm.dm_id, group_id: null, channel_id: null },
+      body,
+    }), () => setDraftMessage(''));
   }
 
-  function chooseTemplate(template_id: TemplateId) {
-    void apply(savePreferences({ theme_id: activeTheme.id, template_id }));
+  function createCommandInvite() {
+    if (!activeGroup) {
+      setCommandError('Create or join a group before creating an invite.');
+      return;
+    }
+    void applyCommand(createInvite({ group_id: activeGroup.group_id, expires: currentSnapshot.invite.expires, max_use: currentSnapshot.invite.max_use }), () => setWorkflow('join'));
+  }
+
+  function setVolume(id: string, value: number[]) {
+    const sessionId = commandState.voice_session?.session_id;
+    if (!sessionId) {
+      setCommandError('Join a voice channel before changing volume.');
+      return;
+    }
+    void applyCommand(setSpeakerVolume({ session_id: sessionId, participant_id: id, volume: value[0] ?? 0 }));
+  }
+
+  function toggleSelfMute(checked: boolean) {
+    const sessionId = commandState.voice_session?.session_id;
+    if (!sessionId) {
+      setCommandError('Join a voice channel before muting.');
+      return;
+    }
+    void applyCommand(setSelfMute({ session_id: sessionId, muted: checked }));
+  }
+
+  async function toggleVoiceJoin(joined: boolean) {
+    if (joined) {
+      if (!activeGroup) {
+        setCommandError('Create or join a group before joining voice.');
+        return;
+      }
+      let voiceChannel = activeVoiceChannel;
+      if (!voiceChannel) {
+        const withVoice = await createChannelCommand({ group_id: activeGroup.group_id, name: 'Voice Lobby', kind: 'Voice', retention_status: 'session' });
+        setCommandState(withVoice);
+        voiceChannel = withVoice.groups.find((group) => group.group_id === activeGroup.group_id)?.channels.find((channel) => channel.kind === 'Voice') ?? null;
+      }
+      if (!voiceChannel) {
+        setCommandError('Voice channel creation did not return a channel.');
+        return;
+      }
+      void applyCommand(joinVoice({ group_id: activeGroup.group_id, channel_id: voiceChannel.channel_id }), () => setWorkflow('voice'));
+      return;
+    }
+    const sessionId = commandState.voice_session?.session_id;
+    if (!sessionId) return;
+    void applyCommand(leaveVoice({ session_id: sessionId }), () => setWorkflow('voice'));
+  }
+
+  function chooseTheme(nextTheme: ThemeId) {
+    void applyCommand(savePreferences({ theme_id: nextTheme, template_id: activeTemplate.id }));
+  }
+
+  function chooseTemplate(nextTemplate: TemplateId) {
+    void applyCommand(savePreferences({ theme_id: activeTheme.id, template_id: nextTemplate }));
+  }
+
+  if (commandState.lifecycle === 'first_run') {
+    return (
+      <FirstRunPanel
+        themeStyle={themeStyle}
+        displayName={draftDisplayName}
+        setDisplayName={setDraftDisplayName}
+        deviceName={draftDeviceName}
+        setDeviceName={setDraftDeviceName}
+        recoveryCode={draftRecoveryCode}
+        setRecoveryCode={setDraftRecoveryCode}
+        commandError={commandError}
+        onCreate={createCommandUser}
+        onRecover={recoverCommandUser}
+      />
+    );
   }
 
   return (
@@ -185,7 +319,7 @@ function App() {
           onSelectText={(groupId, channelId) => { setSelectedGroupId(groupId); setSelectedChannelId(channelId); setView("group"); }}
           onSelectVoice={(groupId) => { setSelectedGroupId(groupId); setView("voice"); }}
         />
-        <ScrollArea className="h-dvh min-w-0">
+        <ScrollArea className="h-dvh">
           <section className="min-h-dvh bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)] p-4 md:p-6">
             <TopBar
               user={state.user.display_name}
@@ -195,12 +329,15 @@ function App() {
               onTemplateChange={chooseTemplate}
               onSetup={() => setView("setup")}
             />
-            {commandError ? <p className="mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">Command error: {commandError}</p> : null}
-            <Tabs value={view} onValueChange={(value) => setView(value as View)} className="mt-5">
+            {commandError ? <p className="mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">Command note: {commandError}</p> : null}
+            {commandState.invites[0] ? <p className="mt-3 rounded-xl border border-emerald-300/30 bg-emerald-300/10 p-3 text-sm text-emerald-100">Invite ready: {commandState.invites[0].code}</p> : null}
+            <Tabs value={workflow} onValueChange={(value) => setWorkflow(value as Workflow)} className="mt-5">
               <TabsList className="flex w-full justify-start overflow-x-auto md:w-auto">
                 <TabsTrigger value="setup">Setup</TabsTrigger>
                 <TabsTrigger value="dm">DMs</TabsTrigger>
-                <TabsTrigger value="group">Groups</TabsTrigger>
+                <TabsTrigger value="join">Join</TabsTrigger>
+                <TabsTrigger value="create-group">Create group</TabsTrigger>
+                <TabsTrigger value="channel">Channels</TabsTrigger>
                 <TabsTrigger value="voice">Voice</TabsTrigger>
               </TabsList>
               <TabsContent value="setup">
@@ -215,18 +352,10 @@ function App() {
                 />
               </TabsContent>
               <TabsContent value="dm">
-                <DmPanel
-                  dms={state.dms}
-                  activeDm={activeDm}
-                  messages={filterMessages(state.messages, activeDm ? { kind: "dm", dm_id: activeDm.dm_id } : null)}
-                  draftPeer={draftDmPeer}
-                  setDraftPeer={setDraftDmPeer}
-                  draftMessage={draftMessage}
-                  setDraftMessage={setDraftMessage}
-                  onStartDm={() => apply(startDm({ peer_label: draftDmPeer }), (next) => setSelectedDmId(next.active_dm_id ?? next.dms.at(-1)?.dm_id ?? null))}
-                  onSend={submitMessage}
-                  onSelect={(dmId) => setSelectedDmId(dmId)}
-                />
+                <DmPanel dms={commandState.dms} messages={commandState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
+              </TabsContent>
+              <TabsContent value="join">
+                <JoinPanel snapshot={currentSnapshot} onJoin={joinCommandGroup} onCreateInvite={createCommandInvite} />
               </TabsContent>
               <TabsContent value="group">
                 <GroupPanel
