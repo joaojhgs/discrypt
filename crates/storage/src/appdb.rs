@@ -1018,10 +1018,7 @@ where
             });
         };
         for column in required.columns {
-            if !columns
-                .iter()
-                .any(|observed_column| *observed_column == column.name)
-            {
+            if !columns.contains(&column.name) {
                 return Err(AppDbError::MissingRequiredColumn {
                     table: required.name,
                     column: column.name,
@@ -1055,6 +1052,7 @@ pub fn quarantine_corrupt_store(path: impl AsRef<Path>) -> Result<QuarantinedApp
     })
 }
 
+#[allow(clippy::absurd_extreme_comparisons)]
 fn validate_version(version: u32) -> Result<(), AppDbError> {
     if version > APP_DB_SCHEMA_VERSION {
         return Err(AppDbError::UnsupportedFutureVersion {
@@ -1256,10 +1254,7 @@ mod tests {
                 "missing migration statement for {required}"
             );
         }
-        assert!(plan
-            .statements
-            .iter()
-            .any(|statement| *statement == "PRAGMA user_version = 1"));
+        assert!(plan.statements.contains(&"PRAGMA user_version = 1"));
         Ok(())
     }
 
