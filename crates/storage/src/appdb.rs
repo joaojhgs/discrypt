@@ -22,6 +22,12 @@ use zeroize::Zeroize;
 const ENVELOPE_FORMAT: &str = "discrypt.appdb.encrypted.v1";
 const DEFAULT_WRAPPING_KEY_ID: &str = "local-appdb-wrapping-key-v1";
 
+pub use crate::app_db::{
+    quarantine_corrupt_store, validate_observed_schema, AppDbColumn, AppDbError,
+    AppDbMigrationPlan, AppDbSchema, AppDbTable, MigrationDirection, QuarantinedAppDb,
+    APP_DB_SCHEMA_VERSION, MIN_SUPPORTED_APP_DB_SCHEMA_VERSION, REQUIRED_TABLES,
+};
+
 /// Local keychain boundary used by the encrypted app DB.
 ///
 /// Implementations should store the wrapping key in an OS/platform keychain or
@@ -1103,6 +1109,16 @@ impl fmt::Display for AppDbMigrationPlan {
 mod tests {
     use super::*;
     use std::{collections::BTreeSet, io::Write};
+
+    #[test]
+    fn encrypted_app_db_exports_versioned_schema_contract() -> Result<(), AppDbError> {
+        let plan = AppDbMigrationPlan::plan(0, APP_DB_SCHEMA_VERSION)?;
+        assert_eq!(plan.direction, MigrationDirection::Forward);
+        for required in REQUIRED_TABLES {
+            assert!(AppDbSchema::current().table(required).is_some());
+        }
+        Ok(())
+    }
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
