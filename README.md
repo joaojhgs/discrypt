@@ -73,6 +73,12 @@ See [`docs/phase-7-ux-e2e-hardening.md`](docs/phase-7-ux-e2e-hardening.md) for t
 
 See [`docs/phase-6-connectivity-signaling-push-metadata.md`](docs/phase-6-connectivity-signaling-push-metadata.md) for the G007 evidence matrix and production-hardening notes.
 
+G039 invite signaling metadata review is tracked in
+[`docs/g039-invite-metadata-review.md`](docs/g039-invite-metadata-review.md).
+It documents the current gap between existing admission/signaling foundations
+and production invite descriptors carrying signed endpoint policy plus trust
+metadata.
+
 ## Phase 5 governance/admission/recovery/abuse slice
 
 - `crates/mls-core/src/governance.rs` models signed epoch-bound governance events, canonical ordering, role authority, and removed-admin race rejection.
