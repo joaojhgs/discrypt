@@ -507,11 +507,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     use std::collections::BTreeSet;
 
     let text_plaintext = b"hello from app-level encrypted text";
-    let text_key = derive_epoch_secret(
-        &[33; 32],
-        ExportLabel::Text,
-        b"room=lab;epoch=7;m=alice-1",
-    );
+    let text_key = derive_epoch_secret(&[33; 32], ExportLabel::Text, b"room=lab;epoch=7;m=alice-1");
     let text_ciphertext = xor_text_ciphertext(&text_key, text_plaintext);
     let opened_text = xor_text_ciphertext(&text_key, &text_ciphertext);
     let text_e2e_roundtrip = opened_text == text_plaintext && text_ciphertext != text_plaintext;
