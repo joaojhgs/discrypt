@@ -22,6 +22,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+openmls = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_rust_crypto = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
 ed25519-dalek = { workspace = true }
