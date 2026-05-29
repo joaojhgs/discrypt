@@ -4,8 +4,68 @@
 //! not create WebRTC offers, gather candidates, or open media transports.
 
 use crate::{ConnectivityConfig, Endpoint, EndpointOverrides, TransportError};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+
+type HmacSha1 = Hmac<Sha1>;
+
+/// ADR-004 decision record for STUN/TURN credential and policy handling.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnStunCredentialDecision {
+    /// Default STUN endpoint class used when an invite does not carry an override.
+    pub default_stun_endpoint: &'static str,
+    /// Default TURN endpoint class used when an invite does not carry an override.
+    pub default_turn_endpoint: &'static str,
+    /// Group ICE policy precedence over invite ICE policy.
+    pub group_override_rule: &'static str,
+    /// Ephemeral credential mechanism used by the self-hosting TURN service.
+    pub ephemeral_credential_service: &'static str,
+    /// Invite descriptor field that signs STUN/TURN references.
+    pub invite_descriptor_reference: &'static str,
+    /// Rotation policy for TURN credentials.
+    pub credential_rotation: &'static str,
+    /// Self-hosting artifacts operators must configure.
+    pub self_hosting_docs: &'static str,
+}
+
+impl TurnStunCredentialDecision {
+    /// Return true when the code-level decision covers every ADR-004 axis.
+    #[must_use]
+    pub fn covers_adr_004(&self) -> bool {
+        self.default_stun_endpoint.contains("stun:")
+            && self.default_turn_endpoint.contains("turns:")
+            && self.group_override_rule.contains("group")
+            && self.group_override_rule.contains("invite")
+            && self.ephemeral_credential_service.contains("TURN service REST")
+            && self.ephemeral_credential_service.contains("HMAC-SHA1")
+            && self
+                .invite_descriptor_reference
+                .contains("ice_endpoint_policy")
+            && self.credential_rotation.contains("expires_at")
+            && self.credential_rotation.contains("reject expired")
+            && self
+                .self_hosting_docs
+                .contains("EXTERNAL_TURN_STATIC_AUTH_SECRET")
+            && self.self_hosting_docs.contains("TURN service")
+    }
+}
+
+/// Current ADR-004 TURN/STUN credential decision.
+#[must_use]
+pub fn turn_stun_credential_decision() -> TurnStunCredentialDecision {
+    TurnStunCredentialDecision {
+        default_stun_endpoint: "stun:default.discrypt.invalid:3478",
+        default_turn_endpoint: "turns:default.discrypt.invalid:5349",
+        group_override_rule: "non-empty group IceEndpointPolicy stun_servers/turn_servers override signed invite policy by endpoint kind; otherwise invite policy falls back to defaults",
+        ephemeral_credential_service: "TURN service REST auth credentials: username is unix-expiry:subject, credential is base64(HMAC-SHA1(static_auth_secret, username)), carried only as ephemeral TurnServerConfig material",
+        invite_descriptor_reference: "InviteSignalingMetadata signs ice_endpoint_policy into StoredInvite signing bytes so invite descriptors reference signaling, STUN, TURN, expiry, and trust metadata together",
+        credential_rotation: "TURN credentials carry credential_expires_at; clients reject expired or incomplete credentials before WebRTC offer generation and operators rotate by issuing a fresh invite/group policy",
+        self_hosting_docs: "external/signaling-repository/deploy/external-signaling.env.example, TURN service.conf.example, compose.yml, and external-signaling-operations.md document EXTERNAL_TURN_STATIC_AUTH_SECRET and TURN service self-hosting",
+    }
+}
 
 /// Signed invite/group policy containing ICE server endpoints joiners may use.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -206,6 +266,115 @@ pub enum TurnCredentialMode {
     },
 }
 
+/// Configuration for issuing short-lived TURN service REST-auth credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnCredentialIssuerConfig {
+    /// Public TURN or TURNS endpoint to embed into invite/group ICE policy.
+    pub public_turn_endpoint: Endpoint,
+    /// TURN realm configured in TURN service.
+    pub realm: String,
+    /// Coturn REST static-auth-secret bytes. Never place this value in invites.
+    #[serde(skip_serializing)]
+    pub static_auth_secret: Vec<u8>,
+    /// Credential lifetime in seconds.
+    pub ttl_seconds: u32,
+    /// Optional subject prefix for usernames.
+    #[serde(default)]
+    pub username_prefix: Option<String>,
+}
+
+impl TurnCredentialIssuerConfig {
+    /// Construct and validate an ephemeral TURN credential issuer.
+    pub fn new(
+        public_turn_endpoint: Endpoint,
+        realm: impl Into<String>,
+        static_auth_secret: Vec<u8>,
+        ttl_seconds: u32,
+        username_prefix: Option<String>,
+    ) -> Result<Self, TransportError> {
+        let config = Self {
+            public_turn_endpoint,
+            realm: realm.into(),
+            static_auth_secret,
+            ttl_seconds,
+            username_prefix,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate TURN service REST-auth issuer configuration before it is used.
+    pub fn validate(&self) -> Result<(), TransportError> {
+        validate_endpoint(&self.public_turn_endpoint, EndpointKind::Turn)?;
+        if self.realm.trim().is_empty()
+            || self.realm.trim() != self.realm
+            || self.realm.chars().any(char::is_whitespace)
+        {
+            return Err(TransportError::InvalidIcePolicy(
+                "TURN realm must be non-empty, trimmed, and whitespace-free".to_owned(),
+            ));
+        }
+        if self.static_auth_secret.len() < 32 {
+            return Err(TransportError::InvalidIcePolicy(
+                "TURN static auth secret must be at least 32 bytes".to_owned(),
+            ));
+        }
+        if !(60..=86_400).contains(&self.ttl_seconds) {
+            return Err(TransportError::InvalidIcePolicy(
+                "TURN credential TTL must be between 60 and 86400 seconds".to_owned(),
+            ));
+        }
+        if let Some(prefix) = &self.username_prefix {
+            if prefix.trim() != prefix || prefix.chars().any(char::is_whitespace) {
+                return Err(TransportError::InvalidIcePolicy(
+                    "TURN username prefix must be trimmed and whitespace-free".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stateless TURN service REST-auth credential issuer used by invite/group policy code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnCredentialIssuer {
+    config: TurnCredentialIssuerConfig,
+}
+
+impl TurnCredentialIssuer {
+    /// Construct a credential issuer from validated self-hosting configuration.
+    pub fn new(config: TurnCredentialIssuerConfig) -> Result<Self, TransportError> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+
+    /// Issue one short-lived TURN credential for an opaque subject.
+    pub fn issue_for_subject(
+        &self,
+        subject: &str,
+        now: DateTime<Utc>,
+    ) -> Result<TurnServerConfig, TransportError> {
+        let subject = sanitized_turn_subject(subject)?;
+        let expires_at = now + chrono::Duration::seconds(i64::from(self.config.ttl_seconds));
+        let expiry = expires_at.timestamp();
+        let username = match &self.config.username_prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{expiry}:{prefix}:{subject}"),
+            _ => format!("{expiry}:{subject}"),
+        };
+        let mut mac = HmacSha1::new_from_slice(&self.config.static_auth_secret).map_err(|_| {
+            TransportError::InvalidIcePolicy("TURN static auth secret invalid".to_owned())
+        })?;
+        mac.update(username.as_bytes());
+        let credential = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+        Ok(TurnServerConfig::new(
+            self.config.public_turn_endpoint.clone(),
+            Some(username),
+            Some(credential),
+            Some(expires_at.to_rfc3339()),
+        ))
+    }
+}
+
 /// TURN server endpoint plus optional configured or short-lived credentials from invite/group policy.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TurnServerConfig {
@@ -353,6 +522,29 @@ fn validate_endpoint(endpoint: &Endpoint, kind: EndpointKind) -> Result<(), Tran
             "unsupported ICE endpoint scheme: {value}"
         )))
     }
+}
+
+fn sanitized_turn_subject(subject: &str) -> Result<String, TransportError> {
+    let trimmed = subject.trim();
+    if trimmed.is_empty() {
+        return Err(TransportError::InvalidIcePolicy(
+            "TURN credential subject is required".to_owned(),
+        ));
+    }
+    if trimmed.len() > 96 {
+        return Err(TransportError::InvalidIcePolicy(
+            "TURN credential subject is too long".to_owned(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err(TransportError::InvalidIcePolicy(
+            "TURN credential subject must be opaque ASCII token characters".to_owned(),
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn push_string(bytes: &mut Vec<u8>, value: &str) {
@@ -560,5 +752,92 @@ mod tests {
         );
         assert!(!format!("{configured:?}").contains("configured-secret"));
         Ok(())
+    }
+
+    #[test]
+    fn turn_rest_credential_issuer_generates_ephemeral_TURN service_credentials(
+    ) -> Result<(), TransportError> {
+        let now = DateTime::parse_from_rfc3339("2026-05-29T22:00:00Z")
+            .map_err(|err| TransportError::InvalidIcePolicy(err.to_string()))?
+            .with_timezone(&Utc);
+        let issuer = TurnCredentialIssuer::new(TurnCredentialIssuerConfig::new(
+            Endpoint::new("turns:turn.example.invalid:5349"),
+            "turn.example.invalid",
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+            600,
+            Some("invite".to_owned()),
+        )?)?;
+
+        let issued = issuer.issue_for_subject("opaque-device-1", now)?;
+        let repeated = issuer.issue_for_subject("opaque-device-1", now)?;
+
+        assert_eq!(issued, repeated);
+        assert_eq!(
+            issued.endpoint,
+            Endpoint::new("turns:turn.example.invalid:5349")
+        );
+        assert_eq!(
+            issued.username.as_deref(),
+            Some("1780092600:invite:opaque-device-1")
+        );
+        assert_eq!(
+            issued.credential_expires_at.as_deref(),
+            Some("2026-05-29T22:10:00+00:00")
+        );
+        assert!(issued
+            .credential
+            .as_ref()
+            .is_some_and(|value| value.len() >= 20));
+        assert!(matches!(
+            issued.credential_mode_at(now)?,
+            TurnCredentialMode::Ephemeral { .. }
+        ));
+        assert!(!format!("{issued:?}").contains("0123456789abcdef"));
+        let issued_credential = issued.credential.as_deref().ok_or_else(|| {
+            TransportError::InvalidIcePolicy("issued TURN credential missing".to_owned())
+        })?;
+        assert!(!format!("{issued:?}").contains(issued_credential));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_credential_issuer_rejects_bad_config_and_subject() -> Result<(), TransportError> {
+        assert!(TurnCredentialIssuerConfig::new(
+            Endpoint::new("https://turn.example.invalid"),
+            "turn.example.invalid",
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+            600,
+            None,
+        )
+        .is_err());
+        assert!(TurnCredentialIssuerConfig::new(
+            Endpoint::new("turns:turn.example.invalid:5349"),
+            "turn.example.invalid",
+            b"short".to_vec(),
+            600,
+            None,
+        )
+        .is_err());
+        let issuer = TurnCredentialIssuer::new(TurnCredentialIssuerConfig::new(
+            Endpoint::new("turns:turn.example.invalid:5349"),
+            "turn.example.invalid",
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+            600,
+            None,
+        )?)?;
+        assert!(issuer.issue_for_subject("not allowed", Utc::now()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn turn_stun_credential_decision_covers_adr_004() {
+        let decision = turn_stun_credential_decision();
+
+        assert!(decision.covers_adr_004());
+        assert!(decision.default_stun_endpoint.starts_with("stun:"));
+        assert!(decision.default_turn_endpoint.starts_with("turns:"));
+        assert!(decision
+            .ephemeral_credential_service
+            .contains("base64(HMAC-SHA1"));
     }
 }

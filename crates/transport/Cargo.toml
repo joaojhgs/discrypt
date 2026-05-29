@@ -27,5 +27,8 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 webrtc = { version = "0.20.0-alpha.1" }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
