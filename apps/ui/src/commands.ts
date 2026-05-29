@@ -214,6 +214,13 @@ export type AppEventView = {
   summary: string;
 };
 
+export type CommandErrorView = {
+  code: string;
+  command: string;
+  message: string;
+  recovery_hint: string;
+};
+
 export type PollAppEventsRequest = {
   after?: number | null;
   kinds?: string[];
@@ -243,6 +250,7 @@ export type AppState = {
   security_copy: SecurityCopyView;
   events: AppEventView[];
   event_cursor: number;
+  last_command_error: CommandErrorView | null;
   snapshot: AppSnapshot;
 };
 
@@ -486,6 +494,7 @@ const fallbackState: AppState = {
     },
   ],
   event_cursor: 1,
+  last_command_error: null,
   snapshot: fallbackSnapshot,
 };
 
@@ -814,8 +823,30 @@ function invokeOrFallback<T>(
 }
 
 function mutateFallback(update: (state: AppState) => void): AppState {
+  fallbackState.last_command_error = null;
   update(fallbackState);
   return cloneState(syncSnapshot(fallbackState));
+}
+
+export function commandErrorToAction(error: CommandErrorView | null): string {
+  return error?.recovery_hint ?? "";
+}
+
+function pushCommandError(
+  state: AppState,
+  eventKind: string,
+  command: string,
+  code: string,
+  message: string,
+  recoveryHint: string,
+): void {
+  state.last_command_error = {
+    code,
+    command,
+    message,
+    recovery_hint: recoveryHint,
+  };
+  pushEvent(state, eventKind, `${code}: ${message}`);
 }
 
 function ensureFallbackReady(
@@ -1296,7 +1327,17 @@ export async function setActiveGroup(
       const group = state.groups.find(
         (item) => item.group_id === request.group_id,
       );
-      if (!group) return;
+      if (!group) {
+        pushCommandError(
+          state,
+          "group.focus_missing",
+          "set_active_group",
+          "group_not_found",
+          "Requested group does not exist",
+          "Pick a group from the server rail before focusing it",
+        );
+        return;
+      }
       state.active_context = {
         kind: "group",
         group_id: group.group_id,
@@ -1318,7 +1359,17 @@ export async function createInvite(
         request.group_id ??
         state.active_context?.group_id ??
         state.groups[0]?.group_id;
-      if (!groupId) return;
+      if (!groupId) {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "create_invite",
+          "group_not_found",
+          "No group exists for invite creation",
+          "Create or select a group before creating an invite",
+        );
+        return;
+      }
       const group = state.groups.find((item) => item.group_id === groupId);
       const inviteKey =
         crypto.randomUUID?.() ?? `local-${state.invites.length + 1}`;
@@ -1380,7 +1431,17 @@ export async function createChannel(
       const group = state.groups.find(
         (item) => item.group_id === request.group_id,
       );
-      if (!group) return;
+      if (!group) {
+        pushCommandError(
+          state,
+          "channel.rejected",
+          "create_channel",
+          "group_not_found",
+          "No matching group for channel creation",
+          "Select an existing group before adding a text or voice channel",
+        );
+        return;
+      }
       const name =
         request.kind === "Text"
           ? `#${request.name.replace(/^#/, "") || "secure-room"}`
@@ -1461,13 +1522,18 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
         channel_id: request.channel_id,
         dm_id: null,
       };
-      pushEvent(
-        state,
-        captureAllowed ? "voice.joined" : "voice.permission_denied",
-        captureAllowed
-          ? "Joined command-backed local voice session"
-          : "Microphone permission/input device required before joining voice",
-      );
+      if (captureAllowed) {
+        pushEvent(state, "voice.joined", "Joined command-backed local voice session");
+      } else {
+        pushCommandError(
+          state,
+          "voice.permission_denied",
+          "join_voice",
+          "voice_permission_required",
+          "Microphone permission/input device required before joining voice",
+          "Grant microphone permission and select an input device before joining voice",
+        );
+      }
     }),
   );
 }
@@ -1480,8 +1546,21 @@ export async function leaveVoice(
       if (
         !state.voice_session ||
         state.voice_session.session_id !== request.session_id
-      )
+      ) {
+        pushCommandError(
+          state,
+          "voice.leave_ignored",
+          "leave_voice",
+          "voice_session_not_found",
+          state.voice_session
+            ? "Leave request did not match active session"
+            : "No active voice session to leave",
+          state.voice_session
+            ? "Use the currently joined voice session before leaving"
+            : "Join a voice channel before trying to leave",
+        );
         return;
+      }
       state.voice_session.joined = false;
       state.voice_session.status_copy =
         "Not joined; command-backed local voice controls are idle";
@@ -1502,8 +1581,21 @@ export async function setSelfMute(request: SelfMuteRequest): Promise<AppState> {
       if (
         !state.voice_session ||
         state.voice_session.session_id !== request.session_id
-      )
+      ) {
+        pushCommandError(
+          state,
+          "voice.self_mute_rejected",
+          "set_self_mute",
+          "voice_session_not_found",
+          state.voice_session
+            ? "Mute request did not match active session"
+            : "No active voice session to mute",
+          state.voice_session
+            ? "Join the voice session again before changing mute state"
+            : "Join a voice channel before muting yourself",
+        );
         return;
+      }
       state.voice_session.self_muted = request.muted;
       state.voice_session.participants = state.voice_session.participants.map(
         (participant) =>
@@ -1532,8 +1624,35 @@ export async function setSpeakerVolume(
       if (
         !state.voice_session ||
         state.voice_session.session_id !== request.session_id
-      )
+      ) {
+        pushCommandError(
+          state,
+          "voice.volume_rejected",
+          "set_speaker_volume",
+          "voice_session_not_found",
+          state.voice_session
+            ? "Volume request did not match active session"
+            : "No active voice session for speaker volume",
+          state.voice_session
+            ? "Use the active voice session before changing speaker volume"
+            : "Join a voice channel before changing speaker volume",
+        );
         return;
+      }
+      const participantExists = state.voice_session.participants.some(
+        (participant) => participant.id === request.participant_id,
+      );
+      if (!participantExists) {
+        pushCommandError(
+          state,
+          "voice.volume_rejected",
+          "set_speaker_volume",
+          "voice_participant_not_found",
+          "No matching voice participant for speaker volume",
+          "Choose a visible participant from the voice member list",
+        );
+        return;
+      }
       state.voice_session.participants = state.voice_session.participants.map(
         (participant) =>
           participant.id === request.participant_id
@@ -1555,7 +1674,17 @@ export async function sendMessage(
     mutateFallback((state) => {
       ensureFallbackReady();
       const body = request.body.trim();
-      if (!body) return;
+      if (!body) {
+        pushCommandError(
+          state,
+          "message.rejected",
+          "send_message",
+          "message_empty",
+          "Empty message was not sent",
+          "Type a non-empty message before sending",
+        );
+        return;
+      }
       state.messages.push({
         message_id: `fallback-${state.messages.length + 1}`,
         target: request.target,

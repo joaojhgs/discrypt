@@ -357,6 +357,19 @@ pub struct AppEventStreamView {
     pub subscribed_kinds: Vec<String>,
 }
 
+/// Typed command error surfaced in state for actionable frontend UX.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandErrorView {
+    /// Stable machine code.
+    pub code: String,
+    /// Command that produced the error.
+    pub command: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Actionable recovery hint for the UI.
+    pub recovery_hint: String,
+}
+
 /// Full command-backed app state consumed by React.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppStateView {
@@ -388,6 +401,9 @@ pub struct AppStateView {
     pub events: Vec<AppEventView>,
     /// Monotonic cursor of the newest event included in this state snapshot.
     pub event_cursor: u64,
+    /// Last typed command error, if the most recent mutation failed validation.
+    #[serde(default)]
+    pub last_command_error: Option<CommandErrorView>,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -632,6 +648,8 @@ struct PersistedAppState {
     device_set: DeviceSet,
     security_copy: SecurityCopyView,
     events: Vec<AppEventView>,
+    #[serde(default)]
+    last_command_error: Option<CommandErrorView>,
     friend_verified: bool,
     next_sequence: u64,
 }
@@ -656,6 +674,7 @@ impl TauriAppService {
     }
 
     fn mutate(&mut self, update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
+        self.state.last_command_error = None;
         update(&mut self.state);
         self.persist();
         self.state.to_view()
@@ -714,6 +733,7 @@ pub fn create_device_pairing_payload(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = &mut guard.state;
+    state.last_command_error = None;
     state.ensure_ready_profile();
     let identity = state.local_identity();
     state.ensure_device_set(&identity);
@@ -751,7 +771,13 @@ pub fn create_device_pairing_payload(
             }
             Err(error) => {
                 let message = error.to_string();
-                state.push_event("device.pairing_rejected", message.clone());
+                state.push_command_error(
+                    "device.pairing_rejected",
+                    "create_device_pairing_payload",
+                    "device_pairing_payload_failed",
+                    message.clone(),
+                    "Retry pairing after confirming an authorized local device and valid pairing epoch",
+                );
                 DevicePairingPayloadView {
                     payload: String::new(),
                     authorizing_device_id: authorizing_device_id.to_string(),
@@ -763,7 +789,13 @@ pub fn create_device_pairing_payload(
         }
     } else {
         let message = "No authorized local device is available to create a pairing payload";
-        state.push_event("device.pairing_rejected", message);
+        state.push_command_error(
+            "device.pairing_rejected",
+            "create_device_pairing_payload",
+            "device_authorizer_missing",
+            message,
+            "Create or recover the local profile before pairing another device",
+        );
         DevicePairingPayloadView {
             payload: String::new(),
             authorizing_device_id: String::new(),
@@ -811,9 +843,12 @@ pub fn accept_device_pairing_payload(request: AcceptDevicePairingPayloadRequest)
                 );
             }
             Err(error) => {
-                state.push_event(
+                state.push_command_error(
                     "device.pairing_rejected",
+                    "accept_device_pairing_payload",
+                    "device_pairing_rejected",
                     format!("Pairing rejected: {error}"),
+                    "Request a fresh signed device-pairing payload from an authorized device",
                 );
             }
         }
@@ -940,7 +975,13 @@ pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
             });
             state.push_event("group.focused", format!("Focused group {}", group.name));
         } else {
-            state.push_event("group.focus_missing", "Requested group does not exist");
+            state.push_command_error(
+                "group.focus_missing",
+                "set_active_group",
+                "group_not_found",
+                "Requested group does not exist",
+                "Pick a group from the server rail before focusing it",
+            );
         }
     })
 }
@@ -1045,7 +1086,13 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             })
             .or_else(|| state.groups.first().map(|group| group.group_id.clone()))
         else {
-            state.push_event("invite.rejected", "No group exists for invite creation");
+            state.push_command_error(
+                "invite.rejected",
+                "create_invite",
+                "group_not_found",
+                "No group exists for invite creation",
+                "Create or select a group before creating an invite",
+            );
             return;
         };
         let sequence = state.next_sequence;
@@ -1097,7 +1144,13 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
             Ok(code) => code,
             Err(error) => {
-                state.push_event("invite.rejected", error);
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_link_invalid",
+                    error,
+                    "Regenerate the invite after validating signaling and ICE metadata",
+                );
                 return;
             }
         };
@@ -1170,7 +1223,13 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
                 format!("Created channel {}", channel.name),
             );
         } else {
-            state.push_event("channel.rejected", "No matching group for channel creation");
+            state.push_command_error(
+                "channel.rejected",
+                "create_channel",
+                "group_not_found",
+                "No matching group for channel creation",
+                "Select an existing group before adding a text or voice channel",
+            );
         }
     })
 }
@@ -1181,7 +1240,13 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
         state.ensure_ready_profile();
         let body = request.body.trim();
         if body.is_empty() {
-            state.push_event("message.rejected", "Empty message was not sent");
+            state.push_command_error(
+                "message.rejected",
+                "send_message",
+                "message_empty",
+                "Empty message was not sent",
+                "Type a non-empty message before sending",
+            );
             return;
         }
         let sequence = state.next_sequence;
@@ -1254,9 +1319,12 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
         if capture_allowed {
             state.push_event("voice.joined", format!("Joined voice session {session_id}"));
         } else {
-            state.push_event(
+            state.push_command_error(
                 "voice.permission_denied",
+                "join_voice",
+                "voice_permission_required",
                 "Microphone permission/input device required before joining voice",
+                "Grant microphone permission and select an input device before joining voice",
             );
         }
     })
@@ -1275,13 +1343,22 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
                 }
                 state.push_event("voice.left", "Left command-backed local voice session");
             } else {
-                state.push_event(
+                state.push_command_error(
                     "voice.leave_ignored",
+                    "leave_voice",
+                    "voice_session_not_found",
                     "Leave request did not match active session",
+                    "Use the currently joined voice session before leaving",
                 );
             }
         } else {
-            state.push_event("voice.leave_ignored", "No active voice session to leave");
+            state.push_command_error(
+                "voice.leave_ignored",
+                "leave_voice",
+                "voice_session_not_found",
+                "No active voice session to leave",
+                "Join a voice channel before trying to leave",
+            );
         }
     })
 }
@@ -1307,7 +1384,23 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
                     "Self unmuted"
                 };
                 state.push_event("voice.self_mute", summary);
+            } else {
+                state.push_command_error(
+                    "voice.self_mute_rejected",
+                    "set_self_mute",
+                    "voice_session_not_found",
+                    "Mute request did not match active session",
+                    "Join the voice session again before changing mute state",
+                );
             }
+        } else {
+            state.push_command_error(
+                "voice.self_mute_rejected",
+                "set_self_mute",
+                "voice_session_not_found",
+                "No active voice session to mute",
+                "Join a voice channel before muting yourself",
+            );
         }
     })
 }
@@ -1326,8 +1419,32 @@ pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
                     participant.volume = volume;
                     let name = participant.name.clone();
                     state.push_event("voice.volume", format!("Set {name} volume to {volume}"));
+                } else {
+                    state.push_command_error(
+                        "voice.volume_rejected",
+                        "set_speaker_volume",
+                        "voice_participant_not_found",
+                        "No matching voice participant for speaker volume",
+                        "Choose a visible participant from the voice member list",
+                    );
                 }
+            } else {
+                state.push_command_error(
+                    "voice.volume_rejected",
+                    "set_speaker_volume",
+                    "voice_session_not_found",
+                    "Volume request did not match active session",
+                    "Use the active voice session before changing speaker volume",
+                );
             }
+        } else {
+            state.push_command_error(
+                "voice.volume_rejected",
+                "set_speaker_volume",
+                "voice_session_not_found",
+                "No active voice session for speaker volume",
+                "Join a voice channel before changing speaker volume",
+            );
         }
     })
 }
@@ -1625,6 +1742,7 @@ impl PersistedAppState {
                 kind: "app.first_run".to_owned(),
                 summary: "No local profile exists; setup/recovery is required".to_owned(),
             }],
+            last_command_error: None,
             friend_verified: false,
             next_sequence: 2,
         }
@@ -1646,6 +1764,7 @@ impl PersistedAppState {
             security_copy: self.security_copy.clone(),
             events: self.events.clone(),
             event_cursor: self.latest_event_cursor(),
+            last_command_error: self.last_command_error.clone(),
             snapshot: self.to_snapshot(),
         }
     }
@@ -1954,6 +2073,36 @@ impl PersistedAppState {
         if overflow > 0 {
             self.events.drain(0..overflow);
         }
+    }
+
+    fn set_command_error(
+        &mut self,
+        command: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        recovery_hint: impl Into<String>,
+    ) {
+        self.last_command_error = Some(CommandErrorView {
+            code: code.into(),
+            command: command.into(),
+            message: message.into(),
+            recovery_hint: recovery_hint.into(),
+        });
+    }
+
+    fn push_command_error(
+        &mut self,
+        event_kind: impl Into<String>,
+        command: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        recovery_hint: impl Into<String>,
+    ) {
+        let event_kind = event_kind.into();
+        let code = code.into();
+        let message = message.into();
+        self.set_command_error(command, code.clone(), message.clone(), recovery_hint);
+        self.push_event(event_kind, format!("{code}: {message}"));
     }
 
     fn local_user_id(&self) -> String {
@@ -3215,6 +3364,117 @@ mod tests {
         assert!(health.collaboration_ready);
         assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
+    }
+
+    #[test]
+    fn typed_command_errors_surface_actionable_codes() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("typed-command-errors");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+
+        let empty_message = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: None,
+                channel_id: None,
+            },
+            body: "   ".to_owned(),
+        });
+        let error = empty_message
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "empty message command error".to_owned())?;
+        assert_eq!(error.command, "send_message");
+        assert_eq!(error.code, "message_empty");
+        assert!(error.recovery_hint.contains("non-empty"));
+        assert!(empty_message
+            .events
+            .iter()
+            .any(|event| event.kind == "message.rejected"));
+
+        let missing_group = create_channel(CreateChannelRequest {
+            group_id: "missing-group".to_owned(),
+            name: "ops".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "7 days".to_owned(),
+        });
+        let error = missing_group
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "missing group command error".to_owned())?;
+        assert_eq!(error.command, "create_channel");
+        assert_eq!(error.code, "group_not_found");
+        assert!(error.recovery_hint.contains("existing group"));
+
+        let group = create_group(CreateGroupRequest {
+            name: "Error Lab".to_owned(),
+            retention: "7 days".to_owned(),
+        });
+        assert!(group.last_command_error.is_none());
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group created".to_owned())?;
+        let voice = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = voice
+            .groups
+            .first()
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Voice)
+            })
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel created".to_owned())?;
+        let denied = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "denied".to_owned(),
+            input_device_id: None,
+            input_device_label: None,
+            output_device_id: None,
+            output_device_label: None,
+        });
+        let error = denied
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "voice permission command error".to_owned())?;
+        assert_eq!(error.command, "join_voice");
+        assert_eq!(error.code, "voice_permission_required");
+        assert!(error.recovery_hint.contains("microphone permission"));
+        assert!(denied
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.permission_denied"));
+        let session_id = denied
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "denied session captured".to_owned())?;
+        let volume_error = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id,
+            participant_id: "missing-participant".to_owned(),
+            volume: 50,
+        });
+        let error = volume_error
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "participant command error".to_owned())?;
+        assert_eq!(error.command, "set_speaker_volume");
+        assert_eq!(error.code, "voice_participant_not_found");
+        assert!(error.recovery_hint.contains("visible participant"));
+        Ok(())
     }
 
     #[test]

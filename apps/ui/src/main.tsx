@@ -17,6 +17,7 @@ import {
   InviteView,
   VoiceParticipantView,
   VoiceSessionView,
+  commandErrorToAction,
   createChannel as createChannelCommand,
   createGroup,
   createInvite,
@@ -187,6 +188,14 @@ function App() {
       setCommandError(null);
       const nextState = await command;
       setCommandState(nextState);
+      if (nextState.last_command_error) {
+        const action = commandErrorToAction(nextState.last_command_error);
+        setCommandError(
+          action
+            ? `${nextState.last_command_error.message} — ${action}`
+            : nextState.last_command_error.message,
+        );
+      }
       success?.(nextState);
     } catch (error: unknown) {
       setCommandError(
