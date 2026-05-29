@@ -191,7 +191,22 @@ impl IceServerConfig {
     }
 }
 
-/// TURN server endpoint plus optional short-lived credentials from invite/group policy.
+/// Redacted TURN credential shape selected for a provider.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCredentialMode {
+    /// No TURN authentication material is configured.
+    Unauthenticated,
+    /// Long-lived or externally rotated configured credentials are present.
+    Configured,
+    /// Short-lived TURN credentials are present and valid until this timestamp.
+    Ephemeral {
+        /// RFC3339 expiration time for the ephemeral credential.
+        expires_at: String,
+    },
+}
+
+/// TURN server endpoint plus optional configured or short-lived credentials from invite/group policy.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TurnServerConfig {
     /// TURN or TURNS provider URI.
@@ -261,22 +276,31 @@ impl TurnServerConfig {
             .transpose()
     }
 
-    /// Validate time-limited TURN credentials and reject expired or incomplete policy.
-    pub fn validate_credentials_at(&self, now: DateTime<Utc>) -> Result<(), TransportError> {
+    /// Classify TURN credentials without exposing credential material.
+    pub fn credential_mode_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<TurnCredentialMode, TransportError> {
         self.validate()?;
         if !self.credentials_declared() {
-            return Ok(());
+            return Ok(TurnCredentialMode::Unauthenticated);
         }
-        let Some(expires_at) = self.parsed_credential_expiry()? else {
-            return Err(TransportError::InvalidIcePolicy(
-                "TURN credential expiry is required when credentials are declared".to_owned(),
-            ));
-        };
-        if expires_at <= now {
-            return Err(TransportError::InvalidIcePolicy(
-                "TURN credential expired".to_owned(),
-            ));
+        if let Some(expires_at) = self.parsed_credential_expiry()? {
+            if expires_at <= now {
+                return Err(TransportError::InvalidIcePolicy(
+                    "TURN credential expired".to_owned(),
+                ));
+            }
+            return Ok(TurnCredentialMode::Ephemeral {
+                expires_at: expires_at.to_rfc3339(),
+            });
         }
+        Ok(TurnCredentialMode::Configured)
+    }
+
+    /// Validate configured or time-limited TURN credentials and reject expired or incomplete policy.
+    pub fn validate_credentials_at(&self, now: DateTime<Utc>) -> Result<(), TransportError> {
+        self.credential_mode_at(now)?;
         Ok(())
     }
 
@@ -497,6 +521,44 @@ mod tests {
             Endpoint::new("turns:turn.example.invalid:5349")
         );
         assert_eq!(connectivity.turn_endpoint(), plan.endpoint);
+        Ok(())
+    }
+
+    #[test]
+    fn turn_credentials_support_ephemeral_and_configured_modes() -> Result<(), TransportError> {
+        let now = Utc::now();
+        let ephemeral = TurnServerConfig::new(
+            Endpoint::new("turns:turn.example.invalid:5349"),
+            Some("joiner".to_owned()),
+            Some("ephemeral-secret".to_owned()),
+            Some((now + Duration::minutes(5)).to_rfc3339()),
+        );
+        let configured = TurnServerConfig::new(
+            Endpoint::new("turns:turn.example.invalid:5349"),
+            Some("configured-user".to_owned()),
+            Some("configured-secret".to_owned()),
+            None,
+        );
+        let unauthenticated = TurnServerConfig::new(
+            Endpoint::new("turn:open-turn.example.invalid:3478"),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            ephemeral.credential_mode_at(now)?,
+            TurnCredentialMode::Ephemeral { .. }
+        ));
+        assert_eq!(
+            configured.credential_mode_at(now)?,
+            TurnCredentialMode::Configured
+        );
+        assert_eq!(
+            unauthenticated.credential_mode_at(now)?,
+            TurnCredentialMode::Unauthenticated
+        );
+        assert!(!format!("{configured:?}").contains("configured-secret"));
         Ok(())
     }
 }

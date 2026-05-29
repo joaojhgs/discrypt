@@ -62,6 +62,9 @@ pub struct WebRtcIceCandidate {
     /// ICE username fragment, when supplied by the WebRTC stack.
     #[serde(default)]
     pub username_fragment: Option<String>,
+    /// Candidate source URL, when supplied by the WebRTC stack.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 impl fmt::Debug for WebRtcIceCandidate {
@@ -75,7 +78,24 @@ impl fmt::Debug for WebRtcIceCandidate {
                 "username_fragment",
                 &self.username_fragment.as_ref().map(|_| "<redacted>"),
             )
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
             .finish()
+    }
+}
+
+impl WebRtcIceCandidate {
+    /// True when the candidate is relay/TURN-derived according to WebRTC candidate metadata.
+    #[must_use]
+    pub fn is_turn_relay_candidate(&self) -> bool {
+        self.candidate
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["typ", "relay"])
+            || self
+                .url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("turn:") || url.starts_with("turns:"))
     }
 }
 
@@ -294,8 +314,16 @@ pub struct WebRtcDirectPathMetrics {
     pub local_candidates_gathered: u64,
     /// Total remote trickle candidates applied to this peer.
     pub remote_candidates_applied: u64,
+    /// Configured TURN server count for fallback path availability.
+    pub configured_turn_servers: u64,
+    /// Locally gathered relay/TURN candidates.
+    pub local_relay_candidates_gathered: u64,
+    /// Remote relay/TURN candidates applied through trickle ICE.
+    pub remote_relay_candidates_applied: u64,
     /// True only when WebRTC reports a direct ICE-capable connected/completed state.
     pub direct_path_ready: bool,
+    /// True only when WebRTC is connected and relay candidate evidence exists with TURN configured.
+    pub turn_fallback_ready: bool,
 }
 
 impl WebRtcDirectPathMetrics {
@@ -310,6 +338,9 @@ struct DirectPathMetricsState {
     ice_gathering_state: RTCIceGatheringState,
     local_candidates_gathered: u64,
     remote_candidates_applied: u64,
+    configured_turn_servers: u64,
+    local_relay_candidates_gathered: u64,
+    remote_relay_candidates_applied: u64,
 }
 
 impl Default for DirectPathMetricsState {
@@ -320,12 +351,29 @@ impl Default for DirectPathMetricsState {
             ice_gathering_state: RTCIceGatheringState::New,
             local_candidates_gathered: 0,
             remote_candidates_applied: 0,
+            configured_turn_servers: 0,
+            local_relay_candidates_gathered: 0,
+            remote_relay_candidates_applied: 0,
         }
     }
 }
 
 impl DirectPathMetricsState {
+    fn with_configured_turn_servers(configured_turn_servers: u64) -> Self {
+        Self {
+            configured_turn_servers,
+            ..Self::default()
+        }
+    }
+
     fn snapshot(&self) -> WebRtcDirectPathMetrics {
+        let connected = matches!(
+            self.peer_connection_state,
+            RTCPeerConnectionState::Connected
+        ) || matches!(
+            self.ice_connection_state,
+            RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+        );
         WebRtcDirectPathMetrics {
             schema_version: WebRtcDirectPathMetrics::SCHEMA_VERSION,
             peer_connection_state: self.peer_connection_state.to_string(),
@@ -333,13 +381,14 @@ impl DirectPathMetricsState {
             ice_gathering_state: self.ice_gathering_state.to_string(),
             local_candidates_gathered: self.local_candidates_gathered,
             remote_candidates_applied: self.remote_candidates_applied,
-            direct_path_ready: matches!(
-                self.peer_connection_state,
-                RTCPeerConnectionState::Connected
-            ) || matches!(
-                self.ice_connection_state,
-                RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
-            ),
+            configured_turn_servers: self.configured_turn_servers,
+            local_relay_candidates_gathered: self.local_relay_candidates_gathered,
+            remote_relay_candidates_applied: self.remote_relay_candidates_applied,
+            direct_path_ready: connected,
+            turn_fallback_ready: connected
+                && self.configured_turn_servers > 0
+                && (self.local_relay_candidates_gathered > 0
+                    || self.remote_relay_candidates_applied > 0),
         }
     }
 }
@@ -388,6 +437,7 @@ pub struct WebRtcNegotiator {
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
     data_channel_label: String,
+    turn_endpoints: Vec<Endpoint>,
 }
 
 impl WebRtcNegotiator {
@@ -395,7 +445,11 @@ impl WebRtcNegotiator {
     pub async fn new(config: WebRtcNegotiationConfig) -> Result<Self, TransportError> {
         config.validate(Utc::now())?;
         let candidates = Arc::new(Mutex::new(Vec::new()));
-        let metrics = Arc::new(Mutex::new(DirectPathMetricsState::default()));
+        let metrics = Arc::new(Mutex::new(
+            DirectPathMetricsState::with_configured_turn_servers(
+                config.ice_servers.turn_servers.len() as u64,
+            ),
+        ));
         let handler = Arc::new(CandidateCollector {
             candidates: Arc::clone(&candidates),
             metrics: Arc::clone(&metrics),
@@ -428,6 +482,12 @@ impl WebRtcNegotiator {
             candidates,
             metrics,
             data_channel_label: config.data_channel_label,
+            turn_endpoints: config
+                .ice_servers
+                .turn_servers
+                .iter()
+                .map(|server| server.endpoint.clone())
+                .collect(),
         })
     }
 
@@ -511,6 +571,9 @@ impl WebRtcNegotiator {
         &self,
         candidate: WebRtcIceCandidate,
     ) -> Result<(), TransportError> {
+        if candidate.is_turn_relay_candidate() {
+            self.metrics.lock().await.remote_relay_candidates_applied += 1;
+        }
         self.peer_connection
             .add_ice_candidate(candidate.into_rtc())
             .await
@@ -543,6 +606,23 @@ impl WebRtcNegotiator {
         }
         session
             .select_direct(endpoint)
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    /// Select a TURN relay route only after WebRTC reports relay candidate evidence.
+    pub async fn select_turn_route_if_ready(
+        &self,
+        session: &mut TransportSession,
+    ) -> Result<Option<TransportSessionSnapshot>, TransportError> {
+        if !self.direct_path_metrics().await.turn_fallback_ready {
+            return Ok(None);
+        }
+        let endpoint = self.turn_endpoints.first().cloned().ok_or_else(|| {
+            TransportError::Unavailable("TURN fallback has no endpoint".to_owned())
+        })?;
+        session
+            .select_turn_relay(endpoint)
             .map(Some)
             .map_err(Into::into)
     }
@@ -590,7 +670,7 @@ impl WebRtcIceCandidate {
             sdp_mid: self.sdp_mid,
             sdp_mline_index: self.sdp_mline_index,
             username_fragment: self.username_fragment,
-            url: None,
+            url: self.url,
         }
     }
 }
@@ -618,13 +698,20 @@ impl PeerConnectionEventHandler for CandidateCollector {
     async fn on_ice_candidate(&self, event: webrtc::peer_connection::RTCPeerConnectionIceEvent) {
         match event.candidate.to_json() {
             Ok(init) => {
-                self.candidates.lock().await.push(WebRtcIceCandidate {
+                let candidate = WebRtcIceCandidate {
                     candidate: init.candidate,
                     sdp_mid: init.sdp_mid,
                     sdp_mline_index: init.sdp_mline_index,
                     username_fragment: init.username_fragment,
-                });
-                self.metrics.lock().await.local_candidates_gathered += 1;
+                    url: init.url,
+                };
+                let is_relay = candidate.is_turn_relay_candidate();
+                self.candidates.lock().await.push(candidate);
+                let mut metrics = self.metrics.lock().await;
+                metrics.local_candidates_gathered += 1;
+                if is_relay {
+                    metrics.local_relay_candidates_gathered += 1;
+                }
             }
             Err(_err) => {}
         }
@@ -807,10 +894,93 @@ mod tests {
             sdp_mid: Some("data".to_owned()),
             sdp_mline_index: Some(0),
             username_fragment: Some("ufrag-secret".to_owned()),
+            url: Some("turns:secret-turn.example.invalid:5349".to_owned()),
         };
         let debug = format!("{candidate:?}");
         assert!(!debug.contains("secret-host"));
         assert!(!debug.contains("ufrag-secret"));
+        assert!(!debug.contains("secret-turn"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_fallback_accepts_configured_credentials_and_requires_relay_evidence(
+    ) -> Result<(), TransportError> {
+        let turn_endpoint = Endpoint::new("turns:turn.example.invalid:5349");
+        let config = IceServerConfig::new(
+            vec![Endpoint::new("stun:127.0.0.1:3478")],
+            vec![TurnServerConfig::new(
+                turn_endpoint.clone(),
+                Some("configured-user".to_owned()),
+                Some("configured-secret".to_owned()),
+                None,
+            )],
+        )?;
+        let negotiator = WebRtcNegotiator::new(WebRtcNegotiationConfig::new(config)).await?;
+        let offer = negotiator.create_offer().await?;
+        assert_eq!(offer.sdp_type, WebRtcSdpType::Offer);
+        assert!(
+            !format!("{:?}", negotiator.direct_path_metrics().await).contains("configured-secret")
+        );
+        assert_eq!(
+            negotiator
+                .direct_path_metrics()
+                .await
+                .configured_turn_servers,
+            1
+        );
+
+        let mut session = TransportSession::new();
+        session.begin_signaling()?;
+        session.begin_ice_gathering()?;
+        session.begin_checking()?;
+        assert!(negotiator
+            .select_turn_route_if_ready(&mut session)
+            .await?
+            .is_none());
+
+        {
+            let mut metrics = negotiator.metrics.lock().await;
+            metrics.peer_connection_state = RTCPeerConnectionState::Connected;
+            metrics.remote_relay_candidates_applied = 1;
+        }
+        let snapshot = negotiator
+            .select_turn_route_if_ready(&mut session)
+            .await?
+            .ok_or_else(|| TransportError::Unavailable("TURN route was not ready".to_owned()))?;
+        assert_eq!(snapshot.state, crate::TransportSessionState::TurnRelay);
+        assert!(snapshot.connected());
+        assert_eq!(
+            snapshot.route.as_ref().map(|route| route.endpoint.clone()),
+            Some(turn_endpoint)
+        );
+        assert!(negotiator.direct_path_metrics().await.turn_fallback_ready);
+
+        negotiator.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_relay_candidate_keeps_turn_metadata_ciphertext_only() -> Result<(), TransportError> {
+        let relay_candidate = WebRtcIceCandidate {
+            candidate: "candidate:relay-foundation 1 udp 1677729535 203.0.113.10 5349 typ relay"
+                .to_owned(),
+            sdp_mid: Some("0".to_owned()),
+            sdp_mline_index: Some(0),
+            username_fragment: Some("relay-ufrag".to_owned()),
+            url: Some("turns:turn.example.invalid:5349".to_owned()),
+        };
+        assert!(relay_candidate.is_turn_relay_candidate());
+        let sealed = WebRtcNegotiationSealer::new([0x54; 32]).seal_candidate(&relay_candidate)?;
+        let opaque = sealed.to_opaque_bytes()?;
+        assert!(!contains_bytes(&opaque, b"typ relay"));
+        assert!(!contains_bytes(&opaque, b"turn.example.invalid"));
+        assert!(!contains_bytes(&opaque, b"relay-ufrag"));
+        assert_eq!(
+            WebRtcNegotiationSealer::new([0x54; 32])
+                .open_candidate(&SealedWebRtcNegotiationPayload::from_opaque_bytes(&opaque)?)?,
+            relay_candidate
+        );
         Ok(())
     }
 }

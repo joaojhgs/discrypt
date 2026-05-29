@@ -1363,6 +1363,31 @@ mod tests {
         let leg = boundary.plan_transport(&group.group_id)?.remove(0);
         boundary.open_transport(&session_id, leg)?;
         assert!(boundary.transport_state(&session_id)?.connected());
+        let turn_session_id = SessionId("session-turn".to_owned());
+        boundary.open_transport(
+            &turn_session_id,
+            TransportLeg {
+                label: "turn-relay".to_owned(),
+                endpoint: "turns:relay.example.invalid:5349".to_owned(),
+                ciphertext_only: true,
+            },
+        )?;
+        let turn_state = boundary.transport_state(&turn_session_id)?;
+        assert_eq!(
+            turn_state.state,
+            transport::TransportSessionState::TurnRelay
+        );
+        assert_eq!(
+            turn_state.route.as_ref().map(|route| route.route),
+            Some(transport::TransportRoute::TurnRelay)
+        );
+        assert_eq!(
+            turn_state
+                .route
+                .as_ref()
+                .map(|route| route.endpoint.0.as_str()),
+            Some("turns:relay.example.invalid:5349")
+        );
 
         let media = boundary.join_media(MediaSessionRequest {
             group_id: group.group_id.clone(),

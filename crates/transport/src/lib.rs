@@ -17,7 +17,7 @@ pub mod session;
 pub mod webrtc_negotiation;
 
 use async_trait::async_trait;
-pub use ice::{IceEndpointPolicy, IceServerConfig, TurnServerConfig};
+pub use ice::{IceEndpointPolicy, IceServerConfig, TurnCredentialMode, TurnServerConfig};
 use serde::{Deserialize, Serialize};
 pub use session::{
     TransportRoute, TransportRouteStatus, TransportSession, TransportSessionError,
