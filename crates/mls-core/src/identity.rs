@@ -1,6 +1,6 @@
 //! Local identity keys, friend codes, and safety-number verification.
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -84,6 +84,12 @@ impl Identity {
     #[must_use]
     pub fn sealed_backup_material(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
+    }
+
+    /// Sign a device-pairing authorization message with the local account key.
+    #[must_use]
+    pub(crate) fn sign_pairing_authorization(&self, message: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(message).to_bytes()
     }
 
     /// Destroy a mutable copy of exported key bytes.
