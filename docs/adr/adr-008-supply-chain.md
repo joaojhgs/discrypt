@@ -95,18 +95,21 @@ Required gates for this decision:
 0. `npm --prefix apps/ui run test:cargo-deny-g121` runs the full
    `cargo deny check --hide-inclusion-graph` policy and fails on advisory,
    license, wildcard, unknown-registry, or unknown-git violations.
-1. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
+1. `npm --prefix apps/ui run test:cargo-audit-g122` runs `cargo audit`,
+   permits only documented non-release waivers, and fails if a waived
+   vulnerability becomes reachable in the active workspace cargo tree.
+2. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
    wiring for cargo-audit, cargo-deny, npm audit, SBOM generation, license policy,
    source policy, lockfiles, and reproducibility assumptions.
-2. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
+3. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
    resolvable from `Cargo.lock` without lockfile mutation.
-3. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
+4. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
    set matches the current dependency graph.
-4. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
+5. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
    policy is configured, with duplicate versions still warnings.
-5. `npm --prefix apps/ui audit --audit-level=high --omit=dev` proves production
+6. `npm --prefix apps/ui audit --audit-level=high --omit=dev` proves production
    npm dependencies have no high-or-worse advisory at this checkpoint.
-6. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
+7. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
    handled by the later advisory/reproducibility stories.
 
 ## Consequences
