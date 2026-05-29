@@ -1,4 +1,6 @@
 //! Domain orchestration facade for Tauri commands and headless E2E tests.
+pub mod services;
+
 use admission::Invite;
 use mls_core::{GroupState, Identity};
 use serde::{Deserialize, Serialize};
