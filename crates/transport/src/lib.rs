@@ -1,9 +1,9 @@
-//! Transport traits plus deterministic connectivity fallback policy.
+//! Transport traits, ICE/WebRTC negotiation, and deterministic fallback policy.
 //!
-//! The production transport implementation will swap these facades for native QUIC,
-//! ICE/STUN, relay-overlay, and TURN plumbing. The policy types here are deliberately
-//! UI-free so the multinode harness can prove the Phase-6 ordering and metadata
-//! contracts without opening real sockets.
+//! This crate now owns real WebRTC offer/answer plus candidate primitives while
+//! keeping route selection and media/data transport claims separate. Policy types
+//! remain UI-free so the multinode harness can prove fallback ordering and
+//! metadata contracts without overstating connectivity.
 //!
 //! ## ProductionStatus
 //! See [`production_status`] for this crate's build-time gate status. Default
@@ -14,6 +14,7 @@
 pub mod ice;
 pub mod production_status;
 pub mod session;
+pub mod webrtc_negotiation;
 
 use async_trait::async_trait;
 pub use ice::{IceEndpointPolicy, IceServerConfig, TurnServerConfig};
@@ -27,6 +28,11 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+pub use webrtc_negotiation::{
+    SealedWebRtcNegotiationPayload, WebRtcIceCandidate, WebRtcNegotiationConfig,
+    WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator, WebRtcSdpType,
+    WebRtcSessionDescription,
+};
 
 /// Transport address or provider URI.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
