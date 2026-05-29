@@ -50,6 +50,9 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
 - G119 abuse E2E: `harness/multinode::abuse_e2e_smoke` covers invite flood,
   spam burst, online admission-helper brute force, signaling opaque blob flood,
   relay freeloading route downranking, and service-level request size exhaustion.
+- G120 operational metrics: `crates/abuse::AbuseMetricsSnapshot` exports aggregate
+  allowed/rate-limited counts and relay contribution totals without actor ids,
+  peer ids, group ids, invite secrets, messages, endpoint payloads, or key material.
 
 ## Production-hardening notes
 
@@ -75,3 +78,7 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
 - G119 keeps the abuse E2E scenarios deterministic and content-free: flood tests
   assert structured rate-limit or `request_too_large` responses and verify rejected
   signaling responses do not echo opaque payload bytes.
+- G120 metrics are safe for dashboards and health logs only as aggregate counters:
+  `invite_allowed_total`, `invite_rate_limited_total`, `message_allowed_total`,
+  `message_rate_limited_total`, and aggregate relay contribution totals. They must not grow labels for raw identities, groups, invite ids, message ids, endpoint
+  payloads, plaintext, or key material.
