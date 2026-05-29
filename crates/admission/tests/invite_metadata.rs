@@ -205,3 +205,42 @@ fn invite_metadata_rejects_invalid_signed_ice_endpoint_policy(
     );
     Ok(())
 }
+
+#[test]
+fn signed_invite_ice_config_rejects_expired_turn_credentials_at_parse_time(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use discrypt_transport::{Endpoint, IceEndpointPolicy, TurnServerConfig};
+
+    let issuer = SigningKey::generate(&mut OsRng);
+    let now = Utc::now();
+    let endpoint = "https://signal.example.invalid/v1/rendezvous";
+    let expired_ice = IceEndpointPolicy::new(
+        vec![Endpoint::new("stun:invite.example.invalid:3478")],
+        vec![TurnServerConfig::new(
+            Endpoint::new("turns:invite.example.invalid:5349"),
+            Some("joiner".to_owned()),
+            Some("expired-secret".to_owned()),
+            Some((now - Duration::minutes(1)).to_rfc3339()),
+        )],
+    )?;
+    let metadata = InviteSignalingMetadata::new(
+        endpoint,
+        InviteEndpointPolicy::ProductionTls,
+        trust_for(endpoint)?,
+    )?
+    .with_ice_endpoint_policy(expired_ice)?;
+    let mut store = InviteStore::new();
+    let invite = store.issue_invite_with_metadata(
+        b"room secret never serialized",
+        now + Duration::minutes(5),
+        1,
+        metadata,
+        &issuer,
+    )?;
+
+    assert_eq!(
+        invite.ice_server_config_at(None, now),
+        Err(InviteError::InvalidEndpointPolicy)
+    );
+    Ok(())
+}

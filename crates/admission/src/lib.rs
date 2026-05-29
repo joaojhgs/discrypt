@@ -295,6 +295,21 @@ impl StoredInvite {
         .map_err(|_| InviteError::InvalidEndpointPolicy)
     }
 
+    /// Verify the signed invite descriptor and reject expired/incomplete TURN credentials at `now`.
+    pub fn ice_server_config_at(
+        &self,
+        group_policy: Option<&IceEndpointPolicy>,
+        now: DateTime<Utc>,
+    ) -> Result<IceServerConfig, InviteError> {
+        self.verify_issuer_signature()?;
+        IceEndpointPolicy::resolve_at(
+            Some(&self.signaling_metadata.ice_endpoint_policy),
+            group_policy,
+            now,
+        )
+        .map_err(|_| InviteError::InvalidEndpointPolicy)
+    }
+
     /// True when the invite has a revocation governance event.
     #[must_use]
     pub fn revoked(&self) -> bool {
