@@ -484,13 +484,17 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameReceiver, SFrameSender,
         SenderBinding,
     };
+    use discrypt_relay_overlay::capability::{
+        BatteryDozePosture, RelayCapabilityAdvertisement, RelayCapacityAdvertisement,
+    };
     use discrypt_relay_overlay::integrity::{
         contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
     };
     use discrypt_relay_overlay::ranking::RelayMetrics;
     use discrypt_relay_overlay::redelivery::{PacketId, RedeliveryError, RedeliveryTracker};
     use discrypt_relay_overlay::store_forward::{
-        StoreForwardEnvelope, StoreForwardError, StoreForwardQueue,
+        StoreForwardEnvelope, StoreForwardError, StoreForwardPolicy, StoreForwardQueue,
+        VolunteerRelaySettings,
     };
     use discrypt_relay_overlay::topology::RelayTopology;
     use discrypt_relay_overlay::{OverlayManager, RelayRuntimeObservation};
@@ -646,7 +650,38 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         && redelivery.request_redelivery(packet_id, "third-relay")
             == Err(RedeliveryError::FanoutExhausted);
 
-    let mut queue = StoreForwardQueue::new();
+    fn relay_capability(
+        peer_id: &str,
+        accepts_store_forward: bool,
+    ) -> RelayCapabilityAdvertisement {
+        RelayCapabilityAdvertisement {
+            peer_id: peer_id.to_owned(),
+            sequence: 1,
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+            relay_capacity: RelayCapacityAdvertisement {
+                max_fanout: 8,
+                egress_bytes_per_second: 64_000,
+                accepts_store_forward,
+            },
+            battery_doze: BatteryDozePosture::Charging,
+            observed_rtt_ms: 10,
+            packet_loss_bps: 0,
+            contributed_bytes: 1_000,
+            consumed_bytes: 1_000,
+        }
+    }
+
+    let mut volunteer = VolunteerRelaySettings::enabled("primary-relay");
+    volunteer.max_queue_envelopes = 4;
+    volunteer.max_fanout_per_message = 2;
+    volunteer.max_volunteer_relays = 2;
+    let mut queue = StoreForwardQueue::with_policy(StoreForwardPolicy::new(
+        ["bob"],
+        1_000,
+        1_000,
+        volunteer.clone(),
+    ));
     let plaintext_leak = StoreForwardEnvelope::new(
         "plaintext-leak",
         "bob",
@@ -664,6 +699,68 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
     let store_forward_plaintext_rejected = queue
         .enqueue_ciphertext_only(plaintext_leak, b"voice frame")
         == Err(StoreForwardError::VisiblePlaintext);
+    let non_member_rejected = queue.enqueue(StoreForwardEnvelope::new(
+        "media-mallory",
+        "mallory",
+        protected_payload(
+            RelayPayloadKind::StoreForward,
+            b"mallory-kid".to_vec(),
+            1,
+            b"store-forward:media-mallory",
+            b"opaque ciphertext".to_vec(),
+        )?,
+        1_000,
+        500,
+        1,
+    )?) == Err(StoreForwardError::UnauthorizedRecipient);
+    let mut retention_queue = StoreForwardQueue::with_policy(StoreForwardPolicy::new(
+        ["bob"],
+        2_000,
+        1_000,
+        volunteer.clone(),
+    ));
+    let retention_window_rejected = retention_queue.enqueue(StoreForwardEnvelope::new(
+        "media-retention",
+        "bob",
+        protected_payload(
+            RelayPayloadKind::StoreForward,
+            b"retention-kid".to_vec(),
+            1,
+            b"store-forward:media-retention",
+            b"opaque ciphertext".to_vec(),
+        )?,
+        1_000,
+        1_500,
+        1,
+    )?) == Err(StoreForwardError::RetentionWindowExceeded);
+    let mut disabled_queue = StoreForwardQueue::with_policy(StoreForwardPolicy::new(
+        ["bob"],
+        1_000,
+        1_000,
+        VolunteerRelaySettings::disabled("primary-relay"),
+    ));
+    let volunteer_disabled_rejected = disabled_queue.enqueue(StoreForwardEnvelope::new(
+        "media-disabled",
+        "bob",
+        protected_payload(
+            RelayPayloadKind::StoreForward,
+            b"disabled-kid".to_vec(),
+            1,
+            b"store-forward:media-disabled",
+            b"opaque ciphertext".to_vec(),
+        )?,
+        1_000,
+        500,
+        1,
+    )?) == Err(StoreForwardError::VolunteerRelayDisabled);
+    let volunteer_targets = queue.volunteer_targets(
+        &[
+            relay_capability("primary-relay", true),
+            relay_capability("backup-relay", true),
+            relay_capability("no-store-relay", false),
+        ],
+        1_100,
+    );
     queue.enqueue_ciphertext_only(
         StoreForwardEnvelope::new(
             "media-1",
@@ -708,7 +805,11 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         redelivery_replay_rejected,
         store_forward_plaintext_rejected,
         store_forward_ttl_enforced: delivered_before_ttl && expired_not_delivered,
-        store_forward_fanout_bounded,
+        store_forward_fanout_bounded: store_forward_fanout_bounded
+            && non_member_rejected
+            && retention_window_rejected
+            && volunteer_disabled_rejected
+            && volunteer_targets == vec!["backup-relay".to_owned()],
         ciphertext_only_media,
         tamper_rejected,
         plaintext: opened.plaintext,
