@@ -86,6 +86,11 @@ import "./styles.css";
 type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 
 type VoiceParticipant = VoiceParticipantView;
+type SetupStepView = {
+  label: string;
+  complete: boolean;
+  detail: string;
+};
 
 function asThemeId(value: string): ThemeId {
   return discryptUiConfig.themes.some((theme) => theme.id === value)
@@ -172,13 +177,34 @@ function App() {
   const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === appState.preferences.theme_id) ?? discryptUiConfig.themes[0];
   const activeTemplate = discryptUiConfig.templates.find((template) => template.id === appState.preferences.template_id) ?? discryptUiConfig.templates[0];
   const themeStyle = activeTheme.cssVars as React.CSSProperties;
-  const completedSteps = [
-    appState.profile !== null,
-    currentSnapshot.friend.verified,
-    appState.devices.length >= 1,
-    currentSnapshot.invite.welcome_required.length > 0,
-    currentSnapshot.retention.selected.length > 0,
-  ].filter(Boolean).length;
+  const setupSteps: SetupStepView[] = [
+    {
+      label: setupChecklist[0],
+      complete: currentSnapshot.friend.verified,
+      detail: currentSnapshot.friend.verified
+        ? "Safety number verified"
+        : "Compare the number with Bob before trusting the DM",
+    },
+    {
+      label: setupChecklist[1],
+      complete: appState.devices.length >= 1,
+      detail: `${appState.devices.length} authorized local device${appState.devices.length === 1 ? "" : "s"}`,
+    },
+    {
+      label: setupChecklist[2],
+      complete: currentSnapshot.invite.welcome_required.length > 0,
+      detail: "Invite admission copy is present",
+    },
+    {
+      label: setupChecklist[3],
+      complete: currentSnapshot.retention.selected.length > 0,
+      detail: `Retention preset: ${currentSnapshot.retention.selected}`,
+    },
+  ];
+  const completedSteps = setupSteps.filter((step) => step.complete).length;
+  const isSetupWorkflow = workflow === "setup";
+  const showRightRail = activeTemplate.showRightRail && !isSetupWorkflow;
+  const showVoiceDock = !isSetupWorkflow;
 
   async function confirmSafetyNumber() {
     try {
@@ -329,8 +355,13 @@ function App() {
         style={themeStyle}
         className={cn(
           'min-h-dvh bg-[hsl(var(--background))] text-[hsl(var(--foreground))]',
-          'grid grid-cols-[72px_minmax(250px,320px)_minmax(0,1fr)_minmax(280px,340px)] overflow-hidden',
-          activeTemplate.density === 'compact' && 'grid-cols-[64px_minmax(230px,290px)_minmax(0,1fr)_minmax(260px,310px)]',
+          'grid overflow-hidden',
+          showRightRail
+            ? 'grid-cols-1 lg:grid-cols-[72px_minmax(250px,320px)_minmax(0,1fr)] xl:grid-cols-[72px_minmax(250px,320px)_minmax(0,1fr)_minmax(280px,340px)]'
+            : 'grid-cols-1 lg:grid-cols-[72px_minmax(250px,320px)_minmax(0,1fr)]',
+          activeTemplate.density === 'compact' && (showRightRail
+            ? 'grid-cols-1 lg:grid-cols-[64px_minmax(230px,290px)_minmax(0,1fr)] xl:grid-cols-[64px_minmax(230px,290px)_minmax(0,1fr)_minmax(260px,310px)]'
+            : 'grid-cols-1 lg:grid-cols-[64px_minmax(230px,290px)_minmax(0,1fr)]'),
         )}
       >
         <ServerRail groupLabel={groupLabel} themeLabel={activeTheme.label} />
@@ -346,9 +377,14 @@ function App() {
           onOpenChannel={() => setWorkflow('channel')}
           voiceJoined={voiceJoined}
           participants={participants}
+          setupSteps={setupSteps}
+          completedSteps={completedSteps}
         />
         <ScrollArea className="h-dvh">
-          <section className="min-h-dvh bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)] p-4 pb-52 md:p-6 md:pb-56">
+          <section className={cn(
+            "min-h-dvh bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)] p-4 md:p-6",
+            showVoiceDock ? "pb-52 md:pb-56" : "pb-8",
+          )}>
             <TopBar
               groupLabel={groupLabel}
               themeId={asThemeId(activeTheme.id)}
@@ -371,7 +407,7 @@ function App() {
                 <TabsTrigger value="voice">Voice</TabsTrigger>
               </TabsList>
               <TabsContent value="setup">
-                <SetupPanel snapshot={currentSnapshot} completedSteps={completedSteps} verifyMessage={verifyMessage} onVerify={confirmSafetyNumber} />
+                <SetupPanel snapshot={currentSnapshot} setupSteps={setupSteps} completedSteps={completedSteps} verifyMessage={verifyMessage} onVerify={confirmSafetyNumber} />
               </TabsContent>
               <TabsContent value="dm">
                 <DmPanel activeDm={activeDm} messages={appState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
@@ -400,8 +436,12 @@ function App() {
             </Tabs>
           </section>
         </ScrollArea>
-        <RightRail snapshot={currentSnapshot} participants={participants} completedSteps={completedSteps} themeLabel={activeTheme.label} templateLabel={activeTemplate.label} activityFeed={currentSnapshot.activity_feed ?? activityFeed} />
-        <VoiceDock route={currentSnapshot.voice.route} voiceJoined={voiceJoined} selfMuted={selfMuted} setVoiceJoined={toggleVoiceJoin} setSelfMuted={toggleSelfMute} participants={participants} />
+        {showRightRail ? (
+          <RightRail snapshot={currentSnapshot} participants={participants} completedSteps={completedSteps} themeLabel={activeTheme.label} templateLabel={activeTemplate.label} activityFeed={currentSnapshot.activity_feed ?? activityFeed} />
+        ) : null}
+        {showVoiceDock ? (
+          <VoiceDock route={currentSnapshot.voice.route} voiceJoined={voiceJoined} selfMuted={selfMuted} setVoiceJoined={toggleVoiceJoin} setSelfMuted={toggleSelfMute} participants={participants} />
+        ) : null}
       </main>
     </TooltipProvider>
   );
@@ -433,32 +473,49 @@ function FirstRunPanel({
   return (
     <main
       style={themeStyle}
-      className="grid min-h-dvh place-items-center bg-[hsl(var(--background))] p-6 text-[hsl(var(--foreground))]"
+      className="min-h-dvh bg-[radial-gradient(circle_at_20%_10%,hsl(var(--primary)/0.12),transparent_24rem),hsl(var(--background))] p-4 text-[hsl(var(--foreground))] md:p-8"
     >
-      <Card className="w-full max-w-3xl border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-2xl">
-        <CardHeader>
-          <Badge variant="secondary" className="w-fit">first run</Badge>
-          <CardTitle className="text-3xl">Set up your local discrypt profile</CardTitle>
-          <CardDescription>
-            Create a new local profile or recover with a test-build placeholder. Recovery does not claim cloud backup, history restore, or cross-device key recovery.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
+      <div className="mx-auto grid min-h-[calc(100dvh-2rem)] w-full max-w-5xl place-items-center md:min-h-[calc(100dvh-4rem)]">
+        <Card className="w-full overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.9)] shadow-2xl shadow-black/30">
+          <div className="grid lg:grid-cols-[0.9fr_1.1fr]">
+            <CardHeader className="border-b border-[hsl(var(--border))] bg-[linear-gradient(135deg,hsl(var(--secondary)/0.48),transparent)] p-6 lg:border-b-0 lg:border-r lg:p-8">
+              <Badge variant="secondary" className="w-fit">first run</Badge>
+              <CardTitle className="max-w-md text-3xl leading-tight md:text-4xl">Set up your local discrypt profile</CardTitle>
+              <CardDescription className="max-w-md text-base leading-7">
+                Create a local identity for this device, or unlock a test-build recovery placeholder. No cloud backup, history restore, QR pairing, or cross-device key recovery is claimed here.
+              </CardDescription>
+              <div className="grid gap-3 pt-3 text-sm text-[hsl(var(--muted-foreground))]">
+                <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">1. Choose a display name and device label.</div>
+                <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">2. Enter the app shell with command-backed local state.</div>
+                <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">3. Verify safety, groups, chat, and voice from the setup checklist.</div>
+              </div>
+            </CardHeader>
+            <CardContent className="grid gap-4 p-6 md:grid-cols-2 lg:p-8">
           {commandError ? <p className="md:col-span-2 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">Command note: {commandError}</p> : null}
-          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
+          <div className="flex min-h-72 flex-col rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold">New local user</h2>
+              <p className="text-sm leading-6 text-[hsl(var(--muted-foreground))]">Best for first machine setup.</p>
+            </div>
             <Label className="grid gap-2">Display name<Input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></Label>
             <Label className="mt-4 grid gap-2">Device name<Input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} /></Label>
-            <Button className="mt-5 w-full" onClick={onCreate}>Create new user</Button>
+            <Button className="mt-auto w-full" onClick={onCreate}>Create new user</Button>
           </div>
-          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
+          <div className="flex min-h-72 flex-col rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold">Existing user</h2>
+              <p className="text-sm leading-6 text-[hsl(var(--muted-foreground))]">Placeholder recovery for this local build.</p>
+            </div>
             <Label className="grid gap-2">Recovery phrase/code<Input value={recoveryCode} onChange={(event) => setRecoveryCode(event.target.value)} /></Label>
             <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
               Local/test-build placeholder only. It unlocks the shell for E2E coverage but does not recover remote devices or message history.
             </p>
-            <Button variant="outline" className="mt-5 w-full" onClick={onRecover}>Recover existing user</Button>
+            <Button variant="outline" className="mt-auto w-full" onClick={onRecover}>Recover existing user</Button>
           </div>
-        </CardContent>
-      </Card>
+            </CardContent>
+          </div>
+        </Card>
+      </div>
     </main>
   );
 }
@@ -515,6 +572,8 @@ function ChannelSidebar({
   onOpenChannel,
   voiceJoined,
   participants,
+  setupSteps,
+  completedSteps,
 }: {
   groupLabel: string;
   role: string;
@@ -527,7 +586,12 @@ function ChannelSidebar({
   onOpenChannel: () => void;
   voiceJoined: boolean;
   participants: VoiceParticipant[];
+  setupSteps: SetupStepView[];
+  completedSteps: number;
 }) {
+  const setupTotal = setupSteps.length;
+  const setupProgress = setupTotal > 0 ? (completedSteps / setupTotal) * 100 : 0;
+  const nextSetupIndex = setupSteps.findIndex((step) => !step.complete);
   return (
     <aside className="hidden h-dvh border-r border-[hsl(var(--border))] bg-[hsl(var(--card)/0.58)] backdrop-blur-xl lg:block">
       <div className="flex h-full flex-col">
@@ -557,35 +621,35 @@ function ChannelSidebar({
             <CardHeader className="p-4 pb-2">
               <div className="flex items-center justify-between">
                 <CardTitle>Group setup</CardTitle>
-                <Badge variant="secondary">4 of 5</Badge>
+                <Badge variant="secondary">{completedSteps} of {setupTotal}</Badge>
               </div>
               <div className="mt-2 h-1.5 rounded-full bg-[hsl(var(--muted))]">
-                <div className="h-full w-4/5 rounded-full bg-[hsl(var(--primary))]" />
+                <div className="h-full rounded-full bg-[hsl(var(--primary))]" style={{ width: `${setupProgress}%` }} />
               </div>
             </CardHeader>
             <CardContent className="grid gap-1 p-3 pt-1">
-              {setupChecklist.slice(0, 4).map((step, index) => (
+              {setupSteps.map((step, index) => (
                 <Button
-                  key={step}
-                  variant={index === 2 ? "outline" : "ghost"}
+                  key={step.label}
+                  variant={index === nextSetupIndex ? "outline" : "ghost"}
                   size="sm"
                   className={cn(
                     "h-auto justify-start whitespace-normal py-2 text-left text-xs",
-                    index === 2 &&
+                    index === nextSetupIndex &&
                       "border-[hsl(var(--primary)/0.5)] text-[hsl(var(--foreground))]",
                   )}
                 >
                   <span
                     className={cn(
                       "grid h-4 w-4 place-items-center rounded-full border text-[10px]",
-                      index === 2
-                        ? "border-[hsl(var(--primary))]"
-                        : "border-emerald-300/50 text-emerald-200",
+                      step.complete
+                        ? "border-emerald-300/50 text-emerald-200"
+                        : "border-[hsl(var(--primary)/0.65)] text-[hsl(var(--primary))]",
                     )}
                   >
-                    {index === 2 ? "" : <CheckCircledIcon />}
+                    {step.complete ? <CheckCircledIcon /> : index + 1}
                   </span>
-                  {step}
+                  {step.label}
                 </Button>
               ))}
             </CardContent>
@@ -797,193 +861,130 @@ function ConfigSelect({
 
 function SetupPanel({
   snapshot,
+  setupSteps,
   completedSteps,
   verifyMessage,
   onVerify,
 }: {
   snapshot: AppSnapshot;
+  setupSteps: SetupStepView[];
   completedSteps: number;
   verifyMessage: string | null;
   onVerify: () => void;
 }) {
+  const setupTotal = setupSteps.length;
+  const nextStep = setupSteps.find((step) => !step.complete) ?? setupSteps[setupSteps.length - 1];
+  const progress = setupTotal > 0 ? (completedSteps / setupTotal) * 100 : 0;
+
   return (
-    <div className="grid gap-4 xl:grid-cols-[1.25fr_0.75fr]">
-      <Card className="overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.86)]">
-        <CardHeader className="pb-3">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="flex gap-4">
-              <div className="grid h-14 w-14 place-items-center rounded-2xl border border-[hsl(var(--primary)/0.35)] bg-[hsl(var(--primary)/0.12)] text-[hsl(var(--primary))]">
-                <LockClosedIcon className="h-6 w-6" />
-              </div>
-              <div>
-                <CardTitle className="text-2xl">
-                  Verify safety numbers
-                </CardTitle>
-                <CardDescription>
-                  Compare the number below with {snapshot.friend.alias} in
-                  person or over a trusted call.
-                </CardDescription>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="mt-1 px-0 text-[hsl(var(--primary))]"
-                >
-                  How it works <ChevronRightIcon />
-                </Button>
-              </div>
+    <div className="mx-auto grid max-w-6xl gap-5">
+      <Card className="overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-xl shadow-black/20">
+        <CardContent className="grid gap-5 p-5 lg:grid-cols-[1fr_auto] lg:items-center lg:p-6">
+          <div className="flex min-w-0 gap-4">
+            <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl border border-[hsl(var(--primary)/0.35)] bg-[hsl(var(--primary)/0.12)] text-[hsl(var(--primary))]">
+              <LockClosedIcon className="h-6 w-6" />
             </div>
-            <Badge variant={snapshot.friend.verified ? "success" : "warning"}>
-              Step {Math.min(completedSteps + 1, 4)} of 4
-            </Badge>
+            <div className="min-w-0">
+              <Badge variant="secondary" className="mb-3 w-fit">setup workflow</Badge>
+              <h2 className="text-2xl font-semibold tracking-tight md:text-3xl">Finish the local trust setup</h2>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-[hsl(var(--muted-foreground))] md:text-base">
+                This screen is the launch checklist for the current local profile: verify Bob, review authorized devices, confirm invite admission, and keep the retention warning visible before chat and voice use.
+              </p>
+            </div>
           </div>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[linear-gradient(135deg,hsl(var(--secondary)/0.62),hsl(var(--card)/0.72))] p-4 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.04)]">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-64 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4">
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sm font-medium">Progress</span>
+              <Badge variant={completedSteps === setupTotal ? "success" : "warning"}>{completedSteps}/{setupTotal}</Badge>
+            </div>
+            <div className="mt-3 h-2 rounded-full bg-[hsl(var(--muted))]">
+              <div className="h-full rounded-full bg-[hsl(var(--primary))] transition-[width]" style={{ width: `${progress}%` }} />
+            </div>
+            <p className="mt-3 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              Next: {nextStep?.label ?? "Ready"}
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)]">
+        <Card className="overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.86)]">
+          <CardHeader className="pb-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <CardTitle className="text-2xl">Verify safety numbers</CardTitle>
+                <CardDescription className="max-w-2xl leading-6">
+                  Compare this number with {snapshot.friend.alias} in person or over a trusted call. The rest of setup stays visible, but this is the only trust step that is still incomplete by default.
+                </CardDescription>
+              </div>
+              <Badge variant={snapshot.friend.verified ? "success" : "warning"}>
+                {snapshot.friend.verified ? "verified" : "needs comparison"}
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
+            <div className="rounded-2xl border border-[hsl(var(--border))] bg-[linear-gradient(135deg,hsl(var(--secondary)/0.62),hsl(var(--card)/0.72))] p-4 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.04)]">
               <div className="flex items-center gap-3">
                 <Avatar className="h-12 w-12">
-                  <AvatarFallback>
-                    {snapshot.friend.alias.slice(0, 2).toUpperCase()}
-                  </AvatarFallback>
+                  <AvatarFallback>{snapshot.friend.alias.slice(0, 2).toUpperCase()}</AvatarFallback>
                 </Avatar>
                 <div>
-                  <p className="text-lg font-semibold">
-                    {snapshot.friend.alias}
-                  </p>
-                  <p
-                    className={cn(
-                      "text-sm",
-                      snapshot.friend.verified
-                        ? "text-emerald-200"
-                        : "text-amber-200",
-                    )}
-                  >
+                  <p className="text-lg font-semibold">{snapshot.friend.alias}</p>
+                  <p className={cn("text-sm", snapshot.friend.verified ? "text-emerald-200" : "text-amber-200")}>
                     {snapshot.friend.verified ? "Verified" : "Unverified"}
                   </p>
                 </div>
               </div>
-              <Button variant="outline" size="sm">
-                Show number
-              </Button>
-            </div>
-            <div className="mt-4 grid gap-3 rounded-xl border border-[hsl(var(--border))] bg-black/20 p-3 2xl:grid-cols-[1fr_auto] 2xl:items-center">
-              <p className="font-mono text-lg font-semibold tracking-[0.12em] text-[hsl(var(--foreground))]">
-                {snapshot.friend.safety_number}
-              </p>
-              <Button onClick={onVerify}>
-                {snapshot.friend.verified ? (
-                  <CheckCircledIcon />
-                ) : (
-                  <LockClosedIcon />
-                )}{" "}
-                Mark as verified
-              </Button>
-            </div>
-            {verifyMessage ? (
-              <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                {verifyMessage}
-              </p>
-            ) : null}
-          </div>
-          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.34)] p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <Avatar>
-                  <AvatarFallback>
-                    {snapshot.friend.alias.slice(0, 2).toUpperCase()}
-                  </AvatarFallback>
-                </Avatar>
-                <div>
-                  <p className="font-semibold">{snapshot.friend.alias}</p>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                    {snapshot.friend.verified
-                      ? "Verified just now"
-                      : "Awaiting local comparison"}
-                  </p>
-                </div>
+              <div className="mt-4 rounded-xl border border-[hsl(var(--border))] bg-black/20 p-4">
+                <p className="break-words font-mono text-lg font-semibold tracking-[0.12em] text-[hsl(var(--foreground))]">
+                  {snapshot.friend.safety_number}
+                </p>
+                <Button className="mt-4 w-full" onClick={onVerify}>
+                  {snapshot.friend.verified ? <CheckCircledIcon /> : <LockClosedIcon />} Mark as verified
+                </Button>
               </div>
-              <Badge variant={snapshot.friend.verified ? "success" : "warning"}>
-                {snapshot.friend.verified ? "Verified" : "Pending"}
-              </Badge>
+              {verifyMessage ? <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">{verifyMessage}</p> : null}
             </div>
-          </div>
-          <div>
-            <div className="mb-3 flex items-center gap-2">
-              <p className="font-semibold">{snapshot.friend.alias}'s devices</p>
-              <Badge variant="secondary">{snapshot.devices.length}</Badge>
+
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1 2xl:grid-cols-2">
+              <InfoRow title="Device review" copy={`${snapshot.devices.length} authorized local device${snapshot.devices.length === 1 ? "" : "s"} available.`} />
+              <InfoRow title="Invite admission" copy={snapshot.invite.welcome_required} />
             </div>
-            <div className="grid gap-2">
-              {snapshot.devices.map((device) => (
-                <div
-                  key={device.device_id}
-                  className="flex items-center justify-between rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-3"
-                >
-                  <div className="flex items-center gap-3">
-                    <Avatar>
-                      <AvatarFallback>
-                        {device.device_id.includes("phone") ? "PH" : "LP"}
-                      </AvatarFallback>
-                    </Avatar>
-                    <div>
-                      <p className="text-sm font-medium">{device.device_id}</p>
-                      <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                        leaf {device.leaf_index} ·{" "}
-                        {device.local ? "local" : "remote"}
-                      </p>
-                    </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.86)]">
+          <CardHeader>
+            <CardTitle>Setup checklist</CardTitle>
+            <CardDescription>{completedSteps}/{setupTotal} checks complete for this local profile.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            {setupSteps.map((step, index) => (
+              <div key={step.label} className={cn(
+                "grid gap-1 rounded-2xl border p-4",
+                step.complete
+                  ? "border-emerald-300/25 bg-emerald-300/7"
+                  : "border-[hsl(var(--primary)/0.45)] bg-[hsl(var(--primary)/0.08)]",
+              )}>
+                <div className="flex items-center gap-3">
+                  <div className={cn(
+                    "grid h-9 w-9 shrink-0 place-items-center rounded-xl border text-sm font-semibold",
+                    step.complete
+                      ? "border-emerald-300/40 bg-emerald-300/10 text-emerald-200"
+                      : "border-[hsl(var(--primary)/0.6)] bg-[hsl(var(--primary)/0.12)] text-[hsl(var(--primary))]",
+                  )}>
+                    {step.complete ? <CheckCircledIcon /> : index + 1}
                   </div>
-                  <Badge variant={device.authorized ? "success" : "warning"}>
-                    {device.authorized ? "Verified just now" : "Blocked"}
-                  </Badge>
+                  <div className="min-w-0">
+                    <p className="font-medium">{step.label}</p>
+                    <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">{step.detail}</p>
+                  </div>
                 </div>
-              ))}
-            </div>
-          </div>
-          <InfoRow
-            title="Invite details"
-            copy={`${snapshot.invite.expires}; ${snapshot.invite.welcome_required}`}
-          />
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>Setup progress</CardTitle>
-          <CardDescription>
-            {completedSteps}/4 checks complete for this encrypted group.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3">
-          <div className="h-2 rounded-full bg-[hsl(var(--muted))]">
-            <div
-              className="h-full rounded-full bg-[hsl(var(--primary))]"
-              style={{ width: `${(completedSteps / 4) * 100}%` }}
-            />
-          </div>
-          {setupChecklist.map((step, index) => (
-            <div
-              key={step}
-              className="flex items-center gap-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.42)] p-3"
-            >
-              <div
-                className={cn(
-                  "grid h-8 w-8 place-items-center rounded-lg border",
-                  index < completedSteps
-                    ? "border-emerald-300/40 bg-emerald-300/10 text-emerald-200"
-                    : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
-                )}
-              >
-                {index < completedSteps ? <CheckCircledIcon /> : index + 1}
               </div>
-              <span className="text-sm">{step}</span>
-            </div>
-          ))}
-          <Card className="mt-2 border-amber-300/30 bg-amber-300/5 shadow-none">
-            <CardContent className="p-4 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-              {snapshot.retention.unlimited_warning}
-            </CardContent>
-          </Card>
-        </CardContent>
-      </Card>
+            ))}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }

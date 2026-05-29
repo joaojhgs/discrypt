@@ -20,6 +20,31 @@ test('first run creates user and empty shell does not blank', async ({ page }) =
   await expect(page.getByText(/no remote delivery is claimed/i).first()).toBeVisible();
 });
 
+test('setup workflow is readable and completes without rail or dock collisions', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole('tab', { name: 'Setup' }).click();
+
+  await expect(page.getByRole('heading', { name: /finish the local trust setup/i })).toBeVisible();
+  await expect(page.getByText('3/4').first()).toBeVisible();
+  await expect(page.getByText(/Voice session not joined/i)).toHaveCount(0);
+  await expect(page.getByRole('tab', { name: /members/i })).toHaveCount(0);
+
+  const setupPanelBounds = await page.getByRole('heading', { name: /finish the local trust setup/i }).evaluate((element) => {
+    const panel = element.closest('.mx-auto');
+    const rect = panel?.getBoundingClientRect();
+    return rect ? { bottom: rect.bottom } : null;
+  });
+  expect(setupPanelBounds).not.toBeNull();
+  expect(setupPanelBounds?.bottom ?? 0).toBeLessThanOrEqual(1000);
+
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+
+  await page.getByRole('button', { name: /mark as verified/i }).click();
+  await expect(page.getByText('4/4').first()).toBeVisible();
+  await expect(page.getByText(/Safety number verified/i).first()).toBeVisible();
+});
+
 
 test('direct message send stays command-backed', async ({ page }) => {
   const errors: string[] = [];
