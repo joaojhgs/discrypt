@@ -26,4 +26,4 @@ pub use device_set::{
 pub use exporter::{derive_epoch_secret, ExportLabel};
 pub use governance::{CanonicalEventRef, GovernanceAction, GovernanceEvent, GovernanceLog, Role};
 pub use group::{GroupState, LeafIndex, MlsCoreError};
-pub use identity::{FriendCode, Identity, SafetyNumber};
+pub use identity::{verifying_key_from_hex, FriendCode, Identity, SafetyNumber};

@@ -17,6 +17,18 @@ impl FriendCode {
         Self(payload.into())
     }
 
+    /// Build a v1 friend-code/QR payload from a display label and public identity key.
+    #[must_use]
+    pub fn from_verifying_key(label: &str, verifying_key: &VerifyingKey) -> Self {
+        let public_key = hex::encode(verifying_key.as_bytes());
+        let fingerprint = Sha256::digest(verifying_key.as_bytes());
+        Self(format!(
+            "discrypt://friend/v1/{}?ik={public_key}&fp={}",
+            slugify(label),
+            hex::encode(&fingerprint[..10])
+        ))
+    }
+
     /// Return the encoded friend code.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -67,20 +79,6 @@ impl SafetyNumber {
             .collect::<Vec<_>>()
             .join(" ");
         Self(grouped)
-    }
-}
-
-impl FriendCode {
-    #[must_use]
-    fn legacy_unchecked_verifying_key_for_tests(&self) -> Option<VerifyingKey> {
-        let identity_key_hex = self
-            .0
-            .split_once("?ik=")
-            .map(|(_, tail)| tail)
-            .and_then(|tail| tail.split('&').next())?;
-        let decoded = hex::decode(identity_key_hex).ok()?;
-        let key_bytes: [u8; 32] = decoded.try_into().ok()?;
-        VerifyingKey::from_bytes(&key_bytes).ok()
     }
 }
 
@@ -169,13 +167,6 @@ impl Identity {
     #[must_use]
     pub fn safety_number(&self, peer: &VerifyingKey) -> SafetyNumber {
         SafetyNumber::from_identity_keys(&self.verifying_key(), peer)
-    }
-
-    /// Safety number derived from the identity key embedded in a friend-code/QR payload.
-    #[must_use]
-    pub fn safety_number_from_friend_code(&self, peer: &FriendCode) -> Option<SafetyNumber> {
-        let peer_key = peer.verifying_key()?;
-        Some(self.safety_number(&peer_key))
     }
 
     /// Safety number derived from the identity key embedded in a friend-code/QR payload.

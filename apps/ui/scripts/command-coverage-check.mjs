@@ -45,6 +45,18 @@ const expectedCommands = [
     returns: "SafetyVerificationResult",
   },
   {
+    command: "create_device_pairing_payload",
+    exportName: "createDevicePairingPayload",
+    args: ["requested_label", "current_epoch", "valid_for_epochs"],
+    returns: "DevicePairingPayloadView",
+  },
+  {
+    command: "accept_device_pairing_payload",
+    exportName: "acceptDevicePairingPayload",
+    args: ["payload", "device_name", "current_epoch"],
+    returns: "AppState",
+  },
+  {
     command: "save_preferences",
     exportName: "savePreferences",
     args: ["theme_id", "template_id"],
