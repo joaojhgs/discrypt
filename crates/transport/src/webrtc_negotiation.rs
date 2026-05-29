@@ -520,6 +520,17 @@ impl DataChannelHub {
     async fn snapshot(&self) -> WebRtcDataTransportMetrics {
         self.metrics.lock().await.snapshot()
     }
+
+    async fn close_all(&self) -> Result<(), TransportError> {
+        let channels = self.channels.lock().await.clone();
+        for channel in channels {
+            channel.close().await.map_err(data_channel_error)?;
+        }
+        let mut metrics = self.metrics.lock().await;
+        metrics.open = false;
+        metrics.last_state = "closed".to_owned();
+        Ok(())
+    }
 }
 
 fn data_channel_error(error: impl fmt::Display) -> TransportError {
@@ -867,6 +878,12 @@ impl WebRtcNegotiator {
         self.data_channels.wait_open(duration).await
     }
 
+    /// Tear down data/control channels and close the peer connection.
+    pub async fn tear_down(&self) -> Result<(), TransportError> {
+        self.data_channels.close_all().await?;
+        self.close().await
+    }
+
     /// Close the peer connection.
     pub async fn close(&self) -> Result<(), TransportError> {
         self.peer_connection
@@ -1040,8 +1057,10 @@ mod tests {
             offerer.add_remote_candidate(candidate).await?;
         }
 
-        offerer.close().await?;
-        answerer.close().await?;
+        offerer.tear_down().await?;
+        answerer.tear_down().await?;
+        assert!(!offerer.text_control_transport_metrics().await.open);
+        assert!(!answerer.text_control_transport_metrics().await.open);
         Ok(())
     }
 

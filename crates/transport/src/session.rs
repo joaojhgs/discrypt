@@ -32,11 +32,13 @@ pub enum TransportSessionState {
     Reconnecting,
     /// The session has reached a terminal failure until reset.
     Failed,
+    /// Session was intentionally cancelled or torn down locally.
+    Cancelled,
 }
 
 impl TransportSessionState {
     /// The exact state set promised by the G041 transport-session contract.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Idle,
         Self::Signaling,
         Self::IceGathering,
@@ -47,6 +49,7 @@ impl TransportSessionState {
         Self::Disconnected,
         Self::Reconnecting,
         Self::Failed,
+        Self::Cancelled,
     ];
 
     /// True when the state represents an active data route.
@@ -108,8 +111,87 @@ pub enum TransportSessionEvent {
     StartReconnecting,
     /// Mark the session failed.
     MarkFailed,
+    /// Cancel any pending reconnect or active route.
+    Cancel,
+    /// Tear down this session and release route state.
+    TearDown,
     /// Reset a failed or disconnected session back to idle.
     Reset,
+}
+
+/// Deterministic reconnect backoff policy for one transport session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconnectBackoffPolicy {
+    /// Initial reconnect delay in milliseconds.
+    pub initial_delay_ms: u64,
+    /// Maximum reconnect delay in milliseconds.
+    pub max_delay_ms: u64,
+    /// Integer multiplier applied after each attempt.
+    pub multiplier: u64,
+    /// Maximum reconnect attempts before terminal failure.
+    pub max_attempts: u32,
+}
+
+impl Default for ReconnectBackoffPolicy {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: 250,
+            max_delay_ms: 8_000,
+            multiplier: 2,
+            max_attempts: 8,
+        }
+    }
+}
+
+impl ReconnectBackoffPolicy {
+    /// Build a policy after validating monotonic finite backoff fields.
+    pub fn new(
+        initial_delay_ms: u64,
+        max_delay_ms: u64,
+        multiplier: u64,
+        max_attempts: u32,
+    ) -> Result<Self, TransportSessionError> {
+        let policy = Self {
+            initial_delay_ms,
+            max_delay_ms,
+            multiplier,
+            max_attempts,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(self) -> Result<(), TransportSessionError> {
+        if self.initial_delay_ms == 0
+            || self.max_delay_ms < self.initial_delay_ms
+            || self.multiplier < 1
+            || self.max_attempts == 0
+        {
+            Err(TransportSessionError::InvalidReconnectPolicy)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Delay for the next one-based reconnect attempt.
+    #[must_use]
+    pub fn delay_for_attempt(self, attempt: u32) -> u64 {
+        let exponent = attempt.saturating_sub(1);
+        let mut delay = self.initial_delay_ms;
+        for _ in 0..exponent {
+            delay = delay.saturating_mul(self.multiplier).min(self.max_delay_ms);
+        }
+        delay.min(self.max_delay_ms)
+    }
+}
+
+/// Decision returned when scheduling a reconnect attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconnectDecision {
+    /// One-based reconnect attempt number.
+    pub attempt: u32,
+    /// Backoff delay before the caller should start the next attempt.
+    pub delay_ms: u64,
 }
 
 /// Active route details included in status snapshots.
@@ -159,6 +241,15 @@ pub enum TransportSessionError {
         from: TransportSessionState,
         /// Requested event.
         event: TransportSessionEvent,
+    },
+    /// Reconnect backoff policy is malformed.
+    #[error("invalid reconnect backoff policy")]
+    InvalidReconnectPolicy,
+    /// Reconnect was requested after the policy attempt budget was exhausted.
+    #[error("reconnect attempts exhausted after {attempts} attempts")]
+    ReconnectAttemptsExhausted {
+        /// Attempts already consumed.
+        attempts: u32,
     },
 }
 
@@ -311,6 +402,64 @@ impl TransportSession {
         Ok(self.snapshot())
     }
 
+    /// Schedule the next reconnect attempt and return the deterministic backoff delay.
+    pub fn schedule_reconnect(
+        &mut self,
+        policy: ReconnectBackoffPolicy,
+    ) -> Result<ReconnectDecision, TransportSessionError> {
+        policy.validate()?;
+        self.require_state(
+            TransportSessionEvent::StartReconnecting,
+            &[TransportSessionState::Disconnected],
+        )?;
+        let next_attempt = self.reconnect_attempts.saturating_add(1);
+        if next_attempt > policy.max_attempts {
+            self.route = None;
+            self.last_error = Some("reconnect attempts exhausted".to_owned());
+            self.state = TransportSessionState::Failed;
+            return Err(TransportSessionError::ReconnectAttemptsExhausted {
+                attempts: self.reconnect_attempts,
+            });
+        }
+        self.reconnect_attempts = next_attempt;
+        self.state = TransportSessionState::Reconnecting;
+        Ok(ReconnectDecision {
+            attempt: next_attempt,
+            delay_ms: policy.delay_for_attempt(next_attempt),
+        })
+    }
+
+    /// Cancel this session from any non-terminal state.
+    pub fn cancel(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<TransportSessionSnapshot, TransportSessionError> {
+        if matches!(
+            self.state,
+            TransportSessionState::Failed | TransportSessionState::Cancelled
+        ) {
+            return Err(self.invalid_transition(TransportSessionEvent::Cancel));
+        }
+        self.route = None;
+        self.last_error = Some(reason.into());
+        self.state = TransportSessionState::Cancelled;
+        Ok(self.snapshot())
+    }
+
+    /// Tear down this session and release route state. Idempotent after cancellation.
+    pub fn tear_down(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<TransportSessionSnapshot, TransportSessionError> {
+        if self.state == TransportSessionState::Failed {
+            return Err(self.invalid_transition(TransportSessionEvent::TearDown));
+        }
+        self.route = None;
+        self.last_error = Some(reason.into());
+        self.state = TransportSessionState::Cancelled;
+        Ok(self.snapshot())
+    }
+
     /// Mark the session failed until it is reset.
     pub fn fail(
         &mut self,
@@ -332,6 +481,7 @@ impl TransportSession {
             &[
                 TransportSessionState::Disconnected,
                 TransportSessionState::Failed,
+                TransportSessionState::Cancelled,
             ],
         )?;
         self.state = TransportSessionState::Idle;
@@ -419,6 +569,7 @@ mod tests {
                 TransportSessionState::Disconnected,
                 TransportSessionState::Reconnecting,
                 TransportSessionState::Failed,
+                TransportSessionState::Cancelled,
             ]
         );
     }
@@ -562,6 +713,75 @@ mod tests {
         assert_eq!(idle.state, TransportSessionState::Idle);
         assert_eq!(idle.reconnect_attempts, 0);
         assert_eq!(idle.last_error, None);
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_backoff_cancellation_and_teardown_are_stateful(
+    ) -> Result<(), TransportSessionError> {
+        let policy = ReconnectBackoffPolicy::new(100, 1_000, 2, 2)?;
+        assert_eq!(policy.delay_for_attempt(1), 100);
+        assert_eq!(policy.delay_for_attempt(2), 200);
+        assert_eq!(policy.delay_for_attempt(8), 1_000);
+        assert!(ReconnectBackoffPolicy::new(0, 1_000, 2, 2).is_err());
+
+        let mut session = ready_session()?;
+        session.select_direct(Endpoint::new("stun:direct.example:3478"))?;
+        session.mark_disconnected("candidate pair failed")?;
+        let first = session.schedule_reconnect(policy)?;
+        assert_eq!(
+            first,
+            ReconnectDecision {
+                attempt: 1,
+                delay_ms: 100
+            }
+        );
+        assert_eq!(session.state(), TransportSessionState::Reconnecting);
+        session.begin_signaling()?;
+        session.begin_ice_gathering()?;
+        session.begin_checking()?;
+        session.select_turn_relay(Endpoint::new("turns:relay.example:5349"))?;
+        let torn_down = session.tear_down("user left voice channel")?;
+        assert_eq!(torn_down.state, TransportSessionState::Cancelled);
+        assert_eq!(torn_down.route, None);
+        assert_eq!(
+            torn_down.last_error.as_deref(),
+            Some("user left voice channel")
+        );
+        let reset = session.reset()?;
+        assert_eq!(reset.state, TransportSessionState::Idle);
+
+        let mut exhausted = ready_session()?;
+        exhausted.select_direct(Endpoint::new("stun:direct.example:3478"))?;
+        exhausted.mark_disconnected("network changed")?;
+        exhausted.schedule_reconnect(policy)?;
+        exhausted.begin_signaling()?;
+        exhausted.begin_ice_gathering()?;
+        exhausted.begin_checking()?;
+        exhausted.select_direct(Endpoint::new("stun:direct.example:3478"))?;
+        exhausted.mark_disconnected("network changed again")?;
+        exhausted.schedule_reconnect(policy)?;
+        exhausted.begin_signaling()?;
+        exhausted.begin_ice_gathering()?;
+        exhausted.begin_checking()?;
+        exhausted.select_direct(Endpoint::new("stun:direct.example:3478"))?;
+        exhausted.mark_disconnected("network changed final")?;
+        assert_eq!(
+            exhausted.schedule_reconnect(policy),
+            Err(TransportSessionError::ReconnectAttemptsExhausted { attempts: 2 })
+        );
+        assert_eq!(exhausted.state(), TransportSessionState::Failed);
+
+        let mut cancelled = ready_session()?;
+        let cancelled_snapshot = cancelled.cancel("join flow cancelled")?;
+        assert_eq!(cancelled_snapshot.state, TransportSessionState::Cancelled);
+        assert_eq!(
+            cancelled.cancel("again"),
+            Err(TransportSessionError::InvalidTransition {
+                from: TransportSessionState::Cancelled,
+                event: TransportSessionEvent::Cancel,
+            })
+        );
         Ok(())
     }
 }
