@@ -4,11 +4,19 @@
 //! provides deterministic primitives and test surfaces; later phases swap the group engine
 //! behind these boundaries for OpenMLS without changing higher-level contracts.
 
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
 pub mod device_set;
 pub mod exporter;
 pub mod governance;
 pub mod group;
 pub mod identity;
+pub mod production_status;
 pub mod provider;
 
 pub use device_set::{DeviceLeaf, DeviceSet, DeviceStatus, TransparencyEvent};

@@ -8,6 +8,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+harness = ["mls_core/harness"]
+local-dev = ["mls_core/local-dev"]
+production-network = ["mls_core/production-network"]
+production-media = ["mls_core/production-media"]
+production-storage = ["mls_core/production-storage"]
+
 [dependencies]
 aes-gcm = { workspace = true }
 serde = { workspace = true }

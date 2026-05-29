@@ -4,6 +4,14 @@
 //! WebRTC frame path. Rust owns SFrame-like keys; callers only exchange KIDs,
 //! counters, plaintext frames, and protected frames.
 
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
+pub mod production_status;
 pub mod sframe;
 pub mod transform_bridge;
 pub mod transport;

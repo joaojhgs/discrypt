@@ -10,6 +10,11 @@ workspace = true
 
 [features]
 default = []
+harness = ["discrypt-core/harness"]
+local-dev = ["discrypt-core/local-dev"]
+production-network = ["discrypt-core/production-network"]
+production-media = ["discrypt-core/production-media"]
+production-storage = ["discrypt-core/production-storage"]
 tauri-runtime = ["dep:tauri", "dep:tauri-build", "tauri/wry"]
 
 [dependencies]

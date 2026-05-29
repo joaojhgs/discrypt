@@ -8,6 +8,84 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+harness = [
+  "discrypt-abuse/harness",
+  "discrypt-admission/harness",
+  "discrypt-core/harness",
+  "discrypt-content-keys/harness",
+  "discrypt-mls-core/harness",
+  "discrypt-mls-delivery/harness",
+  "discrypt-storage/harness",
+  "discrypt-media/harness",
+  "discrypt-relay-overlay/harness",
+  "discrypt-push/harness",
+  "external-signaling/harness",
+  "discrypt-transport/harness",
+  "discrypt-desktop/harness",
+]
+local-dev = [
+  "discrypt-abuse/local-dev",
+  "discrypt-admission/local-dev",
+  "discrypt-core/local-dev",
+  "discrypt-content-keys/local-dev",
+  "discrypt-mls-core/local-dev",
+  "discrypt-mls-delivery/local-dev",
+  "discrypt-storage/local-dev",
+  "discrypt-media/local-dev",
+  "discrypt-relay-overlay/local-dev",
+  "discrypt-push/local-dev",
+  "external-signaling/local-dev",
+  "discrypt-transport/local-dev",
+  "discrypt-desktop/local-dev",
+]
+production-network = [
+  "discrypt-abuse/production-network",
+  "discrypt-admission/production-network",
+  "discrypt-core/production-network",
+  "discrypt-content-keys/production-network",
+  "discrypt-mls-core/production-network",
+  "discrypt-mls-delivery/production-network",
+  "discrypt-storage/production-network",
+  "discrypt-media/production-network",
+  "discrypt-relay-overlay/production-network",
+  "discrypt-push/production-network",
+  "external-signaling/production-network",
+  "discrypt-transport/production-network",
+  "discrypt-desktop/production-network",
+]
+production-media = [
+  "discrypt-abuse/production-media",
+  "discrypt-admission/production-media",
+  "discrypt-core/production-media",
+  "discrypt-content-keys/production-media",
+  "discrypt-mls-core/production-media",
+  "discrypt-mls-delivery/production-media",
+  "discrypt-storage/production-media",
+  "discrypt-media/production-media",
+  "discrypt-relay-overlay/production-media",
+  "discrypt-push/production-media",
+  "external-signaling/production-media",
+  "discrypt-transport/production-media",
+  "discrypt-desktop/production-media",
+]
+production-storage = [
+  "discrypt-abuse/production-storage",
+  "discrypt-admission/production-storage",
+  "discrypt-core/production-storage",
+  "discrypt-content-keys/production-storage",
+  "discrypt-mls-core/production-storage",
+  "discrypt-mls-delivery/production-storage",
+  "discrypt-storage/production-storage",
+  "discrypt-media/production-storage",
+  "discrypt-relay-overlay/production-storage",
+  "discrypt-push/production-storage",
+  "external-signaling/production-storage",
+  "discrypt-transport/production-storage",
+  "discrypt-desktop/production-storage",
+]
+
 [dependencies]
 chrono = { workspace = true }
 anyhow = { workspace = true }

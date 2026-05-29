@@ -1,4 +1,12 @@
 //! Headless multinode harness for discrypt acceptance tests.
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
+pub mod production_status;
 use discrypt_core::create_dm;
 use discrypt_mls_core::Identity;
 

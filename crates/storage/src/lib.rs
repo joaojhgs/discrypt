@@ -1,4 +1,12 @@
 //! Local-only storage facades for author logs, recipient caches, and sealed backup.
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
+pub mod production_status;
 pub use content_keys::KeyState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

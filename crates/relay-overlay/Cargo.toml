@@ -8,6 +8,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+harness = []
+local-dev = []
+production-network = []
+production-media = []
+production-storage = []
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
