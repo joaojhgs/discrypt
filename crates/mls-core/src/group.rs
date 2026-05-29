@@ -245,7 +245,10 @@ mod tests {
         );
         let mut group = GroupState::new("room");
         assert_eq!(group.add_leaf(compromised.clone()), Ok(()));
-        assert_eq!(group.validate_sender(compromised.leaf_index, group.epoch), Ok(()));
+        assert_eq!(
+            group.validate_sender(compromised.leaf_index, group.epoch),
+            Ok(())
+        );
         let before_rotation = group.export(ExportLabel::Content, b"text");
 
         let rotation = devices

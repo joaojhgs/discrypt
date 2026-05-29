@@ -34,7 +34,6 @@ pub struct DeviceLeaf {
     pub status: DeviceStatus,
 }
 
-
 /// Device-set mutation errors.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DeviceSetError {
@@ -304,8 +303,12 @@ impl DeviceSet {
         replacement_epoch: u64,
     ) -> Result<DeviceRotation, DeviceSetError> {
         let retired = self.compromise_device(compromised_device_id, removal_epoch)?;
-        let replacement =
-            self.add_authorized_device(identity, replacement_key, replacement_label, replacement_epoch);
+        let replacement = self.add_authorized_device(
+            identity,
+            replacement_key,
+            replacement_label,
+            replacement_epoch,
+        );
         self.transparency.push(TransparencyEvent {
             device_id: replacement.device_id,
             kind: "device-rotation-replacement".into(),
@@ -449,11 +452,15 @@ mod tests {
         assert_eq!(rotation.retired.status, DeviceStatus::Compromised);
         assert!(!set.device_may_send(compromised.device_id));
         assert_eq!(
-            set.device(compromised.device_id).map(|device| device.status),
+            set.device(compromised.device_id)
+                .map(|device| device.status),
             Some(DeviceStatus::Compromised)
         );
         assert!(set.device_may_send(rotation.replacement.device_id));
-        assert_eq!(rotation.retired.identity_key, rotation.replacement.identity_key);
+        assert_eq!(
+            rotation.retired.identity_key,
+            rotation.replacement.identity_key
+        );
         assert_ne!(rotation.retired.device_key, rotation.replacement.device_key);
         assert_eq!(set.active_devices(), vec![&rotation.replacement]);
         assert_eq!(
