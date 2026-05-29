@@ -28,7 +28,8 @@
     "test:pcap-suite-g096": "node ../../scripts/check-pcap-suite-g096.mjs",
     "test:malicious-relay-g097": "node ../../scripts/check-malicious-relay-g097.mjs",
     "test:malicious-member-g098": "node ../../scripts/check-malicious-member-g098.mjs",
-    "test:retention-shred-g099": "node ../../scripts/check-retention-shred-g099.mjs"
+    "test:retention-shred-g099": "node ../../scripts/check-retention-shred-g099.mjs",
+    "test:performance-soak-g100": "node ../../scripts/check-performance-soak-g100.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

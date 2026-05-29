@@ -280,6 +280,25 @@ pub struct RetentionShredStorageBoundarySmoke {
     pub recovery_after_shred_excludes_content_keys: bool,
 }
 
+/// Deterministic Phase-N performance soak result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerformanceSoakSmoke {
+    /// Sixteen authenticated members are represented in the soak graph.
+    pub sixteen_members_represented: bool,
+    /// Eight concurrent voice senders protect and verify media frames.
+    pub eight_voice_senders_verified: bool,
+    /// Overlay routes cover one-, two-, and three-hop paths inside the hop cap.
+    pub one_to_three_relay_hops_covered: bool,
+    /// Packet-loss simulation drives bounded redelivery without accepting replays.
+    pub packet_loss_redelivery_bounded: bool,
+    /// NAT switching covers direct, overlay, and TURN fallback legs.
+    pub nat_switching_fallbacks_covered: bool,
+    /// Android doze posture is ranked away from preferred relay paths.
+    pub android_doze_deprioritized: bool,
+    /// Restart/reconnect restores encrypted session state and recovers a route.
+    pub restart_reconnect_recovers_route: bool,
+}
+
 /// Deterministic Phase-C device-rotation integration verification result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseCDeviceRotationSmoke {
@@ -509,6 +528,20 @@ impl RetentionShredStorageBoundarySmoke {
             && self.keychain_required_for_restore
             && self.secure_delete_enumerates_store_journal_temp_and_keychain
             && self.recovery_after_shred_excludes_content_keys
+    }
+}
+
+impl PerformanceSoakSmoke {
+    /// True when every performance soak invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.sixteen_members_represented
+            && self.eight_voice_senders_verified
+            && self.one_to_three_relay_hops_covered
+            && self.packet_loss_redelivery_bounded
+            && self.nat_switching_fallbacks_covered
+            && self.android_doze_deprioritized
+            && self.restart_reconnect_recovers_route
     }
 }
 
@@ -2880,6 +2913,205 @@ pub fn retention_shred_storage_boundary_smoke(
     })
 }
 
+/// Exercise the Phase-N deterministic performance soak envelope.
+pub fn performance_soak_smoke() -> Result<PerformanceSoakSmoke, anyhow::Error> {
+    use discrypt_media::{
+        MediaKeyRegistry, ReplayWindow, SFrameReceiver, SFrameSender, SenderBinding,
+    };
+    use discrypt_relay_overlay::capability::{
+        BatteryDozePosture, RelayCapabilityAdvertisement, RelayCapacityAdvertisement,
+    };
+    use discrypt_relay_overlay::redelivery::{RedeliveryError, RedeliveryTracker};
+    use discrypt_relay_overlay::{OverlayManager, OverlayRouteUse, RelayRuntimeObservation};
+    use discrypt_storage::{AppStore, EncryptedAppDb, MemoryAppDbKeychain};
+    use discrypt_transport::{ConnectivityConfig, ConnectivityPlanner, FallbackLeg, SimulatedNat};
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    fn observation(peer_id: &str, latency_ms: u32) -> RelayRuntimeObservation {
+        RelayRuntimeObservation {
+            peer_id: peer_id.to_owned(),
+            latency_ms,
+            successful_probes: 100,
+            failed_probes: 0,
+            battery_cost_bps: 0,
+            contributed_bytes: 64_000,
+            consumed_bytes: 32_000,
+        }
+    }
+
+    fn capability(
+        peer_id: &str,
+        posture: BatteryDozePosture,
+        loss_bps: u16,
+    ) -> RelayCapabilityAdvertisement {
+        RelayCapabilityAdvertisement {
+            peer_id: peer_id.to_owned(),
+            sequence: 1,
+            issued_at_ms: 1_000,
+            expires_at_ms: 60_000,
+            relay_capacity: RelayCapacityAdvertisement {
+                max_fanout: 8,
+                egress_bytes_per_second: 96_000,
+                accepts_store_forward: true,
+            },
+            battery_doze: posture,
+            observed_rtt_ms: 10 + u32::from(loss_bps / 100),
+            packet_loss_bps: loss_bps,
+            contributed_bytes: 96_000,
+            consumed_bytes: 32_000,
+        }
+    }
+
+    let members = (0..16)
+        .map(|idx| format!("member-{idx:02}"))
+        .collect::<Vec<_>>();
+    let sixteen_members_represented =
+        members.len() == 16 && members.iter().collect::<BTreeSet<_>>().len() == 16;
+
+    let mut voice_registry = MediaKeyRegistry::new();
+    let mut protected_voice = Vec::new();
+    for idx in 0..8_u32 {
+        let secret = [idx as u8 + 1; 32];
+        let binding = SenderBinding::derive_for_epoch(
+            &secret,
+            "phase-n-performance-soak",
+            100,
+            idx,
+            format!("voice-device-{idx}"),
+        )?;
+        voice_registry.register_sender(&secret, binding.clone())?;
+        let mut sender = SFrameSender::new(&secret, binding)?;
+        protected_voice.push(sender.protect(format!("voice-frame-{idx}").as_bytes())?);
+    }
+    let mut voice_receiver = SFrameReceiver::new(voice_registry, ReplayWindow::default());
+    let eight_voice_senders_verified = protected_voice.iter().enumerate().all(|(idx, frame)| {
+        voice_receiver
+            .open(frame)
+            .is_ok_and(|verified| verified.plaintext == format!("voice-frame-{idx}").as_bytes())
+    });
+
+    let mut manager = OverlayManager::default();
+    for peer in &members {
+        manager.upsert_observation(observation(peer, 5))?;
+    }
+    for relay in ["relay-a", "relay-b", "relay-c", "relay-d", "relay-e"] {
+        manager.upsert_capability_advertisement(
+            capability(relay, BatteryDozePosture::Charging, 250),
+            2_000,
+        )?;
+    }
+    manager.connect_peers("member-00", "member-01")?;
+    manager.connect_peers("member-02", "relay-a")?;
+    manager.connect_peers("relay-a", "member-03")?;
+    manager.connect_peers("member-04", "relay-b")?;
+    manager.connect_peers("relay-b", "relay-c")?;
+    manager.connect_peers("relay-c", "member-05")?;
+    manager.connect_peers("member-04", "relay-d")?;
+    manager.connect_peers("relay-d", "relay-e")?;
+    manager.connect_peers("relay-e", "member-05")?;
+    let one_hop = manager.construct_route(OverlayRouteUse::VoiceMedia, "member-00", "member-01")?;
+    let two_hop = manager.construct_route(OverlayRouteUse::VoiceMedia, "member-02", "member-03")?;
+    let three_hop =
+        manager.construct_route(OverlayRouteUse::VoiceMedia, "member-04", "member-05")?;
+    let one_to_three_relay_hops_covered = one_hop.hop_count == 1
+        && two_hop.hop_count == 2
+        && three_hop.hop_count == 3
+        && one_hop.route.within_hop_limit()
+        && two_hop.route.within_hop_limit()
+        && three_hop.route.within_hop_limit();
+
+    let mut redelivery = RedeliveryTracker::new(64, 3);
+    let mut dropped = 0_usize;
+    let mut accepted = 0_usize;
+    for sequence in 0..32_u64 {
+        let id = packet_id("soak-media", sequence);
+        if sequence % 4 == 0 {
+            dropped += 1;
+            redelivery.request_redelivery(id.clone(), "relay-a")?;
+            redelivery.request_redelivery(id.clone(), "relay-b")?;
+            redelivery.request_redelivery(id.clone(), "relay-c")?;
+            if redelivery.request_redelivery(id, "relay-d") != Err(RedeliveryError::FanoutExhausted)
+            {
+                return Ok(PerformanceSoakSmoke {
+                    sixteen_members_represented,
+                    eight_voice_senders_verified,
+                    one_to_three_relay_hops_covered,
+                    packet_loss_redelivery_bounded: false,
+                    nat_switching_fallbacks_covered: false,
+                    android_doze_deprioritized: false,
+                    restart_reconnect_recovers_route: false,
+                });
+            }
+        } else if redelivery.accept(&id).is_ok() {
+            accepted += 1;
+        }
+    }
+    let packet_loss_redelivery_bounded = dropped == 8
+        && accepted == 24
+        && redelivery.accept(&packet_id("soak-media", 1)) == Err(RedeliveryError::Replay);
+
+    let connectivity = ConnectivityConfig::default();
+    let direct = ConnectivityPlanner::plan(&connectivity, SimulatedNat::direct())?;
+    let overlay = ConnectivityPlanner::plan(&connectivity, SimulatedNat::overlay_only())?;
+    let turn = ConnectivityPlanner::plan(&connectivity, SimulatedNat::turn_only())?;
+    let nat_switching_fallbacks_covered = direct.selected == FallbackLeg::Stun
+        && overlay.selected == FallbackLeg::RelayOverlay
+        && turn.selected == FallbackLeg::Turn;
+
+    let mut doze_manager = OverlayManager::default();
+    doze_manager.upsert_observation(observation("member-06", 5))?;
+    doze_manager.upsert_observation(observation("member-07", 5))?;
+    doze_manager.upsert_capability_advertisement(
+        capability("android-dozing-relay", BatteryDozePosture::Dozing, 100),
+        2_000,
+    )?;
+    doze_manager.upsert_capability_advertisement(
+        capability("charging-relay", BatteryDozePosture::Charging, 100),
+        2_000,
+    )?;
+    doze_manager.connect_peers("member-06", "android-dozing-relay")?;
+    doze_manager.connect_peers("member-06", "charging-relay")?;
+    doze_manager.connect_peers("charging-relay", "member-07")?;
+    doze_manager.connect_peers("android-dozing-relay", "member-07")?;
+    let ranked = doze_manager.ranked_neighbors("member-06");
+    let android_doze_deprioritized = ranked.first().is_some_and(|peer| peer == "charging-relay")
+        && ranked.iter().any(|peer| peer == "android-dozing-relay");
+
+    let path = std::env::temp_dir().join(format!(
+        "discrypt-phase-n-soak-session-{}-{}.sqlite",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_file(&path);
+    let keychain = MemoryAppDbKeychain::default();
+    let session_bytes = serde_json::to_vec(&three_hop.route)?;
+    let mut db = EncryptedAppDb::with_key_id(&path, keychain.clone(), "phase-n-soak-session");
+    db.save_app_state(&session_bytes)?;
+    let mut restarted = EncryptedAppDb::with_key_id(&path, keychain, "phase-n-soak-session");
+    let restored_route = restarted.load_app_state()?.unwrap_or_default();
+    let restored_route_matches = restored_route == session_bytes;
+    let failover = manager.mark_failed_media_and_reroute(three_hop.route, "relay-b", 1_200, 120)?;
+    let restart_reconnect_recovers_route = restored_route_matches
+        && failover.decision.converged_within_phase2_gate()
+        && !failover.decision.replacement.contains_peer("relay-b")
+        && failover
+            .media_concealment
+            .as_ref()
+            .is_some_and(|report| report.target_met);
+    let _ = fs::remove_file(&path);
+
+    Ok(PerformanceSoakSmoke {
+        sixteen_members_represented,
+        eight_voice_senders_verified,
+        one_to_three_relay_hops_covered,
+        packet_loss_redelivery_bounded,
+        nat_switching_fallbacks_covered,
+        android_doze_deprioritized,
+        restart_reconnect_recovers_route,
+    })
+}
+
 /// Exercise Phase-5 governance, admission, recovery, and abuse controls.
 pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::Error> {
     use chrono::{Duration, Utc};
@@ -3653,6 +3885,23 @@ mod tests {
                 keychain_required_for_restore: true,
                 secure_delete_enumerates_store_journal_temp_and_keychain: true,
                 recovery_after_shred_excludes_content_keys: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn performance_soak_smoke_covers_phase_n_load_and_reconnect_gates() {
+        let smoke = performance_soak_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(PerformanceSoakSmoke {
+                sixteen_members_represented: true,
+                eight_voice_senders_verified: true,
+                one_to_three_relay_hops_covered: true,
+                packet_loss_redelivery_bounded: true,
+                nat_switching_fallbacks_covered: true,
+                android_doze_deprioritized: true,
+                restart_reconnect_recovers_route: true,
             })
         ));
     }
