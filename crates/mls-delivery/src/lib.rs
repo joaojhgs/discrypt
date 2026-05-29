@@ -30,6 +30,12 @@ pub enum DeliveryError {
     /// A Welcome package is expired.
     #[error("welcome expired")]
     WelcomeExpired,
+    /// A repair plan attempted to replay invalid divergent MLS commits.
+    #[error("repair attempted to replay divergent MLS commits")]
+    DivergentCommitReplay,
+    /// A repair plan would move to an older epoch.
+    #[error("repair target epoch {target} is older than local epoch {local}")]
+    StaleRepairTarget { local: u64, target: u64 },
 }
 
 /// Compact state summary exchanged during catch-up.
@@ -220,6 +226,13 @@ impl DeliveryState {
             ForkStatus::NeedsCatchUp { .. }
                 if commit.summary.epoch == self.summary.epoch.saturating_add(1) =>
             {
+                if let Some(event) = commit
+                    .application_events
+                    .iter()
+                    .find(|event| event.epoch != commit.summary.epoch)
+                {
+                    return Err(DeliveryError::DowngradeOrReplay(event.epoch));
+                }
                 self.summary = commit.summary;
                 for event in commit.application_events {
                     self.accepted_events
@@ -238,6 +251,40 @@ impl DeliveryState {
                 Err(DeliveryError::DivergentTree(evidence.local.epoch))
             }
         }
+    }
+
+    /// Apply an explicit fork repair plan.
+    ///
+    /// This models the service contract around OpenMLS repair: losing members
+    /// rejoin/reboot to the winning cryptographic state and only application
+    /// events re-proposed under that repaired epoch are accepted. Divergent MLS
+    /// commits from the losing branch are never replayed.
+    pub fn apply_repair_plan(&mut self, plan: RepairPlan) -> Result<(), DeliveryError> {
+        if plan.replays_divergent_mls_commits {
+            return Err(DeliveryError::DivergentCommitReplay);
+        }
+        if plan.winner.epoch < self.summary.epoch {
+            return Err(DeliveryError::StaleRepairTarget {
+                local: self.summary.epoch,
+                target: plan.winner.epoch,
+            });
+        }
+        if matches!(plan.action, RepairAction::None) {
+            return Ok(());
+        }
+
+        for event in &plan.reproposed_events {
+            if event.epoch != plan.winner.epoch {
+                return Err(DeliveryError::DowngradeOrReplay(event.epoch));
+            }
+        }
+
+        self.summary = plan.winner;
+        for event in plan.reproposed_events {
+            self.accepted_events
+                .insert(CanonicalEventKey::from(&event), event);
+        }
+        Ok(())
     }
 }
 
@@ -353,10 +400,16 @@ pub fn plan_repair(
     } else {
         evidence.local
     };
+    let winner_epoch = winner.epoch;
     RepairPlan {
         action: select_repair_action(true, last_common_leaves),
         winner,
-        reproposed_events: order_application_events(still_valid_events),
+        reproposed_events: order_application_events(
+            still_valid_events
+                .into_iter()
+                .filter(|event| event.epoch == winner_epoch)
+                .collect(),
+        ),
         replays_divergent_mls_commits: false,
     }
 }
@@ -457,6 +510,88 @@ mod tests {
             state.apply_commit(CommitEnvelope::new(summary(2, 9, 2), 1, Vec::new())),
             Err(DeliveryError::DivergentTree(2))
         );
+        assert_eq!(
+            state.apply_commit(CommitEnvelope::new(
+                summary(3, 3, 3),
+                1,
+                vec![ApplicationEvent::new(2, 1, "old", b"ciphertext".to_vec())],
+            )),
+            Err(DeliveryError::DowngradeOrReplay(2))
+        );
+        assert_eq!(state.summary(), &summary(2, 2, 2));
+    }
+
+    #[test]
+    fn repair_rejoins_winner_and_reproposes_only_current_epoch_events() {
+        let local = summary(3, 3, 3);
+        let remote = summary(3, 9, 9);
+        let evidence = ForkEvidence {
+            local: local.clone(),
+            remote: remote.clone(),
+        };
+        let plan = plan_repair(
+            evidence,
+            &[1, 4],
+            vec![
+                ApplicationEvent::new(2, 1, "stale", b"old".to_vec()),
+                ApplicationEvent::new(3, 4, "valid", b"current".to_vec()),
+            ],
+        );
+        assert_eq!(
+            plan.action,
+            RepairAction::RejoinAndReproposal {
+                coordinator_leaf: 4
+            }
+        );
+        assert_eq!(plan.winner, remote);
+        assert_eq!(
+            event_ids(&plan.reproposed_events),
+            BTreeSet::from(["valid".into()])
+        );
+
+        let mut state = DeliveryState::new(local);
+        assert_eq!(state.apply_repair_plan(plan), Ok(()));
+        assert_eq!(state.summary(), &remote);
+        assert_eq!(
+            event_ids(&state.accepted_events()),
+            BTreeSet::from(["valid".into()])
+        );
+    }
+
+    #[test]
+    fn repair_rejects_divergent_commit_replay_and_stale_targets() {
+        let local = summary(4, 4, 4);
+        let mut replay_plan = plan_repair(
+            ForkEvidence {
+                local: local.clone(),
+                remote: summary(4, 9, 9),
+            },
+            &[1],
+            Vec::new(),
+        );
+        replay_plan.replays_divergent_mls_commits = true;
+        let mut state = DeliveryState::new(local.clone());
+        assert_eq!(
+            state.apply_repair_plan(replay_plan),
+            Err(DeliveryError::DivergentCommitReplay)
+        );
+
+        let stale_plan = RepairPlan {
+            action: RepairAction::RejoinAndReproposal {
+                coordinator_leaf: 1,
+            },
+            winner: summary(3, 3, 3),
+            reproposed_events: Vec::new(),
+            replays_divergent_mls_commits: false,
+        };
+        assert_eq!(
+            state.apply_repair_plan(stale_plan),
+            Err(DeliveryError::StaleRepairTarget {
+                local: 4,
+                target: 3,
+            })
+        );
+        assert_eq!(state.summary(), &local);
     }
 
     #[test]
