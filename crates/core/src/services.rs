@@ -693,6 +693,12 @@ pub trait TransportService {
 
     /// Open one selected transport leg for a session.
     fn open_transport(&mut self, session_id: &SessionId, leg: TransportLeg) -> ServiceResult<()>;
+
+    /// Return the latest transport session state/route snapshot for UI and command surfaces.
+    fn transport_state(
+        &self,
+        session_id: &SessionId,
+    ) -> ServiceResult<transport::TransportSessionSnapshot>;
 }
 
 /// Durable app-state store boundary.
@@ -766,6 +772,7 @@ mod tests {
         records: BTreeMap<String, StoreRecord>,
         secrets: BTreeMap<SecretName, OpaqueBytes>,
         signals: Vec<SignalEnvelope>,
+        transport_snapshots: BTreeMap<SessionId, transport::TransportSessionSnapshot>,
         events: Vec<AppEvent>,
         next_event_sequence: u64,
     }
@@ -777,10 +784,15 @@ mod tests {
                 records: BTreeMap::new(),
                 secrets: BTreeMap::new(),
                 signals: Vec::new(),
+                transport_snapshots: BTreeMap::new(),
                 events: Vec::new(),
                 next_event_sequence: 0,
             }
         }
+    }
+
+    fn transport_error(error: transport::TransportSessionError) -> ServiceBoundaryError {
+        ServiceBoundaryError::AdapterUnavailable(error.to_string())
     }
 
     fn hex_for_test(bytes: &[u8]) -> String {
@@ -1066,16 +1078,39 @@ mod tests {
 
         fn open_transport(
             &mut self,
-            _session_id: &SessionId,
+            session_id: &SessionId,
             leg: TransportLeg,
         ) -> ServiceResult<()> {
-            if leg.ciphertext_only {
-                Ok(())
-            } else {
-                Err(ServiceBoundaryError::VerificationFailed(
+            if !leg.ciphertext_only {
+                return Err(ServiceBoundaryError::VerificationFailed(
                     "transport leg must be ciphertext-only".to_owned(),
-                ))
+                ));
             }
+            let mut session = transport::TransportSession::new();
+            session.begin_signaling().map_err(transport_error)?;
+            session.begin_ice_gathering().map_err(transport_error)?;
+            session.begin_checking().map_err(transport_error)?;
+            let endpoint = transport::Endpoint::new(leg.endpoint);
+            let snapshot = match leg.label.as_str() {
+                "direct-ice" | "stun" => session.select_direct(endpoint),
+                "turn" | "turn-relay" => session.select_turn_relay(endpoint),
+                _ => session.select_overlay_relay(endpoint),
+            }
+            .map_err(transport_error)?;
+            self.transport_snapshots
+                .insert(session_id.clone(), snapshot);
+            Ok(())
+        }
+
+        fn transport_state(
+            &self,
+            session_id: &SessionId,
+        ) -> ServiceResult<transport::TransportSessionSnapshot> {
+            Ok(self
+                .transport_snapshots
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| transport::TransportSession::new().snapshot()))
         }
     }
 
@@ -1327,6 +1362,7 @@ mod tests {
         assert_eq!(boundary.poll_signals(&session_id)?.len(), 1);
         let leg = boundary.plan_transport(&group.group_id)?.remove(0);
         boundary.open_transport(&session_id, leg)?;
+        assert!(boundary.transport_state(&session_id)?.connected());
 
         let media = boundary.join_media(MediaSessionRequest {
             group_id: group.group_id.clone(),

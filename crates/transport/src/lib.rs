@@ -29,9 +29,9 @@ use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 pub use webrtc_negotiation::{
-    SealedWebRtcNegotiationPayload, WebRtcIceCandidate, WebRtcNegotiationConfig,
-    WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator, WebRtcSdpType,
-    WebRtcSessionDescription,
+    SealedWebRtcNegotiationPayload, WebRtcDirectPathMetrics, WebRtcIceCandidate,
+    WebRtcNegotiationConfig, WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer,
+    WebRtcNegotiator, WebRtcSdpType, WebRtcSessionDescription,
 };
 
 /// Transport address or provider URI.

@@ -10,11 +10,11 @@ workspace = true
 
 [features]
 default = []
-harness = ["mls_core/harness", "admission/harness", "storage/harness", "content_keys/harness"]
-local-dev = ["mls_core/local-dev", "admission/local-dev", "storage/local-dev", "content_keys/local-dev"]
-production-network = ["mls_core/production-network", "admission/production-network", "storage/production-network", "content_keys/production-network"]
-production-media = ["mls_core/production-media", "admission/production-media", "storage/production-media", "content_keys/production-media"]
-production-storage = ["mls_core/production-storage", "admission/production-storage", "storage/production-storage", "content_keys/production-storage"]
+harness = ["mls_core/harness", "admission/harness", "storage/harness", "content_keys/harness", "transport/harness"]
+local-dev = ["mls_core/local-dev", "admission/local-dev", "storage/local-dev", "content_keys/local-dev", "transport/local-dev"]
+production-network = ["mls_core/production-network", "admission/production-network", "storage/production-network", "content_keys/production-network", "transport/production-network"]
+production-media = ["mls_core/production-media", "admission/production-media", "storage/production-media", "content_keys/production-media", "transport/production-media"]
+production-storage = ["mls_core/production-storage", "admission/production-storage", "storage/production-storage", "content_keys/production-storage", "transport/production-storage"]
 
 [dependencies]
 serde = { workspace = true }
@@ -24,3 +24,4 @@ mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1
 admission = { package = "discrypt-admission", path = "../admission", version = "0.1.0" }
 storage = { package = "discrypt-storage", path = "../storage", version = "0.1.0" }
 content_keys = { package = "discrypt-content-keys", path = "../content-keys", version = "0.1.0" }
+transport = { package = "discrypt-transport", path = "../transport", version = "0.1.0" }

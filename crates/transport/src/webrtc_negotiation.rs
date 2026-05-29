@@ -4,7 +4,9 @@
 //! claim that a direct ICE route, data channel, relay, or media plane is active;
 //! later Phase-G/J goals select routes and move application text/audio frames.
 
-use crate::{IceServerConfig, TransportError};
+use crate::{
+    Endpoint, IceServerConfig, TransportError, TransportSession, TransportSessionSnapshot,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -12,8 +14,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
-    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer,
-    RTCSdpType, RTCSessionDescription, Registry,
+    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit,
+    RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, RTCSdpType,
+    RTCSessionDescription, Registry,
 };
 
 /// SDP type carried through signaling.
@@ -276,6 +279,71 @@ fn aad_for_kind(kind: WebRtcNegotiationPayloadKind) -> &'static str {
     }
 }
 
+/// Direct ICE/WebRTC state and metrics visible to app-service adapters.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebRtcDirectPathMetrics {
+    /// Snapshot schema version for app-service/Tauri consumers.
+    pub schema_version: u16,
+    /// Current aggregate peer connection state.
+    pub peer_connection_state: String,
+    /// Current ICE connection state.
+    pub ice_connection_state: String,
+    /// Current ICE gathering state.
+    pub ice_gathering_state: String,
+    /// Total local candidates gathered by the WebRTC stack.
+    pub local_candidates_gathered: u64,
+    /// Total remote trickle candidates applied to this peer.
+    pub remote_candidates_applied: u64,
+    /// True only when WebRTC reports a direct ICE-capable connected/completed state.
+    pub direct_path_ready: bool,
+}
+
+impl WebRtcDirectPathMetrics {
+    /// Current metrics schema.
+    pub const SCHEMA_VERSION: u16 = 1;
+}
+
+#[derive(Clone, Debug)]
+struct DirectPathMetricsState {
+    peer_connection_state: RTCPeerConnectionState,
+    ice_connection_state: RTCIceConnectionState,
+    ice_gathering_state: RTCIceGatheringState,
+    local_candidates_gathered: u64,
+    remote_candidates_applied: u64,
+}
+
+impl Default for DirectPathMetricsState {
+    fn default() -> Self {
+        Self {
+            peer_connection_state: RTCPeerConnectionState::New,
+            ice_connection_state: RTCIceConnectionState::New,
+            ice_gathering_state: RTCIceGatheringState::New,
+            local_candidates_gathered: 0,
+            remote_candidates_applied: 0,
+        }
+    }
+}
+
+impl DirectPathMetricsState {
+    fn snapshot(&self) -> WebRtcDirectPathMetrics {
+        WebRtcDirectPathMetrics {
+            schema_version: WebRtcDirectPathMetrics::SCHEMA_VERSION,
+            peer_connection_state: self.peer_connection_state.to_string(),
+            ice_connection_state: self.ice_connection_state.to_string(),
+            ice_gathering_state: self.ice_gathering_state.to_string(),
+            local_candidates_gathered: self.local_candidates_gathered,
+            remote_candidates_applied: self.remote_candidates_applied,
+            direct_path_ready: matches!(
+                self.peer_connection_state,
+                RTCPeerConnectionState::Connected
+            ) || matches!(
+                self.ice_connection_state,
+                RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+            ),
+        }
+    }
+}
+
 /// Local WebRTC negotiation configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WebRtcNegotiationConfig {
@@ -318,6 +386,7 @@ impl WebRtcNegotiationConfig {
 pub struct WebRtcNegotiator {
     peer_connection: Box<dyn PeerConnection>,
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
+    metrics: Arc<Mutex<DirectPathMetricsState>>,
     data_channel_label: String,
 }
 
@@ -326,8 +395,10 @@ impl WebRtcNegotiator {
     pub async fn new(config: WebRtcNegotiationConfig) -> Result<Self, TransportError> {
         config.validate(Utc::now())?;
         let candidates = Arc::new(Mutex::new(Vec::new()));
+        let metrics = Arc::new(Mutex::new(DirectPathMetricsState::default()));
         let handler = Arc::new(CandidateCollector {
             candidates: Arc::clone(&candidates),
+            metrics: Arc::clone(&metrics),
         });
         let mut media = MediaEngine::default();
         media.register_default_codecs().map_err(|err| {
@@ -355,6 +426,7 @@ impl WebRtcNegotiator {
         Ok(Self {
             peer_connection: Box::new(peer_connection),
             candidates,
+            metrics,
             data_channel_label: config.data_channel_label,
         })
     }
@@ -442,13 +514,37 @@ impl WebRtcNegotiator {
         self.peer_connection
             .add_ice_candidate(candidate.into_rtc())
             .await
-            .map_err(|err| TransportError::Unavailable(format!("add ICE candidate failed: {err}")))
+            .map_err(|err| {
+                TransportError::Unavailable(format!("add ICE candidate failed: {err}"))
+            })?;
+        self.metrics.lock().await.remote_candidates_applied += 1;
+        Ok(())
     }
 
     /// Drain locally gathered ICE candidates in callback order for signaling.
     pub async fn drain_local_candidates(&self) -> Vec<WebRtcIceCandidate> {
         let mut candidates = self.candidates.lock().await;
         std::mem::take(&mut *candidates)
+    }
+
+    /// Current direct ICE/WebRTC metrics for app-service/Tauri state surfaces.
+    pub async fn direct_path_metrics(&self) -> WebRtcDirectPathMetrics {
+        self.metrics.lock().await.snapshot()
+    }
+
+    /// Select a direct route in a transport session only after WebRTC reports readiness.
+    pub async fn select_direct_route_if_ready(
+        &self,
+        session: &mut TransportSession,
+        endpoint: Endpoint,
+    ) -> Result<Option<TransportSessionSnapshot>, TransportError> {
+        if !self.direct_path_metrics().await.direct_path_ready {
+            return Ok(None);
+        }
+        session
+            .select_direct(endpoint)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     /// Close the peer connection.
@@ -502,10 +598,23 @@ impl WebRtcIceCandidate {
 #[derive(Clone)]
 struct CandidateCollector {
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
+    metrics: Arc<Mutex<DirectPathMetricsState>>,
 }
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for CandidateCollector {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        self.metrics.lock().await.ice_gathering_state = state;
+    }
+
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        self.metrics.lock().await.ice_connection_state = state;
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        self.metrics.lock().await.peer_connection_state = state;
+    }
+
     async fn on_ice_candidate(&self, event: webrtc::peer_connection::RTCPeerConnectionIceEvent) {
         match event.candidate.to_json() {
             Ok(init) => {
@@ -515,6 +624,7 @@ impl PeerConnectionEventHandler for CandidateCollector {
                     sdp_mline_index: init.sdp_mline_index,
                     username_fragment: init.username_fragment,
                 });
+                self.metrics.lock().await.local_candidates_gathered += 1;
             }
             Err(_err) => {}
         }
@@ -582,6 +692,70 @@ mod tests {
         for candidate in answerer.drain_local_candidates().await {
             offerer.add_remote_candidate(candidate).await?;
         }
+
+        offerer.close().await?;
+        answerer.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_path_metrics_promote_transport_session_when_webrtc_connects(
+    ) -> Result<(), TransportError> {
+        let offerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let answerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let offer = offerer.create_offer().await?;
+        let answer = answerer.create_answer(offer).await?;
+        offerer.accept_answer(answer).await?;
+
+        let mut direct_ready = false;
+        for _attempt in 0..40 {
+            for candidate in offerer.drain_local_candidates().await {
+                answerer.add_remote_candidate(candidate).await?;
+            }
+            for candidate in answerer.drain_local_candidates().await {
+                offerer.add_remote_candidate(candidate).await?;
+            }
+            let offer_metrics = offerer.direct_path_metrics().await;
+            let answer_metrics = answerer.direct_path_metrics().await;
+            if offer_metrics.direct_path_ready && answer_metrics.direct_path_ready {
+                direct_ready = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            direct_ready,
+            "loopback WebRTC peers did not report direct path readiness: offer={:?} answer={:?}",
+            offerer.direct_path_metrics().await,
+            answerer.direct_path_metrics().await
+        );
+
+        let mut session = TransportSession::new();
+        session.begin_signaling()?;
+        session.begin_ice_gathering()?;
+        session.begin_checking()?;
+        let snapshot = offerer
+            .select_direct_route_if_ready(&mut session, Endpoint::new("webrtc-direct:loopback"))
+            .await?
+            .ok_or_else(|| TransportError::Unavailable("direct path was not ready".to_owned()))?;
+        assert_eq!(snapshot.state, crate::TransportSessionState::Direct);
+        assert!(snapshot.connected());
+        assert_eq!(
+            snapshot
+                .route
+                .as_ref()
+                .map(|route| route.endpoint.0.as_str()),
+            Some("webrtc-direct:loopback")
+        );
+        assert!(
+            offerer
+                .direct_path_metrics()
+                .await
+                .remote_candidates_applied
+                > 0
+        );
 
         offerer.close().await?;
         answerer.close().await?;
