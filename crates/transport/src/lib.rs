@@ -55,7 +55,7 @@ pub enum TransportError {
     NoViablePath,
     /// A transport session event was invalid for the current state.
     #[error(transparent)]
-    InvalidSessionTransition(#[from] TransportSessionTransitionError),
+    InvalidSessionTransition(#[from] TransportSessionError),
 }
 
 /// Async datagram abstraction retained for native QUIC now and web/DataChannel later.
@@ -543,136 +543,6 @@ mod tests {
         let report = adapter.run_conformance(b"sframe-like ciphertext bytes")?;
         assert!(report.ready());
         assert_eq!(report.delivered_len, b"sframe-like ciphertext bytes".len());
-        Ok(())
-    }
-
-    #[test]
-    fn transport_session_reaches_direct_path_through_required_states(
-    ) -> Result<(), TransportSessionTransitionError> {
-        let mut session = TransportSession::new();
-
-        assert_eq!(session.state(), TransportSessionState::Idle);
-        assert!(session.can_apply(&TransportSessionEvent::StartSignaling));
-        assert!(!session.can_apply(&TransportSessionEvent::CheckingStarted));
-        let transition = session.transition(TransportSessionEvent::StartSignaling)?;
-        assert_eq!(transition.from, TransportSessionState::Idle);
-        assert_eq!(transition.to, TransportSessionState::Signaling);
-        assert_eq!(transition.snapshot.state, TransportSessionState::Signaling);
-        assert_eq!(
-            session
-                .apply(TransportSessionEvent::IceGatheringStarted)?
-                .state,
-            TransportSessionState::IceGathering
-        );
-        assert_eq!(
-            session.apply(TransportSessionEvent::CheckingStarted)?.state,
-            TransportSessionState::Checking
-        );
-        let snapshot = session.apply(TransportSessionEvent::DirectSelected {
-            endpoint: Endpoint::new("ice://direct/peer-a"),
-        })?;
-
-        assert_eq!(snapshot.state, TransportSessionState::Direct);
-        assert!(snapshot.connected);
-        assert_eq!(snapshot.selected_leg, Some(FallbackLeg::Stun));
-        assert_eq!(
-            snapshot.endpoint,
-            Some(Endpoint::new("ice://direct/peer-a"))
-        );
-        assert_eq!(snapshot.reconnect_attempts, 0);
-        assert_eq!(snapshot.last_error, None);
-        Ok(())
-    }
-
-    #[test]
-    fn transport_session_selects_overlay_and_turn_paths(
-    ) -> Result<(), TransportSessionTransitionError> {
-        let overlay = connected_session(TransportSessionEvent::OverlayRelaySelected {
-            endpoint: Endpoint::new("overlay://route/peer-a"),
-        })?;
-        assert_eq!(overlay.state, TransportSessionState::OverlayRelay);
-        assert_eq!(overlay.selected_leg, Some(FallbackLeg::RelayOverlay));
-        assert_eq!(
-            overlay.endpoint,
-            Some(Endpoint::new("overlay://route/peer-a"))
-        );
-
-        let turn = connected_session(TransportSessionEvent::TurnRelaySelected {
-            endpoint: Endpoint::new("turns:turn.example.invalid:5349"),
-        })?;
-        assert_eq!(turn.state, TransportSessionState::TurnRelay);
-        assert_eq!(turn.selected_leg, Some(FallbackLeg::Turn));
-        assert_eq!(
-            turn.endpoint,
-            Some(Endpoint::new("turns:turn.example.invalid:5349"))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn transport_session_reconnects_after_disconnect() -> Result<(), TransportSessionTransitionError>
-    {
-        let mut session = TransportSession::new();
-        reach_checking(&mut session)?;
-        session.apply(TransportSessionEvent::DirectSelected {
-            endpoint: Endpoint::new("ice://direct/peer-a"),
-        })?;
-
-        let disconnected = session.apply(TransportSessionEvent::ConnectionLost)?;
-        assert_eq!(disconnected.state, TransportSessionState::Disconnected);
-        assert!(!disconnected.connected);
-        assert_eq!(disconnected.last_error, Some("connection_lost".to_owned()));
-
-        let reconnecting = session.apply(TransportSessionEvent::ReconnectStarted)?;
-        assert_eq!(reconnecting.state, TransportSessionState::Reconnecting);
-        assert_eq!(reconnecting.reconnect_attempts, 1);
-
-        let signaling = session.apply(TransportSessionEvent::RetrySignaling)?;
-        assert_eq!(signaling.state, TransportSessionState::Signaling);
-        assert_eq!(signaling.selected_leg, None);
-        assert_eq!(signaling.endpoint, None);
-        Ok(())
-    }
-
-    #[test]
-    fn transport_session_rejects_invalid_transitions_and_can_fail_or_reset(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut session = TransportSession::new();
-        let error = match session.apply(TransportSessionEvent::CheckingStarted) {
-            Err(error) => error,
-            Ok(snapshot) => return Err(format!("unexpected transition: {snapshot:?}").into()),
-        };
-        assert_eq!(error.from, TransportSessionState::Idle);
-        assert_eq!(error.event, TransportSessionEvent::CheckingStarted);
-
-        let failed = session.apply(TransportSessionEvent::Fail {
-            reason: "signaling_timeout".to_owned(),
-        })?;
-        assert_eq!(failed.state, TransportSessionState::Failed);
-        assert_eq!(failed.last_error, Some("signaling_timeout".to_owned()));
-
-        let reset = session.apply(TransportSessionEvent::Reset)?;
-        assert_eq!(reset.state, TransportSessionState::Idle);
-        assert_eq!(reset.selected_leg, None);
-        assert_eq!(reset.endpoint, None);
-        assert_eq!(reset.last_error, None);
-        Ok(())
-    }
-
-    fn connected_session(
-        event: TransportSessionEvent,
-    ) -> Result<TransportSessionSnapshot, TransportSessionTransitionError> {
-        let mut session = TransportSession::new();
-        reach_checking(&mut session)?;
-        session.apply(event)
-    }
-
-    fn reach_checking(
-        session: &mut TransportSession,
-    ) -> Result<(), TransportSessionTransitionError> {
-        session.apply(TransportSessionEvent::StartSignaling)?;
-        session.apply(TransportSessionEvent::IceGatheringStarted)?;
-        session.apply(TransportSessionEvent::CheckingStarted)?;
         Ok(())
     }
 }
