@@ -14,7 +14,8 @@
     "test:honesty": "node scripts/honesty-gates.mjs",
     "release:linux": "node ../../scripts/release-linux.mjs",
     "release:linux:dry-run": "node ../../scripts/release-linux.mjs --dry-run",
-    "test:release-linux": "node ../../scripts/check-release-linux.mjs"
+    "test:release-linux": "node ../../scripts/check-release-linux.mjs",
+    "test:linux-runtime-docs": "node ../../scripts/check-linux-runtime-docs.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
