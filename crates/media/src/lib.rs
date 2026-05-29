@@ -11,11 +11,16 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod capture;
 pub mod production_status;
 pub mod sframe;
 pub mod transform_bridge;
 pub mod transport;
 
+pub use capture::{
+    AudioCaptureFormat, CapturedAudioFrame, EncodedOpusFrame, OpusAudioEncoder,
+    ProtectedMediaFrameSink, VoiceCaptureSFramePipeline, VoiceCaptureSendReport,
+};
 pub use sframe::{
     MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameKey, SFrameReceiver,
     SFrameSender, SenderBinding, VerifiedFrame,

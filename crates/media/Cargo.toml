@@ -23,5 +23,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+libopus-rs = { workspace = true }
 mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }
 zeroize = { workspace = true }

@@ -62,6 +62,15 @@ pub enum MediaError {
     /// Sender counter exhausted its u64 range.
     #[error("sender counter exhausted")]
     CounterOverflow,
+    /// Captured audio did not match the production voice media contract.
+    #[error("invalid audio frame: {0}")]
+    InvalidAudioFrame(String),
+    /// Opus encoding failed before SFrame protection.
+    #[error("opus encode failed: {0}")]
+    OpusEncodeFailed(String),
+    /// Protected media frame could not be handed to the transport sink.
+    #[error("media transport failed: {0}")]
+    MediaTransportFailed(String),
 }
 
 /// Protected media frame passed through relays and JS transform plumbing.
