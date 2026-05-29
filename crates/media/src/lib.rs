@@ -18,14 +18,17 @@ pub mod transform_bridge;
 pub mod transport;
 
 pub use capture::{
-    AudioCaptureFormat, CapturedAudioFrame, EncodedOpusFrame, OpusAudioEncoder,
-    ProtectedMediaFrameSink, VoiceCaptureSFramePipeline, VoiceCaptureSendReport,
+    AudioCaptureFormat, CapturedAudioFrame, DecodedAudioFrame, EncodedOpusFrame, OpusAudioDecoder,
+    OpusAudioEncoder, PlaybackAudioSink, ProtectedMediaFrameSink, VoiceCaptureSFramePipeline,
+    VoiceCaptureSendReport, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
 };
 pub use sframe::{
     MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameKey, SFrameReceiver,
     SFrameSender, SenderBinding, VerifiedFrame,
 };
-pub use transform_bridge::{BridgeClearFrame, BridgeProtectedFrame, RustTransformBridge};
+pub use transform_bridge::{
+    BridgeClearFrame, BridgeProtectedFrame, BridgeVerifiedFrame, RustTransformBridge,
+};
 pub use transport::{
     AndroidVoiceContingency, MediaTransportPath, MicrophonePermissionState, NativeWebRtcRsSkeleton,
     VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,

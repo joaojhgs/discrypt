@@ -129,6 +129,12 @@ pub enum MediaError {
     /// Opus encoding failed before SFrame protection.
     #[error("opus encode failed: {0}")]
     OpusEncodeFailed(String),
+    /// Opus decoding failed after SFrame verification.
+    #[error("opus decode failed: {0}")]
+    OpusDecodeFailed(String),
+    /// Decoded audio could not be queued to playback.
+    #[error("playback failed: {0}")]
+    PlaybackFailed(String),
     /// Protected media frame could not be handed to the transport sink.
     #[error("media transport failed: {0}")]
     MediaTransportFailed(String),

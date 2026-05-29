@@ -30,6 +30,8 @@ pub struct MediaSecuritySmoke {
     pub tamper_rejected: bool,
     /// Captured PCM is encoded as Opus and SFrame-protected before transport handoff.
     pub capture_opus_sframe_protected: bool,
+    /// Protected voice frames verify, decode, pass jitter ordering, and reach playback.
+    pub receive_decode_jitter_playback_ready: bool,
     /// Receiver plaintext after successful authentication and replay acceptance.
     pub plaintext: Vec<u8>,
 }
@@ -227,6 +229,7 @@ impl MediaSecuritySmoke {
             && self.replay_rejected
             && self.tamper_rejected
             && self.capture_opus_sframe_protected
+            && self.receive_decode_jitter_playback_ready
     }
 }
 
@@ -374,9 +377,10 @@ impl UxE2eHardeningSmoke {
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
-        AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, MediaKeyRegistry,
-        OpusAudioEncoder, ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge,
-        SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
+        AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, DecodedAudioFrame,
+        MediaKeyRegistry, OpusAudioDecoder, OpusAudioEncoder, PlaybackAudioSink,
+        ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender,
+        SenderBinding, VoiceCaptureSFramePipeline, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
     };
     use discrypt_relay_overlay::integrity::{
         contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
@@ -442,6 +446,21 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         }
     }
 
+    #[derive(Default)]
+    struct HarnessPlaybackSink {
+        played: Vec<DecodedAudioFrame>,
+    }
+
+    impl PlaybackAudioSink for HarnessPlaybackSink {
+        fn queue_playback_frame(
+            &mut self,
+            frame: DecodedAudioFrame,
+        ) -> Result<(), discrypt_media::MediaError> {
+            self.played.push(frame);
+            Ok(())
+        }
+    }
+
     let capture_format = AudioCaptureFormat::mono_20ms_48khz();
     let pcm = (0..capture_format.interleaved_samples_per_frame())
         .map(|sample| {
@@ -478,11 +497,36 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         && capture_sink.sent[0].bytes != encoded_probe.opus_payload
         && !capture_sink.sent[0].kid.is_empty();
 
+    let receive_binding =
+        SenderBinding::derive_for_epoch(&[11; 32], "harness-media", 11, 2, "alice-capture-device")?;
+    let receive_sender =
+        SFrameSender::new_for_epoch(&[12; 32], "harness-receive-unused", 12, 1, "unused")?;
+    let mut receive_registry = MediaKeyRegistry::new();
+    receive_registry.register_sender(&[11; 32], receive_binding)?;
+    let receive_bridge = RustTransformBridge::new(
+        receive_sender,
+        SFrameReceiver::new(receive_registry, ReplayWindow::default()),
+    );
+    let mut receive_pipeline = VoiceReceiveSFramePipeline::new(
+        receive_bridge,
+        OpusAudioDecoder::new(capture_format)?,
+        VoiceJitterBuffer::new(0),
+        HarnessPlaybackSink::default(),
+    );
+    let queued_playback = receive_pipeline.receive_protected_frame(capture_sink.sent[0].clone())?;
+    let playback_sink = receive_pipeline.into_sink();
+    let receive_decode_jitter_playback_ready = queued_playback == 1
+        && playback_sink.played.len() == 1
+        && playback_sink.played[0].sender.group_id == "harness-media"
+        && playback_sink.played[0].sender.epoch == 11
+        && playback_sink.played[0].pcm_i16.len() == capture_format.interleaved_samples_per_frame();
+
     Ok(MediaSecuritySmoke {
         passive_relay_cannot_read,
         replay_rejected,
         tamper_rejected,
         capture_opus_sframe_protected,
+        receive_decode_jitter_playback_ready,
         plaintext: opened.plaintext,
     })
 }
@@ -2306,6 +2350,7 @@ mod tests {
                 replay_rejected: true,
                 tamper_rejected: true,
                 capture_opus_sframe_protected: true,
+                receive_decode_jitter_playback_ready: true,
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
         ));

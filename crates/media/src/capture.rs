@@ -6,7 +6,7 @@
 //! handed to the transport sink.
 
 use crate::{BridgeClearFrame, BridgeProtectedFrame, MediaError, RustTransformBridge};
-use libopus_rs::{Application, Encoder};
+use libopus_rs::{Application, Decoder, Encoder};
 use serde::{Deserialize, Serialize};
 
 const WEBRTC_OPUS_SAMPLE_RATE_HZ: u32 = 48_000;
@@ -207,6 +207,172 @@ impl OpusAudioEncoder {
     }
 }
 
+/// Rust Opus decoder state for a single receive/playback stream.
+#[derive(Debug)]
+pub struct OpusAudioDecoder {
+    decoder: Decoder,
+    format: AudioCaptureFormat,
+}
+
+impl OpusAudioDecoder {
+    /// Create a decoder for validated WebRTC voice playback frames.
+    pub fn new(format: AudioCaptureFormat) -> Result<Self, MediaError> {
+        format.validate()?;
+        let decoder = Decoder::new(format.sample_rate_hz as i32, format.channels as usize)
+            .map_err(|error| MediaError::OpusDecodeFailed(error.to_string()))?;
+        Ok(Self { decoder, format })
+    }
+
+    /// Decode one Opus packet to interleaved PCM samples.
+    pub fn decode(&mut self, opus_payload: &[u8]) -> Result<Vec<i16>, MediaError> {
+        let pcm = self
+            .decoder
+            .decode_i16(opus_payload, false)
+            .map_err(|error| MediaError::OpusDecodeFailed(error.to_string()))?;
+        if pcm.len() != self.format.interleaved_samples_per_frame() {
+            return Err(MediaError::OpusDecodeFailed(format!(
+                "decoded {} PCM samples, expected {}",
+                pcm.len(),
+                self.format.interleaved_samples_per_frame()
+            )));
+        }
+        Ok(pcm)
+    }
+}
+
+/// Decoded, sender-authenticated audio ready for jitter buffering/playback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DecodedAudioFrame {
+    /// Authenticated SFrame sender binding.
+    pub sender: crate::SenderBinding,
+    /// Accepted SFrame counter used for jitter ordering.
+    pub counter: u64,
+    /// Playback format.
+    pub format: AudioCaptureFormat,
+    /// Interleaved PCM samples after Opus decode.
+    pub pcm_i16: Vec<i16>,
+}
+
+/// Small deterministic jitter buffer ordered by authenticated SFrame counter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoiceJitterBuffer {
+    target_depth_frames: usize,
+    next_counter: Option<u64>,
+    buffered: std::collections::BTreeMap<u64, DecodedAudioFrame>,
+}
+
+impl VoiceJitterBuffer {
+    /// Create a jitter buffer. Depth 0 is permitted for tests/direct playback.
+    #[must_use]
+    pub fn new(target_depth_frames: usize) -> Self {
+        Self {
+            target_depth_frames,
+            next_counter: None,
+            buffered: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Insert a decoded frame and return every contiguous frame ready for playback.
+    pub fn push(&mut self, frame: DecodedAudioFrame) -> Vec<DecodedAudioFrame> {
+        self.next_counter = Some(
+            self.next_counter
+                .map_or(frame.counter, |next| next.min(frame.counter)),
+        );
+        self.buffered.insert(frame.counter, frame);
+        self.pop_ready(false)
+    }
+
+    /// Drain all currently contiguous frames, used when closing or after a test burst.
+    pub fn drain_contiguous(&mut self) -> Vec<DecodedAudioFrame> {
+        self.pop_ready(true)
+    }
+
+    fn pop_ready(&mut self, drain: bool) -> Vec<DecodedAudioFrame> {
+        let mut ready = Vec::new();
+        while drain || self.buffered.len() > self.target_depth_frames {
+            let Some(counter) = self.next_counter else {
+                break;
+            };
+            let Some(frame) = self.buffered.remove(&counter) else {
+                break;
+            };
+            self.next_counter = counter.checked_add(1);
+            ready.push(frame);
+        }
+        ready
+    }
+}
+
+/// Playback boundary that receives authenticated decoded audio only.
+pub trait PlaybackAudioSink {
+    /// Queue one decoded frame for playback/mixing.
+    fn queue_playback_frame(&mut self, frame: DecodedAudioFrame) -> Result<(), MediaError>;
+}
+
+/// Protected media receive pipeline for one voice playback stream.
+pub struct VoiceReceiveSFramePipeline<S> {
+    bridge: RustTransformBridge,
+    decoder: OpusAudioDecoder,
+    jitter: VoiceJitterBuffer,
+    sink: S,
+}
+
+impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
+    /// Construct the receive pipeline from Rust-owned transform, decoder, jitter, and sink state.
+    #[must_use]
+    pub fn new(
+        bridge: RustTransformBridge,
+        decoder: OpusAudioDecoder,
+        jitter: VoiceJitterBuffer,
+        sink: S,
+    ) -> Self {
+        Self {
+            bridge,
+            decoder,
+            jitter,
+            sink,
+        }
+    }
+
+    /// Verify sender binding, reject replays, decrypt, decode, jitter, and queue playback.
+    pub fn receive_protected_frame(
+        &mut self,
+        frame: BridgeProtectedFrame,
+    ) -> Result<usize, MediaError> {
+        let counter = frame.counter;
+        let verified = self.bridge.open_protected_frame(frame)?;
+        let pcm_i16 = self.decoder.decode(&verified.clear.bytes)?;
+        let decoded = DecodedAudioFrame {
+            sender: verified.sender,
+            counter,
+            format: self.decoder.format,
+            pcm_i16,
+        };
+        let ready = self.jitter.push(decoded);
+        let queued = ready.len();
+        for frame in ready {
+            self.sink.queue_playback_frame(frame)?;
+        }
+        Ok(queued)
+    }
+
+    /// Flush contiguous jitter-buffered frames to playback.
+    pub fn flush_playback(&mut self) -> Result<usize, MediaError> {
+        let ready = self.jitter.drain_contiguous();
+        let queued = ready.len();
+        for frame in ready {
+            self.sink.queue_playback_frame(frame)?;
+        }
+        Ok(queued)
+    }
+
+    /// Consume the pipeline and return the playback sink.
+    #[must_use]
+    pub fn into_sink(self) -> S {
+        self.sink
+    }
+}
+
 /// Transport boundary that may receive only already protected media frames.
 pub trait ProtectedMediaFrameSink {
     /// Send one protected media frame onto the WebRTC media/data transport.
@@ -300,10 +466,35 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PlaybackSink {
+        played: Vec<DecodedAudioFrame>,
+    }
+
+    impl PlaybackAudioSink for PlaybackSink {
+        fn queue_playback_frame(&mut self, frame: DecodedAudioFrame) -> Result<(), MediaError> {
+            self.played.push(frame);
+            Ok(())
+        }
+    }
+
     fn media_bridge() -> Result<RustTransformBridge, MediaError> {
         let binding =
             SenderBinding::derive_for_epoch(&[4; 32], "capture-group", 4, 42, "capture-device")?;
         let sender = SFrameSender::new(&[4; 32], binding.clone())?;
+        let mut registry = MediaKeyRegistry::new();
+        registry.register_sender(&[4; 32], binding)?;
+        Ok(RustTransformBridge::new(
+            sender,
+            SFrameReceiver::new(registry, ReplayWindow::default()),
+        ))
+    }
+
+    fn receive_bridge() -> Result<RustTransformBridge, MediaError> {
+        let binding =
+            SenderBinding::derive_for_epoch(&[4; 32], "capture-group", 4, 42, "capture-device")?;
+        let sender =
+            SFrameSender::new_for_epoch(&[99; 32], "unused-receive-sender", 99, 1, "unused")?;
         let mut registry = MediaKeyRegistry::new();
         registry.register_sender(&[4; 32], binding)?;
         Ok(RustTransformBridge::new(
@@ -355,6 +546,53 @@ mod tests {
         let sink = pipeline.into_sink();
         assert_eq!(sink.sent.len(), 1);
         assert_ne!(sink.sent[0].bytes, original_opus);
+        Ok(())
+    }
+
+    #[test]
+    fn receive_pipeline_verifies_decodes_jitters_and_rejects_replay() -> Result<(), MediaError> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let mut sender_bridge = media_bridge()?;
+        let mut encoder = OpusAudioEncoder::new(format)?;
+        let encoded0 =
+            encoder.encode(CapturedAudioFrame::new(sine_frame(format), format, 2_000)?)?;
+        let encoded1 =
+            encoder.encode(CapturedAudioFrame::new(sine_frame(format), format, 2_020)?)?;
+        let protected0 = sender_bridge.protect_encoded(encoded0.into_bridge_clear_frame())?;
+        let protected1 = sender_bridge.protect_encoded(encoded1.into_bridge_clear_frame())?;
+
+        let mut tampered = protected0.clone();
+        if let Some(first) = tampered.bytes.first_mut() {
+            *first ^= 0x01;
+        }
+
+        let mut pipeline = VoiceReceiveSFramePipeline::new(
+            receive_bridge()?,
+            OpusAudioDecoder::new(format)?,
+            VoiceJitterBuffer::new(1),
+            PlaybackSink::default(),
+        );
+        assert_eq!(
+            pipeline.receive_protected_frame(tampered),
+            Err(MediaError::AuthenticationFailed)
+        );
+        assert_eq!(pipeline.receive_protected_frame(protected1.clone())?, 0);
+        assert_eq!(pipeline.receive_protected_frame(protected0.clone())?, 1);
+        assert_eq!(
+            pipeline.receive_protected_frame(protected0),
+            Err(MediaError::Replay)
+        );
+        assert_eq!(pipeline.flush_playback()?, 1);
+        let sink = pipeline.into_sink();
+        assert_eq!(sink.played.len(), 2);
+        assert_eq!(sink.played[0].counter, 0);
+        assert_eq!(sink.played[1].counter, 1);
+        assert_eq!(sink.played[0].sender.group_id, "capture-group");
+        assert_eq!(sink.played[0].sender.epoch, 4);
+        assert_eq!(
+            sink.played[0].pcm_i16.len(),
+            format.interleaved_samples_per_frame()
+        );
         Ok(())
     }
 

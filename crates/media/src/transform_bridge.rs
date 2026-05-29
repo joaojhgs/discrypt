@@ -3,7 +3,9 @@
 //! JS owns encoded frame bytes and opaque KIDs/counters only. Raw media keys stay
 //! in Rust `SFrameSender` / `SFrameReceiver` state.
 
-use crate::{MediaError, ProtectedFrame, SFrameReceiver, SFrameSender, VerifiedFrame};
+use crate::{
+    MediaError, ProtectedFrame, SFrameReceiver, SFrameSender, SenderBinding, VerifiedFrame,
+};
 use serde::{Deserialize, Serialize};
 
 /// Clear encoded frame payload received from WebRTC Insertable Streams.
@@ -11,6 +13,17 @@ use serde::{Deserialize, Serialize};
 pub struct BridgeClearFrame {
     /// Encoded audio/video frame bytes before SFrame protection.
     pub bytes: Vec<u8>,
+}
+
+/// Verified clear encoded frame plus authenticated sender identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BridgeVerifiedFrame {
+    /// Authenticated MLS sender binding.
+    pub sender: SenderBinding,
+    /// Accepted sender counter.
+    pub counter: u64,
+    /// Opened encoded media frame.
+    pub clear: BridgeClearFrame,
 }
 
 /// Protected encoded frame that can be passed through JS, relays, and WebRTC.
@@ -79,7 +92,23 @@ impl RustTransformBridge {
         &mut self,
         frame: BridgeProtectedFrame,
     ) -> Result<BridgeClearFrame, MediaError> {
-        self.receiver.open(&frame.into()).map(Into::into)
+        self.open_protected_frame(frame)
+            .map(|verified| verified.clear)
+    }
+
+    /// Open an encoded frame and return the authenticated sender binding and counter.
+    pub fn open_protected_frame(
+        &mut self,
+        frame: BridgeProtectedFrame,
+    ) -> Result<BridgeVerifiedFrame, MediaError> {
+        let verified = self.receiver.open(&frame.into())?;
+        Ok(BridgeVerifiedFrame {
+            sender: verified.binding,
+            counter: verified.counter,
+            clear: BridgeClearFrame {
+                bytes: verified.plaintext,
+            },
+        })
     }
 }
 
