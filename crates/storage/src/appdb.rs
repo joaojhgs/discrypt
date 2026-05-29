@@ -34,6 +34,85 @@ use zeroize::Zeroize;
 const ENVELOPE_FORMAT: &str = "discrypt.appdb.encrypted.v1";
 const DEFAULT_WRAPPING_KEY_ID: &str = "local-appdb-wrapping-key-v1";
 
+/// Launch storage/keychain decision locked by ADR-006.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StorageKeychainDecision {
+    /// Runtime storage format for app-level state.
+    pub app_store_runtime: &'static str,
+    /// SQLite compatibility boundary and schema policy.
+    pub sqlite_schema_policy: &'static str,
+    /// Crates that implement the encrypted store envelope.
+    pub encrypted_store_crates: &'static [&'static str],
+    /// Crate and provider selected for production keychain integration.
+    pub keychain_crate: &'static str,
+    /// WAL, SHM, journal, and temp-file handling policy.
+    pub wal_journal_policy: &'static str,
+    /// Data-key wrapping and envelope policy.
+    pub key_wrapping: &'static str,
+    /// Versioned schema migration policy.
+    pub schema_migrations: &'static str,
+    /// Explicit secure-delete limitation statement.
+    pub secure_delete_limits: &'static str,
+    /// Platform-specific storage differences and launch gates.
+    pub platform_differences: &'static [&'static str],
+}
+
+impl StorageKeychainDecision {
+    /// True when this decision covers every ADR-006 launch axis.
+    #[must_use]
+    pub fn covers_adr_006(&self) -> bool {
+        self.app_store_runtime.contains("EncryptedAppDb")
+            && self.app_store_runtime.contains("AES-256-GCM")
+            && self
+                .app_store_runtime
+                .contains("not persist plaintext SQLite pages")
+            && self.sqlite_schema_policy.contains("AppDbSchema")
+            && self.sqlite_schema_policy.contains("VERSION_1_DDL")
+            && self.sqlite_schema_policy.contains("openmls_sqlite_storage")
+            && self.encrypted_store_crates.contains(&"aes-gcm")
+            && self.encrypted_store_crates.contains(&"serde_json")
+            && self.encrypted_store_crates.contains(&"zeroize")
+            && self.keychain_crate.contains("keyring 3.6.3")
+            && self.keychain_crate.contains("LinuxOsKeychain")
+            && self.wal_journal_policy.contains("sqlite_wal_path")
+            && self.wal_journal_policy.contains("quarantine_corrupt_store")
+            && self.key_wrapping.contains("wrapped_data_key")
+            && self.key_wrapping.contains("data key zeroized")
+            && self.schema_migrations.contains("AppDbMigrationPlan")
+            && self.schema_migrations.contains("validate_observed_schema")
+            && self.secure_delete_limits.contains("best-effort")
+            && self.secure_delete_limits.contains("SSD")
+            && self.secure_delete_limits.contains("cloud snapshot")
+            && self
+                .platform_differences
+                .iter()
+                .any(|platform| platform.contains("Linux") && platform.contains("Secret Service"))
+            && self.platform_differences.iter().any(|platform| {
+                platform.contains("MemoryAppDbKeychain") && platform.contains("non-production")
+            })
+    }
+}
+
+/// Return the ADR-006 storage/keychain launch decision.
+#[must_use]
+pub const fn storage_keychain_decision() -> StorageKeychainDecision {
+    StorageKeychainDecision {
+        app_store_runtime: "EncryptedAppDb persists a serde_json envelope encrypted with AES-256-GCM; app DB does not persist plaintext SQLite pages.",
+        sqlite_schema_policy: "AppDbSchema and VERSION_1_DDL define the SQLite-compatible durable schema contract; OpenMLS protocol state uses openmls_sqlite_storage separately.",
+        encrypted_store_crates: &["aes-gcm", "serde_json", "zeroize", "sha2", "hex"],
+        keychain_crate: "keyring 3.6.3 is optional behind production-storage; LinuxOsKeychain uses the Secret Service sync provider; MemoryAppDbKeychain is restricted to tests/local/non-production builds.",
+        wal_journal_policy: "Encrypted envelope writes use temp-file plus rename; sqlite_wal_path, -shm, and -journal sidecars are leakage-checked or moved by quarantine_corrupt_store; no plaintext WAL is expected for EncryptedAppDb.",
+        key_wrapping: "A random data key encrypts payload bytes; the AppDbKeychain wrapping key wraps that data key into wrapped_data_key with nonces in the envelope; the data key zeroized after wrapping/decryption.",
+        schema_migrations: "AppDbMigrationPlan supports 0<->1 forward/backward/noop transitions, rejects future versions, and validate_observed_schema checks tables and columns before opening state.",
+        secure_delete_limits: "Secure delete is best-effort enumeration plus verification for local files/keychain entries and cannot promise erasure from SSD wear-leveling, backups, or cloud snapshot copies.",
+        platform_differences: &[
+            "Linux production-storage uses keyring Secret Service through LinuxOsKeychain.",
+            "Tests, harnesses, local-dev, and non-production builds may use MemoryAppDbKeychain only as a non-production boundary.",
+            "macOS, Windows, Android, and iOS require platform keychain adapters before any production-storage claim.",
+        ],
+    }
+}
+
 /// Local keychain boundary used by the encrypted app DB.
 ///
 /// Implementations should store the wrapping key in an OS/platform keychain or
@@ -1213,6 +1292,19 @@ mod tests {
             assert!(AppDbSchema::current().table(required).is_some());
         }
         Ok(())
+    }
+
+    #[test]
+    fn storage_keychain_decision_covers_adr_006() {
+        let decision = storage_keychain_decision();
+        assert!(decision.covers_adr_006());
+        assert!(decision
+            .sqlite_schema_policy
+            .contains("SQLite-compatible durable schema contract"));
+        assert!(decision
+            .platform_differences
+            .iter()
+            .any(|platform| platform.contains("macOS") && platform.contains("adapters")));
     }
 
     #[test]

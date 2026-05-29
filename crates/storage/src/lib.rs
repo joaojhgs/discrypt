@@ -17,7 +17,10 @@ pub use appdb::LinuxOsKeychain;
     not(feature = "production-storage")
 ))]
 pub use appdb::MemoryAppDbKeychain;
-pub use appdb::{sqlite_wal_path, AppDbKeychain, EncryptedAppDb};
+pub use appdb::{
+    sqlite_wal_path, storage_keychain_decision, AppDbKeychain, EncryptedAppDb,
+    StorageKeychainDecision,
+};
 pub use content_keys::KeyState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -35,7 +35,8 @@
     "test:adr-002-openmls-provider-storage": "node ../../scripts/check-adr-002-openmls-provider-storage.mjs",
     "test:adr-003-signaling-transport": "node ../../scripts/check-adr-003-signaling-transport.mjs",
     "test:adr-004-turn-stun-credentials": "node ../../scripts/check-adr-004-turn-stun-credentials.mjs",
-    "test:adr-005-pake-admission-helper": "node ../../scripts/check-adr-005-pake-admission-helper.mjs"
+    "test:adr-005-pake-admission-helper": "node ../../scripts/check-adr-005-pake-admission-helper.mjs",
+    "test:adr-006-storage-keychain": "node ../../scripts/check-adr-006-storage-keychain.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
