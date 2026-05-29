@@ -90,11 +90,7 @@ mod tests {
 
     #[test]
     fn bridge_roundtrip_exposes_only_frame_metadata_to_js() -> Result<(), MediaError> {
-        let binding = SenderBinding {
-            kid: b"kid-bridge".to_vec(),
-            leaf_index: 7,
-            device_id: "desktop".into(),
-        };
+        let binding = SenderBinding::derive_for_epoch(&[7; 32], "bridge-group", 7, 7, "desktop")?;
         let sender = SFrameSender::new(&[7; 32], binding.clone())?;
         let mut registry = MediaKeyRegistry::new();
         registry.register_sender(&[7; 32], binding)?;

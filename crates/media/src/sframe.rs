@@ -17,24 +17,82 @@ use zeroize::Zeroize;
 const DEFAULT_REPLAY_WINDOW: u64 = 64;
 const NONCE_LEN: usize = 12;
 
-/// Media sender binding from KID to MLS leaf/device.
+/// Media sender binding from KID to MLS group/epoch/leaf/device.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SenderBinding {
     /// Media key identifier carried in the protected frame header.
     pub kid: Vec<u8>,
-    /// MLS leaf index for the sender device.
+    /// Stable MLS group identifier for this media sender context.
+    pub group_id: String,
+    /// MLS epoch that produced the media exporter secret.
+    pub epoch: u64,
+    /// MLS leaf index for the sender device at `epoch`.
     pub leaf_index: u32,
     /// Stable sender device identifier from the device set.
     pub device_id: String,
 }
 
 impl SenderBinding {
+    /// Derive a KID-bound media sender identity from the MLS media exporter secret.
+    pub fn derive_for_epoch(
+        epoch_secret: &[u8],
+        group_id: impl Into<String>,
+        epoch: u64,
+        leaf_index: u32,
+        device_id: impl Into<String>,
+    ) -> Result<Self, MediaError> {
+        let mut binding = Self {
+            kid: Vec::new(),
+            group_id: group_id.into(),
+            epoch,
+            leaf_index,
+            device_id: device_id.into(),
+        };
+        binding.validate_without_kid()?;
+        binding.kid = binding.derived_kid(epoch_secret);
+        binding.validate()?;
+        Ok(binding)
+    }
+
     /// Validate that the binding is usable as an authenticated media sender id.
     pub fn validate(&self) -> Result<(), MediaError> {
-        if self.kid.is_empty() || self.device_id.trim().is_empty() {
+        self.validate_without_kid()?;
+        if self.kid.is_empty() {
             return Err(MediaError::InvalidBinding);
         }
         Ok(())
+    }
+
+    /// Verify that the frame KID is bound to the MLS epoch exporter secret and sender identity.
+    pub fn verify_derived_kid(&self, epoch_secret: &[u8]) -> Result<(), MediaError> {
+        self.validate()?;
+        if self.kid == self.derived_kid(epoch_secret) {
+            Ok(())
+        } else {
+            Err(MediaError::KidBindingMismatch)
+        }
+    }
+
+    fn validate_without_kid(&self) -> Result<(), MediaError> {
+        if self.group_id.trim().is_empty() || self.device_id.trim().is_empty() {
+            return Err(MediaError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn derived_kid(&self, epoch_secret: &[u8]) -> Vec<u8> {
+        let mut h = Sha256::new();
+        h.update(b"discrypt-sframe-kid-v1");
+        let group = self.group_id.as_bytes();
+        h.update((group.len() as u64).to_be_bytes());
+        h.update(group);
+        h.update(self.epoch.to_be_bytes());
+        h.update(self.leaf_index.to_be_bytes());
+        let device = self.device_id.as_bytes();
+        h.update((device.len() as u64).to_be_bytes());
+        h.update(device);
+        h.update(epoch_secret);
+        h.finalize()[..16].to_vec()
     }
 }
 
@@ -53,6 +111,9 @@ pub enum MediaError {
     /// A sender key was used with a different KID/leaf/device binding.
     #[error("media key does not match sender binding")]
     BindingMismatch,
+    /// KID was not derived from the MLS epoch exporter secret and sender binding.
+    #[error("media kid is not bound to MLS group epoch and sender identity")]
+    KidBindingMismatch,
     /// KID is already registered to a sender binding.
     #[error("duplicate media key id")]
     DuplicateKid,
@@ -121,7 +182,7 @@ impl Drop for SFrameKey {
 impl SFrameKey {
     /// Derive a media key for exactly one MLS leaf/device sender binding.
     pub fn derive(epoch_secret: &[u8], binding: &SenderBinding) -> Result<Self, MediaError> {
-        binding.validate()?;
+        binding.verify_derived_kid(epoch_secret)?;
         let context = binding_context(binding);
         Ok(Self {
             bytes: derive_epoch_secret(epoch_secret, ExportLabel::Media, &context),
@@ -238,6 +299,38 @@ impl SFrameSender {
             key,
             next_counter: 0,
         })
+    }
+
+    /// Create sender state while deriving a KID from MLS group/epoch/leaf/device context.
+    pub fn new_for_epoch(
+        epoch_secret: &[u8],
+        group_id: impl Into<String>,
+        epoch: u64,
+        leaf_index: u32,
+        device_id: impl Into<String>,
+    ) -> Result<Self, MediaError> {
+        Self::new(
+            epoch_secret,
+            SenderBinding::derive_for_epoch(epoch_secret, group_id, epoch, leaf_index, device_id)?,
+        )
+    }
+
+    /// Rotate this sender after MLS membership/epoch changes. Counter restarts under a new KID.
+    pub fn rotate_for_epoch(
+        &mut self,
+        epoch_secret: &[u8],
+        group_id: impl Into<String>,
+        epoch: u64,
+        leaf_index: u32,
+        device_id: impl Into<String>,
+    ) -> Result<(), MediaError> {
+        let binding =
+            SenderBinding::derive_for_epoch(epoch_secret, group_id, epoch, leaf_index, device_id)?;
+        let key = SFrameKey::derive(epoch_secret, &binding)?;
+        self.binding = binding;
+        self.key = key;
+        self.next_counter = 0;
+        Ok(())
     }
 
     /// Protect the next encoded media frame.
@@ -408,6 +501,10 @@ fn binding_context(binding: &SenderBinding) -> Vec<u8> {
     context.extend_from_slice(b"discrypt-sframe-binding-v1");
     context.extend_from_slice(&(binding.kid.len() as u64).to_be_bytes());
     context.extend_from_slice(&binding.kid);
+    let group = binding.group_id.as_bytes();
+    context.extend_from_slice(&(group.len() as u64).to_be_bytes());
+    context.extend_from_slice(group);
+    context.extend_from_slice(&binding.epoch.to_be_bytes());
     context.extend_from_slice(&binding.leaf_index.to_be_bytes());
     let device = binding.device_id.as_bytes();
     context.extend_from_slice(&(device.len() as u64).to_be_bytes());
@@ -440,17 +537,24 @@ fn frame_aad(binding: &SenderBinding, counter: u64) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn binding(kid: &[u8], leaf_index: u32, device_id: &str) -> SenderBinding {
-        SenderBinding {
-            kid: kid.to_vec(),
+    fn binding(
+        epoch_secret: &[u8],
+        epoch: u64,
+        leaf_index: u32,
+        device_id: &str,
+    ) -> Result<SenderBinding, MediaError> {
+        SenderBinding::derive_for_epoch(
+            epoch_secret,
+            "media-test-group",
+            epoch,
             leaf_index,
-            device_id: device_id.to_owned(),
-        }
+            device_id,
+        )
     }
 
     #[test]
     fn rejects_replay_and_roundtrips_facade_ciphertext() -> Result<(), MediaError> {
-        let b = binding(b"kid-alice-laptop", 1, "alice-laptop");
+        let b = binding(&[1; 32], 1, 1, "alice-laptop")?;
         let mut sender = SFrameSender::new(&[1; 32], b.clone())?;
         let mut registry = MediaKeyRegistry::new();
         registry.register_sender(&[1; 32], b)?;
@@ -466,7 +570,7 @@ mod tests {
 
     #[test]
     fn detects_tamper_without_consuming_replay_counter() -> Result<(), MediaError> {
-        let b = binding(b"kid-alice-phone", 2, "alice-phone");
+        let b = binding(&[2; 32], 2, 2, "alice-phone")?;
         let mut sender = SFrameSender::new(&[2; 32], b.clone())?;
         let mut registry = MediaKeyRegistry::new();
         registry.register_sender(&[2; 32], b)?;
@@ -487,8 +591,8 @@ mod tests {
 
     #[test]
     fn binds_key_to_leaf_and_device() -> Result<(), MediaError> {
-        let laptop = binding(b"shared-kid", 3, "laptop");
-        let phone = binding(b"shared-kid", 3, "phone");
+        let laptop = binding(&[3; 32], 3, 3, "laptop")?;
+        let phone = binding(&[3; 32], 3, 3, "phone")?;
         let laptop_key = derive_media_key(&[3; 32], &laptop)?;
 
         assert_ne!(
@@ -504,7 +608,7 @@ mod tests {
 
     #[test]
     fn passive_relay_has_ciphertext_only_and_unknown_kid_cannot_open() -> Result<(), MediaError> {
-        let b = binding(b"kid-bob-desktop", 4, "bob-desktop");
+        let b = binding(&[4; 32], 4, 4, "bob-desktop")?;
         let mut sender = SFrameSender::new(&[4; 32], b.clone())?;
         let relayed = sender.protect(b"secret media")?;
         assert!(!relayed
@@ -525,7 +629,7 @@ mod tests {
     #[test]
     fn key_debug_and_protected_frame_do_not_expose_raw_secret_or_plaintext(
     ) -> Result<(), MediaError> {
-        let b = binding(b"kid-redaction", 8, "alice-desktop");
+        let b = binding(&[8; 32], 8, 8, "alice-desktop")?;
         let key = derive_media_key(&[8; 32], &b)?;
         let debug = format!("{key:?}");
         assert!(debug.contains("<redacted>"));
@@ -542,13 +646,66 @@ mod tests {
 
     #[test]
     fn registry_rejects_duplicate_kid_binding() -> Result<(), MediaError> {
-        let first = binding(b"kid-conflict", 1, "laptop");
-        let second = binding(b"kid-conflict", 2, "phone");
+        let first = binding(&[5; 32], 5, 1, "laptop")?;
+        let second = first.clone();
         let mut registry = MediaKeyRegistry::new();
         registry.register_sender(&[5; 32], first)?;
         assert_eq!(
             registry.register_sender(&[5; 32], second),
             Err(MediaError::DuplicateKid)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_kid_not_derived_from_mls_epoch_sender_binding() -> Result<(), MediaError> {
+        let mut forged = binding(&[6; 32], 6, 1, "alice-laptop")?;
+        forged.kid = b"forged-human-readable-kid".to_vec();
+        assert!(matches!(
+            SFrameSender::new(&[6; 32], forged),
+            Err(MediaError::KidBindingMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rotates_media_kid_and_key_on_mls_epoch_membership_change() -> Result<(), MediaError> {
+        let mut sender =
+            SFrameSender::new_for_epoch(&[7; 32], "rotation-group", 7, 3, "alice-laptop")?;
+        let epoch7_binding = sender.binding().clone();
+        let epoch7_frame = sender.protect(b"epoch seven opus")?;
+
+        sender.rotate_for_epoch(&[8; 32], "rotation-group", 8, 4, "alice-laptop")?;
+        let epoch8_binding = sender.binding().clone();
+        let epoch8_frame = sender.protect(b"epoch eight opus")?;
+
+        assert_ne!(epoch7_binding.kid, epoch8_binding.kid);
+        assert_ne!(epoch7_binding.epoch, epoch8_binding.epoch);
+        assert_ne!(epoch7_binding.leaf_index, epoch8_binding.leaf_index);
+        assert_eq!(epoch8_frame.counter, 0);
+
+        let mut old_registry = MediaKeyRegistry::new();
+        old_registry.register_sender(&[7; 32], epoch7_binding)?;
+        let mut old_receiver = SFrameReceiver::new(old_registry, ReplayWindow::default());
+        assert_eq!(
+            old_receiver.open(&epoch8_frame),
+            Err(MediaError::UnknownSender)
+        );
+        assert_eq!(
+            old_receiver.open(&epoch7_frame)?.plaintext,
+            b"epoch seven opus"
+        );
+
+        let mut new_registry = MediaKeyRegistry::new();
+        new_registry.register_sender(&[8; 32], epoch8_binding)?;
+        let mut new_receiver = SFrameReceiver::new(new_registry, ReplayWindow::default());
+        assert_eq!(
+            new_receiver.open(&epoch7_frame),
+            Err(MediaError::UnknownSender)
+        );
+        assert_eq!(
+            new_receiver.open(&epoch8_frame)?.plaintext,
+            b"epoch eight opus"
         );
         Ok(())
     }

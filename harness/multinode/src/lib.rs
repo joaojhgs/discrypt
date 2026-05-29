@@ -393,11 +393,7 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
             .map_err(|_| discrypt_media::MediaError::AuthenticationFailed)
     }
 
-    let binding = SenderBinding {
-        kid: b"harness-kid-alice".to_vec(),
-        leaf_index: 1,
-        device_id: "alice-laptop".to_owned(),
-    };
+    let binding = SenderBinding::derive_for_epoch(&[9; 32], "harness-media", 9, 1, "alice-laptop")?;
     let mut sender = SFrameSender::new(&[9; 32], binding.clone())?;
     let mut registry = MediaKeyRegistry::new();
     registry.register_sender(&[9; 32], binding.clone())?;
@@ -458,11 +454,8 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
     let captured = CapturedAudioFrame::new(pcm, capture_format, 777)?;
     let mut opus_probe = OpusAudioEncoder::new(capture_format)?;
     let encoded_probe = opus_probe.encode(captured.clone())?;
-    let capture_binding = SenderBinding {
-        kid: b"harness-capture-kid".to_vec(),
-        leaf_index: 2,
-        device_id: "alice-capture-device".to_owned(),
-    };
+    let capture_binding =
+        SenderBinding::derive_for_epoch(&[11; 32], "harness-media", 11, 2, "alice-capture-device")?;
     let capture_sender = SFrameSender::new(&[11; 32], capture_binding.clone())?;
     let mut capture_registry = MediaKeyRegistry::new();
     capture_registry.register_sender(&[11; 32], capture_binding)?;
@@ -506,12 +499,14 @@ pub fn overlay_node_process_report(
         contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
     };
 
-    let binding = SenderBinding {
-        kid: format!("node-{node_index}-kid").into_bytes(),
-        leaf_index: node_index as u32,
-        device_id: format!("node-{node_index}-device"),
-    };
     let epoch_secret = [node_index as u8; 32];
+    let binding = SenderBinding::derive_for_epoch(
+        &epoch_secret,
+        "overlay-process",
+        node_index as u64,
+        node_index as u32,
+        format!("node-{node_index}-device"),
+    )?;
     let plaintext = format!("node-{node_index} voice payload");
     let mut sender = SFrameSender::new(&epoch_secret, binding.clone())?;
     let protected = sender.protect(plaintext.as_bytes())?;
@@ -667,11 +662,8 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         .as_ref()
         .is_some_and(|report| report.target_met && report.observed_gap_ms <= 200);
 
-    let binding = SenderBinding {
-        kid: b"phase2-kid-alice".to_vec(),
-        leaf_index: 1,
-        device_id: "alice-laptop".to_owned(),
-    };
+    let binding =
+        SenderBinding::derive_for_epoch(&[42; 32], "phase2-overlay", 42, 1, "alice-laptop")?;
     let mut sender = SFrameSender::new(&[42; 32], binding.clone())?;
     let mut registry = MediaKeyRegistry::new();
     registry.register_sender(&[42; 32], binding.clone())?;

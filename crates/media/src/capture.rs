@@ -301,11 +301,8 @@ mod tests {
     }
 
     fn media_bridge() -> Result<RustTransformBridge, MediaError> {
-        let binding = SenderBinding {
-            kid: b"capture-kid".to_vec(),
-            leaf_index: 42,
-            device_id: "capture-device".to_owned(),
-        };
+        let binding =
+            SenderBinding::derive_for_epoch(&[4; 32], "capture-group", 4, 42, "capture-device")?;
         let sender = SFrameSender::new(&[4; 32], binding.clone())?;
         let mut registry = MediaKeyRegistry::new();
         registry.register_sender(&[4; 32], binding)?;
