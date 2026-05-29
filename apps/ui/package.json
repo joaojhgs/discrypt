@@ -18,7 +18,8 @@
     "test:linux-runtime-docs": "node ../../scripts/check-linux-runtime-docs.mjs",
     "smoke:linux-packages": "node ../../scripts/smoke-linux-packages.mjs",
     "smoke:linux-packages:dry-run": "node ../../scripts/smoke-linux-packages.mjs --dry-run",
-    "test:linux-package-smoke": "node ../../scripts/check-linux-package-smoke.mjs"
+    "test:linux-package-smoke": "node ../../scripts/check-linux-package-smoke.mjs",
+    "test:desktop-package-ci": "node ../../scripts/check-desktop-package-ci.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
