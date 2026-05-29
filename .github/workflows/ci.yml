@@ -24,11 +24,19 @@ jobs:
   android-check:
     name: android target check
     runs-on: ubuntu-latest
+    env:
+      ANDROID_NDK_VERSION: "28.0.13004108"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+      - uses: android-actions/setup-android@v3
+      - name: Install Android NDK for cargo target check
+        run: |
+          sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
       - run: cargo check --workspace --target aarch64-linux-android
 
   supply-chain:

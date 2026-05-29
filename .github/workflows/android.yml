@@ -1,0 +1,120 @@
+name: android build and media gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_android_emulator:
+        description: Build the Android APK and run the voice media path on an Android emulator runner
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/android.yml
+      - apps/desktop/src-tauri/**
+      - apps/ui/**
+      - crates/media/**
+      - scripts/*android*.mjs
+      - docs/release/android-build-emulator-gate.md
+
+jobs:
+  validate-android-gate:
+    name: validate Android build and media gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm --prefix apps/ui ci
+      - run: npm --prefix apps/ui run test:android-gate
+      - run: cargo test -p discrypt-media android --quiet
+      - run: cargo test -p discrypt-media voice --quiet
+      - run: npm --prefix apps/ui run test:honesty
+      - run: npm --prefix apps/ui run test:command-coverage
+      - run: npm --prefix apps/ui run build
+
+  android-emulator-voice-path:
+    name: Android emulator voice path
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_android_emulator }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DISCRYPT_ANDROID_PACKAGE: chat.discrypt.desktop
+      ANDROID_API_LEVEL: "35"
+      ANDROID_NDK_VERSION: "28.0.13004108"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK and NDK packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;35.0.0" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "emulator" \
+            "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+      - run: npm --prefix apps/ui ci
+      - run: npm --prefix apps/ui run test:android-gate
+      - run: cargo test -p discrypt-media android --quiet
+      - run: cargo check -p discrypt-media --target x86_64-linux-android --quiet
+      - run: npm --prefix apps/ui run test:honesty
+      - run: npm --prefix apps/ui run test:command-coverage
+      - run: npm --prefix apps/ui run build
+      - name: Initialize generated Android project
+        run: >
+          npx --yes @tauri-apps/cli@2.11.2 android init
+          --ci
+          --skip-targets-install
+          --config apps/desktop/src-tauri/tauri.conf.json
+      - name: Build unsigned Android APK
+        run: >
+          npx --yes @tauri-apps/cli@2.11.2 android build
+          --ci
+          --apk
+          --target x86_64
+          --config apps/desktop/src-tauri/tauri.conf.json
+          --features tauri-runtime,production-network,production-media
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          script: |
+            set -euo pipefail
+            APK_PATH=$(find target -path '*apk*' -name '*.apk' | head -n 1)
+            test -n "$APK_PATH"
+            adb install -r "$APK_PATH"
+            adb shell pm grant "$DISCRYPT_ANDROID_PACKAGE" android.permission.RECORD_AUDIO || true
+            adb shell appops set "$DISCRYPT_ANDROID_PACKAGE" RECORD_AUDIO allow || true
+            adb shell am start -W -n "$DISCRYPT_ANDROID_PACKAGE/.MainActivity"
+            sleep 12
+            adb shell pidof "$DISCRYPT_ANDROID_PACKAGE"
+            adb shell dumpsys package "$DISCRYPT_ANDROID_PACKAGE" > android-package-dump.txt
+            grep -q "android.permission.RECORD_AUDIO" android-package-dump.txt
+            adb logcat -d > android-logcat.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: discrypt-android-emulator-voice-path
+          path: |
+            target/**/*.apk
+            android-package-dump.txt
+            android-logcat.txt
