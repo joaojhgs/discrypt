@@ -750,7 +750,8 @@ pub fn storage_persistence_smoke() -> Result<StoragePersistenceSmoke, anyhow::Er
     let sensitive_state = br#"{"schema_version":1,"profile":{"display_name":"Alice"},"messages":[{"body":"phase-b plaintext must not leak"}],"content_key":"forbidden-content-key"}"#;
     fresh_db.save_app_state(sensitive_state)?;
     let mut restarted_db = EncryptedAppDb::new(&path, keychain);
-    let restart_loads_encrypted_state = restarted_db.load_app_state()? == Some(sensitive_state.to_vec());
+    let restart_loads_encrypted_state =
+        restarted_db.load_app_state()? == Some(sensitive_state.to_vec());
 
     let path_contains = |candidate: &std::path::Path, needle: &[u8]| {
         fs::read(candidate)
