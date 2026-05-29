@@ -2,11 +2,33 @@ use discrypt_core::summarize;
 use discrypt_mls_core::GroupState;
 use discrypt_multinode_harness::{
     connectivity_signaling_push_smoke, governance_admission_smoke, media_security_smoke,
-    phase_c_device_rotation_smoke, relay_overlay_smoke, retention_shred_smoke,
-    storage_persistence_smoke, text_history_delivery_smoke, ux_e2e_hardening_smoke,
+    overlay_node_process_report, phase_c_device_rotation_smoke, relay_overlay_smoke,
+    retention_shred_smoke, storage_persistence_smoke, text_history_delivery_smoke,
+    ux_e2e_hardening_smoke,
 };
 
 fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--overlay-node-report")
+    {
+        let node_index = args
+            .get(2)
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or_default();
+        match overlay_node_process_report(node_index) {
+            Ok(report) => {
+                println!("{}", report.to_line());
+                return;
+            }
+            Err(error) => {
+                eprintln!("discrypt overlay node report failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let group = GroupState::new("phase0-smoke");
     let summary = summarize(&group);
     match (

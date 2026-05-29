@@ -57,6 +57,19 @@ pub struct RelayOverlaySmoke {
     pub plaintext: Vec<u8>,
 }
 
+/// Report emitted by one OS process in the 16-node overlay churn/loss harness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayNodeProcessReport {
+    /// Deterministic node index.
+    pub node_index: usize,
+    /// Relay-visible bytes were protected envelope metadata plus ciphertext only.
+    pub relay_visible_ciphertext_only: bool,
+    /// Active relay tamper was rejected by media authentication.
+    pub tamper_rejected: bool,
+    /// Active relay replay was rejected by media replay state.
+    pub replay_rejected: bool,
+}
+
 /// Deterministic Phase-3 text/history/MLS delivery smoke result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextHistoryDeliverySmoke {
@@ -213,6 +226,26 @@ impl RelayOverlaySmoke {
             && self.store_forward_fanout_bounded
             && self.ciphertext_only_media
             && self.tamper_rejected
+    }
+}
+
+impl OverlayNodeProcessReport {
+    /// True when this process satisfied all local relay-security checks.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.relay_visible_ciphertext_only && self.tamper_rejected && self.replay_rejected
+    }
+
+    /// Stable line protocol for parent process parsing.
+    #[must_use]
+    pub fn to_line(&self) -> String {
+        format!(
+            "overlay-node node_index={} relay_visible_ciphertext_only={} tamper_rejected={} replay_rejected={}",
+            self.node_index,
+            self.relay_visible_ciphertext_only,
+            self.tamper_rejected,
+            self.replay_rejected
+        )
     }
 }
 
@@ -378,6 +411,70 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         replay_rejected,
         tamper_rejected,
         plaintext: opened.plaintext,
+    })
+}
+
+/// Run one node's local protected-envelope relay checks for the process harness.
+pub fn overlay_node_process_report(
+    node_index: usize,
+) -> Result<OverlayNodeProcessReport, discrypt_media::MediaError> {
+    use discrypt_media::{
+        MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameReceiver, SFrameSender,
+        SenderBinding,
+    };
+    use discrypt_relay_overlay::integrity::{
+        contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
+    };
+
+    let binding = SenderBinding {
+        kid: format!("node-{node_index}-kid").into_bytes(),
+        leaf_index: node_index as u32,
+        device_id: format!("node-{node_index}-device"),
+    };
+    let epoch_secret = [node_index as u8; 32];
+    let plaintext = format!("node-{node_index} voice payload");
+    let mut sender = SFrameSender::new(&epoch_secret, binding.clone())?;
+    let protected = sender.protect(plaintext.as_bytes())?;
+    let envelope = RelayProtectedEnvelope::new(
+        RelayPayloadKind::Media,
+        protected.kid.clone(),
+        protected.counter,
+        format!("overlay-node-route:{node_index}").as_bytes(),
+        protected.ciphertext.clone(),
+    )
+    .map_err(|_| MediaError::AuthenticationFailed)?;
+    let relay_packet =
+        RelayPacket::from_envelope(format!("relay-{node_index}"), envelope).forward("next-relay");
+    let relay_visible_ciphertext_only = !contains_plaintext(&relay_packet, plaintext.as_bytes())
+        && !relay_packet.envelope.kid.is_empty();
+
+    let mut tamper_registry = MediaKeyRegistry::new();
+    tamper_registry.register_sender(&epoch_secret, binding.clone())?;
+    let mut tamper_receiver = SFrameReceiver::new(tamper_registry, ReplayWindow::default());
+    let tampered = relay_packet.clone().tamper();
+    let tamper_rejected = tamper_receiver.open(&ProtectedFrame {
+        kid: protected.kid.clone(),
+        counter: protected.counter,
+        ciphertext: tampered.envelope.ciphertext,
+    }) == Err(MediaError::AuthenticationFailed);
+
+    let mut replay_registry = MediaKeyRegistry::new();
+    replay_registry.register_sender(&epoch_secret, binding)?;
+    let mut replay_receiver = SFrameReceiver::new(replay_registry, ReplayWindow::default());
+    let replay_frame = ProtectedFrame {
+        kid: protected.kid,
+        counter: protected.counter,
+        ciphertext: relay_packet.envelope.ciphertext,
+    };
+    let first_opened = replay_receiver.open(&replay_frame).is_ok();
+    let replay_rejected =
+        first_opened && replay_receiver.open(&replay_frame) == Err(MediaError::Replay);
+
+    Ok(OverlayNodeProcessReport {
+        node_index,
+        relay_visible_ciphertext_only,
+        tamper_rejected,
+        replay_rejected,
     })
 }
 
