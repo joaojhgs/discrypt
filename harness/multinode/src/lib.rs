@@ -44,6 +44,25 @@ pub struct MediaSecuritySmoke {
     pub plaintext: Vec<u8>,
 }
 
+/// Deterministic Phase-J two-client voice media E2E verification result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoiceMediaE2eSmoke {
+    /// Two local clients exchanged protected media over the direct/STUN WebRTC leg.
+    pub direct_webrtc_audio_exchanged: bool,
+    /// Two local clients exchanged protected media over the peer-overlay relay leg.
+    pub overlay_audio_exchanged: bool,
+    /// Two local clients exchanged protected media over the TURN fallback leg.
+    pub turn_audio_exchanged: bool,
+    /// Local media mute suppressed outbound PCM before Opus/SFrame/transport.
+    pub mute_blocks_outbound_audio: bool,
+    /// Per-speaker playback volume changed authenticated remote playback samples.
+    pub volume_affects_playback: bool,
+    /// Speaking state came from real PCM audio levels on capture and playback.
+    pub speaking_follows_actual_audio: bool,
+    /// Relay/TURN pcap-style capture exposed protected bytes only, never PCM/Opus/key material.
+    pub relay_pcap_protected_only: bool,
+}
+
 /// Deterministic Phase-2 relay overlay smoke result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayOverlaySmoke {
@@ -242,6 +261,20 @@ impl MediaSecuritySmoke {
             && self.playback_volume_mixer_ready
             && self.speaking_indicator_from_vad
             && self.android_native_contingency_ready
+    }
+}
+
+impl VoiceMediaE2eSmoke {
+    /// True when every Phase-J media verification invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.direct_webrtc_audio_exchanged
+            && self.overlay_audio_exchanged
+            && self.turn_audio_exchanged
+            && self.mute_blocks_outbound_audio
+            && self.volume_affects_playback
+            && self.speaking_follows_actual_audio
+            && self.relay_pcap_protected_only
     }
 }
 
@@ -654,6 +687,344 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         speaking_indicator_from_vad,
         android_native_contingency_ready,
         plaintext: opened.plaintext,
+    })
+}
+
+/// Verify two-client protected voice media across direct, overlay, and TURN legs.
+pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
+    use anyhow::{anyhow, ensure};
+    use discrypt_media::{
+        AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, DecodedAudioFrame,
+        MediaKeyRegistry, OpusAudioDecoder, OpusAudioEncoder, PlaybackAudioSink,
+        PlaybackVolumeMixer, ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge,
+        SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
+        VoiceCaptureSendOutcome, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
+    };
+    use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
+    use discrypt_transport::{
+        ConnectivityConfig, FallbackLeg, LocalProcessSocketAdapter, SimulatedNat,
+    };
+
+    #[derive(Default)]
+    struct HarnessMediaSink {
+        sent: Vec<BridgeProtectedFrame>,
+    }
+
+    impl ProtectedMediaFrameSink for HarnessMediaSink {
+        fn send_protected_media_frame(
+            &mut self,
+            frame: BridgeProtectedFrame,
+        ) -> Result<(), discrypt_media::MediaError> {
+            self.sent.push(frame);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct HarnessPlaybackSink {
+        played: Vec<DecodedAudioFrame>,
+    }
+
+    impl PlaybackAudioSink for HarnessPlaybackSink {
+        fn queue_playback_frame(
+            &mut self,
+            frame: DecodedAudioFrame,
+        ) -> Result<(), discrypt_media::MediaError> {
+            self.played.push(frame);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct VoiceRouteResult {
+        audio_exchanged: bool,
+        volume_zeroed: bool,
+        speaking: bool,
+        opus_payload: Vec<u8>,
+        epoch_secret: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct VoiceRouteCase<'a> {
+        route_label: &'a str,
+        nat: SimulatedNat,
+        expected_leg: FallbackLeg,
+        secret_seed: u8,
+        zero_volume: bool,
+    }
+
+    fn signed_voice_frame(format: AudioCaptureFormat, amplitude: f32) -> Vec<i16> {
+        (0..format.interleaved_samples_per_frame())
+            .map(|sample| {
+                let phase = sample as f32 / format.sample_rate_hz as f32;
+                (phase * 440.0 * core::f32::consts::TAU)
+                    .sin()
+                    .mul_add(amplitude, 0.0) as i16
+            })
+            .collect()
+    }
+
+    fn pcm_bytes(pcm: &[i16]) -> Vec<u8> {
+        pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect()
+    }
+
+    fn transport_visible_payload(frame: &BridgeProtectedFrame) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(frame.kid.len() + frame.bytes.len() + 12);
+        payload.extend_from_slice(&(frame.kid.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&frame.kid);
+        payload.extend_from_slice(&frame.counter.to_be_bytes());
+        payload.extend_from_slice(&frame.bytes);
+        payload
+    }
+
+    fn verify_voice_route(
+        route: VoiceRouteCase<'_>,
+        capture_format: AudioCaptureFormat,
+        raw_pcm: &[i16],
+        raw_pcm_bytes: &[u8],
+        pcap: &mut AuditFixture,
+    ) -> Result<VoiceRouteResult, anyhow::Error> {
+        let route_label = route.route_label;
+        let expected_leg = route.expected_leg;
+        let secret_seed = route.secret_seed;
+        let epoch_secret = [secret_seed; 32];
+        let binding = SenderBinding::derive_for_epoch(
+            &epoch_secret,
+            "voice-e2e-lab",
+            u64::from(secret_seed),
+            1,
+            format!("alice-{route_label}-device"),
+        )?;
+        let captured = CapturedAudioFrame::new(
+            raw_pcm.to_vec(),
+            capture_format,
+            10_000 + u64::from(secret_seed),
+        )?;
+        let mut opus_probe = OpusAudioEncoder::new(capture_format)?;
+        let encoded_probe = opus_probe.encode(captured.clone())?;
+
+        let sender = SFrameSender::new(&epoch_secret, binding.clone())?;
+        let mut sender_registry = MediaKeyRegistry::new();
+        sender_registry.register_sender(&epoch_secret, binding.clone())?;
+        let mut capture = VoiceCaptureSFramePipeline::new(
+            OpusAudioEncoder::new(capture_format)?,
+            RustTransformBridge::new(
+                sender,
+                SFrameReceiver::new(sender_registry, ReplayWindow::default()),
+            ),
+            HarnessMediaSink::default(),
+        );
+        let capture_report = capture.capture_encode_protect_send(captured)?;
+        let capture_sink = capture.into_sink();
+        let protected_frame = capture_sink
+            .sent
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("voice route {route_label} produced no protected frame"))?;
+        let payload = transport_visible_payload(&protected_frame);
+        let conformance = LocalProcessSocketAdapter::new(
+            ConnectivityConfig::default(),
+            route.nat,
+            raw_pcm_bytes.to_vec(),
+        )
+        .run_conformance(&payload)?;
+
+        let (component, content, visible_bytes) = match expected_leg {
+            FallbackLeg::Stun => (
+                InfrastructureComponent::Stun,
+                ContentExposure::None,
+                b"voice direct path stun binding; no app payload".to_vec(),
+            ),
+            FallbackLeg::RelayOverlay => (
+                InfrastructureComponent::PeerRelay,
+                ContentExposure::CiphertextOnly,
+                payload.clone(),
+            ),
+            FallbackLeg::Turn => (
+                InfrastructureComponent::Turn,
+                ContentExposure::CiphertextOnly,
+                payload.clone(),
+            ),
+        };
+        pcap.push(PcapEvent {
+            component,
+            content,
+            visible_bytes,
+            ip_or_endpoint: true,
+            timing: true,
+            persists_linkage: false,
+        });
+
+        let receiver_sender = SFrameSender::new_for_epoch(
+            &[secret_seed.wrapping_add(80); 32],
+            "voice-e2e-receiver-unused",
+            u64::from(secret_seed) + 80,
+            1,
+            "receiver-unused",
+        )?;
+        let mut receiver_registry = MediaKeyRegistry::new();
+        receiver_registry.register_sender(&epoch_secret, binding.clone())?;
+        let mut mixer = PlaybackVolumeMixer::unity();
+        if route.zero_volume {
+            mixer.set_speaker_volume(&binding, 0)?;
+        }
+        let mut receive = VoiceReceiveSFramePipeline::with_volume_mixer(
+            RustTransformBridge::new(
+                receiver_sender,
+                SFrameReceiver::new(receiver_registry, ReplayWindow::default()),
+            ),
+            OpusAudioDecoder::new(capture_format)?,
+            VoiceJitterBuffer::new(0),
+            mixer,
+            HarnessPlaybackSink::default(),
+        );
+        let queued = receive.receive_protected_frame(protected_frame)?;
+        let activity = receive.last_voice_activity(&binding)?.cloned();
+        let speaking_speakers = receive.speaking_speakers();
+        let playback_sink = receive.into_sink();
+        let playback_frame = playback_sink.played.first();
+        let volume_zeroed = playback_frame.is_some_and(|frame| {
+            frame.pcm_i16.len() == capture_format.interleaved_samples_per_frame()
+                && frame.pcm_i16.iter().all(|sample| *sample == 0)
+        });
+        let speaking = capture_report.audio_level.speaking
+            && capture_report.audio_level.rms_i16 > 0
+            && activity.as_ref().is_some_and(|event| {
+                event.speaking && event.rms_i16 > 0 && event.counter == Some(0)
+            })
+            && speaking_speakers
+                .iter()
+                .any(|speaker| speaker.device_id == binding.device_id);
+
+        Ok(VoiceRouteResult {
+            audio_exchanged: conformance.ready()
+                && conformance.route_report.selected == expected_leg
+                && conformance.ciphertext_delivered
+                && queued == 1
+                && playback_sink.played.len() == 1
+                && playback_frame.is_some_and(|frame| {
+                    frame.sender.group_id == "voice-e2e-lab"
+                        && frame.sender.device_id == binding.device_id
+                        && frame.counter == 0
+                        && frame.pcm_i16.len() == capture_format.interleaved_samples_per_frame()
+                }),
+            volume_zeroed,
+            speaking,
+            opus_payload: encoded_probe.opus_payload,
+            epoch_secret: epoch_secret.to_vec(),
+        })
+    }
+
+    let capture_format = AudioCaptureFormat::mono_20ms_48khz();
+    let raw_pcm = signed_voice_frame(capture_format, 4_000.0);
+    let raw_pcm_bytes = pcm_bytes(&raw_pcm);
+    ensure!(
+        !raw_pcm_bytes.is_empty(),
+        "voice fixture PCM must not be empty"
+    );
+
+    let mut pcap = AuditFixture::default();
+    let direct = verify_voice_route(
+        VoiceRouteCase {
+            route_label: "direct",
+            nat: SimulatedNat::direct(),
+            expected_leg: FallbackLeg::Stun,
+            secret_seed: 71,
+            zero_volume: false,
+        },
+        capture_format,
+        &raw_pcm,
+        &raw_pcm_bytes,
+        &mut pcap,
+    )?;
+    let overlay = verify_voice_route(
+        VoiceRouteCase {
+            route_label: "overlay",
+            nat: SimulatedNat::overlay_only(),
+            expected_leg: FallbackLeg::RelayOverlay,
+            secret_seed: 72,
+            zero_volume: false,
+        },
+        capture_format,
+        &raw_pcm,
+        &raw_pcm_bytes,
+        &mut pcap,
+    )?;
+    let turn = verify_voice_route(
+        VoiceRouteCase {
+            route_label: "turn",
+            nat: SimulatedNat::turn_only(),
+            expected_leg: FallbackLeg::Turn,
+            secret_seed: 73,
+            zero_volume: true,
+        },
+        capture_format,
+        &raw_pcm,
+        &raw_pcm_bytes,
+        &mut pcap,
+    )?;
+
+    let mute_binding =
+        SenderBinding::derive_for_epoch(&[74; 32], "voice-e2e-mute", 74, 1, "muted-device")?;
+    let mute_sender = SFrameSender::new(&[74; 32], mute_binding.clone())?;
+    let mut mute_registry = MediaKeyRegistry::new();
+    mute_registry.register_sender(&[74; 32], mute_binding)?;
+    let mut muted_capture = VoiceCaptureSFramePipeline::new(
+        OpusAudioEncoder::new(capture_format)?,
+        RustTransformBridge::new(
+            mute_sender,
+            SFrameReceiver::new(mute_registry, ReplayWindow::default()),
+        ),
+        HarnessMediaSink::default(),
+    );
+    muted_capture.set_muted(true);
+    let mute_outcome = muted_capture.capture_encode_protect_or_mute(CapturedAudioFrame::new(
+        raw_pcm.clone(),
+        capture_format,
+        20_000,
+    )?)?;
+    let mute_sink = muted_capture.into_sink();
+    let mute_blocks_outbound_audio = matches!(
+        mute_outcome,
+        VoiceCaptureSendOutcome::Muted {
+            captured_at_ms: 20_000,
+            dropped_pcm_samples
+        } if dropped_pcm_samples == capture_format.interleaved_samples_per_frame()
+    ) && mute_sink.sent.is_empty();
+
+    let forbidden_payloads = vec![
+        raw_pcm_bytes,
+        direct.opus_payload.clone(),
+        overlay.opus_payload.clone(),
+        turn.opus_payload.clone(),
+        direct.epoch_secret.clone(),
+        overlay.epoch_secret.clone(),
+        turn.epoch_secret.clone(),
+        b"mls-epoch-secret".to_vec(),
+        b"content-key".to_vec(),
+    ];
+    let forbidden_refs = forbidden_payloads
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let relay_pcap_protected_only = pcap.no_forbidden_content_egress(&forbidden_refs)
+        && pcap.events().iter().any(|event| {
+            event.component == InfrastructureComponent::PeerRelay
+                && event.content == ContentExposure::CiphertextOnly
+        })
+        && pcap.events().iter().any(|event| {
+            event.component == InfrastructureComponent::Turn
+                && event.content == ContentExposure::CiphertextOnly
+        });
+
+    Ok(VoiceMediaE2eSmoke {
+        direct_webrtc_audio_exchanged: direct.audio_exchanged,
+        overlay_audio_exchanged: overlay.audio_exchanged,
+        turn_audio_exchanged: turn.audio_exchanged,
+        mute_blocks_outbound_audio,
+        volume_affects_playback: turn.volume_zeroed,
+        speaking_follows_actual_audio: direct.speaking && overlay.speaking && turn.speaking,
+        relay_pcap_protected_only,
     })
 }
 
@@ -2432,6 +2803,7 @@ pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
     let governance = governance_admission_smoke()?;
     let connectivity = connectivity_signaling_push_smoke()?;
     let phase_c = phase_c_device_rotation_smoke()?;
+    let voice_e2e = voice_media_e2e_smoke()?;
     let all_phase_smokes_ready = media.ready()
         && overlay.ready()
         && text.ready()
@@ -2439,7 +2811,8 @@ pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
         && storage.ready()
         && governance.ready()
         && connectivity.ready()
-        && phase_c.ready();
+        && phase_c.ready()
+        && voice_e2e.ready();
 
     Ok(UxE2eHardeningSmoke {
         command_surface_ready,
@@ -2483,6 +2856,23 @@ mod tests {
                 android_native_contingency_ready: true,
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
+        ));
+    }
+
+    #[test]
+    fn voice_media_e2e_smoke_covers_phase_j_gate() {
+        let smoke = voice_media_e2e_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(VoiceMediaE2eSmoke {
+                direct_webrtc_audio_exchanged: true,
+                overlay_audio_exchanged: true,
+                turn_audio_exchanged: true,
+                mute_blocks_outbound_audio: true,
+                volume_affects_playback: true,
+                speaking_follows_actual_audio: true,
+                relay_pcap_protected_only: true,
+            })
         ));
     }
 

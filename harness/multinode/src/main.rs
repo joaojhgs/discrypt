@@ -4,7 +4,7 @@ use discrypt_multinode_harness::{
     connectivity_signaling_push_smoke, governance_admission_smoke, media_security_smoke,
     overlay_node_process_report, phase_c_device_rotation_smoke, relay_overlay_smoke,
     retention_shred_smoke, storage_persistence_smoke, text_history_delivery_smoke,
-    ux_e2e_hardening_smoke,
+    ux_e2e_hardening_smoke, voice_media_e2e_smoke,
 };
 
 fn main() {
@@ -40,6 +40,7 @@ fn main() {
         governance_admission_smoke(),
         connectivity_signaling_push_smoke(),
         phase_c_device_rotation_smoke(),
+        voice_media_e2e_smoke(),
         ux_e2e_hardening_smoke(),
     ) {
         (
@@ -51,6 +52,7 @@ fn main() {
             Ok(governance),
             Ok(connectivity),
             Ok(phase_c),
+            Ok(voice_e2e),
             Ok(ux),
         ) => {
             if !(media.ready()
@@ -61,13 +63,14 @@ fn main() {
                 && governance.ready()
                 && connectivity.ready()
                 && phase_c.ready()
+                && voice_e2e.ready()
                 && ux.ready())
             {
                 eprintln!("discrypt multinode harness readiness gate failed");
                 std::process::exit(1);
             }
             println!(
-                "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} media_capture_opus_sframe={} media_receive_playback={} media_mute_suppresses={} media_speaker_volume={} media_speaking_vad={} media_android_native={} overlay_hops={} overlay_failover={} overlay_media_gap={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_e2e_roundtrip={} text_direct_path={} text_overlay_path={} text_turn_path={} text_offline_store_forward={} text_retention_locks_old={} text_pcap_no_plaintext={} text_no_plaintext={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} storage_fresh_install={} storage_restart={} storage_no_plaintext={} storage_corrupt_rejected={} storage_secure_delete={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={} signaling_zero_linkage={} connectivity_fallback={} connectivity_overrides={} android_wake_content_free={} metadata_matrix={} pcap_no_content={} relays_ciphertext_only={} socket_local_process={} route_reporting_honest={} phase_c_retired={} phase_c_rekeyed={} phase_c_old_send_blocked={} phase_c_replacement_send={} phase_c_stale_blocked={} phase_c_transparency={} phase_c_command_devices={} ux_commands={} ux_discord={} ux_verify_devices={} ux_invite_retention_delete={} ux_connectivity_copy={} ux_all_phases={}",
+                "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} media_capture_opus_sframe={} media_receive_playback={} media_mute_suppresses={} media_speaker_volume={} media_speaking_vad={} media_android_native={} voice_direct_webrtc={} voice_overlay={} voice_turn={} voice_mute_blocks={} voice_volume={} voice_speaking={} voice_pcap_protected={} overlay_hops={} overlay_failover={} overlay_media_gap={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_e2e_roundtrip={} text_direct_path={} text_overlay_path={} text_turn_path={} text_offline_store_forward={} text_retention_locks_old={} text_pcap_no_plaintext={} text_no_plaintext={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} storage_fresh_install={} storage_restart={} storage_no_plaintext={} storage_corrupt_rejected={} storage_secure_delete={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={} signaling_zero_linkage={} connectivity_fallback={} connectivity_overrides={} android_wake_content_free={} metadata_matrix={} pcap_no_content={} relays_ciphertext_only={} socket_local_process={} route_reporting_honest={} phase_c_retired={} phase_c_rekeyed={} phase_c_old_send_blocked={} phase_c_replacement_send={} phase_c_stale_blocked={} phase_c_transparency={} phase_c_command_devices={} ux_commands={} ux_discord={} ux_verify_devices={} ux_invite_retention_delete={} ux_connectivity_copy={} ux_all_phases={}",
             summary.room_id,
             summary.epoch,
             summary.members,
@@ -80,6 +83,13 @@ fn main() {
             media.playback_volume_mixer_ready,
             media.speaking_indicator_from_vad,
             media.android_native_contingency_ready,
+            voice_e2e.direct_webrtc_audio_exchanged,
+            voice_e2e.overlay_audio_exchanged,
+            voice_e2e.turn_audio_exchanged,
+            voice_e2e.mute_blocks_outbound_audio,
+            voice_e2e.volume_affects_playback,
+            voice_e2e.speaking_follows_actual_audio,
+            voice_e2e.relay_pcap_protected_only,
             overlay.hop_limit_respected,
             overlay.failover_recovered,
             overlay.media_gap_concealed,
@@ -147,41 +157,45 @@ fn main() {
                 ux.all_phase_smokes_ready
             );
         }
-        (Err(error), _, _, _, _, _, _, _, _) => {
+        (Err(error), _, _, _, _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness media smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, Err(error), _, _, _, _, _, _, _) => {
+        (_, Err(error), _, _, _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness relay overlay smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, Err(error), _, _, _, _, _, _) => {
+        (_, _, Err(error), _, _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness text history smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, Err(error), _, _, _, _, _) => {
+        (_, _, _, Err(error), _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness retention/shred smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, Err(error), _, _, _, _) => {
+        (_, _, _, _, Err(error), _, _, _, _, _) => {
             eprintln!("discrypt multinode harness storage persistence smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, _, Err(error), _, _, _) => {
+        (_, _, _, _, _, Err(error), _, _, _, _) => {
             eprintln!("discrypt multinode harness governance/admission smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, _, _, Err(error), _, _) => {
+        (_, _, _, _, _, _, Err(error), _, _, _) => {
             eprintln!(
                 "discrypt multinode harness connectivity/signaling/push smoke failed: {error}"
             );
             std::process::exit(1);
         }
-        (_, _, _, _, _, _, _, Err(error), _) => {
+        (_, _, _, _, _, _, _, Err(error), _, _) => {
             eprintln!("discrypt multinode harness Phase-C device rotation smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, _, _, _, _, Err(error)) => {
+        (_, _, _, _, _, _, _, _, Err(error), _) => {
+            eprintln!("discrypt multinode harness voice media E2E smoke failed: {error}");
+            std::process::exit(1);
+        }
+        (_, _, _, _, _, _, _, _, _, Err(error)) => {
             eprintln!("discrypt multinode harness UX/E2E hardening smoke failed: {error}");
             std::process::exit(1);
         }
