@@ -732,6 +732,8 @@ pub fn identity_recovery_verification_smoke() -> IdentityRecoveryVerification {
 
     let recovery_without_content_keys = recover_account(RecoveryMaterial::RecoveryCode {
         code_hash: [7u8; 32],
+        room_memberships: vec!["recovered room".to_owned()],
+        device_count: 2,
     })
     .map(|recovery| recovery.account_access_restored && !recovery.content_keys_restored)
     .unwrap_or(false);
