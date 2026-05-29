@@ -229,6 +229,23 @@ pub struct PcapAcceptanceMatrixSmoke {
     pub forbidden_scanner_covers_release_tokens: bool,
 }
 
+/// Deterministic Phase-N malicious relay adversary result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaliciousRelayAdversarySmoke {
+    /// Passive relay-visible bytes do not expose plaintext or key material.
+    pub passive_read_blocked: bool,
+    /// Active relay bit-flip tampering is rejected by receiver authentication.
+    pub tamper_rejected: bool,
+    /// Replayed protected frames are rejected by receiver anti-replay state.
+    pub replay_rejected: bool,
+    /// Dropped packet simulation requests bounded redelivery from alternate peers.
+    pub drop_requests_bounded_redelivery: bool,
+    /// Reordered packets inside the replay window are accepted once and stale repeats are rejected.
+    pub reorder_window_enforced: bool,
+    /// Endpoint churn is damped while hard-failure failover bypasses the planned-change delay.
+    pub endpoint_churn_damped_and_failover_recovered: bool,
+}
+
 /// Deterministic Phase-C device-rotation integration verification result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseCDeviceRotationSmoke {
@@ -419,6 +436,19 @@ impl PcapAcceptanceMatrixSmoke {
             && self.ac18_signaling_zero_linkage_at_rest
             && self.ac_metadata_matrix_validated
             && self.forbidden_scanner_covers_release_tokens
+    }
+}
+
+impl MaliciousRelayAdversarySmoke {
+    /// True when every malicious relay adversary invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.passive_read_blocked
+            && self.tamper_rejected
+            && self.replay_rejected
+            && self.drop_requests_bounded_redelivery
+            && self.reorder_window_enforced
+            && self.endpoint_churn_damped_and_failover_recovered
     }
 }
 
@@ -1457,6 +1487,185 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         tamper_rejected,
         plaintext: opened.plaintext,
     })
+}
+
+/// Exercise malicious relay passive read, tamper, replay, drop, reorder, and churn cases.
+pub fn malicious_relay_adversary_smoke() -> Result<MaliciousRelayAdversarySmoke, anyhow::Error> {
+    use discrypt_media::{
+        MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameReceiver, SFrameSender,
+        SenderBinding,
+    };
+    use discrypt_relay_overlay::integrity::{
+        contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
+    };
+    use discrypt_relay_overlay::redelivery::{PacketId, RedeliveryError, RedeliveryTracker};
+    use discrypt_relay_overlay::{
+        ChurnDampingPolicy, OverlayManager, OverlayManagerError, RelayRuntimeObservation,
+        TopologyChangeReason,
+    };
+
+    fn protected_payload(
+        kind: RelayPayloadKind,
+        kid: Vec<u8>,
+        counter: u64,
+        aad_metadata: &[u8],
+        ciphertext: Vec<u8>,
+    ) -> Result<RelayProtectedEnvelope, anyhow::Error> {
+        Ok(RelayProtectedEnvelope::new(
+            kind,
+            kid,
+            counter,
+            aad_metadata,
+            ciphertext,
+        )?)
+    }
+
+    fn observation(peer_id: &str, latency_ms: u32) -> RelayRuntimeObservation {
+        RelayRuntimeObservation {
+            peer_id: peer_id.to_owned(),
+            latency_ms,
+            successful_probes: 10,
+            failed_probes: 0,
+            battery_cost_bps: 0,
+            contributed_bytes: 10_000,
+            consumed_bytes: 0,
+        }
+    }
+
+    let epoch_secret = [97; 32];
+    let binding = SenderBinding::derive_for_epoch(
+        &epoch_secret,
+        "phase-n-malicious-relay",
+        97,
+        1,
+        "alice-laptop",
+    )?;
+    let mut sender = SFrameSender::new(&epoch_secret, binding.clone())?;
+    let plaintext = b"malicious relay protected voice frame";
+    let protected = sender.protect(plaintext)?;
+    let packet = RelayPacket::from_envelope(
+        "relay-a",
+        protected_payload(
+            RelayPayloadKind::Media,
+            protected.kid.clone(),
+            protected.counter,
+            b"route:alice:relay-a:bob",
+            protected.ciphertext.clone(),
+        )?,
+    )
+    .forward_checked("bob")?;
+    let visible = packet.envelope.visible_bytes();
+    let passive_read_blocked = !contains_plaintext(&packet, plaintext)
+        && !contains_bytes(&visible, &epoch_secret)
+        && !contains_bytes(&visible, b"sframe-key")
+        && !contains_bytes(&visible, b"mls-epoch-secret");
+
+    let mut tamper_registry = MediaKeyRegistry::new();
+    tamper_registry.register_sender(&epoch_secret, binding.clone())?;
+    let mut tamper_receiver = SFrameReceiver::new(tamper_registry, ReplayWindow::default());
+    let tampered_packet = packet.clone().tamper();
+    let tamper_rejected = tamper_receiver.open(&ProtectedFrame {
+        kid: protected.kid.clone(),
+        counter: protected.counter,
+        ciphertext: tampered_packet.envelope.ciphertext,
+    }) == Err(MediaError::AuthenticationFailed);
+
+    let mut replay_registry = MediaKeyRegistry::new();
+    replay_registry.register_sender(&epoch_secret, binding)?;
+    let mut replay_receiver = SFrameReceiver::new(replay_registry, ReplayWindow::default());
+    let replay_frame = ProtectedFrame {
+        kid: protected.kid.clone(),
+        counter: protected.counter,
+        ciphertext: protected.ciphertext.clone(),
+    };
+    let replay_rejected = replay_receiver.open(&replay_frame).is_ok()
+        && replay_receiver.open(&replay_frame) == Err(MediaError::Replay);
+
+    let mut dropped = RedeliveryTracker::new(64, 2);
+    let dropped_packet = PacketId {
+        sender_id: hex_id(&protected.kid),
+        sequence: protected.counter.saturating_add(1),
+    };
+    dropped.request_redelivery(dropped_packet.clone(), "relay-b")?;
+    dropped.request_redelivery(dropped_packet.clone(), "relay-c")?;
+    let drop_requests_bounded_redelivery = dropped.redelivery_fanout(&dropped_packet) == 2
+        && dropped.request_redelivery(dropped_packet, "relay-d")
+            == Err(RedeliveryError::FanoutExhausted);
+
+    let mut reordered = RedeliveryTracker::new(4, 2);
+    let reorder_window_enforced = reordered.accept(&packet_id("kid-reorder", 10)) == Ok(())
+        && reordered.accept(&packet_id("kid-reorder", 8)) == Ok(())
+        && reordered.accept(&packet_id("kid-reorder", 8)) == Err(RedeliveryError::Replay)
+        && reordered.accept(&packet_id("kid-reorder", 15)) == Ok(())
+        && reordered.accept(&packet_id("kid-reorder", 10)) == Err(RedeliveryError::Replay);
+
+    let mut manager = OverlayManager::default().with_churn_policy(ChurnDampingPolicy {
+        min_planned_change_interval_ms: 30_000,
+    });
+    for peer in [
+        observation("alice", 5),
+        observation("relay-a", 20),
+        observation("relay-b", 30),
+        observation("relay-c", 35),
+        observation("bob", 5),
+    ] {
+        manager.upsert_observation(peer)?;
+    }
+    manager.connect_peers_with_churn_damping(
+        "alice",
+        "relay-a",
+        1_000,
+        TopologyChangeReason::PlannedReparent,
+    )?;
+    let planned_churn_damped = matches!(
+        manager.connect_peers_with_churn_damping(
+            "alice",
+            "relay-b",
+            30_999,
+            TopologyChangeReason::PlannedReparent,
+        ),
+        Err(OverlayManagerError::ChurnDamped {
+            next_allowed_at_ms: 31_000
+        })
+    );
+    manager.connect_peers_with_churn_damping(
+        "alice",
+        "relay-b",
+        1_001,
+        TopologyChangeReason::HardFailure,
+    )?;
+    manager.connect_peers("relay-b", "bob")?;
+    let endpoint_churn_damped_and_failover_recovered = planned_churn_damped
+        && manager
+            .route("alice", "bob")?
+            .route
+            .contains_peer("relay-b");
+
+    Ok(MaliciousRelayAdversarySmoke {
+        passive_read_blocked,
+        tamper_rejected,
+        replay_rejected,
+        drop_requests_bounded_redelivery,
+        reorder_window_enforced,
+        endpoint_churn_damped_and_failover_recovered,
+    })
+}
+
+fn packet_id(sender_id: &str, sequence: u64) -> discrypt_relay_overlay::redelivery::PacketId {
+    discrypt_relay_overlay::redelivery::PacketId {
+        sender_id: sender_id.to_owned(),
+        sequence,
+    }
+}
+
+fn hex_id(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Exercise Phase-3 text, history, MLS delivery, gossip, Welcome, and fork repair.
@@ -3117,6 +3326,22 @@ mod tests {
                 ac18_signaling_zero_linkage_at_rest: true,
                 ac_metadata_matrix_validated: true,
                 forbidden_scanner_covers_release_tokens: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn malicious_relay_adversary_smoke_covers_passive_active_and_churn_cases() {
+        let smoke = malicious_relay_adversary_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(MaliciousRelayAdversarySmoke {
+                passive_read_blocked: true,
+                tamper_rejected: true,
+                replay_rejected: true,
+                drop_requests_bounded_redelivery: true,
+                reorder_window_enforced: true,
+                endpoint_churn_damped_and_failover_recovered: true,
             })
         ));
     }
