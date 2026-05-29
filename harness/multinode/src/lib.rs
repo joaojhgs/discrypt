@@ -246,6 +246,25 @@ pub struct MaliciousRelayAdversarySmoke {
     pub endpoint_churn_damped_and_failover_recovered: bool,
 }
 
+/// Deterministic Phase-N malicious member/device adversary result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaliciousMemberAdversarySmoke {
+    /// Media frames cannot be relabeled from one MLS leaf/device KID to another.
+    pub media_impersonation_rejected: bool,
+    /// Evicted members cannot deliver text under the current authorized sender set.
+    pub evicted_member_text_rejected: bool,
+    /// Evicted devices lose media receive authorization after epoch/device rotation.
+    pub evicted_device_media_rejected: bool,
+    /// Forked MLS state is detected as divergent rather than silently accepted.
+    pub forked_mls_commit_rejected: bool,
+    /// Out-of-epoch governance actions are rejected.
+    pub out_of_epoch_governance_rejected: bool,
+    /// Unauthorized governance actions are rejected.
+    pub unauthorized_governance_rejected: bool,
+    /// A removed admin cannot win a same-epoch governance race.
+    pub removed_admin_race_rejected: bool,
+}
+
 /// Deterministic Phase-C device-rotation integration verification result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseCDeviceRotationSmoke {
@@ -449,6 +468,20 @@ impl MaliciousRelayAdversarySmoke {
             && self.drop_requests_bounded_redelivery
             && self.reorder_window_enforced
             && self.endpoint_churn_damped_and_failover_recovered
+    }
+}
+
+impl MaliciousMemberAdversarySmoke {
+    /// True when every malicious member/device adversary invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.media_impersonation_rejected
+            && self.evicted_member_text_rejected
+            && self.evicted_device_media_rejected
+            && self.forked_mls_commit_rejected
+            && self.out_of_epoch_governance_rejected
+            && self.unauthorized_governance_rejected
+            && self.removed_admin_race_rejected
     }
 }
 
@@ -1656,6 +1689,184 @@ fn packet_id(sender_id: &str, sequence: u64) -> discrypt_relay_overlay::redelive
         sender_id: sender_id.to_owned(),
         sequence,
     }
+}
+
+/// Exercise malicious member/device media impersonation, eviction, fork, and governance cases.
+pub fn malicious_member_adversary_smoke() -> Result<MaliciousMemberAdversarySmoke, anyhow::Error> {
+    use discrypt_media::{
+        MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameReceiver, SFrameSender,
+        SenderBinding,
+    };
+    use discrypt_mls_core::governance::{
+        GovernanceAction, GovernanceError, GovernanceEvent, GovernanceState, Role,
+    };
+    use discrypt_mls_delivery::{
+        summary, ApplicationEvent, CommitEnvelope, DeliveryError, DeliveryState,
+        InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextInboundPipeline,
+        TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput, TextReceiveState,
+        TextRetentionMetadata,
+    };
+    use ed25519_dalek::SigningKey;
+    use std::collections::BTreeSet;
+
+    let media_secret = [98; 32];
+    let alice_binding = SenderBinding::derive_for_epoch(
+        &media_secret,
+        "phase-n-malicious-member",
+        98,
+        1,
+        "alice-laptop",
+    )?;
+    let mallory_binding = SenderBinding::derive_for_epoch(
+        &media_secret,
+        "phase-n-malicious-member",
+        98,
+        9,
+        "mallory-phone",
+    )?;
+    let mut alice_sender = SFrameSender::new(&media_secret, alice_binding)?;
+    let alice_frame = alice_sender.protect(b"alice voice frame")?;
+    let mut impersonation_registry = MediaKeyRegistry::new();
+    impersonation_registry.register_sender(&media_secret, mallory_binding.clone())?;
+    let mut impersonation_receiver =
+        SFrameReceiver::new(impersonation_registry, ReplayWindow::default());
+    let relabeled_frame = ProtectedFrame {
+        kid: mallory_binding.kid,
+        counter: alice_frame.counter,
+        ciphertext: alice_frame.ciphertext.clone(),
+    };
+    let media_impersonation_rejected =
+        impersonation_receiver.open(&relabeled_frame) == Err(MediaError::AuthenticationFailed);
+
+    let text_secret = b"openmls-text-exporter-secret";
+    let evicted_signing_key = SigningKey::from_bytes(&[98; 32]);
+    let evicted_envelope = TextMessageEnvelope::sign(
+        "phase-n-malicious-member",
+        TextMessageEnvelopeInput {
+            epoch: 98,
+            sender_leaf: 9,
+            sender_device_id: "mallory-phone".to_owned(),
+            sequence: 1,
+            message_id: "evicted-member-text".to_owned(),
+            retention: TextRetentionMetadata::new("phase-n", 0, Some(60_000), false),
+            content_ciphertext: b"ciphertext-from-evicted-leaf".to_vec(),
+        },
+        &evicted_signing_key,
+    )?;
+    let mut receive_state = TextReceiveState::default();
+    let mut receive_store = InMemoryTextRecipientStore::default();
+    let mut receive_events = InMemoryTextReceiveEvents::default();
+    let evicted_member_text_rejected =
+        TextInboundPipeline::new(&mut receive_state, &mut receive_store, &mut receive_events)
+            .receive(
+                TextInboundRequest {
+                    group_id: "phase-n-malicious-member".to_owned(),
+                    channel_id: "general".to_owned(),
+                    current_epoch: 98,
+                    authorized_sender_leaves: BTreeSet::from([1_u32, 2_u32]),
+                    envelope: evicted_envelope,
+                    received_at_ms: 98_000,
+                    retention_allows_decrypt: true,
+                },
+                text_secret,
+                &evicted_signing_key.verifying_key(),
+            )
+            == Err(DeliveryError::TextReceiveUnauthorizedSender(9));
+
+    let old_secret = [7; 32];
+    let new_secret = [8; 32];
+    let old_binding = SenderBinding::derive_for_epoch(
+        &old_secret,
+        "phase-n-malicious-member",
+        97,
+        4,
+        "alice-lost-phone",
+    )?;
+    let mut old_device_sender = SFrameSender::new(&old_secret, old_binding)?;
+    let old_device_frame = old_device_sender.protect(b"old device media")?;
+    let replacement_binding = SenderBinding::derive_for_epoch(
+        &new_secret,
+        "phase-n-malicious-member",
+        98,
+        5,
+        "alice-replacement-phone",
+    )?;
+    let mut post_eviction_registry = MediaKeyRegistry::new();
+    post_eviction_registry.register_sender(&new_secret, replacement_binding)?;
+    let mut post_eviction_receiver =
+        SFrameReceiver::new(post_eviction_registry, ReplayWindow::default());
+    let evicted_device_media_rejected =
+        post_eviction_receiver.open(&old_device_frame) == Err(MediaError::UnknownSender);
+
+    let mut delivery = DeliveryState::new(summary(98, 1, 1));
+    delivery.apply_commit(CommitEnvelope::new(
+        summary(99, 2, 2),
+        1,
+        vec![ApplicationEvent::new(
+            99,
+            1,
+            "honest-forward-commit",
+            b"ok".to_vec(),
+        )],
+    ))?;
+    let forked_mls_commit_rejected = delivery.apply_commit(CommitEnvelope::new(
+        summary(99, 3, 3),
+        9,
+        vec![ApplicationEvent::new(
+            99,
+            9,
+            "forked-commit-event",
+            b"fork".to_vec(),
+        )],
+    )) == Err(DeliveryError::DivergentTree(99));
+
+    let mut governance = GovernanceState::new(98, 1);
+    governance.apply_event(GovernanceEvent::signed(
+        98,
+        1,
+        GovernanceAction::SetRole {
+            target: 2,
+            role: Role::Admin,
+        },
+    ))?;
+    let out_of_epoch_governance_rejected = governance.apply_event(GovernanceEvent::signed(
+        99,
+        1,
+        GovernanceAction::RevokeInvite {
+            invite_id: "future".to_owned(),
+        },
+    )) == Err(GovernanceError::OutOfEpoch);
+    let unauthorized_governance_rejected = governance.apply_event(GovernanceEvent::signed(
+        98,
+        9,
+        GovernanceAction::RevokeInvite {
+            invite_id: "unauthorized".to_owned(),
+        },
+    )) == Err(GovernanceError::Unauthorized);
+    let removed_admin_race = governance.resolve_epoch_events([
+        GovernanceEvent::signed(
+            98,
+            2,
+            GovernanceAction::RevokeInvite {
+                invite_id: "removed-admin-race".to_owned(),
+            },
+        ),
+        GovernanceEvent::signed(98, 1, GovernanceAction::Ban { target: 2 }),
+    ]);
+    let removed_admin_race_rejected = removed_admin_race
+        == vec![Ok(()), Err(GovernanceError::EvictedCommitter)]
+        && governance.is_banned(2)
+        && !governance.invite_revoked("removed-admin-race");
+
+    Ok(MaliciousMemberAdversarySmoke {
+        media_impersonation_rejected,
+        evicted_member_text_rejected,
+        evicted_device_media_rejected,
+        forked_mls_commit_rejected,
+        out_of_epoch_governance_rejected,
+        unauthorized_governance_rejected,
+        removed_admin_race_rejected,
+    })
 }
 
 fn hex_id(bytes: &[u8]) -> String {
@@ -3342,6 +3553,23 @@ mod tests {
                 drop_requests_bounded_redelivery: true,
                 reorder_window_enforced: true,
                 endpoint_churn_damped_and_failover_recovered: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn malicious_member_adversary_smoke_covers_impersonation_eviction_divergence_and_admin_cases() {
+        let smoke = malicious_member_adversary_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(MaliciousMemberAdversarySmoke {
+                media_impersonation_rejected: true,
+                evicted_member_text_rejected: true,
+                evicted_device_media_rejected: true,
+                forked_mls_commit_rejected: true,
+                out_of_epoch_governance_rejected: true,
+                unauthorized_governance_rejected: true,
+                removed_admin_race_rejected: true,
             })
         ));
     }
