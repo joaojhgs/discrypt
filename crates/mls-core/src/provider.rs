@@ -1,9 +1,9 @@
-//! Provider boundary for future OpenMLS crypto/storage integration.
+//! Provider metadata for the OpenMLS crypto/storage integration.
 //!
 //! ## ProductionStatus
-//! The current provider is an unaudited Phase-0 facade. Production builds must
-//! replace it with an audited OpenMLS provider/storage integration before making
-//! MLS production-readiness claims.
+//! Phase D wires upstream OpenMLS with the RustCrypto provider and OpenMLS SQLite
+//! storage behind the group service boundary. Release audit status remains
+//! explicit metadata rather than an implicit production-readiness claim.
 
 /// Provider marker describing the current cryptographic backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,11 +14,11 @@ pub struct ProviderInfo {
     pub production_audited: bool,
 }
 
-/// Phase-0 provider metadata.
+/// OpenMLS provider metadata.
 #[must_use]
 pub fn provider_info() -> ProviderInfo {
     ProviderInfo {
-        name: "phase0-rustcrypto-facade",
+        name: "openmls-rustcrypto-sqlite",
         production_audited: false,
     }
 }

@@ -364,6 +364,141 @@ pub trait RustExporterSecretProvider {
     ) -> ServiceResult<RustExporterSecret>;
 }
 
+/// Real OpenMLS-backed implementation of [`GroupCryptoService`].
+///
+/// The service keeps raw exporter bytes inside the Rust service boundary and
+/// persists group state through `discrypt_mls_core::OpenMlsGroupEngine`, which
+/// uses upstream OpenMLS provider/storage APIs.
+pub struct OpenMlsGroupCryptoService {
+    engine: mls_core::OpenMlsGroupEngine,
+}
+
+impl OpenMlsGroupCryptoService {
+    /// Open the service using an OpenMLS SQLite storage database.
+    pub fn open(path: impl AsRef<std::path::Path>) -> ServiceResult<Self> {
+        Ok(Self {
+            engine: mls_core::OpenMlsGroupEngine::open(path).map_err(group_crypto_error)?,
+        })
+    }
+
+    /// Load a persisted group from OpenMLS storage using the caller-held signer handle.
+    pub fn load_group(
+        &mut self,
+        group_id: &GroupId,
+        signer_public_key: &[u8],
+    ) -> ServiceResult<GroupCryptoState> {
+        self.engine
+            .load_group(&group_id.0, signer_public_key)
+            .map(group_state_from_snapshot)
+            .map_err(group_crypto_error)
+    }
+
+    /// Return the signer public key handle for a live group.
+    pub fn signer_public_key(&self, group_id: &GroupId) -> ServiceResult<Vec<u8>> {
+        self.engine
+            .signer_public_key(&group_id.0)
+            .map_err(group_crypto_error)
+    }
+
+    /// Stage a real OpenMLS add-member commit and return its opaque commit bytes.
+    pub fn stage_add_member_commit(
+        &mut self,
+        group_id: &GroupId,
+        member_identity: &[u8],
+    ) -> ServiceResult<GroupCommit> {
+        let current = self
+            .engine
+            .snapshot(&group_id.0)
+            .map_err(group_crypto_error)?
+            .epoch;
+        let member = self
+            .engine
+            .generate_member_package(member_identity)
+            .map_err(group_crypto_error)?;
+        let commit = self
+            .engine
+            .stage_add_member(&group_id.0, &member)
+            .map_err(group_crypto_error)?;
+        Ok(GroupCommit {
+            group_id: group_id.clone(),
+            epoch: current.saturating_add(1),
+            commit: OpaqueBytes(commit),
+        })
+    }
+}
+
+impl GroupCryptoService for OpenMlsGroupCryptoService {
+    fn create_group_crypto(
+        &mut self,
+        request: GroupCryptoRequest,
+    ) -> ServiceResult<GroupCryptoState> {
+        let group_id = normalize_group_crypto_id(&request.name);
+        self.engine
+            .create_group(&group_id, request.name.as_bytes())
+            .map(group_state_from_snapshot)
+            .map_err(group_crypto_error)
+    }
+
+    fn apply_group_commit(&mut self, commit: GroupCommit) -> ServiceResult<GroupCryptoState> {
+        self.engine
+            .merge_pending_commit(&commit.group_id.0, commit.epoch, &commit.commit.0)
+            .map(group_state_from_snapshot)
+            .map_err(group_crypto_error)
+    }
+
+    fn export_group_secret(&self, group_id: &GroupId, label: &str) -> ServiceResult<OpaqueBytes> {
+        self.engine
+            .export_secret(&group_id.0, label, b"discrypt-service-boundary", 32)
+            .map(OpaqueBytes)
+            .map_err(group_crypto_error)
+    }
+}
+
+fn normalize_group_crypto_id(name: &str) -> String {
+    let normalized = name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    if normalized.is_empty() {
+        "group".to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn group_state_from_snapshot(snapshot: mls_core::OpenMlsGroupSnapshot) -> GroupCryptoState {
+    GroupCryptoState {
+        group_id: GroupId(snapshot.group_id),
+        epoch: snapshot.epoch,
+        epoch_summary: OpaqueBytes(snapshot.confirmation_tag),
+    }
+}
+
+fn group_crypto_error(error: mls_core::OpenMlsGroupError) -> ServiceBoundaryError {
+    match error {
+        mls_core::OpenMlsGroupError::GroupNotFound(group_id) => {
+            ServiceBoundaryError::NotFound(group_id)
+        }
+        mls_core::OpenMlsGroupError::CommitMismatch(_)
+        | mls_core::OpenMlsGroupError::StaleCommitEpoch { .. } => {
+            ServiceBoundaryError::VerificationFailed(error.to_string())
+        }
+        mls_core::OpenMlsGroupError::SignerNotFound { .. } => {
+            ServiceBoundaryError::Persistence(error.to_string())
+        }
+        _ => ServiceBoundaryError::Persistence(error.to_string()),
+    }
+}
+
 /// Governance boundary for signed epoch-bound room policy events.
 pub trait GovernanceService {
     /// Submit a governance command for canonical ordering/authority checks.
@@ -813,6 +948,63 @@ mod tests {
         fn command_snapshot(&self) -> ServiceResult<AppSnapshot> {
             Ok(self.snapshot.clone())
         }
+    }
+
+    fn temp_openmls_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "discrypt-core-openmls-{name}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn openmls_group_crypto_service_persists_epochs_confirmations_and_exports() -> ServiceResult<()>
+    {
+        let path = temp_openmls_path("service");
+        let mut service = OpenMlsGroupCryptoService::open(&path)?;
+        let created = service.create_group_crypto(GroupCryptoRequest {
+            name: "Phase D Lab".to_owned(),
+            initial_channel_kind: ChannelKind::Text,
+        })?;
+        assert_eq!(created.group_id, GroupId("phase-d-lab".to_owned()));
+        assert_eq!(created.epoch, 0);
+        assert!(!created.epoch_summary.0.is_empty());
+        let signer_public_key = service.signer_public_key(&created.group_id)?;
+        let before = service.export_group_secret(&created.group_id, "discrypt/text")?;
+
+        let commit = service.stage_add_member_commit(&created.group_id, b"bob")?;
+        assert_eq!(commit.epoch, 1);
+        assert!(!commit.commit.0.is_empty());
+        assert!(matches!(
+            service.apply_group_commit(GroupCommit {
+                group_id: created.group_id.clone(),
+                epoch: 0,
+                commit: commit.commit.clone(),
+            }),
+            Err(ServiceBoundaryError::VerificationFailed(_))
+        ));
+
+        let merged = service.apply_group_commit(commit)?;
+        assert_eq!(merged.epoch, 1);
+        assert_ne!(created.epoch_summary, merged.epoch_summary);
+        let after = service.export_group_secret(&created.group_id, "discrypt/text")?;
+        assert_ne!(before, after);
+        drop(service);
+
+        let mut reloaded = OpenMlsGroupCryptoService::open(&path)?;
+        let restored = reloaded.load_group(&created.group_id, &signer_public_key)?;
+        assert_eq!(restored.epoch, merged.epoch);
+        assert_eq!(restored.epoch_summary, merged.epoch_summary);
+        assert_eq!(
+            reloaded.export_group_secret(&created.group_id, "discrypt/text")?,
+            after
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]

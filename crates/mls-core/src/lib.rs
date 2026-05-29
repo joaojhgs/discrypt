@@ -16,6 +16,7 @@ pub mod exporter;
 pub mod governance;
 pub mod group;
 pub mod identity;
+pub mod openmls_engine;
 pub mod production_status;
 pub mod provider;
 
@@ -27,3 +28,7 @@ pub use exporter::{derive_epoch_secret, ExportLabel};
 pub use governance::{CanonicalEventRef, GovernanceAction, GovernanceEvent, GovernanceLog, Role};
 pub use group::{GroupState, LeafIndex, MlsCoreError};
 pub use identity::{verifying_key_from_hex, FriendCode, Identity, SafetyNumber};
+pub use openmls_engine::{
+    DiscryptOpenMlsProvider, JsonOpenMlsCodec, OpenMlsGroupEngine, OpenMlsGroupError,
+    OpenMlsGroupSnapshot, OpenMlsMemberPackage,
+};
