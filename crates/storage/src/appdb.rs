@@ -11,10 +11,22 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
@@ -38,12 +50,25 @@ pub trait AppDbKeychain: Clone + Send + Sync + 'static {
     fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError>;
 }
 
+/// Local deterministic keychains are excluded from production-storage-only builds.
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
 /// In-memory keychain adapter for tests and harnesses.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryAppDbKeychain {
     keys: Arc<Mutex<BTreeMap<String, [u8; 32]>>>,
 }
 
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
 impl MemoryAppDbKeychain {
     /// Insert or replace a wrapping key. Intended for deterministic tests.
     pub fn insert_wrapping_key(
@@ -67,6 +92,12 @@ impl MemoryAppDbKeychain {
     }
 }
 
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
 impl AppDbKeychain for MemoryAppDbKeychain {
     fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
         self.keys
@@ -90,6 +121,84 @@ impl AppDbKeychain for MemoryAppDbKeychain {
             .remove(key_id);
         Ok(())
     }
+}
+
+/// Production Linux keychain backed by the desktop Secret Service/keyring provider.
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxOsKeychain {
+    service: String,
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl LinuxOsKeychain {
+    /// Create a Linux platform keychain adapter for Discrypt app DB wrapping keys.
+    #[must_use]
+    pub fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
+
+    /// Create the default Discrypt app DB keychain adapter.
+    #[must_use]
+    pub fn discrypt_app_db() -> Self {
+        Self::new("discrypt.appdb")
+    }
+
+    /// Service namespace used for OS keychain entries.
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    fn entry(&self, key_id: &str) -> Result<keyring::Entry, AppStoreError> {
+        keyring::Entry::new(&self.service, key_id).map_err(keyring_error)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl Default for LinuxOsKeychain {
+    fn default() -> Self {
+        Self::discrypt_app_db()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl AppDbKeychain for LinuxOsKeychain {
+    fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
+        let entry = self.entry(key_id)?;
+        match entry.get_secret() {
+            Ok(secret) => secret_to_wrapping_key(secret),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(keyring_error(error)),
+        }
+    }
+
+    fn store_wrapping_key(&mut self, key_id: &str, key: [u8; 32]) -> Result<(), AppStoreError> {
+        self.entry(key_id)?.set_secret(&key).map_err(keyring_error)
+    }
+
+    fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError> {
+        let entry = self.entry(key_id)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(keyring_error(error)),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn secret_to_wrapping_key(secret: Vec<u8>) -> Result<Option<[u8; 32]>, AppStoreError> {
+    let key: [u8; 32] = secret
+        .try_into()
+        .map_err(|_| AppStoreError::Crypto("invalid OS keychain wrapping key length"))?;
+    Ok(Some(key))
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn keyring_error(error: keyring::Error) -> AppStoreError {
+    AppStoreError::Keychain(error.to_string())
 }
 
 /// File-backed encrypted application DB.
@@ -1217,6 +1326,26 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn deterministic_memory_keychain_is_available_for_tests_and_local_dev_fallbacks(
+    ) -> Result<(), AppStoreError> {
+        let mut keychain = MemoryAppDbKeychain::default();
+        keychain.store_wrapping_key("local-dev-key", [3; 32])?;
+        assert_eq!(keychain.load_wrapping_key("local-dev-key")?, Some([3; 32]));
+        keychain.delete_wrapping_key("local-dev-key")?;
+        assert_eq!(keychain.load_wrapping_key("local-dev-key")?, None);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_storage_exposes_linux_os_keychain_boundary() {
+        fn assert_keychain<K: AppDbKeychain>(_keychain: K) {}
+        let keychain = LinuxOsKeychain::discrypt_app_db();
+        assert_eq!(keychain.service(), "discrypt.appdb");
+        assert_keychain(keychain);
     }
 
     #[test]

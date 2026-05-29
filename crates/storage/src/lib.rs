@@ -8,7 +8,16 @@
 
 pub mod appdb;
 pub mod production_status;
-pub use appdb::{sqlite_wal_path, AppDbKeychain, EncryptedAppDb, MemoryAppDbKeychain};
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+pub use appdb::LinuxOsKeychain;
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
+pub use appdb::MemoryAppDbKeychain;
+pub use appdb::{sqlite_wal_path, AppDbKeychain, EncryptedAppDb};
 pub use content_keys::KeyState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +45,9 @@ pub enum AppStoreError {
     /// Required keychain wrapping key is unavailable.
     #[error("app store keychain key missing: {0}")]
     KeychainMissing(String),
+    /// Platform keychain operation failed.
+    #[error("app store keychain error: {0}")]
+    Keychain(String),
 }
 
 /// Byte-oriented local app-state store used by the core AppService.

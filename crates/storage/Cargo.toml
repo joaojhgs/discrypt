@@ -14,7 +14,13 @@ harness = ["content_keys/harness", "mls_core/harness"]
 local-dev = ["content_keys/local-dev", "mls_core/local-dev"]
 production-network = ["content_keys/production-network", "mls_core/production-network"]
 production-media = ["content_keys/production-media", "mls_core/production-media"]
-production-storage = ["content_keys/production-storage", "mls_core/production-storage"]
+production-storage = [
+  "content_keys/production-storage",
+  "mls_core/production-storage",
+  "dep:keyring",
+  "keyring/sync-secret-service",
+  "keyring/crypto-rust",
+]
 
 [dependencies]
 aes-gcm = { workspace = true }
@@ -23,6 +29,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+keyring = { version = "3.6.3", default-features = false, optional = true }
 zeroize = { workspace = true }
 content_keys = { package = "discrypt-content-keys", path = "../content-keys", version = "0.1.0" }
 mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }
