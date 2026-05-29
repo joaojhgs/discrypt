@@ -6,6 +6,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod app_db;
 pub mod appdb;
 pub mod production_status;
 pub use appdb::{sqlite_wal_path, AppDbKeychain, EncryptedAppDb, MemoryAppDbKeychain};
