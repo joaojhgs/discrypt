@@ -721,9 +721,11 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     use discrypt_mls_delivery::{
         detect_fork_or_replay, equal_confirmation_tags, order_application_events, plan_repair,
         repair_to_winner, summary, ApplicationEvent, CatchUpBundle, CommitEnvelope, DeliveryError,
-        DeliveryState, ForkEvidence, ForkStatus, InMemoryTextAuthorLog, InMemoryTextSendEvents,
-        InMemoryTextTransport, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundPipeline,
-        TextOutboundRequest, TextRetentionMetadata, TextSelectedRoute, TextSendEventKind,
+        DeliveryState, ForkEvidence, ForkStatus, InMemoryTextAuthorLog, InMemoryTextReceiveEvents,
+        InMemoryTextRecipientStore, InMemoryTextSendEvents, InMemoryTextTransport,
+        TextInboundPipeline, TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput,
+        TextOutboundPipeline, TextOutboundRequest, TextReceiveEventKind, TextReceiveState,
+        TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEventKind,
         WelcomePackage,
     };
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
@@ -777,6 +779,24 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         &text_key,
         &text_signing_key,
     )?;
+    let mut inbound_state = TextReceiveState::default();
+    let mut inbound_store = InMemoryTextRecipientStore::default();
+    let mut inbound_events = InMemoryTextReceiveEvents::default();
+    let inbound_renderable =
+        TextInboundPipeline::new(&mut inbound_state, &mut inbound_store, &mut inbound_events)
+            .receive(
+                TextInboundRequest {
+                    group_id: "lab".to_owned(),
+                    channel_id: "general".to_owned(),
+                    current_epoch: 7,
+                    authorized_sender_leaves: BTreeSet::from([1]),
+                    envelope: outbound_receipt.envelope.clone(),
+                    received_at_ms: 2,
+                    retention_allows_decrypt: true,
+                },
+                &text_key,
+                &text_signing_key.verifying_key(),
+            )?;
     let pipeline_send_ready = outbound_log.entries.len() == 1
         && outbound_transport.frames.len() == 1
         && outbound_events
@@ -785,6 +805,10 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
             .map(|event| &event.kind)
             .collect::<Vec<_>>()
             == vec![&TextSendEventKind::Pending, &TextSendEventKind::Delivered]
+        && inbound_store.entries.len() == 1
+        && inbound_events.events.len() == 1
+        && inbound_events.events[0].kind == TextReceiveEventKind::Updated
+        && inbound_renderable.state == TextRenderState::Decrypted(text_plaintext.to_vec())
         && !outbound_receipt
             .envelope
             .contains_plaintext_sample(text_plaintext)

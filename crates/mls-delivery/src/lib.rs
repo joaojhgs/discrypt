@@ -54,6 +54,27 @@ pub enum DeliveryError {
     /// Outbound text pipeline adapter failed.
     #[error("text outbound adapter failed: {0}")]
     TextOutboundAdapter(String),
+    /// Text receive rejected an unauthorized sender.
+    #[error("text receive sender leaf {0} is not a member of the current epoch")]
+    TextReceiveUnauthorizedSender(u32),
+    /// Text receive rejected a replayed message.
+    #[error("text receive replay for sender {sender_leaf} sequence {sequence}")]
+    TextReceiveReplay { sender_leaf: u32, sequence: u64 },
+    /// Text receive rejected a stale epoch or sequence.
+    #[error("text receive downgrade from current epoch {current_epoch} to {envelope_epoch}")]
+    TextReceiveDowngrade {
+        current_epoch: u64,
+        envelope_epoch: u64,
+    },
+    /// Text receive detected a future/forked epoch.
+    #[error("text receive fork from current epoch {current_epoch} to {envelope_epoch}")]
+    TextReceiveFork {
+        current_epoch: u64,
+        envelope_epoch: u64,
+    },
+    /// Text payload decryption failed.
+    #[error("text message decryption failed")]
+    TextMessageDecryptionFailed,
 }
 
 /// Compact state summary exchanged during catch-up.
@@ -734,6 +755,314 @@ fn push_str_for_hash(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+/// Durable recipient-side ciphertext entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextReceivedEnvelope {
+    /// Channel id whose history owns the entry.
+    pub channel_id: String,
+    /// Full signed encrypted envelope.
+    pub envelope: TextMessageEnvelope,
+    /// Deterministic receive timestamp.
+    pub received_at_ms: u64,
+}
+
+/// Render state returned after receive processing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextRenderState {
+    /// Retention allowed local decryption and plaintext rendering.
+    Decrypted(Vec<u8>),
+    /// Ciphertext was persisted, but plaintext is locked by retention/live-key policy.
+    Locked { reason: String },
+}
+
+/// UI-facing receive result after validation and persistence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextRenderableMessage {
+    /// Stable message id.
+    pub message_id: String,
+    /// Sender MLS leaf.
+    pub sender_leaf: u32,
+    /// Per-author sequence.
+    pub sequence: u64,
+    /// Render state.
+    pub state: TextRenderState,
+}
+
+/// Receive lifecycle event kinds emitted to local UI/command consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextReceiveEventKind {
+    /// A received message was persisted and is renderable or locked.
+    Updated,
+    /// Receive failed; see error text.
+    Error,
+}
+
+/// Local receive event emitted by the inbound text pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextReceiveEvent {
+    /// Message id being reported.
+    pub message_id: String,
+    /// Event kind.
+    pub kind: TextReceiveEventKind,
+    /// Optional adapter/error text for failed receives.
+    pub error: Option<String>,
+}
+
+impl TextReceiveEvent {
+    fn updated(message_id: &str) -> Self {
+        Self {
+            message_id: message_id.to_owned(),
+            kind: TextReceiveEventKind::Updated,
+            error: None,
+        }
+    }
+
+    fn error(message_id: &str, error: &DeliveryError) -> Self {
+        Self {
+            message_id: message_id.to_owned(),
+            kind: TextReceiveEventKind::Error,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// Request accepted by the inbound text receive pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextInboundRequest {
+    /// Raw group id kept inside local Rust services; envelope stores only its commitment.
+    pub group_id: String,
+    /// Channel id whose history receives this message.
+    pub channel_id: String,
+    /// Current locally accepted MLS epoch.
+    pub current_epoch: u64,
+    /// Sender leaves authorized in the current epoch.
+    pub authorized_sender_leaves: BTreeSet<u32>,
+    /// Signed encrypted envelope received from transport/history.
+    pub envelope: TextMessageEnvelope,
+    /// Deterministic receive timestamp.
+    pub received_at_ms: u64,
+    /// Whether retention/live-key policy currently allows local plaintext decryption.
+    pub retention_allows_decrypt: bool,
+}
+
+/// Recipient ciphertext persistence seam used by the inbound text pipeline.
+pub trait TextRecipientStore {
+    /// Persist one received signed encrypted envelope.
+    fn persist_received(&mut self, entry: TextReceivedEnvelope) -> Result<(), DeliveryError>;
+}
+
+/// Event sink for local receive update/error status.
+pub trait TextReceiveEventSink {
+    /// Emit one local receive lifecycle event.
+    fn emit_text_receive_event(&mut self, event: TextReceiveEvent) -> Result<(), DeliveryError>;
+}
+
+/// Per-channel receive ordering and replay state.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextReceiveState {
+    seen: BTreeSet<(u32, u64, String)>,
+    last_sequence_by_leaf: BTreeMap<u32, u64>,
+}
+
+impl TextReceiveState {
+    /// Validate and record one envelope's anti-replay/order key.
+    pub fn accept(&mut self, envelope: &TextMessageEnvelope) -> Result<(), DeliveryError> {
+        let key = (
+            envelope.sender_leaf,
+            envelope.sequence,
+            envelope.message_id.clone(),
+        );
+        if self.seen.contains(&key) {
+            return Err(DeliveryError::TextReceiveReplay {
+                sender_leaf: envelope.sender_leaf,
+                sequence: envelope.sequence,
+            });
+        }
+        if self
+            .last_sequence_by_leaf
+            .get(&envelope.sender_leaf)
+            .is_some_and(|last| envelope.sequence <= *last)
+        {
+            return Err(DeliveryError::TextReceiveReplay {
+                sender_leaf: envelope.sender_leaf,
+                sequence: envelope.sequence,
+            });
+        }
+        self.seen.insert(key);
+        self.last_sequence_by_leaf
+            .insert(envelope.sender_leaf, envelope.sequence);
+        Ok(())
+    }
+}
+
+/// Production text-receive coordinator over validation, storage, decryption, and events.
+pub struct TextInboundPipeline<'a, S, E> {
+    state: &'a mut TextReceiveState,
+    store: &'a mut S,
+    events: &'a mut E,
+}
+
+impl<'a, S, E> TextInboundPipeline<'a, S, E>
+where
+    S: TextRecipientStore,
+    E: TextReceiveEventSink,
+{
+    /// Bind the pipeline to concrete adapter seams.
+    #[must_use]
+    pub fn new(state: &'a mut TextReceiveState, store: &'a mut S, events: &'a mut E) -> Self {
+        Self {
+            state,
+            store,
+            events,
+        }
+    }
+
+    /// Verify, persist, decrypt-or-lock, and emit a UI update for one received text envelope.
+    pub fn receive(
+        &mut self,
+        request: TextInboundRequest,
+        text_exporter_secret: &[u8],
+        verifying_key: &VerifyingKey,
+    ) -> Result<TextRenderableMessage, DeliveryError> {
+        let message_id = request.envelope.message_id.clone();
+        match self.receive_inner(request, text_exporter_secret, verifying_key) {
+            Ok(renderable) => Ok(renderable),
+            Err(error) => {
+                let _ = self
+                    .events
+                    .emit_text_receive_event(TextReceiveEvent::error(&message_id, &error));
+                Err(error)
+            }
+        }
+    }
+
+    fn receive_inner(
+        &mut self,
+        request: TextInboundRequest,
+        text_exporter_secret: &[u8],
+        verifying_key: &VerifyingKey,
+    ) -> Result<TextRenderableMessage, DeliveryError> {
+        let envelope = request.envelope;
+        envelope.verify(&request.group_id, verifying_key)?;
+        if envelope.epoch < request.current_epoch {
+            return Err(DeliveryError::TextReceiveDowngrade {
+                current_epoch: request.current_epoch,
+                envelope_epoch: envelope.epoch,
+            });
+        }
+        if envelope.epoch > request.current_epoch {
+            return Err(DeliveryError::TextReceiveFork {
+                current_epoch: request.current_epoch,
+                envelope_epoch: envelope.epoch,
+            });
+        }
+        if !request
+            .authorized_sender_leaves
+            .contains(&envelope.sender_leaf)
+        {
+            return Err(DeliveryError::TextReceiveUnauthorizedSender(
+                envelope.sender_leaf,
+            ));
+        }
+        self.state.accept(&envelope)?;
+        self.store.persist_received(TextReceivedEnvelope {
+            channel_id: request.channel_id,
+            envelope: envelope.clone(),
+            received_at_ms: request.received_at_ms,
+        })?;
+        let state = if request.retention_allows_decrypt {
+            TextRenderState::Decrypted(decrypt_text_envelope(
+                &request.group_id,
+                text_exporter_secret,
+                &envelope,
+            )?)
+        } else {
+            TextRenderState::Locked {
+                reason: "retention policy requires live key before plaintext render".to_owned(),
+            }
+        };
+        self.events
+            .emit_text_receive_event(TextReceiveEvent::updated(&envelope.message_id))?;
+        Ok(TextRenderableMessage {
+            message_id: envelope.message_id,
+            sender_leaf: envelope.sender_leaf,
+            sequence: envelope.sequence,
+            state,
+        })
+    }
+}
+
+/// In-memory recipient store for deterministic harnesses and service tests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemoryTextRecipientStore {
+    /// Persisted received entries in order.
+    pub entries: Vec<TextReceivedEnvelope>,
+}
+
+impl TextRecipientStore for InMemoryTextRecipientStore {
+    fn persist_received(&mut self, entry: TextReceivedEnvelope) -> Result<(), DeliveryError> {
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
+/// In-memory receive event sink for deterministic harnesses and service tests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InMemoryTextReceiveEvents {
+    /// Emitted receive lifecycle events in order.
+    pub events: Vec<TextReceiveEvent>,
+}
+
+impl TextReceiveEventSink for InMemoryTextReceiveEvents {
+    fn emit_text_receive_event(&mut self, event: TextReceiveEvent) -> Result<(), DeliveryError> {
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+/// Decrypt a verified text envelope using the same exporter-derived key used on send.
+pub fn decrypt_text_envelope(
+    group_id: &str,
+    text_exporter_secret: &[u8],
+    envelope: &TextMessageEnvelope,
+) -> Result<Vec<u8>, DeliveryError> {
+    let request = TextOutboundRequest {
+        group_id: group_id.to_owned(),
+        channel_id: String::new(),
+        epoch: envelope.epoch,
+        sender_leaf: envelope.sender_leaf,
+        sender_device_id: envelope.sender_device_id.clone(),
+        sequence: envelope.sequence,
+        message_id: envelope.message_id.clone(),
+        retention: envelope.retention.clone(),
+        plaintext: Vec::new(),
+        sent_at_ms: 0,
+    };
+    let aad = text_message_encryption_aad(&request)?;
+    let content_key = derive_text_message_content_key(text_exporter_secret, &request);
+    let nonce = text_message_nonce(&content_key, &envelope.message_id, envelope.sequence);
+    decrypt_text_ciphertext(&content_key, &nonce, &aad, &envelope.content_ciphertext)
+}
+
+fn decrypt_text_ciphertext(
+    content_key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, DeliveryError> {
+    let cipher = Aes256Gcm::new_from_slice(content_key)
+        .map_err(|_| DeliveryError::TextMessageDecryptionFailed)?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| DeliveryError::TextMessageDecryptionFailed)
+}
+
 /// Application event carried alongside ordered MLS delivery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationEvent {
@@ -1309,6 +1638,162 @@ mod tests {
         assert!(transport.frames.is_empty());
         assert_eq!(events.events.len(), 1);
         assert_eq!(events.events[0].kind, TextSendEventKind::Error);
+    }
+
+    fn authorized_leaves() -> BTreeSet<u32> {
+        BTreeSet::from([1, 2])
+    }
+
+    fn signed_envelope_for_receive(
+        message_id: &str,
+    ) -> Result<(TextMessageEnvelope, SigningKey), DeliveryError> {
+        let signer = signing_key(12);
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport::default();
+        let mut events = InMemoryTextSendEvents::default();
+        let receipt = TextOutboundPipeline::new(&mut log, &mut transport, &mut events).send(
+            outbound_request(message_id),
+            selected_route(true),
+            b"openmls-text-exporter-secret",
+            &signer,
+        )?;
+        Ok((receipt.envelope, signer))
+    }
+
+    #[test]
+    fn inbound_text_pipeline_validates_decrypts_persists_and_emits_update(
+    ) -> Result<(), DeliveryError> {
+        let (envelope, signer) = signed_envelope_for_receive("msg-receive")?;
+        let mut state = TextReceiveState::default();
+        let mut store = InMemoryTextRecipientStore::default();
+        let mut events = InMemoryTextReceiveEvents::default();
+        let renderable = TextInboundPipeline::new(&mut state, &mut store, &mut events).receive(
+            TextInboundRequest {
+                group_id: "group/private-lab".to_owned(),
+                channel_id: "general".to_owned(),
+                current_epoch: 7,
+                authorized_sender_leaves: authorized_leaves(),
+                envelope,
+                received_at_ms: 2_000,
+                retention_allows_decrypt: true,
+            },
+            b"openmls-text-exporter-secret",
+            &signer.verifying_key(),
+        )?;
+
+        assert_eq!(renderable.message_id, "msg-receive");
+        assert_eq!(renderable.sender_leaf, 1);
+        assert_eq!(renderable.sequence, 2);
+        assert_eq!(
+            renderable.state,
+            TextRenderState::Decrypted(b"hello plaintext".to_vec())
+        );
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.entries[0].channel_id, "general");
+        assert_eq!(store.entries[0].received_at_ms, 2_000);
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].kind, TextReceiveEventKind::Updated);
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_text_pipeline_renders_locked_when_retention_blocks_decrypt(
+    ) -> Result<(), DeliveryError> {
+        let (envelope, signer) = signed_envelope_for_receive("msg-locked")?;
+        let mut state = TextReceiveState::default();
+        let mut store = InMemoryTextRecipientStore::default();
+        let mut events = InMemoryTextReceiveEvents::default();
+        let renderable = TextInboundPipeline::new(&mut state, &mut store, &mut events).receive(
+            TextInboundRequest {
+                group_id: "group/private-lab".to_owned(),
+                channel_id: "general".to_owned(),
+                current_epoch: 7,
+                authorized_sender_leaves: authorized_leaves(),
+                envelope,
+                received_at_ms: 2_000,
+                retention_allows_decrypt: false,
+            },
+            b"openmls-text-exporter-secret",
+            &signer.verifying_key(),
+        )?;
+
+        assert!(matches!(renderable.state, TextRenderState::Locked { .. }));
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(events.events[0].kind, TextReceiveEventKind::Updated);
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_text_pipeline_rejects_replay_unauthorized_and_epoch_mismatch(
+    ) -> Result<(), DeliveryError> {
+        let (envelope, signer) = signed_envelope_for_receive("msg-replay")?;
+        let mut state = TextReceiveState::default();
+        let mut store = InMemoryTextRecipientStore::default();
+        let mut events = InMemoryTextReceiveEvents::default();
+        let mut pipeline = TextInboundPipeline::new(&mut state, &mut store, &mut events);
+        let base_request = TextInboundRequest {
+            group_id: "group/private-lab".to_owned(),
+            channel_id: "general".to_owned(),
+            current_epoch: 7,
+            authorized_sender_leaves: authorized_leaves(),
+            envelope: envelope.clone(),
+            received_at_ms: 2_000,
+            retention_allows_decrypt: true,
+        };
+        assert!(pipeline
+            .receive(
+                base_request.clone(),
+                b"openmls-text-exporter-secret",
+                &signer.verifying_key(),
+            )
+            .is_ok());
+        assert_eq!(
+            pipeline.receive(
+                base_request.clone(),
+                b"openmls-text-exporter-secret",
+                &signer.verifying_key(),
+            ),
+            Err(DeliveryError::TextReceiveReplay {
+                sender_leaf: 1,
+                sequence: 2,
+            })
+        );
+
+        let mut unauthorized = base_request.clone();
+        unauthorized.envelope.message_id = "msg-unauthorized".to_owned();
+        unauthorized.envelope.sequence = 3;
+        unauthorized.envelope.signature = signing_key(12)
+            .sign(&unauthorized.envelope.canonical_unsigned_bytes())
+            .to_bytes()
+            .to_vec();
+        unauthorized.authorized_sender_leaves = BTreeSet::new();
+        assert_eq!(
+            pipeline.receive(
+                unauthorized,
+                b"openmls-text-exporter-secret",
+                &signer.verifying_key(),
+            ),
+            Err(DeliveryError::TextReceiveUnauthorizedSender(1))
+        );
+
+        let mut stale = base_request;
+        stale.current_epoch = 8;
+        assert_eq!(
+            pipeline.receive(
+                stale,
+                b"openmls-text-exporter-secret",
+                &signer.verifying_key(),
+            ),
+            Err(DeliveryError::TextReceiveDowngrade {
+                current_epoch: 8,
+                envelope_epoch: 7,
+            })
+        );
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.kind == TextReceiveEventKind::Error));
+        Ok(())
     }
 
     #[test]
