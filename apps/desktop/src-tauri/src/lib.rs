@@ -201,8 +201,43 @@ pub struct MessageView {
     pub body: String,
     /// Delivery/security status copy.
     pub status: String,
+    /// Stable message state key for UI badges.
+    #[serde(default = "default_text_state_key")]
+    pub state_key: String,
+    /// Human-readable message state label.
+    #[serde(default = "default_text_state_label")]
+    pub state_label: String,
+    /// Evidence/caveat for the message state.
+    #[serde(default = "default_text_state_detail")]
+    pub state_detail: String,
     /// Deterministic local timestamp/counter label.
     pub sent_at: String,
+}
+
+fn default_text_state_key() -> String {
+    "sent_local".to_owned()
+}
+
+fn default_text_state_label() -> String {
+    "Sent locally".to_owned()
+}
+
+fn default_text_state_detail() -> String {
+    "Message is in the local encrypted author log; peer receipt requires backend-state proof"
+        .to_owned()
+}
+
+/// Text state legend for command-backed timelines.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextStateView {
+    /// Stable state key.
+    pub key: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Whether this state is currently observable for this build.
+    pub status: String,
+    /// Evidence/caveat copy for the state.
+    pub detail: String,
 }
 
 /// Redacted TURN endpoint metadata surfaced from a signed invite descriptor.
@@ -444,6 +479,9 @@ pub struct AppStateView {
     /// Backend-derived invite/join progress states for the UI timeline.
     #[serde(default)]
     pub join_progress: Vec<JoinProgressStepView>,
+    /// Text message state legend for timelines.
+    #[serde(default)]
+    pub text_state_legend: Vec<TextStateView>,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -1303,6 +1341,9 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             author,
             body: body.to_owned(),
             status: "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned(),
+            state_key: "sent_local".to_owned(),
+            state_label: "Sent locally".to_owned(),
+            state_detail: default_text_state_detail(),
             sent_at: format!("local-{sequence}"),
         };
         state.messages.push(message);
@@ -1835,6 +1876,7 @@ impl PersistedAppState {
             last_command_error: self.last_command_error.clone(),
             transport_status: self.transport_status(),
             join_progress: self.join_progress(),
+            text_state_legend: text_state_legend(),
             snapshot: self.to_snapshot(),
         }
     }
@@ -2867,6 +2909,59 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+fn text_state_legend() -> Vec<TextStateView> {
+    vec![
+        TextStateView {
+            key: "pending".to_owned(),
+            label: "Pending".to_owned(),
+            status: "available".to_owned(),
+            detail: "Message is queued before local author-log append or transport attempt"
+                .to_owned(),
+        },
+        TextStateView {
+            key: "sent_local".to_owned(),
+            label: "Sent locally".to_owned(),
+            status: "current-send-state".to_owned(),
+            detail: default_text_state_detail(),
+        },
+        TextStateView {
+            key: "peer_receipt".to_owned(),
+            label: "Peer receipt".to_owned(),
+            status: "requires-signed-receipt".to_owned(),
+            detail: "Delivered to peer is shown only with backend-state signed receipt proof"
+                .to_owned(),
+        },
+        TextStateView {
+            key: "received".to_owned(),
+            label: "Received".to_owned(),
+            status: "available".to_owned(),
+            detail: "Inbound messages use this state after membership, epoch, and ordering checks"
+                .to_owned(),
+        },
+        TextStateView {
+            key: "failed".to_owned(),
+            label: "Failed".to_owned(),
+            status: "available".to_owned(),
+            detail: "Send or decrypt failures must retain the command error/recovery reason"
+                .to_owned(),
+        },
+        TextStateView {
+            key: "locked".to_owned(),
+            label: "Locked".to_owned(),
+            status: "available".to_owned(),
+            detail: "Retention or key-lock policy can hide plaintext until authorized unlock"
+                .to_owned(),
+        },
+        TextStateView {
+            key: "shredded".to_owned(),
+            label: "Shredded".to_owned(),
+            status: "available".to_owned(),
+            detail: "Crypto-shred/key deletion state; remote screenshots or exports are not erased"
+                .to_owned(),
+        },
+    ]
+}
+
 fn snapshot_channel_label(message: &MessageView, state: &PersistedAppState) -> String {
     if let Some(channel_id) = &message.target.channel_id {
         for group in &state.groups {
@@ -3730,6 +3825,48 @@ mod tests {
             .join_progress
             .iter()
             .any(|step| step.key == "transport" && step.status == "waiting-route-proof"));
+    }
+
+    #[test]
+    fn text_message_states_include_sent_local_and_full_legend() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-state-ui");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Peer".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let state = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "hello state".to_owned(),
+        });
+        assert_eq!(state.messages[0].state_key, "sent_local");
+        assert_eq!(state.messages[0].state_label, "Sent locally");
+        let keys: Vec<_> = state
+            .text_state_legend
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "pending",
+                "sent_local",
+                "peer_receipt",
+                "received",
+                "failed",
+                "locked",
+                "shredded"
+            ]
+        );
     }
 
     #[test]

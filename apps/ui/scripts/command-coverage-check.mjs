@@ -370,6 +370,7 @@ const allowedProductionClaimContext = [
   "metadata-minimizing",
   "pending on offline devices",
   "backend state",
+  "backend-state",
   "returned by state",
   "honest_copy_ready",
   "media-frame E2E",
@@ -444,6 +445,18 @@ if (!commands.includes("join_progress: JoinProgressStepView[]")) {
 }
 if (!main.includes("JoinProgressCard")) {
   failures.push("UI must render backend-derived group join progress");
+}
+if (!rust.includes("text_state_legend: Vec<TextStateView>")) {
+  failures.push("Tauri AppStateView must expose text_state_legend");
+}
+if (!commands.includes("text_state_legend: TextStateView[]")) {
+  failures.push("TS AppState must carry text_state_legend");
+}
+if (!main.includes("TextStateLegend")) {
+  failures.push("UI must render text message state legend");
+}
+if (!main.includes("message.state_label") || !main.includes("message.state_detail")) {
+  failures.push("Message bubbles must display per-message state label and detail");
 }
 if (!main.includes("Group join progress")) {
   failures.push("join UI must label the command-backed group join progress timeline");

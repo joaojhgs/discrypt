@@ -172,7 +172,17 @@ export type AppMessageView = {
   author: string;
   body: string;
   status: string;
+  state_key: string;
+  state_label: string;
+  state_detail: string;
   sent_at: string;
+};
+
+export type TextStateView = {
+  key: string;
+  label: string;
+  status: string;
+  detail: string;
 };
 
 export type IceTurnServerView = {
@@ -274,6 +284,7 @@ export type AppState = {
   last_command_error: CommandErrorView | null;
   transport_status: TransportStatusView[];
   join_progress: JoinProgressStepView[];
+  text_state_legend: TextStateView[];
   snapshot: AppSnapshot;
 };
 
@@ -526,6 +537,7 @@ const fallbackState: AppState = {
   last_command_error: null,
   transport_status: [],
   join_progress: [],
+  text_state_legend: textStateLegend(),
   snapshot: fallbackSnapshot,
 };
 
@@ -589,7 +601,57 @@ function syncSnapshot(state: AppState): AppState {
   state.event_cursor = state.events.at(-1)?.sequence ?? 0;
   state.transport_status = deriveTransportStatus(state);
   state.join_progress = deriveJoinProgress(state);
+  state.text_state_legend = textStateLegend();
   return state;
+}
+
+function textStateLegend(): TextStateView[] {
+  return [
+    {
+      key: "pending",
+      label: "Pending",
+      status: "available",
+      detail: "Message is queued before local author-log append or transport attempt",
+    },
+    {
+      key: "sent_local",
+      label: "Sent locally",
+      status: "current-send-state",
+      detail:
+        "Message is in the local encrypted author log; peer receipt requires backend-state proof",
+    },
+    {
+      key: "peer_receipt",
+      label: "Peer receipt",
+      status: "requires-signed-receipt",
+      detail:
+        "Delivered to peer is shown only with backend-state signed receipt proof",
+    },
+    {
+      key: "received",
+      label: "Received",
+      status: "available",
+      detail: "Inbound messages use this state after membership, epoch, and ordering checks",
+    },
+    {
+      key: "failed",
+      label: "Failed",
+      status: "available",
+      detail: "Send or decrypt failures must retain the command error/recovery reason",
+    },
+    {
+      key: "locked",
+      label: "Locked",
+      status: "available",
+      detail: "Retention or key-lock policy can hide plaintext until authorized unlock",
+    },
+    {
+      key: "shredded",
+      label: "Shredded",
+      status: "available",
+      detail: "Crypto-shred/key deletion state; remote screenshots or exports are not erased",
+    },
+  ];
 }
 
 function deriveJoinProgress(state: AppState): JoinProgressStepView[] {
@@ -1878,6 +1940,10 @@ export async function sendMessage(
         body,
         status:
           "local encrypted author log; remote delivery/read receipts not claimed without signed receipt",
+        state_key: "sent_local",
+        state_label: "Sent locally",
+        state_detail:
+          "Message is in the local encrypted author log; peer receipt requires backend-state proof",
         sent_at: `local-${state.messages.length + 1}`,
       });
       pushEvent(

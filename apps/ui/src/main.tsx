@@ -16,6 +16,7 @@ import {
   GroupView,
   InviteView,
   JoinProgressStepView,
+  TextStateView,
   TransportStatusView,
   VoiceParticipantView,
   VoiceSessionView,
@@ -617,6 +618,7 @@ function App() {
             <DmPanel
               activeDm={activeDm}
               messages={appState.messages}
+              textStateLegend={appState.text_state_legend}
               draftDmName={draftDmName}
               setDraftDmName={setDraftDmName}
               draftMessage={draftMessage}
@@ -653,6 +655,7 @@ function App() {
               activeChannel={activeTextChannel}
               channels={textChannels}
               messages={appState.messages}
+              textStateLegend={appState.text_state_legend}
               draftChannel={draftChannel}
               setDraftChannel={setDraftChannel}
               draftMessage={draftMessage}
@@ -1500,6 +1503,7 @@ function SetupPanel({
 function DmPanel({
   activeDm,
   messages,
+  textStateLegend,
   draftDmName,
   setDraftDmName,
   draftMessage,
@@ -1509,6 +1513,7 @@ function DmPanel({
 }: {
   activeDm: DirectConversationView | null;
   messages: AppMessageView[];
+  textStateLegend: TextStateView[];
   draftDmName: string;
   setDraftDmName: (value: string) => void;
   draftMessage: string;
@@ -1546,6 +1551,7 @@ function DmPanel({
           "Start a DM to create a local conversation."
         }
         messages={visibleMessages}
+        textStateLegend={textStateLegend}
         draftMessage={draftMessage}
         setDraftMessage={setDraftMessage}
         sendLabel="Send DM message"
@@ -1901,6 +1907,7 @@ function ChannelPanel({
   activeChannel,
   channels,
   messages,
+  textStateLegend,
   draftChannel,
   setDraftChannel,
   draftMessage,
@@ -1913,6 +1920,7 @@ function ChannelPanel({
   activeChannel: ChannelStateView | null;
   channels: ChannelStateView[];
   messages: AppMessageView[];
+  textStateLegend: TextStateView[];
   draftChannel: string;
   setDraftChannel: (value: string) => void;
   draftMessage: string;
@@ -1936,6 +1944,7 @@ function ChannelPanel({
             : "Create or join a group before sending messages."
         }
         messages={visibleMessages}
+        textStateLegend={textStateLegend}
         draftMessage={draftMessage}
         setDraftMessage={setDraftMessage}
         sendLabel="Send message"
@@ -1993,6 +2002,7 @@ function Timeline({
   title,
   description,
   messages,
+  textStateLegend,
   draftMessage,
   setDraftMessage,
   sendLabel,
@@ -2002,6 +2012,7 @@ function Timeline({
   title: string;
   description: string;
   messages: AppMessageView[];
+  textStateLegend: TextStateView[];
   draftMessage: string;
   setDraftMessage: (value: string) => void;
   sendLabel: string;
@@ -2014,6 +2025,7 @@ function Timeline({
         <CardTitle className="text-xl">{title}</CardTitle>
         <CardDescription>{description}</CardDescription>
       </CardHeader>
+      <TextStateLegend states={textStateLegend} />
       <ScrollArea className="min-h-0 flex-1 p-4">
         <div className="grid gap-3">
           {messages.length === 0 ? (
@@ -2053,6 +2065,41 @@ function Timeline({
   );
 }
 
+function TextStateLegend({ states }: { states: TextStateView[] }) {
+  if (states.length === 0) return null;
+  return (
+    <div className="border-b border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.18)] p-3">
+      <div className="flex gap-2 overflow-x-auto pb-1" aria-label="Text message states">
+        {states.map((state) => (
+          <div
+            key={state.key}
+            className="min-w-44 rounded-xl border border-[hsl(var(--border))] bg-black/10 p-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-semibold">{state.label}</span>
+              <Badge variant={messageStateBadgeVariant(state.key)}>
+                {state.status}
+              </Badge>
+            </div>
+            <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-[hsl(var(--muted-foreground))]">
+              {state.detail}
+            </p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function messageStateBadgeVariant(
+  stateKey: string,
+): React.ComponentProps<typeof Badge>["variant"] {
+  if (["sent_local", "received"].includes(stateKey)) return "success";
+  if (["pending", "locked", "peer_receipt"].includes(stateKey)) return "warning";
+  if (["failed", "shredded"].includes(stateKey)) return "secondary";
+  return "outline";
+}
+
 function MessageBubble({ message }: { message: AppMessageView }) {
   return (
     <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.34)] p-3">
@@ -2061,8 +2108,14 @@ function MessageBubble({ message }: { message: AppMessageView }) {
         <span>{message.sent_at}</span>
       </div>
       <p className="mt-1 text-sm leading-6">{message.body}</p>
-      <p className="mt-2 text-[11px] text-[hsl(var(--muted-foreground))]">
-        {message.status}
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-[hsl(var(--muted-foreground))]">
+        <Badge variant={messageStateBadgeVariant(message.state_key)}>
+          {message.state_label}
+        </Badge>
+        <span>{message.status}</span>
+      </div>
+      <p className="mt-1 text-[11px] leading-5 text-[hsl(var(--muted-foreground))]">
+        {message.state_detail}
       </p>
     </div>
   );
