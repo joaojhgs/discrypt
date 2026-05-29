@@ -364,6 +364,12 @@ export type SpeakerVolumeRequest = {
   volume: number;
 };
 
+export const RESET_APP_CONFIRMATION_PHRASE = "DELETE LOCAL DISCRYPT STATE";
+
+export type ResetAppStateRequest = {
+  confirmation: string;
+};
+
 export type CommandHealth = {
   snapshot_ready: boolean;
   verification_ready: boolean;
@@ -1772,8 +1778,22 @@ export async function commandHealth(): Promise<CommandHealth> {
   }));
 }
 
-export async function resetAppState(): Promise<AppState> {
-  return invokeOrFallback<AppState>("reset_app_state", undefined, () => {
+export async function resetAppState(
+  request: ResetAppStateRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("reset_app_state", { request }, () => {
+    fallbackState.last_command_error = null;
+    if (request.confirmation.trim() !== RESET_APP_CONFIRMATION_PHRASE) {
+      pushCommandError(
+        fallbackState,
+        "state.reset_rejected",
+        "reset_app_state",
+        "confirmation_required",
+        "Local state reset requires the exact confirmation phrase",
+        `Type ${RESET_APP_CONFIRMATION_PHRASE} to erase local app state`,
+      );
+      return cloneState(syncSnapshot(fallbackState));
+    }
     fallbackState.lifecycle = "first_run";
     fallbackState.profile = null;
     fallbackState.dms = [];
@@ -1790,6 +1810,12 @@ export async function resetAppState(): Promise<AppState> {
         summary: "No local profile exists; setup/recovery is required",
       },
     ];
+    fallbackState.last_command_error = null;
+    pushEvent(
+      fallbackState,
+      "state.reset",
+      "Local app state reset after explicit typed confirmation",
+    );
     return cloneState(syncSnapshot(fallbackState));
   });
 }

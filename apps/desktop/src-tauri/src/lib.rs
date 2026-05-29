@@ -370,6 +370,16 @@ pub struct CommandErrorView {
     pub recovery_hint: String,
 }
 
+/// Confirmation phrase required before destructive local-state reset.
+pub const RESET_APP_CONFIRMATION_PHRASE: &str = "DELETE LOCAL DISCRYPT STATE";
+
+/// Request to destructively reset local app state from the UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResetAppStateRequest {
+    /// Must exactly match RESET_APP_CONFIRMATION_PHRASE.
+    pub confirmation: String,
+}
+
 /// Full command-backed app state consumed by React.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppStateView {
@@ -1537,6 +1547,33 @@ pub fn command_health() -> CommandHealth {
     }
 }
 
+/// Destructively reset persisted app state only after explicit UI confirmation.
+pub fn reset_app_state_confirmed(request: ResetAppStateRequest) -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    if request.confirmation.trim() != RESET_APP_CONFIRMATION_PHRASE {
+        guard.state.push_command_error(
+            "state.reset_rejected",
+            "reset_app_state",
+            "confirmation_required",
+            "Local state reset requires the exact confirmation phrase",
+            format!("Type {RESET_APP_CONFIRMATION_PHRASE} to erase local app state"),
+        );
+        guard.persist();
+        return guard.state.to_view();
+    }
+    guard.state = PersistedAppState::initial();
+    guard.state.push_event(
+        "state.reset",
+        "Local app state reset after explicit typed confirmation",
+    );
+    guard.persist();
+    guard.state.to_view()
+}
+
 /// Reset the persisted app state. Intended only for tests/dev smoke.
 pub fn reset_app_state() -> AppStateView {
     let service = app_service();
@@ -1676,8 +1713,8 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn reset_app_state() -> AppStateView {
-        super::reset_app_state()
+    pub(super) fn reset_app_state(request: ResetAppStateRequest) -> AppStateView {
+        super::reset_app_state_confirmed(request)
     }
 }
 
@@ -3364,6 +3401,35 @@ mod tests {
         assert!(health.collaboration_ready);
         assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
+    }
+
+    #[test]
+    fn reset_app_state_requires_explicit_confirmation() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("reset-confirmation");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let rejected = reset_app_state_confirmed(ResetAppStateRequest {
+            confirmation: "delete".to_owned(),
+        });
+        assert_eq!(rejected.lifecycle, AppLifecycle::Ready);
+        let error = rejected
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "typed reset confirmation error".to_owned())?;
+        assert_eq!(error.command, "reset_app_state");
+        assert_eq!(error.code, "confirmation_required");
+        assert!(error.recovery_hint.contains(RESET_APP_CONFIRMATION_PHRASE));
+
+        let reset = reset_app_state_confirmed(ResetAppStateRequest {
+            confirmation: RESET_APP_CONFIRMATION_PHRASE.to_owned(),
+        });
+        assert_eq!(reset.lifecycle, AppLifecycle::FirstRun);
+        assert!(reset.profile.is_none());
+        assert!(reset.groups.is_empty());
+        Ok(())
     }
 
     #[test]

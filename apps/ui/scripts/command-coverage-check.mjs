@@ -162,7 +162,7 @@ const expectedCommands = [
   {
     command: "reset_app_state",
     exportName: "resetAppState",
-    args: [],
+    args: ["confirmation"],
     returns: "AppState",
   },
 ];

@@ -17,6 +17,7 @@ import {
   InviteView,
   VoiceParticipantView,
   VoiceSessionView,
+  RESET_APP_CONFIRMATION_PHRASE,
   commandErrorToAction,
   createChannel as createChannelCommand,
   createGroup,
@@ -27,6 +28,7 @@ import {
   leaveVoice,
   loadAppState,
   recoverUser,
+  resetAppState,
   savePreferences,
   sendMessage,
   setActiveGroup,
@@ -160,6 +162,7 @@ function App() {
     "local recovery placeholder",
   );
   const [draftDmName, setDraftDmName] = useState("New contact");
+  const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
 
   useEffect(() => {
@@ -510,6 +513,18 @@ function App() {
     );
   }
 
+  function resetCommandState() {
+    void applyCommand(
+      resetAppState({ confirmation: resetPhrase }),
+      (state) => {
+        if (!state.last_command_error) {
+          setResetPhrase("");
+          setWorkflow("setup");
+        }
+      },
+    );
+  }
+
   if (appState.lifecycle === "first_run") {
     return (
       <FirstRunPanel
@@ -670,6 +685,9 @@ function App() {
           completedSteps={completedSteps}
           themeLabel={activeTheme.label}
           templateLabel={activeTemplate.label}
+          resetPhrase={resetPhrase}
+          setResetPhrase={setResetPhrase}
+          onResetState={resetCommandState}
         />
       ) : null}
     </main>
@@ -1962,6 +1980,9 @@ function InspectorRail({
   completedSteps,
   themeLabel,
   templateLabel,
+  resetPhrase,
+  setResetPhrase,
+  onResetState,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
@@ -1969,6 +1990,9 @@ function InspectorRail({
   completedSteps: number;
   themeLabel: string;
   templateLabel: string;
+  resetPhrase: string;
+  setResetPhrase: (value: string) => void;
+  onResetState: () => void;
 }) {
   const latestEvents = useMemo(
     () => appState.events.slice(-10).reverse(),
@@ -2008,6 +2032,31 @@ function InspectorRail({
               <p>{snapshot.security_copy.metadata}</p>
               <Separator />
               <p>{snapshot.security_copy.deletion}</p>
+            </CardContent>
+          </Card>
+          <Card className="border-[hsl(var(--destructive)/0.35)]">
+            <CardHeader>
+              <CardTitle>Danger zone</CardTitle>
+              <CardDescription>
+                Resetting local state erases this device&apos;s profile, groups, messages, invites, and voice preferences from the command-backed shell.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-3">
+              <Label className="grid gap-2 text-sm">
+                Type {RESET_APP_CONFIRMATION_PHRASE}
+                <Input
+                  value={resetPhrase}
+                  onChange={(event) => setResetPhrase(event.target.value)}
+                  placeholder={RESET_APP_CONFIRMATION_PHRASE}
+                />
+              </Label>
+              <Button
+                variant="destructive"
+                disabled={resetPhrase !== RESET_APP_CONFIRMATION_PHRASE}
+                onClick={onResetState}
+              >
+                Reset local state
+              </Button>
             </CardContent>
           </Card>
           <Card>
