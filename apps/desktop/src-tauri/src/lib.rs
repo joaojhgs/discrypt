@@ -14,7 +14,7 @@ use discrypt_core::{
     MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
     SecurityCopyView, ServerView,
 };
-use discrypt_mls_core::{DevicePairingPayload, DeviceSet, Identity};
+use discrypt_mls_core::{DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, Identity};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
 use discrypt_storage::{
@@ -23,7 +23,7 @@ use discrypt_storage::{
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -628,12 +628,9 @@ pub fn accept_device_pairing_payload(request: AcceptDevicePairingPayloadRequest)
                     .iter()
                     .any(|device| device.device_id == leaf.device_id.to_string())
                 {
-                    state.devices.push(DeviceView {
-                        device_id: leaf.device_id.to_string(),
-                        leaf_index: leaf.leaf_index,
-                        local: false,
-                        authorized: true,
-                    });
+                    state
+                        .devices
+                        .push(device_view_from_leaf(&leaf, false, true));
                 }
                 state.push_event(
                     "device.paired",
@@ -641,7 +638,10 @@ pub fn accept_device_pairing_payload(request: AcceptDevicePairingPayloadRequest)
                 );
             }
             Err(error) => {
-                state.push_event("device.pairing_rejected", format!("Pairing rejected: {error}"));
+                state.push_event(
+                    "device.pairing_rejected",
+                    format!("Pairing rejected: {error}"),
+                );
             }
         }
     })
@@ -1434,7 +1434,8 @@ impl PersistedAppState {
             },
         });
         self.lifecycle = AppLifecycle::Ready;
-        self.identity_seed_hex = new_identity_seed_hex(&display_name, &device_name, self.next_sequence);
+        self.identity_seed_hex =
+            new_identity_seed_hex(&display_name, &device_name, self.next_sequence);
         let identity = self.local_identity();
         self.device_set = DeviceSet::new();
         let seed = self.identity_seed_bytes();
@@ -1442,15 +1443,7 @@ impl PersistedAppState {
         let leaf = self
             .device_set
             .add_authorized_device(&identity, device_key, &device_name, 1);
-        self.devices = vec![DeviceView {
-            device_id: leaf.device_id.to_string(),
-            leaf_index: leaf.leaf_index,
-            local: true,
-            authorized: true,
-            revoked: false,
-            added_at_epoch: 1,
-            revoked_at_epoch: None,
-        }];
+        self.devices = vec![device_view_from_leaf(&leaf, true, true)];
         if self.dms.is_empty() {
             let friend = core_app_snapshot().friend;
             let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);
@@ -1510,7 +1503,8 @@ impl PersistedAppState {
                 .as_ref()
                 .map(|profile| profile.device_name.as_str())
                 .unwrap_or("Desktop");
-            self.identity_seed_hex = new_identity_seed_hex(display_name, device_name, self.next_sequence);
+            self.identity_seed_hex =
+                new_identity_seed_hex(display_name, device_name, self.next_sequence);
         }
         hex_32(&self.identity_seed_hex).unwrap_or_else(|| {
             let digest: [u8; 32] = Sha256::digest(self.identity_seed_hex.as_bytes()).into();
@@ -1543,12 +1537,7 @@ impl PersistedAppState {
             .device_set
             .add_authorized_device(identity, device_key, &device_name, 1);
         if self.devices.is_empty() {
-            self.devices.push(DeviceView {
-                device_id: leaf.device_id.to_string(),
-                leaf_index: leaf.leaf_index,
-                local: true,
-                authorized: true,
-            });
+            self.devices.push(device_view_from_leaf(&leaf, true, true));
         }
     }
 
@@ -1564,11 +1553,17 @@ impl PersistedAppState {
 
         let local_device = self.devices.first().cloned().unwrap_or_else(|| DeviceView {
             device_id: "desktop".to_owned(),
+            label: "Desktop".to_owned(),
             leaf_index: 1,
+            identity_key: String::new(),
+            device_key: String::new(),
             local: true,
             authorized: true,
+            revoked: false,
+            added_at_epoch: 1,
+            revoked_at_epoch: None,
         });
-        self.devices = vec![local_device];
+        self.devices = vec![local_device.clone()];
         for index in 2..=recovery.device_count.max(1) {
             let device_id = format!("recovered-device-{index}");
             if !self
@@ -1577,10 +1572,16 @@ impl PersistedAppState {
                 .any(|device| device.device_id == device_id)
             {
                 self.devices.push(DeviceView {
-                    device_id,
+                    device_id: device_id.clone(),
+                    label: format!("Recovered device {index}"),
                     leaf_index: index as u32,
+                    identity_key: local_device.identity_key.clone(),
+                    device_key: format!("recovered-device-key-{index}"),
                     local: false,
                     authorized: true,
+                    revoked: false,
+                    added_at_epoch: index as u64,
+                    revoked_at_epoch: None,
                 });
             }
         }
@@ -1690,6 +1691,46 @@ fn recovery_seed_key(recovery_code: &str) -> [u8; 32] {
     hasher.update(b"discrypt:desktop:sealed-account-recovery");
     hasher.update(recovery_code.trim().as_bytes());
     hasher.finalize().into()
+}
+
+fn new_identity_seed_hex(display_name: &str, device_name: &str, sequence: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt:desktop:identity-seed:v1");
+    hasher.update(display_name.trim().as_bytes());
+    hasher.update([0]);
+    hasher.update(device_name.trim().as_bytes());
+    hasher.update(sequence.to_be_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn hex_32(value: &str) -> Option<[u8; 32]> {
+    let decoded = hex::decode(value).ok()?;
+    decoded.try_into().ok()
+}
+
+fn command_device_key(seed: &[u8; 32], device_name: &str, sequence: u64) -> VerifyingKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt:desktop:device-key:v1");
+    hasher.update(seed);
+    hasher.update(device_name.trim().as_bytes());
+    hasher.update(sequence.to_be_bytes());
+    let material: [u8; 32] = hasher.finalize().into();
+    SigningKey::from_bytes(&material).verifying_key()
+}
+
+fn device_view_from_leaf(leaf: &DeviceLeaf, local: bool, authorized: bool) -> DeviceView {
+    DeviceView {
+        device_id: leaf.device_id.to_string(),
+        label: leaf.label.clone(),
+        leaf_index: leaf.leaf_index,
+        identity_key: hex::encode(leaf.identity_key),
+        device_key: hex::encode(leaf.device_key),
+        local,
+        authorized,
+        revoked: leaf.status != DeviceStatus::Active,
+        added_at_epoch: leaf.added_at_epoch,
+        revoked_at_epoch: leaf.removed_at_epoch,
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]

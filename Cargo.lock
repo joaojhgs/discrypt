@@ -873,7 +873,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "discrypt-core",
+ "discrypt-mls-core",
  "discrypt-storage",
+ "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",

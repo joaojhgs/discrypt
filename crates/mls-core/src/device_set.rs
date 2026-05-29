@@ -117,7 +117,7 @@ pub enum DevicePairingError {
 }
 
 /// Own device set for one account identity.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSet {
     next_leaf: u32,
     devices: BTreeMap<Uuid, DeviceLeaf>,
@@ -276,15 +276,17 @@ impl DeviceSet {
 
     /// Remove a device and emit a transparency event. Returns true if an active device changed.
     pub fn remove_device(&mut self, device_id: Uuid, epoch: u64) -> bool {
-        let Some(device) = self.devices.get_mut(&device_id) else {
-            return false;
-        };
-        if device.status == DeviceStatus::Removed {
-            return false;
-        }
-        device.status = DeviceStatus::Removed;
-        device.removed_at_epoch = Some(epoch);
-        self.transparency.push(TransparencyEvent {
+        self.retire_device(device_id, DeviceStatus::Removed, "device-removed", epoch)
+            .is_ok()
+    }
+
+    /// Mark a device as compromised and invalidate its credentials for future sends.
+    pub fn compromise_device(
+        &mut self,
+        device_id: Uuid,
+        epoch: u64,
+    ) -> Result<DeviceLeaf, DeviceSetError> {
+        self.retire_device(
             device_id,
             DeviceStatus::Compromised,
             "device-compromised-removed",
@@ -367,6 +369,7 @@ impl DeviceSet {
             return Err(DeviceSetError::DeviceAlreadyRetired(device_id));
         }
         device.status = status;
+        device.removed_at_epoch = Some(epoch);
         let retired = device.clone();
         self.transparency.push(TransparencyEvent {
             device_id,

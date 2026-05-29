@@ -22,6 +22,7 @@ discrypt-core = { path = "../../../crates/core", version = "0.1.0" }
 discrypt-mls-core = { path = "../../../crates/mls-core", version = "0.1.0" }
 discrypt-storage = { path = "../../../crates/storage", version = "0.1.0" }
 chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
