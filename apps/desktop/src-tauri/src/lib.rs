@@ -1581,17 +1581,11 @@ impl PersistedAppState {
 
         let local_device = self.devices.first().cloned().unwrap_or_else(|| DeviceView {
             device_id: "desktop".to_owned(),
-            label: "Desktop".to_owned(),
             leaf_index: 1,
-            identity_key: String::new(),
-            device_key: String::new(),
             local: true,
             authorized: true,
-            revoked: false,
-            added_at_epoch: 1,
-            revoked_at_epoch: None,
         });
-        self.devices = vec![local_device.clone()];
+        self.devices = vec![local_device];
         for index in 2..=recovery.device_count.max(1) {
             let device_id = format!("recovered-device-{index}");
             if !self
@@ -1719,46 +1713,6 @@ fn recovery_seed_key(recovery_code: &str) -> [u8; 32] {
     hasher.update(b"discrypt:desktop:sealed-account-recovery");
     hasher.update(recovery_code.trim().as_bytes());
     hasher.finalize().into()
-}
-
-fn new_identity_seed_hex(display_name: &str, device_name: &str, sequence: u64) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"discrypt:desktop:identity-seed:v1");
-    hasher.update(display_name.trim().as_bytes());
-    hasher.update([0]);
-    hasher.update(device_name.trim().as_bytes());
-    hasher.update(sequence.to_be_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn hex_32(value: &str) -> Option<[u8; 32]> {
-    let decoded = hex::decode(value).ok()?;
-    decoded.try_into().ok()
-}
-
-fn command_device_key(seed: &[u8; 32], device_name: &str, sequence: u64) -> VerifyingKey {
-    let mut hasher = Sha256::new();
-    hasher.update(b"discrypt:desktop:device-key:v1");
-    hasher.update(seed);
-    hasher.update(device_name.trim().as_bytes());
-    hasher.update(sequence.to_be_bytes());
-    let material: [u8; 32] = hasher.finalize().into();
-    SigningKey::from_bytes(&material).verifying_key()
-}
-
-fn device_view_from_leaf(leaf: &DeviceLeaf, local: bool, authorized: bool) -> DeviceView {
-    DeviceView {
-        device_id: leaf.device_id.to_string(),
-        label: leaf.label.clone(),
-        leaf_index: leaf.leaf_index,
-        identity_key: hex::encode(leaf.identity_key),
-        device_key: hex::encode(leaf.device_key),
-        local,
-        authorized,
-        revoked: leaf.status != DeviceStatus::Active,
-        added_at_epoch: leaf.added_at_epoch,
-        revoked_at_epoch: leaf.removed_at_epoch,
-    }
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -2043,9 +1997,11 @@ mod tests {
         assert!(state
             .profile
             .as_ref()
-            .map(|profile| profile
-                .recovery_status
-                .contains("content keys restored: false"))
+            .map(|profile| {
+                profile
+                    .recovery_status
+                    .contains("content keys restored: false")
+            })
             .unwrap_or(false));
         assert!(state
             .events
