@@ -20,7 +20,8 @@ pub mod production_status;
 pub mod provider;
 
 pub use device_set::{
-    DeviceLeaf, DeviceRotation, DeviceSet, DeviceSetError, DeviceStatus, TransparencyEvent,
+    DeviceLeaf, DevicePairingError, DevicePairingPayload, DeviceRotation, DeviceSet,
+    DeviceSetError, DeviceStatus, TransparencyEvent,
 };
 pub use exporter::{derive_epoch_secret, ExportLabel};
 pub use governance::{CanonicalEventRef, GovernanceAction, GovernanceEvent, GovernanceLog, Role};
