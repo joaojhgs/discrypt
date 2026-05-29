@@ -448,6 +448,7 @@ type TauriInvoke = <T>(
 const LOCAL_DEV_FALLBACK_ENABLED =
   import.meta.env.DEV ||
   import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
+const FALLBACK_STORAGE_KEY = "discrypt.local-dev.app-state.v1";
 
 const fallbackFriendIdentity = createFallbackFriendIdentity("New contact");
 
@@ -571,6 +572,39 @@ const fallbackState: AppState = {
 
 function cloneState(state: AppState): AppState {
   return structuredClone(state);
+}
+
+function readStoredFallbackState(): AppState | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = window.localStorage.getItem(FALLBACK_STORAGE_KEY);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored) as AppState;
+    if (parsed?.schema_version !== fallbackState.schema_version) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function hydrateFallbackState(): void {
+  const stored = readStoredFallbackState();
+  if (!stored) return;
+  Object.assign(fallbackState, stored);
+  syncSnapshot(fallbackState);
+}
+
+function persistFallbackState(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      FALLBACK_STORAGE_KEY,
+      JSON.stringify(syncSnapshot(fallbackState)),
+    );
+  } catch {
+    // Local-dev fallback persistence is best-effort; Tauri IPC-backed builds use
+    // the Rust storage boundary.
+  }
 }
 
 function syncSnapshot(state: AppState): AppState {
@@ -1186,9 +1220,12 @@ function invokeOrFallback<T>(
 }
 
 function mutateFallback(update: (state: AppState) => void): AppState {
+  hydrateFallbackState();
   fallbackState.last_command_error = null;
   update(fallbackState);
-  return cloneState(syncSnapshot(fallbackState));
+  const nextState = syncSnapshot(fallbackState);
+  persistFallbackState();
+  return cloneState(nextState);
 }
 
 export function commandErrorToAction(error: CommandErrorView | null): string {
@@ -1333,9 +1370,10 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
 }
 
 export async function loadAppState(): Promise<AppState> {
-  return invokeOrFallback<AppState>("app_state", undefined, () =>
-    cloneState(syncSnapshot(fallbackState)),
-  );
+  return invokeOrFallback<AppState>("app_state", undefined, () => {
+    hydrateFallbackState();
+    return cloneState(syncSnapshot(fallbackState));
+  });
 }
 
 export async function loadCompatibilityAppSnapshot(): Promise<AppSnapshot> {
@@ -1533,10 +1571,12 @@ export async function verifySafetyNumber(
     "verify_safety_number",
     { request },
     () => {
+      hydrateFallbackState();
       const verified =
         request.friend_id === fallbackState.snapshot.friend.friend_code &&
         request.provided === fallbackState.snapshot.friend.safety_number;
       fallbackState.snapshot.friend.verified = verified;
+      persistFallbackState();
       return {
         verified,
         message: verified
@@ -2163,6 +2203,7 @@ export async function resetAppState(
   request: ResetAppStateRequest,
 ): Promise<AppState> {
   return invokeOrFallback<AppState>("reset_app_state", { request }, () => {
+    hydrateFallbackState();
     fallbackState.last_command_error = null;
     if (request.confirmation.trim() !== RESET_APP_CONFIRMATION_PHRASE) {
       pushCommandError(
@@ -2197,6 +2238,8 @@ export async function resetAppState(
       "state.reset",
       "Local app state reset after explicit typed confirmation",
     );
-    return cloneState(syncSnapshot(fallbackState));
+    const nextState = syncSnapshot(fallbackState);
+    persistFallbackState();
+    return cloneState(nextState);
   });
 }

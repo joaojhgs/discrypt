@@ -10,6 +10,10 @@ const commands = readFileSync(
   "utf8",
 );
 const main = readFileSync(new URL("../src/main.tsx", import.meta.url), "utf8");
+const statefulE2e = readFileSync(
+  new URL("../tests/e2e/stateful-ui.spec.ts", import.meta.url),
+  "utf8",
+);
 const failures = [];
 
 const expectedCommands = [
@@ -517,6 +521,22 @@ for (const inviteUiToken of [
 }
 if (!main.includes("Danger zone") || !main.includes("resetPhrase !== RESET_APP_CONFIRMATION_PHRASE")) {
   failures.push("UI must gate destructive reset behind the typed danger-zone confirmation phrase");
+}
+for (const e2eToken of [
+  "setup workflow remains readable and completes",
+  "group invite join text channel and voice controls work without fake members",
+  "local-dev e2e persistence survives browser reload",
+  "small-window navigation exposes setup groups invites text and voice",
+  "transport status surfaces signaling not-ready state before invite metadata",
+  "mediaDevices",
+  "toHaveValue(\"61\")",
+]) {
+  if (!statefulE2e.includes(e2eToken)) {
+    failures.push(`Playwright stateful UX coverage missing: ${e2eToken}`);
+  }
+}
+if (!commands.includes("FALLBACK_STORAGE_KEY") || !commands.includes("persistFallbackState")) {
+  failures.push("local-dev fallback must persist command-backed state for reload UX E2E coverage");
 }
 
 const commandBackedCopy = [
