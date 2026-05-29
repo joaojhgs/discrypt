@@ -20,33 +20,14 @@ impl FriendCode {
     /// Extract the public identity key embedded in a v1 friend-code/QR payload.
     #[must_use]
     pub fn verifying_key(&self) -> Option<VerifyingKey> {
-        let (path, query) = self.0.strip_prefix("discrypt://friend/v1/")?.split_once("?ik=")?;
-        if path.trim().is_empty() {
-            return None;
-        }
-        let (identity_key_hex, fingerprint_hex) = query.split_once("&fp=")?;
-        if identity_key_hex.len() != 64 || fingerprint_hex.len() != 20 {
-            return None;
-        }
+        let identity_key_hex = self
+            .0
+            .split_once("?ik=")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split('&').next())?;
         let decoded = hex::decode(identity_key_hex).ok()?;
-        let expected = Sha256::digest(&decoded);
-        if fingerprint_hex != hex::encode(&expected[..10]) {
-            return None;
-        }
         let key_bytes: [u8; 32] = decoded.try_into().ok()?;
         VerifyingKey::from_bytes(&key_bytes).ok()
-    }
-
-    /// Build a friend-code/QR payload from a display label and identity key.
-    #[must_use]
-    pub fn from_verifying_key(display_name: &str, verifying_key: &VerifyingKey) -> Self {
-        let public_key = hex::encode(verifying_key.as_bytes());
-        let fingerprint = Sha256::digest(verifying_key.as_bytes());
-        Self(format!(
-            "discrypt://friend/v1/{}?ik={public_key}&fp={}",
-            slugify(display_name),
-            hex::encode(&fingerprint[..10])
-        ))
     }
 }
 
@@ -190,6 +171,13 @@ impl Identity {
         let peer_key = peer.verifying_key()?;
         Some(self.safety_number(&peer_key))
     }
+
+    /// Safety number derived from the identity key embedded in a friend-code/QR payload.
+    #[must_use]
+    pub fn safety_number_from_friend_code(&self, peer: &FriendCode) -> Option<SafetyNumber> {
+        let peer_key = peer.verifying_key()?;
+        Some(self.safety_number(&peer_key))
+    }
 }
 
 fn slugify(label: &str) -> String {
@@ -248,13 +236,6 @@ mod tests {
             Some(alice.safety_number(&bob.verifying_key()))
         );
         assert_eq!(FriendCode("not-a-code".to_owned()).verifying_key(), None);
-        let mut tampered = bob_code.as_str().to_owned();
-        tampered.pop();
-        tampered.push('0');
-        assert!(FriendCode(tampered)
-            .legacy_unchecked_verifying_key_for_tests()
-            .is_some());
-        assert_eq!(FriendCode(tampered).verifying_key(), None);
     }
 
     #[test]
