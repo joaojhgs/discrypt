@@ -8,10 +8,10 @@
 
 pub mod production_status;
 use admission::Invite;
-use mls_core::{GroupState, Identity};
+use mls_core::{DeviceSet, GroupState, Identity};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use storage::{AppStore, AppStoreError, MemoryAppStore};
+use storage::{recover_account, AppStore, AppStoreError, MemoryAppStore, RecoveryMaterial};
 use thiserror::Error;
 
 /// Room summary returned to UI.
@@ -254,6 +254,19 @@ pub struct SafetyVerificationResult {
     pub verified: bool,
     /// User-facing result copy.
     pub message: String,
+}
+
+/// End-to-end identity/recovery verification evidence for local harnesses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityRecoveryVerification {
+    /// Two independently generated profiles derive the same pairwise safety number.
+    pub two_profiles_verify_safety_numbers: bool,
+    /// A second own device is paired under the same account identity with a distinct device key.
+    pub second_device_paired: bool,
+    /// Account-continuity recovery succeeds without restoring content keys.
+    pub recovery_without_content_keys: bool,
+    /// A compromised device is revoked with structured revocation metadata.
+    pub compromised_device_revoked: bool,
 }
 
 /// Group creation request.
@@ -694,6 +707,52 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
     }
 }
 
+/// Verify the Phase C identity, second-device, recovery, and revocation story.
+#[must_use]
+pub fn identity_recovery_verification_smoke() -> IdentityRecoveryVerification {
+    let alice = Identity::generate("Alice");
+    let bob = Identity::generate("Bob");
+    let alice_code = alice.friend_code();
+    let bob_code = bob.friend_code();
+    let alice_view = alice.safety_number_from_friend_code(&bob_code);
+    let bob_view = bob.safety_number_from_friend_code(&alice_code);
+    let two_profiles_verify_safety_numbers = alice_view.is_some() && alice_view == bob_view;
+
+    let mut devices = DeviceSet::new();
+    let desktop_key = Identity::generate("Alice desktop device").verifying_key();
+    let phone_key = Identity::generate("Alice phone device").verifying_key();
+    let desktop = devices.add_authorized_device(&alice, desktop_key, "Desktop", 1);
+    let phone = devices.add_authorized_device(&alice, phone_key, "Phone", 2);
+    let active_devices = devices.active_devices();
+    let second_device_paired = active_devices.len() == 2
+        && desktop.identity_key == phone.identity_key
+        && desktop.device_key != phone.device_key
+        && phone.label == "Phone"
+        && phone.added_at_epoch == 2;
+
+    let recovery_without_content_keys =
+        recover_account(RecoveryMaterial::RecoveryCode {
+            code_hash: [7u8; 32],
+        })
+        .map(|recovery| recovery.account_access_restored && !recovery.content_keys_restored)
+        .unwrap_or(false);
+
+    let removed = devices.remove_device(phone.device_id, 3);
+    let compromised_device_revoked = removed
+        && devices.active_devices().len() == 1
+        && devices
+            .transparency_events()
+            .last()
+            .is_some_and(|event| event.kind == "device-removed" && event.epoch == 3);
+
+    IdentityRecoveryVerification {
+        two_profiles_verify_safety_numbers,
+        second_device_paired,
+        recovery_without_content_keys,
+        compromised_device_revoked,
+    }
+}
+
 /// Build an in-memory app service seeded with the deterministic fixture.
 pub fn in_memory_app_service() -> Result<AppService<MemoryAppStore>, AppServiceError> {
     AppService::load_or_seed(MemoryAppStore::default())
@@ -1047,5 +1106,14 @@ mod tests {
             .iter()
             .any(|message| message.body == "hello command-backed timeline"));
         Ok(())
+    }
+
+    #[test]
+    fn phase_c_identity_recovery_verification_smoke_passes() {
+        let verification = identity_recovery_verification_smoke();
+        assert!(verification.two_profiles_verify_safety_numbers);
+        assert!(verification.second_device_paired);
+        assert!(verification.recovery_without_content_keys);
+        assert!(verification.compromised_device_revoked);
     }
 }
