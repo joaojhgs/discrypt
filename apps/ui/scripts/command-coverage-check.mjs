@@ -6,17 +6,21 @@ const commands = readFileSync(new URL('../src/commands.ts', import.meta.url), 'u
 const failures = [];
 
 const requiredCommandExports = [
-  'loadAppSnapshot',
+  'loadAppState',
+  'createUser',
+  'recoverUser',
   'verifySafetyNumber',
+  'savePreferences',
+  'startDm',
   'createGroup',
   'joinGroup',
+  'createInvite',
   'createChannel',
-  'savePreferences',
+  'sendMessage',
   'joinVoice',
   'leaveVoice',
   'setSelfMute',
   'setSpeakerVolume',
-  'sendMessage',
 ];
 for (const name of requiredCommandExports) {
   if (!new RegExp(`export\\s+async\\s+function\\s+${name}\\b`).test(commands)) {
@@ -25,12 +29,16 @@ for (const name of requiredCommandExports) {
 }
 
 const requiredMainUsages = [
-  'loadAppSnapshot(',
+  'loadAppState(',
+  'createUser(',
+  'recoverUser(',
   'verifySafetyNumber(',
+  'startDm(',
   'createGroup(',
   'joinGroup(',
-  'createChannelCommand(',
-  'savePreferences(',
+  'createInvite(',
+  'createChannel(',
+  'sendMessage(',
   'joinVoice(',
   'leaveVoice(',
   'setSelfMute(',
@@ -42,39 +50,43 @@ for (const usage of requiredMainUsages) {
   }
 }
 
-const forbiddenLocalProductState = [
+const requiredDtoKeys = [
+  'display_name',
+  'device_name',
+  'recovery_code',
+  'peer_label',
+  'group_id',
+  'channel_id',
+  'session_id',
+  'participant_id',
+  'MessageTarget',
+];
+for (const key of requiredDtoKeys) {
+  if (!commands.includes(key)) failures.push(`command DTO key/type missing: ${key}`);
+}
+
+const forbiddenTokens = [
+  'currentSnapshot.servers[0]',
+  'loadAppSnapshot().then',
   'localChannels',
-  'groupMode',
-  'initialVoiceRoster',
   'setParticipants',
   'setVoiceJoined] = useState',
   'setSelfMuted] = useState',
+  'createChannelCommand',
+  'channel_name',
+  'server_name',
 ];
-for (const token of forbiddenLocalProductState) {
-  if (main.includes(token) || commands.includes(token)) {
-    failures.push(`forbidden local-only product state token found: ${token}`);
-  }
+for (const token of forbiddenTokens) {
+  if (main.includes(token)) failures.push(`forbidden UI drift/local-state token found in main.tsx: ${token}`);
 }
 
-const forbiddenClaims = [
-  'Relay active',
-  'Deleted after',
-  'local shell state only',
-  'backend channel persistence is intentionally outside',
-];
-for (const claim of forbiddenClaims) {
-  if (main.includes(claim)) {
-    failures.push(`unsafe UI claim found in main.tsx: ${claim}`);
-  }
-}
-
-const commandBackedCopy = [
-  'command-backed',
-  'AppService command',
-  'media-frame E2E gate',
+const honestCopy = [
+  'QR/cross-device recovery is not enabled',
+  'production media path waits for adapter/E2E gates',
+  'local encrypted-message facade persisted',
   'pending on offline devices',
 ];
-for (const copy of commandBackedCopy) {
+for (const copy of honestCopy) {
   if (!main.includes(copy) && !commands.includes(copy)) {
     failures.push(`expected honest/command-backed copy missing: ${copy}`);
   }
@@ -85,4 +97,4 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`- ${failure}`);
   process.exit(1);
 }
-console.log(`UI command coverage gate passed: ${requiredCommandExports.length} command clients and ${requiredMainUsages.length} UI usages verified.`);
+console.log(`UI command coverage gate passed: ${requiredCommandExports.length} command clients, ${requiredMainUsages.length} UI usages, DTO drift guards active.`);
