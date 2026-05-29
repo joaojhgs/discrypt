@@ -357,6 +357,8 @@ pub struct AppStateView {
     pub security_copy: SecurityCopyView,
     /// Most recent local events.
     pub events: Vec<AppEventView>,
+    /// Monotonic cursor of the newest event included in this state snapshot.
+    pub event_cursor: u64,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -1585,8 +1587,16 @@ impl PersistedAppState {
             devices: self.devices.clone(),
             security_copy: self.security_copy.clone(),
             events: self.events.clone(),
+            event_cursor: self.latest_event_cursor(),
             snapshot: self.to_snapshot(),
         }
+    }
+
+    fn latest_event_cursor(&self) -> u64 {
+        self.events
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or_default()
     }
 
     fn to_snapshot(&self) -> AppSnapshot {
@@ -3110,6 +3120,156 @@ mod tests {
         assert!(health.collaboration_ready);
         assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
+    }
+
+    #[test]
+    fn mutation_commands_return_current_state_with_event_cursor() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("mutation-cursor");
+
+        fn assert_cursor_advanced(previous: u64, state: &AppStateView) -> u64 {
+            assert_eq!(
+                Some(state.event_cursor),
+                state.events.last().map(|event| event.sequence)
+            );
+            assert!(state.event_cursor > previous);
+            state.event_cursor
+        }
+
+        let mut cursor = 0;
+        let created = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        cursor = assert_cursor_advanced(cursor, &created);
+
+        let themed = save_preferences(SavePreferencesRequest {
+            theme_id: "graphite-calm".to_owned(),
+            template_id: "command-center".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &themed);
+
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &dm);
+        let dm_id = dm
+            .dms
+            .first()
+            .map(|dm| dm.dm_id.clone())
+            .ok_or_else(|| "dm created".to_owned())?;
+
+        let group = create_group(CreateGroupRequest {
+            name: "Cursor Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &group);
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group created".to_owned())?;
+
+        let focused = set_active_group(SetActiveGroupRequest {
+            group_id: group_id.clone(),
+        });
+        cursor = assert_cursor_advanced(cursor, &focused);
+
+        let invite = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &invite);
+
+        let text_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "ops".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &text_channel);
+        let channel_id = text_channel
+            .groups
+            .first()
+            .and_then(|group| group.channels.first())
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel created".to_owned())?;
+
+        let message = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id.clone()),
+                channel_id: Some(channel_id),
+            },
+            body: "cursor-backed state".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &message);
+
+        let dm_message = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "cursor-backed dm".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &dm_message);
+
+        let voice_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        cursor = assert_cursor_advanced(cursor, &voice_channel);
+        let voice_channel_id = voice_channel
+            .groups
+            .first()
+            .and_then(|group| group.channels.last())
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel created".to_owned())?;
+
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id: voice_channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+        cursor = assert_cursor_advanced(cursor, &joined);
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session joined".to_owned())?;
+        let participant_id = joined
+            .voice_session
+            .as_ref()
+            .and_then(|session| session.participants.first())
+            .map(|participant| participant.id.clone())
+            .ok_or_else(|| "voice participant present".to_owned())?;
+
+        let muted = set_self_mute(SetSelfMuteRequest {
+            session_id: session_id.clone(),
+            muted: true,
+        });
+        cursor = assert_cursor_advanced(cursor, &muted);
+
+        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: session_id.clone(),
+            participant_id,
+            volume: 42,
+        });
+        cursor = assert_cursor_advanced(cursor, &volume);
+
+        let left = leave_voice(LeaveVoiceRequest { session_id });
+        let _cursor = assert_cursor_advanced(cursor, &left);
+        Ok(())
     }
 
     #[test]

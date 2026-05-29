@@ -228,6 +228,7 @@ export type AppState = {
   devices: DeviceView[];
   security_copy: SecurityCopyView;
   events: AppEventView[];
+  event_cursor: number;
   snapshot: AppSnapshot;
 };
 
@@ -470,6 +471,7 @@ const fallbackState: AppState = {
       summary: "No local profile exists; setup/recovery is required",
     },
   ],
+  event_cursor: 1,
   snapshot: fallbackSnapshot,
 };
 
@@ -530,12 +532,14 @@ function syncSnapshot(state: AppState): AppState {
     .slice()
     .reverse()
     .map((event) => event.summary);
+  state.event_cursor = state.events.at(-1)?.sequence ?? 0;
   return state;
 }
 
 function pushEvent(state: AppState, kind: string, summary: string): void {
   const lastSequence = state.events.at(-1)?.sequence ?? 0;
   state.events.push({ sequence: lastSequence + 1, kind, summary });
+  state.event_cursor = lastSequence + 1;
 }
 
 function slugify(value: string): string {
