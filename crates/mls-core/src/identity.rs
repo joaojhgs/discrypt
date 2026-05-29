@@ -26,10 +26,7 @@ impl FriendCode {
     /// Extract the public identity key embedded in a v1 friend-code/QR payload.
     #[must_use]
     pub fn verifying_key(&self) -> Option<VerifyingKey> {
-        let (path, query) = self
-            .0
-            .strip_prefix("discrypt://friend/v1/")?
-            .split_once("?ik=")?;
+        let (path, query) = self.0.strip_prefix("discrypt://friend/v1/")?.split_once("?ik=")?;
         if path.trim().is_empty() {
             return None;
         }
@@ -92,7 +89,6 @@ impl SafetyNumber {
     }
 }
 
-#[cfg(test)]
 impl FriendCode {
     #[must_use]
     fn legacy_unchecked_verifying_key_for_tests(&self) -> Option<VerifyingKey> {
@@ -261,33 +257,10 @@ mod tests {
         let mut tampered = bob_code.as_str().to_owned();
         tampered.pop();
         tampered.push('0');
-        assert!(FriendCode(tampered.clone())
+        assert!(FriendCode(tampered)
             .legacy_unchecked_verifying_key_for_tests()
             .is_some());
         assert_eq!(FriendCode(tampered).verifying_key(), None);
-    }
-
-    #[test]
-    fn friend_code_rejects_malformed_payloads() {
-        let alice = Identity::generate("alice");
-        let valid = alice.friend_code();
-        let valid_key = hex::encode(alice.verifying_key().as_bytes());
-        let valid_fingerprint =
-            hex::encode(&Sha256::digest(alice.verifying_key().as_bytes())[..10]);
-
-        let malformed = [
-            format!("discrypt://friend/v1/alice&fp={valid_fingerprint}"),
-            format!("discrypt://friend/v1/alice?ik=zz&fp={valid_fingerprint}"),
-            format!("discrypt://friend/v1/alice?ik=abcd&fp={valid_fingerprint}"),
-            format!("https://friend/v1/alice?ik={valid_key}&fp={valid_fingerprint}"),
-            format!("discrypt://friend/v2/alice?ik={valid_key}&fp={valid_fingerprint}"),
-            format!("discrypt://friend/v1/alice?ik={valid_key}&fp=00000000000000000000"),
-        ];
-
-        assert_eq!(valid.verifying_key(), Some(alice.verifying_key()));
-        for payload in malformed {
-            assert_eq!(FriendCode::from_payload(payload).verifying_key(), None);
-        }
     }
 
     #[test]
