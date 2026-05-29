@@ -18,10 +18,6 @@ use discrypt_core::{
 use discrypt_mls_core::{DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, Identity};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
-use discrypt_storage::{
-    recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
-    RecoveryCodeVerifier, RecoveryMaterial,
-};
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
 use ed25519_dalek::{SigningKey, VerifyingKey};
