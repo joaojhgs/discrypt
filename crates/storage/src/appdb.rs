@@ -1104,6 +1104,32 @@ mod tests {
     use super::*;
     use std::{collections::BTreeSet, io::Write};
 
+    #[test]
+    fn encrypted_app_db_exports_versioned_schema_contract() -> Result<(), AppDbError> {
+        let plan = AppDbMigrationPlan::plan(0, APP_DB_SCHEMA_VERSION)?;
+        assert_eq!(plan.direction, MigrationDirection::Forward);
+        for required in REQUIRED_TABLES {
+            assert!(AppDbSchema::current().table(required).is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_planner_rejects_future_versions_and_noops_current() -> Result<(), AppDbError> {
+        let noop = AppDbMigrationPlan::plan(APP_DB_SCHEMA_VERSION, APP_DB_SCHEMA_VERSION)?;
+        assert_eq!(noop.direction, MigrationDirection::Noop);
+        assert!(noop.is_empty());
+
+        assert!(matches!(
+            AppDbMigrationPlan::plan(APP_DB_SCHEMA_VERSION, APP_DB_SCHEMA_VERSION + 1),
+            Err(AppDbError::UnsupportedFutureVersion {
+                version,
+                current: APP_DB_SCHEMA_VERSION,
+            }) if version == APP_DB_SCHEMA_VERSION + 1
+        ));
+        Ok(())
+    }
+
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "discrypt-{name}-{}-{}.sqlite",
