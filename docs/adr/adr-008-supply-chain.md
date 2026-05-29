@@ -24,8 +24,9 @@ The launch policy is lockfile-first, CI-enforced, and release-dashboard backed:
 - npm advisories are scanned with `npm audit --audit-level=high --omit=dev` after
   `npm ci` in the `supply-chain` job, and G123 additionally gates the full UI
   graph with `npm audit --audit-level=high`.
-- Rust SBOMs are generated with `cargo sbom --output-format spdx_json_2_3` and
-  uploaded as the `discrypt-sbom` CI artifact.
+- SBOMs are generated for Rust with `cargo sbom --output-format spdx_json_2_3`,
+  for npm with `npm sbom --sbom-format spdx`, and for packaged artifacts with
+  `scripts/generate-sbom-g124.mjs`; CI uploads them as the `discrypt-sbom` artifact.
 - License policy lives in `deny.toml`; allowed licenses are MIT, Apache-2.0,
   BSD-2-Clause, BSD-3-Clause, Unicode-3.0, AGPL-3.0-or-later, MPL-2.0, and ISC.
 - Source policy denies unknown registries and unknown git sources.
@@ -100,20 +101,22 @@ Required gates for this decision:
    permits only documented non-release waivers, and fails if a waived
    vulnerability becomes reachable in the active workspace cargo tree.
 2. `npm --prefix apps/ui run test:npm-audit-g123` runs production and full UI
-   `npm audit --audit-level=high` checks and permits only a documented non-release waiver.
-3. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
+   `npm audit --audit-level=high` checks and permits only a documented
+   non-release waiver.
+3. `npm --prefix apps/ui run test:sbom-g124` runs `generate-sbom-g124` and
+   verifies SBOM generated for Rust, npm, and packaged artifacts, including a
+   manifest with lockfile hashes, SBOM hashes, Linux bundle targets, and package
+   artifact hashes when packages have been built.
+4. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
    wiring for cargo-audit, cargo-deny, npm audit, SBOM generation, license policy,
    source policy, lockfiles, and reproducibility assumptions.
-4. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
+5. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
    resolvable from `Cargo.lock` without lockfile mutation.
-5. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
+6. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
    set matches the current dependency graph.
-6. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
+7. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
    policy is configured, with duplicate versions still warnings.
-6. `npm --prefix apps/ui run test:npm-audit-g123` runs
-   `npm audit --audit-level=high --omit=dev` and proves production npm
-   dependencies have no high-or-worse advisory or documented non-release waiver.
-8. Full `cargo audit and advisory-deny clean runs remain release-blocking gates
+9. Full `cargo audit and advisory-deny clean runs remain release-blocking gates
    handled by the later advisory/reproducibility stories.
 
 ## Consequences

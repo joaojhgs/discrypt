@@ -56,7 +56,8 @@ jobs:
           cargo install cargo-sbom --locked || true
       - run: cargo audit
       - run: cargo deny check
-      - run: cargo sbom --output-format spdx_json_2_3 > discrypt.spdx.json
+      - run: mkdir -p target/sbom
+      - run: cargo sbom --output-format spdx_json_2_3 > target/sbom/discrypt-rust.spdx.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -66,10 +67,12 @@ jobs:
         working-directory: apps/ui
       - run: npm audit --audit-level=high --omit=dev
         working-directory: apps/ui
+      - run: npm sbom --sbom-format spdx --sbom-type application > ../../target/sbom/discrypt-ui-npm.spdx.json
+        working-directory: apps/ui
       - uses: actions/upload-artifact@v4
         with:
           name: discrypt-sbom
-          path: discrypt.spdx.json
+          path: target/sbom
 
   ui:
     runs-on: ubuntu-latest

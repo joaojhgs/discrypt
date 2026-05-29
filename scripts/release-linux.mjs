@@ -90,6 +90,12 @@ steps.push(
     "--features",
     releaseFeatures.join(","),
   ]),
+  run(process.execPath, [
+    "scripts/generate-sbom-g124.mjs",
+    "--out-dir",
+    "target/sbom",
+    "--require-packaged-artifacts",
+  ]),
 );
 
 const plan = {

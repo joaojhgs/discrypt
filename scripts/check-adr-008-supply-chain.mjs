@@ -32,6 +32,8 @@ for (const token of [
   'cargo deny check',
   'npm audit --audit-level=high --omit=dev',
   'cargo sbom --output-format spdx_json_2_3',
+  'npm sbom --sbom-format spdx',
+  'scripts/generate-sbom-g124.mjs',
   'Crypto-sensitive dependency policy',
   'License policy',
   'Reproducible build assumptions',
@@ -59,16 +61,18 @@ for (const token of [
   'cargo install cargo-sbom --locked',
   'cargo audit',
   'cargo deny check',
-  'cargo sbom --output-format spdx_json_2_3 > discrypt.spdx.json',
+  'cargo sbom --output-format spdx_json_2_3 > target/sbom/discrypt-rust.spdx.json',
+  'npm sbom --sbom-format spdx --sbom-type application > ../../target/sbom/discrypt-ui-npm.spdx.json',
   'npm audit --audit-level=high --omit=dev',
   'actions/upload-artifact@v4',
   'discrypt-sbom',
+  'target/sbom',
 ]) requireText('ci', token);
 
 for (const token of ['license = "AGPL-3.0-or-later"', '[workspace.dependencies]']) requireText('cargoToml', token);
 for (const token of ['openmls', 'webrtc', 'aes-gcm']) requireText('cargoLock', token);
 for (const token of ['"lockfileVersion"', '"packages"']) requireText('packageLock', token);
-for (const token of ['test:adr-008-supply-chain']) requireText('packageJson', token);
+for (const token of ['test:adr-008-supply-chain', 'test:sbom-g124']) requireText('packageJson', token);
 for (const token of ['SBOMs, lockfile hashes, and git commit', 'reproducibility evidence archived']) requireText('releasePolicy', token);
 
 if (/TODO|FIXME|unimplemented!|todo!/i.test(files.adr)) failures.push('ADR-008 contains unfinished-work marker');

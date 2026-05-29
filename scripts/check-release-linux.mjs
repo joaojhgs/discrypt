@@ -37,6 +37,7 @@ for (const token of [
   "cargo test -p discrypt-desktop --features",
   "npx --yes @tauri-apps/cli@2.11.2 build",
   "--bundles deb,rpm,appimage",
+  "node scripts/generate-sbom-g124.mjs --out-dir target/sbom --require-packaged-artifacts",
 ]) {
   if (!rendered.includes(token)) failures.push(`release plan missing command token: ${token}`);
 }
