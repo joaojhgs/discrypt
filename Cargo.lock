@@ -964,6 +964,7 @@ dependencies = [
  "chrono",
  "discrypt-core",
  "discrypt-mls-core",
+ "external-signaling",
  "discrypt-storage",
  "ed25519-dalek",
  "hex",
@@ -1073,6 +1074,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

@@ -40,6 +40,46 @@ const APP_STATE_STORE_FILENAME: &str = "app-state.discrypt-store";
 const DEFAULT_THEME_ID: &str = "graphite-calm";
 const DEFAULT_TEMPLATE_ID: &str = "command-center";
 
+/// Desktop/Tauri wrapper around the Rust signaling protocol client.
+pub struct DesktopSignalingClient<T> {
+    inner: external_signaling::client::SignalingClient<T>,
+}
+
+impl<T> DesktopSignalingClient<T>
+where
+    T: external_signaling::client::SignalingTransport,
+{
+    /// Construct the app-service signaling client wrapper.
+    pub fn new(inner: external_signaling::client::SignalingClient<T>) -> Self {
+        Self { inner }
+    }
+
+    /// Publish an opaque signaling payload for a Tauri/app-service session.
+    pub fn publish_opaque_signal(
+        &mut self,
+        kind: external_signaling::server::SignalKind,
+        session_id: &str,
+        payload: &[u8],
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.inner
+            .publish_signal(kind, session_id.as_bytes(), payload, expires_at)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Take opaque signaling payloads for a Tauri/app-service session.
+    pub fn take_opaque_signals(
+        &mut self,
+        kind: external_signaling::server::SignalKind,
+        session_id: &str,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        self.inner
+            .take_signals(kind, session_id.as_bytes())
+            .map(|signals| signals.into_iter().map(|signal| signal.payload).collect())
+            .map_err(|err| err.to_string())
+    }
+}
+
 /// Lifecycle route for the desktop app shell.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2433,6 +2473,39 @@ mod tests {
             production_path.file_name().and_then(|value| value.to_str()),
             Some(APP_STATE_STORE_FILENAME)
         );
+    }
+
+    #[test]
+    fn desktop_signaling_client_wraps_rust_protocol_client() -> Result<(), String> {
+        let service = external_signaling::server::SharedSignalingService::new();
+        let transport = external_signaling::client::SharedServiceTransport::new(
+            service,
+            external_signaling::server::ServerConfig::default(),
+        );
+        let client = external_signaling::client::SignalingClient::new(
+            external_signaling::client::SignalingClientConfig::new(
+                "https://127.0.0.1:8787",
+                b"desktop-client-token".to_vec(),
+                b"desktop-nonce-seed".to_vec(),
+            )
+            .map_err(|err| err.to_string())?,
+            transport,
+        )
+        .map_err(|err| err.to_string())?;
+        let mut desktop_client = DesktopSignalingClient::new(client);
+        let expires_at = Utc::now() + Duration::seconds(60);
+
+        desktop_client.publish_opaque_signal(
+            external_signaling::server::SignalKind::Offer,
+            "session-1",
+            b"opaque-offer",
+            expires_at,
+        )?;
+        let signals = desktop_client
+            .take_opaque_signals(external_signaling::server::SignalKind::Offer, "session-1")?;
+
+        assert_eq!(signals, vec![b"opaque-offer".to_vec()]);
+        Ok(())
     }
 
     #[test]
