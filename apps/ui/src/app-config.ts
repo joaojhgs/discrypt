@@ -123,7 +123,7 @@ export const discryptUiConfig = {
 };
 
 export const setupChecklist = [
-  "Verify Bob safety number",
+  "Verify contact safety number",
   "Review two authorized devices",
   "Confirm invite requires MLS Welcome",
   "Choose retention preset",
@@ -138,7 +138,7 @@ export const activityFeed = [
 
 export const initialVoiceRoster = [
   {
-    id: "local-user",
+    id: "local-profile-pending",
     name: "You",
     role: "you",
     speaking: false,

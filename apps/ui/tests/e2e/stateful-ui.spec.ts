@@ -78,7 +78,7 @@ test("direct message send stays command-backed", async ({ page }) => {
     .getByRole("navigation", { name: /workspace sections/i })
     .getByRole("button", { name: "DMs", exact: true })
     .click();
-  await expect(page.getByText(/Bob/).first()).toBeVisible();
+  await expect(page.getByText(/New contact/).first()).toBeVisible();
   await page.getByLabel("Message").fill("DM ping from the local harness");
   await page.getByRole("button", { name: /send dm message/i }).click();
   await expect(page.getByText(/DM ping from the local harness/i)).toBeVisible();
@@ -153,7 +153,7 @@ test("group invite join text channel and voice controls work without fake member
   await expect(
     page.getByText(/Phase-1 SFrame\/relay media security/i),
   ).toBeVisible();
-  await expect(page.getByText(/Bob · friend/)).toHaveCount(0);
+  await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
   await expect(page.getByText(/muted/).first()).toBeVisible();

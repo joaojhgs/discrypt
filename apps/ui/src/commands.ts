@@ -306,6 +306,7 @@ const LOCAL_DEV_FALLBACK_ENABLED =
   import.meta.env.DEV ||
   import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
 
+const fallbackFriendIdentity = createFallbackFriendIdentity("New contact");
 
 declare global {
   interface Window {
@@ -320,9 +321,9 @@ declare global {
 const fallbackSnapshot: AppSnapshot = {
   schema_version: 1,
   friend: {
-    alias: "Bob",
-    friend_code: "friend:bob:stable-fixture",
-    safety_number: "0231 1597 2653 5897",
+    alias: fallbackFriendIdentity.alias,
+    friend_code: fallbackFriendIdentity.friendCode,
+    safety_number: fallbackFriendIdentity.safetyNumber,
     verified: false,
   },
   devices: [],
@@ -511,6 +512,44 @@ function stableHash(value: string): string {
     .repeat(4);
 }
 
+function randomHex(bytes: number): string {
+  const buffer = new Uint8Array(bytes);
+  globalThis.crypto?.getRandomValues(buffer);
+  return Array.from(buffer, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
+function groupSafetyHash(value: string): string {
+  return stableHash(value)
+    .match(/.{1,4}/g)
+    ?.slice(0, 12)
+    .join(" ") ?? "0000 0000 0000 0000";
+}
+
+function createFallbackFriendIdentity(alias: string): {
+  alias: string;
+  friendCode: string;
+  safetyNumber: string;
+} {
+  const publicKey = randomHex(32);
+  const fingerprint = stableHash(publicKey).slice(0, 20);
+  return {
+    alias,
+    friendCode: `discrypt://friend/v1/${slugify(alias)}?ik=${publicKey}&fp=${fingerprint}`,
+    safetyNumber: groupSafetyHash(`local-dev-fallback:${publicKey}`),
+  };
+}
+
+function participantIdFromFriendCode(friendCode: string): string {
+  const fingerprint = friendCode.split("&fp=").at(1)?.split("&").at(0);
+  return `friend-${(fingerprint ?? stableHash(friendCode)).slice(0, 10)}`;
+}
+
+function localUserId(state: AppState): string {
+  return state.profile?.user_id ?? "local-profile-pending";
+}
+
 function inviteExpirationHorizon(label: string): string {
   const lower = label.toLowerCase();
   const now = Date.now();
@@ -585,20 +624,23 @@ function ensureFallbackReady(
       authorized: true,
     },
   ];
+  const dmId = `dm-${slugify(fallbackState.snapshot.friend.friend_code).slice(0, 24)}`;
   fallbackState.dms = [
     {
-      dm_id: "dm-bob",
-      participant_id: "bob",
-      display_name: "Bob",
+      dm_id: dmId,
+      participant_id: participantIdFromFriendCode(
+        fallbackState.snapshot.friend.friend_code,
+      ),
+      display_name: fallbackState.snapshot.friend.alias,
       local_only_copy:
-        "Default local DM fixture; no remote delivery is claimed",
+        "Local DM seeded from a generated friend-code/QR payload; no remote delivery is claimed",
     },
   ];
   fallbackState.active_context = {
     kind: "dm",
     group_id: null,
     channel_id: null,
-    dm_id: "dm-bob",
+    dm_id: dmId,
   };
   pushEvent(
     fallbackState,
@@ -695,7 +737,8 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("start_dm", { request }, () =>
     mutateFallback((state) => {
       ensureFallbackReady();
-      const displayName = request.display_name.trim() || "Bob";
+      const displayName =
+        request.display_name.trim() || state.snapshot.friend.alias;
       const dmId = `dm-${slugify(displayName)}`;
       if (!state.dms.some((dm) => dm.dm_id === dmId)) {
         state.dms.push({
@@ -901,7 +944,7 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
         self_muted: state.voice_session?.self_muted ?? false,
         participants: [
           {
-            id: "local-user",
+            id: localUserId(state),
             name: "You",
             role: "you",
             speaking: true,
@@ -964,7 +1007,7 @@ export async function setSelfMute(request: SelfMuteRequest): Promise<AppState> {
       state.voice_session.self_muted = request.muted;
       state.voice_session.participants = state.voice_session.participants.map(
         (participant) =>
-          participant.id === "local-user"
+          participant.id === localUserId(state)
             ? {
                 ...participant,
                 muted: request.muted,
@@ -1017,7 +1060,7 @@ export async function sendMessage(
       state.messages.push({
         message_id: `fallback-${state.messages.length + 1}`,
         target: request.target,
-        author_id: "local-user",
+        author_id: localUserId(state),
         author: state.profile?.display_name ?? "Alice",
         body,
         status:

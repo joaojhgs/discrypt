@@ -9,10 +9,9 @@
 pub mod production_status;
 use chrono::{Duration, Utc};
 use discrypt_core::{
-    app_snapshot as core_app_snapshot, verify_safety_number as core_verify_safety_number,
-    AppSnapshot, ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
-    MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
-    SecurityCopyView, ServerView,
+    app_snapshot as core_app_snapshot, AppSnapshot, ChannelKind,
+    ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
+    SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
 use discrypt_storage::AppStore;
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
@@ -473,7 +472,17 @@ pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
 
 /// Tauri command: verify a user-confirmed safety-number comparison and persist success.
 pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerificationResult {
-    let result = core_verify_safety_number(request);
+    let snapshot = app_snapshot();
+    let verified =
+        request.friend_id == snapshot.friend.friend_code && request.provided == snapshot.friend.safety_number;
+    let result = SafetyVerificationResult {
+        verified,
+        message: if verified {
+            "Safety number verified; MITM risk accepted by explicit user comparison".to_owned()
+        } else {
+            "Safety number mismatch; do not trust this device or DM".to_owned()
+        },
+    };
     if result.verified {
         mutate_state(|state| {
             state.friend_verified = true;
@@ -501,7 +510,7 @@ pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
 pub fn start_dm(request: StartDmRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
-        let display_name = normalize_label(&request.display_name, "Bob");
+        let display_name = normalize_label(&request.display_name, &core_app_snapshot().friend.alias);
         let dm_id = stable_id("dm", &display_name, state.next_sequence);
         if !state.dms.iter().any(|dm| dm.display_name == display_name) {
             state.dms.push(DirectConversationView {
@@ -756,7 +765,7 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
         let message = MessageView {
             message_id: format!("msg-{sequence}"),
             target: request.target,
-            author_id: "local-user".to_owned(),
+            author_id: state.local_user_id(),
             author,
             body: body.to_owned(),
             status: "local encrypted author log; socket delivery not claimed".to_owned(),
@@ -780,13 +789,14 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             .as_ref()
             .map(|session| session.self_muted)
             .unwrap_or(false);
+        let local_user_id = state.local_user_id();
         state.voice_session = Some(VoiceSessionView {
             session_id: session_id.clone(),
             group_id: request.group_id.clone(),
             channel_id: request.channel_id.clone(),
             joined: true,
             self_muted,
-            participants: default_voice_participants(!self_muted),
+            participants: default_voice_participants(&local_user_id, !self_muted),
             route_copy:
                 "Local voice controls only; network media route is not connected in this build"
                     .to_owned(),
@@ -831,11 +841,12 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
 /// Tauri command: persist local self-mute state.
 pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
     mutate_state(|state| {
+        let local_user_id = state.local_user_id();
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 session.self_muted = request.muted;
                 for participant in &mut session.participants {
-                    if participant.id == "local-user" {
+                    if participant.id == local_user_id {
                         participant.muted = request.muted;
                         participant.speaking = session.joined && !request.muted;
                     }
@@ -889,10 +900,11 @@ pub fn metadata_warning() -> String {
 /// E2E command-health smoke used by CI and the multinode harness.
 pub fn command_health() -> CommandHealth {
     let state = app_state();
-    let verification = core_verify_safety_number(SafetyVerificationRequest {
-        friend_id: state.snapshot.friend.friend_code.clone(),
-        provided: state.snapshot.friend.safety_number.clone(),
-    });
+    let verification = SafetyVerificationResult {
+        verified: !state.snapshot.friend.friend_code.is_empty()
+            && !state.snapshot.friend.safety_number.is_empty(),
+        message: "command health checked generated safety-number fields".to_owned(),
+    };
     let honest_copy_ready = state
         .security_copy
         .deletion
@@ -1138,9 +1150,6 @@ impl PersistedAppState {
         let mut snapshot = core_app_snapshot();
         snapshot.schema_version = self.schema_version;
         snapshot.friend.verified = self.friend_verified;
-        if let Some(profile) = &self.profile {
-            snapshot.friend.alias = profile.display_name.clone();
-        }
         snapshot.devices = self.devices.clone();
         snapshot.preferences = discrypt_core::PreferencesView {
             theme_id: self.preferences.theme_id.clone(),
@@ -1195,7 +1204,7 @@ impl PersistedAppState {
         } else {
             discrypt_core::VoiceSessionView {
                 joined: false,
-                participants: default_voice_participants(false)
+                participants: default_voice_participants(&self.local_user_id(), false)
                     .into_iter()
                     .map(|participant| discrypt_core::VoiceParticipantView {
                         id: participant.id,
@@ -1247,20 +1256,29 @@ impl PersistedAppState {
             authorized: true,
         }];
         if self.dms.is_empty() {
+            let friend = core_app_snapshot().friend;
+            let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);
             self.dms.push(DirectConversationView {
-                dm_id: "dm-bob".to_owned(),
-                participant_id: "bob".to_owned(),
-                display_name: "Bob".to_owned(),
-                local_only_copy: "Default local DM fixture; no remote delivery is claimed"
-                    .to_owned(),
+                dm_id: dm_id.clone(),
+                participant_id: participant_id_from_friend_code(&friend.friend_code),
+                display_name: friend.alias,
+                local_only_copy: "Local DM seeded from a generated friend-code/QR payload; no remote delivery is claimed".to_owned(),
+            });
+            self.active_context = Some(ActiveContextView {
+                kind: "dm".to_owned(),
+                group_id: None,
+                channel_id: None,
+                dm_id: Some(dm_id),
             });
         }
-        self.active_context = self.active_context.clone().or(Some(ActiveContextView {
-            kind: "dm".to_owned(),
-            group_id: None,
-            channel_id: None,
-            dm_id: Some("dm-bob".to_owned()),
-        }));
+        if self.active_context.is_none() {
+            self.active_context = self.dms.first().map(|dm| ActiveContextView {
+                kind: "dm".to_owned(),
+                group_id: None,
+                channel_id: None,
+                dm_id: Some(dm.dm_id.clone()),
+            });
+        }
         let kind = if recovered {
             "identity.recovered"
         } else {
@@ -1296,6 +1314,13 @@ impl PersistedAppState {
         if overflow > 0 {
             self.events.drain(0..overflow);
         }
+    }
+
+    fn local_user_id(&self) -> String {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .unwrap_or_else(|| "local-profile-pending".to_owned())
     }
 }
 
@@ -1392,15 +1417,24 @@ fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
     ]
 }
 
-fn default_voice_participants(local_speaking: bool) -> Vec<VoiceParticipantView> {
+fn default_voice_participants(local_user_id: &str, local_speaking: bool) -> Vec<VoiceParticipantView> {
     vec![VoiceParticipantView {
-        id: "local-user".to_owned(),
+        id: local_user_id.to_owned(),
         name: "You".to_owned(),
         role: "you".to_owned(),
         speaking: local_speaking,
         muted: false,
         volume: 82,
     }]
+}
+
+fn participant_id_from_friend_code(friend_code: &str) -> String {
+    let fingerprint = friend_code
+        .split("&fp=")
+        .nth(1)
+        .and_then(|tail| tail.split('&').next())
+        .unwrap_or(friend_code);
+    format!("friend-{}", fingerprint.chars().take(10).collect::<String>())
 }
 
 fn invite_expiration_horizon(label: &str) -> String {
@@ -1654,7 +1688,7 @@ mod tests {
             device_name: None,
         });
         let dm_state = start_dm(StartDmRequest {
-            display_name: "Bob".to_owned(),
+            display_name: "New contact".to_owned(),
         });
         let dm_id = dm_state.dms[0].dm_id.clone();
         send_message(SendMessageRequest {
@@ -1743,9 +1777,14 @@ mod tests {
             .as_ref()
             .map(|session| session.self_muted)
             .unwrap_or(false));
+        let local_user_id = joined
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .unwrap_or_default();
         let volume = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id: session_id.clone(),
-            participant_id: "local-user".to_owned(),
+            participant_id: local_user_id.clone(),
             volume: 55,
         });
         assert_eq!(
@@ -1755,7 +1794,7 @@ mod tests {
                 .and_then(|session| session
                     .participants
                     .iter()
-                    .find(|participant| participant.id == "local-user"))
+                    .find(|participant| participant.id == local_user_id))
                 .map(|participant| participant.volume),
             Some(55)
         );

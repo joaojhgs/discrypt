@@ -106,7 +106,7 @@ function App() {
   const [draftRecoveryCode, setDraftRecoveryCode] = useState(
     "local recovery placeholder",
   );
-  const [draftDmName, setDraftDmName] = useState("Bob");
+  const [draftDmName, setDraftDmName] = useState("New contact");
   const [inspectorOpen, setInspectorOpen] = useState(false);
 
   useEffect(() => {
@@ -173,7 +173,7 @@ function App() {
   const voiceJoined = appState.voice_session?.joined ?? false;
   const selfMuted =
     appState.voice_session?.self_muted ??
-    participants.find((participant) => participant.id === "local-user")
+    participants.find((participant) => participant.id === appState.profile?.user_id)
       ?.muted ??
     false;
   const activeTheme =
@@ -1764,7 +1764,7 @@ function VoicePanel({
           {!voiceJoined ? (
             <EmptyState
               title="Not in voice"
-              copy="Join to create a local voice session. No remote Bob/relay members are fabricated."
+              copy="Join to create a local voice session. No remote friend/relay members are fabricated."
             />
           ) : null}
           {voiceJoined && visibleParticipants.length === 0 ? (
