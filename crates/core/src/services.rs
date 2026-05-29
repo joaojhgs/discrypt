@@ -9,6 +9,7 @@ use crate::{
     AppSnapshot, ChannelKind, SafetyVerificationRequest, SafetyVerificationResult,
     SendMessageRequest,
 };
+use mls_core::ExportLabel;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -54,6 +55,65 @@ pub struct EventTopic(pub String);
 /// Opaque bytes passed across implementation seams.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OpaqueBytes(pub Vec<u8>);
+
+/// Rust-only exporter secret material.
+///
+/// This type intentionally does not implement `Serialize`/`Deserialize`, and its
+/// debug form redacts bytes. Command/Tauri/UI-facing boundaries should exchange
+/// ciphertext, protected frames, KIDs, counters, and message ids instead of this
+/// raw exporter material.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RustExporterSecret {
+    bytes: Vec<u8>,
+}
+
+impl RustExporterSecret {
+    /// Wrap raw exporter material inside the Rust-only boundary type.
+    #[must_use]
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+        }
+    }
+
+    /// Borrow bytes for Rust-owned text/media/content-key adapters.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl core::fmt::Debug for RustExporterSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RustExporterSecret")
+            .field("len", &self.bytes.len())
+            .field("raw", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Rust services allowed to receive MLS/OpenMLS exporter material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustExporterSecretService {
+    /// Text encryption/history delivery service.
+    Text,
+    /// Media/SFrame service.
+    Media,
+    /// Message content-key service.
+    ContentKey,
+}
+
+impl RustExporterSecretService {
+    /// Map the service boundary to an approved MLS exporter label.
+    #[must_use]
+    pub fn export_label(self) -> ExportLabel {
+        match self {
+            Self::Text => ExportLabel::Text,
+            Self::Media => ExportLabel::Media,
+            Self::ContentKey => ExportLabel::ContentKey,
+        }
+    }
+}
 
 /// Errors shared by boundary traits.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -277,7 +337,7 @@ pub trait IdentityService {
     fn enroll_device(&mut self, enrollment: DeviceEnrollment) -> ServiceResult<IdentitySummary>;
 }
 
-/// Group crypto boundary for MLS/OpenMLS state, epochs, commits, and exporters.
+/// Group crypto boundary for MLS/OpenMLS state, epochs, and commits.
 pub trait GroupCryptoService {
     /// Create a group crypto state shell.
     fn create_group_crypto(
@@ -287,9 +347,21 @@ pub trait GroupCryptoService {
 
     /// Apply an opaque, already-authenticated group commit.
     fn apply_group_commit(&mut self, commit: GroupCommit) -> ServiceResult<GroupCryptoState>;
+}
 
-    /// Export opaque secret material for a named subsystem under the current epoch.
-    fn export_group_secret(&self, group_id: &GroupId, label: &str) -> ServiceResult<OpaqueBytes>;
+/// Rust-only exporter boundary for encrypted payload services.
+///
+/// Implement this alongside concrete Rust text/media/content-key adapters. Do
+/// not expose it through command handlers, Tauri invoke payloads, governance,
+/// admission, relay, signaling, transport, or generic keychain APIs.
+pub trait RustExporterSecretProvider {
+    /// Export material for one approved Rust payload service under the current epoch.
+    fn export_rust_service_secret(
+        &self,
+        group_id: &GroupId,
+        service: RustExporterSecretService,
+        context: &[u8],
+    ) -> ServiceResult<RustExporterSecret>;
 }
 
 /// Governance boundary for signed epoch-bound room policy events.
