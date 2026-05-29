@@ -797,7 +797,7 @@ fn seed_state() -> AppState {
                 "Deletion copy includes offline-device caveat".to_owned(),
             ],
             connectivity: ConnectivityView {
-                fallback_chain: "STUN → relay-overlay → TURN; owner endpoints may override defaults".to_owned(),
+                fallback_chain: "Command-backed policy: STUN → relay-overlay → TURN; runtime transport remains release-gated until E2E passes".to_owned(),
                 metadata_copy: "Content-private and metadata-minimizing, not metadata-anonymous".to_owned(),
                 push_copy: "Android FCM wake is content-free and carries no room, sender, or message body".to_owned(),
             },

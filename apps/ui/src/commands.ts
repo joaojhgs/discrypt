@@ -370,7 +370,7 @@ const fallbackSnapshot: AppSnapshot = {
   ],
   connectivity: {
     fallback_chain:
-      "STUN → relay-overlay → TURN; owner endpoints may override defaults",
+      "Command-backed policy: STUN → relay-overlay → TURN; runtime transport remains release-gated until E2E passes",
     metadata_copy:
       "Content-private and metadata-minimizing, not metadata-anonymous",
     push_copy:
