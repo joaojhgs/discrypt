@@ -101,7 +101,9 @@ pub enum InviteEndpointPolicy {
 }
 
 impl InviteEndpointPolicy {
-    fn canonical_name(&self) -> &'static str {
+    /// Stable string encoded into signed descriptors and invite links.
+    #[must_use]
+    pub fn canonical_name(&self) -> &'static str {
         match self {
             Self::ProductionTls => "production_tls",
             Self::LocalDevLoopback => "local_dev_loopback",
@@ -149,8 +151,7 @@ impl InviteTrustMetadata {
     }
 
     fn validate(&self) -> Result<(), InviteError> {
-        if !is_hex_fingerprint(&self.signaling_fingerprint) || self.trust_status.trim().is_empty()
-        {
+        if !is_hex_fingerprint(&self.signaling_fingerprint) || self.trust_status.trim().is_empty() {
             return Err(InviteError::InvalidTrustMetadata);
         }
         Ok(())
@@ -207,7 +208,10 @@ impl InviteSignalingMetadata {
         {
             return Err(InviteError::InvalidSignalingEndpoint);
         }
-        if !self.endpoint_policy.validates_endpoint(&self.signaling_endpoint) {
+        if !self
+            .endpoint_policy
+            .validates_endpoint(&self.signaling_endpoint)
+        {
             return Err(InviteError::InvalidSignalingEndpoint);
         }
         self.trust.validate()

@@ -950,33 +950,16 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
         let signaling_endpoint = default_signaling_endpoint();
         let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
-        let trust_metadata = match InviteTrustMetadata::new(
-            signaling_trust_fingerprint.clone(),
-            "signed endpoint fingerprint; verify before MLS Welcome",
-        ) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                state.push_event(
-                    "invite.rejected",
-                    format!("Invalid signaling trust metadata: {error}"),
-                );
-                return;
-            }
-        };
-        let signaling_metadata = match InviteSignalingMetadata::new(
+        let signaling_metadata = InviteSignalingMetadata::new(
             signaling_endpoint.clone(),
             InviteEndpointPolicy::ProductionTls,
-            trust_metadata,
-        ) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                state.push_event(
-                    "invite.rejected",
-                    format!("Invalid signaling endpoint metadata: {error}"),
-                );
-                return;
-            }
-        };
+            InviteTrustMetadata::new(
+                signaling_trust_fingerprint.clone(),
+                "signed endpoint fingerprint; verify before MLS Welcome",
+            )
+            .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
+        )
+        .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = invite_store
@@ -996,13 +979,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
-            Ok(code) => code,
-            Err(error) => {
-                state.push_event("invite.rejected", error);
-                return;
-            }
-        };
+        let invite_code = production_invite_link(&descriptor, expires_at.as_str(), max_uses);
         let invite = InviteView {
             invite_id: format!("invite-{}", descriptor.invite_id),
             invite_key: descriptor.invite_id.clone(),
