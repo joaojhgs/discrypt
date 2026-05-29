@@ -1102,6 +1102,7 @@ impl fmt::Display for AppDbMigrationPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::BTreeSet, io::Write};
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
