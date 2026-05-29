@@ -230,6 +230,29 @@ export type RecoverUserRequest = {
   display_name: string;
   recovery_code: string;
   device_name?: string | null;
+  recovery_room_memberships?: string[];
+  recovered_device_count?: number | null;
+  use_sealed_account_backup?: boolean;
+};
+
+export type CreateDevicePairingPayloadRequest = {
+  requested_label: string;
+  current_epoch?: number | null;
+  valid_for_epochs?: number | null;
+};
+
+export type AcceptDevicePairingPayloadRequest = {
+  payload: string;
+  device_name?: string | null;
+  current_epoch?: number | null;
+};
+
+export type DevicePairingPayloadView = {
+  payload: string;
+  authorizing_device_id: string;
+  requested_label: string;
+  expires_epoch: number;
+  rejected_reason: string | null;
 };
 
 export type CreateGroupRequest = {
@@ -547,6 +570,78 @@ function createFallbackFriendIdentity(alias: string): {
   };
 }
 
+function fallbackIdentityKey(): string {
+  return (
+    fallbackState.snapshot.friend.friend_code
+      .split("ik=")
+      .at(1)
+      ?.split("&")
+      .at(0) ?? stableHash(fallbackState.snapshot.friend.friend_code)
+  );
+}
+
+function canonicalPairingMessage(payload: {
+  version: number;
+  authorizing_device_id: string;
+  identity_key: string;
+  requested_label: string;
+  challenge: string;
+  expires_epoch: number;
+}): string {
+  return `discrypt-device-pairing-v${payload.version}|authorizer=${payload.authorizing_device_id}|identity=${payload.identity_key}|label=${payload.requested_label}|challenge=${payload.challenge}|expires_epoch=${payload.expires_epoch}`;
+}
+
+function fallbackPairingSignature(payload: {
+  version: number;
+  authorizing_device_id: string;
+  identity_key: string;
+  requested_label: string;
+  challenge: string;
+  expires_epoch: number;
+}): string {
+  return stableHash(
+    `${canonicalPairingMessage(payload)}|${fallbackState.snapshot.friend.friend_code}`,
+  );
+}
+
+function parseFallbackPairingPayload(payload: string):
+  | {
+      version: number;
+      authorizing_device_id: string;
+      identity_key: string;
+      requested_label: string;
+      challenge: string;
+      expires_epoch: number;
+      signature: string;
+    }
+  | null {
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+    if (
+      typeof parsed.version !== "number" ||
+      typeof parsed.authorizing_device_id !== "string" ||
+      typeof parsed.identity_key !== "string" ||
+      typeof parsed.requested_label !== "string" ||
+      typeof parsed.challenge !== "string" ||
+      typeof parsed.expires_epoch !== "number" ||
+      typeof parsed.signature !== "string"
+    ) {
+      return null;
+    }
+    return {
+      version: parsed.version,
+      authorizing_device_id: parsed.authorizing_device_id,
+      identity_key: parsed.identity_key,
+      requested_label: parsed.requested_label,
+      challenge: parsed.challenge,
+      expires_epoch: parsed.expires_epoch,
+      signature: parsed.signature,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function participantIdFromFriendCode(friendCode: string): string {
   const fingerprint = friendCode.split("&fp=").at(1)?.split("&").at(0);
   return `friend-${(fingerprint ?? stableHash(friendCode)).slice(0, 10)}`;
@@ -700,16 +795,146 @@ export async function recoverUser(
       const displayName = request.display_name.trim() || "Alice recovered";
       const deviceName = request.device_name?.trim() || "Desktop";
       ensureFallbackReady(displayName, deviceName);
+      const recoveredDeviceCount = Math.max(
+        1,
+        Math.floor(request.recovered_device_count ?? state.devices.length || 1),
+      );
+      while (state.devices.length < recoveredDeviceCount) {
+        const leafIndex = state.devices.length + 1;
+        state.devices.push({
+          device_id: `recovered-${leafIndex}-${slugify(deviceName)}`,
+          leaf_index: leafIndex,
+          local: false,
+          authorized: true,
+        });
+      }
+      for (const room of request.recovery_room_memberships ?? []) {
+        const name = room.trim();
+        if (!name) continue;
+        const groupId = `group-${slugify(name)}`;
+        if (!state.groups.some((group) => group.group_id === groupId)) {
+          state.groups.push({
+            group_id: groupId,
+            name,
+            role: "member",
+            channels: defaultGroupChannels(),
+          });
+        }
+      }
       if (state.profile) {
         state.profile.recovery_status =
-          "Recovered locally from placeholder code; no cloud or cross-device history recovery claimed";
+          "Recovered account continuity locally; content keys restored: false";
       }
       pushEvent(
         state,
         "identity.recovered",
-        "Local recovery placeholder accepted; no history/key recovery was claimed",
+        `Account-continuity recovery accepted; rooms=${request.recovery_room_memberships?.length ?? 0} devices=${recoveredDeviceCount} content_keys_restored=false`,
       );
     }),
+  );
+}
+
+export async function createDevicePairingPayload(
+  request: CreateDevicePairingPayloadRequest,
+): Promise<DevicePairingPayloadView> {
+  return invokeOrFallback<DevicePairingPayloadView>(
+    "create_device_pairing_payload",
+    { request },
+    () => {
+      ensureFallbackReady();
+      const authorizingDevice = fallbackState.devices.find(
+        (device) => device.authorized,
+      );
+      const requestedLabel = request.requested_label.trim() || "paired device";
+      const currentEpoch =
+        request.current_epoch ?? fallbackState.events.at(-1)?.sequence ?? 1;
+      const expiresEpoch =
+        currentEpoch + Math.max(1, request.valid_for_epochs ?? 3);
+      if (!authorizingDevice) {
+        const rejected = "No authorized local device is available";
+        pushEvent(fallbackState, "device.pairing_rejected", rejected);
+        return {
+          payload: "",
+          authorizing_device_id: "",
+          requested_label: requestedLabel,
+          expires_epoch: currentEpoch,
+          rejected_reason: rejected,
+        };
+      }
+      const payload = {
+        version: 1,
+        authorizing_device_id: authorizingDevice.device_id,
+        identity_key: fallbackIdentityKey(),
+        requested_label: requestedLabel,
+        challenge: crypto.randomUUID?.() ?? `fallback-${Date.now()}`,
+        expires_epoch: expiresEpoch,
+      };
+      const signed = {
+        ...payload,
+        signature: fallbackPairingSignature(payload),
+      };
+      pushEvent(
+        fallbackState,
+        "device.pairing_payload_created",
+        `Pairing payload created for ${requestedLabel}`,
+      );
+      return {
+        payload: JSON.stringify(signed),
+        authorizing_device_id: authorizingDevice.device_id,
+        requested_label: requestedLabel,
+        expires_epoch: expiresEpoch,
+        rejected_reason: null,
+      };
+    },
+  );
+}
+
+export async function acceptDevicePairingPayload(
+  request: AcceptDevicePairingPayloadRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "accept_device_pairing_payload",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        ensureFallbackReady();
+        const parsed = parseFallbackPairingPayload(request.payload);
+        const currentEpoch =
+          request.current_epoch ?? state.events.at(-1)?.sequence ?? 1;
+        const reject = (reason: string) =>
+          pushEvent(state, "device.pairing_rejected", `Pairing rejected: ${reason}`);
+        if (!parsed) {
+          reject("invalid pairing payload");
+          return;
+        }
+        if (parsed.identity_key !== fallbackIdentityKey()) {
+          reject("pairing payload identity does not match local identity");
+          return;
+        }
+        if (!state.devices.some((device) => device.device_id === parsed.authorizing_device_id && device.authorized)) {
+          reject("authorizing device is not an active device for this identity");
+          return;
+        }
+        if (currentEpoch > parsed.expires_epoch) {
+          reject("pairing payload expired");
+          return;
+        }
+        if (parsed.signature !== fallbackPairingSignature(parsed)) {
+          reject("pairing payload signature verification failed");
+          return;
+        }
+        const label = request.device_name?.trim() || parsed.requested_label;
+        const deviceId = `paired-${slugify(label)}-${state.devices.length + 1}`;
+        if (!state.devices.some((device) => device.device_id === deviceId)) {
+          state.devices.push({
+            device_id: deviceId,
+            leaf_index: state.devices.length + 1,
+            local: false,
+            authorized: true,
+          });
+        }
+        pushEvent(state, "device.paired", `Authorized paired device ${label}`);
+      }),
   );
 }
 
