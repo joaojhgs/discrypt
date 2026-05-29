@@ -1060,12 +1060,6 @@ fn validate_version(version: u32) -> Result<(), AppDbError> {
             current: APP_DB_SCHEMA_VERSION,
         });
     }
-    if version < MIN_SUPPORTED_APP_DB_SCHEMA_VERSION {
-        return Err(AppDbError::UnsupportedLegacyVersion {
-            version,
-            minimum: MIN_SUPPORTED_APP_DB_SCHEMA_VERSION,
-        });
-    }
     Ok(())
 }
 
