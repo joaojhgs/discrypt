@@ -211,6 +211,21 @@ export type VoiceStateView = {
   detail: string;
 };
 
+export type ServiceCapabilityView = {
+  key: string;
+  label: string;
+  status: string;
+  detail: string;
+};
+
+export type RuntimeModeView = {
+  mode: string;
+  production_labels_enabled: boolean;
+  harness_badge: string;
+  disabled_reason: string;
+  services: ServiceCapabilityView[];
+};
+
 export type InviteView = {
   invite_id: string;
   invite_key: string;
@@ -293,6 +308,7 @@ export type AppState = {
   join_progress: JoinProgressStepView[];
   text_state_legend: TextStateView[];
   voice_states: VoiceStateView[];
+  runtime_mode: RuntimeModeView;
   snapshot: AppSnapshot;
 };
 
@@ -547,6 +563,7 @@ const fallbackState: AppState = {
   join_progress: [],
   text_state_legend: textStateLegend(),
   voice_states: [],
+  runtime_mode: fallbackRuntimeMode(),
   snapshot: fallbackSnapshot,
 };
 
@@ -612,7 +629,38 @@ function syncSnapshot(state: AppState): AppState {
   state.join_progress = deriveJoinProgress(state);
   state.text_state_legend = textStateLegend();
   state.voice_states = deriveVoiceStates(state);
+  state.runtime_mode = fallbackRuntimeMode();
   return state;
+}
+
+function fallbackRuntimeMode(): RuntimeModeView {
+  return {
+    mode: "local-dev-harness",
+    production_labels_enabled: false,
+    harness_badge: "local-dev / harness mode",
+    disabled_reason:
+      "Production labels disabled until backend state proves network, media, and storage services are configured",
+    services: [
+      {
+        key: "network",
+        label: "Network services",
+        status: "not-configured",
+        detail: "Signaling/relay service labels require configured network features and backend state",
+      },
+      {
+        key: "media",
+        label: "Media services",
+        status: "not-configured",
+        detail: "Voice media labels require configured media features and route evidence",
+      },
+      {
+        key: "storage",
+        label: "Storage services",
+        status: "not-configured",
+        detail: "Storage service labels require production storage feature on supported targets",
+      },
+    ],
+  };
 }
 
 function deriveVoiceStates(state: AppState): VoiceStateView[] {

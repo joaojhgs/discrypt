@@ -467,6 +467,18 @@ if (!main.includes("VoiceStateGrid")) {
 if (!main.includes("voiceStateBadgeVariant")) {
   failures.push("voice UI must map backend voice states to visible badges");
 }
+if (!rust.includes("runtime_mode: RuntimeModeView")) {
+  failures.push("Tauri AppStateView must expose runtime_mode for production label gating");
+}
+if (!commands.includes("runtime_mode: RuntimeModeView")) {
+  failures.push("TS AppState must carry runtime_mode for production label gating");
+}
+if (!main.includes("RuntimeModeBanner")) {
+  failures.push("UI must visibly mark local-dev/harness runtime mode");
+}
+if (!main.includes("runtimeMode.production_labels_enabled")) {
+  failures.push("UI must gate production label badge state from runtimeMode.production_labels_enabled");
+}
 if (!main.includes("message.state_label") || !main.includes("message.state_detail")) {
   failures.push("Message bubbles must display per-message state label and detail");
 }

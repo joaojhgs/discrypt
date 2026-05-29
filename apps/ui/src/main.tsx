@@ -16,6 +16,7 @@ import {
   GroupView,
   InviteView,
   JoinProgressStepView,
+  RuntimeModeView,
   TextStateView,
   TransportStatusView,
   VoiceParticipantView,
@@ -593,6 +594,7 @@ function App() {
           inspectorOpen={inspectorOpen}
           canCreateInvite={Boolean(activeGroup)}
         />
+        <RuntimeModeBanner runtimeMode={appState.runtime_mode} />
         {commandError ? (
           <p className="mx-4 mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 md:mx-6">
             Command note: {commandError}
@@ -1119,6 +1121,42 @@ function SidebarButton({
         ) : null}
       </span>
     </Button>
+  );
+}
+
+function RuntimeModeBanner({ runtimeMode }: { runtimeMode: RuntimeModeView }) {
+  return (
+    <section className="mx-4 mt-3 rounded-2xl border border-amber-300/25 bg-amber-300/10 p-3 text-amber-50 md:mx-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={runtimeMode.production_labels_enabled ? "success" : "warning"}>
+              {runtimeMode.harness_badge}
+            </Badge>
+            <span className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-50/70">
+              runtime mode: {runtimeMode.mode}
+            </span>
+          </div>
+          <p className="mt-2 text-sm leading-6 text-amber-50/85">
+            {runtimeMode.disabled_reason}
+          </p>
+        </div>
+        <div className="grid min-w-[16rem] gap-2 sm:grid-cols-3">
+          {runtimeMode.services.map((service) => (
+            <div
+              key={service.key}
+              className="rounded-xl border border-amber-300/15 bg-black/15 p-2"
+              title={service.detail}
+            >
+              <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-50/60">
+                {service.label}
+              </p>
+              <p className="mt-1 text-xs text-amber-50/90">{service.status}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
   );
 }
 

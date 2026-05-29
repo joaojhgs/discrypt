@@ -442,6 +442,34 @@ pub struct VoiceStateView {
     pub detail: String,
 }
 
+/// Runtime capability and copy-gating state for UI honesty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeModeView {
+    /// Runtime mode label shown by the UI.
+    pub mode: String,
+    /// Whether production wording is allowed in UI labels.
+    pub production_labels_enabled: bool,
+    /// Visible badge/copy for local-dev or harness mode.
+    pub harness_badge: String,
+    /// Backend-derived reason production labels are disabled.
+    pub disabled_reason: String,
+    /// Service capability rows derived from Cargo features/configuration.
+    pub services: Vec<ServiceCapabilityView>,
+}
+
+/// Single service capability row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServiceCapabilityView {
+    /// Service key.
+    pub key: String,
+    /// Human label.
+    pub label: String,
+    /// Current readiness status.
+    pub status: String,
+    /// Honest caveat/evidence copy.
+    pub detail: String,
+}
+
 /// Confirmation phrase required before destructive local-state reset.
 pub const RESET_APP_CONFIRMATION_PHRASE: &str = "DELETE LOCAL DISCRYPT STATE";
 
@@ -498,6 +526,8 @@ pub struct AppStateView {
     /// Backend-derived voice state rows for the voice UI.
     #[serde(default)]
     pub voice_states: Vec<VoiceStateView>,
+    /// Runtime mode and service configuration state for copy gating.
+    pub runtime_mode: RuntimeModeView,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -1894,6 +1924,7 @@ impl PersistedAppState {
             join_progress: self.join_progress(),
             text_state_legend: text_state_legend(),
             voice_states: self.voice_states(),
+            runtime_mode: runtime_mode_view(),
             snapshot: self.to_snapshot(),
         }
     }
@@ -2998,6 +3029,52 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+fn runtime_mode_view() -> RuntimeModeView {
+    let network_ready = cfg!(feature = "production-network");
+    let media_ready = cfg!(feature = "production-media");
+    let storage_ready = cfg!(all(target_os = "linux", feature = "production-storage"));
+    let production_labels_enabled = network_ready && media_ready && storage_ready;
+    let mode = if production_labels_enabled {
+        "configured-services"
+    } else {
+        "local-dev-harness"
+    };
+    RuntimeModeView {
+        mode: mode.to_owned(),
+        production_labels_enabled,
+        harness_badge: if production_labels_enabled {
+            "services configured".to_owned()
+        } else {
+            "local-dev / harness mode".to_owned()
+        },
+        disabled_reason: if production_labels_enabled {
+            "Production labels enabled because network, media, and storage service features are configured".to_owned()
+        } else {
+            "Production labels disabled until backend state proves network, media, and storage services are configured".to_owned()
+        },
+        services: vec![
+            ServiceCapabilityView {
+                key: "network".to_owned(),
+                label: "Network services".to_owned(),
+                status: if network_ready { "configured" } else { "not-configured" }.to_owned(),
+                detail: "Signaling/relay service labels require configured network features and backend state".to_owned(),
+            },
+            ServiceCapabilityView {
+                key: "media".to_owned(),
+                label: "Media services".to_owned(),
+                status: if media_ready { "configured" } else { "not-configured" }.to_owned(),
+                detail: "Voice media labels require configured media features and route evidence".to_owned(),
+            },
+            ServiceCapabilityView {
+                key: "storage".to_owned(),
+                label: "Storage services".to_owned(),
+                status: if storage_ready { "configured" } else { "not-configured" }.to_owned(),
+                detail: "Storage service labels require the production storage feature on supported targets".to_owned(),
+            },
+        ],
+    }
+}
+
 fn text_state_legend() -> Vec<TextStateView> {
     vec![
         TextStateView {
@@ -3914,6 +3991,18 @@ mod tests {
             .join_progress
             .iter()
             .any(|step| step.key == "transport" && step.status == "waiting-route-proof"));
+    }
+
+    #[test]
+    fn runtime_mode_disables_production_labels_without_configured_services() {
+        let runtime = runtime_mode_view();
+        assert_eq!(runtime.mode, "local-dev-harness");
+        assert!(!runtime.production_labels_enabled);
+        assert!(runtime.harness_badge.contains("harness"));
+        assert!(runtime
+            .disabled_reason
+            .contains("Production labels disabled"));
+        assert_eq!(runtime.services.len(), 3);
     }
 
     #[test]
