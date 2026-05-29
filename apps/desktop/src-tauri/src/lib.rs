@@ -48,6 +48,8 @@ const APP_STATE_SCHEMA_VERSION: u32 = 1;
 const APP_STATE_STORE_FILENAME: &str = "app-state.discrypt-store";
 const DEFAULT_THEME_ID: &str = "graphite-calm";
 const DEFAULT_TEMPLATE_ID: &str = "command-center";
+const UI_THEME_IDS: &[&str] = &["midnight-steel", "graphite-calm", "ocean-contrast"];
+const UI_TEMPLATE_IDS: &[&str] = &["command-center", "compact-ops"];
 
 /// Desktop/Tauri wrapper around the Rust signaling protocol client.
 pub struct DesktopSignalingClient<T> {
@@ -1009,8 +1011,8 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
 pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.preferences = UiPreferencesView {
-            theme_id: normalize_label(&request.theme_id, DEFAULT_THEME_ID),
-            template_id: normalize_label(&request.template_id, DEFAULT_TEMPLATE_ID),
+            theme_id: normalize_theme_id(&request.theme_id),
+            template_id: normalize_template_id(&request.template_id),
         };
         state.push_event("preferences.saved", "Theme/template preferences saved");
     })
@@ -3155,6 +3157,24 @@ fn normalize_label(value: &str, fallback: &str) -> String {
     }
 }
 
+fn normalize_theme_id(value: &str) -> String {
+    let trimmed = value.trim();
+    if UI_THEME_IDS.contains(&trimmed) {
+        trimmed.to_owned()
+    } else {
+        DEFAULT_THEME_ID.to_owned()
+    }
+}
+
+fn normalize_template_id(value: &str) -> String {
+    let trimmed = value.trim();
+    if UI_TEMPLATE_IDS.contains(&trimmed) {
+        trimmed.to_owned()
+    } else {
+        DEFAULT_TEMPLATE_ID.to_owned()
+    }
+}
+
 fn normalize_channel_name(value: &str, kind: ChannelKind) -> String {
     let trimmed = normalize_label(value.trim_start_matches('#'), "secure-room");
     match kind {
@@ -4188,6 +4208,31 @@ mod tests {
         assert!(health.collaboration_ready);
         assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
+    }
+
+    #[test]
+    fn preferences_use_app_config_ids_and_persist_across_reload() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("preferences-persist");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let themed = save_preferences(SavePreferencesRequest {
+            theme_id: "ocean-contrast".to_owned(),
+            template_id: "compact-ops".to_owned(),
+        });
+        assert_eq!(themed.preferences.theme_id, "ocean-contrast");
+        assert_eq!(themed.preferences.template_id, "compact-ops");
+        let reloaded = load_state().to_view();
+        assert_eq!(reloaded.preferences.theme_id, "ocean-contrast");
+        assert_eq!(reloaded.preferences.template_id, "compact-ops");
+        let normalized = save_preferences(SavePreferencesRequest {
+            theme_id: "not-in-app-config".to_owned(),
+            template_id: "also-invalid".to_owned(),
+        });
+        assert_eq!(normalized.preferences.theme_id, DEFAULT_THEME_ID);
+        assert_eq!(normalized.preferences.template_id, DEFAULT_TEMPLATE_ID);
     }
 
     #[test]

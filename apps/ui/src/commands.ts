@@ -1,3 +1,5 @@
+import { discryptUiConfig } from "./app-config";
+
 export type ChannelKind = "Text" | "Voice";
 
 export type FriendView = {
@@ -1548,12 +1550,26 @@ export async function verifySafetyNumber(
 export async function savePreferences(
   request: SavePreferencesRequest,
 ): Promise<AppState> {
-  return invokeOrFallback<AppState>("save_preferences", { request }, () =>
+  const normalized = normalizePreferences(request);
+  return invokeOrFallback<AppState>("save_preferences", { request: normalized }, () =>
     mutateFallback((state) => {
-      state.preferences = request;
+      state.preferences = normalized;
       pushEvent(state, "preferences.saved", "Theme/template preferences saved");
     }),
   );
+}
+
+function normalizePreferences(request: SavePreferencesRequest): SavePreferencesRequest {
+  const themeIds = discryptUiConfig.themes.map((theme) => theme.id);
+  const templateIds = discryptUiConfig.templates.map((template) => template.id);
+  return {
+    theme_id: themeIds.includes(request.theme_id as never)
+      ? request.theme_id
+      : discryptUiConfig.activeTheme,
+    template_id: templateIds.includes(request.template_id as never)
+      ? request.template_id
+      : discryptUiConfig.activeTemplate,
+  };
 }
 
 export async function startDm(request: StartDmRequest): Promise<AppState> {

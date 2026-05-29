@@ -476,6 +476,15 @@ if (!commands.includes("runtime_mode: RuntimeModeView")) {
 if (!main.includes("RuntimeModeBanner")) {
   failures.push("UI must visibly mark local-dev/harness runtime mode");
 }
+if (!rust.includes("UI_THEME_IDS") || !rust.includes("UI_TEMPLATE_IDS")) {
+  failures.push("backend preferences must constrain theme/template IDs to app-config-compatible allowlists");
+}
+if (!commands.includes("discryptUiConfig.themes") || !commands.includes("discryptUiConfig.templates")) {
+  failures.push("frontend preferences must normalize through apps/ui/src/app-config.ts definitions");
+}
+if (!main.includes("discryptUiConfig.themes") || !main.includes("savePreferences")) {
+  failures.push("UI must keep theme/template selectors sourced from app-config and persisted through savePreferences");
+}
 if (!main.includes("runtimeMode.production_labels_enabled")) {
   failures.push("UI must gate production label badge state from runtimeMode.production_labels_enabled");
 }
