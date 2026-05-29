@@ -204,6 +204,13 @@ export type JoinProgressStepView = {
   detail: string;
 };
 
+export type VoiceStateView = {
+  key: string;
+  label: string;
+  status: string;
+  detail: string;
+};
+
 export type InviteView = {
   invite_id: string;
   invite_key: string;
@@ -285,6 +292,7 @@ export type AppState = {
   transport_status: TransportStatusView[];
   join_progress: JoinProgressStepView[];
   text_state_legend: TextStateView[];
+  voice_states: VoiceStateView[];
   snapshot: AppSnapshot;
 };
 
@@ -538,6 +546,7 @@ const fallbackState: AppState = {
   transport_status: [],
   join_progress: [],
   text_state_legend: textStateLegend(),
+  voice_states: [],
   snapshot: fallbackSnapshot,
 };
 
@@ -602,7 +611,70 @@ function syncSnapshot(state: AppState): AppState {
   state.transport_status = deriveTransportStatus(state);
   state.join_progress = deriveJoinProgress(state);
   state.text_state_legend = textStateLegend();
+  state.voice_states = deriveVoiceStates(state);
   return state;
+}
+
+function deriveVoiceStates(state: AppState): VoiceStateView[] {
+  const session = state.voice_session;
+  const joined = Boolean(session?.joined);
+  const permission = session?.microphone_permission ?? "unknown";
+  const muted = Boolean(session?.self_muted);
+  const speaking = Boolean(
+    session?.participants.some((participant) => participant.speaking && !participant.muted),
+  );
+  const hasTurn = Boolean(state.invites.at(-1)?.ice_turn_servers.length);
+  return [
+    {
+      key: "permission_needed",
+      label: "Permission needed",
+      status: permission === "granted" ? "granted" : "needed",
+      detail: "Microphone permission must be granted before capture starts",
+    },
+    {
+      key: "joining",
+      label: "Joining",
+      status: joined ? "joined" : "idle",
+      detail: "Join command creates a local voice session and records selected devices",
+    },
+    {
+      key: "ice_checking",
+      label: "ICE checking",
+      status: joined ? "waiting-route-proof" : "idle",
+      detail: "ICE checks require route metrics from transport state before success is displayed",
+    },
+    {
+      key: "route",
+      label: "Direct / overlay / TURN",
+      status: joined ? (hasTurn ? "turn-configured" : "policy-only") : "idle",
+      detail:
+        "Direct, overlay, and TURN route labels stay policy-only until backend route evidence exists",
+    },
+    {
+      key: "muted",
+      label: "Muted",
+      status: muted ? "muted" : "unmuted",
+      detail: "Mute state is command-backed and suppresses outbound local media frames",
+    },
+    {
+      key: "speaking",
+      label: "Speaking",
+      status: speaking ? "active" : "silent",
+      detail: "Speaking indicators come from participant audio-level state returned by the backend",
+    },
+    {
+      key: "reconnecting",
+      label: "Reconnecting",
+      status: "idle",
+      detail: "Reconnect state appears only when transport events report retry/backoff activity",
+    },
+    {
+      key: "left",
+      label: "Left",
+      status: joined ? "not-left" : "left-or-not-joined",
+      detail: "Leaving clears the local joined state and keeps no fabricated remote roster",
+    },
+  ];
 }
 
 function textStateLegend(): TextStateView[] {

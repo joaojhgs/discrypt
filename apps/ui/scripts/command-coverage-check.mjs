@@ -455,6 +455,18 @@ if (!commands.includes("text_state_legend: TextStateView[]")) {
 if (!main.includes("TextStateLegend")) {
   failures.push("UI must render text message state legend");
 }
+if (!rust.includes("voice_states: Vec<VoiceStateView>")) {
+  failures.push("Tauri AppStateView must expose backend-derived voice_states");
+}
+if (!commands.includes("voice_states: VoiceStateView[]")) {
+  failures.push("TS AppState must carry backend-derived voice_states");
+}
+if (!main.includes("VoiceStateGrid")) {
+  failures.push("UI must render backend-derived voice state grid");
+}
+if (!main.includes("voiceStateBadgeVariant")) {
+  failures.push("voice UI must map backend voice states to visible badges");
+}
 if (!main.includes("message.state_label") || !main.includes("message.state_detail")) {
   failures.push("Message bubbles must display per-message state label and detail");
 }

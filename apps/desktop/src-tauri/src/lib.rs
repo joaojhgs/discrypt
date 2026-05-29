@@ -429,6 +429,19 @@ pub struct JoinProgressStepView {
     pub detail: String,
 }
 
+/// Backend-derived voice state row for the voice UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceStateView {
+    /// Stable state key.
+    pub key: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Current backend-derived state.
+    pub status: String,
+    /// Evidence/caveat copy.
+    pub detail: String,
+}
+
 /// Confirmation phrase required before destructive local-state reset.
 pub const RESET_APP_CONFIRMATION_PHRASE: &str = "DELETE LOCAL DISCRYPT STATE";
 
@@ -482,6 +495,9 @@ pub struct AppStateView {
     /// Text message state legend for timelines.
     #[serde(default)]
     pub text_state_legend: Vec<TextStateView>,
+    /// Backend-derived voice state rows for the voice UI.
+    #[serde(default)]
+    pub voice_states: Vec<VoiceStateView>,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -1877,6 +1893,7 @@ impl PersistedAppState {
             transport_status: self.transport_status(),
             join_progress: self.join_progress(),
             text_state_legend: text_state_legend(),
+            voice_states: self.voice_states(),
             snapshot: self.to_snapshot(),
         }
     }
@@ -2027,6 +2044,78 @@ impl PersistedAppState {
                 }
                 .to_owned(),
                 detail: "Transport connected is shown only after backend state provides direct, overlay, or TURN route evidence".to_owned(),
+            },
+        ]
+    }
+
+    fn voice_states(&self) -> Vec<VoiceStateView> {
+        let session = self.voice_session.as_ref();
+        let joined = session.map(|voice| voice.joined).unwrap_or(false);
+        let permission = session
+            .map(|voice| voice.microphone_permission.as_str())
+            .unwrap_or("unknown");
+        let muted = session.map(|voice| voice.self_muted).unwrap_or(false);
+        let speaking = session
+            .map(|voice| {
+                voice
+                    .participants
+                    .iter()
+                    .any(|participant| participant.speaking && !participant.muted)
+            })
+            .unwrap_or(false);
+        let has_turn = self
+            .invites
+            .last()
+            .map(|invite| !invite.ice_turn_servers.is_empty())
+            .unwrap_or(false);
+        vec![
+            VoiceStateView {
+                key: "permission_needed".to_owned(),
+                label: "Permission needed".to_owned(),
+                status: if permission == "granted" { "granted" } else { "needed" }.to_owned(),
+                detail: "Microphone permission must be granted before capture starts".to_owned(),
+            },
+            VoiceStateView {
+                key: "joining".to_owned(),
+                label: "Joining".to_owned(),
+                status: if joined { "joined" } else { "idle" }.to_owned(),
+                detail: "Join command creates a local voice session and records selected devices".to_owned(),
+            },
+            VoiceStateView {
+                key: "ice_checking".to_owned(),
+                label: "ICE checking".to_owned(),
+                status: if joined { "waiting-route-proof" } else { "idle" }.to_owned(),
+                detail: "ICE checks require route metrics from transport state before success is displayed".to_owned(),
+            },
+            VoiceStateView {
+                key: "route".to_owned(),
+                label: "Direct / overlay / TURN".to_owned(),
+                status: if joined { if has_turn { "turn-configured" } else { "policy-only" } } else { "idle" }.to_owned(),
+                detail: "Direct, overlay, and TURN route labels stay policy-only until backend route evidence exists".to_owned(),
+            },
+            VoiceStateView {
+                key: "muted".to_owned(),
+                label: "Muted".to_owned(),
+                status: if muted { "muted" } else { "unmuted" }.to_owned(),
+                detail: "Mute state is command-backed and suppresses outbound local media frames".to_owned(),
+            },
+            VoiceStateView {
+                key: "speaking".to_owned(),
+                label: "Speaking".to_owned(),
+                status: if speaking { "active" } else { "silent" }.to_owned(),
+                detail: "Speaking indicators come from participant audio-level state returned by the backend".to_owned(),
+            },
+            VoiceStateView {
+                key: "reconnecting".to_owned(),
+                label: "Reconnecting".to_owned(),
+                status: "idle".to_owned(),
+                detail: "Reconnect state appears only when transport events report retry/backoff activity".to_owned(),
+            },
+            VoiceStateView {
+                key: "left".to_owned(),
+                label: "Left".to_owned(),
+                status: if joined { "not-left" } else { "left-or-not-joined" }.to_owned(),
+                detail: "Leaving clears the local joined state and keeps no fabricated remote roster".to_owned(),
             },
         ]
     }
@@ -3825,6 +3914,64 @@ mod tests {
             .join_progress
             .iter()
             .any(|step| step.key == "transport" && step.status == "waiting-route-proof"));
+    }
+
+    #[test]
+    fn voice_states_surface_permission_route_mute_speaking_and_left() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("voice-state-ui");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Voice State Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group_id = group.groups[0].group_id.clone();
+        let channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Voice Lobby".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel.groups[0]
+            .channels
+            .iter()
+            .find(|channel| matches!(channel.kind, ChannelKind::Voice))
+            .map(|channel| channel.channel_id.clone())
+            .unwrap_or_else(|| "voice".to_owned());
+        let state = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic".to_owned()),
+            input_device_label: Some("Mic".to_owned()),
+            output_device_id: Some("speaker".to_owned()),
+            output_device_label: Some("Speaker".to_owned()),
+        });
+        let keys: Vec<_> = state
+            .voice_states
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "permission_needed",
+                "joining",
+                "ice_checking",
+                "route",
+                "muted",
+                "speaking",
+                "reconnecting",
+                "left"
+            ]
+        );
+        assert!(state
+            .voice_states
+            .iter()
+            .any(|entry| entry.key == "joining" && entry.status == "joined"));
     }
 
     #[test]

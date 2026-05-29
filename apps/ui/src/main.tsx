@@ -20,6 +20,7 @@ import {
   TransportStatusView,
   VoiceParticipantView,
   VoiceSessionView,
+  VoiceStateView,
   RESET_APP_CONFIRMATION_PHRASE,
   commandErrorToAction,
   createChannel as createChannelCommand,
@@ -675,6 +676,7 @@ function App() {
               }
               participants={participants}
               voiceSession={appState.voice_session}
+              voiceStates={appState.voice_states}
               voiceJoined={voiceJoined}
               selfMuted={selfMuted}
               setVoiceJoined={toggleVoiceJoin}
@@ -2127,6 +2129,7 @@ function VoicePanel({
   route,
   participants,
   voiceSession,
+  voiceStates,
   voiceJoined,
   selfMuted,
   setVoiceJoined,
@@ -2138,6 +2141,7 @@ function VoicePanel({
   route: string;
   participants: VoiceParticipant[];
   voiceSession: VoiceSessionView | null;
+  voiceStates: VoiceStateView[];
   voiceJoined: boolean;
   selfMuted: boolean;
   setVoiceJoined: (joined: boolean) => void;
@@ -2168,6 +2172,7 @@ function VoicePanel({
           </div>
         </CardHeader>
         <CardContent className="grid gap-3">
+          <VoiceStateGrid states={voiceStates} />
           {!voiceJoined ? (
             <EmptyState
               title={permissionDenied ? "Microphone blocked" : "Not in voice"}
@@ -2402,6 +2407,44 @@ function EmptyState({ title, copy }: { title: string; copy: string }) {
     </div>
   );
 }
+function VoiceStateGrid({ states }: { states: VoiceStateView[] }) {
+  if (states.length === 0) return null;
+  return (
+    <div className="grid gap-2 md:grid-cols-2">
+      {states.map((state) => (
+        <div
+          key={state.key}
+          className="rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.30)] p-3"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-semibold uppercase tracking-[0.14em] text-[hsl(var(--muted-foreground))]">
+              {state.label}
+            </span>
+            <Badge variant={voiceStateBadgeVariant(state.status)}>
+              {state.status}
+            </Badge>
+          </div>
+          <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+            {state.detail}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function voiceStateBadgeVariant(
+  status: string,
+): React.ComponentProps<typeof Badge>["variant"] {
+  if (["joined", "granted", "active", "unmuted"].includes(status)) {
+    return "success";
+  }
+  if (["needed", "waiting-route-proof", "muted"].includes(status)) {
+    return "warning";
+  }
+  return "secondary";
+}
+
 function ControlRow({
   label,
   checked,
