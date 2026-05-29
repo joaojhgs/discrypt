@@ -1646,7 +1646,11 @@ pub fn command_health() -> CommandHealth {
         && state
             .security_copy
             .metadata
-            .contains("does not claim anonymity");
+            .contains("does not claim anonymity")
+        && state
+            .security_copy
+            .malicious_member
+            .contains("not metadata anonymity");
     let app_state_ready = state.schema_version == APP_STATE_SCHEMA_VERSION;
     let identity_ready = matches!(
         state.lifecycle,

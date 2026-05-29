@@ -43,7 +43,8 @@
     "test:presence-g111": "node ../../scripts/check-presence-g111.mjs",
     "test:presence-g112": "node ../../scripts/check-presence-g112.mjs",
     "test:presence-g113": "node ../../scripts/check-presence-g113.mjs",
-    "test:presence-g114": "node ../../scripts/check-presence-g114.mjs"
+    "test:presence-g114": "node ../../scripts/check-presence-g114.mjs",
+    "test:presence-g115": "node ../../scripts/check-presence-g115.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

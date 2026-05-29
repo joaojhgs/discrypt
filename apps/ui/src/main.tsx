@@ -654,6 +654,7 @@ function App() {
           ) : null}
           {workflow === "channel" ? (
             <ChannelPanel
+              snapshot={currentSnapshot}
               group={activeGroup}
               activeChannel={activeTextChannel}
               channels={textChannels}
@@ -1491,6 +1492,10 @@ function SetupPanel({
                 title="Invite admission"
                 copy={snapshot.invite.welcome_required}
               />
+              <InfoRow
+                title="Residual presence risk"
+                copy={snapshot.security_copy.malicious_member}
+              />
             </div>
           </CardContent>
         </Card>
@@ -1943,6 +1948,7 @@ function CreateGroupPanel({
 }
 
 function ChannelPanel({
+  snapshot,
   group,
   activeChannel,
   channels,
@@ -1956,6 +1962,7 @@ function ChannelPanel({
   onCreateVoiceChannel,
   onSendMessage,
 }: {
+  snapshot: AppSnapshot;
   group: GroupView | null;
   activeChannel: ChannelStateView | null;
   channels: ChannelStateView[];
@@ -2018,6 +2025,11 @@ function ChannelPanel({
               <Icon>+</Icon>Voice
             </Button>
           </div>
+          <Separator />
+          <InfoRow
+            title="Residual presence risk"
+            copy={snapshot.security_copy.malicious_member}
+          />
           <Separator />
           {channels.length === 0 ? (
             <p className="text-sm text-[hsl(var(--muted-foreground))]">
@@ -2375,6 +2387,8 @@ function InspectorRail({
               <p>{snapshot.security_copy.metadata}</p>
               <Separator />
               <p>{snapshot.security_copy.deletion}</p>
+              <Separator />
+              <p>{snapshot.security_copy.malicious_member}</p>
             </CardContent>
           </Card>
           <Card className="border-[hsl(var(--destructive)/0.35)]">

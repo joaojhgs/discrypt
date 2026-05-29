@@ -536,7 +536,7 @@ const fallbackSnapshot: AppSnapshot = {
     deletion:
       "Deleted on your online devices now; pending on offline devices until they reconnect",
     malicious_member:
-      "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient",
+      "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient. Authorized members can still infer some liveness from archival live-key behavior; this is not metadata anonymity.",
   },
 };
 
@@ -2195,7 +2195,8 @@ export async function commandHealth(): Promise<CommandHealth> {
     voice_ready: false,
     honest_copy_ready:
       fallbackState.security_copy.deletion.includes("pending on offline devices") &&
-      fallbackState.security_copy.metadata.includes("does not claim anonymity"),
+      fallbackState.security_copy.metadata.includes("does not claim anonymity") &&
+      fallbackState.security_copy.malicious_member.includes("not metadata anonymity"),
   }));
 }
 

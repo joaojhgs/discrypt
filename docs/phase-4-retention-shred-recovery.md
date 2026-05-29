@@ -41,7 +41,7 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   Raw network identity strings are not stored. Over-limit responses do not return keys.
   Uniform unavailable mode makes invalid proof, non-member, over-limit, and generic
   failure responses indistinguishable. Malicious non-member probes covering invalid proof, stale epoch, unregistered device, non-member, and generic reachability all collapse
-  without returning a decryptable key.
+  without returning a decryptable key. Authorized members can still infer some liveness from archival live-key behavior; this is not metadata anonymity, and the UI must show that residual risk next to setup, group, and channel safety surfaces.
 - AC-SHRED-PERSIST: SQLite/WAL/key-store material is removed in the simulator; failed
   verification can restore the snapshot before final destroy.
 - AC-RECOVERY/AC12 foundation: backups are account-continuity only and do not contain

@@ -974,7 +974,7 @@ fn seed_state() -> AppState {
             security_copy: SecurityCopyView {
                 metadata: "Passive infrastructure can see IPs and timing; discrypt does not claim anonymity".to_owned(),
                 deletion: "Deleted on your online devices now; pending on offline devices until they reconnect".to_owned(),
-                malicious_member: "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient".to_owned(),
+                malicious_member: "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient. Authorized members can still infer some liveness from archival live-key behavior; this is not metadata anonymity.".to_owned(),
             },
         },
         next_message_sequence: 1,
@@ -1098,6 +1098,14 @@ mod tests {
             .connectivity
             .metadata_copy
             .contains("not metadata-anonymous"));
+        assert!(snapshot
+            .security_copy
+            .malicious_member
+            .contains("not metadata anonymity"));
+        assert!(snapshot
+            .security_copy
+            .malicious_member
+            .contains("infer some liveness"));
         assert!(snapshot
             .voice_session
             .status_copy
