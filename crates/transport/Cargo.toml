@@ -17,6 +17,7 @@ production-media = []
 production-storage = []
 
 [dependencies]
+chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
