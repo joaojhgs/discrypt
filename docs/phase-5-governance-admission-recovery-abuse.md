@@ -45,5 +45,10 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
 - `AdmissionController` treats password proof success as an external PAKE/helper result;
   production must wire OPAQUE/PAKE or an online authorized admission helper before any
   password-gated room claim.
+- G039 invite signaling metadata is tracked separately in
+  [`g039-invite-metadata-review.md`](g039-invite-metadata-review.md). The current
+  admission descriptor covers opaque ids, room-secret commitments, expiry, max-use,
+  issuer signatures, and revocation/use accounting; it does not yet claim signed
+  endpoint policy or trust-fingerprint coverage.
 - Abuse controls are local deterministic primitives; production Sybil resistance remains
   documented posture rather than a cryptographic guarantee.

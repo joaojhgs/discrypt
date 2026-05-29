@@ -44,6 +44,10 @@ content-free Android FCM wake envelopes, and pcap-style metadata matrix fixtures
 - The signaling reference is an in-memory deterministic model. Production should
   preserve the same at-rest shape while adding authentication, expiry cleanup, and
   abuse throttles around publish/fetch.
+- G039 invite signaling metadata is tracked separately in
+  [`g039-invite-metadata-review.md`](g039-invite-metadata-review.md). The current
+  signaling client validates endpoint syntax for protocol use, but invite-created
+  join links do not yet carry signed endpoint policy or trust metadata.
 - The fallback planner is policy, not socket code. Native QUIC/ICE/TURN plumbing
   must feed real reachability results into the same ordered policy and keep TURN
   strictly ciphertext-only.
