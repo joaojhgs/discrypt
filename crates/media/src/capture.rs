@@ -397,11 +397,26 @@ pub struct VoiceCaptureSendReport {
     pub counter: u64,
 }
 
+/// Result of applying media-path mute control to one captured frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum VoiceCaptureSendOutcome {
+    /// Frame was encoded, SFrame-protected, and handed to the transport sink.
+    Sent(VoiceCaptureSendReport),
+    /// Frame was intentionally suppressed before Opus encode/SFrame/transport.
+    Muted {
+        /// Capture timestamp that was suppressed.
+        captured_at_ms: u64,
+        /// Number of raw PCM samples discarded locally.
+        dropped_pcm_samples: usize,
+    },
+}
+
 /// End-to-end local send pipeline for one voice capture stream.
 pub struct VoiceCaptureSFramePipeline<S> {
     encoder: OpusAudioEncoder,
     bridge: RustTransformBridge,
     sink: S,
+    muted: bool,
 }
 
 impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
@@ -412,14 +427,32 @@ impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
             encoder,
             bridge,
             sink,
+            muted: false,
         }
     }
 
-    /// Encode, protect, and send exactly one captured audio frame.
-    pub fn capture_encode_protect_send(
+    /// Set local media-path mute state. When muted, captured PCM is discarded before encode.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    /// Current local media-path mute state.
+    #[must_use]
+    pub const fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Apply mute control, or encode/protect/send exactly one captured audio frame.
+    pub fn capture_encode_protect_or_mute(
         &mut self,
         frame: CapturedAudioFrame,
-    ) -> Result<VoiceCaptureSendReport, MediaError> {
+    ) -> Result<VoiceCaptureSendOutcome, MediaError> {
+        if self.muted {
+            return Ok(VoiceCaptureSendOutcome::Muted {
+                captured_at_ms: frame.captured_at_ms,
+                dropped_pcm_samples: frame.pcm_i16.len(),
+            });
+        }
         let encoded = self.encoder.encode(frame)?;
         let sequence = encoded.sequence;
         let captured_at_ms = encoded.captured_at_ms;
@@ -436,7 +469,18 @@ impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
             counter: protected.counter,
         };
         self.sink.send_protected_media_frame(protected)?;
-        Ok(report)
+        Ok(VoiceCaptureSendOutcome::Sent(report))
+    }
+
+    /// Encode, protect, and send exactly one captured audio frame; fail closed if muted.
+    pub fn capture_encode_protect_send(
+        &mut self,
+        frame: CapturedAudioFrame,
+    ) -> Result<VoiceCaptureSendReport, MediaError> {
+        match self.capture_encode_protect_or_mute(frame)? {
+            VoiceCaptureSendOutcome::Sent(report) => Ok(report),
+            VoiceCaptureSendOutcome::Muted { .. } => Err(MediaError::MediaMuted),
+        }
     }
 
     /// Consume the pipeline and return the transport sink for verification or shutdown.
@@ -546,6 +590,48 @@ mod tests {
         let sink = pipeline.into_sink();
         assert_eq!(sink.sent.len(), 1);
         assert_ne!(sink.sent[0].bytes, original_opus);
+        Ok(())
+    }
+
+    #[test]
+    fn mute_control_suppresses_pcm_before_encode_or_transport() -> Result<(), MediaError> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let mut pipeline = VoiceCaptureSFramePipeline::new(
+            OpusAudioEncoder::new(format)?,
+            media_bridge()?,
+            RecordingSink::default(),
+        );
+        pipeline.set_muted(true);
+        let muted = pipeline.capture_encode_protect_or_mute(CapturedAudioFrame::new(
+            sine_frame(format),
+            format,
+            3_000,
+        )?)?;
+        assert_eq!(
+            muted,
+            VoiceCaptureSendOutcome::Muted {
+                captured_at_ms: 3_000,
+                dropped_pcm_samples: format.interleaved_samples_per_frame(),
+            }
+        );
+        assert_eq!(
+            pipeline.capture_encode_protect_send(CapturedAudioFrame::new(
+                sine_frame(format),
+                format,
+                3_020,
+            )?),
+            Err(MediaError::MediaMuted)
+        );
+        assert!(pipeline.is_muted());
+        pipeline.set_muted(false);
+        let report = pipeline.capture_encode_protect_send(CapturedAudioFrame::new(
+            sine_frame(format),
+            format,
+            3_040,
+        )?)?;
+        assert_eq!(report.sequence, 0);
+        let sink = pipeline.into_sink();
+        assert_eq!(sink.sent.len(), 1);
         Ok(())
     }
 

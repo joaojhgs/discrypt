@@ -135,6 +135,9 @@ pub enum MediaError {
     /// Decoded audio could not be queued to playback.
     #[error("playback failed: {0}")]
     PlaybackFailed(String),
+    /// Outbound media frame was suppressed because media-path mute is active.
+    #[error("outbound media muted")]
+    MediaMuted,
     /// Protected media frame could not be handed to the transport sink.
     #[error("media transport failed: {0}")]
     MediaTransportFailed(String),

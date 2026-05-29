@@ -20,7 +20,7 @@ pub mod transport;
 pub use capture::{
     AudioCaptureFormat, CapturedAudioFrame, DecodedAudioFrame, EncodedOpusFrame, OpusAudioDecoder,
     OpusAudioEncoder, PlaybackAudioSink, ProtectedMediaFrameSink, VoiceCaptureSFramePipeline,
-    VoiceCaptureSendReport, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
+    VoiceCaptureSendOutcome, VoiceCaptureSendReport, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
 };
 pub use sframe::{
     MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameKey, SFrameReceiver,

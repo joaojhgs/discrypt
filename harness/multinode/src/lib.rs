@@ -32,6 +32,8 @@ pub struct MediaSecuritySmoke {
     pub capture_opus_sframe_protected: bool,
     /// Protected voice frames verify, decode, pass jitter ordering, and reach playback.
     pub receive_decode_jitter_playback_ready: bool,
+    /// Media-path mute suppresses outbound PCM before encode/protect/transport.
+    pub mute_suppresses_outbound_media: bool,
     /// Receiver plaintext after successful authentication and replay acceptance.
     pub plaintext: Vec<u8>,
 }
@@ -230,6 +232,7 @@ impl MediaSecuritySmoke {
             && self.tamper_rejected
             && self.capture_opus_sframe_protected
             && self.receive_decode_jitter_playback_ready
+            && self.mute_suppresses_outbound_media
     }
 }
 
@@ -380,7 +383,8 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, DecodedAudioFrame,
         MediaKeyRegistry, OpusAudioDecoder, OpusAudioEncoder, PlaybackAudioSink,
         ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender,
-        SenderBinding, VoiceCaptureSFramePipeline, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
+        SenderBinding, VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceJitterBuffer,
+        VoiceReceiveSFramePipeline,
     };
     use discrypt_relay_overlay::integrity::{
         contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
@@ -521,12 +525,41 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         && playback_sink.played[0].sender.epoch == 11
         && playback_sink.played[0].pcm_i16.len() == capture_format.interleaved_samples_per_frame();
 
+    let mute_binding =
+        SenderBinding::derive_for_epoch(&[13; 32], "harness-muted-send", 13, 1, "muted-device")?;
+    let mute_sender = SFrameSender::new(&[13; 32], mute_binding.clone())?;
+    let mut mute_registry = MediaKeyRegistry::new();
+    mute_registry.register_sender(&[13; 32], mute_binding)?;
+    let mut muted_pipeline = VoiceCaptureSFramePipeline::new(
+        OpusAudioEncoder::new(capture_format)?,
+        RustTransformBridge::new(
+            mute_sender,
+            SFrameReceiver::new(mute_registry, ReplayWindow::default()),
+        ),
+        HarnessMediaSink::default(),
+    );
+    muted_pipeline.set_muted(true);
+    let mute_outcome = muted_pipeline.capture_encode_protect_or_mute(CapturedAudioFrame::new(
+        vec![0; capture_format.interleaved_samples_per_frame()],
+        capture_format,
+        888,
+    )?)?;
+    let mute_sink = muted_pipeline.into_sink();
+    let mute_suppresses_outbound_media = matches!(
+        mute_outcome,
+        VoiceCaptureSendOutcome::Muted {
+            captured_at_ms: 888,
+            dropped_pcm_samples
+        } if dropped_pcm_samples == capture_format.interleaved_samples_per_frame()
+    ) && mute_sink.sent.is_empty();
+
     Ok(MediaSecuritySmoke {
         passive_relay_cannot_read,
         replay_rejected,
         tamper_rejected,
         capture_opus_sframe_protected,
         receive_decode_jitter_playback_ready,
+        mute_suppresses_outbound_media,
         plaintext: opened.plaintext,
     })
 }
@@ -2351,6 +2384,7 @@ mod tests {
                 tamper_rejected: true,
                 capture_opus_sframe_protected: true,
                 receive_decode_jitter_playback_ready: true,
+                mute_suppresses_outbound_media: true,
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
         ));
