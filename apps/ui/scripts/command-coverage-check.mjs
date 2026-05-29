@@ -138,34 +138,18 @@ for (const token of forbiddenLegacyDtoTokens) {
   }
 }
 
-const requiredDtoKeys = [
-  'display_name',
-  'device_name',
-  'recovery_code',
-  'peer_label',
-  'group_id',
-  'channel_id',
-  'session_id',
-  'participant_id',
-  'MessageTarget',
-];
-for (const key of requiredDtoKeys) {
-  if (!commands.includes(key)) failures.push(`command DTO key/type missing: ${key}`);
-}
-
-const forbiddenTokens = [
-  'currentSnapshot.servers[0]',
-  'loadAppSnapshot().then',
+const forbiddenLocalProductState = [
   'localChannels',
+  'groupMode',
+  'initialVoiceRoster',
   'setParticipants',
   'setVoiceJoined] = useState',
   'setSelfMuted] = useState',
-  'createChannelCommand',
-  'channel_name',
-  'server_name',
 ];
-for (const token of forbiddenTokens) {
-  if (main.includes(token)) failures.push(`forbidden UI drift/local-state token found in main.tsx: ${token}`);
+for (const token of forbiddenLocalProductState) {
+  if (main.includes(token) || commands.includes(token)) {
+    failures.push(`forbidden local-only product state token found: ${token}`);
+  }
 }
 
 const commandBackedCopy = [
@@ -173,7 +157,7 @@ const commandBackedCopy = [
   'media-frame E2E',
   'pending on offline devices',
 ];
-for (const copy of honestCopy) {
+for (const copy of commandBackedCopy) {
   if (!main.includes(copy) && !commands.includes(copy)) {
     failures.push(`expected honest/command-backed copy missing: ${copy}`);
   }

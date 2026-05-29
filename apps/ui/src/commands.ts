@@ -1,5 +1,4 @@
 export type ChannelKind = "Text" | "Voice";
-export type LifecycleStage = "needs_identity" | "ready";
 
 export type FriendView = {
   alias: string;
@@ -15,16 +14,16 @@ export type DeviceView = {
   authorized: boolean;
 };
 
-export type LegacyChannelView = {
+export type ChannelView = {
   name: string;
   kind: ChannelKind;
   retention_status: string;
 };
 
-export type LegacyServerView = {
+export type ServerView = {
   name: string;
   role: string;
-  channels: LegacyChannelView[];
+  channels: ChannelView[];
 };
 
 export type InviteFlowView = {
@@ -68,6 +67,14 @@ export type PreferencesView = {
   template_id: string;
 };
 
+export type MessageView = {
+  id: string;
+  channel: string;
+  author: string;
+  body: string;
+  state: string;
+};
+
 export type ConnectivityView = {
   fallback_chain: string;
   metadata_copy: string;
@@ -84,13 +91,13 @@ export type AppSnapshot = {
   schema_version: number;
   friend: FriendView;
   devices: DeviceView[];
-  servers: LegacyServerView[];
+  servers: ServerView[];
   invite: InviteFlowView;
   retention: RetentionSettingsView;
   voice: VoiceRoomView;
   voice_session: SnapshotVoiceSessionView;
   preferences: PreferencesView;
-  messages: unknown[];
+  messages: MessageView[];
   activity_feed: string[];
   connectivity: ConnectivityView;
   security_copy: SecurityCopyView;
@@ -229,6 +236,7 @@ export type CreateInviteRequest = {
   expires: string;
   max_use: string;
 };
+
 export type CreateChannelRequest = {
   group_id: string;
   name: string;
@@ -287,7 +295,11 @@ type TauriInvoke = <T>(
 
 declare global {
   interface Window {
-    __TAURI__?: { core?: { invoke?: TauriInvoke } };
+    __TAURI__?: {
+      core?: {
+        invoke?: TauriInvoke;
+      };
+    };
   }
 }
 
@@ -457,15 +469,11 @@ function invokeOrFallback<T>(
   args: Record<string, unknown> | undefined,
   fallback: () => T,
 ): Promise<T> {
-  const tauriInvoke = invoke();
-  if (tauriInvoke) {
-    return tauriInvoke<T>(command, args);
+  const tauriInvoke = window.__TAURI__?.core?.invoke;
+  if (!tauriInvoke) {
+    return Promise.resolve(fallback());
   }
-  return cloneState(fallback() as T);
-}
-
-export async function loadAppState(): Promise<AppStateView> {
-  return invokeOrFallback<AppStateView>("app_state", undefined, () => fallbackState);
+  return tauriInvoke<T>(command, args);
 }
 
 function mutateFallback(update: (state: AppState) => void): AppState {
@@ -845,197 +853,4 @@ export async function resetAppState(): Promise<AppState> {
     ];
     return cloneState(syncSnapshot(fallbackState));
   });
-}
-
-export async function joinVoice(request: JoinVoiceRequest): Promise<AppStateView> {
-  return invokeOrFallback("join_voice", { request }, () => {
-    let session = fallbackState.voice_sessions.find(
-      (item) => item.group_id === request.group_id && item.channel_id === request.channel_id,
-    );
-    if (!session) {
-      session = {
-        session_id: stableId("voice", `${request.group_id}-${request.channel_id}`),
-        group_id: request.group_id,
-        channel_id: request.channel_id,
-        joined: false,
-        self_muted: false,
-        participants: defaultVoiceParticipants(fallbackState.user?.display_name ?? "You"),
-        route: "local voice session only; production media path waits for adapter/E2E gates",
-      };
-      fallbackState.voice_sessions.push(session);
-    }
-    fallbackState.voice_sessions.forEach((item) => {
-      item.joined = false;
-      item.participants.forEach((participant) => (participant.speaking = false));
-    });
-    session.joined = true;
-    session.self_muted = false;
-    session.participants[0].speaking = true;
-    fallbackState.active_voice_session_id = session.session_id;
-    pushEvent("voice.joined", "Joined voice session");
-    return fallbackState;
-  });
-}
-
-export async function leaveVoice(request: LeaveVoiceRequest): Promise<AppStateView> {
-  return invokeOrFallback("leave_voice", { request }, () => {
-    const session = fallbackState.voice_sessions.find((item) => item.session_id === request.session_id);
-    if (session) {
-      session.joined = false;
-      session.participants.forEach((participant) => (participant.speaking = false));
-    }
-    if (fallbackState.active_voice_session_id === request.session_id) fallbackState.active_voice_session_id = null;
-    pushEvent("voice.left", "Left voice session");
-    return fallbackState;
-  });
-}
-
-export async function setSelfMute(request: SelfMuteRequest): Promise<AppStateView> {
-  return invokeOrFallback("set_self_mute", { request }, () => {
-    const session = fallbackState.voice_sessions.find((item) => item.session_id === request.session_id);
-    if (session) {
-      session.self_muted = request.muted;
-      const self = session.participants.find((participant) => participant.id === "local");
-      if (self) {
-        self.muted = request.muted;
-        self.speaking = session.joined && !request.muted;
-      }
-    }
-    return fallbackState;
-  });
-}
-
-export async function setSpeakerVolume(request: SpeakerVolumeRequest): Promise<AppStateView> {
-  return invokeOrFallback("set_speaker_volume", { request }, () => {
-    const session = fallbackState.voice_sessions.find((item) => item.session_id === request.session_id);
-    const participant = session?.participants.find((item) => item.id === request.participant_id);
-    if (participant) participant.volume = Math.max(0, Math.min(100, request.volume));
-    return fallbackState;
-  });
-}
-
-function createFallbackState(): AppStateView {
-  return {
-    snapshot: {
-      schema_version: 2,
-      friend: {
-        alias: "Bob",
-        friend_code: "friend:bob:stable-fixture",
-        safety_number: "0231 1597 2653 5897",
-        verified: false,
-      },
-      devices: [
-        { device_id: "local-device", leaf_index: 1, local: true, authorized: true },
-      ],
-      servers: [],
-      invite: {
-        expires: "Invite expires and can be revoked",
-        max_use: "Max-use is enforced before MLS admission",
-        password_gate: "Password rooms require online authorization; no offline verifier",
-        welcome_required: "Final admission still requires an authorized MLS Welcome/add",
-      },
-      retention: {
-        presets: ["1 hour", "24 hours", "7 days", "30 days", "90 days"],
-        selected: "7 days",
-        unlimited_warning: "Unlimited keeps local keys longer and weakens lock behavior; opt in explicitly",
-        transition_copy: "Shortening re-locks older messages retroactively; lengthening applies only to future messages",
-      },
-      voice: {
-        route: "STUN → peer relay overlay → TURN",
-        relay_copy: "Relays see SFrame ciphertext only after harness gates; production media is not claimed yet",
-        android_path: "Android QR/device pairing is future work in this build",
-      },
-      voice_session: {},
-      preferences: { theme_id: "graphite-calm", template_id: "command-center" },
-      messages: [],
-      activity_feed: [],
-      connectivity: {
-        fallback_chain: "local harness → socket adapter → production relay",
-        metadata_copy: "Metadata is minimized but this build does not claim anonymity",
-        push_copy: "Push wake is harnessed only",
-      },
-      security_copy: {
-        metadata: "Metadata is minimized but this build does not claim anonymity",
-        deletion: "Deletion is cooperative and pending on offline devices",
-        malicious_member: "A malicious recipient can copy plaintext after decryption",
-      },
-    },
-    lifecycle: "needs_identity",
-    user: null,
-    preferences: { theme_id: "graphite-calm", template_id: "command-center" },
-    dms: [],
-    groups: [],
-    active_group_id: null,
-    active_dm_id: null,
-    messages: [],
-    voice_sessions: [],
-    active_voice_session_id: null,
-    events: [{ sequence: 1, kind: "app.needs_identity", summary: "Choose create user or recover user" }],
-    active_invite: null,
-    recovery_copy: "Recovery is local-only in this build. QR/cross-device recovery is not enabled yet; do not assume remote history or content-key restoration.",
-  };
-}
-
-function ensureFallbackReady() {
-  if (fallbackState.dms.length === 0) {
-    fallbackState.dms.push({ dm_id: stableId("dm", "Bob"), peer_label: "Bob" });
-    fallbackState.active_dm_id = fallbackState.dms[0].dm_id;
-  }
-  if (fallbackState.groups.length === 0) {
-    const group_id = stableId("group", "discrypt lab");
-    fallbackState.groups.push({ group_id, name: "discrypt lab", role: "owner", channels: defaultChannels("7 days"), invite_codes: [] });
-    fallbackState.active_group_id = group_id;
-  }
-  fallbackState.groups.forEach((group) => {
-    group.channels
-      .filter((channel) => channel.kind === "Voice")
-      .forEach((channel) => {
-        const session_id = stableId("voice", `${group.group_id}-${channel.channel_id}`);
-        if (!fallbackState.voice_sessions.some((session) => session.session_id === session_id)) {
-          fallbackState.voice_sessions.push({
-            session_id,
-            group_id: group.group_id,
-            channel_id: channel.channel_id,
-            joined: false,
-            self_muted: false,
-            participants: defaultVoiceParticipants(fallbackState.user?.display_name ?? "You"),
-            route: "local voice session only; production media path waits for adapter/E2E gates",
-          });
-        }
-      });
-  });
-}
-
-function defaultChannels(retention: string): AppChannelView[] {
-  return [
-    { channel_id: stableId("channel", "general"), name: "#general", kind: "Text", retention_status: retention || "7 days" },
-    {
-      channel_id: stableId("channel", "voice-lobby"),
-      name: "Voice Lobby",
-      kind: "Voice",
-      retention_status: "Session-state only; media-frame E2E gate required before production voice claims",
-    },
-  ];
-}
-
-function defaultVoiceParticipants(displayName: string): VoiceParticipantView[] {
-  return [
-    { id: "local", name: displayName || "You", role: "you", speaking: false, muted: false, volume: 100 },
-    { id: "peer-bob", name: "Bob", role: "peer", speaking: false, muted: false, volume: 72 },
-    { id: "relay", name: "Relay route", role: "route", speaking: false, muted: true, volume: 40 },
-  ];
-}
-
-function pushEvent(kind: string, summary: string) {
-  fallbackState.events.unshift({ sequence: fallbackState.events.length + 1, kind, summary });
-  fallbackState.events = fallbackState.events.slice(0, 24);
-}
-
-function stableId(prefix: string, value: string): string {
-  const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  return `${prefix}-${normalized || "local"}`;
-}
-
-function cloneState<T>(value: T): T {
-  return typeof structuredClone === "function" ? structuredClone(value) : JSON.parse(JSON.stringify(value));
 }

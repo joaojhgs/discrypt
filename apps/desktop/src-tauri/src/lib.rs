@@ -8,7 +8,7 @@ use discrypt_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 
@@ -160,7 +160,7 @@ pub struct VoiceParticipantView {
     pub role: String,
     /// Whether the participant is currently speaking.
     pub speaking: bool,
-    /// Whether this participant is muted.
+    /// Whether the participant is muted.
     pub muted: bool,
     /// Local speaker volume 0-100.
     pub volume: u8,
@@ -392,7 +392,7 @@ struct PersistedAppState {
     next_sequence: u64,
 }
 
-static APP_STATE: OnceLock<Result<Mutex<PersistedAppState>, String>> = OnceLock::new();
+static APP_STATE: OnceLock<Mutex<PersistedAppState>> = OnceLock::new();
 
 /// Tauri command: return the transitional compatibility snapshot for older clients.
 pub fn app_snapshot() -> AppSnapshot {
@@ -400,51 +400,8 @@ pub fn app_snapshot() -> AppSnapshot {
 }
 
 /// Tauri command: return the full command-backed app state for the React shell.
-pub fn app_state() -> Result<AppStateView, String> {
-    with_state(PersistedAppState::to_view)
-}
-
-/// Tauri command: create a new local user profile.
-pub fn create_user(request: CreateUserRequest) -> Result<AppStateView, String> {
-    mutate_state(|state| {
-        let display_name = normalize_label(&request.display_name, "Alice");
-        let device_name = normalize_label(&request.device_name, "this device");
-        state.user = Some(UserIdentityView {
-            user_id: stable_id("user", &display_name),
-            display_name: display_name.clone(),
-            device_name,
-            recovery_hint: "Local recovery placeholder created on this device; QR/cross-device recovery is not enabled yet.".to_owned(),
-        });
-        state.lifecycle = LifecycleStage::Ready;
-        ensure_default_collaboration_state(state, &display_name);
-        state.push_event(
-            "identity.created",
-            format!("Created local user {display_name}"),
-        );
-        Ok(())
-    })
-}
-
-/// Tauri command: recover/select an existing local user placeholder.
-pub fn recover_user(request: RecoverUserRequest) -> Result<AppStateView, String> {
-    mutate_state(|state| {
-        let display_name = normalize_label(&request.display_name, "Recovered user");
-        let device_name = normalize_label(&request.device_name, "recovered device");
-        let code = normalize_label(&request.recovery_code, "manual-local-recovery");
-        state.user = Some(UserIdentityView {
-            user_id: stable_id("user", &format!("{display_name}-{code}")),
-            display_name: display_name.clone(),
-            device_name,
-            recovery_hint: "Recovered a local profile placeholder only. This build does not claim QR, backup, or cross-device content-key recovery.".to_owned(),
-        });
-        state.lifecycle = LifecycleStage::Ready;
-        ensure_default_collaboration_state(state, &display_name);
-        state.push_event(
-            "identity.recovered",
-            "Recovered local user placeholder with honest copy",
-        );
-        Ok(())
-    })
+pub fn app_state() -> AppStateView {
+    with_state(|state| state.to_view())
 }
 
 /// Tauri command: create a new local user and unlock the shell.
@@ -473,9 +430,7 @@ pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
 }
 
 /// Tauri command: verify a user-confirmed safety-number comparison and persist success.
-pub fn verify_safety_number(
-    request: SafetyVerificationRequest,
-) -> Result<SafetyVerificationResult, String> {
+pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerificationResult {
     let result = core_verify_safety_number(request);
     if result.verified {
         mutate_state(|state| {
@@ -486,36 +441,17 @@ pub fn verify_safety_number(
             );
         });
     }
-    Ok(result)
+    result
 }
 
 /// Tauri command: save theme/template preferences.
-pub fn save_preferences(request: SavePreferencesRequest) -> Result<AppStateView, String> {
+pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
     mutate_state(|state| {
         state.preferences = UiPreferencesView {
             theme_id: normalize_label(&request.theme_id, DEFAULT_THEME_ID),
             template_id: normalize_label(&request.template_id, DEFAULT_TEMPLATE_ID),
         };
         state.push_event("preferences.saved", "Theme/template preferences saved");
-        Ok(())
-    })
-}
-
-/// Tauri command: start or open a direct-message timeline.
-pub fn start_dm(request: StartDmRequest) -> Result<AppStateView, String> {
-    mutate_state(|state| {
-        require_identity(state)?;
-        let peer_label = normalize_label(&request.peer_label, "Bob");
-        let dm_id = stable_id("dm", &peer_label);
-        if !state.dms.iter().any(|dm| dm.dm_id == dm_id) {
-            state.dms.push(DmView {
-                dm_id: dm_id.clone(),
-                peer_label: peer_label.clone(),
-            });
-        }
-        state.active_dm_id = Some(dm_id);
-        state.push_event("dm.opened", format!("Opened DM with {peer_label}"));
-        Ok(())
     })
 }
 
@@ -551,7 +487,7 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
 }
 
 /// Tauri command: create a local-first group and make it active.
-pub fn create_group(request: CreateGroupRequest) -> Result<AppStateView, String> {
+pub fn create_group(request: CreateGroupRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
         let name = normalize_label(&request.name, "private lab");
@@ -586,7 +522,7 @@ pub fn create_group(request: CreateGroupRequest) -> Result<AppStateView, String>
 }
 
 /// Tauri command: join a local-first group from an invite.
-pub fn join_group(request: JoinGroupRequest) -> Result<AppStateView, String> {
+pub fn join_group(request: JoinGroupRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
         let invite_code = normalize_label(&request.invite_code, "manual invite");
@@ -625,8 +561,8 @@ pub fn join_group(request: JoinGroupRequest) -> Result<AppStateView, String> {
     })
 }
 
-/// Tauri command: create a channel in a group.
-pub fn create_channel(request: CreateChannelRequest) -> Result<AppStateView, String> {
+/// Tauri command: create an invite for the active group.
+pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
         let Some(group_id) = request
@@ -711,9 +647,9 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
         state.ensure_ready_profile();
         let body = request.body.trim();
         if body.is_empty() {
-            return Err("message body must not be empty".to_owned());
+            state.push_event("message.rejected", "Empty message was not sent");
+            return;
         }
-        validate_message_target(state, &request.target)?;
         let sequence = state.next_sequence;
         let author = state
             .profile
@@ -726,15 +662,14 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             author_id: "local-user".to_owned(),
             author,
             body: body.to_owned(),
-            status: "local encrypted-message facade persisted; relay/network delivery not claimed"
-                .to_owned(),
+            status: "local encrypted author log; socket delivery not claimed".to_owned(),
             sent_at: format!("local-{sequence}"),
-        });
+        };
+        state.messages.push(message);
         state.push_event(
             "message.sent",
-            "Message persisted to local encrypted timeline facade",
+            "Message appended to local encrypted timeline facade",
         );
-        Ok(())
     })
 }
 
@@ -795,7 +730,7 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
 }
 
 /// Tauri command: persist local self-mute state.
-pub fn set_self_mute(request: SetSelfMuteRequest) -> Result<AppStateView, String> {
+pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
     mutate_state(|state| {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
@@ -818,7 +753,7 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> Result<AppStateView, String
 }
 
 /// Tauri command: persist a participant speaker volume.
-pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> Result<AppStateView, String> {
+pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
     mutate_state(|state| {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
@@ -834,13 +769,11 @@ pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> Result<AppStateVi
                 }
             }
         }
-        state.push_event("voice.volume", format!("Set speaker volume to {volume}"));
-        Ok(())
     })
 }
 
 /// Tauri command: return recent command-backed app events for polling clients.
-pub fn poll_app_events() -> Result<Vec<AppEventView>, String> {
+pub fn poll_app_events() -> Vec<AppEventView> {
     with_state(|state| state.events.clone())
 }
 
@@ -891,12 +824,12 @@ mod ipc_commands {
     use super::*;
 
     #[tauri::command]
-    pub(super) fn app_snapshot() -> Result<AppSnapshot, String> {
+    pub(super) fn app_snapshot() -> AppSnapshot {
         super::app_snapshot()
     }
 
     #[tauri::command]
-    pub(super) fn app_state() -> Result<AppStateView, String> {
+    pub(super) fn app_state() -> AppStateView {
         super::app_state()
     }
 
@@ -913,14 +846,12 @@ mod ipc_commands {
     #[tauri::command]
     pub(super) fn verify_safety_number(
         request: SafetyVerificationRequest,
-    ) -> Result<SafetyVerificationResult, String> {
+    ) -> SafetyVerificationResult {
         super::verify_safety_number(request)
     }
 
     #[tauri::command]
-    pub(super) fn save_preferences(
-        request: SavePreferencesRequest,
-    ) -> Result<AppStateView, String> {
+    pub(super) fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
         super::save_preferences(request)
     }
 
@@ -935,7 +866,7 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn join_group(request: JoinGroupRequest) -> Result<AppStateView, String> {
+    pub(super) fn join_group(request: JoinGroupRequest) -> AppStateView {
         super::join_group(request)
     }
 
@@ -950,7 +881,7 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn send_message(request: SendMessageRequest) -> Result<AppStateView, String> {
+    pub(super) fn send_message(request: SendMessageRequest) -> AppStateView {
         super::send_message(request)
     }
 
@@ -965,34 +896,32 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn set_self_mute(request: SetSelfMuteRequest) -> Result<AppStateView, String> {
+    pub(super) fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
         super::set_self_mute(request)
     }
 
     #[tauri::command]
-    pub(super) fn set_speaker_volume(
-        request: SetSpeakerVolumeRequest,
-    ) -> Result<AppStateView, String> {
+    pub(super) fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
         super::set_speaker_volume(request)
     }
 
     #[tauri::command]
-    pub(super) fn poll_app_events() -> Result<Vec<AppEventView>, String> {
+    pub(super) fn poll_app_events() -> Vec<AppEventView> {
         super::poll_app_events()
     }
 
     #[tauri::command]
-    pub(super) fn deletion_warning() -> Result<String, String> {
+    pub(super) fn deletion_warning() -> String {
         super::deletion_warning()
     }
 
     #[tauri::command]
-    pub(super) fn metadata_warning() -> Result<String, String> {
+    pub(super) fn metadata_warning() -> String {
         super::metadata_warning()
     }
 
     #[tauri::command]
-    pub(super) fn command_health() -> Result<CommandHealth, String> {
+    pub(super) fn command_health() -> CommandHealth {
         super::command_health()
     }
 
@@ -1036,6 +965,7 @@ pub fn run() {
 
 impl PersistedAppState {
     fn initial() -> Self {
+        let snapshot = core_app_snapshot();
         Self {
             schema_version: APP_STATE_SCHEMA_VERSION,
             lifecycle: AppLifecycle::FirstRun,
@@ -1245,32 +1175,25 @@ impl PersistedAppState {
     }
 }
 
-fn with_state<T>(read: impl FnOnce(&PersistedAppState) -> T) -> Result<T, String> {
-    let state = state_mutex()?;
+fn with_state<T>(read: impl FnOnce(&PersistedAppState) -> T) -> T {
+    let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
     let guard = state
         .lock()
-        .map_err(|_| "app state lock poisoned".to_owned())?;
-    Ok(read(&guard))
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    read(&guard)
 }
 
 fn mutate_state(update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
     let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
     let mut guard = state
         .lock()
-        .map_err(|_| "app state lock poisoned".to_owned())?;
-    update(&mut guard)?;
-    persist_state(&guard)?;
-    Ok(guard.to_view())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(&mut guard);
+    persist_state(&guard);
+    guard.to_view()
 }
 
-fn state_mutex() -> Result<&'static Mutex<PersistedAppState>, String> {
-    APP_STATE
-        .get_or_init(|| load_state().map(Mutex::new))
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-fn load_state() -> Result<PersistedAppState, String> {
+fn load_state() -> PersistedAppState {
     let path = state_path();
     if let Ok(contents) = fs::read_to_string(path) {
         if let Ok(state) = serde_json::from_str::<PersistedAppState>(&contents) {
@@ -1278,19 +1201,12 @@ fn load_state() -> Result<PersistedAppState, String> {
                 return state;
             }
         }
-    };
-    normalize_loaded_state(&mut state);
-    persist_state(&state)?;
-    Ok(state)
+    }
+    PersistedAppState::initial()
 }
 
-fn persist_state(state: &PersistedAppState) -> Result<(), String> {
+fn persist_state(state: &PersistedAppState) {
     let path = state_path();
-    atomic_write_json(&path, state)
-        .map_err(|error| format!("failed to persist app state at {}: {error}", path.display()))
-}
-
-fn atomic_write_json(path: &Path, state: &PersistedAppState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -1300,12 +1216,6 @@ fn atomic_write_json(path: &Path, state: &PersistedAppState) -> std::io::Result<
             let _ = fs::rename(tmp, path);
         }
     }
-    let encoded = serde_json::to_vec_pretty(state)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, encoded)?;
-    fs::rename(tmp, path)?;
-    Ok(())
 }
 
 fn state_path() -> PathBuf {
@@ -1384,7 +1294,7 @@ fn normalize_label(value: &str, fallback: &str) -> String {
 }
 
 fn normalize_channel_name(value: &str, kind: ChannelKind) -> String {
-    let trimmed = normalize_label(value.trim_start_matches('#'), "general");
+    let trimmed = normalize_label(value.trim_start_matches('#'), "secure-room");
     match kind {
         ChannelKind::Text => format!("#{trimmed}"),
         ChannelKind::Voice => trimmed,
