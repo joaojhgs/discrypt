@@ -442,6 +442,18 @@ if (!main.includes("TransportStatusStrip")) {
 if (!main.includes("Backend-derived state only")) {
   failures.push("transport status UI must explain that connectivity claims require backend evidence");
 }
+for (const inviteUiToken of [
+  "Latest invite descriptor",
+  "Signaling endpoint",
+  "Revocation status",
+  "Password-gate status",
+  "MLS admission state",
+  "Max-use limit",
+]) {
+  if (!main.includes(inviteUiToken)) {
+    failures.push(`invite UI missing production metadata surface: ${inviteUiToken}`);
+  }
+}
 if (!main.includes("Danger zone") || !main.includes("resetPhrase !== RESET_APP_CONFIRMATION_PHRASE")) {
   failures.push("UI must gate destructive reset behind the typed danger-zone confirmation phrase");
 }

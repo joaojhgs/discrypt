@@ -1619,35 +1619,7 @@ function JoinPanel({
             ) : null}
           </div>
           {latestInvite ? (
-            <div className="rounded-2xl border border-emerald-300/30 bg-emerald-300/10 p-4 text-sm text-emerald-100">
-              <p className="font-medium">Latest invite</p>
-              <p className="mt-1 break-all font-mono text-xs">
-                {latestInvite.code}
-              </p>
-              <div className="mt-3 grid gap-2 text-xs text-emerald-50/85 sm:grid-cols-2">
-                <span>Invite key: {latestInvite.invite_key}</span>
-                <span>Expires: {latestInvite.expires_at}</span>
-                <span>Max uses: {latestInvite.max_use}</span>
-                <span>Uses: {latestInvite.uses}</span>
-                <span>
-                  Signaling: {latestInvite.signaling_endpoint || "not provided"}
-                </span>
-                <span>
-                  Endpoint policy: {latestInvite.endpoint_policy || "unknown"}
-                </span>
-              </div>
-              <p className="mt-2 break-all text-[11px] text-emerald-50/70">
-                Signaling trust:{" "}
-                {latestInvite.signaling_trust_status || "not provided"}
-              </p>
-              <p className="mt-2 break-all text-[11px] text-emerald-50/70">
-                Signaling fingerprint:{" "}
-                {latestInvite.signaling_trust_fingerprint || "not provided"}
-              </p>
-              <p className="mt-2 break-all text-[11px] text-emerald-50/70">
-                Room secret commitment: {latestInvite.room_secret_hash}
-              </p>
-            </div>
+            <InviteDetailCard invite={latestInvite} snapshot={snapshot} />
           ) : null}
         </CardContent>
       </Card>
@@ -1664,6 +1636,134 @@ function JoinPanel({
           />
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function InviteDetailCard({
+  invite,
+  snapshot,
+}: {
+  invite: InviteView;
+  snapshot: AppSnapshot;
+}) {
+  const maxUsesNumber = Number(invite.max_use.match(/\d+/)?.[0] ?? 0);
+  const remainingUses = maxUsesNumber
+    ? Math.max(0, maxUsesNumber - invite.uses)
+    : null;
+  const revocationStatus = invite.revoked
+    ? "revoked locally"
+    : "usable while expiry and max-use checks pass";
+  const passwordGateStatus = snapshot.invite.password_gate;
+  const mlsAdmissionState = invite.admission_copy || snapshot.invite.welcome_required;
+  return (
+    <Card className="border-emerald-300/25 bg-emerald-300/8 text-emerald-50">
+      <CardHeader className="gap-3 pb-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <CardTitle className="text-base text-emerald-50">
+              Latest invite descriptor
+            </CardTitle>
+            <CardDescription className="text-emerald-50/75">
+              Signaling, limits, revocation, password-gate, and MLS admission
+              state are shown from command state.
+            </CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={invite.revoked ? "warning" : "success"}>
+              {invite.revoked ? "revoked" : "not revoked"}
+            </Badge>
+            <Badge variant="secondary">uses {invite.uses}</Badge>
+          </div>
+        </div>
+        <p className="break-all rounded-xl border border-emerald-300/20 bg-black/20 p-3 font-mono text-xs text-emerald-50/90">
+          {invite.code}
+        </p>
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        <div className="grid gap-3 md:grid-cols-2">
+          <InviteFact label="Signaling endpoint" value={invite.signaling_endpoint || "not provided"} />
+          <InviteFact label="Endpoint policy" value={invite.endpoint_policy || "unknown"} />
+          <InviteFact label="Expiry label" value={invite.expires} />
+          <InviteFact label="Expires at" value={invite.expires_at || "not provided"} />
+          <InviteFact label="Max-use limit" value={invite.max_use} />
+          <InviteFact
+            label="Remaining local uses"
+            value={remainingUses === null ? "not parsed" : String(remainingUses)}
+          />
+          <InviteFact label="Revocation status" value={revocationStatus} />
+          <InviteFact label="Password-gate status" value={passwordGateStatus} />
+        </div>
+        <div className="grid gap-3 lg:grid-cols-2">
+          <InviteFact label="MLS admission state" value={mlsAdmissionState} />
+          <InviteFact
+            label="Signaling trust"
+            value={invite.signaling_trust_status || "not provided"}
+          />
+          <InviteFact
+            label="Trust fingerprint"
+            value={invite.signaling_trust_fingerprint || "not provided"}
+            mono
+          />
+          <InviteFact
+            label="Room secret commitment"
+            value={invite.room_secret_hash || "not provided"}
+            mono
+          />
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <InviteFact
+            label="ICE/STUN metadata"
+            value={
+              invite.ice_stun_servers.length
+                ? invite.ice_stun_servers.join(", ")
+                : "not provided"
+            }
+          />
+          <InviteFact
+            label="TURN metadata"
+            value={
+              invite.ice_turn_servers.length
+                ? invite.ice_turn_servers
+                    .map((server) =>
+                      `${server.endpoint} (${
+                        server.credential_declared
+                          ? "redacted credential declared"
+                          : "no raw credential exposed"
+                      })`,
+                    )
+                    .join(", ")
+                : "not provided"
+            }
+          />
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function InviteFact({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="min-w-0 rounded-xl border border-emerald-300/15 bg-black/15 p-3">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-50/60">
+        {label}
+      </p>
+      <p
+        className={cn(
+          "mt-1 break-words text-sm leading-6 text-emerald-50/90",
+          mono && "font-mono text-xs",
+        )}
+      >
+        {value}
+      </p>
     </div>
   );
 }
