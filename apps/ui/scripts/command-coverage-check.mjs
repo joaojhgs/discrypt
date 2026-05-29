@@ -302,6 +302,15 @@ if (
 if (!commands.includes('"app_state"')) {
   failures.push("frontend command client must invoke app_state");
 }
+if (!commands.includes("RESET_APP_CONFIRMATION_PHRASE")) {
+  failures.push("resetAppState must require the shared destructive confirmation phrase");
+}
+if (!commands.includes('"confirmation_required"')) {
+  failures.push("resetAppState fallback must surface typed confirmation_required errors");
+}
+if (commands.includes('export async function resetAppState(): Promise<AppState>')) {
+  failures.push("resetAppState must not be callable without an explicit confirmation request");
+}
 
 const forbiddenLegacyDtoTokens = [
   "server_name: string",
@@ -419,6 +428,9 @@ if (!rust.includes("honest_copy_ready")) {
 }
 if (!commands.includes("honest_copy_ready")) {
   failures.push("TS CommandHealth must carry honest_copy_ready for copy gates");
+}
+if (!main.includes("Danger zone") || !main.includes("resetPhrase !== RESET_APP_CONFIRMATION_PHRASE")) {
+  failures.push("UI must gate destructive reset behind the typed danger-zone confirmation phrase");
 }
 
 const commandBackedCopy = [

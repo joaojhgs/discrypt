@@ -3391,6 +3391,78 @@ mod tests {
     }
 
     #[test]
+    fn tauri_command_integration_exercises_real_service_and_event_stream() -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("command-integration-real-service");
+        let created = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        assert_eq!(created.lifecycle, AppLifecycle::Ready);
+        let group = create_group(CreateGroupRequest {
+            name: "Integration Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group created through command service".to_owned())?;
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "ops".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        let channel_id = channel_state
+            .groups
+            .first()
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Text)
+            })
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel created through command service".to_owned())?;
+        let messaged = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id.clone()),
+                channel_id: Some(channel_id),
+            },
+            body: "service-backed command path".to_owned(),
+        });
+        assert!(messaged.last_command_error.is_none());
+        assert_eq!(app_state().messages.len(), 1);
+        let events = poll_app_events(Some(PollAppEventsRequest {
+            after: Some(0),
+            kinds: vec!["group".to_owned(), "message".to_owned()],
+            limit: Some(16),
+        }));
+        assert!(events
+            .events
+            .iter()
+            .any(|event| event.kind == "message.sent"));
+        assert!(path.exists());
+        let persisted = fs::read_to_string(path).map_err(|err| err.to_string())?;
+        assert!(persisted.contains("service-backed command path"));
+        Ok(())
+    }
+
+    #[test]
+    fn production_adapter_conformance_integration_mode_is_cfg_audited() {
+        let _guard = test_lock();
+        let path = fresh_state_path("production-adapter-env");
+        std::env::set_var("DISCRYPT_APP_STATE_PATH", &path);
+        let production_path = app_store_path_with_env_override(false);
+        assert_ne!(production_path, path);
+        assert!(production_path.ends_with(APP_STATE_STORE_FILENAME));
+        assert!(!env_app_state_override_allowed() || cfg!(test));
+    }
+
+    #[test]
     fn command_health_covers_full_user_flow() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("health");
