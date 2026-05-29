@@ -20,6 +20,24 @@ test('first run creates user and empty shell does not blank', async ({ page }) =
   await expect(page.getByText(/no remote delivery is claimed/i).first()).toBeVisible();
 });
 
+
+test('direct message send stays command-backed', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (message) => {
+    if (message.type() === 'error') errors.push(message.text());
+  });
+
+  await page.getByRole('tab', { name: 'DMs' }).click();
+  await expect(page.getByText(/Bob/).first()).toBeVisible();
+  await page.getByLabel('Message').fill('DM ping from the local harness');
+  await page.getByRole('button', { name: /send dm message/i }).click();
+  await expect(page.getByText(/DM ping from the local harness/i)).toBeVisible();
+  await expect(page.getByText(/no remote delivery is claimed/i).first()).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+
 test('group invite text and voice leave regression remain on shell', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));

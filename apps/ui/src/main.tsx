@@ -156,6 +156,10 @@ function App() {
   const activeGroup = appState.active_context?.group_id
     ? appState.groups.find((group) => group.group_id === appState.active_context?.group_id) ?? appState.groups[0] ?? null
     : appState.groups[0] ?? null;
+  const activeDmId = appState.active_context?.dm_id ?? appState.dms[0]?.dm_id ?? null;
+  const activeDm = activeDmId
+    ? appState.dms.find((dm) => dm.dm_id === activeDmId) ?? appState.dms[0] ?? null
+    : appState.dms[0] ?? null;
   const activeServer = currentSnapshot.servers[0] ?? { name: 'No group selected', role: 'local profile', channels: [] };
   const textChannels = activeServer.channels.filter((channel) => channel.kind === 'Text');
   const voiceChannels = activeServer.channels.filter((channel) => channel.kind === 'Voice');
@@ -235,7 +239,7 @@ function App() {
 
   function sendCommandDm() {
     const body = draftMessage.trim();
-    const dm = appState.dms[0];
+    const dm = activeDm;
     if (!body || !dm) return;
     void applyCommand(sendMessage({
       target: { kind: 'dm', dm_id: dm.dm_id, group_id: null, channel_id: null },
@@ -370,7 +374,7 @@ function App() {
                 <SetupPanel snapshot={currentSnapshot} completedSteps={completedSteps} verifyMessage={verifyMessage} onVerify={confirmSafetyNumber} />
               </TabsContent>
               <TabsContent value="dm">
-                <DmPanel dms={appState.dms} messages={appState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
+                <DmPanel activeDm={activeDm} messages={appState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
               </TabsContent>
               <TabsContent value="join">
                 <JoinPanel snapshot={currentSnapshot} onJoin={joinCommandGroup} onCreateInvite={createCommandInvite} />
@@ -985,7 +989,7 @@ function SetupPanel({
 }
 
 function DmPanel({
-  dms,
+  activeDm,
   messages,
   draftDmName,
   setDraftDmName,
@@ -994,7 +998,7 @@ function DmPanel({
   onStartDm,
   onSendDm,
 }: {
-  dms: { dm_id: string; display_name: string; local_only_copy: string }[];
+  activeDm: { dm_id: string; display_name: string; local_only_copy: string } | null;
   messages: { message_id: string; target: { dm_id: string | null }; author: string; body: string; status: string }[];
   draftDmName: string;
   setDraftDmName: (value: string) => void;
@@ -1003,7 +1007,6 @@ function DmPanel({
   onStartDm: () => void;
   onSendDm: () => void;
 }) {
-  const activeDm = dms[0] ?? null;
   const visibleMessages = activeDm
     ? messages.filter((message) => message.target.dm_id === activeDm.dm_id)
     : [];
