@@ -121,6 +121,48 @@ pub struct ConstructedOverlayRoute {
     pub manager_epoch: u64,
 }
 
+/// Reason a topology edge is being changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyChangeReason {
+    /// Initial or trusted topology setup; not rate-limited.
+    Bootstrap,
+    /// Planned reparent caused by metric/ranking churn; rate-limited.
+    PlannedReparent,
+    /// Hard failure recovery; bypasses churn damping.
+    HardFailure,
+}
+
+/// Damping policy for planned topology churn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChurnDampingPolicy {
+    /// Minimum milliseconds between planned reparent/topology changes.
+    pub min_planned_change_interval_ms: u64,
+}
+
+impl Default for ChurnDampingPolicy {
+    fn default() -> Self {
+        Self {
+            min_planned_change_interval_ms: 30_000,
+        }
+    }
+}
+
+/// Accepted topology change report.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TopologyChangeReport {
+    /// Change reason.
+    pub reason: TopologyChangeReason,
+    /// Endpoint A in the new/updated edge.
+    pub a: String,
+    /// Endpoint B in the new/updated edge.
+    pub b: String,
+    /// Manager epoch after the accepted change.
+    pub manager_epoch: u64,
+    /// Next time a planned reparent may be accepted.
+    pub next_planned_change_allowed_at_ms: Option<u64>,
+}
+
 /// Errors returned by [`OverlayManager`].
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum OverlayManagerError {
@@ -136,6 +178,12 @@ pub enum OverlayManagerError {
     /// Route cannot satisfy hop, fanout, or capacity policy.
     #[error("overlay route capacity check failed: {0}")]
     RouteCapacity(String),
+    /// Planned topology change was blocked by churn damping.
+    #[error("planned overlay topology change damped until {next_allowed_at_ms}ms")]
+    ChurnDamped {
+        /// Earliest time the planned change may be retried.
+        next_allowed_at_ms: u64,
+    },
 }
 
 /// Stateful overlay routing manager fed by runtime metrics.
@@ -144,6 +192,8 @@ pub struct OverlayManager {
     topology: RelayTopology,
     observations: BTreeMap<String, RelayRuntimeObservation>,
     capabilities: CapabilityAdvertisementBook,
+    churn_policy: ChurnDampingPolicy,
+    last_planned_topology_change_ms: Option<u64>,
     failed_peers: BTreeSet<String>,
     epoch: u64,
 }
@@ -162,6 +212,8 @@ impl OverlayManager {
             topology,
             observations: BTreeMap::new(),
             capabilities: CapabilityAdvertisementBook::default(),
+            churn_policy: ChurnDampingPolicy::default(),
+            last_planned_topology_change_ms: None,
             failed_peers: BTreeSet::new(),
             epoch: 0,
         }
@@ -209,6 +261,47 @@ impl OverlayManager {
         self.topology.connect(a, b)?;
         self.bump_epoch();
         Ok(())
+    }
+
+    /// Set churn damping policy.
+    #[must_use]
+    pub fn with_churn_policy(mut self, churn_policy: ChurnDampingPolicy) -> Self {
+        self.churn_policy = churn_policy;
+        self
+    }
+
+    /// Connect peers with churn damping for planned reparenting.
+    pub fn connect_peers_with_churn_damping(
+        &mut self,
+        a: &str,
+        b: &str,
+        now_ms: u64,
+        reason: TopologyChangeReason,
+    ) -> Result<TopologyChangeReport, OverlayManagerError> {
+        if reason == TopologyChangeReason::PlannedReparent {
+            if let Some(last) = self.last_planned_topology_change_ms {
+                let next_allowed =
+                    last.saturating_add(self.churn_policy.min_planned_change_interval_ms);
+                if now_ms < next_allowed {
+                    return Err(OverlayManagerError::ChurnDamped {
+                        next_allowed_at_ms: next_allowed,
+                    });
+                }
+            }
+            self.last_planned_topology_change_ms = Some(now_ms);
+        }
+        self.topology.connect(a, b)?;
+        self.bump_epoch();
+        let next_planned_change_allowed_at_ms = self
+            .last_planned_topology_change_ms
+            .map(|last| last.saturating_add(self.churn_policy.min_planned_change_interval_ms));
+        Ok(TopologyChangeReport {
+            reason,
+            a: a.to_owned(),
+            b: b.to_owned(),
+            manager_epoch: self.epoch,
+            next_planned_change_allowed_at_ms,
+        })
     }
 
     /// Return source-neighbor order from the latest runtime observations.
@@ -518,6 +611,73 @@ mod tests {
         assert!(manager
             .construct_route(OverlayRouteUse::TextControl, "alice", "bob")
             .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn planned_reparenting_is_damped_to_one_change_per_window() -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default().with_churn_policy(ChurnDampingPolicy {
+            min_planned_change_interval_ms: 30_000,
+        });
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("relay-a", 20, 10, 0),
+            observation("relay-b", 30, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        let first = manager.connect_peers_with_churn_damping(
+            "alice",
+            "relay-a",
+            1_000,
+            TopologyChangeReason::PlannedReparent,
+        )?;
+        assert_eq!(first.next_planned_change_allowed_at_ms, Some(31_000));
+        assert!(matches!(
+            manager.connect_peers_with_churn_damping(
+                "alice",
+                "relay-b",
+                30_999,
+                TopologyChangeReason::PlannedReparent,
+            ),
+            Err(OverlayManagerError::ChurnDamped {
+                next_allowed_at_ms: 31_000
+            })
+        ));
+        assert!(manager
+            .connect_peers_with_churn_damping(
+                "alice",
+                "relay-b",
+                31_000,
+                TopologyChangeReason::PlannedReparent,
+            )
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn hard_failure_reparent_bypasses_churn_damping() -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("relay-a", 20, 10, 0),
+            observation("relay-b", 30, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers_with_churn_damping(
+            "alice",
+            "relay-a",
+            1_000,
+            TopologyChangeReason::PlannedReparent,
+        )?;
+        let hard_failure = manager.connect_peers_with_churn_damping(
+            "alice",
+            "relay-b",
+            1_001,
+            TopologyChangeReason::HardFailure,
+        )?;
+        assert_eq!(hard_failure.reason, TopologyChangeReason::HardFailure);
         Ok(())
     }
 
