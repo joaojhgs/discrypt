@@ -120,7 +120,7 @@ test("group invite join text channel and voice controls work without fake member
   ).toBeVisible();
   await expect(page.getByText(/Invite key:/i)).toBeVisible();
   await expect(page.getByText(/Signaling:/i)).toBeVisible();
-  await expect(page.getByText(/Endpoint policy:/i)).toBeVisible();
+  await expect(page.getByText(/Signaling trust:/i)).toBeVisible();
   await expect(page.getByText(/Room secret commitment:/i)).toBeVisible();
   await page.getByRole("button", { name: /use latest invite/i }).click();
   await page.getByRole("button", { name: /join\/open group/i }).click();

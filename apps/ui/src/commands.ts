@@ -839,7 +839,7 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
     device_id: slugify(request.device_name ?? "Desktop"),
     label: request.device_name ?? "Desktop",
     leaf_index: 1,
-    identity_key: stableHash(`${request.display_name ?? "Recovered"}:account-key`),
+    identity_key: stableHash(`${request.display_name}:recovered-account-key`),
     device_key: randomHex(32),
     local: true,
     authorized: true,
@@ -853,12 +853,12 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
       device_id: `recovered-device-${index}`,
       label: `Recovered device ${index}`,
       leaf_index: index,
-      identity_key: stableHash(`recovered-device-${index}:identity`),
+      identity_key: stableHash(`${request.display_name}:recovered-device:${index}`),
       device_key: randomHex(32),
       local: false,
       authorized: true,
       revoked: false,
-      added_at_epoch: 1,
+      added_at_epoch: index,
       revoked_at_epoch: null,
     });
   }
