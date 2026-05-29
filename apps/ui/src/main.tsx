@@ -151,26 +151,27 @@ function App() {
     return <main className="grid min-h-dvh place-items-center bg-[hsl(var(--background))] p-6 text-[hsl(var(--foreground))]">Loading discrypt…</main>;
   }
 
-  const currentSnapshot = commandState.snapshot;
-  const activeGroup = commandState.active_context?.group_id
-    ? commandState.groups.find((group) => group.group_id === commandState.active_context?.group_id) ?? commandState.groups[0] ?? null
-    : commandState.groups[0] ?? null;
+  const appState = commandState;
+  const currentSnapshot = appState.snapshot;
+  const activeGroup = appState.active_context?.group_id
+    ? appState.groups.find((group) => group.group_id === appState.active_context?.group_id) ?? appState.groups[0] ?? null
+    : appState.groups[0] ?? null;
   const activeServer = currentSnapshot.servers[0] ?? { name: 'No group selected', role: 'local profile', channels: [] };
   const textChannels = activeServer.channels.filter((channel) => channel.kind === 'Text');
   const voiceChannels = activeServer.channels.filter((channel) => channel.kind === 'Voice');
   const activeTextChannel = activeGroup?.channels.find((channel) => channel.kind === 'Text') ?? null;
   const activeVoiceChannel = activeGroup?.channels.find((channel) => channel.kind === 'Voice') ?? null;
   const groupLabel = activeGroup?.name ?? 'Local profile';
-  const participants = commandState.voice_session?.participants ?? currentSnapshot.voice_session.participants;
-  const voiceJoined = commandState.voice_session?.joined ?? false;
-  const selfMuted = commandState.voice_session?.self_muted ?? participants.find((participant) => participant.id === 'local-user' || participant.id === 'alice')?.muted ?? false;
-  const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === commandState.preferences.theme_id) ?? discryptUiConfig.themes[0];
-  const activeTemplate = discryptUiConfig.templates.find((template) => template.id === commandState.preferences.template_id) ?? discryptUiConfig.templates[0];
+  const participants = appState.voice_session?.participants ?? currentSnapshot.voice_session.participants;
+  const voiceJoined = appState.voice_session?.joined ?? false;
+  const selfMuted = appState.voice_session?.self_muted ?? participants.find((participant) => participant.id === 'local-user' || participant.id === 'alice')?.muted ?? false;
+  const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === appState.preferences.theme_id) ?? discryptUiConfig.themes[0];
+  const activeTemplate = discryptUiConfig.templates.find((template) => template.id === appState.preferences.template_id) ?? discryptUiConfig.templates[0];
   const themeStyle = activeTheme.cssVars as React.CSSProperties;
   const completedSteps = [
-    commandState.profile !== null,
+    appState.profile !== null,
     currentSnapshot.friend.verified,
-    commandState.devices.length >= 1,
+    appState.devices.length >= 1,
     currentSnapshot.invite.welcome_required.length > 0,
     currentSnapshot.retention.selected.length > 0,
   ].filter(Boolean).length;
@@ -234,7 +235,7 @@ function App() {
 
   function sendCommandDm() {
     const body = draftMessage.trim();
-    const dm = commandState.dms[0];
+    const dm = appState.dms[0];
     if (!body || !dm) return;
     void applyCommand(sendMessage({
       target: { kind: 'dm', dm_id: dm.dm_id, group_id: null, channel_id: null },
@@ -251,7 +252,7 @@ function App() {
   }
 
   function setVolume(id: string, value: number[]) {
-    const sessionId = commandState.voice_session?.session_id;
+    const sessionId = appState.voice_session?.session_id;
     if (!sessionId) {
       setCommandError('Join a voice channel before changing volume.');
       return;
@@ -260,7 +261,7 @@ function App() {
   }
 
   function toggleSelfMute(checked: boolean) {
-    const sessionId = commandState.voice_session?.session_id;
+    const sessionId = appState.voice_session?.session_id;
     if (!sessionId) {
       setCommandError('Join a voice channel before muting.');
       return;
@@ -287,7 +288,7 @@ function App() {
       void applyCommand(joinVoice({ group_id: activeGroup.group_id, channel_id: voiceChannel.channel_id }), () => setWorkflow('voice'));
       return;
     }
-    const sessionId = commandState.voice_session?.session_id;
+    const sessionId = appState.voice_session?.session_id;
     if (!sessionId) return;
     void applyCommand(leaveVoice({ session_id: sessionId }), () => setWorkflow('voice'));
   }
@@ -300,7 +301,7 @@ function App() {
     void applyCommand(savePreferences({ theme_id: activeTheme.id, template_id: nextTemplate }));
   }
 
-  if (commandState.lifecycle === 'first_run') {
+  if (appState.lifecycle === 'first_run') {
     return (
       <FirstRunPanel
         themeStyle={themeStyle}
@@ -355,7 +356,7 @@ function App() {
               onOpenChannel={() => setWorkflow('channel')}
             />
             {commandError ? <p className="mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">Command note: {commandError}</p> : null}
-            {commandState.invites[0] ? <p className="mt-3 rounded-xl border border-emerald-300/30 bg-emerald-300/10 p-3 text-sm text-emerald-100">Invite ready: {commandState.invites[0].code}</p> : null}
+            {appState.invites[0] ? <p className="mt-3 rounded-xl border border-emerald-300/30 bg-emerald-300/10 p-3 text-sm text-emerald-100">Invite ready: {appState.invites[0].code}</p> : null}
             <Tabs value={workflow} onValueChange={(value) => setWorkflow(value as Workflow)} className="mt-5">
               <TabsList className="flex w-full justify-start overflow-x-auto md:w-auto">
                 <TabsTrigger value="setup">Setup</TabsTrigger>
@@ -369,7 +370,7 @@ function App() {
                 <SetupPanel snapshot={currentSnapshot} completedSteps={completedSteps} verifyMessage={verifyMessage} onVerify={confirmSafetyNumber} />
               </TabsContent>
               <TabsContent value="dm">
-                <DmPanel dms={commandState.dms} messages={commandState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
+                <DmPanel dms={appState.dms} messages={appState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
               </TabsContent>
               <TabsContent value="join">
                 <JoinPanel snapshot={currentSnapshot} onJoin={joinCommandGroup} onCreateInvite={createCommandInvite} />
@@ -399,6 +400,62 @@ function App() {
         <VoiceDock route={currentSnapshot.voice.route} voiceJoined={voiceJoined} selfMuted={selfMuted} setVoiceJoined={toggleVoiceJoin} setSelfMuted={toggleSelfMute} participants={participants} />
       </main>
     </TooltipProvider>
+  );
+}
+
+function FirstRunPanel({
+  themeStyle,
+  displayName,
+  setDisplayName,
+  deviceName,
+  setDeviceName,
+  recoveryCode,
+  setRecoveryCode,
+  commandError,
+  onCreate,
+  onRecover,
+}: {
+  themeStyle: React.CSSProperties;
+  displayName: string;
+  setDisplayName: (value: string) => void;
+  deviceName: string;
+  setDeviceName: (value: string) => void;
+  recoveryCode: string;
+  setRecoveryCode: (value: string) => void;
+  commandError: string | null;
+  onCreate: () => void;
+  onRecover: () => void;
+}) {
+  return (
+    <main
+      style={themeStyle}
+      className="grid min-h-dvh place-items-center bg-[hsl(var(--background))] p-6 text-[hsl(var(--foreground))]"
+    >
+      <Card className="w-full max-w-3xl border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-2xl">
+        <CardHeader>
+          <Badge variant="secondary" className="w-fit">first run</Badge>
+          <CardTitle className="text-3xl">Set up your local discrypt profile</CardTitle>
+          <CardDescription>
+            Create a new local profile or recover with a test-build placeholder. Recovery does not claim cloud backup, history restore, or cross-device key recovery.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-2">
+          {commandError ? <p className="md:col-span-2 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">Command note: {commandError}</p> : null}
+          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
+            <Label className="grid gap-2">Display name<Input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></Label>
+            <Label className="mt-4 grid gap-2">Device name<Input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} /></Label>
+            <Button className="mt-5 w-full" onClick={onCreate}>Create new user</Button>
+          </div>
+          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
+            <Label className="grid gap-2">Recovery phrase/code<Input value={recoveryCode} onChange={(event) => setRecoveryCode(event.target.value)} /></Label>
+            <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+              Local/test-build placeholder only. It unlocks the shell for E2E coverage but does not recover remote devices or message history.
+            </p>
+            <Button variant="outline" className="mt-5 w-full" onClick={onRecover}>Recover existing user</Button>
+          </div>
+        </CardContent>
+      </Card>
+    </main>
   );
 }
 
@@ -927,12 +984,71 @@ function SetupPanel({
   );
 }
 
+function DmPanel({
+  dms,
+  messages,
+  draftDmName,
+  setDraftDmName,
+  draftMessage,
+  setDraftMessage,
+  onStartDm,
+  onSendDm,
+}: {
+  dms: { dm_id: string; display_name: string; local_only_copy: string }[];
+  messages: { message_id: string; target: { dm_id: string | null }; author: string; body: string; status: string }[];
+  draftDmName: string;
+  setDraftDmName: (value: string) => void;
+  draftMessage: string;
+  setDraftMessage: (value: string) => void;
+  onStartDm: () => void;
+  onSendDm: () => void;
+}) {
+  const activeDm = dms[0] ?? null;
+  const visibleMessages = activeDm
+    ? messages.filter((message) => message.target.dm_id === activeDm.dm_id)
+    : [];
+  return (
+    <div className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+      <Card>
+        <CardHeader>
+          <CardTitle>Direct messages</CardTitle>
+          <CardDescription>Local harness-backed DM state with no remote delivery claim.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Label className="grid gap-2">Contact name<Input value={draftDmName} onChange={(event) => setDraftDmName(event.target.value)} /></Label>
+          <Button className="mt-4 w-full" onClick={onStartDm}><PlusIcon /> Start/open DM</Button>
+          <Separator className="my-4" />
+          <Label className="grid gap-2">Message<Input value={draftMessage} onChange={(event) => setDraftMessage(event.target.value)} /></Label>
+          <Button variant="secondary" className="mt-3 w-full" disabled={!activeDm} onClick={onSendDm}>Send DM message</Button>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>{activeDm ? activeDm.display_name : 'No DM yet'}</CardTitle>
+          <CardDescription>{activeDm?.local_only_copy ?? 'Start a DM to create a local conversation.'}</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          {visibleMessages.length === 0 ? <p className="text-sm text-[hsl(var(--muted-foreground))]">No messages yet.</p> : null}
+          {visibleMessages.map((message) => (
+            <div key={message.message_id} className="rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-3">
+              <div className="flex items-center justify-between gap-3 text-xs text-[hsl(var(--muted-foreground))]"><span>{message.author}</span><span>{message.status}</span></div>
+              <p className="mt-1 text-sm">{message.body}</p>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function JoinPanel({
   snapshot,
   onJoin,
+  onCreateInvite,
 }: {
   snapshot: AppSnapshot;
   onJoin: () => void;
+  onCreateInvite: () => void;
 }) {
   return (
     <Card>
@@ -958,8 +1074,9 @@ function JoinPanel({
             {copy}
           </div>
         ))}
-        <div className="lg:col-span-2">
+        <div className="flex flex-wrap gap-2 lg:col-span-2">
           <Button onClick={onJoin}>Use current invite template</Button>
+          <Button variant="outline" onClick={onCreateInvite}>Create copyable invite</Button>
         </div>
       </CardContent>
     </Card>
