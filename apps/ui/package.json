@@ -9,6 +9,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test:command-coverage": "node scripts/command-coverage-check.mjs",
+    "test:production-copy": "node scripts/command-coverage-check.mjs",
     "test:e2e": "playwright test",
     "test:honesty": "node scripts/honesty-gates.mjs"
   },

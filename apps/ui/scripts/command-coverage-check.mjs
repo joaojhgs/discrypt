@@ -306,6 +306,94 @@ for (const token of forbiddenLocalProductState) {
   }
 }
 
+
+const productionClaimTerms = [
+  "P2P",
+  "WebRTC",
+  "connected",
+  "relay active",
+  "TURN active",
+  "delivered",
+  "encrypted",
+];
+const allowedProductionClaimContext = [
+  "local",
+  "local-only",
+  "local-first",
+  "command-backed",
+  "harness",
+  "facade",
+  "release-gated",
+  "not connected",
+  "not claimed",
+  "No relay is active",
+  "policy",
+  "ciphertext",
+  "content-private",
+  "metadata-minimizing",
+  "pending on offline devices",
+  "backend state",
+  "returned by state",
+  "honest_copy_ready",
+  "media-frame E2E",
+  "socket/media adapter E2E",
+];
+
+function stringLiteralValues(source) {
+  const values = [];
+  const pattern = /(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/g;
+  for (const match of source.matchAll(pattern)) {
+    values.push({ raw: match[0], value: match[2], index: match.index ?? 0 });
+  }
+  return values;
+}
+
+function lineAndColumn(source, index) {
+  const prefix = source.slice(0, index);
+  const lines = prefix.split("\n");
+  return { line: lines.length, column: lines[lines.length - 1].length + 1 };
+}
+
+function hasProductionClaim(value, term) {
+  if (term === "P2P") return /\bP2P\b/.test(value);
+  return value.toLowerCase().includes(term.toLowerCase());
+}
+
+function hasAllowedProductionClaimContext(value) {
+  return allowedProductionClaimContext.some((context) =>
+    value.toLowerCase().includes(context.toLowerCase()),
+  );
+}
+
+for (const [label, source] of [
+  ["apps/ui/src/main.tsx", main],
+  ["apps/ui/src/commands.ts", commands],
+]) {
+  for (const literal of stringLiteralValues(source)) {
+    const terms = productionClaimTerms.filter((term) =>
+      hasProductionClaim(literal.value, term),
+    );
+    if (terms.length === 0) continue;
+    if (hasAllowedProductionClaimContext(literal.value)) continue;
+    const { line, column } = lineAndColumn(source, literal.index);
+    failures.push(
+      `${label}:${line}:${column} production claim token(s) ${terms.join(
+        ", ",
+      )} lack backend-state/local-only/release-gated context: ${literal.raw.slice(
+        0,
+        120,
+      )}`,
+    );
+  }
+}
+
+if (!rust.includes("honest_copy_ready")) {
+  failures.push("Tauri command_health must expose honest_copy_ready for copy gates");
+}
+if (!commands.includes("honest_copy_ready")) {
+  failures.push("TS CommandHealth must carry honest_copy_ready for copy gates");
+}
+
 const commandBackedCopy = [
   "command-backed",
   "media-frame E2E",

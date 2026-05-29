@@ -1,4 +1,9 @@
 //! Provider boundary for future OpenMLS crypto/storage integration.
+//!
+//! ## ProductionStatus
+//! The current provider is an unaudited Phase-0 facade. Production builds must
+//! replace it with an audited OpenMLS provider/storage integration before making
+//! MLS production-readiness claims.
 
 /// Provider marker describing the current cryptographic backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
