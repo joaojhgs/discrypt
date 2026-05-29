@@ -13,11 +13,12 @@
 
 pub mod production_status;
 pub mod session;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 pub use session::{
-    TransportSession, TransportSessionEvent, TransportSessionSnapshot, TransportSessionState,
-    TransportSessionTransition, TransportSessionTransitionError,
+    TransportRoute, TransportRouteStatus, TransportSession, TransportSessionError,
+    TransportSessionEvent, TransportSessionSnapshot, TransportSessionState,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
