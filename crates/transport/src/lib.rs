@@ -4,6 +4,14 @@
 //! ICE/STUN, relay-overlay, and TURN plumbing. The policy types here are deliberately
 //! UI-free so the multinode harness can prove the Phase-6 ordering and metadata
 //! contracts without opening real sockets.
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
+pub mod production_status;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};

@@ -1,6 +1,12 @@
 //! Domain orchestration facade for Tauri commands and headless E2E tests.
-pub mod services;
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
 
+pub mod production_status;
 use admission::Invite;
 use mls_core::{GroupState, Identity};
 use serde::{Deserialize, Serialize};

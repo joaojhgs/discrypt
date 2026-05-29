@@ -8,6 +8,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+harness = ["mls_core/harness", "admission/harness", "storage/harness", "content_keys/harness"]
+local-dev = ["mls_core/local-dev", "admission/local-dev", "storage/local-dev", "content_keys/local-dev"]
+production-network = ["mls_core/production-network", "admission/production-network", "storage/production-network", "content_keys/production-network"]
+production-media = ["mls_core/production-media", "admission/production-media", "storage/production-media", "content_keys/production-media"]
+production-storage = ["mls_core/production-storage", "admission/production-storage", "storage/production-storage", "content_keys/production-storage"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

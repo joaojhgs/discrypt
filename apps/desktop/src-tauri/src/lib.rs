@@ -1,4 +1,12 @@
 //! Tauri command surface and local-first app-state service for the native discrypt shell.
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
+pub mod production_status;
 use chrono::{Duration, Utc};
 use discrypt_core::{
     app_snapshot as core_app_snapshot, verify_safety_number as core_verify_safety_number,

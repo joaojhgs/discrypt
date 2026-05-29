@@ -1,4 +1,12 @@
 //! Content-key retention, live-key, and shred primitives.
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
+pub mod production_status;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -5,9 +5,17 @@
 //! replay state, and stores only ciphertext envelopes for opportunistic
 //! store-and-forward.
 
+//!
+//! ## ProductionStatus
+//! See [`production_status`] for this crate's build-time gate status. Default
+//! builds keep `harness` and `local-dev` disabled; production claims require the
+//! explicit `production-network`, `production-media`, or `production-storage`
+//! feature matching the claimed runtime capability.
+
 pub mod failover;
 pub mod gossip;
 pub mod integrity;
+pub mod production_status;
 pub mod ranking;
 pub mod redelivery;
 pub mod store_forward;
