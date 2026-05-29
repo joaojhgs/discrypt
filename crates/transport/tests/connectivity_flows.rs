@@ -36,8 +36,10 @@ fn valid_direct_overlay_and_turn_flows_select_expected_leg() -> Result<(), Trans
 #[test]
 fn turn_flow_uses_effective_turn_endpoint_without_parsing_ice_config() -> Result<(), TransportError>
 {
-    let mut config = ConnectivityConfig::default();
-    config.default_turn = Endpoint::new("turns:transport-session-test.invalid:5349");
+    let config = ConnectivityConfig {
+        default_turn: Endpoint::new("turns:transport-session-test.invalid:5349"),
+        ..ConnectivityConfig::default()
+    };
 
     let plan = ConnectivityPlanner::plan(&config, SimulatedNat::turn_only())?;
 
@@ -61,10 +63,11 @@ fn disconnected_local_socket_flow_can_reconnect_with_ciphertext_only_delivery(
         b"cleartext session payload".to_vec(),
     );
 
-    assert_eq!(
-        adapter.run_conformance(b"").unwrap_err(),
-        TransportError::Unavailable("empty ciphertext".to_owned())
-    );
+    let empty_result = adapter.run_conformance(b"");
+    assert!(matches!(
+        empty_result,
+        Err(TransportError::Unavailable(message)) if message == "empty ciphertext"
+    ));
 
     let first_reconnect = adapter.run_conformance(b"ciphertext after reconnect one")?;
     assert!(first_reconnect.ready());
@@ -90,12 +93,11 @@ fn plaintext_failure_does_not_prevent_later_reconnect() -> Result<(), TransportE
         b"forbidden plaintext".to_vec(),
     );
 
-    assert_eq!(
-        adapter
-            .run_conformance(b"prefix forbidden plaintext suffix")
-            .unwrap_err(),
-        TransportError::PlaintextLeak
-    );
+    let plaintext_result = adapter.run_conformance(b"prefix forbidden plaintext suffix");
+    assert!(matches!(
+        plaintext_result,
+        Err(TransportError::PlaintextLeak)
+    ));
 
     let recovered = adapter.run_conformance(b"opaque sframe bytes after plaintext rejection")?;
     assert!(recovered.ready());
