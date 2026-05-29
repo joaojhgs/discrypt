@@ -17,6 +17,7 @@ production-media = ["content_keys/production-media", "mls_core/production-media"
 production-storage = ["content_keys/production-storage", "mls_core/production-storage"]
 
 [dependencies]
+aes-gcm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
