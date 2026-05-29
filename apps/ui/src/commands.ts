@@ -214,6 +214,20 @@ export type AppEventView = {
   summary: string;
 };
 
+export type PollAppEventsRequest = {
+  after?: number | null;
+  kinds?: string[];
+  limit?: number | null;
+};
+
+export type AppEventStreamView = {
+  events: AppEventView[];
+  cursor: number;
+  next_cursor: number;
+  has_more: boolean;
+  subscribed_kinds: string[];
+};
+
 export type AppState = {
   schema_version: number;
   lifecycle: AppLifecycle;
@@ -1561,11 +1575,39 @@ export async function sendMessage(
   );
 }
 
-export async function pollAppEvents(): Promise<AppEventView[]> {
-  return invokeOrFallback<AppEventView[]>(
+export async function pollAppEvents(
+  request: PollAppEventsRequest = {},
+): Promise<AppEventStreamView> {
+  return invokeOrFallback<AppEventStreamView>(
     "poll_app_events",
-    undefined,
-    () => cloneState(syncSnapshot(fallbackState)).events,
+    { request },
+    () => {
+      const state = cloneState(syncSnapshot(fallbackState));
+      const cursor = request.after ?? 0;
+      const subscribedKinds = [...new Set(request.kinds ?? [])]
+        .map((kind) => kind.trim().toLowerCase())
+        .filter((kind) =>
+          ["message", "invite", "group", "device", "transport", "voice"].includes(
+            kind,
+          ),
+        )
+        .sort();
+      const limit = Math.max(1, Math.min(request.limit ?? 64, 256));
+      const matchesTopic = (event: AppEventView) =>
+        subscribedKinds.length === 0 ||
+        subscribedKinds.includes(event.kind.split(".")[0] ?? event.kind);
+      const filtered = state.events.filter(
+        (event) => event.sequence > cursor && matchesTopic(event),
+      );
+      const events = filtered.slice(0, limit);
+      return {
+        events,
+        cursor,
+        next_cursor: events.at(-1)?.sequence ?? state.event_cursor,
+        has_more: filtered.length > limit,
+        subscribed_kinds: subscribedKinds,
+      };
+    },
   );
 }
 

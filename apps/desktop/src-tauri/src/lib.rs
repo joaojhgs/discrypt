@@ -328,6 +328,35 @@ pub struct AppEventView {
     pub summary: String,
 }
 
+/// Cursor/topic request for command-backed event polling.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PollAppEventsRequest {
+    /// Return events strictly after this cursor.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Optional topic filters: message, invite, group, device, transport, voice.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Optional max events returned by this poll.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Cursor-based event stream response for frontend reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AppEventStreamView {
+    /// Events matching the requested cursor/topic filter.
+    pub events: Vec<AppEventView>,
+    /// Cursor supplied by the caller, or zero for first poll.
+    pub cursor: u64,
+    /// Cursor clients should use for the next poll.
+    pub next_cursor: u64,
+    /// Whether more matching events remain after this page.
+    pub has_more: bool,
+    /// Normalized topic filters used for this stream.
+    pub subscribed_kinds: Vec<String>,
+}
+
 /// Full command-backed app state consumed by React.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppStateView {
@@ -1303,9 +1332,38 @@ pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
     })
 }
 
-/// Tauri command: return recent command-backed app events for polling clients.
-pub fn poll_app_events() -> Vec<AppEventView> {
-    with_state(|state| state.events.clone())
+/// Tauri command: return cursor/topic filtered command-backed app events for polling clients.
+pub fn poll_app_events(request: Option<PollAppEventsRequest>) -> AppEventStreamView {
+    with_state(|state| {
+        let request = request.unwrap_or_default();
+        let cursor = request.after.unwrap_or_default();
+        let subscribed_kinds = normalize_event_subscriptions(&request.kinds);
+        let limit = request.limit.unwrap_or(64).clamp(1, 256);
+        let mut matching = state
+            .events
+            .iter()
+            .filter(|event| {
+                event.sequence > cursor
+                    && event_matches_subscription(&event.kind, &subscribed_kinds)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = matching.len() > limit;
+        if has_more {
+            matching.truncate(limit);
+        }
+        let next_cursor = matching
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or_else(|| state.latest_event_cursor());
+        AppEventStreamView {
+            events: matching,
+            cursor,
+            next_cursor,
+            has_more,
+            subscribed_kinds,
+        }
+    })
 }
 
 /// Tauri command: return the mandatory cooperative-deletion warning copy.
@@ -1481,8 +1539,8 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn poll_app_events() -> Vec<AppEventView> {
-        super::poll_app_events()
+    pub(super) fn poll_app_events(request: Option<PollAppEventsRequest>) -> AppEventStreamView {
+        super::poll_app_events(request)
     }
 
     #[tauri::command]
@@ -1924,6 +1982,43 @@ fn mutate_app_service(update: impl FnOnce(&mut PersistedAppState)) -> AppStateVi
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.mutate(update)
+}
+
+fn normalize_event_subscriptions(raw: &[String]) -> Vec<String> {
+    let mut normalized = raw
+        .iter()
+        .map(|kind| kind.trim().to_ascii_lowercase())
+        .filter(|kind| {
+            matches!(
+                kind.as_str(),
+                "message" | "invite" | "group" | "device" | "transport" | "voice"
+            )
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn event_matches_subscription(kind: &str, subscriptions: &[String]) -> bool {
+    if subscriptions.is_empty() {
+        return true;
+    }
+    subscriptions
+        .iter()
+        .any(|subscription| event_kind_topic(kind) == subscription)
+}
+
+fn event_kind_topic(kind: &str) -> &str {
+    match kind.split_once('.').map(|(topic, _)| topic).unwrap_or(kind) {
+        "message" => "message",
+        "invite" => "invite",
+        "group" => "group",
+        "device" => "device",
+        "transport" | "connectivity" | "signaling" | "relay" | "ice" => "transport",
+        "voice" => "voice",
+        _ => "message",
+    }
 }
 
 fn load_state() -> PersistedAppState {
@@ -3269,6 +3364,128 @@ mod tests {
 
         let left = leave_voice(LeaveVoiceRequest { session_id });
         let _cursor = assert_cursor_advanced(cursor, &left);
+        Ok(())
+    }
+
+    #[test]
+    fn event_stream_poll_filters_topics_and_cursors() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("event-stream");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Stream Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group created".to_owned())?;
+        create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+        });
+        create_device_pairing_payload(CreateDevicePairingPayloadRequest {
+            requested_label: "Phone".to_owned(),
+            current_epoch: Some(10),
+            valid_for_epochs: Some(2),
+        });
+        let text_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "ops".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        let text_channel_id = text_channel
+            .groups
+            .first()
+            .and_then(|group| group.channels.first())
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel created".to_owned())?;
+        send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id.clone()),
+                channel_id: Some(text_channel_id),
+            },
+            body: "stream me".to_owned(),
+        });
+        let voice_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Voice Ops".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let voice_channel_id = voice_channel
+            .groups
+            .first()
+            .and_then(|group| group.channels.last())
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel created".to_owned())?;
+        join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id: voice_channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+
+        let first_page = poll_app_events(Some(PollAppEventsRequest {
+            after: Some(0),
+            kinds: vec![],
+            limit: Some(3),
+        }));
+        assert_eq!(first_page.cursor, 0);
+        assert_eq!(first_page.events.len(), 3);
+        assert!(first_page.has_more);
+        assert!(first_page.next_cursor > first_page.cursor);
+
+        let invite_events = poll_app_events(Some(PollAppEventsRequest {
+            after: Some(0),
+            kinds: vec!["invite".to_owned()],
+            limit: Some(16),
+        }));
+        assert_eq!(invite_events.subscribed_kinds, vec!["invite".to_owned()]);
+        assert!(!invite_events.events.is_empty());
+        assert!(invite_events
+            .events
+            .iter()
+            .all(|event| event.kind.starts_with("invite.")));
+
+        let topic_events = poll_app_events(Some(PollAppEventsRequest {
+            after: Some(0),
+            kinds: vec![
+                "message".to_owned(),
+                "device".to_owned(),
+                "group".to_owned(),
+                "voice".to_owned(),
+            ],
+            limit: Some(64),
+        }));
+        for topic in ["message.", "device.", "group.", "voice."] {
+            assert!(
+                topic_events
+                    .events
+                    .iter()
+                    .any(|event| event.kind.starts_with(topic)),
+                "missing topic {topic}"
+            );
+        }
+
+        let drained = poll_app_events(Some(PollAppEventsRequest {
+            after: Some(topic_events.next_cursor),
+            kinds: vec!["message".to_owned(), "voice".to_owned()],
+            limit: Some(64),
+        }));
+        assert!(drained.events.is_empty());
+        assert_eq!(drained.cursor, topic_events.next_cursor);
         Ok(())
     }
 

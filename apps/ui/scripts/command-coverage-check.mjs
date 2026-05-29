@@ -138,8 +138,8 @@ const expectedCommands = [
   {
     command: "poll_app_events",
     exportName: "pollAppEvents",
-    args: [],
-    returns: "AppEventView[]",
+    args: ["after", "kinds", "limit"],
+    returns: "AppEventStreamView",
   },
   {
     command: "deletion_warning",
