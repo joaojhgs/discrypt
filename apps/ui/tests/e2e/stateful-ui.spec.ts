@@ -116,8 +116,10 @@ test("group invite join text channel and voice controls work without fake member
     .getByRole("button", { name: /create invite for active group/i })
     .click();
   await expect(
-    page.getByText(/invite ready: discrypt:\/\/join/i),
+    page.getByText(/invite ready: discrypt:\/\/join\/v1/i),
   ).toBeVisible();
+  await expect(page.getByText(/Invite key:/i)).toBeVisible();
+  await expect(page.getByText(/Room secret hash:/i)).toBeVisible();
   await page.getByRole("button", { name: /use latest invite/i }).click();
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByRole("heading", { name: "#general" })).toBeVisible();
@@ -131,10 +133,26 @@ test("group invite join text channel and voice controls work without fake member
 
   await page
     .getByRole("navigation", { name: /workspace sections/i })
+    .getByRole("button", { name: "Groups", exact: true })
+    .click();
+  await page.getByLabel("Group name").fill("Second Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByText(/Second Lab/i).first()).toBeVisible();
+  await page.getByRole("button", { name: /Open Private Lab group/i }).click();
+  await expect(page.getByText(/Private Lab/i).first()).toBeVisible();
+
+  await page
+    .getByRole("navigation", { name: /workspace sections/i })
     .getByRole("button", { name: "Voice", exact: true })
     .click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
+  await expect(
+    page.getByText(/Phase-1 SFrame\/relay media security/i),
+  ).toBeVisible();
   await expect(page.getByText(/Bob · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
   await page.getByRole("switch", { name: /mute my microphone/i }).click();

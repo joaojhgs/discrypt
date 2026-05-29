@@ -1,4 +1,5 @@
 //! Tauri command surface and local-first app-state service for the native discrypt shell.
+use chrono::{Duration, Utc};
 use discrypt_core::{
     app_snapshot as core_app_snapshot, verify_safety_number as core_verify_safety_number,
     AppSnapshot, ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
@@ -6,11 +7,13 @@ use discrypt_core::{
     SecurityCopyView, ServerView,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
+use uuid::Uuid;
 
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_THEME_ID: &str = "graphite-calm";
@@ -137,14 +140,29 @@ pub struct MessageView {
 pub struct InviteView {
     /// Stable invite identifier for the local command surface.
     pub invite_id: String,
+    /// Opaque invite key embedded in the link.
+    #[serde(default)]
+    pub invite_key: String,
     /// Group id this invite targets.
     pub group_id: String,
     /// User-pastable invite code/URL.
     pub code: String,
+    /// Hash of the room secret; the plan requires secret-derived admission, not incremental ids.
+    #[serde(default)]
+    pub room_secret_hash: String,
     /// Expiry label.
     pub expires: String,
+    /// Machine-readable expiration timestamp/relative horizon for the invite.
+    #[serde(default)]
+    pub expires_at: String,
     /// Maximum-use label.
     pub max_use: String,
+    /// Current local use count.
+    #[serde(default)]
+    pub uses: u32,
+    /// Whether the local invite was revoked.
+    #[serde(default)]
+    pub revoked: bool,
     /// Honest admission copy.
     pub admission_copy: String,
 }
@@ -274,6 +292,13 @@ pub struct CreateGroupRequest {
     pub name: String,
     /// Default retention label for new text channels.
     pub retention: String,
+}
+
+/// Request to focus an existing group from the server rail.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetActiveGroupRequest {
+    /// Existing group id.
+    pub group_id: String,
 }
 
 /// Request to join a local-first group/server from an invite.
@@ -521,12 +546,39 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
     })
 }
 
+/// Tauri command: focus an existing local-first group from the server rail.
+pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
+    mutate_state(|state| {
+        state.ensure_ready_profile();
+        if let Some(group) = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == request.group_id)
+        {
+            state.active_context = Some(ActiveContextView {
+                kind: "group".to_owned(),
+                group_id: Some(group.group_id.clone()),
+                channel_id: None,
+                dm_id: None,
+            });
+            state.push_event("group.focused", format!("Focused group {}", group.name));
+        } else {
+            state.push_event("group.focus_missing", "Requested group does not exist");
+        }
+    })
+}
+
 /// Tauri command: join a local-first group from an invite.
 pub fn join_group(request: JoinGroupRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
         let invite_code = normalize_label(&request.invite_code, "manual invite");
-        if let Some(invite) = state.invites.iter().find(|invite| invite.code == invite_code).cloned() {
+        if let Some(invite) = state
+            .invites
+            .iter()
+            .find(|invite| invite.code == invite_code)
+            .cloned()
+        {
             let group_name = state
                 .groups
                 .iter()
@@ -539,7 +591,10 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 channel_id: None,
                 dm_id: None,
             });
-            state.push_event("group.opened_from_invite", format!("Opened {group_name} from local invite"));
+            state.push_event(
+                "group.opened_from_invite",
+                format!("Opened {group_name} from local invite"),
+            );
             return;
         }
         let name = request
@@ -595,13 +650,28 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .find(|group| group.group_id == group_id)
             .map(|group| group.name.clone())
             .unwrap_or_else(|| "group".to_owned());
+        let invite_key = Uuid::new_v4().to_string();
+        let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
+        let room_secret_hash = hex::encode(Sha256::digest(room_secret.as_bytes()));
+        let room_secret_token = &room_secret_hash[..32];
+        let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
+        let max_use = normalize_label(&request.max_use, "Max-use is enforced before MLS admission");
+        let expires_at = invite_expiration_horizon(&expires);
+        let max_uses = parse_max_uses(&max_use);
         let invite = InviteView {
-            invite_id: format!("invite-{sequence}"),
+            invite_id: format!("invite-{invite_key}"),
+            invite_key: invite_key.clone(),
             group_id: group_id.clone(),
-            code: format!("discrypt://join/{sequence}-{group_name}"),
-            expires: normalize_label(&request.expires, "Invite expires and can be revoked"),
-            max_use: normalize_label(&request.max_use, "Max-use is enforced before MLS admission"),
-            admission_copy: "Final admission still requires an authorized MLS Welcome/add"
+            code: format!(
+                "discrypt://join/v1/{invite_key}?room_secret={room_secret_token}&exp={expires_at}&max={max_uses}"
+            ),
+            room_secret_hash,
+            expires,
+            expires_at,
+            max_use,
+            uses: 0,
+            revoked: false,
+            admission_copy: "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient"
                 .to_owned(),
         };
         state.invites.push(invite);
@@ -700,9 +770,12 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             joined: true,
             self_muted,
             participants: default_voice_participants(!self_muted),
-            route_copy: "Local voice controls only; network media route is not connected in this build".to_owned(),
-            status_copy: "Voice session state joined locally; real audio-frame media remains release-gated"
-                .to_owned(),
+            route_copy:
+                "Local voice controls only; network media route is not connected in this build"
+                    .to_owned(),
+            status_copy:
+                "Voice session state joined locally; real audio-frame media remains release-gated"
+                    .to_owned(),
         });
         state.active_context = Some(ActiveContextView {
             kind: "voice_channel".to_owned(),
@@ -721,8 +794,7 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
             if session.session_id == request.session_id {
                 session.joined = false;
                 session.status_copy =
-                    "Not joined; command-backed local voice controls are idle"
-                        .to_owned();
+                    "Not joined; command-backed local voice controls are idle".to_owned();
                 for participant in &mut session.participants {
                     participant.speaking = false;
                 }
@@ -876,6 +948,11 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
+        super::set_active_group(request)
+    }
+
+    #[tauri::command]
     pub(super) fn join_group(request: JoinGroupRequest) -> AppStateView {
         super::join_group(request)
     }
@@ -955,6 +1032,7 @@ pub fn run() {
             ipc_commands::save_preferences,
             ipc_commands::start_dm,
             ipc_commands::create_group,
+            ipc_commands::set_active_group,
             ipc_commands::join_group,
             ipc_commands::create_invite,
             ipc_commands::create_channel,
@@ -1094,8 +1172,9 @@ impl PersistedAppState {
                     })
                     .collect(),
                 status_copy: "Not joined; command-backed local voice controls are idle".to_owned(),
-                route_copy: "Local voice controls only; network media route is not connected in this build"
-                    .to_owned(),
+                route_copy:
+                    "Local voice controls only; network media route is not connected in this build"
+                        .to_owned(),
             }
         };
         snapshot.activity_feed = self
@@ -1273,6 +1352,31 @@ fn default_voice_participants(local_speaking: bool) -> Vec<VoiceParticipantView>
         muted: false,
         volume: 82,
     }]
+}
+
+fn invite_expiration_horizon(label: &str) -> String {
+    let lower = label.to_ascii_lowercase();
+    let now = Utc::now();
+    let expires_at = if lower.contains("hour") || lower.contains("1 h") {
+        now + Duration::hours(1)
+    } else if lower.contains("day") || lower.contains("24") || lower.contains("1 d") {
+        now + Duration::days(1)
+    } else if lower.contains("30") {
+        now + Duration::days(30)
+    } else if lower.contains("90") {
+        now + Duration::days(90)
+    } else {
+        now + Duration::days(7)
+    };
+    expires_at.to_rfc3339()
+}
+
+fn parse_max_uses(label: &str) -> u32 {
+    label
+        .split(|ch: char| !ch.is_ascii_digit())
+        .find_map(|part| part.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
 }
 
 fn parse_invite_group_name(invite_code: &str) -> String {
@@ -1463,7 +1567,12 @@ mod tests {
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
         });
-        assert!(invite_state.invites[0].code.starts_with("discrypt://join/"));
+        assert!(invite_state.invites[0]
+            .code
+            .starts_with("discrypt://join/v1/"));
+        assert!(invite_state.invites[0].code.contains("room_secret="));
+        assert_eq!(invite_state.invites[0].uses, 0);
+        assert!(!invite_state.invites[0].room_secret_hash.is_empty());
         let channel_state = create_channel(CreateChannelRequest {
             group_id: group_id.clone(),
             name: "ops".to_owned(),
@@ -1513,6 +1622,32 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.body == "persist this dm"));
+    }
+
+    #[test]
+    fn set_active_group_focuses_existing_group() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("group-focus");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let alpha = create_group(CreateGroupRequest {
+            name: "Alpha Lab".to_owned(),
+            retention: "7 days".to_owned(),
+        });
+        create_group(CreateGroupRequest {
+            name: "Beta Lab".to_owned(),
+            retention: "7 days".to_owned(),
+        });
+        let alpha_id = alpha.groups[0].group_id.clone();
+        let focused = set_active_group(SetActiveGroupRequest {
+            group_id: alpha_id.clone(),
+        });
+        assert_eq!(
+            focused.active_context.and_then(|context| context.group_id),
+            Some(alpha_id)
+        );
     }
 
     #[test]

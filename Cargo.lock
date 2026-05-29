@@ -689,11 +689,15 @@ dependencies = [
 name = "discrypt-desktop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "discrypt-core",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
+ "uuid",
 ]
 
 [[package]]

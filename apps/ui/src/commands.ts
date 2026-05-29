@@ -159,10 +159,15 @@ export type AppMessageView = {
 
 export type InviteView = {
   invite_id: string;
+  invite_key: string;
   group_id: string;
   code: string;
+  room_secret_hash: string;
   expires: string;
+  expires_at: string;
   max_use: string;
+  uses: number;
+  revoked: boolean;
   admission_copy: string;
 };
 
@@ -229,6 +234,10 @@ export type CreateGroupRequest = {
 export type JoinGroupRequest = {
   invite_code: string;
   group_name?: string | null;
+};
+
+export type SetActiveGroupRequest = {
+  group_id: string;
 };
 
 export type CreateInviteRequest = {
@@ -484,6 +493,40 @@ function defaultGroupChannels(): ChannelStateView[] {
   ];
 }
 
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return Array.from({ length: 8 }, (_, index) =>
+    ((hash >>> ((index % 4) * 8)) & 0xff).toString(16).padStart(2, "0"),
+  )
+    .join("")
+    .repeat(4);
+}
+
+function inviteExpirationHorizon(label: string): string {
+  const lower = label.toLowerCase();
+  const now = Date.now();
+  const millis =
+    lower.includes("hour") || lower.includes("1 h")
+      ? 60 * 60 * 1000
+      : lower.includes("day") || lower.includes("24") || lower.includes("1 d")
+        ? 24 * 60 * 60 * 1000
+        : lower.includes("30")
+          ? 30 * 24 * 60 * 60 * 1000
+          : lower.includes("90")
+            ? 90 * 24 * 60 * 60 * 1000
+            : 7 * 24 * 60 * 60 * 1000;
+  return new Date(now + millis).toISOString();
+}
+
+function parseMaxUses(label: string): number {
+  const match = label.match(/\d+/);
+  return match ? Number(match[0]) || 5 : 5;
+}
+
 function parseInviteGroupName(inviteCode: string): string {
   const tail = inviteCode.trim().split("/").filter(Boolean).at(-1) ?? "";
   const name = tail.includes("-")
@@ -736,23 +779,60 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
   );
 }
 
+export async function setActiveGroup(
+  request: SetActiveGroupRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_active_group", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const group = state.groups.find(
+        (item) => item.group_id === request.group_id,
+      );
+      if (!group) return;
+      state.active_context = {
+        kind: "group",
+        group_id: group.group_id,
+        channel_id: null,
+        dm_id: null,
+      };
+      pushEvent(state, "group.focused", `Focused group ${group.name}`);
+    }),
+  );
+}
+
 export async function createInvite(
   request: CreateInviteRequest,
 ): Promise<AppState> {
   return invokeOrFallback<AppState>("create_invite", { request }, () =>
     mutateFallback((state) => {
       ensureFallbackReady();
-      const groupId = request.group_id ?? state.groups[0]?.group_id;
+      const groupId =
+        request.group_id ??
+        state.active_context?.group_id ??
+        state.groups[0]?.group_id;
       if (!groupId) return;
       const group = state.groups.find((item) => item.group_id === groupId);
-      const inviteId = `invite-${state.invites.length + 1}`;
+      const inviteKey =
+        crypto.randomUUID?.() ?? `local-${state.invites.length + 1}`;
+      const roomSecretHash = stableHash(
+        `${groupId}:${inviteKey}:${state.invites.length}`,
+      );
+      const roomSecret = roomSecretHash.slice(0, 32);
+      const expires = request.expires || fallbackState.snapshot.invite.expires;
+      const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
       state.invites.push({
-        invite_id: inviteId,
+        invite_id: `invite-${inviteKey}`,
+        invite_key: inviteKey,
         group_id: groupId,
-        code: `discrypt://join/${inviteId}-${slugify(group?.name ?? "group")}`,
-        expires: request.expires || fallbackState.snapshot.invite.expires,
-        max_use: request.max_use || fallbackState.snapshot.invite.max_use,
-        admission_copy: fallbackState.snapshot.invite.welcome_required,
+        code: `discrypt://join/v1/${inviteKey}?room_secret=${roomSecret}&exp=${encodeURIComponent(inviteExpirationHorizon(expires))}&max=${parseMaxUses(maxUse)}`,
+        room_secret_hash: roomSecretHash,
+        expires,
+        expires_at: inviteExpirationHorizon(expires),
+        max_use: maxUse,
+        uses: 0,
+        revoked: false,
+        admission_copy:
+          "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient",
       });
       pushEvent(
         state,

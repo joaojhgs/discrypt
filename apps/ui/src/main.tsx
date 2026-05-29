@@ -14,6 +14,7 @@ import {
   ChannelStateView,
   DirectConversationView,
   GroupView,
+  InviteView,
   VoiceParticipantView,
   createChannel as createChannelCommand,
   createGroup,
@@ -26,6 +27,7 @@ import {
   recoverUser,
   savePreferences,
   sendMessage,
+  setActiveGroup,
   setSelfMute,
   setSpeakerVolume,
   startDm,
@@ -281,6 +283,12 @@ function App() {
     );
   }
 
+  function focusCommandGroup(groupId: string) {
+    void applyCommand(setActiveGroup({ group_id: groupId }), () =>
+      setWorkflow("channel"),
+    );
+  }
+
   function createCommandChannel(kind: ChannelKind = "Text") {
     if (!activeGroup) {
       setCommandError("Create or join a group before adding a channel.");
@@ -468,6 +476,7 @@ function App() {
         groups={appState.groups}
         activeGroup={activeGroup}
         themeLabel={activeTheme.label}
+        onSelectGroup={focusCommandGroup}
       />
       <ChannelSidebar
         groupLabel={groupLabel}
@@ -539,7 +548,7 @@ function App() {
               setInviteValue={setDraftInvite}
               groupName={draftJoinName}
               setGroupName={setDraftJoinName}
-              latestInvite={appState.invites.at(-1)?.code ?? null}
+              latestInvite={appState.invites.at(-1) ?? null}
               onJoin={joinCommandGroup}
               onCreateInvite={createCommandInvite}
               canCreateInvite={Boolean(activeGroup)}
@@ -786,10 +795,12 @@ function ServerRail({
   groups,
   activeGroup,
   themeLabel,
+  onSelectGroup,
 }: {
   groups: GroupView[];
   activeGroup: GroupView | null;
   themeLabel: string;
+  onSelectGroup: (groupId: string) => void;
 }) {
   return (
     <aside className="hidden border-r border-[hsl(var(--border))] bg-black/20 p-3 md:flex md:flex-col md:items-center md:gap-3">
@@ -809,18 +820,22 @@ function ServerRail({
       )
         .slice(0, 6)
         .map((group) => (
-          <div
+          <button
             key={group.group_id}
+            type="button"
             title={group.name}
+            aria-label={`Open ${group.name} group`}
+            onClick={() => onSelectGroup(group.group_id)}
+            disabled={group.group_id === "local"}
             className={cn(
-              "grid h-11 w-11 place-items-center rounded-2xl border text-xs font-bold",
+              "grid h-11 w-11 place-items-center rounded-2xl border text-xs font-bold transition hover:border-[hsl(var(--primary)/0.6)] hover:text-[hsl(var(--foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] disabled:cursor-default",
               group.group_id === activeGroup?.group_id
                 ? "border-[hsl(var(--primary)/0.6)] bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))]"
                 : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
             )}
           >
             {group.name.slice(0, 2).toUpperCase()}
-          </div>
+          </button>
         ))}
       <div
         className="mt-auto grid h-10 w-10 place-items-center rounded-xl border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
@@ -1399,7 +1414,7 @@ function JoinPanel({
   setInviteValue: (value: string) => void;
   groupName: string;
   setGroupName: (value: string) => void;
-  latestInvite: string | null;
+  latestInvite: InviteView | null;
   onJoin: () => void;
   onCreateInvite: () => void;
   canCreateInvite: boolean;
@@ -1441,7 +1456,7 @@ function JoinPanel({
             {latestInvite ? (
               <Button
                 variant="secondary"
-                onClick={() => setInviteValue(latestInvite)}
+                onClick={() => setInviteValue(latestInvite.code)}
               >
                 Use latest invite
               </Button>
@@ -1450,7 +1465,18 @@ function JoinPanel({
           {latestInvite ? (
             <div className="rounded-2xl border border-emerald-300/30 bg-emerald-300/10 p-4 text-sm text-emerald-100">
               <p className="font-medium">Latest invite</p>
-              <p className="mt-1 break-all font-mono text-xs">{latestInvite}</p>
+              <p className="mt-1 break-all font-mono text-xs">
+                {latestInvite.code}
+              </p>
+              <div className="mt-3 grid gap-2 text-xs text-emerald-50/85 sm:grid-cols-2">
+                <span>Invite key: {latestInvite.invite_key}</span>
+                <span>Expires: {latestInvite.expires_at}</span>
+                <span>Max uses: {latestInvite.max_use}</span>
+                <span>Uses: {latestInvite.uses}</span>
+              </div>
+              <p className="mt-2 break-all text-[11px] text-emerald-50/70">
+                Room secret hash: {latestInvite.room_secret_hash}
+              </p>
             </div>
           ) : null}
         </CardContent>
@@ -1820,7 +1846,7 @@ function VoicePanel({
           </Button>
           <InfoRow
             title="Voice honesty"
-            copy="This build persists local voice session controls only. Real media transport is release-gated behind media-frame E2E and no relay/member is shown unless returned by state."
+            copy="Phase-1 SFrame/relay media security is implemented in the Rust harness; this UI currently controls the local voice session until native media-frame E2E is wired into the Tauri shell. No relay/member is shown unless returned by state."
           />
         </CardContent>
       </Card>

@@ -14,6 +14,10 @@ tauri-runtime = ["dep:tauri", "dep:tauri-build", "tauri/wry"]
 
 [dependencies]
 discrypt-core = { path = "../../../crates/core", version = "0.1.0" }
+chrono = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2.11.2", optional = true, default-features = false , features = [] }
