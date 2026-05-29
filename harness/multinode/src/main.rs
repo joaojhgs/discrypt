@@ -2,8 +2,8 @@ use discrypt_core::summarize;
 use discrypt_mls_core::GroupState;
 use discrypt_multinode_harness::{
     connectivity_signaling_push_smoke, governance_admission_smoke, media_security_smoke,
-    relay_overlay_smoke, retention_shred_smoke, storage_persistence_smoke,
-    text_history_delivery_smoke, ux_e2e_hardening_smoke,
+    phase_c_device_rotation_smoke, relay_overlay_smoke, retention_shred_smoke,
+    storage_persistence_smoke, text_history_delivery_smoke, ux_e2e_hardening_smoke,
 };
 
 fn main() {
@@ -17,6 +17,7 @@ fn main() {
         storage_persistence_smoke(),
         governance_admission_smoke(),
         connectivity_signaling_push_smoke(),
+        phase_c_device_rotation_smoke(),
         ux_e2e_hardening_smoke(),
     ) {
         (
@@ -27,6 +28,7 @@ fn main() {
             Ok(storage),
             Ok(governance),
             Ok(connectivity),
+            Ok(phase_c),
             Ok(ux),
         ) => {
             if !(media.ready()
@@ -36,13 +38,14 @@ fn main() {
                 && storage.ready()
                 && governance.ready()
                 && connectivity.ready()
+                && phase_c.ready()
                 && ux.ready())
             {
                 eprintln!("discrypt multinode harness readiness gate failed");
                 std::process::exit(1);
             }
             println!(
-                "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} overlay_hops={} overlay_failover={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_e2e_roundtrip={} text_no_plaintext={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} storage_fresh_install={} storage_restart={} storage_no_plaintext={} storage_corrupt_rejected={} storage_secure_delete={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={} signaling_zero_linkage={} connectivity_fallback={} connectivity_overrides={} android_wake_content_free={} metadata_matrix={} pcap_no_content={} relays_ciphertext_only={} socket_local_process={} route_reporting_honest={} ux_commands={} ux_discord={} ux_verify_devices={} ux_invite_retention_delete={} ux_connectivity_copy={} ux_all_phases={}",
+                "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} overlay_hops={} overlay_failover={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_e2e_roundtrip={} text_no_plaintext={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} storage_fresh_install={} storage_restart={} storage_no_plaintext={} storage_corrupt_rejected={} storage_secure_delete={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={} signaling_zero_linkage={} connectivity_fallback={} connectivity_overrides={} android_wake_content_free={} metadata_matrix={} pcap_no_content={} relays_ciphertext_only={} socket_local_process={} route_reporting_honest={} phase_c_retired={} phase_c_rekeyed={} phase_c_old_send_blocked={} phase_c_replacement_send={} phase_c_stale_blocked={} phase_c_transparency={} phase_c_command_devices={} ux_commands={} ux_discord={} ux_verify_devices={} ux_invite_retention_delete={} ux_connectivity_copy={} ux_all_phases={}",
             summary.room_id,
             summary.epoch,
             summary.members,
@@ -94,6 +97,13 @@ fn main() {
             connectivity.relays_ciphertext_only,
             connectivity.socket_local_process_conformant,
             connectivity.route_reporting_honest,
+            phase_c.compromised_device_retired,
+            phase_c.group_rekeyed_after_rotation,
+            phase_c.old_device_send_blocked,
+            phase_c.replacement_device_can_send,
+            phase_c.stale_epoch_send_blocked,
+            phase_c.transparency_notices_include_rotation,
+            phase_c.command_surface_reports_device_metadata,
             ux.command_surface_ready,
             ux.discord_style_model_ready,
             ux.verification_and_devices_ready,
@@ -102,37 +112,41 @@ fn main() {
                 ux.all_phase_smokes_ready
             );
         }
-        (Err(error), _, _, _, _, _, _, _) => {
+        (Err(error), _, _, _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness media smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, Err(error), _, _, _, _, _, _) => {
+        (_, Err(error), _, _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness relay overlay smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, Err(error), _, _, _, _, _) => {
+        (_, _, Err(error), _, _, _, _, _, _) => {
             eprintln!("discrypt multinode harness text history smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, Err(error), _, _, _, _) => {
+        (_, _, _, Err(error), _, _, _, _, _) => {
             eprintln!("discrypt multinode harness retention/shred smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, Err(error), _, _, _) => {
+        (_, _, _, _, Err(error), _, _, _, _) => {
             eprintln!("discrypt multinode harness storage persistence smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, _, Err(error), _, _) => {
+        (_, _, _, _, _, Err(error), _, _, _) => {
             eprintln!("discrypt multinode harness governance/admission smoke failed: {error}");
             std::process::exit(1);
         }
-        (_, _, _, _, _, _, Err(error), _) => {
+        (_, _, _, _, _, _, Err(error), _, _) => {
             eprintln!(
                 "discrypt multinode harness connectivity/signaling/push smoke failed: {error}"
             );
             std::process::exit(1);
         }
-        (_, _, _, _, _, _, _, Err(error)) => {
+        (_, _, _, _, _, _, _, Err(error), _) => {
+            eprintln!("discrypt multinode harness Phase-C device rotation smoke failed: {error}");
+            std::process::exit(1);
+        }
+        (_, _, _, _, _, _, _, _, Err(error)) => {
             eprintln!("discrypt multinode harness UX/E2E hardening smoke failed: {error}");
             std::process::exit(1);
         }

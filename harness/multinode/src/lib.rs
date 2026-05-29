@@ -154,6 +154,25 @@ pub struct ConnectivitySignalingPushSmoke {
     pub route_reporting_honest: bool,
 }
 
+/// Deterministic Phase-C device-rotation integration verification result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhaseCDeviceRotationSmoke {
+    /// Compromised device is marked retired and no longer eligible to author sends.
+    pub compromised_device_retired: bool,
+    /// Group state rekeys after removing the compromised leaf and adding replacement.
+    pub group_rekeyed_after_rotation: bool,
+    /// Old compromised leaf cannot send in the current group epoch.
+    pub old_device_send_blocked: bool,
+    /// Replacement leaf can send in the current group epoch.
+    pub replacement_device_can_send: bool,
+    /// Replacement leaf cannot replay sends under the prior epoch.
+    pub stale_epoch_send_blocked: bool,
+    /// Transparency stream includes compromised removal and replacement notices.
+    pub transparency_notices_include_rotation: bool,
+    /// Command/UI-facing health still reports honest device-management metadata.
+    pub command_surface_reports_device_metadata: bool,
+}
+
 /// Deterministic Phase-7 UX and end-to-end hardening smoke result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UxE2eHardeningSmoke {
@@ -263,6 +282,20 @@ impl ConnectivitySignalingPushSmoke {
             && self.relays_ciphertext_only
             && self.socket_local_process_conformant
             && self.route_reporting_honest
+    }
+}
+
+impl PhaseCDeviceRotationSmoke {
+    /// True when every Phase-C device-rotation invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.compromised_device_retired
+            && self.group_rekeyed_after_rotation
+            && self.old_device_send_blocked
+            && self.replacement_device_can_send
+            && self.stale_epoch_send_blocked
+            && self.transparency_notices_include_rotation
+            && self.command_surface_reports_device_metadata
     }
 }
 
@@ -1113,6 +1146,91 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+/// Exercise Phase-C compromised-device rotation, next-epoch send blocking, and UI metadata.
+pub fn phase_c_device_rotation_smoke() -> Result<PhaseCDeviceRotationSmoke, anyhow::Error> {
+    use discrypt_mls_core::{
+        DeviceSet, DeviceStatus, ExportLabel, GroupState, Identity, MlsCoreError,
+    };
+
+    let identity = Identity::generate("alice");
+    let compromised_device_key = Identity::generate("alice-lost-laptop-device").verifying_key();
+    let replacement_device_key =
+        Identity::generate("alice-replacement-laptop-device").verifying_key();
+    let mut devices = DeviceSet::new();
+    let compromised =
+        devices.add_authorized_device(&identity, compromised_device_key, "lost laptop", 0);
+
+    let mut group = GroupState::new("phase-c-device-rotation");
+    group.add_leaf(compromised.clone())?;
+    let before_rotation = group.export(ExportLabel::Content, b"phase-c-text-send");
+    let original_epoch = group.epoch;
+
+    let rotation = devices.rotate_compromised_device(
+        &identity,
+        compromised.device_id,
+        replacement_device_key,
+        "replacement laptop",
+        original_epoch.saturating_add(1),
+        original_epoch.saturating_add(2),
+    )?;
+    group.rotate_leaf(compromised.leaf_index, rotation.replacement.clone())?;
+
+    let compromised_device_retired = devices
+        .device(compromised.device_id)
+        .is_some_and(|device| device.status == DeviceStatus::Compromised)
+        && !devices.device_may_send(compromised.device_id)
+        && devices.device_may_send(rotation.replacement.device_id);
+    let group_rekeyed_after_rotation = group.export(ExportLabel::Content, b"phase-c-text-send")
+        != before_rotation
+        && group.epoch == original_epoch.saturating_add(2);
+    let old_device_send_blocked = group.validate_sender(compromised.leaf_index, group.epoch)
+        == Err(MlsCoreError::SenderNotAuthorized(compromised.leaf_index));
+    let replacement_device_can_send =
+        group.validate_sender(rotation.replacement.leaf_index, group.epoch) == Ok(());
+    let stale_epoch_send_blocked = group.validate_sender(
+        rotation.replacement.leaf_index,
+        group.epoch.saturating_sub(1),
+    ) == Err(MlsCoreError::StaleSenderEpoch {
+        current: group.epoch,
+        attempted: group.epoch.saturating_sub(1),
+    });
+    let transparency_notices_include_rotation = devices
+        .transparency_events()
+        .iter()
+        .any(|event| event.kind == "device-compromised-removed")
+        && devices
+            .transparency_events()
+            .iter()
+            .any(|event| event.kind == "device-rotation-replacement");
+
+    let snapshot = discrypt_core::app_snapshot();
+    let command_health = discrypt_desktop::command_health();
+    let command_surface_reports_device_metadata = command_health.identity_ready
+        && command_health.honest_copy_ready
+        && snapshot
+            .devices
+            .iter()
+            .any(|device| device.local && device.authorized)
+        && snapshot
+            .devices
+            .iter()
+            .any(|device| !device.local && device.authorized)
+        && snapshot
+            .security_copy
+            .deletion
+            .contains("pending on offline devices until they reconnect");
+
+    Ok(PhaseCDeviceRotationSmoke {
+        compromised_device_retired,
+        group_rekeyed_after_rotation,
+        old_device_send_blocked,
+        replacement_device_can_send,
+        stale_epoch_send_blocked,
+        transparency_notices_include_rotation,
+        command_surface_reports_device_metadata,
+    })
+}
+
 /// Exercise Phase-7 Tauri/React command-surface and final E2E hardening gates.
 pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
     let snapshot = discrypt_core::app_snapshot();
@@ -1175,13 +1293,15 @@ pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
     let storage = storage_persistence_smoke()?;
     let governance = governance_admission_smoke()?;
     let connectivity = connectivity_signaling_push_smoke()?;
+    let phase_c = phase_c_device_rotation_smoke()?;
     let all_phase_smokes_ready = media.ready()
         && overlay.ready()
         && text.ready()
         && retention.ready()
         && storage.ready()
         && governance.ready()
-        && connectivity.ready();
+        && connectivity.ready()
+        && phase_c.ready();
 
     Ok(UxE2eHardeningSmoke {
         command_surface_ready,
@@ -1324,6 +1444,23 @@ mod tests {
                 relays_ciphertext_only: true,
                 socket_local_process_conformant: true,
                 route_reporting_honest: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn phase_c_device_rotation_smoke_blocks_old_device_sends() {
+        let smoke = phase_c_device_rotation_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(PhaseCDeviceRotationSmoke {
+                compromised_device_retired: true,
+                group_rekeyed_after_rotation: true,
+                old_device_send_blocked: true,
+                replacement_device_can_send: true,
+                stale_epoch_send_blocked: true,
+                transparency_notices_include_rotation: true,
+                command_surface_reports_device_metadata: true,
             })
         ));
     }
