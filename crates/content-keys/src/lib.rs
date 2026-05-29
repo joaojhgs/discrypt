@@ -388,13 +388,69 @@ pub enum LocalMembershipStateError {
     },
 }
 
+/// Optional dimensions for live-key request rate limiting.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct LiveKeyRequestScope {
+    /// Author/content-key owner being requested, when known.
+    pub author_leaf: Option<u32>,
+    /// Domain-separated hash of network identity, when available.
+    pub network_identity_hash: Option<[u8; 32]>,
+}
+
+impl LiveKeyRequestScope {
+    /// Scope without author/network dimensions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scope one request to an author/content-key owner.
+    #[must_use]
+    pub fn for_author(author_leaf: u32) -> Self {
+        Self {
+            author_leaf: Some(author_leaf),
+            network_identity_hash: None,
+        }
+    }
+
+    /// Attach a hashed network identity, such as peer socket, relay identity, or
+    /// authenticated transport token. Raw identity text is not persisted.
+    #[must_use]
+    pub fn with_network_identity(mut self, network_identity: impl AsRef<[u8]>) -> Self {
+        let mut h = Sha256::new();
+        h.update(b"discrypt-live-key-rate-limit-network-identity-v1");
+        h.update(network_identity.as_ref());
+        self.network_identity_hash = Some(h.finalize().into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct LiveKeyRateLimitKey {
+    requester_leaf: u32,
+    epoch: u64,
+    author_leaf: Option<u32>,
+    network_identity_hash: Option<[u8; 32]>,
+}
+
+impl LiveKeyRateLimitKey {
+    fn from_proof_scope(proof: &MembershipProof, scope: &LiveKeyRequestScope) -> Self {
+        Self {
+            requester_leaf: proof.requester_leaf,
+            epoch: proof.epoch,
+            author_leaf: scope.author_leaf,
+            network_identity_hash: scope.network_identity_hash,
+        }
+    }
+}
+
 /// Membership-gated, rate-limited, decoy-capable live-key oracle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveKeyOracle {
     members_by_epoch: BTreeMap<u64, BTreeSet<u32>>,
     group_commitments_by_epoch: BTreeMap<u64, [u8; 32]>,
     authorized_device_keys: BTreeMap<(u64, u32), BTreeSet<[u8; 32]>>,
-    requests_by_leaf_epoch: BTreeMap<(u32, u64), usize>,
+    requests_by_rate_key: BTreeMap<LiveKeyRateLimitKey, usize>,
     max_requests: usize,
     decoy_key: [u8; 32],
 }
@@ -457,7 +513,7 @@ impl LiveKeyOracle {
             members_by_epoch,
             group_commitments_by_epoch,
             authorized_device_keys: BTreeMap::new(),
-            requests_by_leaf_epoch: BTreeMap::new(),
+            requests_by_rate_key: BTreeMap::new(),
             max_requests: max_requests.max(1),
             decoy_key: [0xD; 32],
         }
@@ -492,19 +548,43 @@ impl LiveKeyOracle {
         true
     }
 
-    /// Request an archival key. Non-members and invalid proofs receive decoys;
-    /// authorized members are rate-limited by leaf and epoch.
+    /// Request an archival key using the default requester+epoch rate scope.
     pub fn request_key(&mut self, proof: &MembershipProof, key: [u8; 32]) -> LiveKeyResponse {
+        self.request_key_scoped(proof, &LiveKeyRequestScope::new(), key)
+    }
+
+    /// Request an archival key using explicit author/network rate-limit dimensions.
+    pub fn request_key_for_author(
+        &mut self,
+        proof: &MembershipProof,
+        author_leaf: u32,
+        network_identity: Option<&str>,
+        key: [u8; 32],
+    ) -> LiveKeyResponse {
+        let mut scope = LiveKeyRequestScope::for_author(author_leaf);
+        if let Some(network_identity) = network_identity {
+            scope = scope.with_network_identity(network_identity);
+        }
+        self.request_key_scoped(proof, &scope, key)
+    }
+
+    /// Request an archival key. Non-members and invalid proofs receive decoys;
+    /// authorized members are rate-limited by requester, epoch, author, and
+    /// network identity when those dimensions are available.
+    pub fn request_key_scoped(
+        &mut self,
+        proof: &MembershipProof,
+        scope: &LiveKeyRequestScope,
+        key: [u8; 32],
+    ) -> LiveKeyResponse {
         if !self.proof_authorized(proof) {
             return LiveKeyResponse {
                 state: KeyState::Decoy(self.decoy_key),
                 authorized: false,
             };
         }
-        let counter = self
-            .requests_by_leaf_epoch
-            .entry((proof.requester_leaf, proof.epoch))
-            .or_default();
+        let rate_key = LiveKeyRateLimitKey::from_proof_scope(proof, scope);
+        let counter = self.requests_by_rate_key.entry(rate_key).or_default();
         *counter = counter.saturating_add(1);
         if *counter > self.max_requests {
             return LiveKeyResponse {
@@ -667,6 +747,55 @@ mod tests {
         let rejected = oracle.request_key(&tampered_signature, key);
         assert!(matches!(rejected.state, KeyState::Decoy(_)));
         assert!(!rejected.authorized);
+        Ok(())
+    }
+
+    #[test]
+    fn live_key_oracle_rate_limits_by_requester_epoch_author_and_network(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut members = BTreeMap::new();
+        members.insert(17, BTreeSet::from([1, 2]));
+        let mut oracle = LiveKeyOracle::new(members, 1);
+        let requester_one = SigningKey::from_bytes(&[0x71; 32]);
+        let requester_two = SigningKey::from_bytes(&[0x72; 32]);
+        assert!(oracle.authorize_member_device(17, 1, &requester_one.verifying_key()));
+        assert!(oracle.authorize_member_device(17, 2, &requester_two.verifying_key()));
+        let commitment = oracle
+            .epoch_group_commitment(17)
+            .ok_or_else(|| std::io::Error::other("epoch commitment missing"))?;
+        let proof_one = MembershipProof::sign(1, 17, "room-rates", commitment, &requester_one);
+        let proof_two = MembershipProof::sign(2, 17, "room-rates", commitment, &requester_two);
+        let key = [0x88; 32];
+
+        let author_a_network_a =
+            LiveKeyRequestScope::for_author(41).with_network_identity("relay-a");
+        let first = oracle.request_key_scoped(&proof_one, &author_a_network_a, key);
+        assert_eq!(first.state, KeyState::Cached(key));
+        assert!(first.authorized);
+        let limited = oracle.request_key_scoped(&proof_one, &author_a_network_a, key);
+        assert_eq!(limited.state, KeyState::RateLimited);
+        assert!(!limited.authorized);
+
+        let author_b_same_network =
+            LiveKeyRequestScope::for_author(42).with_network_identity("relay-a");
+        let separate_author = oracle.request_key_scoped(&proof_one, &author_b_same_network, key);
+        assert_eq!(separate_author.state, KeyState::Cached(key));
+        assert!(separate_author.authorized);
+
+        let author_a_network_b =
+            LiveKeyRequestScope::for_author(41).with_network_identity("relay-b");
+        let separate_network = oracle.request_key_scoped(&proof_one, &author_a_network_b, key);
+        assert_eq!(separate_network.state, KeyState::Cached(key));
+        assert!(separate_network.authorized);
+
+        let separate_requester = oracle.request_key_scoped(&proof_two, &author_a_network_a, key);
+        assert_eq!(separate_requester.state, KeyState::Cached(key));
+        assert!(separate_requester.authorized);
+
+        let convenience_limited =
+            oracle.request_key_for_author(&proof_one, 41, Some("relay-a"), key);
+        assert_eq!(convenience_limited.state, KeyState::RateLimited);
+        assert!(!convenience_limited.authorized);
         Ok(())
     }
 
