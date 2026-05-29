@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 
+const SEALED_ACCOUNT_BACKUP_DOMAIN: &[u8] = b"discrypt:v1:sealed-account-backup";
+const RECOVERY_CODE_DOMAIN: &[u8] = b"discrypt:v1:account-recovery-code";
+
 /// App-store persistence errors.
 #[derive(Debug, thiserror::Error)]
 pub enum AppStoreError {
@@ -573,6 +576,31 @@ pub struct AccountBackup {
     pub device_count: usize,
 }
 
+/// Persistable verifier for a user-held recovery code.
+///
+/// The raw recovery code is deliberately not stored here. Call
+/// [`recovery_code_material`] with the user-supplied code to produce verified
+/// recovery material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryCodeVerifier {
+    /// Domain-separated hash of the normalized recovery code.
+    pub code_hash: [u8; 32],
+}
+
+impl RecoveryCodeVerifier {
+    /// Build a recovery-code verifier without retaining the raw code.
+    pub fn from_code(code: impl AsRef<str>) -> Result<Self, RecoveryError> {
+        Ok(Self {
+            code_hash: hash_recovery_code(code.as_ref())?,
+        })
+    }
+
+    /// Check whether a user-supplied code matches this verifier.
+    pub fn verifies(&self, code: impl AsRef<str>) -> bool {
+        hash_recovery_code(code.as_ref()).is_ok_and(|candidate| candidate == self.code_hash)
+    }
+}
+
 /// Seal account-continuity data without content keys.
 #[must_use]
 pub fn seal_account_backup(
@@ -581,11 +609,15 @@ pub fn seal_account_backup(
     device_count: usize,
 ) -> AccountBackup {
     let mut material = *key;
-    let digest = Sha256::digest(material);
+    let mut hasher = Sha256::new();
+    hasher.update(SEALED_ACCOUNT_BACKUP_DOMAIN);
+    hasher.update(material);
+    let digest = hasher.finalize();
     material.zeroize();
+    let (room_memberships, device_count) = normalize_account_continuity(rooms, device_count);
     AccountBackup {
         identity_key_ciphertext: digest.to_vec(),
-        room_memberships: rooms,
+        room_memberships,
         device_count,
     }
 }
@@ -595,8 +627,15 @@ pub fn seal_account_backup(
 pub enum RecoveryMaterial {
     /// Existing authorized device participates.
     ExistingDevice { device_id: String },
-    /// User-held recovery code.
-    RecoveryCode { code_hash: [u8; 32] },
+    /// User-held recovery code has been verified against a stored verifier.
+    RecoveryCode {
+        /// Matched recovery-code hash. The raw code is never stored.
+        code_hash: [u8; 32],
+        /// Room memberships restored for account continuity.
+        room_memberships: Vec<String>,
+        /// Device count in the recovered device set.
+        device_count: usize,
+    },
     /// Sealed account-continuity backup.
     SealedBackup(AccountBackup),
     /// No remaining trust material.
@@ -609,6 +648,12 @@ pub enum RecoveryError {
     /// No authorized device, recovery code, or backup exists.
     #[error("account recovery requires trust material")]
     NoTrustMaterial,
+    /// Empty recovery codes are rejected before hashing.
+    #[error("recovery code cannot be empty")]
+    EmptyRecoveryCode,
+    /// The supplied recovery code does not match the stored verifier.
+    #[error("recovery code did not match account verifier")]
+    InvalidRecoveryCode,
 }
 
 /// Account-continuity recovery result.
@@ -624,24 +669,78 @@ pub struct AccountRecovery {
     pub content_keys_restored: bool,
 }
 
+/// Build verified recovery material from a user-held code and persisted verifier.
+///
+/// The returned material contains account-continuity metadata only. Archival
+/// message/content keys are intentionally not accepted by this API and therefore
+/// cannot be restored by [`recover_account`].
+pub fn recovery_code_material(
+    code: impl AsRef<str>,
+    verifier: &RecoveryCodeVerifier,
+    rooms: Vec<String>,
+    device_count: usize,
+) -> Result<RecoveryMaterial, RecoveryError> {
+    if !verifier.verifies(code) {
+        return Err(RecoveryError::InvalidRecoveryCode);
+    }
+    let (room_memberships, device_count) = normalize_account_continuity(rooms, device_count);
+    Ok(RecoveryMaterial::RecoveryCode {
+        code_hash: verifier.code_hash,
+        room_memberships,
+        device_count,
+    })
+}
+
 /// Recover account continuity without restoring archival content keys.
 pub fn recover_account(material: RecoveryMaterial) -> Result<AccountRecovery, RecoveryError> {
     match material {
         RecoveryMaterial::None => Err(RecoveryError::NoTrustMaterial),
-        RecoveryMaterial::ExistingDevice { .. } | RecoveryMaterial::RecoveryCode { .. } => {
-            Ok(AccountRecovery {
-                account_access_restored: true,
-                room_memberships: Vec::new(),
-                device_count: 1,
-                content_keys_restored: false,
-            })
-        }
-        RecoveryMaterial::SealedBackup(backup) => Ok(AccountRecovery {
-            account_access_restored: true,
-            room_memberships: backup.room_memberships,
-            device_count: backup.device_count,
-            content_keys_restored: false,
-        }),
+        RecoveryMaterial::ExistingDevice { .. } => Ok(account_continuity_recovery(Vec::new(), 1)),
+        RecoveryMaterial::RecoveryCode {
+            room_memberships,
+            device_count,
+            ..
+        } => Ok(account_continuity_recovery(room_memberships, device_count)),
+        RecoveryMaterial::SealedBackup(backup) => Ok(account_continuity_recovery(
+            backup.room_memberships,
+            backup.device_count,
+        )),
+    }
+}
+
+fn hash_recovery_code(code: &str) -> Result<[u8; 32], RecoveryError> {
+    let normalized = code.trim();
+    if normalized.is_empty() {
+        return Err(RecoveryError::EmptyRecoveryCode);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(RECOVERY_CODE_DOMAIN);
+    hasher.update((normalized.len() as u64).to_be_bytes());
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&digest);
+    Ok(hash)
+}
+
+fn normalize_account_continuity(rooms: Vec<String>, device_count: usize) -> (Vec<String>, usize) {
+    let room_memberships = rooms
+        .into_iter()
+        .map(|room| room.trim().to_owned())
+        .filter(|room| !room.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    (room_memberships, device_count.max(1))
+}
+
+fn account_continuity_recovery(rooms: Vec<String>, device_count: usize) -> AccountRecovery {
+    let (room_memberships, device_count) = normalize_account_continuity(rooms, device_count);
+    AccountRecovery {
+        account_access_restored: true,
+        room_memberships,
+        device_count,
+        content_keys_restored: false,
     }
 }
 
@@ -743,7 +842,20 @@ mod tests {
 
     #[test]
     fn backup_excludes_content_keys() {
-        let b = seal_account_backup(&[9; 32], vec!["room".into()], 2);
+        let b = seal_account_backup(&[9; 32], vec![" room ".into(), "room".into()], 0);
+        assert_eq!(b.device_count, 1);
+        assert_eq!(b.room_memberships, vec!["room"]);
+        assert_eq!(b.identity_key_ciphertext.len(), 32);
+    }
+
+    #[test]
+    fn sealed_account_backup_is_domain_separated_from_raw_content_key_hashes() {
+        let content_key = [9; 32];
+        let b = seal_account_backup(&content_key, vec!["room".into()], 2);
+        assert_ne!(
+            b.identity_key_ciphertext,
+            Sha256::digest(content_key).to_vec()
+        );
         assert_eq!(b.device_count, 2);
         assert_eq!(b.room_memberships, vec!["room"]);
         assert_eq!(b.identity_key_ciphertext.len(), 32);
@@ -807,6 +919,41 @@ mod tests {
         sim.secure_delete(["db.sqlite", "db.sqlite-wal", "key.store"]);
         assert!(!sim.contains_material(b"content-key"));
         assert!(sim.deleted_all(["db.sqlite", "db.sqlite-wal", "key.store"]));
+    }
+
+    #[test]
+    fn recovery_code_requires_verifier_and_never_restores_content_keys() -> Result<(), RecoveryError>
+    {
+        assert_eq!(
+            RecoveryCodeVerifier::from_code("   "),
+            Err(RecoveryError::EmptyRecoveryCode)
+        );
+        let verifier = RecoveryCodeVerifier::from_code(" paper-coral-falcon ")?;
+        assert!(verifier.verifies("paper-coral-falcon"));
+        assert!(verifier.verifies("  paper-coral-falcon  "));
+        assert!(!verifier.verifies("paper-coral-falcon-wrong"));
+        assert_eq!(
+            recovery_code_material("wrong", &verifier, vec!["room".into()], 2),
+            Err(RecoveryError::InvalidRecoveryCode)
+        );
+
+        let material = recovery_code_material(
+            "paper-coral-falcon",
+            &verifier,
+            vec!["room".into(), "room".into(), " ".into()],
+            3,
+        )?;
+        let recovered = recover_account(material)?;
+        assert_eq!(
+            recovered,
+            AccountRecovery {
+                account_access_restored: true,
+                room_memberships: vec!["room".to_owned()],
+                device_count: 3,
+                content_keys_restored: false,
+            }
+        );
+        Ok(())
     }
 
     #[test]

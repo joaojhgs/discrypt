@@ -808,7 +808,8 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
         GovernanceAction, GovernanceError, GovernanceEvent, GovernanceLog, GovernanceState, Role,
     };
     use discrypt_storage::{
-        recover_account, seal_account_backup, AccountRecovery, RecoveryError, RecoveryMaterial,
+        recover_account, recovery_code_material, seal_account_backup, AccountRecovery,
+        RecoveryCodeVerifier, RecoveryError, RecoveryMaterial,
     };
 
     let mut log = GovernanceLog::default();
@@ -897,8 +898,22 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
                 == Err(InviteError::PasswordRejected);
 
     let backup = seal_account_backup(&[8; 32], vec!["room".into()], 2);
+    let recovery_code = RecoveryCodeVerifier::from_code("paper-coral-falcon")?;
+    let code_material =
+        recovery_code_material("paper-coral-falcon", &recovery_code, vec!["room".into()], 2)?;
     let recovery_trust_model = recover_account(RecoveryMaterial::None)
         == Err(RecoveryError::NoTrustMaterial)
+        && recovery_code_material("wrong", &recovery_code, vec!["room".into()], 2)
+            == Err(RecoveryError::InvalidRecoveryCode)
+        && matches!(
+            recover_account(code_material),
+            Ok(AccountRecovery {
+                account_access_restored: true,
+                room_memberships,
+                device_count: 2,
+                content_keys_restored: false,
+            }) if room_memberships == vec!["room".to_owned()]
+        )
         && matches!(
             recover_account(RecoveryMaterial::SealedBackup(backup)),
             Ok(AccountRecovery {
