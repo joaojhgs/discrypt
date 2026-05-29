@@ -45,6 +45,12 @@ pub enum DeliveryError {
     /// Text message envelope signature verification failed.
     #[error("text message envelope signature verification failed")]
     TextMessageSignatureVerificationFailed,
+    /// Text delivery receipt is malformed or missing authenticated metadata.
+    #[error("invalid text delivery receipt: {0}")]
+    InvalidTextDeliveryReceipt(String),
+    /// Text delivery receipt signature verification failed.
+    #[error("text delivery receipt signature verification failed")]
+    TextDeliveryReceiptSignatureVerificationFailed,
     /// Text payload encryption failed.
     #[error("text message encryption failed")]
     TextMessageEncryptionFailed,
@@ -232,6 +238,135 @@ pub struct TextMessageEnvelope {
     pub content_ciphertext: Vec<u8>,
     /// Ed25519 signature over the canonical unsigned envelope bytes.
     pub signature: Vec<u8>,
+}
+
+/// Required unsigned fields for a delivery receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextDeliveryReceiptInput {
+    /// Stable message id being acknowledged.
+    pub message_id: String,
+    /// Recipient MLS leaf that verified/persisted the envelope.
+    pub recipient_leaf: u32,
+    /// Stable recipient device id under the account identity.
+    pub recipient_device_id: String,
+    /// Deterministic receipt timestamp in milliseconds.
+    pub received_at_ms: u64,
+    /// Ciphertext hash of the received signed envelope.
+    pub envelope_ciphertext_hash: [u8; 32],
+}
+
+/// Signed delivery receipt that can justify a remote-delivered UI state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextDeliveryReceipt {
+    /// Content-hiding commitment to the group id.
+    pub group_id_commitment: [u8; 32],
+    /// Stable message id being acknowledged.
+    pub message_id: String,
+    /// Recipient MLS leaf that verified/persisted the envelope.
+    pub recipient_leaf: u32,
+    /// Stable recipient device id under the account identity.
+    pub recipient_device_id: String,
+    /// Deterministic receipt timestamp in milliseconds.
+    pub received_at_ms: u64,
+    /// Ciphertext hash of the received signed envelope.
+    pub envelope_ciphertext_hash: [u8; 32],
+    /// Ed25519 signature over canonical receipt bytes.
+    pub signature: Vec<u8>,
+}
+
+impl TextDeliveryReceipt {
+    /// Create a receipt for an envelope that was actually validated and persisted.
+    pub fn sign(
+        group_id: &str,
+        input: TextDeliveryReceiptInput,
+        signing_key: &SigningKey,
+    ) -> Result<Self, DeliveryError> {
+        let mut receipt = Self {
+            group_id_commitment: group_id_commitment(group_id)?,
+            message_id: input.message_id,
+            recipient_leaf: input.recipient_leaf,
+            recipient_device_id: input.recipient_device_id,
+            received_at_ms: input.received_at_ms,
+            envelope_ciphertext_hash: input.envelope_ciphertext_hash,
+            signature: Vec::new(),
+        };
+        receipt.validate_unsigned()?;
+        receipt.signature = signing_key
+            .sign(&receipt.canonical_unsigned_bytes())
+            .to_bytes()
+            .to_vec();
+        Ok(receipt)
+    }
+
+    /// Verify group binding, message binding, ciphertext hash, and recipient signature.
+    pub fn verify(
+        &self,
+        group_id: &str,
+        envelope: &TextMessageEnvelope,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), DeliveryError> {
+        self.validate_unsigned()?;
+        if self.group_id_commitment != group_id_commitment(group_id)? {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "group commitment mismatch".to_owned(),
+            ));
+        }
+        if self.message_id != envelope.message_id {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "message id mismatch".to_owned(),
+            ));
+        }
+        if self.envelope_ciphertext_hash != envelope.ciphertext_hash() {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "ciphertext hash mismatch".to_owned(),
+            ));
+        }
+        let signature_bytes: [u8; 64] = self.signature.as_slice().try_into().map_err(|_| {
+            DeliveryError::InvalidTextDeliveryReceipt("signature must be 64 bytes".to_owned())
+        })?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify(&self.canonical_unsigned_bytes(), &signature)
+            .map_err(|_| DeliveryError::TextDeliveryReceiptSignatureVerificationFailed)
+    }
+
+    /// Canonical unsigned bytes covered by the receipt signature.
+    #[must_use]
+    pub fn canonical_unsigned_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_bytes(&mut out, b"discrypt-text-delivery-receipt-v1");
+        out.extend_from_slice(&self.group_id_commitment);
+        push_str(&mut out, &self.message_id);
+        out.extend_from_slice(&self.recipient_leaf.to_be_bytes());
+        push_str(&mut out, &self.recipient_device_id);
+        out.extend_from_slice(&self.received_at_ms.to_be_bytes());
+        out.extend_from_slice(&self.envelope_ciphertext_hash);
+        out
+    }
+
+    fn validate_unsigned(&self) -> Result<(), DeliveryError> {
+        if self.group_id_commitment == [0; 32] {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "group commitment is required".to_owned(),
+            ));
+        }
+        if self.message_id.trim().is_empty() {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "message id is required".to_owned(),
+            ));
+        }
+        if self.recipient_device_id.trim().is_empty() {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "recipient device id is required".to_owned(),
+            ));
+        }
+        if self.envelope_ciphertext_hash == [0; 32] {
+            return Err(DeliveryError::InvalidTextDeliveryReceipt(
+                "ciphertext hash is required".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl TextMessageEnvelope {
@@ -452,8 +587,10 @@ pub struct TextOutboundFrame {
 pub enum TextSendEventKind {
     /// Message was encrypted, persisted, and queued for transport.
     Pending,
-    /// Message frame was accepted by the selected transport/overlay.
-    Delivered,
+    /// Message frame was accepted by local transport; remote delivery is not claimed.
+    TransportAccepted,
+    /// A signed recipient receipt was verified.
+    ReceiptVerified,
     /// Send failed; see event error text.
     Error,
 }
@@ -478,10 +615,10 @@ impl TextSendEvent {
         }
     }
 
-    fn delivered(message_id: &str) -> Self {
+    fn transport_accepted(message_id: &str) -> Self {
         Self {
             message_id: message_id.to_owned(),
-            kind: TextSendEventKind::Delivered,
+            kind: TextSendEventKind::TransportAccepted,
             error: None,
         }
     }
@@ -615,7 +752,7 @@ where
             },
         )?;
         self.events
-            .emit_text_send_event(TextSendEvent::delivered(&request.message_id))?;
+            .emit_text_send_event(TextSendEvent::transport_accepted(&request.message_id))?;
         Ok(TextSendReceipt {
             message_id: request.message_id,
             envelope,
@@ -1871,8 +2008,49 @@ mod tests {
                 .iter()
                 .map(|event| &event.kind)
                 .collect::<Vec<_>>(),
-            vec![&TextSendEventKind::Pending, &TextSendEventKind::Delivered]
+            vec![
+                &TextSendEventKind::Pending,
+                &TextSendEventKind::TransportAccepted,
+            ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn text_delivery_receipt_authenticates_remote_delivery_claim() -> Result<(), DeliveryError> {
+        let (envelope, _sender) = signed_envelope_for_receive("msg-receipted")?;
+        let recipient_signer = signing_key(33);
+        let receipt = TextDeliveryReceipt::sign(
+            "group/private-lab",
+            TextDeliveryReceiptInput {
+                message_id: envelope.message_id.clone(),
+                recipient_leaf: 2,
+                recipient_device_id: "bob-phone".to_owned(),
+                received_at_ms: 2_222,
+                envelope_ciphertext_hash: envelope.ciphertext_hash(),
+            },
+            &recipient_signer,
+        )?;
+
+        receipt.verify(
+            "group/private-lab",
+            &envelope,
+            &recipient_signer.verifying_key(),
+        )?;
+        let mut tampered = receipt.clone();
+        tampered.message_id = "other-message".to_owned();
+        assert!(matches!(
+            tampered.verify(
+                "group/private-lab",
+                &envelope,
+                &recipient_signer.verifying_key(),
+            ),
+            Err(DeliveryError::InvalidTextDeliveryReceipt(_))
+        ));
+        assert!(matches!(
+            receipt.verify("wrong-group", &envelope, &recipient_signer.verifying_key(),),
+            Err(DeliveryError::InvalidTextDeliveryReceipt(_))
+        ));
         Ok(())
     }
 

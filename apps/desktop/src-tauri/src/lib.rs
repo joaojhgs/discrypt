@@ -1102,13 +1102,13 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             author_id: state.local_user_id(),
             author,
             body: body.to_owned(),
-            status: "local encrypted author log; socket delivery not claimed".to_owned(),
+            status: "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned(),
             sent_at: format!("local-{sequence}"),
         };
         state.messages.push(message);
         state.push_event(
             "message.sent",
-            "Message appended to local encrypted timeline facade",
+            "Message appended to local encrypted timeline; remote delivery/read receipts are not claimed",
         );
     })
 }

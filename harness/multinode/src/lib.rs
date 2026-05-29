@@ -906,7 +906,10 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
             .iter()
             .map(|event| &event.kind)
             .collect::<Vec<_>>()
-            == vec![&TextSendEventKind::Pending, &TextSendEventKind::Delivered]
+            == vec![
+                &TextSendEventKind::Pending,
+                &TextSendEventKind::TransportAccepted,
+            ]
         && inbound_store.entries.len() == 1
         && inbound_events.events.len() == 1
         && inbound_events.events[0].kind == TextReceiveEventKind::Updated

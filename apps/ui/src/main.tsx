@@ -1712,8 +1712,8 @@ function Timeline({
         </Label>
         <div className="mt-3 flex items-center justify-between gap-3">
           <p className="text-xs text-[hsl(var(--muted-foreground))]">
-            Local encrypted timeline facade; remote socket delivery is not
-            claimed.
+            Local encrypted timeline; remote delivery/read receipts require
+            signed receipts and are not claimed here.
           </p>
           <Button onClick={onSend} disabled={disabled || !draftMessage.trim()}>
             {sendLabel}

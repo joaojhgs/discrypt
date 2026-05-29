@@ -630,7 +630,7 @@ impl<S: AppStore> AppService<S> {
             channel: channel.clone(),
             author: "Alice".to_owned(),
             body: body.to_owned(),
-            state: "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness".to_owned(),
+            state: "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned(),
         });
         self.push_activity(format!("Persisted local-first text message in {channel}"));
         self.persist()?;
@@ -927,7 +927,7 @@ fn seed_state() -> AppState {
                     channel: "#general".to_owned(),
                     author: "Alice".to_owned(),
                     body: "Local-first command-backed timeline is persisted by AppStore.".to_owned(),
-                    state: "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness".to_owned(),
+                    state: "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned(),
                 },
                 MessageView {
                     id: "locked-msg-1".to_owned(),

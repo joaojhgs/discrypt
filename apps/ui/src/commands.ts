@@ -1486,13 +1486,13 @@ export async function sendMessage(
         author: state.profile?.display_name ?? "Alice",
         body,
         status:
-          "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness",
+          "local encrypted author log; remote delivery/read receipts not claimed without signed receipt",
         sent_at: `local-${state.messages.length + 1}`,
       });
       pushEvent(
         state,
         "message.sent",
-        "Message appended to local encrypted timeline facade",
+        "Message appended to local encrypted timeline; remote delivery/read receipts are not claimed",
       );
     }),
   );
