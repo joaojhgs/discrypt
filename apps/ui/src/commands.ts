@@ -302,6 +302,11 @@ type TauriInvoke = <T>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+const LOCAL_DEV_FALLBACK_ENABLED =
+  import.meta.env.DEV ||
+  import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
+
+
 declare global {
   interface Window {
     __TAURI__?: {
@@ -542,6 +547,13 @@ function invokeOrFallback<T>(
 ): Promise<T> {
   const tauriInvoke = window.__TAURI__?.core?.invoke;
   if (!tauriInvoke) {
+    if (!LOCAL_DEV_FALLBACK_ENABLED) {
+      return Promise.reject(
+        new Error(
+          `Tauri IPC unavailable for ${command}; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev/test harness`,
+        ),
+      );
+    }
     return Promise.resolve(fallback());
   }
   return tauriInvoke<T>(command, args);
@@ -1047,13 +1059,17 @@ export async function metadataWarning(): Promise<string> {
 
 export async function commandHealth(): Promise<CommandHealth> {
   return invokeOrFallback<CommandHealth>("command_health", undefined, () => ({
-    snapshot_ready: true,
-    verification_ready: true,
-    app_state_ready: true,
-    identity_ready: true,
-    collaboration_ready: true,
-    voice_ready: true,
-    honest_copy_ready: true,
+    snapshot_ready: fallbackState.snapshot.schema_version >= 1,
+    verification_ready: Boolean(fallbackState.snapshot.friend.safety_number),
+    app_state_ready: fallbackState.schema_version >= 1,
+    identity_ready: ["first_run", "ready"].includes(fallbackState.lifecycle),
+    collaboration_ready: fallbackState.messages.every((message) =>
+      message.status.includes("not claimed"),
+    ),
+    voice_ready: false,
+    honest_copy_ready:
+      fallbackState.security_copy.deletion.includes("pending on offline devices") &&
+      fallbackState.security_copy.metadata.includes("does not claim anonymity"),
   }));
 }
 

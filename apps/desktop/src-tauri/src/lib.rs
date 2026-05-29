@@ -18,7 +18,6 @@ use discrypt_storage::{AppStore, FileAppStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
@@ -389,20 +388,24 @@ pub struct SetSpeakerVolumeRequest {
     pub volume: u8,
 }
 
-/// Command result for local E2E/smoke execution.
+/// Command-surface health for local E2E/smoke execution.
+///
+/// These fields describe command availability and honest-copy coverage, not live
+/// production network/media readiness. Production capability claims remain gated
+/// by backend state and Cargo production features.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandHealth {
-    /// Compatibility flag for older harnesses that expected snapshot readiness.
+    /// Compatibility snapshot command can serialize the current backend state.
     pub snapshot_ready: bool,
-    /// Compatibility flag for older harnesses that expected safety verification readiness.
+    /// Safety verification command can derive and compare the current backend safety number.
     pub verification_ready: bool,
-    /// Canonical app-state command is available.
+    /// Canonical app-state command can serialize the current backend state.
     pub app_state_ready: bool,
-    /// Identity lifecycle commands are available.
+    /// Identity lifecycle commands are available for the current lifecycle state.
     pub identity_ready: bool,
-    /// Group/channel/message/invite commands are available.
+    /// Group/channel/message/invite commands are available against local AppStore state.
     pub collaboration_ready: bool,
-    /// Voice join/leave/mute/volume commands are available.
+    /// Voice control commands are available; this is false until production media is enabled.
     pub voice_ready: bool,
     /// Honest security copy is present.
     pub honest_copy_ready: bool,
@@ -882,18 +885,36 @@ pub fn metadata_warning() -> String {
 /// E2E command-health smoke used by CI and the multinode harness.
 pub fn command_health() -> CommandHealth {
     let state = app_state();
-    let honest_copy_ready = deletion_warning().contains("pending on offline devices")
-        && metadata_warning().contains("does not claim anonymity");
+    let verification = core_verify_safety_number(SafetyVerificationRequest {
+        friend_id: state.snapshot.friend.friend_code.clone(),
+        provided: state.snapshot.friend.safety_number.clone(),
+    });
+    let honest_copy_ready = state
+        .security_copy
+        .deletion
+        .contains("pending on offline devices")
+        && state
+            .security_copy
+            .metadata
+            .contains("does not claim anonymity");
+    let app_state_ready = state.schema_version == APP_STATE_SCHEMA_VERSION;
+    let identity_ready = matches!(
+        state.lifecycle,
+        AppLifecycle::FirstRun | AppLifecycle::Ready
+    );
+    let collaboration_ready = app_state_ready
+        && state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION
+        && state
+            .messages
+            .iter()
+            .all(|message| message.status.contains("not claimed"));
     CommandHealth {
         snapshot_ready: state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION,
-        verification_ready: true,
-        app_state_ready: state.schema_version == APP_STATE_SCHEMA_VERSION,
-        identity_ready: matches!(
-            state.lifecycle,
-            AppLifecycle::FirstRun | AppLifecycle::Ready
-        ),
-        collaboration_ready: true,
-        voice_ready: true,
+        verification_ready: verification.verified,
+        app_state_ready,
+        identity_ready,
+        collaboration_ready,
+        voice_ready: cfg!(feature = "production-media"),
         honest_copy_ready,
     }
 }
@@ -1475,6 +1496,7 @@ fn slugify(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1783,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_uses_env_override_and_atomic_shape() {
+    fn persistence_uses_app_store_env_override_and_atomic_shape() {
         let _guard = test_lock();
         let path = reset_with_temp_state("atomic");
         create_user(CreateUserRequest {
@@ -1792,8 +1814,27 @@ mod tests {
         });
         assert!(path.exists());
         assert!(!path.with_extension("json.tmp").exists());
-        let contents = fs::read_to_string(path).unwrap_or_default();
+        let mut store = FileAppStore::new(&path);
+        let contents = store
+            .load_app_state()
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default();
         assert!(contents.contains("schema_version"));
+    }
+
+    #[test]
+    fn production_path_ignores_env_override_without_harness_gate() {
+        let _guard = test_lock();
+        let path = fresh_state_path("prod-env-ignored");
+        std::env::set_var("DISCRYPT_APP_STATE_PATH", &path);
+        let production_path = app_store_path_with_env_override(false);
+        assert_ne!(production_path, path);
+        assert_eq!(
+            production_path.file_name().and_then(|value| value.to_str()),
+            Some(APP_STATE_STORE_FILENAME)
+        );
     }
 
     #[test]
@@ -1804,7 +1845,7 @@ mod tests {
         assert!(health.app_state_ready);
         assert!(health.identity_ready);
         assert!(health.collaboration_ready);
-        assert!(health.voice_ready);
+        assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
     }
 }
