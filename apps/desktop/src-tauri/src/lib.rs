@@ -15,6 +15,10 @@ use discrypt_core::{
 };
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
+use discrypt_storage::{
+    recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
+    RecoveryCodeVerifier, RecoveryMaterial,
+};
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
 use serde::{Deserialize, Serialize};
@@ -1313,16 +1317,12 @@ impl PersistedAppState {
             );
         }
 
-        let local_device = self
-            .devices
-            .first()
-            .cloned()
-            .unwrap_or_else(|| DeviceView {
-                device_id: "desktop".to_owned(),
-                leaf_index: 1,
-                local: true,
-                authorized: true,
-            });
+        let local_device = self.devices.first().cloned().unwrap_or_else(|| DeviceView {
+            device_id: "desktop".to_owned(),
+            leaf_index: 1,
+            local: true,
+            authorized: true,
+        });
         self.devices = vec![local_device];
         for index in 2..=recovery.device_count.max(1) {
             let device_id = format!("recovered-device-{index}");
@@ -1424,6 +1424,39 @@ fn persist_state(state: &PersistedAppState) {
         let mut store = app_store();
         let _ = store.save_app_state(&encoded);
     }
+}
+
+fn account_recovery_from_request(request: &RecoverUserRequest) -> AccountRecovery {
+    let rooms = request.recovery_room_memberships.clone();
+    let device_count = request.recovered_device_count.unwrap_or(1);
+    let material = if request.use_sealed_account_backup {
+        let key = recovery_seed_key(&request.recovery_code);
+        RecoveryMaterial::SealedBackup(seal_account_backup(&key, rooms, device_count))
+    } else {
+        RecoveryCodeVerifier::from_code(&request.recovery_code)
+            .and_then(|verifier| {
+                recovery_code_material(&request.recovery_code, &verifier, rooms, device_count)
+            })
+            .unwrap_or_else(|_| RecoveryMaterial::ExistingDevice {
+                device_id: request
+                    .device_name
+                    .clone()
+                    .unwrap_or_else(|| "Desktop".to_owned()),
+            })
+    };
+    recover_account(material).unwrap_or(AccountRecovery {
+        account_access_restored: false,
+        room_memberships: Vec::new(),
+        device_count: 1,
+        content_keys_restored: false,
+    })
+}
+
+fn recovery_seed_key(recovery_code: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt:desktop:sealed-account-recovery");
+    hasher.update(recovery_code.trim().as_bytes());
+    hasher.finalize().into()
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -1691,12 +1724,19 @@ mod tests {
             display_name: "Alice recovered".to_owned(),
             recovery_code: "local-placeholder".to_owned(),
             device_name: None,
+            recovery_room_memberships: Vec::new(),
+            recovered_device_count: None,
+            use_sealed_account_backup: false,
         });
         assert_eq!(state.lifecycle, AppLifecycle::Ready);
         assert!(state
             .profile
             .as_ref()
-            .map(|profile| profile.recovery_status.contains("placeholder"))
+            .map(|profile| {
+                profile
+                    .recovery_status
+                    .contains("content keys restored: false")
+            })
             .unwrap_or(false));
         assert!(state
             .events
