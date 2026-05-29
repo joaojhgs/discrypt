@@ -9,7 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-default = ["harness", "local-dev"]
+default = []
 harness = [
   "discrypt-abuse/harness",
   "discrypt-admission/harness",
