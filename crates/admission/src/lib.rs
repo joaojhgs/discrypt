@@ -52,6 +52,15 @@ pub enum InviteError {
     /// Invite issuer signature is malformed or invalid.
     #[error("invite issuer signature invalid")]
     InvalidIssuerSignature,
+    /// Signaling endpoint is malformed or violates its endpoint policy.
+    #[error("invite signaling endpoint invalid")]
+    InvalidSignalingEndpoint,
+    /// Signaling trust metadata is malformed.
+    #[error("invite signaling trust metadata invalid")]
+    InvalidTrustMetadata,
+    /// Signaling endpoint policy is malformed or unsupported.
+    #[error("invite signaling endpoint policy invalid")]
+    InvalidEndpointPolicy,
     /// Password gate is not backed by PAKE/OPAQUE/helper rate limiting.
     #[error("offline verifier cannot enforce rate limits")]
     OfflineVerifierRejected,
@@ -81,6 +90,130 @@ pub enum InviteError {
     InvalidWelcomeAuthorization,
 }
 
+/// Policy that tells joiners which endpoint classes are allowed for rendezvous.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteEndpointPolicy {
+    /// Production endpoint: TLS Web/HTTP or QUIC rendezvous only.
+    ProductionTls,
+    /// Local development endpoint: loopback-only cleartext is allowed.
+    LocalDevLoopback,
+}
+
+impl InviteEndpointPolicy {
+    fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::ProductionTls => "production_tls",
+            Self::LocalDevLoopback => "local_dev_loopback",
+        }
+    }
+
+    fn validates_endpoint(&self, endpoint: &str) -> bool {
+        match self {
+            Self::ProductionTls => {
+                endpoint.starts_with("https://")
+                    || endpoint.starts_with("wss://")
+                    || endpoint.starts_with("quic://")
+            }
+            Self::LocalDevLoopback => {
+                endpoint.starts_with("http://127.0.0.1:")
+                    || endpoint.starts_with("ws://127.0.0.1:")
+                    || endpoint.starts_with("http://[::1]:")
+                    || endpoint.starts_with("ws://[::1]:")
+            }
+        }
+    }
+}
+
+/// Joiner-visible signaling trust metadata pinned by the signed invite descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InviteTrustMetadata {
+    /// Hex fingerprint for the signaling server key/certificate expected by the joiner.
+    pub signaling_fingerprint: String,
+    /// Human-readable trust posture; does not grant identity/group trust by itself.
+    pub trust_status: String,
+}
+
+impl InviteTrustMetadata {
+    /// Construct signaling trust metadata after validating the fingerprint shape.
+    pub fn new(
+        signaling_fingerprint: impl Into<String>,
+        trust_status: impl Into<String>,
+    ) -> Result<Self, InviteError> {
+        let metadata = Self {
+            signaling_fingerprint: signaling_fingerprint.into(),
+            trust_status: trust_status.into(),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    fn validate(&self) -> Result<(), InviteError> {
+        if !is_hex_fingerprint(&self.signaling_fingerprint) || self.trust_status.trim().is_empty()
+        {
+            return Err(InviteError::InvalidTrustMetadata);
+        }
+        Ok(())
+    }
+}
+
+/// Production invite metadata required to locate and validate the rendezvous endpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InviteSignalingMetadata {
+    /// Public signaling rendezvous endpoint. It is signed but carries no room/group secret.
+    pub signaling_endpoint: String,
+    /// Endpoint policy joiners must enforce before using the endpoint.
+    pub endpoint_policy: InviteEndpointPolicy,
+    /// Joiner-visible endpoint trust material.
+    pub trust: InviteTrustMetadata,
+}
+
+impl InviteSignalingMetadata {
+    /// Construct and validate invite signaling metadata.
+    pub fn new(
+        signaling_endpoint: impl Into<String>,
+        endpoint_policy: InviteEndpointPolicy,
+        trust: InviteTrustMetadata,
+    ) -> Result<Self, InviteError> {
+        let metadata = Self {
+            signaling_endpoint: signaling_endpoint.into(),
+            endpoint_policy,
+            trust,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    /// Deterministic safe default used by local command surfaces and tests.
+    #[must_use]
+    pub fn default_production() -> Self {
+        let endpoint = "https://signaling.discrypt.invalid/v1/rendezvous".to_owned();
+        let fingerprint = signaling_fingerprint_for_endpoint(&endpoint);
+        Self {
+            signaling_endpoint: endpoint,
+            endpoint_policy: InviteEndpointPolicy::ProductionTls,
+            trust: InviteTrustMetadata {
+                signaling_fingerprint: fingerprint,
+                trust_status: "signed endpoint fingerprint; verify before MLS Welcome".to_owned(),
+            },
+        }
+    }
+
+    /// Validate endpoint, policy, and trust metadata without exposing invite secrets.
+    pub fn validate(&self) -> Result<(), InviteError> {
+        if self.signaling_endpoint.trim() != self.signaling_endpoint
+            || self.signaling_endpoint.is_empty()
+            || self.signaling_endpoint.len() > 512
+        {
+            return Err(InviteError::InvalidSignalingEndpoint);
+        }
+        if !self.endpoint_policy.validates_endpoint(&self.signaling_endpoint) {
+            return Err(InviteError::InvalidSignalingEndpoint);
+        }
+        self.trust.validate()
+    }
+}
+
 /// Production invite descriptor stored and exchanged without exposing the raw room secret.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredInvite {
@@ -92,6 +225,8 @@ pub struct StoredInvite {
     pub issuer_public_key: Vec<u8>,
     /// Issuer signature over the canonical invite descriptor.
     pub issuer_signature: Vec<u8>,
+    /// Signed signaling endpoint and trust metadata for joiner rendezvous.
+    pub signaling_metadata: InviteSignalingMetadata,
     /// Expiry timestamp.
     pub expires_at: DateTime<Utc>,
     /// Maximum accepted uses.
@@ -105,6 +240,7 @@ pub struct StoredInvite {
 impl StoredInvite {
     /// Verify the issuer signature on this invite descriptor.
     pub fn verify_issuer_signature(&self) -> Result<(), InviteError> {
+        self.signaling_metadata.validate()?;
         let verifying_key = VerifyingKey::from_bytes(
             &self
                 .issuer_public_key
@@ -131,6 +267,7 @@ impl StoredInvite {
         room_secret_commitment: [u8; 32],
         expires_at: DateTime<Utc>,
         max_uses: u32,
+        signaling_metadata: InviteSignalingMetadata,
         issuer: &SigningKey,
     ) -> Self {
         let issuer_public_key = issuer.verifying_key().to_bytes().to_vec();
@@ -139,6 +276,7 @@ impl StoredInvite {
             room_secret_commitment,
             issuer_public_key,
             issuer_signature: Vec::new(),
+            signaling_metadata,
             expires_at,
             max_uses,
             consumed_uses: 0,
@@ -153,6 +291,7 @@ impl StoredInvite {
             &self.invite_id,
             &self.room_secret_commitment,
             &self.issuer_public_key,
+            &self.signaling_metadata,
             self.expires_at,
             self.max_uses,
         )
@@ -186,11 +325,35 @@ impl InviteStore {
             room_secret_commitment(room_secret),
             expires_at,
             max_uses.max(1),
+            InviteSignalingMetadata::default_production(),
             issuer,
         );
         self.invites
             .insert(invite.invite_id.clone(), invite.clone());
         invite
+    }
+
+    /// Issue and persist a signed invite descriptor with explicit production signaling metadata.
+    pub fn issue_invite_with_metadata(
+        &mut self,
+        room_secret: &[u8],
+        expires_at: DateTime<Utc>,
+        max_uses: u32,
+        signaling_metadata: InviteSignalingMetadata,
+        issuer: &SigningKey,
+    ) -> Result<StoredInvite, InviteError> {
+        signaling_metadata.validate()?;
+        let invite = StoredInvite::sign(
+            opaque_invite_id(),
+            room_secret_commitment(room_secret),
+            expires_at,
+            max_uses.max(1),
+            signaling_metadata,
+            issuer,
+        );
+        self.invites
+            .insert(invite.invite_id.clone(), invite.clone());
+        Ok(invite)
     }
 
     /// Return a stored invite by opaque id.
@@ -249,10 +412,24 @@ fn opaque_invite_id() -> String {
     hex::encode(bytes)
 }
 
+/// Deterministic hex fingerprint for endpoint trust pinning in local command surfaces.
+#[must_use]
+pub fn signaling_fingerprint_for_endpoint(endpoint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"external-signaling-endpoint-fingerprint-v1");
+    hasher.update(endpoint.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn is_hex_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
 fn canonical_invite_signing_bytes(
     invite_id: &str,
     room_secret_commitment: &[u8; 32],
     issuer_public_key: &[u8],
+    signaling_metadata: &InviteSignalingMetadata,
     expires_at: DateTime<Utc>,
     max_uses: u32,
 ) -> Vec<u8> {
@@ -263,6 +440,17 @@ fn canonical_invite_signing_bytes(
     bytes.extend_from_slice(room_secret_commitment);
     bytes.extend_from_slice(&(issuer_public_key.len() as u64).to_le_bytes());
     bytes.extend_from_slice(issuer_public_key);
+    bytes.extend_from_slice(&(signaling_metadata.signaling_endpoint.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(signaling_metadata.signaling_endpoint.as_bytes());
+    let policy = signaling_metadata.endpoint_policy.canonical_name();
+    bytes.extend_from_slice(&(policy.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(policy.as_bytes());
+    bytes.extend_from_slice(
+        &(signaling_metadata.trust.signaling_fingerprint.len() as u64).to_le_bytes(),
+    );
+    bytes.extend_from_slice(signaling_metadata.trust.signaling_fingerprint.as_bytes());
+    bytes.extend_from_slice(&(signaling_metadata.trust.trust_status.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(signaling_metadata.trust.trust_status.as_bytes());
     bytes.extend_from_slice(&expires_at.timestamp_millis().to_le_bytes());
     bytes.extend_from_slice(&max_uses.to_le_bytes());
     bytes
