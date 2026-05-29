@@ -13,7 +13,10 @@ use discrypt_core::{
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
-use discrypt_storage::AppStore;
+use discrypt_storage::{
+    recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
+    RecoveryCodeVerifier, RecoveryMaterial,
+};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -270,15 +273,24 @@ pub struct CreateUserRequest {
     pub device_name: Option<String>,
 }
 
-/// Request to recover a local user profile placeholder.
+/// Request to recover a local user profile with account-continuity-only material.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecoverUserRequest {
     /// Display name.
     pub display_name: String,
-    /// Local recovery phrase/code placeholder.
+    /// Local recovery phrase/code.
     pub recovery_code: String,
     /// Optional device label.
     pub device_name: Option<String>,
+    /// Room memberships restored from recovery metadata, never message history or keys.
+    #[serde(default)]
+    pub recovery_room_memberships: Vec<String>,
+    /// Device-set count restored from recovery metadata.
+    #[serde(default)]
+    pub recovered_device_count: Option<usize>,
+    /// Use sealed account-continuity backup material instead of verifier-backed code material.
+    #[serde(default)]
+    pub use_sealed_account_backup: bool,
 }
 
 /// Request to persist UI preference changes.
@@ -450,21 +462,25 @@ pub fn create_user(request: CreateUserRequest) -> AppStateView {
     mutate_state(|state| state.create_user(request, false))
 }
 
-/// Tauri command: recover an existing local user placeholder and unlock the shell.
+/// Tauri command: recover account continuity and unlock the shell without content keys.
 pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
     mutate_state(|state| {
+        let recovery = account_recovery_from_request(&request);
         state.create_user(
             CreateUserRequest {
-                display_name: request.display_name,
-                device_name: request.device_name,
+                display_name: request.display_name.clone(),
+                device_name: request.device_name.clone(),
             },
             true,
         );
+        state.apply_account_recovery(&recovery);
         state.push_event(
             "identity.recovered",
             format!(
-                "Local recovery placeholder accepted; code length {} was not treated as cloud/key recovery",
-                request.recovery_code.trim().len()
+                "Account-continuity recovery accepted; rooms={} devices={} content_keys_restored={}",
+                recovery.room_memberships.len(),
+                recovery.device_count,
+                recovery.content_keys_restored
             ),
         );
     })
@@ -1289,6 +1305,58 @@ impl PersistedAppState {
             kind,
             format!("Profile ready for {display_name} on {device_name}"),
         );
+    }
+
+    fn apply_account_recovery(&mut self, recovery: &AccountRecovery) {
+        if let Some(profile) = &mut self.profile {
+            profile.recovery_status = format!(
+                "Account continuity restored for {} room(s) and {} device(s); content keys restored: {}",
+                recovery.room_memberships.len(),
+                recovery.device_count,
+                recovery.content_keys_restored
+            );
+        }
+
+        let local_device = self
+            .devices
+            .first()
+            .cloned()
+            .unwrap_or_else(|| DeviceView {
+                device_id: "desktop".to_owned(),
+                leaf_index: 1,
+                local: true,
+                authorized: true,
+            });
+        self.devices = vec![local_device];
+        for index in 2..=recovery.device_count.max(1) {
+            let device_id = format!("recovered-device-{index}");
+            if !self
+                .devices
+                .iter()
+                .any(|device| device.device_id == device_id)
+            {
+                self.devices.push(DeviceView {
+                    device_id,
+                    leaf_index: index as u32,
+                    local: false,
+                    authorized: true,
+                });
+            }
+        }
+
+        for room in &recovery.room_memberships {
+            let room_name = normalize_label(room, "recovered room");
+            if self.groups.iter().any(|group| group.name == room_name) {
+                continue;
+            }
+            let group_id = stable_id("group", &room_name, self.next_sequence);
+            self.groups.push(GroupView {
+                group_id,
+                name: room_name,
+                role: "member".to_owned(),
+                channels: default_group_channels(self.next_sequence),
+            });
+        }
     }
 
     fn ensure_ready_profile(&mut self) {
