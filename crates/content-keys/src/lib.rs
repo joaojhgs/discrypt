@@ -8,6 +8,7 @@
 
 pub mod production_status;
 use chrono::{DateTime, Duration, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use mls_core::{derive_epoch_secret, ExportLabel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -237,32 +238,126 @@ impl CrossDeviceShredState {
     }
 }
 
-/// Local membership proof for archival live-key requests.
+const LIVE_KEY_MEMBERSHIP_PROOF_DOMAIN: &[u8] = b"discrypt-live-key-membership-proof-v1";
+
+/// Verification errors for signed live-key membership proofs.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum MembershipProofError {
+    /// Proof verifier key is not a valid Ed25519 public key.
+    #[error("membership proof verifier key is invalid")]
+    InvalidVerifierKey,
+    /// Proof signature bytes are not a valid Ed25519 signature.
+    #[error("membership proof signature bytes are invalid")]
+    InvalidSignatureBytes,
+    /// Proof signature verification failed.
+    #[error("membership proof signature verification failed")]
+    InvalidSignature,
+    /// Proof was signed for a different epoch group commitment.
+    #[error("membership proof group commitment mismatch")]
+    GroupCommitmentMismatch,
+}
+
+/// Signed membership proof for archival live-key requests.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct MembershipProof {
     /// Requesting leaf.
     pub requester_leaf: u32,
     /// Epoch being proven.
     pub epoch: u64,
-    /// Locally verified group-state credential hash.
-    pub credential_hash: [u8; 32],
+    /// Stable local room/group identifier included in the signed transcript.
+    pub group_id: String,
+    /// Canonical local group-state commitment for the claimed epoch.
+    pub group_commitment: [u8; 32],
+    /// Ed25519 device public key that signed this proof.
+    pub device_public_key: [u8; 32],
+    /// Ed25519 signature over the canonical live-key membership transcript.
+    pub signature: Vec<u8>,
 }
 
 impl MembershipProof {
-    /// Build a deterministic proof token.
+    /// Sign a live-key membership proof for one leaf at one group epoch.
     #[must_use]
-    pub fn new(requester_leaf: u32, epoch: u64, room_id: &str) -> Self {
-        let mut h = Sha256::new();
-        h.update(b"discrypt-membership-proof");
-        h.update(requester_leaf.to_be_bytes());
-        h.update(epoch.to_be_bytes());
-        h.update(room_id.as_bytes());
+    pub fn sign(
+        requester_leaf: u32,
+        epoch: u64,
+        group_id: impl Into<String>,
+        group_commitment: [u8; 32],
+        signing_key: &SigningKey,
+    ) -> Self {
+        let group_id = group_id.into();
+        let device_public_key = signing_key.verifying_key().to_bytes();
+        let transcript = membership_proof_transcript(
+            requester_leaf,
+            epoch,
+            &group_id,
+            &group_commitment,
+            &device_public_key,
+        );
+        let signature = signing_key.sign(&transcript).to_bytes().to_vec();
         Self {
             requester_leaf,
             epoch,
-            credential_hash: h.finalize().into(),
+            group_id,
+            group_commitment,
+            device_public_key,
+            signature,
         }
     }
+
+    /// Verify the proof signature and bind it to the expected epoch commitment.
+    pub fn verify_signature(
+        &self,
+        expected_group_commitment: &[u8; 32],
+    ) -> Result<(), MembershipProofError> {
+        if &self.group_commitment != expected_group_commitment {
+            return Err(MembershipProofError::GroupCommitmentMismatch);
+        }
+        let verifier = VerifyingKey::from_bytes(&self.device_public_key)
+            .map_err(|_| MembershipProofError::InvalidVerifierKey)?;
+        let signature = Signature::from_slice(&self.signature)
+            .map_err(|_| MembershipProofError::InvalidSignatureBytes)?;
+        let transcript = membership_proof_transcript(
+            self.requester_leaf,
+            self.epoch,
+            &self.group_id,
+            &self.group_commitment,
+            &self.device_public_key,
+        );
+        verifier
+            .verify(&transcript, &signature)
+            .map_err(|_| MembershipProofError::InvalidSignature)
+    }
+}
+
+fn membership_proof_transcript(
+    requester_leaf: u32,
+    epoch: u64,
+    group_id: &str,
+    group_commitment: &[u8; 32],
+    device_public_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(
+        LIVE_KEY_MEMBERSHIP_PROOF_DOMAIN.len() + 4 + 8 + 8 + group_id.len() + 32 + 32,
+    );
+    transcript.extend_from_slice(LIVE_KEY_MEMBERSHIP_PROOF_DOMAIN);
+    transcript.extend_from_slice(&requester_leaf.to_be_bytes());
+    transcript.extend_from_slice(&epoch.to_be_bytes());
+    transcript.extend_from_slice(&(group_id.len() as u64).to_be_bytes());
+    transcript.extend_from_slice(group_id.as_bytes());
+    transcript.extend_from_slice(group_commitment);
+    transcript.extend_from_slice(device_public_key);
+    transcript
+}
+
+fn derive_membership_group_commitment(epoch: u64, members: &BTreeSet<u32>) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"discrypt-live-key-epoch-group-commitment-v1");
+    h.update(epoch.to_be_bytes());
+    h.update((members.len() as u64).to_be_bytes());
+    for member in members {
+        h.update(member.to_be_bytes());
+    }
+    h.finalize().into()
 }
 
 /// Live-key oracle response with explicit authorization flag.
@@ -278,6 +373,8 @@ pub struct LiveKeyResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveKeyOracle {
     members_by_epoch: BTreeMap<u64, BTreeSet<u32>>,
+    group_commitments_by_epoch: BTreeMap<u64, [u8; 32]>,
+    authorized_device_keys: BTreeMap<(u64, u32), BTreeSet<[u8; 32]>>,
     requests_by_leaf_epoch: BTreeMap<(u32, u64), usize>,
     max_requests: usize,
     decoy_key: [u8; 32],
@@ -287,31 +384,63 @@ impl LiveKeyOracle {
     /// Create an oracle from epoch membership.
     #[must_use]
     pub fn new(members_by_epoch: BTreeMap<u64, BTreeSet<u32>>, max_requests: usize) -> Self {
+        let group_commitments_by_epoch = members_by_epoch
+            .iter()
+            .map(|(epoch, members)| (*epoch, derive_membership_group_commitment(*epoch, members)))
+            .collect();
         Self {
             members_by_epoch,
+            group_commitments_by_epoch,
+            authorized_device_keys: BTreeMap::new(),
             requests_by_leaf_epoch: BTreeMap::new(),
             max_requests: max_requests.max(1),
             decoy_key: [0xD; 32],
         }
     }
 
-    /// Request an archival key. Non-members and over-limit callers receive decoys.
-    pub fn request_key(&mut self, proof: &MembershipProof, key: [u8; 32]) -> LiveKeyResponse {
-        let allowed_member = self
+    /// Return the canonical local group-state commitment for an epoch.
+    #[must_use]
+    pub fn epoch_group_commitment(&self, epoch: u64) -> Option<[u8; 32]> {
+        self.group_commitments_by_epoch.get(&epoch).copied()
+    }
+
+    /// Authorize a device signer for a member leaf at an epoch.
+    ///
+    /// Returns false if the leaf is not a local member for that epoch.
+    pub fn authorize_member_device(
+        &mut self,
+        epoch: u64,
+        requester_leaf: u32,
+        verifier: &VerifyingKey,
+    ) -> bool {
+        let member = self
             .members_by_epoch
-            .get(&proof.epoch)
-            .is_some_and(|members| members.contains(&proof.requester_leaf));
-        let counter = self
-            .requests_by_leaf_epoch
-            .entry((proof.requester_leaf, proof.epoch))
-            .or_default();
-        *counter = counter.saturating_add(1);
-        if !allowed_member {
+            .get(&epoch)
+            .is_some_and(|members| members.contains(&requester_leaf));
+        if !member {
+            return false;
+        }
+        self.authorized_device_keys
+            .entry((epoch, requester_leaf))
+            .or_default()
+            .insert(verifier.to_bytes());
+        true
+    }
+
+    /// Request an archival key. Non-members and invalid proofs receive decoys;
+    /// authorized members are rate-limited by leaf and epoch.
+    pub fn request_key(&mut self, proof: &MembershipProof, key: [u8; 32]) -> LiveKeyResponse {
+        if !self.proof_authorized(proof) {
             return LiveKeyResponse {
                 state: KeyState::Decoy(self.decoy_key),
                 authorized: false,
             };
         }
+        let counter = self
+            .requests_by_leaf_epoch
+            .entry((proof.requester_leaf, proof.epoch))
+            .or_default();
+        *counter = counter.saturating_add(1);
         if *counter > self.max_requests {
             return LiveKeyResponse {
                 state: KeyState::RateLimited,
@@ -322,6 +451,24 @@ impl LiveKeyOracle {
             state: KeyState::Cached(key),
             authorized: true,
         }
+    }
+
+    fn proof_authorized(&self, proof: &MembershipProof) -> bool {
+        let Some(members) = self.members_by_epoch.get(&proof.epoch) else {
+            return false;
+        };
+        if !members.contains(&proof.requester_leaf) {
+            return false;
+        }
+        let Some(expected_commitment) = self.group_commitments_by_epoch.get(&proof.epoch) else {
+            return false;
+        };
+        if proof.verify_signature(expected_commitment).is_err() {
+            return false;
+        }
+        self.authorized_device_keys
+            .get(&(proof.epoch, proof.requester_leaf))
+            .is_some_and(|keys| keys.contains(&proof.device_public_key))
     }
 }
 
@@ -383,19 +530,78 @@ mod tests {
     }
 
     #[test]
-    fn live_key_oracle_gates_membership_and_rate_limits_with_decoys() {
+    fn live_key_oracle_gates_membership_and_rate_limits_with_decoys(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut members = BTreeMap::new();
         members.insert(7, BTreeSet::from([1, 2]));
         let mut oracle = LiveKeyOracle::new(members, 1);
+        let signing_key = SigningKey::from_bytes(&[1; 32]);
+        assert!(oracle.authorize_member_device(7, 1, &signing_key.verifying_key()));
+        let commitment = oracle
+            .epoch_group_commitment(7)
+            .ok_or_else(|| std::io::Error::other("epoch commitment missing"))?;
+        let proof = MembershipProof::sign(1, 7, "room", commitment, &signing_key);
         let key = [9; 32];
-        let allowed = oracle.request_key(&MembershipProof::new(1, 7, "room"), key);
+        let allowed = oracle.request_key(&proof, key);
         assert_eq!(allowed.state, KeyState::Cached(key));
         assert!(allowed.authorized);
-        let limited = oracle.request_key(&MembershipProof::new(1, 7, "room"), key);
+        let limited = oracle.request_key(&proof, key);
         assert_eq!(limited.state, KeyState::RateLimited);
         assert!(!limited.authorized);
-        let decoy = oracle.request_key(&MembershipProof::new(9, 7, "room"), key);
+        let non_member = SigningKey::from_bytes(&[9; 32]);
+        let decoy = oracle.request_key(
+            &MembershipProof::sign(9, 7, "room", commitment, &non_member),
+            key,
+        );
         assert!(matches!(decoy.state, KeyState::Decoy(_)));
         assert!(!decoy.authorized);
+        Ok(())
+    }
+
+    #[test]
+    fn live_key_oracle_requires_signed_epoch_membership_proof(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut members = BTreeMap::new();
+        members.insert(11, BTreeSet::from([4]));
+        let mut oracle = LiveKeyOracle::new(members, 3);
+        let member = SigningKey::from_bytes(&[4; 32]);
+        let other_device = SigningKey::from_bytes(&[5; 32]);
+        assert!(oracle.authorize_member_device(11, 4, &member.verifying_key()));
+        assert!(!oracle.authorize_member_device(11, 99, &other_device.verifying_key()));
+        let commitment = oracle
+            .epoch_group_commitment(11)
+            .ok_or_else(|| std::io::Error::other("epoch commitment missing"))?;
+        let proof = MembershipProof::sign(4, 11, "room-alpha", commitment, &member);
+        assert!(proof.verify_signature(&commitment).is_ok());
+        let key = [8; 32];
+        let allowed = oracle.request_key(&proof, key);
+        assert_eq!(allowed.state, KeyState::Cached(key));
+        assert!(allowed.authorized);
+
+        let mut tampered_group = proof.clone();
+        tampered_group.group_commitment = [0xA; 32];
+        assert_eq!(
+            tampered_group.verify_signature(&commitment),
+            Err(MembershipProofError::GroupCommitmentMismatch)
+        );
+        let rejected = oracle.request_key(&tampered_group, key);
+        assert!(matches!(rejected.state, KeyState::Decoy(_)));
+        assert!(!rejected.authorized);
+
+        let unregistered = MembershipProof::sign(4, 11, "room-alpha", commitment, &other_device);
+        let rejected = oracle.request_key(&unregistered, key);
+        assert!(matches!(rejected.state, KeyState::Decoy(_)));
+        assert!(!rejected.authorized);
+
+        let mut tampered_signature = proof;
+        tampered_signature.signature[0] ^= 0x80;
+        assert_eq!(
+            tampered_signature.verify_signature(&commitment),
+            Err(MembershipProofError::InvalidSignature)
+        );
+        let rejected = oracle.request_key(&tampered_signature, key);
+        assert!(matches!(rejected.state, KeyState::Decoy(_)));
+        assert!(!rejected.authorized);
+        Ok(())
     }
 }

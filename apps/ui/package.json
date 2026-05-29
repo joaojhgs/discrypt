@@ -38,7 +38,8 @@
     "test:adr-005-pake-admission-helper": "node ../../scripts/check-adr-005-pake-admission-helper.mjs",
     "test:adr-006-storage-keychain": "node ../../scripts/check-adr-006-storage-keychain.mjs",
     "test:adr-007-pcap-forbidden-byte-tooling": "node ../../scripts/check-adr-007-pcap-forbidden-byte-tooling.mjs",
-    "test:adr-008-supply-chain": "node ../../scripts/check-adr-008-supply-chain.mjs"
+    "test:adr-008-supply-chain": "node ../../scripts/check-adr-008-supply-chain.mjs",
+    "test:presence-g110": "node ../../scripts/check-presence-g110.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

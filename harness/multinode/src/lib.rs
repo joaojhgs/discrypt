@@ -2599,6 +2599,7 @@ pub fn retention_shred_smoke() -> Result<RetentionShredSmoke, anyhow::Error> {
         RetentionTransition, RetentionWindow,
     };
     use discrypt_storage::{seal_account_backup, SecureDeleteSimulator};
+    use ed25519_dalek::SigningKey;
     use std::collections::{BTreeMap, BTreeSet};
 
     let now = Utc::now();
@@ -2653,9 +2654,19 @@ pub fn retention_shred_smoke() -> Result<RetentionShredSmoke, anyhow::Error> {
     let mut members = BTreeMap::new();
     members.insert(9, BTreeSet::from([1, 2]));
     let mut oracle = LiveKeyOracle::new(members, 1);
-    let allowed = oracle.request_key(&MembershipProof::new(1, 9, "room"), key);
-    let limited = oracle.request_key(&MembershipProof::new(1, 9, "room"), key);
-    let decoy = oracle.request_key(&MembershipProof::new(99, 9, "room"), key);
+    let member_signer = SigningKey::from_bytes(&[1; 32]);
+    let non_member_signer = SigningKey::from_bytes(&[99; 32]);
+    let Some(commitment) = oracle.epoch_group_commitment(9) else {
+        anyhow::bail!("retention smoke epoch commitment missing");
+    };
+    let proof = MembershipProof::sign(1, 9, "room", commitment, &member_signer);
+    oracle.authorize_member_device(9, 1, &member_signer.verifying_key());
+    let allowed = oracle.request_key(&proof, key);
+    let limited = oracle.request_key(&proof, key);
+    let decoy = oracle.request_key(
+        &MembershipProof::sign(99, 9, "room", commitment, &non_member_signer),
+        key,
+    );
     let live_key_membership_rate_limit_decoy = allowed.authorized
         && allowed.state == KeyState::Cached(key)
         && !limited.authorized

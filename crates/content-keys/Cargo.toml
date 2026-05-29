@@ -23,4 +23,5 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 zeroize = { workspace = true }
+ed25519-dalek = { workspace = true }
 mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }
