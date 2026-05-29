@@ -202,6 +202,18 @@ pub struct MessageView {
     pub sent_at: String,
 }
 
+/// Redacted TURN endpoint metadata surfaced from a signed invite descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IceTurnServerView {
+    /// TURN or TURNS endpoint URI.
+    pub endpoint: String,
+    /// Whether the signed policy declared TURN credentials without exposing the raw secret.
+    pub credential_declared: bool,
+    /// Credential expiry timestamp when provided by the signed policy.
+    #[serde(default)]
+    pub credential_expires_at: Option<String>,
+}
+
 /// Command-backed invite row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteView {
@@ -229,6 +241,12 @@ pub struct InviteView {
     /// Signed endpoint policy that constrains allowed endpoint schemes.
     #[serde(default)]
     pub endpoint_policy: String,
+    /// Parsed ICE/STUN endpoints from the signed invite descriptor.
+    #[serde(default)]
+    pub ice_stun_servers: Vec<String>,
+    /// Parsed redacted TURN endpoints from the signed invite descriptor.
+    #[serde(default)]
+    pub ice_turn_servers: Vec<IceTurnServerView>,
     /// Expiry label.
     pub expires: String,
     /// Machine-readable expiration timestamp/relative horizon for the invite.
@@ -903,6 +921,8 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 signaling_trust_fingerprint: parsed.signaling_trust_fingerprint,
                 signaling_trust_status: parsed.signaling_trust_status,
                 endpoint_policy: parsed.endpoint_policy,
+                ice_stun_servers: parsed.ice_stun_servers,
+                ice_turn_servers: parsed.ice_turn_servers,
                 expires: "Invite expiry from signed descriptor".to_owned(),
                 expires_at: parsed.expires_at,
                 max_use: parsed.max_uses.to_string(),
@@ -979,6 +999,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
+        let ice_config = descriptor.ice_server_config_at(None, Utc::now()).ok();
         let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
             Ok(code) => code,
             Err(error) => {
@@ -997,6 +1018,14 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             signaling_trust_status: "signed endpoint fingerprint; verify before MLS Welcome"
                 .to_owned(),
             endpoint_policy: "production_tls".to_owned(),
+            ice_stun_servers: ice_config
+                .as_ref()
+                .map(ice_stun_server_views)
+                .unwrap_or_default(),
+            ice_turn_servers: ice_config
+                .as_ref()
+                .map(ice_turn_server_views)
+                .unwrap_or_default(),
             expires,
             expires_at,
             max_use,
@@ -2071,6 +2100,8 @@ struct ParsedInviteMetadata {
     signaling_trust_fingerprint: String,
     signaling_trust_status: String,
     endpoint_policy: String,
+    ice_stun_servers: Vec<String>,
+    ice_turn_servers: Vec<IceTurnServerView>,
     expires_at: String,
     max_uses: u32,
 }
@@ -2084,6 +2115,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         let descriptor: discrypt_admission::StoredInvite =
             serde_json::from_slice(&descriptor_bytes).ok()?;
         descriptor.verify_issuer_signature().ok()?;
+        let ice_config = descriptor.ice_server_config_at(None, Utc::now()).ok()?;
         let endpoint_policy = match descriptor.signaling_metadata.endpoint_policy {
             InviteEndpointPolicy::ProductionTls => "production_tls",
             InviteEndpointPolicy::LocalDevLoopback => "local_dev_loopback",
@@ -2096,6 +2128,8 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             signaling_trust_fingerprint: descriptor.signaling_metadata.trust.signaling_fingerprint,
             signaling_trust_status: descriptor.signaling_metadata.trust.trust_status,
             endpoint_policy,
+            ice_stun_servers: ice_stun_server_views(&ice_config),
+            ice_turn_servers: ice_turn_server_views(&ice_config),
             expires_at: descriptor.expires_at.to_rfc3339(),
             max_uses: descriptor.max_uses,
         });
@@ -2129,9 +2163,33 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         signaling_trust_fingerprint,
         signaling_trust_status,
         endpoint_policy,
+        ice_stun_servers: Vec::new(),
+        ice_turn_servers: Vec::new(),
         expires_at,
         max_uses,
     })
+}
+
+fn ice_stun_server_views(config: &discrypt_transport::IceServerConfig) -> Vec<String> {
+    config
+        .stun_servers
+        .iter()
+        .map(|endpoint| endpoint.0.clone())
+        .collect()
+}
+
+fn ice_turn_server_views(config: &discrypt_transport::IceServerConfig) -> Vec<IceTurnServerView> {
+    config
+        .turn_servers
+        .iter()
+        .map(|server| IceTurnServerView {
+            endpoint: server.endpoint.0.clone(),
+            credential_declared: server.username.is_some()
+                || server.credential.is_some()
+                || server.credential_expires_at.is_some(),
+            credential_expires_at: server.credential_expires_at.clone(),
+        })
+        .collect()
 }
 
 fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -2496,6 +2554,16 @@ mod tests {
         );
         assert_eq!(invite_state.invites[0].uses, 0);
         assert!(!invite_state.invites[0].room_secret_hash.is_empty());
+        assert_eq!(
+            invite_state.invites[0].ice_stun_servers,
+            vec!["stun:default.discrypt.invalid:3478".to_owned()]
+        );
+        assert_eq!(invite_state.invites[0].ice_turn_servers.len(), 1);
+        assert_eq!(
+            invite_state.invites[0].ice_turn_servers[0].endpoint,
+            "turns:default.discrypt.invalid:5349".to_owned()
+        );
+        assert!(!invite_state.invites[0].ice_turn_servers[0].credential_declared);
         let channel_state = create_channel(CreateChannelRequest {
             group_id: group_id.clone(),
             name: "ops".to_owned(),
@@ -2536,8 +2604,46 @@ mod tests {
         );
         assert_eq!(parsed.signaling_trust_status, "signed endpoint".to_owned());
         assert_eq!(parsed.endpoint_policy, "production_tls".to_owned());
+        assert!(parsed.ice_stun_servers.is_empty());
+        assert!(parsed.ice_turn_servers.is_empty());
         assert_eq!(parsed.max_uses, 3);
         assert!(!code.contains("room_secret="));
+    }
+
+    #[test]
+    fn production_invite_descriptor_parser_surfaces_redacted_ice_metadata() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("invite-ice-parse");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "ICE Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_state.groups[0].group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+        });
+        let parsed = parse_invite_metadata(&invite_state.invites[0].code);
+        assert!(parsed.is_some());
+        let Some(parsed) = parsed else {
+            return;
+        };
+
+        assert_eq!(
+            parsed.ice_stun_servers,
+            vec!["stun:default.discrypt.invalid:3478".to_owned()]
+        );
+        assert_eq!(parsed.ice_turn_servers.len(), 1);
+        assert_eq!(
+            parsed.ice_turn_servers[0].endpoint,
+            "turns:default.discrypt.invalid:5349".to_owned()
+        );
+        assert!(!parsed.ice_turn_servers[0].credential_declared);
+        assert!(!format!("{parsed:?}").contains("raw-turn-secret"));
     }
 
     #[test]
