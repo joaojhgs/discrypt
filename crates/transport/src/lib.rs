@@ -16,6 +16,7 @@ pub mod production_status;
 pub mod session;
 
 use async_trait::async_trait;
+pub use ice::{IceEndpointPolicy, IceServerConfig, TurnServerConfig};
 use serde::{Deserialize, Serialize};
 pub use session::{
     TransportRoute, TransportRouteStatus, TransportSession, TransportSessionError,
@@ -25,7 +26,6 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
-pub use ice::{IceEndpointPolicy, IceServerConfig, TurnServerConfig};
 use thiserror::Error;
 
 /// Transport address or provider URI.

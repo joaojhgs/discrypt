@@ -175,7 +175,10 @@ impl std::fmt::Debug for TurnServerConfig {
             .debug_struct("TurnServerConfig")
             .field("endpoint", &self.endpoint)
             .field("username", &self.username)
-            .field("credential", &self.credential.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
             .field("credential_expires_at", &self.credential_expires_at)
             .finish()
     }
@@ -338,9 +341,15 @@ mod tests {
         let stun = ConnectivityPlanner::plan(&fallback, SimulatedNat::direct())?;
         let turn = ConnectivityPlanner::plan(&fallback, SimulatedNat::turn_only())?;
 
-        assert_eq!(stun.endpoint, Endpoint::new("stuns:group.example.invalid:5349"));
+        assert_eq!(
+            stun.endpoint,
+            Endpoint::new("stuns:group.example.invalid:5349")
+        );
         assert_eq!(turn.selected, FallbackLeg::Turn);
-        assert_eq!(turn.endpoint, Endpoint::new("turn:group.example.invalid:3478"));
+        assert_eq!(
+            turn.endpoint,
+            Endpoint::new("turn:group.example.invalid:3478")
+        );
         Ok(())
     }
 }
