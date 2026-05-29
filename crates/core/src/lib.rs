@@ -782,21 +782,36 @@ pub fn generated_device_view(
 /// Validate that a snapshot safety number matches its local and peer identity keys.
 #[must_use]
 pub fn snapshot_safety_number_matches_identity_keys(snapshot: &AppSnapshot) -> bool {
-    let Some(local_identity_key) = snapshot
+    let Some(safety_number) = snapshot
         .devices
         .iter()
         .find(|device| device.local && !device.revoked)
-        .and_then(|device| verifying_key_from_hex(&device.identity_key))
+        .and_then(|device| {
+            safety_number_for_identity_hex_and_friend_code(
+                &device.identity_key,
+                &snapshot.friend.friend_code,
+            )
+        })
     else {
         return false;
     };
-    let Some(peer_identity_key) =
-        mls_core::FriendCode::from_payload(snapshot.friend.friend_code.clone()).verifying_key()
-    else {
-        return false;
-    };
-    SafetyNumber::from_identity_keys(&local_identity_key, &peer_identity_key).as_str()
-        == snapshot.friend.safety_number
+    safety_number == snapshot.friend.safety_number
+}
+
+/// Derive a safety number from a local identity key and peer friend-code payload.
+#[must_use]
+pub fn safety_number_for_identity_hex_and_friend_code(
+    local_identity_key_hex: &str,
+    friend_code: &str,
+) -> Option<String> {
+    let local_identity_key = verifying_key_from_hex(local_identity_key_hex)?;
+    let peer_identity_key =
+        mls_core::FriendCode::from_payload(friend_code.to_owned()).verifying_key()?;
+    Some(
+        SafetyNumber::from_identity_keys(&local_identity_key, &peer_identity_key)
+            .as_str()
+            .to_owned(),
+    )
 }
 
 /// Build an in-memory app service seeded with the deterministic fixture.

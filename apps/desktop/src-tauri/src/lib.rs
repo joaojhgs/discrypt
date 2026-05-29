@@ -10,9 +10,10 @@ pub mod production_status;
 use chrono::{Duration, Utc};
 use discrypt_core::{
     app_snapshot as core_app_snapshot, generated_device_view, identity_recovery_verification_smoke,
-    snapshot_safety_number_matches_identity_keys, AppSnapshot, ChannelKind,
-    ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
-    SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
+    safety_number_for_identity_hex_and_friend_code, snapshot_safety_number_matches_identity_keys,
+    AppSnapshot, ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
+    MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
+    SecurityCopyView, ServerView,
 };
 use discrypt_mls_core::{DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, Identity};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
@@ -1353,6 +1354,19 @@ impl PersistedAppState {
         snapshot.schema_version = self.schema_version;
         snapshot.friend.verified = self.friend_verified;
         snapshot.devices = self.devices.clone();
+        if let Some(safety_number) = self
+            .devices
+            .iter()
+            .find(|device| device.local && !device.revoked)
+            .and_then(|device| {
+                safety_number_for_identity_hex_and_friend_code(
+                    &device.identity_key,
+                    &snapshot.friend.friend_code,
+                )
+            })
+        {
+            snapshot.friend.safety_number = safety_number;
+        }
         snapshot.preferences = discrypt_core::PreferencesView {
             theme_id: self.preferences.theme_id.clone(),
             template_id: self.preferences.template_id.clone(),
@@ -1991,6 +2005,15 @@ mod tests {
             Some("Alice")
         );
         assert_eq!(state.dms.len(), 1);
+        assert_eq!(state.dms[0].display_name, "New contact");
+        assert!(state.dms[0].participant_id.starts_with("friend-"));
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices[0].label, "Desktop");
+        assert_eq!(state.devices[0].identity_key.len(), 64);
+        assert_eq!(state.devices[0].device_key.len(), 64);
+        assert_ne!(state.devices[0].identity_key, state.devices[0].device_key);
+        assert!(!state.devices[0].revoked);
+        assert_eq!(state.devices[0].revoked_at_epoch, None);
         assert!(path.exists());
 
         let loaded = load_state().to_view();
@@ -2028,6 +2051,43 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == "identity.recovered"));
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices[0].label, "Desktop");
+        assert_eq!(state.devices[0].identity_key.len(), 64);
+        assert_eq!(state.devices[0].device_key.len(), 64);
+    }
+
+    #[test]
+    fn verify_safety_number_rejects_mismatches_and_persists_success() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("verify-safety");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let snapshot = app_snapshot();
+
+        let wrong_friend = verify_safety_number(SafetyVerificationRequest {
+            friend_id: "wrong-friend".to_owned(),
+            provided: snapshot.friend.safety_number.clone(),
+        });
+        assert!(!wrong_friend.verified);
+        assert!(!app_snapshot().friend.verified);
+
+        let wrong_number = verify_safety_number(SafetyVerificationRequest {
+            friend_id: snapshot.friend.friend_code.clone(),
+            provided: "0000".to_owned(),
+        });
+        assert!(!wrong_number.verified);
+        assert!(!app_snapshot().friend.verified);
+
+        let ok = verify_safety_number(SafetyVerificationRequest {
+            friend_id: snapshot.friend.friend_code,
+            provided: snapshot.friend.safety_number,
+        });
+        assert!(ok.verified);
+        assert!(app_snapshot().friend.verified);
+        assert!(load_state().friend_verified);
     }
 
     #[test]
@@ -2369,6 +2429,7 @@ mod tests {
         let health = command_health();
         assert!(health.app_state_ready);
         assert!(health.identity_ready);
+        assert!(health.verification_ready);
         assert!(health.collaboration_ready);
         assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
