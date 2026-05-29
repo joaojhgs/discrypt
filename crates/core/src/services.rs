@@ -426,3 +426,387 @@ pub trait AppServiceBoundary:
     /// Return the current command-facing snapshot assembled from service state.
     fn command_snapshot(&self) -> ServiceResult<AppSnapshot>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{app_snapshot, ChannelKind};
+    use std::collections::BTreeMap;
+
+    #[derive(Debug)]
+    struct BoundaryHarness {
+        snapshot: AppSnapshot,
+        records: BTreeMap<String, StoreRecord>,
+        secrets: BTreeMap<SecretName, OpaqueBytes>,
+        signals: Vec<SignalEnvelope>,
+        events: Vec<AppEvent>,
+        next_event_sequence: u64,
+    }
+
+    impl Default for BoundaryHarness {
+        fn default() -> Self {
+            Self {
+                snapshot: app_snapshot(),
+                records: BTreeMap::new(),
+                secrets: BTreeMap::new(),
+                signals: Vec::new(),
+                events: Vec::new(),
+                next_event_sequence: 0,
+            }
+        }
+    }
+
+    impl IdentityService for BoundaryHarness {
+        fn local_identity(&self) -> ServiceResult<IdentitySummary> {
+            Ok(IdentitySummary {
+                user_id: UserId("alice".to_owned()),
+                device_id: DeviceId(self.snapshot.devices[0].device_id.clone()),
+                friend_code: self.snapshot.friend.friend_code.clone(),
+                safety_number: self.snapshot.friend.safety_number.clone(),
+            })
+        }
+
+        fn verify_safety_number(
+            &mut self,
+            request: SafetyVerificationRequest,
+        ) -> ServiceResult<SafetyVerificationResult> {
+            let verified = request.friend_id == self.snapshot.friend.friend_code
+                && request.provided == self.snapshot.friend.safety_number;
+            Ok(SafetyVerificationResult {
+                verified,
+                message: "boundary-owned verification result".to_owned(),
+            })
+        }
+
+        fn enroll_device(
+            &mut self,
+            enrollment: DeviceEnrollment,
+        ) -> ServiceResult<IdentitySummary> {
+            let mut identity = self.local_identity()?;
+            identity.device_id = enrollment.device_id;
+            Ok(identity)
+        }
+    }
+
+    impl GroupCryptoService for BoundaryHarness {
+        fn create_group_crypto(
+            &mut self,
+            request: GroupCryptoRequest,
+        ) -> ServiceResult<GroupCryptoState> {
+            Ok(GroupCryptoState {
+                group_id: GroupId(request.name),
+                epoch: 1,
+                epoch_summary: OpaqueBytes(vec![request.initial_channel_kind as u8]),
+            })
+        }
+
+        fn apply_group_commit(&mut self, commit: GroupCommit) -> ServiceResult<GroupCryptoState> {
+            Ok(GroupCryptoState {
+                group_id: commit.group_id,
+                epoch: commit.epoch,
+                epoch_summary: commit.commit,
+            })
+        }
+
+        fn export_group_secret(
+            &self,
+            group_id: &GroupId,
+            label: &str,
+        ) -> ServiceResult<OpaqueBytes> {
+            Ok(OpaqueBytes(format!("{}:{label}", group_id.0).into_bytes()))
+        }
+    }
+
+    impl GovernanceService for BoundaryHarness {
+        fn submit_governance(
+            &mut self,
+            command: GovernanceCommand,
+        ) -> ServiceResult<GovernanceReceipt> {
+            Ok(GovernanceReceipt {
+                group_id: command.group_id,
+                epoch: 1,
+                event_ref: "governance:event:1".to_owned(),
+            })
+        }
+
+        fn role_for_user(&self, _group_id: &GroupId, _user_id: &UserId) -> ServiceResult<String> {
+            Ok("owner".to_owned())
+        }
+    }
+
+    impl AdmissionService for BoundaryHarness {
+        fn create_invite(&mut self, request: InviteRequest) -> ServiceResult<AdmissionTicket> {
+            Ok(AdmissionTicket {
+                group_id: request.group_id,
+                ticket: OpaqueBytes(vec![request.max_uses as u8]),
+                welcome_required: true,
+            })
+        }
+
+        fn redeem_invite(&mut self, ticket: AdmissionTicket) -> ServiceResult<AdmissionTicket> {
+            Ok(ticket)
+        }
+    }
+
+    impl TextService for BoundaryHarness {
+        fn send_text(&mut self, request: SendMessageRequest) -> ServiceResult<MessageId> {
+            Ok(MessageId(format!(
+                "{}:{}",
+                request.channel,
+                request.body.len()
+            )))
+        }
+
+        fn load_text_history(
+            &self,
+            channel_id: &ChannelId,
+            _cursor: Option<String>,
+        ) -> ServiceResult<TextHistoryPage> {
+            Ok(TextHistoryPage {
+                channel_id: channel_id.clone(),
+                message_ids: vec![MessageId("m1".to_owned())],
+                next_cursor: None,
+            })
+        }
+    }
+
+    impl MediaService for BoundaryHarness {
+        fn join_media(&mut self, request: MediaSessionRequest) -> ServiceResult<MediaSessionState> {
+            Ok(MediaSessionState {
+                session_id: SessionId(format!("media:{}", request.channel_id.0)),
+                joined: true,
+                route_copy: "test media boundary only".to_owned(),
+            })
+        }
+
+        fn leave_media(&mut self, session_id: &SessionId) -> ServiceResult<MediaSessionState> {
+            Ok(MediaSessionState {
+                session_id: session_id.clone(),
+                joined: false,
+                route_copy: "left".to_owned(),
+            })
+        }
+
+        fn send_media_frame(
+            &mut self,
+            _session_id: &SessionId,
+            _frame: OpaqueBytes,
+        ) -> ServiceResult<()> {
+            Ok(())
+        }
+    }
+
+    impl OverlayService for BoundaryHarness {
+        fn select_overlay_route(&self, _group_id: &GroupId) -> ServiceResult<OverlayRoute> {
+            Ok(OverlayRoute {
+                relays: vec![RelayId("r1".to_owned())],
+                hop_count: 1,
+                ciphertext_only: true,
+            })
+        }
+
+        fn forward_ciphertext(
+            &mut self,
+            route: &OverlayRoute,
+            ciphertext: OpaqueBytes,
+        ) -> ServiceResult<()> {
+            if !route.ciphertext_only || ciphertext.0.is_empty() {
+                return Err(ServiceBoundaryError::InvalidRequest(
+                    "overlay requires ciphertext-only non-empty payload".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl SignalingService for BoundaryHarness {
+        fn publish_signal(&mut self, envelope: SignalEnvelope) -> ServiceResult<()> {
+            self.signals.push(envelope);
+            Ok(())
+        }
+
+        fn poll_signals(&mut self, session_id: &SessionId) -> ServiceResult<Vec<SignalEnvelope>> {
+            Ok(self
+                .signals
+                .iter()
+                .filter(|signal| &signal.session_id == session_id)
+                .cloned()
+                .collect())
+        }
+    }
+
+    impl TransportService for BoundaryHarness {
+        fn plan_transport(&self, _group_id: &GroupId) -> ServiceResult<Vec<TransportLeg>> {
+            Ok(vec![TransportLeg {
+                label: "relay-overlay".to_owned(),
+                endpoint: "r1".to_owned(),
+                ciphertext_only: true,
+            }])
+        }
+
+        fn open_transport(
+            &mut self,
+            _session_id: &SessionId,
+            leg: TransportLeg,
+        ) -> ServiceResult<()> {
+            if leg.ciphertext_only {
+                Ok(())
+            } else {
+                Err(ServiceBoundaryError::VerificationFailed(
+                    "transport leg must be ciphertext-only".to_owned(),
+                ))
+            }
+        }
+    }
+
+    impl AppStateStoreService for BoundaryHarness {
+        fn load_record(&self, key: &str) -> ServiceResult<Option<StoreRecord>> {
+            Ok(self.records.get(key).cloned())
+        }
+
+        fn save_record(&mut self, record: StoreRecord) -> ServiceResult<()> {
+            self.records.insert(record.key.clone(), record);
+            Ok(())
+        }
+    }
+
+    impl KeychainService for BoundaryHarness {
+        fn seal_secret(&mut self, name: SecretName, plaintext: OpaqueBytes) -> ServiceResult<()> {
+            self.secrets.insert(name, plaintext);
+            Ok(())
+        }
+
+        fn open_secret(&self, name: &SecretName) -> ServiceResult<Option<OpaqueBytes>> {
+            Ok(self.secrets.get(name).cloned())
+        }
+
+        fn delete_secret(&mut self, name: &SecretName) -> ServiceResult<()> {
+            self.secrets.remove(name);
+            Ok(())
+        }
+    }
+
+    impl EventBusService for BoundaryHarness {
+        fn publish_event(
+            &mut self,
+            topic: EventTopic,
+            payload: OpaqueBytes,
+        ) -> ServiceResult<AppEvent> {
+            self.next_event_sequence += 1;
+            let event = AppEvent {
+                topic,
+                sequence: self.next_event_sequence,
+                payload,
+            };
+            self.events.push(event.clone());
+            Ok(event)
+        }
+
+        fn drain_events(
+            &mut self,
+            topic: &EventTopic,
+            after: Option<u64>,
+        ) -> ServiceResult<Vec<AppEvent>> {
+            Ok(self
+                .events
+                .iter()
+                .filter(|event| {
+                    &event.topic == topic && after.is_none_or(|sequence| event.sequence > sequence)
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    impl AppServiceBoundary for BoundaryHarness {
+        fn command_snapshot(&self) -> ServiceResult<AppSnapshot> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    #[test]
+    fn aggregate_boundary_covers_required_service_seams() -> ServiceResult<()> {
+        let mut boundary = BoundaryHarness::default();
+        let object: &mut dyn AppServiceBoundary = &mut boundary;
+
+        let identity = object.local_identity()?;
+        assert_eq!(identity.user_id, UserId("alice".to_owned()));
+        assert!(
+            object
+                .verify_safety_number(SafetyVerificationRequest {
+                    friend_id: identity.friend_code,
+                    provided: identity.safety_number,
+                })?
+                .verified
+        );
+
+        let group = object.create_group_crypto(GroupCryptoRequest {
+            name: "lab".to_owned(),
+            initial_channel_kind: ChannelKind::Text,
+        })?;
+        assert_eq!(group.epoch, 1);
+        assert_eq!(
+            object.role_for_user(&group.group_id, &UserId("alice".to_owned()))?,
+            "owner"
+        );
+        assert!(
+            object
+                .create_invite(InviteRequest {
+                    group_id: group.group_id.clone(),
+                    creator: UserId("alice".to_owned()),
+                    password_gate: Some("online helper".to_owned()),
+                    max_uses: 1,
+                })?
+                .welcome_required
+        );
+        assert_eq!(
+            object
+                .send_text(SendMessageRequest {
+                    channel: "#general".to_owned(),
+                    body: "hello".to_owned(),
+                })?
+                .0,
+            "#general:5"
+        );
+
+        let route = object.select_overlay_route(&group.group_id)?;
+        assert!(route.ciphertext_only);
+        object.forward_ciphertext(&route, OpaqueBytes(vec![1, 2, 3]))?;
+
+        let session_id = SessionId("session-1".to_owned());
+        object.publish_signal(SignalEnvelope {
+            session_id: session_id.clone(),
+            sender: DeviceId("alice-laptop".to_owned()),
+            payload: OpaqueBytes(vec![7]),
+        })?;
+        assert_eq!(object.poll_signals(&session_id)?.len(), 1);
+        let leg = object.plan_transport(&group.group_id)?.remove(0);
+        object.open_transport(&session_id, leg)?;
+
+        let media = object.join_media(MediaSessionRequest {
+            group_id: group.group_id.clone(),
+            channel_id: ChannelId("voice".to_owned()),
+            participant: UserId("alice".to_owned()),
+        })?;
+        assert!(media.joined);
+        object.send_media_frame(&media.session_id, OpaqueBytes(vec![9]))?;
+
+        object.save_record(StoreRecord {
+            key: "snapshot".to_owned(),
+            value: OpaqueBytes(vec![1]),
+        })?;
+        assert!(object.load_record("snapshot")?.is_some());
+        let secret_name = SecretName("identity-key".to_owned());
+        object.seal_secret(secret_name.clone(), OpaqueBytes(vec![3]))?;
+        assert_eq!(
+            object.open_secret(&secret_name)?,
+            Some(OpaqueBytes(vec![3]))
+        );
+
+        let topic = EventTopic("commands".to_owned());
+        object.publish_event(topic.clone(), OpaqueBytes(vec![4]))?;
+        assert_eq!(object.drain_events(&topic, None)?.len(), 1);
+        assert_eq!(object.command_snapshot()?.schema_version, 2);
+        Ok(())
+    }
+}
