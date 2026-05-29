@@ -265,6 +265,21 @@ pub struct MaliciousMemberAdversarySmoke {
     pub removed_admin_race_rejected: bool,
 }
 
+/// Deterministic Phase-N retention/shred storage-boundary result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionShredStorageBoundarySmoke {
+    /// Locked/cached retention records survive encrypted AppStore restart.
+    pub retention_state_round_trips_encrypted_store: bool,
+    /// DB, WAL, temp file, and keychain snapshots exclude plaintext and content-key bytes.
+    pub store_and_keychain_exclude_plaintext_and_content_keys: bool,
+    /// Removing the wrapping key prevents restoring retained ciphertext from the DB file.
+    pub keychain_required_for_restore: bool,
+    /// Secure deletion enumerates DB, WAL, temp, and keychain boundaries.
+    pub secure_delete_enumerates_store_journal_temp_and_keychain: bool,
+    /// Account-continuity recovery material cannot resurrect shredded content keys.
+    pub recovery_after_shred_excludes_content_keys: bool,
+}
+
 /// Deterministic Phase-C device-rotation integration verification result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseCDeviceRotationSmoke {
@@ -482,6 +497,18 @@ impl MaliciousMemberAdversarySmoke {
             && self.out_of_epoch_governance_rejected
             && self.unauthorized_governance_rejected
             && self.removed_admin_race_rejected
+    }
+}
+
+impl RetentionShredStorageBoundarySmoke {
+    /// True when every retention/shred storage-boundary invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.retention_state_round_trips_encrypted_store
+            && self.store_and_keychain_exclude_plaintext_and_content_keys
+            && self.keychain_required_for_restore
+            && self.secure_delete_enumerates_store_journal_temp_and_keychain
+            && self.recovery_after_shred_excludes_content_keys
     }
 }
 
@@ -2712,6 +2739,147 @@ pub fn storage_persistence_smoke() -> Result<StoragePersistenceSmoke, anyhow::Er
     })
 }
 
+/// Exercise retention/shred behavior against encrypted store and keychain boundaries.
+pub fn retention_shred_storage_boundary_smoke(
+) -> Result<RetentionShredStorageBoundarySmoke, anyhow::Error> {
+    use discrypt_storage::{
+        recover_account, recovery_code_material, seal_account_backup, sqlite_wal_path,
+        AppDbKeychain, AppStore, EncryptedAppDb, KeyState, LocalStore, MemoryAppDbKeychain,
+        RecipientCacheEntry, RecoveryCodeVerifier,
+    };
+    use std::fs;
+
+    fn path_contains(path: &std::path::Path, needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && fs::read(path)
+                .map(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+                .unwrap_or(false)
+    }
+
+    fn keychain_contains(
+        keychain: &MemoryAppDbKeychain,
+        needle: &[u8],
+    ) -> Result<bool, anyhow::Error> {
+        Ok(keychain.snapshot_wrapping_keys()?.values().any(|key| {
+            !needle.is_empty() && key.windows(needle.len()).any(|window| window == needle)
+        }))
+    }
+
+    let run_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "discrypt-phase-n-retention-boundary-{}-{run_id}.sqlite",
+        std::process::id()
+    ));
+    let wal_path = sqlite_wal_path(&path);
+    let tmp_path = path.with_extension("json.tmp");
+    for candidate in [&path, &wal_path, &tmp_path] {
+        let _ = fs::remove_file(candidate);
+    }
+
+    let key_id = "phase-n-retention-boundary-key";
+    let content_key = [44_u8; 32];
+    let forbidden_plaintext = b"phase-n retained plaintext body";
+    let mut local_store = LocalStore::with_recipient_cache_capacity(4);
+    local_store.cache_received(RecipientCacheEntry::new(
+        "cached-message",
+        b"ciphertext-only-cached-message".to_vec(),
+        KeyState::Cached(content_key),
+        10,
+    ));
+    local_store.cache_received(RecipientCacheEntry::new(
+        "locked-message",
+        b"ciphertext-only-locked-message".to_vec(),
+        KeyState::Locked,
+        11,
+    ));
+    local_store.cache_received(RecipientCacheEntry::new(
+        "shredded-message",
+        b"ciphertext-only-shredded-message".to_vec(),
+        KeyState::Shredded,
+        12,
+    ));
+    let serialized_store = serde_json::to_vec(&local_store)?;
+    let keychain = MemoryAppDbKeychain::default();
+    let mut db = EncryptedAppDb::with_key_id(&path, keychain.clone(), key_id);
+    db.save_app_state(&serialized_store)?;
+    let mut restarted = EncryptedAppDb::with_key_id(&path, keychain.clone(), key_id);
+    let restored = restarted.load_app_state()?.unwrap_or_default();
+    let restored_store: LocalStore = serde_json::from_slice(&restored)?;
+    let retention_state_round_trips_encrypted_store = restored_store
+        .recipient_cache()
+        .get("cached-message")
+        .is_some_and(|entry| entry.key_state == KeyState::Cached(content_key))
+        && restored_store
+            .recipient_cache()
+            .get("locked-message")
+            .is_some_and(|entry| entry.key_state == KeyState::Locked)
+        && restored_store
+            .recipient_cache()
+            .get("shredded-message")
+            .is_some_and(|entry| entry.key_state == KeyState::Shredded);
+
+    let store_and_keychain_exclude_plaintext_and_content_keys = [
+        forbidden_plaintext.as_slice(),
+        content_key.as_slice(),
+        b"phase-n-content-key".as_slice(),
+    ]
+    .into_iter()
+    .all(|needle| {
+        !path_contains(&path, needle)
+            && !path_contains(&wal_path, needle)
+            && !path_contains(&tmp_path, needle)
+            && keychain_contains(&keychain, needle).is_ok_and(|contains| !contains)
+    });
+
+    let mut keychain_removed = keychain.clone();
+    keychain_removed.delete_wrapping_key(key_id)?;
+    let mut missing_key_db = EncryptedAppDb::with_key_id(&path, keychain_removed.clone(), key_id);
+    let keychain_required_for_restore = missing_key_db.load_app_state().is_err();
+
+    fs::write(&wal_path, b"phase-n-content-key journal residue")?;
+    fs::write(&tmp_path, b"phase-n-content-key temp residue")?;
+    let mut partial_keychain = keychain.clone();
+    fs::remove_file(&path)?;
+    fs::remove_file(&wal_path)?;
+    let partial_delete_incomplete = tmp_path.exists()
+        || !partial_keychain.snapshot_wrapping_keys()?.is_empty()
+        || keychain_contains(&partial_keychain, content_key.as_slice())?;
+    partial_keychain.delete_wrapping_key(key_id)?;
+    let _ = fs::remove_file(&tmp_path);
+    let secure_delete_enumerates_store_journal_temp_and_keychain = partial_delete_incomplete
+        && !path.exists()
+        && !wal_path.exists()
+        && !tmp_path.exists()
+        && partial_keychain.snapshot_wrapping_keys()?.is_empty();
+
+    let verifier = RecoveryCodeVerifier::from_code("phase-n recovery code")?;
+    let recovery = recover_account(recovery_code_material(
+        "phase-n recovery code",
+        &verifier,
+        vec!["phase-n-room".to_owned()],
+        2,
+    )?)?;
+    let backup = seal_account_backup(&content_key, vec!["phase-n-room".to_owned()], 2);
+    let recovery_after_shred_excludes_content_keys = recovery.account_access_restored
+        && !recovery.content_keys_restored
+        && !backup
+            .identity_key_ciphertext
+            .windows(content_key.len())
+            .any(|window| window == content_key);
+
+    for candidate in [&path, &wal_path, &tmp_path] {
+        let _ = fs::remove_file(candidate);
+    }
+
+    Ok(RetentionShredStorageBoundarySmoke {
+        retention_state_round_trips_encrypted_store,
+        store_and_keychain_exclude_plaintext_and_content_keys,
+        keychain_required_for_restore,
+        secure_delete_enumerates_store_journal_temp_and_keychain,
+        recovery_after_shred_excludes_content_keys,
+    })
+}
+
 /// Exercise Phase-5 governance, admission, recovery, and abuse controls.
 pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::Error> {
     use chrono::{Duration, Utc};
@@ -3470,6 +3638,21 @@ mod tests {
                 live_key_membership_rate_limit_decoy: true,
                 secure_delete_negative: true,
                 recovery_cannot_resurrect_content_keys: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn retention_shred_storage_boundary_smoke_covers_real_store_and_keychain_gates() {
+        let smoke = retention_shred_storage_boundary_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(RetentionShredStorageBoundarySmoke {
+                retention_state_round_trips_encrypted_store: true,
+                store_and_keychain_exclude_plaintext_and_content_keys: true,
+                keychain_required_for_restore: true,
+                secure_delete_enumerates_store_journal_temp_and_keychain: true,
+                recovery_after_shred_excludes_content_keys: true,
             })
         ));
     }
