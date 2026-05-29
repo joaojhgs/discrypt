@@ -67,3 +67,7 @@ jobs:
         working-directory: apps/ui
       - run: npm run build
         working-directory: apps/ui
+      - run: npm run test:command-coverage
+        working-directory: apps/ui
+      - run: npm run test:honesty
+        working-directory: apps/ui
