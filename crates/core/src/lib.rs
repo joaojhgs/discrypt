@@ -43,12 +43,24 @@ pub struct FriendView {
 pub struct DeviceView {
     /// Device id shown in transparency notices.
     pub device_id: String,
+    /// Human label for the device.
+    pub label: String,
     /// MLS leaf index for this device.
     pub leaf_index: u32,
+    /// Account identity public key associated with this device.
+    pub identity_key: String,
+    /// Per-device public key for this device leaf.
+    pub device_key: String,
     /// Whether this device is current/local.
     pub local: bool,
     /// Whether this device is authorized by an existing device.
     pub authorized: bool,
+    /// Whether this device has been revoked.
+    pub revoked: bool,
+    /// Epoch where this device was added.
+    pub added_at_epoch: u64,
+    /// Epoch where this device was revoked, if any.
+    pub revoked_at_epoch: Option<u64>,
 }
 
 /// UI channel kind.
@@ -692,6 +704,8 @@ fn seed_state() -> AppState {
     let peer = Identity::generate("New contact");
     let local_friend_code = local.friend_code();
     let peer_friend_code = peer.friend_code();
+    let local_device_identity = Identity::generate("Alice Desktop device");
+    let peer_device_identity = Identity::generate("New contact primary device");
     let local_device_id = device_id_from_friend_code(local_friend_code.as_str(), "desktop");
     let peer_device_id = device_id_from_friend_code(peer_friend_code.as_str(), "primary");
     let safety_number = local
@@ -711,15 +725,27 @@ fn seed_state() -> AppState {
             devices: vec![
                 DeviceView {
                     device_id: local_device_id,
+                    label: "Desktop".to_owned(),
                     leaf_index: 1,
+                    identity_key: hex_encode(local.verifying_key().as_bytes()),
+                    device_key: hex_encode(local_device_identity.verifying_key().as_bytes()),
                     local: true,
                     authorized: true,
+                    revoked: false,
+                    added_at_epoch: 1,
+                    revoked_at_epoch: None,
                 },
                 DeviceView {
                     device_id: peer_device_id,
+                    label: "Primary".to_owned(),
                     leaf_index: 2,
+                    identity_key: hex_encode(peer.verifying_key().as_bytes()),
+                    device_key: hex_encode(peer_device_identity.verifying_key().as_bytes()),
                     local: false,
                     authorized: true,
+                    revoked: false,
+                    added_at_epoch: 1,
+                    revoked_at_epoch: None,
                 },
             ],
             servers: vec![ServerView {
@@ -832,6 +858,16 @@ fn device_id_from_friend_code(friend_code: &str, label: &str) -> String {
     format!("device-{}-{suffix}", slugify(label))
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn normalize_label(input: &str, fallback: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -900,6 +936,14 @@ mod tests {
         assert!(!snapshot.friend.verified);
         assert_eq!(snapshot, app_snapshot());
         assert_eq!(snapshot.devices.len(), 2);
+        assert!(snapshot.devices.iter().all(|device| {
+            !device.label.is_empty()
+                && device.identity_key.len() == 64
+                && device.device_key.len() == 64
+                && !device.revoked
+                && device.added_at_epoch == 1
+                && device.revoked_at_epoch.is_none()
+        }));
         assert!(snapshot
             .servers
             .iter()

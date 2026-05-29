@@ -1266,11 +1266,24 @@ impl PersistedAppState {
             },
         });
         self.lifecycle = AppLifecycle::Ready;
+        let base_device = core_app_snapshot().devices.into_iter().next();
         self.devices = vec![DeviceView {
             device_id: slugify(&device_name),
+            label: device_name.clone(),
             leaf_index: 1,
+            identity_key: base_device
+                .as_ref()
+                .map(|device| device.identity_key.clone())
+                .unwrap_or_default(),
+            device_key: base_device
+                .as_ref()
+                .map(|device| device.device_key.clone())
+                .unwrap_or_default(),
             local: true,
             authorized: true,
+            revoked: false,
+            added_at_epoch: 1,
+            revoked_at_epoch: None,
         }];
         if self.dms.is_empty() {
             let friend = core_app_snapshot().friend;

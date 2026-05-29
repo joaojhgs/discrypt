@@ -32,6 +32,10 @@ pub struct DeviceLeaf {
     pub label: String,
     /// Leaf status.
     pub status: DeviceStatus,
+    /// Epoch when this device was added.
+    pub added_at_epoch: u64,
+    /// Epoch when this device was revoked/removed.
+    pub removed_at_epoch: Option<u64>,
 }
 
 /// Device-set mutation errors.
@@ -243,6 +247,8 @@ impl DeviceSet {
             device_key: device_key.to_bytes(),
             label: normalize_device_label(label),
             status: DeviceStatus::Active,
+            added_at_epoch: epoch,
+            removed_at_epoch: None,
         };
         self.next_leaf = self.next_leaf.saturating_add(1);
         self.transparency.push(TransparencyEvent {
@@ -270,17 +276,15 @@ impl DeviceSet {
 
     /// Remove a device and emit a transparency event. Returns true if an active device changed.
     pub fn remove_device(&mut self, device_id: Uuid, epoch: u64) -> bool {
-        self.retire_device(device_id, DeviceStatus::Removed, "device-removed", epoch)
-            .is_ok()
-    }
-
-    /// Mark a device as compromised and invalidate its credentials for future sends.
-    pub fn compromise_device(
-        &mut self,
-        device_id: Uuid,
-        epoch: u64,
-    ) -> Result<DeviceLeaf, DeviceSetError> {
-        self.retire_device(
+        let Some(device) = self.devices.get_mut(&device_id) else {
+            return false;
+        };
+        if device.status == DeviceStatus::Removed {
+            return false;
+        }
+        device.status = DeviceStatus::Removed;
+        device.removed_at_epoch = Some(epoch);
+        self.transparency.push(TransparencyEvent {
             device_id,
             DeviceStatus::Compromised,
             "device-compromised-removed",
@@ -428,6 +432,16 @@ mod tests {
         assert!(set.remove_device(leaf.device_id, 2));
         assert_eq!(set.active_devices().len(), 0);
         assert_eq!(set.transparency_events().len(), 2);
+        assert_eq!(
+            set.transparency_events()[1].kind,
+            "device-removed".to_owned()
+        );
+        assert_eq!(
+            set.devices
+                .get(&leaf.device_id)
+                .and_then(|device| device.removed_at_epoch),
+            Some(2)
+        );
     }
 
     #[test]

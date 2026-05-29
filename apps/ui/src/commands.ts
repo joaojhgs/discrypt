@@ -9,9 +9,15 @@ export type FriendView = {
 
 export type DeviceView = {
   device_id: string;
+  label: string;
   leaf_index: number;
+  identity_key: string;
+  device_key: string;
   local: boolean;
   authorized: boolean;
+  revoked: boolean;
+  added_at_epoch: number;
+  revoked_at_epoch: number | null;
 };
 
 export type ChannelView = {
@@ -619,9 +625,15 @@ function ensureFallbackReady(
   fallbackState.devices = [
     {
       device_id: slugify(deviceName),
+      label: deviceName,
       leaf_index: 1,
+      identity_key: stableHash(`${displayName}:account-key`),
+      device_key: randomHex(32),
       local: true,
       authorized: true,
+      revoked: false,
+      added_at_epoch: 1,
+      revoked_at_epoch: null,
     },
   ];
   const dmId = `dm-${slugify(fallbackState.snapshot.friend.friend_code).slice(0, 24)}`;
