@@ -528,6 +528,17 @@ mod tests {
         }
     }
 
+
+    fn hex_for_test(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
     impl IdentityService for BoundaryHarness {
         fn local_identity(&self) -> ServiceResult<IdentitySummary> {
             Ok(IdentitySummary {
@@ -580,12 +591,22 @@ mod tests {
             })
         }
 
-        fn export_group_secret(
+    }
+
+    impl RustExporterSecretProvider for BoundaryHarness {
+        fn export_rust_service_secret(
             &self,
             group_id: &GroupId,
-            label: &str,
-        ) -> ServiceResult<OpaqueBytes> {
-            Ok(OpaqueBytes(format!("{}:{label}", group_id.0).into_bytes()))
+            service: RustExporterSecretService,
+            context: &[u8],
+        ) -> ServiceResult<RustExporterSecret> {
+            Ok(RustExporterSecret::new(format!(
+                "{}:{:?}:{}:{}",
+                group_id.0,
+                service.export_label(),
+                service as u8,
+                hex_for_test(context)
+            )))
         }
     }
 
@@ -799,12 +820,11 @@ mod tests {
     #[test]
     fn aggregate_boundary_covers_required_service_seams() -> ServiceResult<()> {
         let mut boundary = BoundaryHarness::default();
-        let object: &mut dyn AppServiceBoundary = &mut boundary;
 
-        let identity = object.local_identity()?;
+        let identity = boundary.local_identity()?;
         assert_eq!(identity.user_id, UserId("alice".to_owned()));
         assert!(
-            object
+            boundary
                 .verify_safety_number(SafetyVerificationRequest {
                     friend_id: identity.friend_code,
                     provided: identity.safety_number,
@@ -812,11 +832,32 @@ mod tests {
                 .verified
         );
 
-        let group = object.create_group_crypto(GroupCryptoRequest {
+        let group = boundary.create_group_crypto(GroupCryptoRequest {
             name: "lab".to_owned(),
             initial_channel_kind: ChannelKind::Text,
         })?;
         assert_eq!(group.epoch, 1);
+
+        let text_secret = boundary.export_rust_service_secret(
+            &group.group_id,
+            RustExporterSecretService::Text,
+            b"history",
+        )?;
+        let media_secret = boundary.export_rust_service_secret(
+            &group.group_id,
+            RustExporterSecretService::Media,
+            b"voice",
+        )?;
+        let content_key_secret = boundary.export_rust_service_secret(
+            &group.group_id,
+            RustExporterSecretService::ContentKey,
+            b"message",
+        )?;
+        assert_ne!(text_secret.as_bytes(), media_secret.as_bytes());
+        assert_ne!(text_secret.as_bytes(), content_key_secret.as_bytes());
+        assert!(!format!("{text_secret:?}").contains("lab"));
+
+        let object: &mut dyn AppServiceBoundary = &mut boundary;
         assert_eq!(
             object.role_for_user(&group.group_id, &UserId("alice".to_owned()))?,
             "owner"
