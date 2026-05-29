@@ -824,6 +824,10 @@ fn seed_state() -> AppState {
     let peer = Identity::generate("New contact");
     let local_friend_code = local.friend_code();
     let peer_friend_code = peer.friend_code();
+    let local_device_identity = Identity::generate("Alice Desktop device");
+    let peer_device_identity = Identity::generate("New contact primary device");
+    let local_device_id = device_id_from_friend_code(local_friend_code.as_str(), "desktop");
+    let peer_device_id = device_id_from_friend_code(peer_friend_code.as_str(), "primary");
     let safety_number = local
         .safety_number_from_friend_code(&peer_friend_code)
         .unwrap_or_else(|| local.safety_number(&peer.verifying_key()))
@@ -840,15 +844,11 @@ fn seed_state() -> AppState {
             },
             devices: vec![
                 DeviceView {
-                    device_id: device_id_from_friend_code(local_friend_code.as_str(), "desktop"),
+                    device_id: local_device_id,
                     label: "Desktop".to_owned(),
                     leaf_index: 1,
                     identity_key: hex_encode(local.verifying_key().as_bytes()),
-                    device_key: hex_encode(
-                        Identity::generate("Alice Desktop device")
-                            .verifying_key()
-                            .as_bytes(),
-                    ),
+                    device_key: hex_encode(local_device_identity.verifying_key().as_bytes()),
                     local: true,
                     authorized: true,
                     revoked: false,
@@ -856,15 +856,11 @@ fn seed_state() -> AppState {
                     revoked_at_epoch: None,
                 },
                 DeviceView {
-                    device_id: device_id_from_friend_code(peer_friend_code.as_str(), "primary"),
+                    device_id: peer_device_id,
                     label: "Primary".to_owned(),
                     leaf_index: 2,
                     identity_key: hex_encode(peer.verifying_key().as_bytes()),
-                    device_key: hex_encode(
-                        Identity::generate("New contact primary device")
-                            .verifying_key()
-                            .as_bytes(),
-                    ),
+                    device_key: hex_encode(peer_device_identity.verifying_key().as_bytes()),
                     local: false,
                     authorized: true,
                     revoked: false,
