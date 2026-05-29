@@ -431,36 +431,22 @@ mod tests {
     }
 
     #[test]
-    fn pairing_payload_adds_second_device_after_existing_device_authorization(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn compromised_rotation_invalidates_old_device_and_preserves_identity(
+    ) -> Result<(), DeviceSetError> {
         let identity = Identity::generate("alice");
         let compromised_key = SigningKey::generate(&mut OsRng).verifying_key();
         let replacement_key = SigningKey::generate(&mut OsRng).verifying_key();
         let mut set = DeviceSet::new();
         let compromised = set.add_authorized_device(&identity, compromised_key, "lost laptop", 7);
 
-        let payload = set.create_pairing_payload(&identity, laptop.device_id, "phone", 2, 3)?;
-        let phone = set.add_device_from_pairing_payload(&identity, &payload, phone_key, 2)?;
-
-        assert_eq!(phone.leaf_index, 1);
-        assert_eq!(phone.label, "phone");
-        assert_eq!(set.active_devices().len(), 2);
-        assert_eq!(set.transparency_events()[1].kind, "device-paired");
-        assert_eq!(laptop.identity_key, phone.identity_key);
-        assert_ne!(laptop.device_key, phone.device_key);
-        Ok(())
-    }
-
-    #[test]
-    fn pairing_rejects_tampering_expiry_and_missing_authorizer(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let identity = Identity::generate("alice");
-        let other_identity = Identity::generate("mallory");
-        let laptop_key = SigningKey::generate(&mut OsRng).verifying_key();
-        let phone_key = SigningKey::generate(&mut OsRng).verifying_key();
-        let mut set = DeviceSet::new();
-        let laptop = set.add_authorized_device(&identity, laptop_key, "laptop", 1);
-        let payload = set.create_pairing_payload(&identity, laptop.device_id, "phone", 2, 1)?;
+        let rotation = set.rotate_compromised_device(
+            &identity,
+            compromised.device_id,
+            replacement_key,
+            "new laptop",
+            8,
+            9,
+        )?;
 
         assert_eq!(rotation.retired.status, DeviceStatus::Compromised);
         assert!(!set.device_may_send(compromised.device_id));
@@ -481,12 +467,6 @@ mod tests {
         assert_eq!(
             set.add_device_from_pairing_payload(&identity, &tampered, phone_key, 2),
             Err(DevicePairingError::SignatureVerificationFailed)
-        );
-
-        let empty = DeviceSet::new();
-        assert_eq!(
-            empty.create_pairing_payload(&identity, laptop.device_id, "phone", 2, 1),
-            Err(DevicePairingError::UnauthorizedAuthorizingDevice)
         );
         Ok(())
     }

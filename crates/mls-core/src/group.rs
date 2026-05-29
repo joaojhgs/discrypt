@@ -234,7 +234,8 @@ mod tests {
     }
 
     #[test]
-    fn compromised_device_rotation_rekeys_and_blocks_old_sender() {
+    fn compromised_device_rotation_rekeys_and_blocks_old_sender(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let identity = Identity::generate("alice");
         let mut devices = DeviceSet::new();
         let compromised = devices.add_authorized_device(
@@ -251,16 +252,14 @@ mod tests {
         );
         let before_rotation = group.export(ExportLabel::Content, b"text");
 
-        let rotation = devices
-            .rotate_compromised_device(
-                &identity,
-                compromised.device_id,
-                SigningKey::generate(&mut OsRng).verifying_key(),
-                "replacement laptop",
-                group.epoch + 1,
-                group.epoch + 2,
-            )
-            .expect("compromised device rotates");
+        let rotation = devices.rotate_compromised_device(
+            &identity,
+            compromised.device_id,
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            "replacement laptop",
+            group.epoch + 1,
+            group.epoch + 2,
+        )?;
         assert_eq!(
             group.rotate_leaf(compromised.leaf_index, rotation.replacement.clone()),
             Ok(())
@@ -283,5 +282,6 @@ mod tests {
                 attempted: group.epoch - 1,
             })
         );
+        Ok(())
     }
 }
