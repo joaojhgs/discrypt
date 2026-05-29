@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use discrypt_admission::{
     signaling_fingerprint_for_endpoint, InviteEndpointPolicy, InviteSignalingMetadata, InviteStore,
-    InviteTrustMetadata, StoredInvite,
+    InviteTrustMetadata,
 };
 use discrypt_core::{
     app_snapshot as core_app_snapshot, generated_device_view, identity_recovery_verification_smoke,
@@ -979,7 +979,13 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let invite_code = production_invite_link(&descriptor, expires_at.as_str(), max_uses);
+        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
+            Ok(code) => code,
+            Err(error) => {
+                state.push_event("invite.rejected", error);
+                return;
+            }
+        };
         let invite = InviteView {
             invite_id: format!("invite-{}", descriptor.invite_id),
             invite_key: descriptor.invite_id.clone(),
@@ -2069,30 +2075,31 @@ struct ParsedInviteMetadata {
     max_uses: u32,
 }
 
-fn default_signaling_endpoint() -> String {
-    "https://signaling.discrypt.invalid/v1/rendezvous".to_owned()
-}
-
-fn production_invite_link(descriptor: &StoredInvite, expires_at: &str, max_uses: u32) -> String {
-    format!(
-        "discrypt://join/v1/{}?endpoint={}&policy={}&trust_fp={}&trust={}&commitment={}&issuer={}&sig={}&exp={}&max={}",
-        descriptor.invite_id,
-        percent_encode(&descriptor.signaling_metadata.signaling_endpoint),
-        descriptor.signaling_metadata.endpoint_policy.canonical_name(),
-        descriptor.signaling_metadata.trust.signaling_fingerprint,
-        percent_encode(&descriptor.signaling_metadata.trust.trust_status),
-        hex::encode(descriptor.room_secret_commitment),
-        hex::encode(&descriptor.issuer_public_key),
-        hex::encode(&descriptor.issuer_signature),
-        percent_encode(expires_at),
-        max_uses,
-    )
-}
-
 fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
     let trimmed = invite_code.trim();
     let (prefix, query) = trimmed.split_once('?')?;
     let invite_key = prefix.rsplit('/').next()?.to_owned();
+    if let Some(descriptor_payload) = query_value(query, "d") {
+        let descriptor_bytes = URL_SAFE_NO_PAD.decode(descriptor_payload.as_bytes()).ok()?;
+        let descriptor: discrypt_admission::StoredInvite =
+            serde_json::from_slice(&descriptor_bytes).ok()?;
+        descriptor.verify_issuer_signature().ok()?;
+        let endpoint_policy = match descriptor.signaling_metadata.endpoint_policy {
+            InviteEndpointPolicy::ProductionTls => "production_tls",
+            InviteEndpointPolicy::LocalDevLoopback => "local_dev_loopback",
+        }
+        .to_owned();
+        return Some(ParsedInviteMetadata {
+            invite_key: descriptor.invite_id,
+            room_secret_hash: hex::encode(descriptor.room_secret_commitment),
+            signaling_endpoint: descriptor.signaling_metadata.signaling_endpoint,
+            signaling_trust_fingerprint: descriptor.signaling_metadata.trust.signaling_fingerprint,
+            signaling_trust_status: descriptor.signaling_metadata.trust.trust_status,
+            endpoint_policy,
+            expires_at: descriptor.expires_at.to_rfc3339(),
+            max_uses: descriptor.max_uses,
+        });
+    }
     let endpoint = query_value(query, "endpoint")
         .and_then(percent_decode)
         .filter(|value| !value.is_empty())?;
@@ -2132,18 +2139,6 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         let (candidate, value) = pair.split_once('=')?;
         (candidate == key).then_some(value)
     })
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -2487,8 +2482,7 @@ mod tests {
             .code
             .starts_with("discrypt://join/v1/"));
         assert!(!invite_state.invites[0].code.contains("room_secret="));
-        assert!(invite_state.invites[0].code.contains("endpoint="));
-        assert!(invite_state.invites[0].code.contains("trust_fp="));
+        assert!(invite_state.invites[0].code.contains("?d="));
         assert_eq!(
             invite_state.invites[0].endpoint_policy,
             "production_tls".to_owned()
