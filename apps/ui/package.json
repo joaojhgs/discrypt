@@ -20,7 +20,8 @@
     "smoke:linux-packages:dry-run": "node ../../scripts/smoke-linux-packages.mjs --dry-run",
     "test:linux-package-smoke": "node ../../scripts/check-linux-package-smoke.mjs",
     "test:desktop-package-ci": "node ../../scripts/check-desktop-package-ci.mjs",
-    "test:android-gate": "node ../../scripts/check-android-gate.mjs"
+    "test:android-gate": "node ../../scripts/check-android-gate.mjs",
+    "test:signaling-relay-ops": "node ../../scripts/check-signaling-relay-ops.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
