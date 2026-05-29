@@ -921,7 +921,10 @@ name = "discrypt-admission"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "ed25519-dalek",
  "hex",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "thiserror 2.0.18",
