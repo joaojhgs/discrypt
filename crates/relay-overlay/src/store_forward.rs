@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+use crate::integrity::RelayProtectedEnvelope;
+
 /// Store-forward queue errors.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StoreForwardError {
@@ -13,9 +15,6 @@ pub enum StoreForwardError {
     /// Fanout is zero.
     #[error("store-forward fanout exhausted")]
     FanoutExhausted,
-    /// Ciphertext payload is empty.
-    #[error("empty ciphertext")]
-    EmptyCiphertext,
     /// Relay-visible bytes contain a caller-supplied plaintext sample.
     #[error("visible plaintext in store-forward ciphertext")]
     VisiblePlaintext,
@@ -28,8 +27,8 @@ pub struct StoreForwardEnvelope {
     pub message_id: String,
     /// Intended recipient/member id.
     pub recipient_id: String,
-    /// Relay-visible ciphertext only; no plaintext or content key.
-    pub ciphertext: Vec<u8>,
+    /// Relay-visible protected payload; never a bare ciphertext byte slice.
+    pub payload: RelayProtectedEnvelope,
     /// Creation timestamp in deterministic harness milliseconds.
     pub created_at_ms: u64,
     /// Absolute expiration timestamp in deterministic harness milliseconds.
@@ -43,14 +42,11 @@ impl StoreForwardEnvelope {
     pub fn new(
         message_id: impl Into<String>,
         recipient_id: impl Into<String>,
-        ciphertext: Vec<u8>,
+        payload: RelayProtectedEnvelope,
         created_at_ms: u64,
         ttl_ms: u64,
         fanout: usize,
     ) -> Result<Self, StoreForwardError> {
-        if ciphertext.is_empty() {
-            return Err(StoreForwardError::EmptyCiphertext);
-        }
         if ttl_ms == 0 {
             return Err(StoreForwardError::Expired);
         }
@@ -60,7 +56,7 @@ impl StoreForwardEnvelope {
         Ok(Self {
             message_id: message_id.into(),
             recipient_id: recipient_id.into(),
-            ciphertext,
+            payload,
             created_at_ms,
             expires_at_ms: created_at_ms.saturating_add(ttl_ms),
             fanout_remaining: fanout,
@@ -117,7 +113,8 @@ impl StoreForwardQueue {
     ) -> Result<(), StoreForwardError> {
         if !forbidden_plaintext.is_empty()
             && envelope
-                .ciphertext
+                .payload
+                .visible_bytes()
                 .windows(forbidden_plaintext.len())
                 .any(|window| window == forbidden_plaintext)
         {
@@ -167,14 +164,27 @@ impl StoreForwardQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrity::{RelayPayloadKind, RelayProtectedEnvelope};
+
+    fn payload(
+        ciphertext: &[u8],
+    ) -> Result<RelayProtectedEnvelope, crate::integrity::RelayIntegrityError> {
+        RelayProtectedEnvelope::new(
+            RelayPayloadKind::StoreForward,
+            b"kid-store".to_vec(),
+            1,
+            b"message aad",
+            ciphertext.to_vec(),
+        )
+    }
 
     #[test]
-    fn queues_ciphertext_until_ttl_and_recipient_match() -> Result<(), StoreForwardError> {
+    fn queues_ciphertext_until_ttl_and_recipient_match() -> Result<(), Box<dyn std::error::Error>> {
         let mut queue = StoreForwardQueue::new();
         queue.enqueue(StoreForwardEnvelope::new(
             "m1",
             "bob",
-            b"ciphertext".to_vec(),
+            payload(b"ciphertext")?,
             1_000,
             500,
             2,
@@ -183,18 +193,18 @@ mod tests {
         assert_eq!(queue.len(), 1);
         let delivered = queue.drain_for_recipient("bob", 1_100);
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].ciphertext, b"ciphertext");
+        assert_eq!(delivered[0].payload.ciphertext, b"ciphertext");
         assert!(queue.is_empty());
         Ok(())
     }
 
     #[test]
-    fn expired_messages_are_not_delivered() -> Result<(), StoreForwardError> {
+    fn expired_messages_are_not_delivered() -> Result<(), Box<dyn std::error::Error>> {
         let mut queue = StoreForwardQueue::new();
         queue.enqueue(StoreForwardEnvelope::new(
             "m1",
             "bob",
-            b"ciphertext".to_vec(),
+            payload(b"ciphertext")?,
             1_000,
             100,
             1,

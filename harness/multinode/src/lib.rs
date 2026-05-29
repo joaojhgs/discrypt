@@ -320,7 +320,20 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
     use discrypt_media::{
         MediaKeyRegistry, ReplayWindow, SFrameReceiver, SFrameSender, SenderBinding,
     };
-    use discrypt_relay_overlay::integrity::{contains_plaintext, RelayPacket};
+    use discrypt_relay_overlay::integrity::{
+        contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
+    };
+
+    fn relay_payload(
+        kind: RelayPayloadKind,
+        kid: Vec<u8>,
+        counter: u64,
+        aad_metadata: &[u8],
+        ciphertext: Vec<u8>,
+    ) -> Result<RelayProtectedEnvelope, discrypt_media::MediaError> {
+        RelayProtectedEnvelope::new(kind, kid, counter, aad_metadata, ciphertext)
+            .map_err(|_| discrypt_media::MediaError::AuthenticationFailed)
+    }
 
     let binding = SenderBinding {
         kid: b"harness-kid-alice".to_vec(),
@@ -336,7 +349,17 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
 
     let plaintext = b"harness encoded voice frame";
     let relayed = sender.protect(plaintext)?;
-    let relay_packet = RelayPacket::new("relay-a", relayed.ciphertext.clone()).forward("relay-b");
+    let relay_packet = RelayPacket::from_envelope(
+        "relay-a",
+        relay_payload(
+            RelayPayloadKind::Media,
+            relayed.kid.clone(),
+            relayed.counter,
+            b"media-security-smoke",
+            relayed.ciphertext.clone(),
+        )?,
+    )
+    .forward("relay-b");
     let passive_relay_cannot_read = !contains_plaintext(&relay_packet, b"voice");
 
     let opened = receiver.open(&relayed)?;
@@ -364,7 +387,9 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameReceiver, SFrameSender,
         SenderBinding,
     };
-    use discrypt_relay_overlay::integrity::{contains_plaintext, RelayPacket};
+    use discrypt_relay_overlay::integrity::{
+        contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
+    };
     use discrypt_relay_overlay::ranking::RelayMetrics;
     use discrypt_relay_overlay::redelivery::{PacketId, RedeliveryError, RedeliveryTracker};
     use discrypt_relay_overlay::store_forward::{
@@ -381,6 +406,22 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
             battery_cost: 0.0,
             freeload_penalty,
         }
+    }
+
+    fn protected_payload(
+        kind: RelayPayloadKind,
+        kid: Vec<u8>,
+        counter: u64,
+        aad_metadata: &[u8],
+        ciphertext: Vec<u8>,
+    ) -> Result<RelayProtectedEnvelope, anyhow::Error> {
+        Ok(RelayProtectedEnvelope::new(
+            kind,
+            kid,
+            counter,
+            aad_metadata,
+            ciphertext,
+        )?)
     }
 
     let mut topology = RelayTopology::default();
@@ -457,25 +498,42 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
 
     let plaintext = b"phase2 encoded voice frame";
     let protected = sender.protect(plaintext)?;
+    let relay_envelope = protected_payload(
+        RelayPayloadKind::Media,
+        protected.kid.clone(),
+        protected.counter,
+        b"route:alice:primary-relay:bob",
+        protected.ciphertext.clone(),
+    )?;
     let relayed = route.path[1..route.path.len() - 1].iter().try_fold(
-        RelayPacket::new(&route.path[1], protected.ciphertext.clone()),
+        RelayPacket::from_envelope(&route.path[1], relay_envelope),
         |packet, hop| packet.forward_checked(hop),
     )?;
     let ciphertext_only_media = !contains_plaintext(&relayed, b"voice frame");
     let opened = receiver.open(&ProtectedFrame {
         kid: protected.kid.clone(),
         counter: protected.counter,
-        ciphertext: relayed.bytes.clone(),
+        ciphertext: relayed.envelope.ciphertext.clone(),
     })?;
 
     let mut tamper_registry = MediaKeyRegistry::new();
     tamper_registry.register_sender(&[42; 32], binding)?;
     let mut tamper_receiver = SFrameReceiver::new(tamper_registry, ReplayWindow::default());
-    let tampered_packet = RelayPacket::new("primary-relay", protected.ciphertext.clone()).tamper();
+    let tampered_packet = RelayPacket::from_envelope(
+        "primary-relay",
+        protected_payload(
+            RelayPayloadKind::Media,
+            protected.kid.clone(),
+            protected.counter,
+            b"route:alice:primary-relay:bob",
+            protected.ciphertext.clone(),
+        )?,
+    )
+    .tamper();
     let tamper_rejected = tamper_receiver.open(&ProtectedFrame {
         kid: protected.kid.clone(),
         counter: protected.counter,
-        ciphertext: tampered_packet.bytes,
+        ciphertext: tampered_packet.envelope.ciphertext,
     }) == Err(MediaError::AuthenticationFailed);
 
     let mut redelivery = RedeliveryTracker::new(64, 2);
@@ -495,7 +553,13 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
     let plaintext_leak = StoreForwardEnvelope::new(
         "plaintext-leak",
         "bob",
-        b"visible phase2 encoded voice frame".to_vec(),
+        protected_payload(
+            RelayPayloadKind::StoreForward,
+            b"leak-kid".to_vec(),
+            1,
+            b"store-forward:plaintext-leak",
+            b"visible phase2 encoded voice frame".to_vec(),
+        )?,
         1_000,
         1_000,
         1,
@@ -504,7 +568,20 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         .enqueue_ciphertext_only(plaintext_leak, b"voice frame")
         == Err(StoreForwardError::VisiblePlaintext);
     queue.enqueue_ciphertext_only(
-        StoreForwardEnvelope::new("media-1", "bob", protected.ciphertext, 1_000, 1_000, 2)?,
+        StoreForwardEnvelope::new(
+            "media-1",
+            "bob",
+            protected_payload(
+                RelayPayloadKind::StoreForward,
+                protected.kid.clone(),
+                protected.counter,
+                b"store-forward:media-1",
+                protected.ciphertext,
+            )?,
+            1_000,
+            1_000,
+            2,
+        )?,
         b"voice frame",
     )?;
     let delivered_before_ttl = queue.drain_for_recipient("bob", 1_500).len() == 1;
@@ -512,7 +589,13 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         StoreForwardEnvelope::new(
             "media-2",
             "bob",
-            b"opaque ciphertext".to_vec(),
+            protected_payload(
+                RelayPayloadKind::StoreForward,
+                b"opaque-kid".to_vec(),
+                2,
+                b"store-forward:media-2",
+                b"opaque ciphertext".to_vec(),
+            )?,
             2_000,
             10,
             1,

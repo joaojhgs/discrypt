@@ -28,6 +28,7 @@ pub use capability::{
     RelayCapabilityAdvertisement, RelayCapacityAdvertisement,
 };
 pub use gossip::{GossipItem, GossipMesh, GossipNode};
+pub use integrity::{RelayPacket, RelayPayloadKind, RelayProtectedEnvelope};
 pub use manager::{
     ChurnDampingPolicy, ConstructedOverlayRoute, FailoverRecoveryPolicy, MediaConcealmentReport,
     OverlayFailoverReport, OverlayManager, OverlayManagerError, OverlayRouteDecision,
