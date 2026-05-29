@@ -187,6 +187,13 @@ export type TransportStatusView = {
   detail: string;
 };
 
+export type JoinProgressStepView = {
+  key: string;
+  label: string;
+  status: string;
+  detail: string;
+};
+
 export type InviteView = {
   invite_id: string;
   invite_key: string;
@@ -266,6 +273,7 @@ export type AppState = {
   event_cursor: number;
   last_command_error: CommandErrorView | null;
   transport_status: TransportStatusView[];
+  join_progress: JoinProgressStepView[];
   snapshot: AppSnapshot;
 };
 
@@ -517,6 +525,7 @@ const fallbackState: AppState = {
   event_cursor: 1,
   last_command_error: null,
   transport_status: [],
+  join_progress: [],
   snapshot: fallbackSnapshot,
 };
 
@@ -579,7 +588,64 @@ function syncSnapshot(state: AppState): AppState {
     .map((event) => event.summary);
   state.event_cursor = state.events.at(-1)?.sequence ?? 0;
   state.transport_status = deriveTransportStatus(state);
+  state.join_progress = deriveJoinProgress(state);
   return state;
+}
+
+function deriveJoinProgress(state: AppState): JoinProgressStepView[] {
+  const latestInvite = state.invites.at(-1) ?? null;
+  const hasInvite = Boolean(latestInvite);
+  const openedFromInvite = state.events.some(
+    (event) =>
+      event.kind === "group.joined" || event.kind === "group.opened_from_invite",
+  );
+  const hasActiveGroup = Boolean(state.active_context?.group_id);
+  const voiceJoined = Boolean(state.voice_session?.joined);
+  return [
+    {
+      key: "invite_parsed",
+      label: "Invite parsed",
+      status: hasInvite ? "complete" : "waiting-for-invite",
+      detail: latestInvite
+        ? `Invite ${latestInvite.invite_key} parsed with signaling endpoint ${latestInvite.signaling_endpoint}`
+        : "Paste or create an invite before join progress can start",
+    },
+    {
+      key: "rendezvous",
+      label: "Rendezvous link",
+      status: hasInvite ? "waiting-for-backend-event" : "blocked",
+      detail:
+        "Rendezvous connected is marked only when backend state reports an authenticated publish/take exchange",
+    },
+    {
+      key: "authorized_member",
+      label: "Authorized member",
+      status: hasInvite ? "waiting-for-authorized-member" : "blocked",
+      detail:
+        "Waiting for an authorized member or helper to approve admission; the invite link alone is insufficient",
+    },
+    {
+      key: "welcome",
+      label: "Welcome package",
+      status: openedFromInvite ? "local-admission-recorded" : "pending-welcome",
+      detail:
+        "Welcome received becomes complete only after backend state records a verified MLS Welcome/add",
+    },
+    {
+      key: "mls_joined",
+      label: "MLS group state",
+      status: hasActiveGroup ? "local-group-open" : "pending-mls-proof",
+      detail:
+        "MLS joined requires command state for the active group plus epoch/member verification",
+    },
+    {
+      key: "transport",
+      label: "Transport route",
+      status: voiceJoined ? "media-gated" : "waiting-route-proof",
+      detail:
+        "Transport connected is shown only after backend state provides direct, overlay, or TURN route evidence",
+    },
+  ];
 }
 
 function deriveTransportStatus(state: AppState): TransportStatusView[] {

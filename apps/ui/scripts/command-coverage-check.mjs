@@ -436,6 +436,21 @@ if (!rust.includes("transport_status: Vec<TransportStatusView>")) {
 if (!commands.includes("transport_status: TransportStatusView[]")) {
   failures.push("TS AppState must carry backend-derived transport_status");
 }
+if (!rust.includes("join_progress: Vec<JoinProgressStepView>")) {
+  failures.push("Tauri AppStateView must expose backend-derived join_progress");
+}
+if (!commands.includes("join_progress: JoinProgressStepView[]")) {
+  failures.push("TS AppState must carry backend-derived join_progress");
+}
+if (!main.includes("JoinProgressCard")) {
+  failures.push("UI must render backend-derived group join progress");
+}
+if (!main.includes("Group join progress")) {
+  failures.push("join UI must label the command-backed group join progress timeline");
+}
+if (!main.includes("evidence-gated by command state")) {
+  failures.push("join progress UI must explain progress requires command-state evidence");
+}
 if (!main.includes("TransportStatusStrip")) {
   failures.push("UI must render backend-derived transport statuses");
 }

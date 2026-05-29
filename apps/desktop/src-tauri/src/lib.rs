@@ -381,6 +381,19 @@ pub struct TransportStatusView {
     pub detail: String,
 }
 
+/// Backend-derived group-join progress for the invite/join UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JoinProgressStepView {
+    /// Stable stage key.
+    pub key: String,
+    /// Human label for the stage.
+    pub label: String,
+    /// Current backend-derived stage status.
+    pub status: String,
+    /// Evidence or caveat explaining the status.
+    pub detail: String,
+}
+
 /// Confirmation phrase required before destructive local-state reset.
 pub const RESET_APP_CONFIRMATION_PHRASE: &str = "DELETE LOCAL DISCRYPT STATE";
 
@@ -428,6 +441,9 @@ pub struct AppStateView {
     /// Backend-derived transport/connectivity states for honest UI status surfaces.
     #[serde(default)]
     pub transport_status: Vec<TransportStatusView>,
+    /// Backend-derived invite/join progress states for the UI timeline.
+    #[serde(default)]
+    pub join_progress: Vec<JoinProgressStepView>,
     /// Compatibility snapshot for existing harnesses and transitional UI.
     pub snapshot: AppSnapshot,
 }
@@ -1818,6 +1834,7 @@ impl PersistedAppState {
             event_cursor: self.latest_event_cursor(),
             last_command_error: self.last_command_error.clone(),
             transport_status: self.transport_status(),
+            join_progress: self.join_progress(),
             snapshot: self.to_snapshot(),
         }
     }
@@ -1909,6 +1926,65 @@ impl PersistedAppState {
                 detail: last_error
                     .map(|error| error.recovery_hint.clone())
                     .unwrap_or_else(|| "No failed transport command is currently reported".to_owned()),
+            },
+        ]
+    }
+
+    fn join_progress(&self) -> Vec<JoinProgressStepView> {
+        let latest_invite = self.invites.last();
+        let has_invite = latest_invite.is_some();
+        let opened_from_invite = self
+            .events
+            .iter()
+            .any(|event| event.kind == "group.joined" || event.kind == "group.opened_from_invite");
+        let has_active_group = self
+            .active_context
+            .as_ref()
+            .and_then(|context| context.group_id.as_ref())
+            .is_some();
+        vec![
+            JoinProgressStepView {
+                key: "invite_parsed".to_owned(),
+                label: "Invite parsed".to_owned(),
+                status: if has_invite { "complete" } else { "waiting-for-invite" }.to_owned(),
+                detail: latest_invite
+                    .map(|invite| format!("Invite {} parsed with signaling endpoint {}", invite.invite_key, invite.signaling_endpoint))
+                    .unwrap_or_else(|| "Paste or create an invite before join progress can start".to_owned()),
+            },
+            JoinProgressStepView {
+                key: "rendezvous".to_owned(),
+                label: "Rendezvous link".to_owned(),
+                status: if has_invite { "waiting-for-backend-event" } else { "blocked" }.to_owned(),
+                detail: "Rendezvous connected is marked only when backend state reports an authenticated publish/take exchange".to_owned(),
+            },
+            JoinProgressStepView {
+                key: "authorized_member".to_owned(),
+                label: "Authorized member".to_owned(),
+                status: if has_invite { "waiting-for-authorized-member" } else { "blocked" }.to_owned(),
+                detail: "Waiting for an authorized member or helper to approve admission; the invite link alone is insufficient".to_owned(),
+            },
+            JoinProgressStepView {
+                key: "welcome".to_owned(),
+                label: "Welcome package".to_owned(),
+                status: if opened_from_invite { "local-admission-recorded" } else { "pending-welcome" }.to_owned(),
+                detail: "Welcome received becomes complete only after backend state records a verified MLS Welcome/add".to_owned(),
+            },
+            JoinProgressStepView {
+                key: "mls_joined".to_owned(),
+                label: "MLS group state".to_owned(),
+                status: if has_active_group { "local-group-open" } else { "pending-mls-proof" }.to_owned(),
+                detail: "MLS joined requires command state for the active group plus epoch/member verification".to_owned(),
+            },
+            JoinProgressStepView {
+                key: "transport".to_owned(),
+                label: "Transport route".to_owned(),
+                status: if self.voice_session.as_ref().map(|session| session.joined).unwrap_or(false) {
+                    "media-gated"
+                } else {
+                    "waiting-route-proof"
+                }
+                .to_owned(),
+                detail: "Transport connected is shown only after backend state provides direct, overlay, or TURN route evidence".to_owned(),
             },
         ]
     }
@@ -3611,6 +3687,49 @@ mod tests {
             .transport_status
             .iter()
             .any(|status| status.label == "direct" && status.status == "no-direct-proof"));
+    }
+
+    #[test]
+    fn join_progress_surfaces_backend_join_stages() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("join-progress-ui");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Join Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let state = create_invite(CreateInviteRequest {
+            group_id: Some(group.groups[0].group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+        });
+        let keys: Vec<_> = state
+            .join_progress
+            .iter()
+            .map(|step| step.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "invite_parsed",
+                "rendezvous",
+                "authorized_member",
+                "welcome",
+                "mls_joined",
+                "transport"
+            ]
+        );
+        assert!(state
+            .join_progress
+            .iter()
+            .any(|step| step.key == "invite_parsed" && step.status == "complete"));
+        assert!(state
+            .join_progress
+            .iter()
+            .any(|step| step.key == "transport" && step.status == "waiting-route-proof"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ import {
   DirectConversationView,
   GroupView,
   InviteView,
+  JoinProgressStepView,
   TransportStatusView,
   VoiceParticipantView,
   VoiceSessionView,
@@ -632,6 +633,7 @@ function App() {
               groupName={draftJoinName}
               setGroupName={setDraftJoinName}
               latestInvite={appState.invites.at(-1) ?? null}
+              joinProgress={appState.join_progress}
               onJoin={joinCommandGroup}
               onCreateInvite={createCommandInvite}
               canCreateInvite={Boolean(activeGroup)}
@@ -1561,6 +1563,7 @@ function JoinPanel({
   groupName,
   setGroupName,
   latestInvite,
+  joinProgress,
   onJoin,
   onCreateInvite,
   canCreateInvite,
@@ -1571,6 +1574,7 @@ function JoinPanel({
   groupName: string;
   setGroupName: (value: string) => void;
   latestInvite: InviteView | null;
+  joinProgress: JoinProgressStepView[];
   onJoin: () => void;
   onCreateInvite: () => void;
   canCreateInvite: boolean;
@@ -1618,6 +1622,7 @@ function JoinPanel({
               </Button>
             ) : null}
           </div>
+          <JoinProgressCard steps={joinProgress} />
           {latestInvite ? (
             <InviteDetailCard invite={latestInvite} snapshot={snapshot} />
           ) : null}
@@ -1638,6 +1643,77 @@ function JoinPanel({
       </Card>
     </div>
   );
+}
+
+function JoinProgressCard({ steps }: { steps: JoinProgressStepView[] }) {
+  const visibleSteps = steps.length
+    ? steps
+    : [
+        {
+          key: "invite_parsed",
+          label: "Invite parsed",
+          status: "waiting-for-invite",
+          detail: "Paste or create an invite before join progress can start",
+        },
+        {
+          key: "rendezvous",
+          label: "Rendezvous link",
+          status: "blocked",
+          detail:
+            "Rendezvous connected is marked only when backend state reports an authenticated publish/take exchange",
+        },
+      ];
+  return (
+    <Card className="border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.26)]">
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base">Group join progress</CardTitle>
+        <CardDescription>
+          Invite parsing, rendezvous, authorization, Welcome, MLS, and route
+          stages stay evidence-gated by command state.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        {visibleSteps.map((step, index) => (
+          <div
+            key={step.key}
+            className="grid grid-cols-[28px_minmax(0,1fr)] gap-3 rounded-xl border border-[hsl(var(--border))] bg-black/10 p-3"
+          >
+            <div
+              className={cn(
+                "grid h-7 w-7 place-items-center rounded-full border text-xs font-semibold",
+                step.status === "complete"
+                  ? "border-emerald-300/40 bg-emerald-300/15 text-emerald-100"
+                  : "border-[hsl(var(--border))] bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]",
+              )}
+            >
+              {step.status === "complete" ? "✓" : index + 1}
+            </div>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="font-medium">{step.label}</p>
+                <Badge variant={joinProgressBadgeVariant(step.status)}>
+                  {step.status}
+                </Badge>
+              </div>
+              <p className="mt-1 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                {step.detail}
+              </p>
+            </div>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+function joinProgressBadgeVariant(
+  status: string,
+): React.ComponentProps<typeof Badge>["variant"] {
+  if (status === "complete" || status === "local-group-open") return "success";
+  if (status.startsWith("waiting") || status.startsWith("pending")) {
+    return "warning";
+  }
+  return "secondary";
 }
 
 function InviteDetailCard({
