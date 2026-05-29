@@ -10,15 +10,16 @@ workspace = true
 
 [features]
 default = []
-harness = ["discrypt-core/harness"]
-local-dev = ["discrypt-core/local-dev"]
-production-network = ["discrypt-core/production-network"]
-production-media = ["discrypt-core/production-media"]
-production-storage = ["discrypt-core/production-storage"]
+harness = ["discrypt-core/harness", "discrypt-storage/harness"]
+local-dev = ["discrypt-core/local-dev", "discrypt-storage/local-dev"]
+production-network = ["discrypt-core/production-network", "discrypt-storage/production-network"]
+production-media = ["discrypt-core/production-media", "discrypt-storage/production-media"]
+production-storage = ["discrypt-core/production-storage", "discrypt-storage/production-storage"]
 tauri-runtime = ["dep:tauri", "dep:tauri-build", "tauri/wry"]
 
 [dependencies]
 discrypt-core = { path = "../../../crates/core", version = "0.1.0" }
+discrypt-storage = { path = "../../../crates/storage", version = "0.1.0" }
 chrono = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }

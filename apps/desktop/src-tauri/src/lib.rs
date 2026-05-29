@@ -14,6 +14,7 @@ use discrypt_core::{
     MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
     SecurityCopyView, ServerView,
 };
+use discrypt_storage::{AppStore, FileAppStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +25,7 @@ use std::{
 use uuid::Uuid;
 
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
+const APP_STATE_STORE_FILENAME: &str = "app-state.discrypt-store";
 const DEFAULT_THEME_ID: &str = "graphite-calm";
 const DEFAULT_TEMPLATE_ID: &str = "command-center";
 
@@ -1291,9 +1293,9 @@ fn mutate_state(update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
 }
 
 fn load_state() -> PersistedAppState {
-    let path = state_path();
-    if let Ok(contents) = fs::read_to_string(path) {
-        if let Ok(state) = serde_json::from_str::<PersistedAppState>(&contents) {
+    let mut store = app_store();
+    if let Ok(Some(bytes)) = store.load_app_state() {
+        if let Ok(state) = serde_json::from_slice::<PersistedAppState>(&bytes) {
             if state.schema_version == APP_STATE_SCHEMA_VERSION {
                 return state;
             }
@@ -1303,35 +1305,43 @@ fn load_state() -> PersistedAppState {
 }
 
 fn persist_state(state: &PersistedAppState) {
-    let path = state_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(encoded) = serde_json::to_string_pretty(state) {
-        let tmp = path.with_extension("json.tmp");
-        if fs::write(&tmp, encoded).is_ok() {
-            let _ = fs::rename(tmp, path);
-        }
+    if let Ok(encoded) = serde_json::to_vec_pretty(state) {
+        let mut store = app_store();
+        let _ = store.save_app_state(&encoded);
     }
 }
 
-fn state_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("DISCRYPT_APP_STATE_PATH") {
-        return PathBuf::from(path);
+fn app_store() -> FileAppStore {
+    FileAppStore::new(app_store_path())
+}
+
+fn app_store_path() -> PathBuf {
+    app_store_path_with_env_override(env_app_state_override_allowed())
+}
+
+fn env_app_state_override_allowed() -> bool {
+    cfg!(any(test, feature = "harness", feature = "local-dev"))
+}
+
+fn app_store_path_with_env_override(allow_env_override: bool) -> PathBuf {
+    if allow_env_override {
+        if let Some(path) = std::env::var_os("DISCRYPT_APP_STATE_PATH") {
+            return PathBuf::from(path);
+        }
     }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(data_home)
             .join("discrypt")
-            .join("app-state.json");
+            .join(APP_STATE_STORE_FILENAME);
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
             .join(".local")
             .join("share")
             .join("discrypt")
-            .join("app-state.json");
+            .join(APP_STATE_STORE_FILENAME);
     }
-    PathBuf::from("discrypt-app-state.json")
+    PathBuf::from(APP_STATE_STORE_FILENAME)
 }
 
 fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
