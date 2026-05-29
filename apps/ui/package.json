@@ -32,7 +32,8 @@
     "test:performance-soak-g100": "node ../../scripts/check-performance-soak-g100.mjs",
     "test:ac-dashboard-g101": "node ../../scripts/check-ac-dashboard-g101.mjs",
     "test:adr-001-webrtc-media-path": "node ../../scripts/check-adr-001-webrtc-media-path.mjs",
-    "test:adr-002-openmls-provider-storage": "node ../../scripts/check-adr-002-openmls-provider-storage.mjs"
+    "test:adr-002-openmls-provider-storage": "node ../../scripts/check-adr-002-openmls-provider-storage.mjs",
+    "test:adr-003-signaling-transport": "node ../../scripts/check-adr-003-signaling-transport.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
