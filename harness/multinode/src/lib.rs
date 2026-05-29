@@ -832,7 +832,9 @@ pub fn storage_persistence_smoke() -> Result<StoragePersistenceSmoke, anyhow::Er
 pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::Error> {
     use chrono::{Duration, Utc};
     use discrypt_abuse::AbuseControls;
-    use discrypt_admission::{AdmissionController, Invite, InviteError, PasswordGate};
+    use discrypt_admission::{
+        AdmissionController, AuthorizedWelcome, Invite, InviteError, PasswordGate,
+    };
     use discrypt_mls_core::governance::{
         GovernanceAction, GovernanceError, GovernanceEvent, GovernanceLog, GovernanceState, Role,
     };
@@ -840,6 +842,8 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
         recover_account, recovery_code_material, seal_account_backup, AccountRecovery,
         RecoveryCodeVerifier, RecoveryError, RecoveryMaterial,
     };
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     let mut log = GovernanceLog::default();
     let high = GovernanceEvent::signed(10, 9, GovernanceAction::Ban { target: 4 });
@@ -917,14 +921,48 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
         },
         1,
     );
-    let password_and_welcome_gate =
-        offline.finalize_admission(&mut invite, now, "alice", true, true)
-            == Err(InviteError::OfflineVerifierRejected)
-            && pake.finalize_admission(&mut invite, now, "alice", true, false)
-                == Err(InviteError::WelcomeRequired)
-            && pake.finalize_admission(&mut invite, now, "alice", true, true) == Ok(())
-            && pake.finalize_admission(&mut invite, now, "alice", true, true)
-                == Err(InviteError::PasswordRejected);
+    let welcome_payload = b"openmls-welcome";
+    let welcome = AuthorizedWelcome::sign(
+        invite.id.to_string(),
+        b"group-a".to_vec(),
+        welcome_payload,
+        now + Duration::minutes(1),
+        &SigningKey::generate(&mut OsRng),
+    );
+    let password_and_welcome_gate = offline.finalize_admission(
+        &mut invite,
+        now,
+        "alice",
+        true,
+        Some(&welcome),
+        welcome_payload,
+    ) == Err(InviteError::OfflineVerifierRejected)
+        && pake.finalize_admission(&mut invite, now, "alice", true, None, welcome_payload)
+            == Err(InviteError::WelcomeRequired)
+        && pake.finalize_admission(
+            &mut invite,
+            now,
+            "alice",
+            true,
+            Some(&welcome),
+            b"tampered-welcome",
+        ) == Err(InviteError::InvalidWelcomeAuthorization)
+        && pake.finalize_admission(
+            &mut invite,
+            now,
+            "alice",
+            true,
+            Some(&welcome),
+            welcome_payload,
+        ) == Ok(())
+        && pake.finalize_admission(
+            &mut invite,
+            now,
+            "alice",
+            true,
+            Some(&welcome),
+            welcome_payload,
+        ) == Err(InviteError::PasswordRejected);
 
     let backup = seal_account_backup(&[8; 32], vec!["room".into()], 2);
     let recovery_code = RecoveryCodeVerifier::from_code("paper-coral-falcon")?;

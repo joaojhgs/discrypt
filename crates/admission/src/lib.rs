@@ -70,6 +70,15 @@ pub enum InviteError {
     /// Final MLS add/Welcome authorization is absent.
     #[error("authorized MLS welcome required")]
     WelcomeRequired,
+    /// Final MLS Welcome authorization expired.
+    #[error("authorized MLS welcome expired")]
+    WelcomeExpired,
+    /// Final MLS Welcome authorization targets a different invite.
+    #[error("authorized MLS welcome invite mismatch")]
+    WelcomeInviteMismatch,
+    /// Final MLS Welcome authorization signature/hash is invalid.
+    #[error("authorized MLS welcome invalid")]
+    InvalidWelcomeAuthorization,
 }
 
 /// Production invite descriptor stored and exchanged without exposing the raw room secret.
@@ -292,6 +301,120 @@ impl Invite {
         self.uses = self.uses.saturating_add(1);
         Ok(())
     }
+}
+
+/// Signed authorization that binds final admission to an MLS Welcome/add payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizedWelcome {
+    /// Invite id this Welcome satisfies.
+    pub invite_id: String,
+    /// Application/group id or OpenMLS group id bytes.
+    pub group_id: Vec<u8>,
+    /// Hash of the exact Welcome/add payload the joiner must process.
+    pub welcome_payload_hash: [u8; 32],
+    /// Authorization expiry.
+    pub expires_at: DateTime<Utc>,
+    /// Issuer device verification key.
+    pub issuer_public_key: Vec<u8>,
+    /// Issuer signature over the canonical Welcome authorization.
+    pub issuer_signature: Vec<u8>,
+}
+
+impl AuthorizedWelcome {
+    /// Create a signed Welcome authorization for an invite and concrete Welcome payload.
+    #[must_use]
+    pub fn sign(
+        invite_id: impl Into<String>,
+        group_id: impl Into<Vec<u8>>,
+        welcome_payload: &[u8],
+        expires_at: DateTime<Utc>,
+        issuer: &SigningKey,
+    ) -> Self {
+        let issuer_public_key = issuer.verifying_key().to_bytes().to_vec();
+        let mut authorization = Self {
+            invite_id: invite_id.into(),
+            group_id: group_id.into(),
+            welcome_payload_hash: welcome_payload_hash(welcome_payload),
+            expires_at,
+            issuer_public_key,
+            issuer_signature: Vec::new(),
+        };
+        authorization.issuer_signature = issuer
+            .sign(&authorization.signing_bytes())
+            .to_bytes()
+            .to_vec();
+        authorization
+    }
+
+    /// Verify this authorization against the invite id and exact Welcome payload.
+    pub fn verify(
+        &self,
+        expected_invite_id: &str,
+        welcome_payload: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<(), InviteError> {
+        if self.invite_id != expected_invite_id {
+            return Err(InviteError::WelcomeInviteMismatch);
+        }
+        if now > self.expires_at {
+            return Err(InviteError::WelcomeExpired);
+        }
+        if self.welcome_payload_hash != welcome_payload_hash(welcome_payload) {
+            return Err(InviteError::InvalidWelcomeAuthorization);
+        }
+        let verifying_key = VerifyingKey::from_bytes(
+            &self
+                .issuer_public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| InviteError::InvalidWelcomeAuthorization)?,
+        )
+        .map_err(|_| InviteError::InvalidWelcomeAuthorization)?;
+        let signature = Signature::from_slice(&self.issuer_signature)
+            .map_err(|_| InviteError::InvalidWelcomeAuthorization)?;
+        verifying_key
+            .verify(&self.signing_bytes(), &signature)
+            .map_err(|_| InviteError::InvalidWelcomeAuthorization)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        canonical_welcome_authorization_bytes(
+            &self.invite_id,
+            &self.group_id,
+            &self.welcome_payload_hash,
+            self.expires_at,
+            &self.issuer_public_key,
+        )
+    }
+}
+
+/// Domain-separated hash of an MLS Welcome/add payload.
+#[must_use]
+pub fn welcome_payload_hash(welcome_payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-authorized-welcome-payload-v1");
+    hasher.update(welcome_payload);
+    hasher.finalize().into()
+}
+
+fn canonical_welcome_authorization_bytes(
+    invite_id: &str,
+    group_id: &[u8],
+    welcome_payload_hash: &[u8; 32],
+    expires_at: DateTime<Utc>,
+    issuer_public_key: &[u8],
+) -> Vec<u8> {
+    let mut bytes = b"discrypt-authorized-welcome".to_vec();
+    bytes.push(1);
+    bytes.extend_from_slice(&(invite_id.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(invite_id.as_bytes());
+    bytes.extend_from_slice(&(group_id.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(group_id);
+    bytes.extend_from_slice(welcome_payload_hash);
+    bytes.extend_from_slice(&expires_at.timestamp_millis().to_le_bytes());
+    bytes.extend_from_slice(&(issuer_public_key.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(issuer_public_key);
+    bytes
 }
 
 /// Signed proof from an online authorized helper that a subject passed the
@@ -571,27 +694,27 @@ impl AdmissionController {
         now: DateTime<Utc>,
         subject: impl Into<String>,
         helper_proof: &AuthorizedHelperProof,
-        authorized_welcome: bool,
+        authorized_welcome: Option<&AuthorizedWelcome>,
+        welcome_payload: &[u8],
     ) -> Result<(), InviteError> {
-        if !authorized_welcome {
-            return Err(InviteError::WelcomeRequired);
-        }
+        let welcome = authorized_welcome.ok_or(InviteError::WelcomeRequired)?;
+        welcome.verify(&invite.id.to_string(), welcome_payload, now)?;
         self.attempt_online_helper(subject, helper_proof, now)?;
         invite.consume(now)
     }
 
-    /// Final admission requires invite, password gate success, and authorized Welcome/add.
+    /// Final admission requires invite, password gate success, and signed Welcome/add authorization.
     pub fn finalize_admission(
         &mut self,
         invite: &mut Invite,
         now: DateTime<Utc>,
         subject: impl Into<String>,
         password_proof_ok: bool,
-        authorized_welcome: bool,
+        authorized_welcome: Option<&AuthorizedWelcome>,
+        welcome_payload: &[u8],
     ) -> Result<(), InviteError> {
-        if !authorized_welcome {
-            return Err(InviteError::WelcomeRequired);
-        }
+        let welcome = authorized_welcome.ok_or(InviteError::WelcomeRequired)?;
+        welcome.verify(&invite.id.to_string(), welcome_payload, now)?;
         self.attempt_password(subject, password_proof_ok)?;
         invite.consume(now)
     }
@@ -738,12 +861,35 @@ mod tests {
             },
             3,
         );
+        let welcome_payload = b"openmls-welcome";
+        let welcome_issuer = SigningKey::generate(&mut OsRng);
+        let welcome = AuthorizedWelcome::sign(
+            invite.id.to_string(),
+            b"group-a".to_vec(),
+            welcome_payload,
+            now + Duration::minutes(1),
+            &welcome_issuer,
+        );
         assert_eq!(
-            controller.finalize_helper_admission(&mut invite, now, "alice", &proof, false),
+            controller.finalize_helper_admission(
+                &mut invite,
+                now,
+                "alice",
+                &proof,
+                None,
+                welcome_payload
+            ),
             Err(InviteError::WelcomeRequired)
         );
         assert_eq!(
-            controller.finalize_helper_admission(&mut invite, now, "alice", &proof, true),
+            controller.finalize_helper_admission(
+                &mut invite,
+                now,
+                "alice",
+                &proof,
+                Some(&welcome),
+                welcome_payload,
+            ),
             Ok(())
         );
 
@@ -754,8 +900,22 @@ mod tests {
             3,
         );
         let mut invite = Invite::new(b"room", now + Duration::minutes(1), 1);
+        let wrong_gate_welcome = AuthorizedWelcome::sign(
+            invite.id.to_string(),
+            b"group-a".to_vec(),
+            welcome_payload,
+            now + Duration::minutes(1),
+            &welcome_issuer,
+        );
         assert_eq!(
-            wrong_controller.finalize_helper_admission(&mut invite, now, "alice", &proof, true),
+            wrong_controller.finalize_helper_admission(
+                &mut invite,
+                now,
+                "alice",
+                &proof,
+                Some(&wrong_gate_welcome),
+                welcome_payload,
+            ),
             Err(InviteError::HelperMismatch)
         );
     }
@@ -770,8 +930,23 @@ mod tests {
             },
             1,
         );
+        let welcome_payload = b"welcome";
+        let welcome = AuthorizedWelcome::sign(
+            invite.id.to_string(),
+            b"group".to_vec(),
+            welcome_payload,
+            now + Duration::minutes(1),
+            &SigningKey::generate(&mut OsRng),
+        );
         assert_eq!(
-            offline.finalize_admission(&mut invite, now, "alice", true, true),
+            offline.finalize_admission(
+                &mut invite,
+                now,
+                "alice",
+                true,
+                Some(&welcome),
+                welcome_payload,
+            ),
             Err(InviteError::OfflineVerifierRejected)
         );
         let mut pake = AdmissionController::new(
@@ -781,15 +956,40 @@ mod tests {
             1,
         );
         assert_eq!(
-            pake.finalize_admission(&mut invite, now, "alice", true, false),
+            pake.finalize_admission(&mut invite, now, "alice", true, None, welcome_payload),
             Err(InviteError::WelcomeRequired)
         );
         assert_eq!(
-            pake.finalize_admission(&mut invite, now, "alice", true, true),
+            pake.finalize_admission(
+                &mut invite,
+                now,
+                "alice",
+                true,
+                Some(&welcome),
+                b"tampered-welcome",
+            ),
+            Err(InviteError::InvalidWelcomeAuthorization)
+        );
+        assert_eq!(
+            pake.finalize_admission(
+                &mut invite,
+                now,
+                "alice",
+                true,
+                Some(&welcome),
+                welcome_payload,
+            ),
             Ok(())
         );
         assert_eq!(
-            pake.finalize_admission(&mut invite, now, "alice", true, true),
+            pake.finalize_admission(
+                &mut invite,
+                now,
+                "alice",
+                true,
+                Some(&welcome),
+                welcome_payload,
+            ),
             Err(InviteError::PasswordRejected)
         );
     }

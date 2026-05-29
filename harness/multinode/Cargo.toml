@@ -102,3 +102,5 @@ discrypt-push = { path = "../../crates/push", version = "0.1.0" }
 external-signaling = { path = "../../external/signaling-repository", version = "0.1.0" }
 discrypt-transport = { path = "../../crates/transport", version = "0.1.0" }
 discrypt-desktop = { path = "../../apps/desktop/src-tauri", version = "0.1.0" }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }

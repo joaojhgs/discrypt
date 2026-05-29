@@ -1041,6 +1041,8 @@ dependencies = [
  "external-signaling",
  "discrypt-storage",
  "discrypt-transport",
+ "ed25519-dalek",
+ "rand 0.8.6",
 ]
 
 [[package]]
