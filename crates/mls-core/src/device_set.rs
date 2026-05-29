@@ -394,16 +394,16 @@ fn normalize_device_label(label: impl Into<String>) -> String {
 }
 
 fn decode_32_byte_hex(value: &str) -> Result<[u8; 32], DevicePairingError> {
-    let decoded =
-        hex::decode(value).map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))?;
+    let decoded = hex::decode(value)
+        .map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))?;
     decoded
         .try_into()
         .map_err(|_| DevicePairingError::InvalidPayload("expected 32-byte key".to_owned()))
 }
 
 fn decode_signature(value: &str) -> Result<Signature, DevicePairingError> {
-    let decoded =
-        hex::decode(value).map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))?;
+    let decoded = hex::decode(value)
+        .map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))?;
     Signature::from_slice(&decoded)
         .map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))
 }
