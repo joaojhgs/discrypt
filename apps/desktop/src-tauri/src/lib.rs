@@ -8,7 +8,9 @@
 
 pub mod production_status;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
+use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
     signaling_fingerprint_for_endpoint, InviteEndpointPolicy, InviteSignalingMetadata, InviteStore,
     InviteTrustMetadata,
@@ -56,6 +58,11 @@ const DEFAULT_THEME_ID: &str = "graphite-calm";
 const DEFAULT_TEMPLATE_ID: &str = "command-center";
 const UI_THEME_IDS: &[&str] = &["midnight-steel", "graphite-calm", "ocean-contrast"];
 const UI_TEMPLATE_IDS: &[&str] = &["command-center", "compact-ops"];
+const INVITE_CREATE_LIMIT: u32 = 5;
+const TEXT_SEND_LIMIT: u32 = 20;
+const ADMISSION_HELPER_ATTEMPT_LIMIT: u32 = 5;
+const SIGNALING_ACTION_LIMIT: u32 = 60;
+const ABUSE_WINDOW_SECONDS: i64 = 60;
 
 /// Desktop/Tauri wrapper around the Rust signaling protocol client.
 pub struct DesktopSignalingClient<T> {
@@ -761,6 +768,58 @@ pub struct CommandHealth {
     pub honest_copy_ready: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AbuseBucketView {
+    key: String,
+    timestamps: Vec<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct PersistedAbuseState {
+    #[serde(default)]
+    invite_create: Vec<AbuseBucketView>,
+    #[serde(default)]
+    invite_consume: Vec<AbuseBucketView>,
+    #[serde(default)]
+    admission_helper: Vec<AbuseBucketView>,
+    #[serde(default)]
+    signaling_publish_take: Vec<AbuseBucketView>,
+    #[serde(default)]
+    text_send: Vec<AbuseBucketView>,
+}
+
+impl PersistedAbuseState {
+    fn allow_invite_create(&mut self, key: &str, now: DateTime<Utc>) -> bool {
+        allow_persisted_action(&mut self.invite_create, key, INVITE_CREATE_LIMIT, now)
+    }
+
+    fn allow_invite_consume(&mut self, key: &str, now: DateTime<Utc>) -> bool {
+        allow_persisted_action(&mut self.invite_consume, key, INVITE_CREATE_LIMIT, now)
+    }
+
+    fn allow_admission_helper(&mut self, key: &str, now: DateTime<Utc>) -> bool {
+        allow_persisted_action(
+            &mut self.admission_helper,
+            key,
+            ADMISSION_HELPER_ATTEMPT_LIMIT,
+            now,
+        )
+    }
+
+    fn allow_signaling_publish_take(&mut self, key: &str, now: DateTime<Utc>) -> bool {
+        allow_persisted_action(
+            &mut self.signaling_publish_take,
+            key,
+            SIGNALING_ACTION_LIMIT,
+            now,
+        )
+    }
+
+    fn allow_text_send(&mut self, key: &str, now: DateTime<Utc>) -> bool {
+        allow_persisted_action(&mut self.text_send, key, TEXT_SEND_LIMIT, now)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -782,6 +841,8 @@ struct PersistedAppState {
     events: Vec<AppEventView>,
     #[serde(default)]
     last_command_error: Option<CommandErrorView>,
+    #[serde(default)]
+    abuse: PersistedAbuseState,
     friend_verified: bool,
     next_sequence: u64,
 }
@@ -1124,6 +1185,33 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
         let invite_code = normalize_label(&request.invite_code, "manual invite");
+        let abuse_key = format!(
+            "consume:{}:{}",
+            state.local_user_id(),
+            invite_code_fingerprint(&invite_code)
+        );
+        if !state.abuse.allow_invite_consume(&abuse_key, Utc::now()) {
+            state.push_command_error(
+                "invite.rate_limited",
+                "join_group",
+                "invite_consume_rate_limited",
+                "Invite consumption is rate-limited for this profile and invite descriptor",
+                "Wait for the abuse-control window before retrying this invite",
+            );
+            return;
+        }
+        if parse_invite_metadata(&invite_code).is_some()
+            && !state.abuse.allow_admission_helper(&abuse_key, Utc::now())
+        {
+            state.push_command_error(
+                "admission.rate_limited",
+                "join_group",
+                "admission_helper_rate_limited",
+                "Admission helper attempts are rate-limited before invite consumption",
+                "Retry after the helper rate-limit window with a fresh authorized proof",
+            );
+            return;
+        }
         if let Some(invite) = state
             .invites
             .iter()
@@ -1228,6 +1316,17 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             );
             return;
         };
+        let abuse_key = format!("invite:{}:{}", state.local_user_id(), group_id);
+        if !state.abuse.allow_invite_create(&abuse_key, Utc::now()) {
+            state.push_command_error(
+                "invite.rate_limited",
+                "create_invite",
+                "invite_create_rate_limited",
+                "Invite creation is rate-limited for this group and issuer",
+                "Wait for the abuse-control window before issuing another invite",
+            );
+            return;
+        }
         let sequence = state.next_sequence;
         let group_name = state
             .groups
@@ -1314,6 +1413,24 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             admission_copy: "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient"
                 .to_owned(),
         };
+        let signaling_key = format!(
+            "signaling:{}:{}",
+            state.local_user_id(),
+            descriptor.invite_id
+        );
+        if !state
+            .abuse
+            .allow_signaling_publish_take(&signaling_key, Utc::now())
+        {
+            state.push_command_error(
+                "signaling.rate_limited",
+                "create_invite",
+                "signaling_publish_rate_limited",
+                "Signaling rendezvous publish/take is rate-limited for this invite",
+                "Retry after the signaling abuse-control window",
+            );
+            return;
+        }
         state.invites.push(invite);
         state.push_event("invite.created", format!("Invite created for {group_name}"));
     })
@@ -1379,6 +1496,17 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                 "message_empty",
                 "Empty message was not sent",
                 "Type a non-empty message before sending",
+            );
+            return;
+        }
+        let abuse_key = text_send_abuse_key(state, &request.target);
+        if !state.abuse.allow_text_send(&abuse_key, Utc::now()) {
+            state.push_command_error(
+                "message.rate_limited",
+                "send_message",
+                "text_send_rate_limited",
+                "Text send is rate-limited for this author and conversation",
+                "Wait for the abuse-control window before sending more text",
             );
             return;
         }
@@ -1910,6 +2038,7 @@ impl PersistedAppState {
                 summary: "No local profile exists; setup/recovery is required".to_owned(),
             }],
             last_command_error: None,
+            abuse: PersistedAbuseState::default(),
             friend_verified: false,
             next_sequence: 2,
         }
@@ -2515,6 +2644,63 @@ impl PersistedAppState {
             .map(|profile| profile.user_id.clone())
             .unwrap_or_else(|| "local-profile-pending".to_owned())
     }
+}
+
+fn allow_persisted_action(
+    buckets: &mut Vec<AbuseBucketView>,
+    key: &str,
+    limit: u32,
+    now: DateTime<Utc>,
+) -> bool {
+    let window = Duration::seconds(ABUSE_WINDOW_SECONDS);
+    for bucket in buckets.iter_mut() {
+        bucket
+            .timestamps
+            .retain(|timestamp| *timestamp + window >= now);
+    }
+    buckets.retain(|bucket| !bucket.timestamps.is_empty());
+    if !buckets.iter().any(|bucket| bucket.key == key) {
+        buckets.push(AbuseBucketView {
+            key: key.to_owned(),
+            timestamps: Vec::new(),
+        });
+    }
+    let Some(bucket) = buckets.iter_mut().find(|bucket| bucket.key == key) else {
+        return false;
+    };
+    if bucket.timestamps.len() as u32 >= limit.max(1) {
+        return false;
+    }
+    bucket.timestamps.push(now);
+    true
+}
+
+fn invite_code_fingerprint(invite_code: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-desktop-invite-code-fingerprint-v1");
+    hasher.update(invite_code.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn text_send_abuse_key(state: &PersistedAppState, target: &MessageTargetView) -> String {
+    format!(
+        "text:{}:{}:{}:{}",
+        state.local_user_id(),
+        target.kind,
+        target.group_id.as_deref().unwrap_or(""),
+        target.dm_id.as_deref().unwrap_or("")
+    )
+}
+
+#[cfg(test)]
+fn abuse_controls_contract_covers_g116() -> bool {
+    let mut controls = AbuseControls::new(
+        INVITE_CREATE_LIMIT,
+        TEXT_SEND_LIMIT,
+        Duration::seconds(ABUSE_WINDOW_SECONDS),
+    );
+    let now = Utc::now();
+    controls.allow_invite("contract", now) && controls.allow_message("contract", now)
 }
 
 fn app_service() -> &'static Mutex<TauriAppService> {
@@ -4300,6 +4486,104 @@ mod tests {
         assert!(health.collaboration_ready);
         assert_eq!(health.voice_ready, cfg!(feature = "production-media"));
         assert!(health.honest_copy_ready);
+        assert!(abuse_controls_contract_covers_g116());
+    }
+
+    #[test]
+    fn abuse_rate_limits_invite_consume_helper_and_text_send_commands() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("abuse-command-rate-limits");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Abuse Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group_id = group.groups[0].group_id.clone();
+        for index in 0..INVITE_CREATE_LIMIT {
+            let state = create_invite(CreateInviteRequest {
+                group_id: Some(group_id.clone()),
+                expires: "1 day".to_owned(),
+                max_use: "1".to_owned(),
+            });
+            assert!(
+                state.last_command_error.is_none(),
+                "invite {index} should pass"
+            );
+        }
+        let limited_invite = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "1".to_owned(),
+        });
+        assert_eq!(
+            limited_invite
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invite_create_rate_limited")
+        );
+
+        let invite_code = limited_invite.invites[0].code.clone();
+        for index in 0..INVITE_CREATE_LIMIT {
+            let joined = join_group(JoinGroupRequest {
+                invite_code: invite_code.clone(),
+                group_name: Some(format!("Joined {index}")),
+            });
+            assert!(
+                joined.last_command_error.is_none(),
+                "join {index} should pass"
+            );
+        }
+        let limited_join = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: Some("Joined limited".to_owned()),
+        });
+        assert_eq!(
+            limited_join
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invite_consume_rate_limited")
+        );
+
+        let dm = start_dm(StartDmRequest {
+            display_name: "Peer".to_owned(),
+        });
+        let dm_id = dm.dms[0].dm_id.clone();
+        for index in 0..TEXT_SEND_LIMIT {
+            let sent = send_message(SendMessageRequest {
+                target: MessageTargetView {
+                    kind: "dm".to_owned(),
+                    dm_id: Some(dm_id.clone()),
+                    group_id: None,
+                    channel_id: None,
+                },
+                body: format!("message {index}"),
+            });
+            assert!(
+                sent.last_command_error.is_none(),
+                "message {index} should pass"
+            );
+        }
+        let limited_message = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "limited".to_owned(),
+        });
+        assert_eq!(
+            limited_message
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("text_send_rate_limited")
+        );
     }
 
     #[test]

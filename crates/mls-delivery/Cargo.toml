@@ -18,6 +18,8 @@ production-storage = ["mls_core/production-storage"]
 
 [dependencies]
 aes-gcm = { workspace = true }
+discrypt-abuse = { path = "../abuse", version = "0.1.0" }
+chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

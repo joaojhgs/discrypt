@@ -1128,6 +1128,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "discrypt-abuse",
  "discrypt-admission",
  "discrypt-core",
  "discrypt-media",
@@ -1188,6 +1189,8 @@ name = "discrypt-mls-delivery"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "chrono",
+ "discrypt-abuse",
  "discrypt-mls-core",
  "ed25519-dalek",
  "hex",

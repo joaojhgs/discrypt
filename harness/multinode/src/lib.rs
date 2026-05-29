@@ -2017,6 +2017,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
             retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
             plaintext: text_plaintext.to_vec(),
             sent_at_ms: 1,
+            now: chrono::Utc::now(),
         },
         TextSelectedRoute {
             session_id: "text-session".to_owned(),
@@ -2102,6 +2103,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
                 retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
                 plaintext: text_plaintext.to_vec(),
                 sent_at_ms: sequence,
+                now: chrono::Utc::now(),
             },
             TextSelectedRoute {
                 session_id: format!("text-{route_label}-session"),
@@ -2239,6 +2241,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
             retention: TextRetentionMetadata::new("short text ttl", 1_000, Some(2_000), false),
             plaintext: text_plaintext.to_vec(),
             sent_at_ms: 1_000,
+            now: chrono::Utc::now(),
         },
         TextSelectedRoute {
             session_id: "text-offline-store-forward".to_owned(),

@@ -14,6 +14,8 @@
 pub mod production_status;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use chrono::{DateTime, Utc};
+use discrypt_abuse::AbuseControls;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,6 +62,9 @@ pub enum DeliveryError {
     /// Outbound text pipeline adapter failed.
     #[error("text outbound adapter failed: {0}")]
     TextOutboundAdapter(String),
+    /// Outbound text send exceeded the abuse-control rate limit.
+    #[error("text send rate-limited for {0}")]
+    TextSendRateLimited(String),
     /// Text receive rejected an unauthorized sender.
     #[error("text receive sender leaf {0} is not a member of the current epoch")]
     TextReceiveUnauthorizedSender(u32),
@@ -545,6 +550,8 @@ pub struct TextOutboundRequest {
     pub plaintext: Vec<u8>,
     /// Deterministic local send timestamp.
     pub sent_at_ms: u64,
+    /// Wall-clock timestamp for abuse-control rate-limit windows.
+    pub now: DateTime<Utc>,
 }
 
 /// Ciphertext-only route selected for outbound text/control data.
@@ -665,6 +672,28 @@ pub trait TextSendEventSink {
     fn emit_text_send_event(&mut self, event: TextSendEvent) -> Result<(), DeliveryError>;
 }
 
+/// Abuse-control seam for outbound text rate limiting.
+pub trait TextSendAbuseGate {
+    /// Allow one outbound text send for this sender/conversation key.
+    fn allow_text_send(
+        &mut self,
+        sender_device_id: &str,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> bool;
+}
+
+impl TextSendAbuseGate for AbuseControls {
+    fn allow_text_send(
+        &mut self,
+        sender_device_id: &str,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.allow_message(&format!("{sender_device_id}:{conversation_id}"), now)
+    }
+}
+
 /// Production text-send coordinator over storage, transport, and local event seams.
 pub struct TextOutboundPipeline<'a, L, T, E> {
     author_log: &'a mut L,
@@ -706,6 +735,30 @@ where
                 Err(error)
             }
         }
+    }
+
+    /// Rate-limit, encrypt, sign, persist, send, and emit lifecycle events for one text message.
+    pub fn send_with_abuse_gate<G>(
+        &mut self,
+        request: TextOutboundRequest,
+        route: TextSelectedRoute,
+        text_exporter_secret: &[u8],
+        signing_key: &SigningKey,
+        abuse_gate: &mut G,
+    ) -> Result<TextSendReceipt, DeliveryError>
+    where
+        G: TextSendAbuseGate,
+    {
+        let message_id = request.message_id.clone();
+        let abuse_key = format!("{}:{}", request.group_id, request.channel_id);
+        if !abuse_gate.allow_text_send(&request.sender_device_id, &abuse_key, request.now) {
+            let error = DeliveryError::TextSendRateLimited(abuse_key);
+            let _ = self
+                .events
+                .emit_text_send_event(TextSendEvent::error(&message_id, &error));
+            return Err(error);
+        }
+        self.send(request, route, text_exporter_secret, signing_key)
     }
 
     fn send_inner(
@@ -1464,6 +1517,7 @@ pub fn decrypt_text_envelope(
         retention: envelope.retention.clone(),
         plaintext: Vec::new(),
         sent_at_ms: 0,
+        now: Utc::now(),
     };
     let aad = text_message_encryption_aad(&request)?;
     let content_key = derive_text_message_content_key(text_exporter_secret, &request);
@@ -1958,6 +2012,7 @@ mod tests {
             retention: retention(),
             plaintext: b"hello plaintext".to_vec(),
             sent_at_ms: 1_234,
+            now: Utc::now(),
         }
     }
 
@@ -2014,6 +2069,41 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn outbound_text_pipeline_enforces_abuse_gate_before_storage_or_transport() {
+        let signer = signing_key(12);
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport::default();
+        let mut events = InMemoryTextSendEvents::default();
+        let mut gate = AbuseControls::new(10, 1, chrono::Duration::minutes(1));
+        let mut pipeline = TextOutboundPipeline::new(&mut log, &mut transport, &mut events);
+
+        assert!(pipeline
+            .send_with_abuse_gate(
+                outbound_request("msg-rate-ok"),
+                selected_route(true),
+                b"openmls-text-exporter-secret",
+                &signer,
+                &mut gate,
+            )
+            .is_ok());
+        let result = pipeline.send_with_abuse_gate(
+            outbound_request("msg-rate-limited"),
+            selected_route(true),
+            b"openmls-text-exporter-secret",
+            &signer,
+            &mut gate,
+        );
+
+        assert!(matches!(result, Err(DeliveryError::TextSendRateLimited(_))));
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(transport.frames.len(), 1);
+        assert_eq!(
+            events.events.last().map(|event| &event.kind),
+            Some(&TextSendEventKind::Error)
+        );
     }
 
     #[test]
