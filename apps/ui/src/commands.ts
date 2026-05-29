@@ -400,7 +400,7 @@ const fallbackSnapshot: AppSnapshot = {
   messages: [],
   activity_feed: [
     "Demo fallback active: packaged Tauri builds must use IPC-backed commands",
-    "Recovery is local/test-build placeholder only; no history/key recovery claim",
+    "Recovery restores account continuity only; no content-key recovery claim",
     "Deletion copy includes offline-device caveat",
   ],
   connectivity: {
@@ -707,15 +707,23 @@ function mutateFallback(update: (state: AppState) => void): AppState {
 function ensureFallbackReady(
   displayName = "Alice",
   deviceName = "Desktop",
+  recovered = false,
 ): void {
-  if (fallbackState.lifecycle === "ready") return;
+  if (fallbackState.lifecycle === "ready") {
+    if (recovered && fallbackState.profile) {
+      fallbackState.profile.recovery_status =
+        "Account continuity restored; content keys restored: false";
+    }
+    return;
+  }
   fallbackState.lifecycle = "ready";
   fallbackState.profile = {
     user_id: `user-${slugify(displayName)}`,
     display_name: displayName,
     device_name: deviceName,
-    recovery_status:
-      "New local profile; recovery export remains a local placeholder",
+    recovery_status: recovered
+      ? "Account continuity restored; content keys restored: false"
+      : "New local profile; recovery export remains local account-continuity only",
   };
   fallbackState.devices = [
     {
@@ -751,9 +759,57 @@ function ensureFallbackReady(
   };
   pushEvent(
     fallbackState,
-    "identity.created",
+    recovered ? "identity.recovered" : "identity.created",
     `Profile ready for ${displayName}`,
   );
+}
+
+function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
+  const rooms = [...new Set(request.recovery_room_memberships ?? [])]
+    .map((room) => room.trim())
+    .filter(Boolean);
+  const deviceCount = Math.max(1, Math.floor(request.recovered_device_count ?? 1));
+  if (fallbackState.profile) {
+    fallbackState.profile.recovery_status = `Account continuity restored for ${rooms.length} room(s) and ${deviceCount} device(s); content keys restored: false`;
+  }
+  const localDevice = fallbackState.devices[0] ?? {
+    device_id: slugify(request.device_name ?? "Desktop"),
+    leaf_index: 1,
+    local: true,
+    authorized: true,
+  };
+  fallbackState.devices = [localDevice];
+  for (let index = 2; index <= deviceCount; index += 1) {
+    fallbackState.devices.push({
+      device_id: `recovered-device-${index}`,
+      leaf_index: index,
+      local: false,
+      authorized: true,
+    });
+  }
+  for (const room of rooms) {
+    if (fallbackState.groups.some((group) => group.name === room)) continue;
+    const groupId = `group-${slugify(room)}`;
+    fallbackState.groups.push({
+      group_id: groupId,
+      name: room,
+      role: "member",
+      channels: [
+        {
+          channel_id: `${groupId}-general`,
+          name: "#general",
+          kind: "Text",
+          retention_status: "7 days",
+        },
+        {
+          channel_id: `${groupId}-voice`,
+          name: "Voice Lobby",
+          kind: "Voice",
+          retention_status: "session",
+        },
+      ],
+    });
+  }
 }
 
 export async function loadAppState(): Promise<AppState> {

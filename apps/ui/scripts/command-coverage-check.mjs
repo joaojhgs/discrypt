@@ -35,7 +35,14 @@ const expectedCommands = [
   {
     command: "recover_user",
     exportName: "recoverUser",
-    args: ["display_name", "recovery_code", "device_name"],
+    args: [
+      "display_name",
+      "recovery_code",
+      "device_name",
+      "recovery_room_memberships",
+      "recovered_device_count",
+      "use_sealed_account_backup",
+    ],
     returns: "AppState",
   },
   {

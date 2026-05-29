@@ -1642,6 +1642,42 @@ impl PersistedAppState {
     }
 }
 
+fn account_recovery_from_request(request: &RecoverUserRequest) -> AccountRecovery {
+    let rooms = request.recovery_room_memberships.clone();
+    let device_count = request.recovered_device_count.unwrap_or(1);
+    let material = if request.use_sealed_account_backup {
+        let key = recovery_seed_key(&request.recovery_code);
+        RecoveryMaterial::SealedBackup(seal_account_backup(&key, rooms, device_count))
+    } else {
+        RecoveryCodeVerifier::from_code(&request.recovery_code)
+            .and_then(|verifier| {
+                recovery_code_material(&request.recovery_code, &verifier, rooms, device_count)
+            })
+            .unwrap_or_else(|_| RecoveryMaterial::ExistingDevice {
+                device_id: request
+                    .device_name
+                    .clone()
+                    .unwrap_or_else(|| "Desktop".to_owned()),
+            })
+    };
+    recover_account(material).unwrap_or(AccountRecovery {
+        account_access_restored: false,
+        room_memberships: Vec::new(),
+        device_count: 1,
+        content_keys_restored: false,
+    })
+}
+
+fn recovery_seed_key(recovery_code: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt:desktop:sealed-account-recovery");
+    hasher.update(recovery_code.trim().as_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&digest);
+    key
+}
+
 fn with_state<T>(read: impl FnOnce(&PersistedAppState) -> T) -> T {
     let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
     let guard = state

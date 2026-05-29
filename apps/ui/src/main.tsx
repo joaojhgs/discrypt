@@ -244,6 +244,9 @@ function App() {
         display_name: draftDisplayName,
         device_name: draftDeviceName,
         recovery_code: draftRecoveryCode,
+        recovery_room_memberships: ["Recovered Private Lab"],
+        recovered_device_count: 2,
+        use_sealed_account_backup: true,
       }),
       () => setWorkflow("setup"),
     );
@@ -708,9 +711,9 @@ function FirstRunPanel({
                 Set up your local discrypt profile
               </CardTitle>
               <CardDescription className="max-w-md text-base leading-7">
-                Create a local identity for this device, or unlock a test-build
-                recovery placeholder. No cloud backup, history restore, QR
-                pairing, or cross-device key recovery is claimed here.
+                Create a local identity for this device, or recover
+                account-continuity metadata. No cloud history restore, QR
+                pairing, or content-key recovery is claimed here.
               </CardDescription>
               <div className="grid gap-3 pt-3 text-sm text-[hsl(var(--muted-foreground))]">
                 <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
@@ -760,7 +763,7 @@ function FirstRunPanel({
                 <div className="mb-4">
                   <h2 className="text-lg font-semibold">Existing user</h2>
                   <p className="text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                    Placeholder recovery for this local build.
+                    Account-continuity recovery for this local build.
                   </p>
                 </div>
                 <Label className="grid gap-2">
@@ -771,9 +774,9 @@ function FirstRunPanel({
                   />
                 </Label>
                 <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                  Local/test-build placeholder only. It unlocks the shell for
-                  E2E coverage but does not recover remote devices or message
-                  history.
+                  Restores profile, device count, and room membership metadata
+                  for E2E coverage; message history and content keys are not
+                  restored.
                 </p>
                 <Button
                   variant="outline"
