@@ -605,7 +605,35 @@ struct PersistedAppState {
     next_sequence: u64,
 }
 
-static APP_STATE: OnceLock<Mutex<PersistedAppState>> = OnceLock::new();
+static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
+
+/// Shared command-facing app service used by Tauri IPC wrappers.
+#[derive(Debug)]
+struct TauriAppService {
+    state: PersistedAppState,
+}
+
+impl TauriAppService {
+    fn load() -> Self {
+        Self {
+            state: load_state(),
+        }
+    }
+
+    fn read<T>(&self, read: impl FnOnce(&PersistedAppState) -> T) -> T {
+        read(&self.state)
+    }
+
+    fn mutate(&mut self, update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
+        update(&mut self.state);
+        self.persist();
+        self.state.to_view()
+    }
+
+    fn persist(&self) {
+        persist_state(&self.state);
+    }
+}
 
 /// Tauri command: return the transitional compatibility snapshot for older clients.
 pub fn app_snapshot() -> AppSnapshot {
@@ -619,12 +647,12 @@ pub fn app_state() -> AppStateView {
 
 /// Tauri command: create a new local user and unlock the shell.
 pub fn create_user(request: CreateUserRequest) -> AppStateView {
-    mutate_state(|state| state.create_user(request, false))
+    mutate_app_service(|state| state.create_user(request, false))
 }
 
 /// Tauri command: recover account continuity and unlock the shell without content keys.
 pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         let recovery = account_recovery_from_request(&request);
         state.create_user(
             CreateUserRequest {
@@ -650,23 +678,24 @@ pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
 pub fn create_device_pairing_payload(
     request: CreateDevicePairingPayloadRequest,
 ) -> DevicePairingPayloadView {
-    let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
-    let mut guard = state
+    let service = app_service();
+    let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.ensure_ready_profile();
-    let identity = guard.local_identity();
-    guard.ensure_device_set(&identity);
+    let state = &mut guard.state;
+    state.ensure_ready_profile();
+    let identity = state.local_identity();
+    state.ensure_device_set(&identity);
     let requested_label = normalize_label(&request.requested_label, "paired device");
-    let current_epoch = request.current_epoch.unwrap_or(guard.next_sequence);
+    let current_epoch = request.current_epoch.unwrap_or(state.next_sequence);
     let valid_for_epochs = request.valid_for_epochs.unwrap_or(3).max(1);
-    let authorizing_device_id = guard
+    let authorizing_device_id = state
         .device_set
         .active_devices()
         .first()
         .map(|device| device.device_id);
     let view = if let Some(authorizing_device_id) = authorizing_device_id {
-        match guard.device_set.create_pairing_payload(
+        match state.device_set.create_pairing_payload(
             &identity,
             authorizing_device_id,
             requested_label.clone(),
@@ -677,7 +706,7 @@ pub fn create_device_pairing_payload(
                 let expires_epoch = serde_json::from_str::<DevicePairingPayload>(&payload)
                     .map(|payload| payload.expires_epoch)
                     .unwrap_or_else(|_| current_epoch.saturating_add(valid_for_epochs));
-                guard.push_event(
+                state.push_event(
                     "device.pairing_payload_created",
                     format!("Pairing payload created for {requested_label}"),
                 );
@@ -691,7 +720,7 @@ pub fn create_device_pairing_payload(
             }
             Err(error) => {
                 let message = error.to_string();
-                guard.push_event("device.pairing_rejected", message.clone());
+                state.push_event("device.pairing_rejected", message.clone());
                 DevicePairingPayloadView {
                     payload: String::new(),
                     authorizing_device_id: authorizing_device_id.to_string(),
@@ -703,7 +732,7 @@ pub fn create_device_pairing_payload(
         }
     } else {
         let message = "No authorized local device is available to create a pairing payload";
-        guard.push_event("device.pairing_rejected", message);
+        state.push_event("device.pairing_rejected", message);
         DevicePairingPayloadView {
             payload: String::new(),
             authorizing_device_id: String::new(),
@@ -712,13 +741,13 @@ pub fn create_device_pairing_payload(
             rejected_reason: Some(message.to_owned()),
         }
     };
-    persist_state(&guard);
+    guard.persist();
     view
 }
 
 /// Tauri command: accept a signed pasteable pairing payload and add the new device row.
 pub fn accept_device_pairing_payload(request: AcceptDevicePairingPayloadRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let identity = state.local_identity();
         state.ensure_device_set(&identity);
@@ -774,7 +803,7 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
         },
     };
     if result.verified {
-        mutate_state(|state| {
+        mutate_app_service(|state| {
             state.friend_verified = true;
             state.push_event(
                 "friend.verified",
@@ -787,7 +816,7 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
 
 /// Tauri command: save theme/template preferences.
 pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.preferences = UiPreferencesView {
             theme_id: normalize_label(&request.theme_id, DEFAULT_THEME_ID),
             template_id: normalize_label(&request.template_id, DEFAULT_TEMPLATE_ID),
@@ -798,7 +827,7 @@ pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
 
 /// Tauri command: start or focus a direct-message conversation.
 pub fn start_dm(request: StartDmRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let display_name =
             normalize_label(&request.display_name, &core_app_snapshot().friend.alias);
@@ -830,7 +859,7 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
 
 /// Tauri command: create a local-first group and make it active.
 pub fn create_group(request: CreateGroupRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let name = normalize_label(&request.name, "private lab");
         let group_id = stable_id("group", &name, state.next_sequence);
@@ -865,7 +894,7 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
 
 /// Tauri command: focus an existing local-first group from the server rail.
 pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         if let Some(group) = state
             .groups
@@ -887,7 +916,7 @@ pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
 
 /// Tauri command: join a local-first group from an invite.
 pub fn join_group(request: JoinGroupRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let invite_code = normalize_label(&request.invite_code, "manual invite");
         if let Some(invite) = state
@@ -973,7 +1002,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
 
 /// Tauri command: create an invite for the active group.
 pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let Some(group_id) = request
             .group_id
@@ -1075,7 +1104,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
 
 /// Tauri command: create a channel in a group.
 pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let channel_id = stable_id("channel", &request.name, state.next_sequence);
         let channel = ChannelStateView {
@@ -1117,7 +1146,7 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
 
 /// Tauri command: append a message to a local timeline.
 pub fn send_message(request: SendMessageRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let body = request.body.trim();
         if body.is_empty() {
@@ -1149,7 +1178,7 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
 
 /// Tauri command: join a voice channel.
 pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         state.ensure_ready_profile();
         let session_id = stable_id("voice", &request.channel_id, state.next_sequence);
         let selection = voice_device_selection(&request);
@@ -1204,7 +1233,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
 
 /// Tauri command: leave a voice session.
 pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 session.joined = false;
@@ -1228,7 +1257,7 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
 
 /// Tauri command: persist local self-mute state.
 pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         let local_user_id = state.local_user_id();
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
@@ -1254,7 +1283,7 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
 
 /// Tauri command: persist a participant speaker volume.
 pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
-    mutate_state(|state| {
+    mutate_app_service(|state| {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 let volume = request.volume.min(100);
@@ -1333,13 +1362,13 @@ pub fn command_health() -> CommandHealth {
 
 /// Reset the persisted app state. Intended only for tests/dev smoke.
 pub fn reset_app_state() -> AppStateView {
-    let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
-    let mut guard = state
+    let service = app_service();
+    let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = PersistedAppState::initial();
-    persist_state(&guard);
-    guard.to_view()
+    guard.state = PersistedAppState::initial();
+    guard.persist();
+    guard.state.to_view()
 }
 
 /// Tauri IPC wrappers live in a child module because Tauri 2 command macros
@@ -1867,22 +1896,24 @@ impl PersistedAppState {
     }
 }
 
-fn with_state<T>(read: impl FnOnce(&PersistedAppState) -> T) -> T {
-    let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
-    let guard = state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    read(&guard)
+fn app_service() -> &'static Mutex<TauriAppService> {
+    APP_SERVICE.get_or_init(|| Mutex::new(TauriAppService::load()))
 }
 
-fn mutate_state(update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
-    let state = APP_STATE.get_or_init(|| Mutex::new(load_state()));
-    let mut guard = state
+fn with_state<T>(read: impl FnOnce(&PersistedAppState) -> T) -> T {
+    let service = app_service();
+    let guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    update(&mut guard);
-    persist_state(&guard);
-    guard.to_view()
+    guard.read(read)
+}
+
+fn mutate_app_service(update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.mutate(update)
 }
 
 fn load_state() -> PersistedAppState {
@@ -3079,5 +3110,14 @@ mod tests {
         assert!(health.collaboration_ready);
         assert!(!health.voice_ready);
         assert!(health.honest_copy_ready);
+    }
+
+    #[test]
+    fn tauri_commands_use_shared_app_service_singleton() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("static APP_SERVICE"));
+        assert!(!source.contains(&["static", "APP_STATE"].join(" ")));
+        assert!(!source.contains(&["get_or_init(||", "Mutex::new(load_state()))",].join(" ")));
+        assert!(source.matches("mutate_app_service(").count() >= 16);
     }
 }
