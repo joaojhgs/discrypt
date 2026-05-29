@@ -469,7 +469,7 @@ pub struct CommandHealth {
     pub honest_copy_ready: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
     lifecycle: AppLifecycle,
@@ -1805,6 +1805,7 @@ fn account_recovery_from_request(request: &RecoverUserRequest) -> AccountRecover
             .and_then(recover_account)
     };
     recovered.unwrap_or_else(|_| AccountRecovery {
+        account_access_restored: false,
         room_memberships: Vec::new(),
         device_count: 1,
         content_keys_restored: false,
