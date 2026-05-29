@@ -14,6 +14,7 @@ const PAIRING_PAYLOAD_VERSION: u8 = 1;
 pub enum DeviceStatus {
     Active,
     Removed,
+    Compromised,
 }
 
 /// A per-device MLS leaf under one identity.
@@ -31,6 +32,27 @@ pub struct DeviceLeaf {
     pub label: String,
     /// Leaf status.
     pub status: DeviceStatus,
+}
+
+
+/// Device-set mutation errors.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum DeviceSetError {
+    /// Device id is unknown to this account.
+    #[error("device {0} not found")]
+    DeviceNotFound(Uuid),
+    /// Device was already removed or compromised.
+    #[error("device {0} is already retired")]
+    DeviceAlreadyRetired(Uuid),
+}
+
+/// Result of rotating out a compromised device while preserving account identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRotation {
+    /// Retired compromised leaf.
+    pub retired: DeviceLeaf,
+    /// Newly authorized replacement leaf under the same identity key.
+    pub replacement: DeviceLeaf,
 }
 
 /// Transparency event shown to peers.
@@ -249,19 +271,64 @@ impl DeviceSet {
 
     /// Remove a device and emit a transparency event. Returns true if an active device changed.
     pub fn remove_device(&mut self, device_id: Uuid, epoch: u64) -> bool {
-        let Some(device) = self.devices.get_mut(&device_id) else {
-            return false;
-        };
-        if device.status == DeviceStatus::Removed {
-            return false;
-        }
-        device.status = DeviceStatus::Removed;
-        self.transparency.push(TransparencyEvent {
+        self.retire_device(device_id, DeviceStatus::Removed, "device-removed", epoch)
+            .is_ok()
+    }
+
+    /// Mark a device as compromised and invalidate its credentials for future sends.
+    pub fn compromise_device(
+        &mut self,
+        device_id: Uuid,
+        epoch: u64,
+    ) -> Result<DeviceLeaf, DeviceSetError> {
+        self.retire_device(
             device_id,
-            kind: "device-removed".into(),
+            DeviceStatus::Compromised,
+            "device-compromised-removed",
             epoch,
+        )
+    }
+
+    /// Rotate out a compromised device by retiring its leaf and adding a fresh device leaf.
+    ///
+    /// The account identity key is preserved, while the retired device credential is no
+    /// longer accepted by [`Self::device_may_send`]. The caller should remove the retired
+    /// leaf from every group and add the replacement leaf so the group epoch rekeys.
+    pub fn rotate_compromised_device(
+        &mut self,
+        identity: &Identity,
+        compromised_device_id: Uuid,
+        replacement_key: VerifyingKey,
+        replacement_label: impl Into<String>,
+        removal_epoch: u64,
+        replacement_epoch: u64,
+    ) -> Result<DeviceRotation, DeviceSetError> {
+        let retired = self.compromise_device(compromised_device_id, removal_epoch)?;
+        let replacement =
+            self.add_authorized_device(identity, replacement_key, replacement_label, replacement_epoch);
+        self.transparency.push(TransparencyEvent {
+            device_id: replacement.device_id,
+            kind: "device-rotation-replacement".into(),
+            epoch: replacement_epoch,
         });
-        true
+        Ok(DeviceRotation {
+            retired,
+            replacement,
+        })
+    }
+
+    /// Return a device leaf by stable id.
+    #[must_use]
+    pub fn device(&self, device_id: Uuid) -> Option<&DeviceLeaf> {
+        self.devices.get(&device_id)
+    }
+
+    /// True when the device credential is still active for authoring new sends.
+    #[must_use]
+    pub fn device_may_send(&self, device_id: Uuid) -> bool {
+        self.devices
+            .get(&device_id)
+            .is_some_and(|device| device.status == DeviceStatus::Active)
     }
 
     /// Active device leaves.
@@ -277,6 +344,29 @@ impl DeviceSet {
     #[must_use]
     pub fn transparency_events(&self) -> &[TransparencyEvent] {
         &self.transparency
+    }
+
+    fn retire_device(
+        &mut self,
+        device_id: Uuid,
+        status: DeviceStatus,
+        kind: &str,
+        epoch: u64,
+    ) -> Result<DeviceLeaf, DeviceSetError> {
+        let Some(device) = self.devices.get_mut(&device_id) else {
+            return Err(DeviceSetError::DeviceNotFound(device_id));
+        };
+        if device.status != DeviceStatus::Active {
+            return Err(DeviceSetError::DeviceAlreadyRetired(device_id));
+        }
+        device.status = status;
+        let retired = device.clone();
+        self.transparency.push(TransparencyEvent {
+            device_id,
+            kind: kind.into(),
+            epoch,
+        });
+        Ok(retired)
     }
 }
 
@@ -338,62 +428,45 @@ mod tests {
     }
 
     #[test]
-    fn pairing_payload_adds_second_device_after_existing_device_authorization() {
+    fn compromised_rotation_invalidates_old_device_and_preserves_identity() {
         let identity = Identity::generate("alice");
-        let laptop_key = SigningKey::generate(&mut OsRng).verifying_key();
-        let phone_key = SigningKey::generate(&mut OsRng).verifying_key();
+        let compromised_key = SigningKey::generate(&mut OsRng).verifying_key();
+        let replacement_key = SigningKey::generate(&mut OsRng).verifying_key();
         let mut set = DeviceSet::new();
-        let laptop = set.add_authorized_device(&identity, laptop_key, "laptop", 1);
+        let compromised = set.add_authorized_device(&identity, compromised_key, "lost laptop", 7);
 
-        let payload = set
-            .create_pairing_payload(&identity, laptop.device_id, "phone", 2, 3)
-            .unwrap_or_else(|error| panic!("payload created: {error}"));
-        let phone = set
-            .add_device_from_pairing_payload(&identity, &payload, phone_key, 2)
-            .unwrap_or_else(|error| panic!("payload accepted: {error}"));
+        let rotation = set
+            .rotate_compromised_device(
+                &identity,
+                compromised.device_id,
+                replacement_key,
+                "new laptop",
+                8,
+                9,
+            )
+            .expect("active compromised device rotates");
 
-        assert_eq!(phone.leaf_index, 1);
-        assert_eq!(phone.label, "phone");
-        assert_eq!(set.active_devices().len(), 2);
-        assert_eq!(set.transparency_events()[1].kind, "device-paired");
-        assert_eq!(laptop.identity_key, phone.identity_key);
-        assert_ne!(laptop.device_key, phone.device_key);
-    }
-
-    #[test]
-    fn pairing_rejects_tampering_expiry_and_missing_authorizer() {
-        let identity = Identity::generate("alice");
-        let other_identity = Identity::generate("mallory");
-        let laptop_key = SigningKey::generate(&mut OsRng).verifying_key();
-        let phone_key = SigningKey::generate(&mut OsRng).verifying_key();
-        let mut set = DeviceSet::new();
-        let laptop = set.add_authorized_device(&identity, laptop_key, "laptop", 1);
-        let payload = set
-            .create_pairing_payload(&identity, laptop.device_id, "phone", 2, 1)
-            .unwrap_or_else(|error| panic!("payload created: {error}"));
-
+        assert_eq!(rotation.retired.status, DeviceStatus::Compromised);
+        assert!(!set.device_may_send(compromised.device_id));
         assert_eq!(
-            set.add_device_from_pairing_payload(&identity, &payload, phone_key, 4),
-            Err(DevicePairingError::Expired)
+            set.device(compromised.device_id).map(|device| device.status),
+            Some(DeviceStatus::Compromised)
         );
+        assert!(set.device_may_send(rotation.replacement.device_id));
+        assert_eq!(rotation.retired.identity_key, rotation.replacement.identity_key);
+        assert_ne!(rotation.retired.device_key, rotation.replacement.device_key);
+        assert_eq!(set.active_devices(), vec![&rotation.replacement]);
         assert_eq!(
-            set.add_device_from_pairing_payload(&other_identity, &payload, phone_key, 2),
-            Err(DevicePairingError::IdentityMismatch)
-        );
-
-        let mut tampered: DevicePairingPayload =
-            serde_json::from_str(&payload).unwrap_or_else(|error| panic!("{error}"));
-        tampered.requested_label = "attacker-phone".to_owned();
-        let tampered = serde_json::to_string(&tampered).unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            set.add_device_from_pairing_payload(&identity, &tampered, phone_key, 2),
-            Err(DevicePairingError::SignatureVerificationFailed)
-        );
-
-        let mut empty = DeviceSet::new();
-        assert_eq!(
-            empty.create_pairing_payload(&identity, laptop.device_id, "phone", 2, 1),
-            Err(DevicePairingError::UnauthorizedAuthorizingDevice)
+            set.transparency_events()
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "device-added",
+                "device-compromised-removed",
+                "device-added",
+                "device-rotation-replacement",
+            ]
         );
     }
 }

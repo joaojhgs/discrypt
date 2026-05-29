@@ -18,6 +18,15 @@ pub enum MlsCoreError {
     /// Leaf not found.
     #[error("leaf {0} not found")]
     LeafNotFound(LeafIndex),
+    /// Leaf is retired and cannot be added or used as a sender.
+    #[error("leaf {0} is not active")]
+    InactiveLeaf(LeafIndex),
+    /// Sender leaf is not authorized in the current epoch.
+    #[error("sender leaf {0} is not authorized")]
+    SenderNotAuthorized(LeafIndex),
+    /// Sender attempted to author under an old or future epoch.
+    #[error("sender epoch {attempted} does not match current epoch {current}")]
+    StaleSenderEpoch { current: u64, attempted: u64 },
 }
 
 /// Phase-0 group wrapper preserving epoch/exporter contracts.
@@ -47,6 +56,9 @@ impl GroupState {
 
     /// Add a device leaf and advance epoch.
     pub fn add_leaf(&mut self, leaf: DeviceLeaf) -> Result<(), MlsCoreError> {
+        if leaf.status != crate::DeviceStatus::Active {
+            return Err(MlsCoreError::InactiveLeaf(leaf.leaf_index));
+        }
         if self.members.contains_key(&leaf.leaf_index) {
             return Err(MlsCoreError::LeafAlreadyExists(leaf.leaf_index));
         }
@@ -64,10 +76,57 @@ impl GroupState {
         Ok(())
     }
 
+    /// Rotate out one compromised leaf, add a replacement leaf, and rekey both epochs.
+    pub fn rotate_leaf(
+        &mut self,
+        compromised_leaf: LeafIndex,
+        replacement: DeviceLeaf,
+    ) -> Result<(), MlsCoreError> {
+        if !self.members.contains_key(&compromised_leaf) {
+            return Err(MlsCoreError::LeafNotFound(compromised_leaf));
+        }
+        if replacement.status != crate::DeviceStatus::Active {
+            return Err(MlsCoreError::InactiveLeaf(replacement.leaf_index));
+        }
+        if self.members.contains_key(&replacement.leaf_index) {
+            return Err(MlsCoreError::LeafAlreadyExists(replacement.leaf_index));
+        }
+
+        self.members.remove(&compromised_leaf);
+        self.advance_epoch(b"remove-compromised");
+        self.members.insert(replacement.leaf_index, replacement);
+        self.advance_epoch(b"add-rotation-replacement");
+        Ok(())
+    }
+
     /// Current active members.
     #[must_use]
     pub fn members(&self) -> &BTreeMap<LeafIndex, DeviceLeaf> {
         &self.members
+    }
+
+    /// True when a leaf may author an application send in the current epoch.
+    #[must_use]
+    pub fn sender_may_send(&self, leaf: LeafIndex, epoch: u64) -> bool {
+        epoch == self.epoch
+            && self
+                .members
+                .get(&leaf)
+                .is_some_and(|device| device.status == crate::DeviceStatus::Active)
+    }
+
+    /// Reject old, removed, or compromised device sends before application delivery.
+    pub fn validate_sender(&self, leaf: LeafIndex, epoch: u64) -> Result<(), MlsCoreError> {
+        if epoch != self.epoch {
+            return Err(MlsCoreError::StaleSenderEpoch {
+                current: self.epoch,
+                attempted: epoch,
+            });
+        }
+        if !self.sender_may_send(leaf, epoch) {
+            return Err(MlsCoreError::SenderNotAuthorized(leaf));
+        }
+        Ok(())
     }
 
     /// Export a secret for another subsystem.
@@ -172,5 +231,54 @@ mod tests {
         assert_eq!(group.members().len(), 12);
         assert_eq!(group.epoch, 20);
         assert_ne!(first, group.export(ExportLabel::SFrame, b"call"));
+    }
+
+    #[test]
+    fn compromised_device_rotation_rekeys_and_blocks_old_sender() {
+        let identity = Identity::generate("alice");
+        let mut devices = DeviceSet::new();
+        let compromised = devices.add_authorized_device(
+            &identity,
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            "lost laptop",
+            0,
+        );
+        let mut group = GroupState::new("room");
+        assert_eq!(group.add_leaf(compromised.clone()), Ok(()));
+        assert_eq!(group.validate_sender(compromised.leaf_index, group.epoch), Ok(()));
+        let before_rotation = group.export(ExportLabel::Content, b"text");
+
+        let rotation = devices
+            .rotate_compromised_device(
+                &identity,
+                compromised.device_id,
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                "replacement laptop",
+                group.epoch + 1,
+                group.epoch + 2,
+            )
+            .expect("compromised device rotates");
+        assert_eq!(
+            group.rotate_leaf(compromised.leaf_index, rotation.replacement.clone()),
+            Ok(())
+        );
+
+        assert_ne!(before_rotation, group.export(ExportLabel::Content, b"text"));
+        assert!(!group.sender_may_send(compromised.leaf_index, group.epoch));
+        assert_eq!(
+            group.validate_sender(compromised.leaf_index, group.epoch),
+            Err(MlsCoreError::SenderNotAuthorized(compromised.leaf_index))
+        );
+        assert_eq!(
+            group.validate_sender(rotation.replacement.leaf_index, group.epoch),
+            Ok(())
+        );
+        assert_eq!(
+            group.validate_sender(rotation.replacement.leaf_index, group.epoch - 1),
+            Err(MlsCoreError::StaleSenderEpoch {
+                current: group.epoch,
+                attempted: group.epoch - 1,
+            })
+        );
     }
 }
