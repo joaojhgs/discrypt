@@ -30,5 +30,5 @@ pub use group::{GroupState, LeafIndex, MlsCoreError};
 pub use identity::{verifying_key_from_hex, FriendCode, Identity, SafetyNumber};
 pub use openmls_engine::{
     DiscryptOpenMlsProvider, JsonOpenMlsCodec, OpenMlsGroupEngine, OpenMlsGroupError,
-    OpenMlsGroupSnapshot, OpenMlsMemberPackage,
+    OpenMlsGroupOperationResult, OpenMlsGroupSnapshot, OpenMlsMemberPackage,
 };

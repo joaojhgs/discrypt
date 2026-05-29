@@ -18,12 +18,18 @@ pub enum ExportLabel {
 }
 
 impl ExportLabel {
-    fn as_bytes(self) -> &'static [u8] {
+    /// MLS exporter label string for the approved Rust service boundary.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Text => b"discrypt/v1/text",
-            Self::Media => b"discrypt/v1/media",
-            Self::ContentKey => b"discrypt/v1/content-key",
+            Self::Text => "discrypt/v1/text",
+            Self::Media => "discrypt/v1/media",
+            Self::ContentKey => "discrypt/v1/content-key",
         }
+    }
+
+    fn as_bytes(self) -> &'static [u8] {
+        self.as_str().as_bytes()
     }
 }
 

@@ -487,17 +487,74 @@ impl GroupCryptoService for OpenMlsGroupCryptoService {
             .map_err(group_crypto_error)
     }
 
+    fn add_group_member(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult> {
+        self.engine
+            .add_member(&operation.group_id.0, operation.member.0.as_bytes())
+            .map(group_operation_from_openmls)
+            .map_err(group_crypto_error)
+    }
+
+    fn add_group_device(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult> {
+        let device = operation.device.ok_or_else(|| {
+            ServiceBoundaryError::InvalidRequest(
+                "add_group_device requires a concrete device id".to_owned(),
+            )
+        })?;
+        self.engine
+            .add_device(&operation.group_id.0, &operation.member.0, &device.0)
+            .map(group_operation_from_openmls)
+            .map_err(group_crypto_error)
+    }
+
+    fn remove_group_member(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult> {
+        self.engine
+            .remove_member(&operation.group_id.0, &operation.member.0)
+            .map(group_operation_from_openmls)
+            .map_err(group_crypto_error)
+    }
+
+    fn remove_group_device(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult> {
+        let device = operation.device.ok_or_else(|| {
+            ServiceBoundaryError::InvalidRequest(
+                "remove_group_device requires a concrete device id".to_owned(),
+            )
+        })?;
+        self.engine
+            .remove_device(&operation.group_id.0, &operation.member.0, &device.0)
+            .map(group_operation_from_openmls)
+            .map_err(group_crypto_error)
+    }
+
     fn apply_group_commit(&mut self, commit: GroupCommit) -> ServiceResult<GroupCryptoState> {
         self.engine
             .merge_pending_commit(&commit.group_id.0, commit.epoch, &commit.commit.0)
             .map(group_state_from_snapshot)
             .map_err(group_crypto_error)
     }
+}
 
-    fn export_group_secret(&self, group_id: &GroupId, label: &str) -> ServiceResult<OpaqueBytes> {
+impl RustExporterSecretProvider for OpenMlsGroupCryptoService {
+    fn export_rust_service_secret(
+        &self,
+        group_id: &GroupId,
+        service: RustExporterSecretService,
+        context: &[u8],
+    ) -> ServiceResult<RustExporterSecret> {
         self.engine
-            .export_secret(&group_id.0, label, b"discrypt-service-boundary", 32)
-            .map(OpaqueBytes)
+            .export_secret(&group_id.0, service.export_label().as_str(), context, 32)
+            .map(RustExporterSecret::new)
             .map_err(group_crypto_error)
     }
 }
@@ -531,10 +588,25 @@ fn group_state_from_snapshot(snapshot: mls_core::OpenMlsGroupSnapshot) -> GroupC
     }
 }
 
+fn group_operation_from_openmls(
+    output: mls_core::OpenMlsGroupOperationResult,
+) -> GroupOperationResult {
+    GroupOperationResult {
+        state: group_state_from_snapshot(output.state),
+        commit: OpaqueBytes(output.commit),
+        welcome: output.welcome.map(OpaqueBytes),
+        group_info: output.group_info.map(OpaqueBytes),
+    }
+}
+
 fn group_crypto_error(error: mls_core::OpenMlsGroupError) -> ServiceBoundaryError {
     match error {
         mls_core::OpenMlsGroupError::GroupNotFound(group_id) => {
             ServiceBoundaryError::NotFound(group_id)
+        }
+        mls_core::OpenMlsGroupError::MemberNotFound { .. }
+        | mls_core::OpenMlsGroupError::MemberAlreadyExists { .. } => {
+            ServiceBoundaryError::InvalidRequest(error.to_string())
         }
         mls_core::OpenMlsGroupError::CommitMismatch(_)
         | mls_core::OpenMlsGroupError::StaleCommitEpoch { .. } => {
@@ -762,6 +834,80 @@ mod tests {
                 group_id: GroupId(request.name),
                 epoch: 1,
                 epoch_summary: OpaqueBytes(vec![request.initial_channel_kind as u8]),
+            })
+        }
+
+        fn add_group_member(
+            &mut self,
+            operation: GroupMemberOperation,
+        ) -> ServiceResult<GroupOperationResult> {
+            Ok(GroupOperationResult {
+                state: GroupCryptoState {
+                    group_id: operation.group_id,
+                    epoch: 2,
+                    epoch_summary: OpaqueBytes(operation.member.0.as_bytes().to_vec()),
+                },
+                commit: OpaqueBytes(b"add-member-commit".to_vec()),
+                welcome: Some(OpaqueBytes(b"welcome-member".to_vec())),
+                group_info: Some(OpaqueBytes(b"group-info-member".to_vec())),
+            })
+        }
+
+        fn add_group_device(
+            &mut self,
+            operation: GroupMemberOperation,
+        ) -> ServiceResult<GroupOperationResult> {
+            let device = operation.device.ok_or_else(|| {
+                ServiceBoundaryError::InvalidRequest(
+                    "device operation requires a device id".to_owned(),
+                )
+            })?;
+            Ok(GroupOperationResult {
+                state: GroupCryptoState {
+                    group_id: operation.group_id,
+                    epoch: 2,
+                    epoch_summary: OpaqueBytes(device.0.as_bytes().to_vec()),
+                },
+                commit: OpaqueBytes(b"add-device-commit".to_vec()),
+                welcome: Some(OpaqueBytes(b"welcome-device".to_vec())),
+                group_info: Some(OpaqueBytes(b"group-info-device".to_vec())),
+            })
+        }
+
+        fn remove_group_member(
+            &mut self,
+            operation: GroupMemberOperation,
+        ) -> ServiceResult<GroupOperationResult> {
+            Ok(GroupOperationResult {
+                state: GroupCryptoState {
+                    group_id: operation.group_id,
+                    epoch: 3,
+                    epoch_summary: OpaqueBytes(operation.member.0.as_bytes().to_vec()),
+                },
+                commit: OpaqueBytes(b"remove-member-commit".to_vec()),
+                welcome: None,
+                group_info: None,
+            })
+        }
+
+        fn remove_group_device(
+            &mut self,
+            operation: GroupMemberOperation,
+        ) -> ServiceResult<GroupOperationResult> {
+            let device = operation.device.ok_or_else(|| {
+                ServiceBoundaryError::InvalidRequest(
+                    "device operation requires a device id".to_owned(),
+                )
+            })?;
+            Ok(GroupOperationResult {
+                state: GroupCryptoState {
+                    group_id: operation.group_id,
+                    epoch: 3,
+                    epoch_summary: OpaqueBytes(device.0.as_bytes().to_vec()),
+                },
+                commit: OpaqueBytes(b"remove-device-commit".to_vec()),
+                welcome: None,
+                group_info: None,
             })
         }
 
@@ -1021,25 +1167,60 @@ mod tests {
         assert_eq!(created.epoch, 0);
         assert!(!created.epoch_summary.0.is_empty());
         let signer_public_key = service.signer_public_key(&created.group_id)?;
-        let before = service.export_group_secret(&created.group_id, "discrypt/text")?;
+        let before = service.export_rust_service_secret(
+            &created.group_id,
+            RustExporterSecretService::Text,
+            b"room",
+        )?;
+
+        let added = service.add_group_member(GroupMemberOperation {
+            group_id: created.group_id.clone(),
+            member: UserId("carol".to_owned()),
+            device: None,
+        })?;
+        assert_eq!(added.state.epoch, 1);
+        assert!(added.welcome.is_some());
+        assert!(!added.commit.0.is_empty());
+        let with_device = service.add_group_device(GroupMemberOperation {
+            group_id: created.group_id.clone(),
+            member: UserId("carol".to_owned()),
+            device: Some(DeviceId("phone".to_owned())),
+        })?;
+        assert_eq!(with_device.state.epoch, 2);
+        let removed_device = service.remove_group_device(GroupMemberOperation {
+            group_id: created.group_id.clone(),
+            member: UserId("carol".to_owned()),
+            device: Some(DeviceId("phone".to_owned())),
+        })?;
+        assert_eq!(removed_device.state.epoch, 3);
+        let removed_member = service.remove_group_member(GroupMemberOperation {
+            group_id: created.group_id.clone(),
+            member: UserId("carol".to_owned()),
+            device: None,
+        })?;
+        assert_eq!(removed_member.state.epoch, 4);
 
         let commit = service.stage_add_member_commit(&created.group_id, b"bob")?;
-        assert_eq!(commit.epoch, 1);
+        assert_eq!(commit.epoch, 5);
         assert!(!commit.commit.0.is_empty());
         assert!(matches!(
             service.apply_group_commit(GroupCommit {
                 group_id: created.group_id.clone(),
-                epoch: 0,
+                epoch: 4,
                 commit: commit.commit.clone(),
             }),
             Err(ServiceBoundaryError::VerificationFailed(_))
         ));
 
         let merged = service.apply_group_commit(commit)?;
-        assert_eq!(merged.epoch, 1);
+        assert_eq!(merged.epoch, 5);
         assert_ne!(created.epoch_summary, merged.epoch_summary);
-        let after = service.export_group_secret(&created.group_id, "discrypt/text")?;
-        assert_ne!(before, after);
+        let after = service.export_rust_service_secret(
+            &created.group_id,
+            RustExporterSecretService::Text,
+            b"room",
+        )?;
+        assert_ne!(before.as_bytes(), after.as_bytes());
         drop(service);
 
         let mut reloaded = OpenMlsGroupCryptoService::open(&path)?;
@@ -1047,8 +1228,14 @@ mod tests {
         assert_eq!(restored.epoch, merged.epoch);
         assert_eq!(restored.epoch_summary, merged.epoch_summary);
         assert_eq!(
-            reloaded.export_group_secret(&created.group_id, "discrypt/text")?,
-            after
+            reloaded
+                .export_rust_service_secret(
+                    &created.group_id,
+                    RustExporterSecretService::Text,
+                    b"room",
+                )?
+                .as_bytes(),
+            after.as_bytes()
         );
 
         let _ = std::fs::remove_file(path);
@@ -1075,7 +1262,7 @@ mod tests {
             initial_channel_kind: ChannelKind::Text,
         })?;
         assert_eq!(group.epoch, 1);
-        let add_member = object.add_group_member(GroupMemberOperation {
+        let add_member = boundary.add_group_member(GroupMemberOperation {
             group_id: group.group_id.clone(),
             member: UserId("bob".to_owned()),
             device: None,
@@ -1083,32 +1270,32 @@ mod tests {
         assert_eq!(add_member.state.epoch, 2);
         assert!(add_member.welcome.is_some());
         assert!(!add_member.commit.0.is_empty());
-        let add_device = object.add_group_device(GroupMemberOperation {
+        let add_device = boundary.add_group_device(GroupMemberOperation {
             group_id: group.group_id.clone(),
             member: UserId("alice".to_owned()),
             device: Some(DeviceId("alice-phone".to_owned())),
         })?;
         assert_eq!(add_device.state.epoch, 2);
         assert!(add_device.welcome.is_some());
-        let remove_device = object.remove_group_device(GroupMemberOperation {
+        let remove_device = boundary.remove_group_device(GroupMemberOperation {
             group_id: group.group_id.clone(),
             member: UserId("alice".to_owned()),
             device: Some(DeviceId("alice-phone".to_owned())),
         })?;
         assert_eq!(remove_device.state.epoch, 3);
         assert!(remove_device.welcome.is_none());
-        let remove_member = object.remove_group_member(GroupMemberOperation {
+        let remove_member = boundary.remove_group_member(GroupMemberOperation {
             group_id: group.group_id.clone(),
             member: UserId("bob".to_owned()),
             device: None,
         })?;
         assert_eq!(remove_member.state.epoch, 3);
         assert_eq!(
-            object.role_for_user(&group.group_id, &UserId("alice".to_owned()))?,
+            boundary.role_for_user(&group.group_id, &UserId("alice".to_owned()))?,
             "owner"
         );
         assert!(
-            object
+            boundary
                 .create_invite(InviteRequest {
                     group_id: group.group_id.clone(),
                     creator: UserId("alice".to_owned()),
@@ -1118,7 +1305,7 @@ mod tests {
                 .welcome_required
         );
         assert_eq!(
-            object
+            boundary
                 .send_text(SendMessageRequest {
                     channel: "#general".to_owned(),
                     body: "hello".to_owned(),
@@ -1127,44 +1314,44 @@ mod tests {
             "#general:5"
         );
 
-        let route = object.select_overlay_route(&group.group_id)?;
+        let route = boundary.select_overlay_route(&group.group_id)?;
         assert!(route.ciphertext_only);
-        object.forward_ciphertext(&route, OpaqueBytes(vec![1, 2, 3]))?;
+        boundary.forward_ciphertext(&route, OpaqueBytes(vec![1, 2, 3]))?;
 
         let session_id = SessionId("session-1".to_owned());
-        object.publish_signal(SignalEnvelope {
+        boundary.publish_signal(SignalEnvelope {
             session_id: session_id.clone(),
             sender: DeviceId("alice-laptop".to_owned()),
             payload: OpaqueBytes(vec![7]),
         })?;
-        assert_eq!(object.poll_signals(&session_id)?.len(), 1);
-        let leg = object.plan_transport(&group.group_id)?.remove(0);
-        object.open_transport(&session_id, leg)?;
+        assert_eq!(boundary.poll_signals(&session_id)?.len(), 1);
+        let leg = boundary.plan_transport(&group.group_id)?.remove(0);
+        boundary.open_transport(&session_id, leg)?;
 
-        let media = object.join_media(MediaSessionRequest {
+        let media = boundary.join_media(MediaSessionRequest {
             group_id: group.group_id.clone(),
             channel_id: ChannelId("voice".to_owned()),
             participant: UserId("alice".to_owned()),
         })?;
         assert!(media.joined);
-        object.send_media_frame(&media.session_id, OpaqueBytes(vec![9]))?;
+        boundary.send_media_frame(&media.session_id, OpaqueBytes(vec![9]))?;
 
-        object.save_record(StoreRecord {
+        boundary.save_record(StoreRecord {
             key: "snapshot".to_owned(),
             value: OpaqueBytes(vec![1]),
         })?;
-        assert!(object.load_record("snapshot")?.is_some());
+        assert!(boundary.load_record("snapshot")?.is_some());
         let secret_name = SecretName("identity-key".to_owned());
-        object.seal_secret(secret_name.clone(), OpaqueBytes(vec![3]))?;
+        boundary.seal_secret(secret_name.clone(), OpaqueBytes(vec![3]))?;
         assert_eq!(
-            object.open_secret(&secret_name)?,
+            boundary.open_secret(&secret_name)?,
             Some(OpaqueBytes(vec![3]))
         );
 
         let topic = EventTopic("commands".to_owned());
-        object.publish_event(topic.clone(), OpaqueBytes(vec![4]))?;
-        assert_eq!(object.drain_events(&topic, None)?.len(), 1);
-        assert_eq!(object.command_snapshot()?.schema_version, 2);
+        boundary.publish_event(topic.clone(), OpaqueBytes(vec![4]))?;
+        assert_eq!(boundary.drain_events(&topic, None)?.len(), 1);
+        assert_eq!(boundary.command_snapshot()?.schema_version, 2);
         Ok(())
     }
 }
