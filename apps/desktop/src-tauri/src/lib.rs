@@ -9,9 +9,10 @@
 pub mod production_status;
 use chrono::{Duration, Utc};
 use discrypt_core::{
-    app_snapshot as core_app_snapshot, AppSnapshot, ChannelKind,
-    ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
-    SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
+    app_snapshot as core_app_snapshot, identity_recovery_verification_smoke, AppSnapshot,
+    ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
+    MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
+    SecurityCopyView, ServerView,
 };
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
@@ -913,6 +914,7 @@ pub fn metadata_warning() -> String {
 /// E2E command-health smoke used by CI and the multinode harness.
 pub fn command_health() -> CommandHealth {
     let state = app_state();
+    let identity_verification = identity_recovery_verification_smoke();
     let verification = SafetyVerificationResult {
         verified: !state.snapshot.friend.friend_code.is_empty()
             && !state.snapshot.friend.safety_number.is_empty(),
@@ -939,10 +941,14 @@ pub fn command_health() -> CommandHealth {
             .all(|message| message.status.contains("not claimed"));
     CommandHealth {
         snapshot_ready: state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION,
-        verification_ready: verification.verified,
+        verification_ready: verification.verified
+            && identity_verification.two_profiles_verify_safety_numbers,
         app_state_ready,
         identity_ready,
-        collaboration_ready,
+        collaboration_ready: collaboration_ready
+            && identity_verification.second_device_paired
+            && identity_verification.recovery_without_content_keys
+            && identity_verification.compromised_device_revoked,
         voice_ready: cfg!(feature = "production-media"),
         honest_copy_ready,
     }

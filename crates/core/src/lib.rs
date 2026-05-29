@@ -730,12 +730,11 @@ pub fn identity_recovery_verification_smoke() -> IdentityRecoveryVerification {
         && phone.label == "Phone"
         && phone.added_at_epoch == 2;
 
-    let recovery_without_content_keys =
-        recover_account(RecoveryMaterial::RecoveryCode {
-            code_hash: [7u8; 32],
-        })
-        .map(|recovery| recovery.account_access_restored && !recovery.content_keys_restored)
-        .unwrap_or(false);
+    let recovery_without_content_keys = recover_account(RecoveryMaterial::RecoveryCode {
+        code_hash: [7u8; 32],
+    })
+    .map(|recovery| recovery.account_access_restored && !recovery.content_keys_restored)
+    .unwrap_or(false);
 
     let removed = devices.remove_device(phone.device_id, 3);
     let compromised_device_revoked = removed
