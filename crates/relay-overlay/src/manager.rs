@@ -7,6 +7,7 @@
 //! updates the content-blind relay topology, and returns auditable route/failover
 //! decisions without inspecting application plaintext.
 
+use crate::capability::{CapabilityAdvertisementError, RelayCapabilityAdvertisement};
 use crate::failover::{reroute_after_failure, FailoverDecision};
 use crate::ranking::RelayMetrics;
 use crate::topology::{RelayRoute, RelayTopology, TopologyError};
@@ -91,6 +92,9 @@ pub enum OverlayManagerError {
     /// Underlying topology operation failed.
     #[error(transparent)]
     Topology(#[from] TopologyError),
+    /// Capability advertisement validation/storage failed.
+    #[error(transparent)]
+    Capability(#[from] CapabilityAdvertisementError),
 }
 
 /// Stateful overlay routing manager fed by runtime metrics.
@@ -144,6 +148,16 @@ impl OverlayManager {
             .insert(observation.peer_id.clone(), observation);
         self.bump_epoch();
         Ok(())
+    }
+
+    /// Accept a fresh capability advertisement and feed it into runtime routing metrics.
+    pub fn upsert_capability_advertisement(
+        &mut self,
+        advertisement: RelayCapabilityAdvertisement,
+        now_ms: u64,
+    ) -> Result<(), OverlayManagerError> {
+        advertisement.validate_at(now_ms)?;
+        self.upsert_observation(advertisement.to_runtime_observation())
     }
 
     /// Connect two known peers in the local overlay graph.
@@ -288,6 +302,42 @@ mod tests {
         assert_eq!(
             manager.route("alice", "bob")?.route.path,
             ["alice", "relay-b", "bob"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manager_accepts_capability_advertisements_as_routing_inputs(
+    ) -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for (peer_id, rtt) in [("alice", 5), ("relay-a", 25), ("relay-b", 75), ("bob", 5)] {
+            manager.upsert_capability_advertisement(
+                RelayCapabilityAdvertisement {
+                    peer_id: peer_id.to_owned(),
+                    sequence: 1,
+                    issued_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                    relay_capacity: crate::RelayCapacityAdvertisement {
+                        max_fanout: 8,
+                        egress_bytes_per_second: 128_000,
+                        accepts_store_forward: true,
+                    },
+                    battery_doze: crate::BatteryDozePosture::BatteryNormal,
+                    observed_rtt_ms: rtt,
+                    packet_loss_bps: 0,
+                    contributed_bytes: 10_000,
+                    consumed_bytes: 0,
+                },
+                1_500,
+            )?;
+        }
+        manager.connect_peers("alice", "relay-a")?;
+        manager.connect_peers("relay-a", "bob")?;
+        manager.connect_peers("alice", "relay-b")?;
+        manager.connect_peers("relay-b", "bob")?;
+        assert_eq!(
+            manager.route("alice", "bob")?.route.path,
+            ["alice", "relay-a", "bob"]
         );
         Ok(())
     }

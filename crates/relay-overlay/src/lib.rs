@@ -12,6 +12,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod capability;
 pub mod failover;
 pub mod gossip;
 pub mod integrity;
@@ -22,6 +23,10 @@ pub mod redelivery;
 pub mod store_forward;
 pub mod topology;
 
+pub use capability::{
+    BatteryDozePosture, CapabilityAdvertisementBook, CapabilityAdvertisementError,
+    RelayCapabilityAdvertisement, RelayCapacityAdvertisement,
+};
 pub use gossip::{GossipItem, GossipMesh, GossipNode};
 pub use manager::{
     OverlayFailoverReport, OverlayManager, OverlayManagerError, OverlayRouteDecision,
