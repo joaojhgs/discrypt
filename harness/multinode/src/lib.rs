@@ -34,6 +34,8 @@ pub struct MediaSecuritySmoke {
     pub receive_decode_jitter_playback_ready: bool,
     /// Media-path mute suppresses outbound PCM before encode/protect/transport.
     pub mute_suppresses_outbound_media: bool,
+    /// Per-speaker playback volume is applied after authenticated receive/decode.
+    pub playback_volume_mixer_ready: bool,
     /// Receiver plaintext after successful authentication and replay acceptance.
     pub plaintext: Vec<u8>,
 }
@@ -233,6 +235,7 @@ impl MediaSecuritySmoke {
             && self.capture_opus_sframe_protected
             && self.receive_decode_jitter_playback_ready
             && self.mute_suppresses_outbound_media
+            && self.playback_volume_mixer_ready
     }
 }
 
@@ -382,9 +385,9 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
     use discrypt_media::{
         AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, DecodedAudioFrame,
         MediaKeyRegistry, OpusAudioDecoder, OpusAudioEncoder, PlaybackAudioSink,
-        ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender,
-        SenderBinding, VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceJitterBuffer,
-        VoiceReceiveSFramePipeline,
+        PlaybackVolumeMixer, ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge,
+        SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
+        VoiceCaptureSendOutcome, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
     };
     use discrypt_relay_overlay::integrity::{
         contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
@@ -474,7 +477,7 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
                 .mul_add(3_000.0, 0.0) as i16
         })
         .collect::<Vec<_>>();
-    let captured = CapturedAudioFrame::new(pcm, capture_format, 777)?;
+    let captured = CapturedAudioFrame::new(pcm.clone(), capture_format, 777)?;
     let mut opus_probe = OpusAudioEncoder::new(capture_format)?;
     let encoded_probe = opus_probe.encode(captured.clone())?;
     let capture_binding =
@@ -553,6 +556,51 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         } if dropped_pcm_samples == capture_format.interleaved_samples_per_frame()
     ) && mute_sink.sent.is_empty();
 
+    let volume_binding =
+        SenderBinding::derive_for_epoch(&[14; 32], "harness-volume", 14, 3, "volume-device")?;
+    let volume_sender = SFrameSender::new(&[14; 32], volume_binding.clone())?;
+    let mut volume_registry = MediaKeyRegistry::new();
+    volume_registry.register_sender(&[14; 32], volume_binding.clone())?;
+    let mut volume_capture = VoiceCaptureSFramePipeline::new(
+        OpusAudioEncoder::new(capture_format)?,
+        RustTransformBridge::new(
+            volume_sender,
+            SFrameReceiver::new(volume_registry, ReplayWindow::default()),
+        ),
+        HarnessMediaSink::default(),
+    );
+    let _volume_report = volume_capture.capture_encode_protect_send(CapturedAudioFrame::new(
+        pcm.clone(),
+        capture_format,
+        999,
+    )?)?;
+    let volume_sink = volume_capture.into_sink();
+    let receive_sender =
+        SFrameSender::new_for_epoch(&[15; 32], "harness-volume-unused", 15, 1, "unused")?;
+    let mut playback_registry = MediaKeyRegistry::new();
+    playback_registry.register_sender(&[14; 32], volume_binding.clone())?;
+    let mut playback_mixer = PlaybackVolumeMixer::unity();
+    playback_mixer.set_speaker_volume(&volume_binding, 0)?;
+    let mut volume_receive = VoiceReceiveSFramePipeline::with_volume_mixer(
+        RustTransformBridge::new(
+            receive_sender,
+            SFrameReceiver::new(playback_registry, ReplayWindow::default()),
+        ),
+        OpusAudioDecoder::new(capture_format)?,
+        VoiceJitterBuffer::new(0),
+        playback_mixer,
+        HarnessPlaybackSink::default(),
+    );
+    let volume_queued = volume_receive.receive_protected_frame(volume_sink.sent[0].clone())?;
+    let volume_playback_sink = volume_receive.into_sink();
+    let playback_volume_mixer_ready = volume_queued == 1
+        && volume_playback_sink.played.len() == 1
+        && volume_playback_sink.played[0].sender.device_id == "volume-device"
+        && volume_playback_sink.played[0]
+            .pcm_i16
+            .iter()
+            .all(|sample| *sample == 0);
+
     Ok(MediaSecuritySmoke {
         passive_relay_cannot_read,
         replay_rejected,
@@ -560,6 +608,7 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         capture_opus_sframe_protected,
         receive_decode_jitter_playback_ready,
         mute_suppresses_outbound_media,
+        playback_volume_mixer_ready,
         plaintext: opened.plaintext,
     })
 }
@@ -2385,6 +2434,7 @@ mod tests {
                 capture_opus_sframe_protected: true,
                 receive_decode_jitter_playback_ready: true,
                 mute_suppresses_outbound_media: true,
+                playback_volume_mixer_ready: true,
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
         ));

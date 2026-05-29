@@ -8,11 +8,16 @@
 use crate::{BridgeClearFrame, BridgeProtectedFrame, MediaError, RustTransformBridge};
 use libopus_rs::{Application, Decoder, Encoder};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const WEBRTC_OPUS_SAMPLE_RATE_HZ: u32 = 48_000;
 const MIN_OPUS_PACKET_BYTES: usize = 3;
 const MAX_OPUS_PACKET_BYTES: usize = 1_275;
 const MAX_OPUS_FRAME_DATA_BYTES: usize = 1_274;
+/// 1000 millipercent is unity gain for speaker playback volume.
+pub const SPEAKER_VOLUME_UNITY_MILLIPERCENT: u16 = 1_000;
+/// Keep local playback gain bounded to avoid clipping abuse or accidental runaway amplification.
+pub const SPEAKER_VOLUME_MAX_MILLIPERCENT: u16 = 2_000;
 
 /// PCM capture format accepted by the production voice send path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -253,12 +258,141 @@ pub struct DecodedAudioFrame {
     pub pcm_i16: Vec<i16>,
 }
 
-/// Small deterministic jitter buffer ordered by authenticated SFrame counter.
+/// Stable playback-volume key derived only after SFrame authenticated the sender binding.
+///
+/// The key intentionally follows the user/device inside a group across MLS epoch/KID rotations,
+/// so a local volume setting survives membership churn while still being scoped to an
+/// authenticated media sender identity.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct SpeakerPlaybackKey {
+    /// Stable MLS group identifier for this voice room.
+    pub group_id: String,
+    /// Stable sender device identifier authenticated by the media sender binding.
+    pub device_id: String,
+}
+
+impl SpeakerPlaybackKey {
+    /// Build a playback key from an already authenticated sender binding.
+    pub fn from_sender(sender: &crate::SenderBinding) -> Result<Self, MediaError> {
+        sender.validate()?;
+        Ok(Self {
+            group_id: sender.group_id.clone(),
+            device_id: sender.device_id.clone(),
+        })
+    }
+}
+
+/// Per-speaker playback volume mixer.
+///
+/// Volumes are stored as millipercent (`1000 == 100%`). The mixer accepts only
+/// authenticated sender bindings from decoded media frames; callers cannot pick an
+/// unauthenticated display name and affect another speaker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackVolumeMixer {
+    default_volume_millipercent: u16,
+    speaker_volumes_millipercent: BTreeMap<SpeakerPlaybackKey, u16>,
+}
+
+impl Default for PlaybackVolumeMixer {
+    fn default() -> Self {
+        Self::unity()
+    }
+}
+
+impl PlaybackVolumeMixer {
+    /// Create a mixer with unity gain and no per-speaker overrides.
+    #[must_use]
+    pub fn unity() -> Self {
+        Self {
+            default_volume_millipercent: SPEAKER_VOLUME_UNITY_MILLIPERCENT,
+            speaker_volumes_millipercent: BTreeMap::new(),
+        }
+    }
+
+    /// Create a mixer with a validated default playback volume.
+    pub fn new(default_volume_millipercent: u16) -> Result<Self, MediaError> {
+        validate_volume_millipercent(default_volume_millipercent)?;
+        Ok(Self {
+            default_volume_millipercent,
+            speaker_volumes_millipercent: BTreeMap::new(),
+        })
+    }
+
+    /// Update the default playback volume used when a speaker has no override.
+    pub fn set_default_volume_millipercent(
+        &mut self,
+        volume_millipercent: u16,
+    ) -> Result<(), MediaError> {
+        validate_volume_millipercent(volume_millipercent)?;
+        self.default_volume_millipercent = volume_millipercent;
+        Ok(())
+    }
+
+    /// Set a volume override for one authenticated sender binding.
+    pub fn set_speaker_volume(
+        &mut self,
+        sender: &crate::SenderBinding,
+        volume_millipercent: u16,
+    ) -> Result<(), MediaError> {
+        let key = SpeakerPlaybackKey::from_sender(sender)?;
+        self.set_speaker_volume_by_key(key, volume_millipercent)
+    }
+
+    /// Set a volume override for a previously authenticated speaker key.
+    pub fn set_speaker_volume_by_key(
+        &mut self,
+        key: SpeakerPlaybackKey,
+        volume_millipercent: u16,
+    ) -> Result<(), MediaError> {
+        validate_volume_millipercent(volume_millipercent)?;
+        if volume_millipercent == self.default_volume_millipercent {
+            self.speaker_volumes_millipercent.remove(&key);
+        } else {
+            self.speaker_volumes_millipercent
+                .insert(key, volume_millipercent);
+        }
+        Ok(())
+    }
+
+    /// Read the effective playback volume for an authenticated sender binding.
+    pub fn volume_for_sender(&self, sender: &crate::SenderBinding) -> Result<u16, MediaError> {
+        let key = SpeakerPlaybackKey::from_sender(sender)?;
+        Ok(*self
+            .speaker_volumes_millipercent
+            .get(&key)
+            .unwrap_or(&self.default_volume_millipercent))
+    }
+
+    /// Apply the authenticated sender's volume to decoded PCM with saturating i16 bounds.
+    pub fn mix_frame(&self, mut frame: DecodedAudioFrame) -> Result<DecodedAudioFrame, MediaError> {
+        let volume = self.volume_for_sender(&frame.sender)?;
+        for sample in &mut frame.pcm_i16 {
+            *sample = apply_volume(*sample, volume);
+        }
+        Ok(frame)
+    }
+}
+
+fn validate_volume_millipercent(volume_millipercent: u16) -> Result<(), MediaError> {
+    if volume_millipercent <= SPEAKER_VOLUME_MAX_MILLIPERCENT {
+        Ok(())
+    } else {
+        Err(MediaError::InvalidPlaybackVolume(volume_millipercent))
+    }
+}
+
+fn apply_volume(sample: i16, volume_millipercent: u16) -> i16 {
+    let scaled =
+        sample as i32 * volume_millipercent as i32 / SPEAKER_VOLUME_UNITY_MILLIPERCENT as i32;
+    scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Small deterministic jitter buffer ordered by authenticated SFrame counter per speaker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VoiceJitterBuffer {
     target_depth_frames: usize,
-    next_counter: Option<u64>,
-    buffered: std::collections::BTreeMap<u64, DecodedAudioFrame>,
+    next_counter_by_speaker: BTreeMap<SpeakerPlaybackKey, u64>,
+    buffered: BTreeMap<(SpeakerPlaybackKey, u64), DecodedAudioFrame>,
 }
 
 impl VoiceJitterBuffer {
@@ -267,39 +401,76 @@ impl VoiceJitterBuffer {
     pub fn new(target_depth_frames: usize) -> Self {
         Self {
             target_depth_frames,
-            next_counter: None,
-            buffered: std::collections::BTreeMap::new(),
+            next_counter_by_speaker: BTreeMap::new(),
+            buffered: BTreeMap::new(),
         }
     }
 
     /// Insert a decoded frame and return every contiguous frame ready for playback.
-    pub fn push(&mut self, frame: DecodedAudioFrame) -> Vec<DecodedAudioFrame> {
-        self.next_counter = Some(
-            self.next_counter
-                .map_or(frame.counter, |next| next.min(frame.counter)),
-        );
-        self.buffered.insert(frame.counter, frame);
-        self.pop_ready(false)
+    pub fn push(&mut self, frame: DecodedAudioFrame) -> Result<Vec<DecodedAudioFrame>, MediaError> {
+        let speaker_key = SpeakerPlaybackKey::from_sender(&frame.sender)?;
+        self.next_counter_by_speaker
+            .entry(speaker_key.clone())
+            .and_modify(|next| *next = (*next).min(frame.counter))
+            .or_insert(frame.counter);
+        let counter = frame.counter;
+        self.buffered.insert((speaker_key.clone(), counter), frame);
+        Ok(self.pop_ready_for_speaker(&speaker_key, false))
     }
 
     /// Drain all currently contiguous frames, used when closing or after a test burst.
     pub fn drain_contiguous(&mut self) -> Vec<DecodedAudioFrame> {
-        self.pop_ready(true)
+        let speakers = self
+            .next_counter_by_speaker
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        speakers
+            .iter()
+            .flat_map(|speaker| self.pop_ready_for_speaker(speaker, true))
+            .collect()
     }
 
-    fn pop_ready(&mut self, drain: bool) -> Vec<DecodedAudioFrame> {
+    fn pop_ready_for_speaker(
+        &mut self,
+        speaker_key: &SpeakerPlaybackKey,
+        drain: bool,
+    ) -> Vec<DecodedAudioFrame> {
         let mut ready = Vec::new();
-        while drain || self.buffered.len() > self.target_depth_frames {
-            let Some(counter) = self.next_counter else {
+        while drain || self.buffered_len_for_speaker(speaker_key) > self.target_depth_frames {
+            let Some(counter) = self.next_counter_by_speaker.get(speaker_key).copied() else {
                 break;
             };
-            let Some(frame) = self.buffered.remove(&counter) else {
+            let Some(frame) = self.buffered.remove(&(speaker_key.clone(), counter)) else {
                 break;
             };
-            self.next_counter = counter.checked_add(1);
+            match counter.checked_add(1) {
+                Some(next) => {
+                    self.next_counter_by_speaker
+                        .insert(speaker_key.clone(), next);
+                }
+                None => {
+                    self.next_counter_by_speaker.remove(speaker_key);
+                }
+            }
             ready.push(frame);
         }
+        if !self
+            .buffered
+            .keys()
+            .any(|(speaker, _)| speaker == speaker_key)
+            && ready.is_empty()
+        {
+            self.next_counter_by_speaker.remove(speaker_key);
+        }
         ready
+    }
+
+    fn buffered_len_for_speaker(&self, speaker_key: &SpeakerPlaybackKey) -> usize {
+        self.buffered
+            .keys()
+            .filter(|(speaker, _)| speaker == speaker_key)
+            .count()
     }
 }
 
@@ -312,8 +483,10 @@ pub trait PlaybackAudioSink {
 /// Protected media receive pipeline for one voice playback stream.
 pub struct VoiceReceiveSFramePipeline<S> {
     bridge: RustTransformBridge,
-    decoder: OpusAudioDecoder,
+    playback_format: AudioCaptureFormat,
+    decoders_by_speaker: BTreeMap<SpeakerPlaybackKey, OpusAudioDecoder>,
     jitter: VoiceJitterBuffer,
+    volume_mixer: PlaybackVolumeMixer,
     sink: S,
 }
 
@@ -326,12 +499,41 @@ impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
         jitter: VoiceJitterBuffer,
         sink: S,
     ) -> Self {
+        Self::with_volume_mixer(bridge, decoder, jitter, PlaybackVolumeMixer::unity(), sink)
+    }
+
+    /// Construct the receive pipeline with an explicit per-speaker playback volume mixer.
+    #[must_use]
+    pub fn with_volume_mixer(
+        bridge: RustTransformBridge,
+        decoder: OpusAudioDecoder,
+        jitter: VoiceJitterBuffer,
+        volume_mixer: PlaybackVolumeMixer,
+        sink: S,
+    ) -> Self {
         Self {
             bridge,
-            decoder,
+            playback_format: decoder.format,
+            decoders_by_speaker: BTreeMap::new(),
             jitter,
+            volume_mixer,
             sink,
         }
+    }
+
+    /// Set local playback volume for one authenticated speaker.
+    pub fn set_speaker_volume(
+        &mut self,
+        sender: &crate::SenderBinding,
+        volume_millipercent: u16,
+    ) -> Result<(), MediaError> {
+        self.volume_mixer
+            .set_speaker_volume(sender, volume_millipercent)
+    }
+
+    /// Read the effective local playback volume for one authenticated speaker.
+    pub fn speaker_volume(&self, sender: &crate::SenderBinding) -> Result<u16, MediaError> {
+        self.volume_mixer.volume_for_sender(sender)
     }
 
     /// Verify sender binding, reject replays, decrypt, decode, jitter, and queue playback.
@@ -339,19 +541,30 @@ impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
         &mut self,
         frame: BridgeProtectedFrame,
     ) -> Result<usize, MediaError> {
-        let counter = frame.counter;
         let verified = self.bridge.open_protected_frame(frame)?;
-        let pcm_i16 = self.decoder.decode(&verified.clear.bytes)?;
+        let speaker_key = SpeakerPlaybackKey::from_sender(&verified.sender)?;
+        if !self.decoders_by_speaker.contains_key(&speaker_key) {
+            self.decoders_by_speaker.insert(
+                speaker_key.clone(),
+                OpusAudioDecoder::new(self.playback_format)?,
+            );
+        }
+        let decoder = self
+            .decoders_by_speaker
+            .get_mut(&speaker_key)
+            .ok_or_else(|| MediaError::OpusDecodeFailed("missing per-speaker decoder".into()))?;
+        let pcm_i16 = decoder.decode(&verified.clear.bytes)?;
         let decoded = DecodedAudioFrame {
             sender: verified.sender,
-            counter,
-            format: self.decoder.format,
+            counter: verified.counter,
+            format: self.playback_format,
             pcm_i16,
         };
-        let ready = self.jitter.push(decoded);
+        let ready = self.jitter.push(decoded)?;
         let queued = ready.len();
         for frame in ready {
-            self.sink.queue_playback_frame(frame)?;
+            let mixed = self.volume_mixer.mix_frame(frame)?;
+            self.sink.queue_playback_frame(mixed)?;
         }
         Ok(queued)
     }
@@ -361,7 +574,8 @@ impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
         let ready = self.jitter.drain_contiguous();
         let queued = ready.len();
         for frame in ready {
-            self.sink.queue_playback_frame(frame)?;
+            let mixed = self.volume_mixer.mix_frame(frame)?;
+            self.sink.queue_playback_frame(mixed)?;
         }
         Ok(queued)
     }
@@ -632,6 +846,118 @@ mod tests {
         assert_eq!(report.sequence, 0);
         let sink = pipeline.into_sink();
         assert_eq!(sink.sent.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn playback_volume_mixer_applies_only_authenticated_speaker_gain() -> Result<(), MediaError> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let alice = SenderBinding::derive_for_epoch(&[21; 32], "mix-group", 21, 1, "alice")?;
+        let bob = SenderBinding::derive_for_epoch(&[22; 32], "mix-group", 22, 2, "bob")?;
+        let mut mixer = PlaybackVolumeMixer::unity();
+        mixer.set_speaker_volume(&alice, 500)?;
+        mixer.set_speaker_volume(&bob, 1_500)?;
+
+        let alice_mixed = mixer.mix_frame(DecodedAudioFrame {
+            sender: alice.clone(),
+            counter: 0,
+            format,
+            pcm_i16: vec![1_000, -1_000, 30_000, -30_000],
+        })?;
+        assert_eq!(alice_mixed.pcm_i16, vec![500, -500, 15_000, -15_000]);
+
+        let bob_mixed = mixer.mix_frame(DecodedAudioFrame {
+            sender: bob.clone(),
+            counter: 0,
+            format,
+            pcm_i16: vec![1_000, -1_000, 30_000, -30_000],
+        })?;
+        assert_eq!(bob_mixed.pcm_i16, vec![1_500, -1_500, 32_767, -32_768]);
+        assert_eq!(mixer.volume_for_sender(&alice)?, 500);
+        assert_eq!(mixer.volume_for_sender(&bob)?, 1_500);
+        assert_eq!(
+            mixer.set_speaker_volume(&alice, SPEAKER_VOLUME_MAX_MILLIPERCENT + 1),
+            Err(MediaError::InvalidPlaybackVolume(
+                SPEAKER_VOLUME_MAX_MILLIPERCENT + 1
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn receive_pipeline_applies_per_speaker_volume_before_playback() -> Result<(), MediaError> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let capture_binding =
+            SenderBinding::derive_for_epoch(&[4; 32], "capture-group", 4, 42, "capture-device")?;
+        let mut sender_bridge = media_bridge()?;
+        let mut encoder = OpusAudioEncoder::new(format)?;
+        let encoded =
+            encoder.encode(CapturedAudioFrame::new(sine_frame(format), format, 2_500)?)?;
+        let protected = sender_bridge.protect_encoded(encoded.into_bridge_clear_frame())?;
+
+        let mut pipeline = VoiceReceiveSFramePipeline::new(
+            receive_bridge()?,
+            OpusAudioDecoder::new(format)?,
+            VoiceJitterBuffer::new(0),
+            PlaybackSink::default(),
+        );
+        pipeline.set_speaker_volume(&capture_binding, 0)?;
+        assert_eq!(pipeline.speaker_volume(&capture_binding)?, 0);
+        assert_eq!(pipeline.receive_protected_frame(protected)?, 1);
+        let sink = pipeline.into_sink();
+        assert_eq!(sink.played.len(), 1);
+        assert!(sink.played[0].pcm_i16.iter().all(|sample| *sample == 0));
+        assert_eq!(sink.played[0].sender.device_id, "capture-device");
+        Ok(())
+    }
+
+    #[test]
+    fn receive_pipeline_keeps_same_counter_speakers_separate_for_mixing() -> Result<(), MediaError>
+    {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let alice = SenderBinding::derive_for_epoch(&[31; 32], "room", 31, 1, "alice")?;
+        let bob = SenderBinding::derive_for_epoch(&[32; 32], "room", 32, 2, "bob")?;
+        let mut registry = MediaKeyRegistry::new();
+        registry.register_sender(&[31; 32], alice.clone())?;
+        registry.register_sender(&[32; 32], bob.clone())?;
+        let receive_sender = SFrameSender::new_for_epoch(&[33; 32], "unused", 33, 9, "unused")?;
+        let receive_bridge = RustTransformBridge::new(
+            receive_sender,
+            SFrameReceiver::new(registry, ReplayWindow::default()),
+        );
+
+        let mut alice_sender = SFrameSender::new(&[31; 32], alice.clone())?;
+        let mut bob_sender = SFrameSender::new(&[32; 32], bob.clone())?;
+        let mut alice_encoder = OpusAudioEncoder::new(format)?;
+        let mut bob_encoder = OpusAudioEncoder::new(format)?;
+        let alice_encoded =
+            alice_encoder.encode(CapturedAudioFrame::new(sine_frame(format), format, 4_000)?)?;
+        let bob_encoded =
+            bob_encoder.encode(CapturedAudioFrame::new(sine_frame(format), format, 4_000)?)?;
+        let alice_protected: BridgeProtectedFrame =
+            alice_sender.protect(&alice_encoded.opus_payload)?.into();
+        let bob_protected: BridgeProtectedFrame =
+            bob_sender.protect(&bob_encoded.opus_payload)?.into();
+        assert_eq!(alice_protected.counter, 0);
+        assert_eq!(bob_protected.counter, 0);
+
+        let mut pipeline = VoiceReceiveSFramePipeline::new(
+            receive_bridge,
+            OpusAudioDecoder::new(format)?,
+            VoiceJitterBuffer::new(1),
+            PlaybackSink::default(),
+        );
+        pipeline.set_speaker_volume(&alice, 0)?;
+        pipeline.set_speaker_volume(&bob, 1_000)?;
+        assert_eq!(pipeline.receive_protected_frame(alice_protected)?, 0);
+        assert_eq!(pipeline.receive_protected_frame(bob_protected)?, 0);
+        assert_eq!(pipeline.flush_playback()?, 2);
+        let sink = pipeline.into_sink();
+        assert_eq!(sink.played.len(), 2);
+        assert_eq!(sink.played[0].sender.device_id, "alice");
+        assert_eq!(sink.played[1].sender.device_id, "bob");
+        assert!(sink.played[0].pcm_i16.iter().all(|sample| *sample == 0));
+        assert!(sink.played[1].pcm_i16.iter().any(|sample| *sample != 0));
         Ok(())
     }
 

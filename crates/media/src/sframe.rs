@@ -135,6 +135,9 @@ pub enum MediaError {
     /// Decoded audio could not be queued to playback.
     #[error("playback failed: {0}")]
     PlaybackFailed(String),
+    /// Speaker playback volume was outside the supported local mixer range.
+    #[error("invalid playback volume millipercent: {0}")]
+    InvalidPlaybackVolume(u16),
     /// Outbound media frame was suppressed because media-path mute is active.
     #[error("outbound media muted")]
     MediaMuted,
