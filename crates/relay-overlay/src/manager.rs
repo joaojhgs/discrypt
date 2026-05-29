@@ -81,8 +81,46 @@ pub struct OverlayRouteDecision {
 pub struct OverlayFailoverReport {
     /// Reroute details returned by the deterministic failover module.
     pub decision: FailoverDecision,
+    /// Recovery SLA used to accept or reject the failover.
+    pub recovery_policy: FailoverRecoveryPolicy,
+    /// Media concealment/gap report when failover protected a media route.
+    pub media_concealment: Option<MediaConcealmentReport>,
     /// Sequence number of the manager state used for the decision.
     pub manager_epoch: u64,
+}
+
+/// Runtime failover SLA for overlay route recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FailoverRecoveryPolicy {
+    /// Maximum accepted route convergence time in milliseconds.
+    pub max_failover_ms: u64,
+    /// Maximum tolerated media gap after concealment in milliseconds.
+    pub max_media_gap_ms: u64,
+    /// Nominal concealment frame size used to size concealment work.
+    pub concealment_frame_ms: u64,
+}
+
+impl Default for FailoverRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            max_failover_ms: 3_000,
+            max_media_gap_ms: 200,
+            concealment_frame_ms: 20,
+        }
+    }
+}
+
+/// Media gap/concealment result for a protected failover.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaConcealmentReport {
+    /// Observed media gap after transport/overlay recovery.
+    pub observed_gap_ms: u64,
+    /// Maximum tolerated media gap.
+    pub target_gap_ms: u64,
+    /// Number of concealment frames needed to bridge the observed gap.
+    pub concealment_frames: u64,
+    /// Whether the media gap stayed inside the target.
+    pub target_met: bool,
 }
 
 /// Overlay route payload class.
@@ -183,6 +221,22 @@ pub enum OverlayManagerError {
     ChurnDamped {
         /// Earliest time the planned change may be retried.
         next_allowed_at_ms: u64,
+    },
+    /// Failover convergence exceeded the release SLA.
+    #[error("overlay failover exceeded {max_failover_ms}ms: observed {observed_ms}ms")]
+    FailoverSlaExceeded {
+        /// Observed route convergence time.
+        observed_ms: u64,
+        /// Maximum allowed convergence time.
+        max_failover_ms: u64,
+    },
+    /// Media gap after failover exceeded the concealment target.
+    #[error("media failover gap exceeded {max_gap_ms}ms: observed {observed_gap_ms}ms")]
+    MediaGapExceeded {
+        /// Observed media gap after concealment/recovery.
+        observed_gap_ms: u64,
+        /// Maximum tolerated gap.
+        max_gap_ms: u64,
     },
 }
 
@@ -384,6 +438,52 @@ impl OverlayManager {
         failed_peer: &str,
         observed_convergence_ms: u64,
     ) -> Result<OverlayFailoverReport, OverlayManagerError> {
+        self.mark_failed_and_reroute_with_policy(
+            previous,
+            failed_peer,
+            observed_convergence_ms,
+            None,
+            FailoverRecoveryPolicy::default(),
+        )
+    }
+
+    /// Mark a media relay failed and produce a replacement route that satisfies
+    /// both the route failover SLA and media concealment/gap target.
+    pub fn mark_failed_media_and_reroute(
+        &mut self,
+        previous: RelayRoute,
+        failed_peer: &str,
+        observed_convergence_ms: u64,
+        observed_media_gap_ms: u64,
+    ) -> Result<OverlayFailoverReport, OverlayManagerError> {
+        self.mark_failed_and_reroute_with_policy(
+            previous,
+            failed_peer,
+            observed_convergence_ms,
+            Some(observed_media_gap_ms),
+            FailoverRecoveryPolicy::default(),
+        )
+    }
+
+    /// Mark a peer failed and produce a bounded-hop replacement route under a
+    /// caller-supplied recovery policy.
+    pub fn mark_failed_and_reroute_with_policy(
+        &mut self,
+        previous: RelayRoute,
+        failed_peer: &str,
+        observed_convergence_ms: u64,
+        observed_media_gap_ms: Option<u64>,
+        recovery_policy: FailoverRecoveryPolicy,
+    ) -> Result<OverlayFailoverReport, OverlayManagerError> {
+        if observed_convergence_ms > recovery_policy.max_failover_ms {
+            return Err(OverlayManagerError::FailoverSlaExceeded {
+                observed_ms: observed_convergence_ms,
+                max_failover_ms: recovery_policy.max_failover_ms,
+            });
+        }
+        let media_concealment = observed_media_gap_ms
+            .map(|observed_gap_ms| media_concealment_report(observed_gap_ms, recovery_policy))
+            .transpose()?;
         self.failed_peers.insert(failed_peer.to_owned());
         let decision = reroute_after_failure(
             &self.topology,
@@ -394,6 +494,8 @@ impl OverlayManager {
         self.bump_epoch();
         Ok(OverlayFailoverReport {
             decision,
+            recovery_policy,
+            media_concealment,
             manager_epoch: self.epoch,
         })
     }
@@ -425,6 +527,26 @@ fn validate_observation(observation: &RelayRuntimeObservation) -> Result<(), Ove
         ));
     }
     Ok(())
+}
+
+fn media_concealment_report(
+    observed_gap_ms: u64,
+    policy: FailoverRecoveryPolicy,
+) -> Result<MediaConcealmentReport, OverlayManagerError> {
+    if observed_gap_ms > policy.max_media_gap_ms {
+        return Err(OverlayManagerError::MediaGapExceeded {
+            observed_gap_ms,
+            max_gap_ms: policy.max_media_gap_ms,
+        });
+    }
+    let frame_ms = policy.concealment_frame_ms.max(1);
+    let concealment_frames = observed_gap_ms.div_ceil(frame_ms);
+    Ok(MediaConcealmentReport {
+        observed_gap_ms,
+        target_gap_ms: policy.max_media_gap_ms,
+        concealment_frames,
+        target_met: true,
+    })
 }
 
 #[cfg(test)]
@@ -702,10 +824,78 @@ mod tests {
         let report = manager.mark_failed_and_reroute(previous, "primary", 2_400)?;
         assert_eq!(report.decision.replacement.path, ["alice", "backup", "bob"]);
         assert!(report.decision.converged_within_phase2_gate());
+        assert_eq!(report.recovery_policy.max_failover_ms, 3_000);
+        assert!(report.media_concealment.is_none());
         assert!(!manager
             .route("alice", "bob")?
             .route
             .contains_peer("primary"));
+        Ok(())
+    }
+
+    #[test]
+    fn media_failover_enforces_three_second_and_200ms_gap_targets(
+    ) -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("primary", 10, 10, 0),
+            observation("backup", 30, 10, 0),
+            observation("bob", 5, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "primary")?;
+        manager.connect_peers("primary", "bob")?;
+        manager.connect_peers("alice", "backup")?;
+        manager.connect_peers("backup", "bob")?;
+
+        let previous = manager.route("alice", "bob")?.route;
+        let report = manager.mark_failed_media_and_reroute(previous, "primary", 2_750, 180)?;
+        assert_eq!(report.decision.replacement.path, ["alice", "backup", "bob"]);
+        assert_eq!(
+            report.media_concealment,
+            Some(MediaConcealmentReport {
+                observed_gap_ms: 180,
+                target_gap_ms: 200,
+                concealment_frames: 9,
+                target_met: true,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failover_rejects_sla_and_media_gap_violations() -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("primary", 10, 10, 0),
+            observation("backup", 30, 10, 0),
+            observation("bob", 5, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "primary")?;
+        manager.connect_peers("primary", "bob")?;
+        manager.connect_peers("alice", "backup")?;
+        manager.connect_peers("backup", "bob")?;
+
+        let previous = manager.route("alice", "bob")?.route;
+        assert!(matches!(
+            manager.mark_failed_media_and_reroute(previous.clone(), "primary", 3_001, 180),
+            Err(OverlayManagerError::FailoverSlaExceeded {
+                observed_ms: 3_001,
+                max_failover_ms: 3_000
+            })
+        ));
+        assert!(matches!(
+            manager.mark_failed_media_and_reroute(previous, "primary", 2_900, 201),
+            Err(OverlayManagerError::MediaGapExceeded {
+                observed_gap_ms: 201,
+                max_gap_ms: 200
+            })
+        ));
         Ok(())
     }
 

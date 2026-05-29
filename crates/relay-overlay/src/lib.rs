@@ -29,9 +29,9 @@ pub use capability::{
 };
 pub use gossip::{GossipItem, GossipMesh, GossipNode};
 pub use manager::{
-    ChurnDampingPolicy, ConstructedOverlayRoute, OverlayFailoverReport, OverlayManager,
-    OverlayManagerError, OverlayRouteDecision, OverlayRouteUse, RelayRuntimeObservation,
-    TopologyChangeReason, TopologyChangeReport,
+    ChurnDampingPolicy, ConstructedOverlayRoute, FailoverRecoveryPolicy, MediaConcealmentReport,
+    OverlayFailoverReport, OverlayManager, OverlayManagerError, OverlayRouteDecision,
+    OverlayRouteUse, RelayRuntimeObservation, TopologyChangeReason, TopologyChangeReport,
 };
 pub use ranking::{rank, score, RelayMetrics};
 pub use topology::hop_limit_ok;

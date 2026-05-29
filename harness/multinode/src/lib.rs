@@ -39,6 +39,8 @@ pub struct RelayOverlaySmoke {
     pub hop_limit_respected: bool,
     /// Failover avoids the failed relay and converges within the Phase-2 gate.
     pub failover_recovered: bool,
+    /// Media route failover meets the ≤200 ms gap/concealment target.
+    pub media_gap_concealed: bool,
     /// Replay/redelivery bookkeeping rejects duplicate packet ids.
     pub redelivery_replay_rejected: bool,
     /// Store-forward rejects caller-supplied plaintext samples in relay payloads.
@@ -204,6 +206,7 @@ impl RelayOverlaySmoke {
     pub fn ready(&self) -> bool {
         self.hop_limit_respected
             && self.failover_recovered
+            && self.media_gap_concealed
             && self.redelivery_replay_rejected
             && self.store_forward_plaintext_rejected
             && self.store_forward_ttl_enforced
@@ -361,7 +364,6 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameReceiver, SFrameSender,
         SenderBinding,
     };
-    use discrypt_relay_overlay::failover::reroute_after_failure;
     use discrypt_relay_overlay::integrity::{contains_plaintext, RelayPacket};
     use discrypt_relay_overlay::ranking::RelayMetrics;
     use discrypt_relay_overlay::redelivery::{PacketId, RedeliveryError, RedeliveryTracker};
@@ -369,6 +371,7 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
         StoreForwardEnvelope, StoreForwardError, StoreForwardQueue,
     };
     use discrypt_relay_overlay::topology::RelayTopology;
+    use discrypt_relay_overlay::{OverlayManager, RelayRuntimeObservation};
 
     fn metrics(peer_id: &str, latency_ms: u32, freeload_penalty: f32) -> RelayMetrics {
         RelayMetrics {
@@ -400,10 +403,47 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
     let route = topology.route("alice", "bob")?;
     let hop_limit_respected =
         route.path == ["alice", "primary-relay", "bob"] && route.within_hop_limit();
-    let failover = reroute_after_failure(&topology, route.clone(), "primary-relay", 2_500)?;
+    let failover = discrypt_relay_overlay::failover::reroute_after_failure(
+        &topology,
+        route.clone(),
+        "primary-relay",
+        2_500,
+    )?;
     let failover_recovered = failover.converged_within_phase2_gate()
         && failover.replacement.path == ["alice", "backup-relay", "bob"]
         && !failover.replacement.contains_peer("primary-relay");
+
+    let mut manager = OverlayManager::default();
+    for peer in [
+        ("alice", 1),
+        ("primary-relay", 10),
+        ("backup-relay", 30),
+        ("bob", 1),
+    ] {
+        manager.upsert_observation(RelayRuntimeObservation {
+            peer_id: peer.0.to_owned(),
+            latency_ms: peer.1,
+            successful_probes: 10,
+            failed_probes: 0,
+            battery_cost_bps: 0,
+            contributed_bytes: 10_000,
+            consumed_bytes: 0,
+        })?;
+    }
+    manager.connect_peers("alice", "primary-relay")?;
+    manager.connect_peers("primary-relay", "bob")?;
+    manager.connect_peers("alice", "backup-relay")?;
+    manager.connect_peers("backup-relay", "bob")?;
+    let media_failover = manager.mark_failed_media_and_reroute(
+        manager.route("alice", "bob")?.route,
+        "primary-relay",
+        2_500,
+        180,
+    )?;
+    let media_gap_concealed = media_failover
+        .media_concealment
+        .as_ref()
+        .is_some_and(|report| report.target_met && report.observed_gap_ms <= 200);
 
     let binding = SenderBinding {
         kid: b"phase2-kid-alice".to_vec(),
@@ -484,6 +524,7 @@ pub fn relay_overlay_smoke() -> Result<RelayOverlaySmoke, anyhow::Error> {
     Ok(RelayOverlaySmoke {
         hop_limit_respected,
         failover_recovered,
+        media_gap_concealed,
         redelivery_replay_rejected,
         store_forward_plaintext_rejected,
         store_forward_ttl_enforced: delivered_before_ttl && expired_not_delivered,
@@ -1425,6 +1466,7 @@ mod tests {
             Ok(RelayOverlaySmoke {
                 hop_limit_respected: true,
                 failover_recovered: true,
+                media_gap_concealed: true,
                 redelivery_replay_rejected: true,
                 store_forward_plaintext_rejected: true,
                 store_forward_ttl_enforced: true,
