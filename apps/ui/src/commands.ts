@@ -55,7 +55,7 @@ export type VoiceParticipantView = {
   volume: number;
 };
 
-export type VoiceSessionView = {
+export type SnapshotVoiceSessionView = {
   joined: boolean;
   participants: VoiceParticipantView[];
   status_copy: string;
@@ -95,12 +95,109 @@ export type AppSnapshot = {
   invite: InviteFlowView;
   retention: RetentionSettingsView;
   voice: VoiceRoomView;
-  voice_session: VoiceSessionView;
+  voice_session: SnapshotVoiceSessionView;
   preferences: PreferencesView;
   messages: MessageView[];
   activity_feed: string[];
   connectivity: ConnectivityView;
   security_copy: SecurityCopyView;
+};
+
+export type AppLifecycle = "first_run" | "ready";
+
+export type UserProfileView = {
+  user_id: string;
+  display_name: string;
+  device_name: string;
+  recovery_status: string;
+};
+
+export type DirectConversationView = {
+  dm_id: string;
+  participant_id: string;
+  display_name: string;
+  local_only_copy: string;
+};
+
+export type ChannelStateView = {
+  channel_id: string;
+  name: string;
+  kind: ChannelKind;
+  retention_status: string;
+};
+
+export type GroupView = {
+  group_id: string;
+  name: string;
+  role: string;
+  channels: ChannelStateView[];
+};
+
+export type ActiveContextView = {
+  kind: "dm" | "text_channel" | "voice_channel" | "group" | string;
+  group_id: string | null;
+  channel_id: string | null;
+  dm_id: string | null;
+};
+
+export type MessageTargetView = {
+  kind: "dm" | "channel" | string;
+  dm_id: string | null;
+  group_id: string | null;
+  channel_id: string | null;
+};
+
+export type AppMessageView = {
+  message_id: string;
+  target: MessageTargetView;
+  author_id: string;
+  author: string;
+  body: string;
+  status: string;
+  sent_at: string;
+};
+
+export type InviteView = {
+  invite_id: string;
+  group_id: string;
+  code: string;
+  expires: string;
+  max_use: string;
+  admission_copy: string;
+};
+
+export type VoiceSessionView = {
+  session_id: string;
+  group_id: string;
+  channel_id: string;
+  joined: boolean;
+  self_muted: boolean;
+  participants: VoiceParticipantView[];
+  route_copy: string;
+  status_copy: string;
+};
+
+export type AppEventView = {
+  sequence: number;
+  kind: string;
+  summary: string;
+};
+
+export type AppState = {
+  schema_version: number;
+  lifecycle: AppLifecycle;
+  profile: UserProfileView | null;
+  preferences: PreferencesView;
+  dms: DirectConversationView[];
+  groups: GroupView[];
+  active_context: ActiveContextView | null;
+  messages: AppMessageView[];
+  voice_session: VoiceSessionView | null;
+  invites: InviteView[];
+  devices: DeviceView[];
+  security_copy: SecurityCopyView;
+  events: AppEventView[];
+  snapshot: AppSnapshot;
 };
 
 export type SafetyVerificationRequest = {
@@ -113,6 +210,17 @@ export type SafetyVerificationResult = {
   message: string;
 };
 
+export type CreateUserRequest = {
+  display_name: string;
+  device_name?: string | null;
+};
+
+export type RecoverUserRequest = {
+  display_name: string;
+  recovery_code: string;
+  device_name?: string | null;
+};
+
 export type CreateGroupRequest = {
   name: string;
   retention: string;
@@ -120,12 +228,20 @@ export type CreateGroupRequest = {
 
 export type JoinGroupRequest = {
   invite_code: string;
+  group_name?: string | null;
+};
+
+export type CreateInviteRequest = {
+  group_id?: string | null;
+  expires: string;
+  max_use: string;
 };
 
 export type CreateChannelRequest = {
-  server_name: string;
+  group_id: string;
   name: string;
   kind: ChannelKind;
+  retention_status: string;
 };
 
 export type SavePreferencesRequest = {
@@ -133,18 +249,41 @@ export type SavePreferencesRequest = {
   template_id: string;
 };
 
+export type StartDmRequest = {
+  display_name: string;
+};
+
+export type SendMessageRequest = {
+  target: MessageTargetView;
+  body: string;
+};
+
+export type JoinVoiceRequest = {
+  group_id: string;
+  channel_id: string;
+};
+
+export type LeaveVoiceRequest = {
+  session_id: string;
+};
+
 export type SelfMuteRequest = {
+  session_id: string;
   muted: boolean;
 };
 
 export type SpeakerVolumeRequest = {
+  session_id: string;
   participant_id: string;
   volume: number;
 };
 
-export type SendMessageRequest = {
-  channel: string;
-  body: string;
+export type CommandHealth = {
+  app_state_ready: boolean;
+  identity_ready: boolean;
+  collaboration_ready: boolean;
+  voice_ready: boolean;
+  honest_copy_ready: boolean;
 };
 
 type TauriInvoke = <T>(
@@ -170,34 +309,8 @@ const fallbackSnapshot: AppSnapshot = {
     safety_number: "0231 1597 2653 5897",
     verified: false,
   },
-  devices: [
-    { device_id: "alice-laptop", leaf_index: 1, local: true, authorized: true },
-    { device_id: "alice-phone", leaf_index: 2, local: false, authorized: true },
-  ],
-  servers: [
-    {
-      name: "discrypt lab",
-      role: "owner",
-      channels: [
-        {
-          name: "#general",
-          kind: "Text",
-          retention_status: "7 day default; older messages lock, not vanish",
-        },
-        {
-          name: "#ops",
-          kind: "Text",
-          retention_status: "shorten is retroactive; lengthen is future-only",
-        },
-        {
-          name: "Voice Lobby",
-          kind: "Voice",
-          retention_status:
-            "Session-state only; media-frame E2E gate required before production voice claims",
-        },
-      ],
-    },
-  ],
+  devices: [],
+  servers: [],
   invite: {
     expires: "Invite expires and can be revoked",
     max_use: "Max-use is enforced before MLS admission",
@@ -225,66 +338,21 @@ const fallbackSnapshot: AppSnapshot = {
   voice: {
     route: "STUN → peer relay overlay → TURN",
     relay_copy:
-      "Relays see SFrame ciphertext only in harness gates; production media waits for real audio-frame E2E",
+      "Relays see SFrame ciphertext only in harness gates; production media waits for real media-frame E2E",
     android_path:
       "Android uses encoded transforms when available, otherwise the native webrtc-rs contingency",
   },
   voice_session: {
-    joined: true,
-    participants: [
-      {
-        id: "alice",
-        name: "Alice",
-        role: "you",
-        speaking: true,
-        muted: false,
-        volume: 82,
-      },
-      {
-        id: "bob",
-        name: "Bob",
-        role: "friend",
-        speaking: true,
-        muted: false,
-        volume: 68,
-      },
-      {
-        id: "ops",
-        name: "Ops relay",
-        role: "route",
-        speaking: false,
-        muted: true,
-        volume: 38,
-      },
-    ],
-    status_copy:
-      "Voice session state is command-backed; real audio-frame transport remains release-gated",
-    route_copy:
-      "Route copy is harness-backed until socket/media adapter E2E passes",
+    joined: false,
+    participants: [],
+    status_copy: "Not joined; voice session is optional and shell-safe",
+    route_copy: "Route copy is harness-backed until socket/media adapter E2E passes",
   },
   preferences: { theme_id: "graphite-calm", template_id: "command-center" },
-  messages: [
-    {
-      id: "local-msg-1",
-      channel: "#general",
-      author: "Alice",
-      body: "Local-first command-backed timeline is persisted by AppStore.",
-      state:
-        "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness",
-    },
-    {
-      id: "locked-msg-1",
-      channel: "#general",
-      author: "Bob",
-      body: "Locked placeholder — author device must be online for a live-key request.",
-      state: "locked",
-    },
-  ],
+  messages: [],
   activity_feed: [
     "Demo fallback active: packaged Tauri builds must use IPC-backed commands",
-    "Invite policy checked: expiry + max-use + revoke controls",
-    "Android wake path is content-free",
-    "Relay route carries ciphertext only in harness gates",
+    "Recovery is local/test-build placeholder only; no history/key recovery claim",
     "Deletion copy includes offline-device caveat",
   ],
   connectivity: {
@@ -305,6 +373,95 @@ const fallbackSnapshot: AppSnapshot = {
   },
 };
 
+const fallbackState: AppState = {
+  schema_version: 1,
+  lifecycle: "first_run",
+  profile: null,
+  preferences: fallbackSnapshot.preferences,
+  dms: [],
+  groups: [],
+  active_context: null,
+  messages: [],
+  voice_session: null,
+  invites: [],
+  devices: [],
+  security_copy: fallbackSnapshot.security_copy,
+  events: [
+    {
+      sequence: 1,
+      kind: "app.first_run",
+      summary: "No local profile exists; setup/recovery is required",
+    },
+  ],
+  snapshot: fallbackSnapshot,
+};
+
+function cloneState(state: AppState): AppState {
+  return structuredClone(state);
+}
+
+function syncSnapshot(state: AppState): AppState {
+  state.snapshot.schema_version = state.schema_version;
+  state.snapshot.preferences = state.preferences;
+  state.snapshot.devices = state.devices;
+  state.snapshot.security_copy = state.security_copy;
+  state.snapshot.servers = state.groups.map((group) => ({
+    name: group.name,
+    role: group.role,
+    channels: group.channels.map((channel) => ({
+      name: channel.name,
+      kind: channel.kind,
+      retention_status: channel.retention_status,
+    })),
+  }));
+  state.snapshot.messages = state.messages.map((message) => ({
+    id: message.message_id,
+    channel:
+      state.groups
+        .flatMap((group) => group.channels)
+        .find((channel) => channel.channel_id === message.target.channel_id)
+        ?.name ??
+      message.target.dm_id ??
+      "#general",
+    author: message.author,
+    body: message.body,
+    state: message.status,
+  }));
+  state.snapshot.voice_session = state.voice_session
+    ? {
+        joined: state.voice_session.joined,
+        participants: state.voice_session.participants,
+        status_copy: state.voice_session.status_copy,
+        route_copy: state.voice_session.route_copy,
+      }
+    : {
+        joined: false,
+        participants: [],
+        status_copy: "Not joined; voice session is optional and shell-safe",
+        route_copy: "Route copy is harness-backed until socket/media adapter E2E passes",
+      };
+  state.snapshot.activity_feed = state.events
+    .slice()
+    .reverse()
+    .map((event) => event.summary);
+  return state;
+}
+
+function pushEvent(state: AppState, kind: string, summary: string): void {
+  const lastSequence = state.events.at(-1)?.sequence ?? 0;
+  state.events.push({ sequence: lastSequence + 1, kind, summary });
+}
+
+function slugify(value: string): string {
+  return (
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "local"
+  );
+}
+
 function invokeOrFallback<T>(
   command: string,
   args: Record<string, unknown> | undefined,
@@ -317,11 +474,85 @@ function invokeOrFallback<T>(
   return tauriInvoke<T>(command, args);
 }
 
+function mutateFallback(update: (state: AppState) => void): AppState {
+  update(fallbackState);
+  return cloneState(syncSnapshot(fallbackState));
+}
+
+function ensureFallbackReady(displayName = "Alice", deviceName = "Desktop"): void {
+  if (fallbackState.lifecycle === "ready") return;
+  fallbackState.lifecycle = "ready";
+  fallbackState.profile = {
+    user_id: `user-${slugify(displayName)}`,
+    display_name: displayName,
+    device_name: deviceName,
+    recovery_status: "New local profile; recovery export remains a local placeholder",
+  };
+  fallbackState.devices = [
+    { device_id: slugify(deviceName), leaf_index: 1, local: true, authorized: true },
+  ];
+  fallbackState.dms = [
+    {
+      dm_id: "dm-bob",
+      participant_id: "bob",
+      display_name: "Bob",
+      local_only_copy: "Default local DM fixture; no remote delivery is claimed",
+    },
+  ];
+  fallbackState.active_context = {
+    kind: "dm",
+    group_id: null,
+    channel_id: null,
+    dm_id: "dm-bob",
+  };
+  pushEvent(fallbackState, "identity.created", `Profile ready for ${displayName}`);
+}
+
+export async function loadAppState(): Promise<AppState> {
+  return invokeOrFallback<AppState>("app_state", undefined, () =>
+    cloneState(syncSnapshot(fallbackState)),
+  );
+}
+
+export async function loadCompatibilityAppSnapshot(): Promise<AppSnapshot> {
+  return invokeOrFallback<AppSnapshot>("app_snapshot", undefined, () =>
+    cloneState(syncSnapshot(fallbackState)).snapshot,
+  );
+}
+
 export async function loadAppSnapshot(): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>(
-    "app_snapshot",
-    undefined,
-    () => fallbackSnapshot,
+  const state = await loadAppState();
+  return state.snapshot;
+}
+
+export async function createUser(request: CreateUserRequest): Promise<AppState> {
+  return invokeOrFallback<AppState>("create_user", { request }, () =>
+    mutateFallback((state) => {
+      const displayName = request.display_name.trim() || "Alice";
+      const deviceName = request.device_name?.trim() || "Desktop";
+      ensureFallbackReady(displayName, deviceName);
+    }),
+  );
+}
+
+export async function recoverUser(
+  request: RecoverUserRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("recover_user", { request }, () =>
+    mutateFallback((state) => {
+      const displayName = request.display_name.trim() || "Alice recovered";
+      const deviceName = request.device_name?.trim() || "Desktop";
+      ensureFallbackReady(displayName, deviceName);
+      if (state.profile) {
+        state.profile.recovery_status =
+          "Recovered locally from placeholder code; no cloud or cross-device history recovery claimed";
+      }
+      pushEvent(
+        state,
+        "identity.recovered",
+        "Local recovery placeholder accepted; no history/key recovery was claimed",
+      );
+    }),
   );
 }
 
@@ -333,9 +564,9 @@ export async function verifySafetyNumber(
     { request },
     () => {
       const verified =
-        request.friend_id === fallbackSnapshot.friend.friend_code &&
-        request.provided === fallbackSnapshot.friend.safety_number;
-      fallbackSnapshot.friend.verified = verified;
+        request.friend_id === fallbackState.snapshot.friend.friend_code &&
+        request.provided === fallbackState.snapshot.friend.safety_number;
+      fallbackState.snapshot.friend.verified = verified;
       return {
         verified,
         message: verified
@@ -346,152 +577,276 @@ export async function verifySafetyNumber(
   );
 }
 
-export async function createGroup(
-  request: CreateGroupRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("create_group", { request }, () => {
-    fallbackSnapshot.servers.unshift({
-      name: request.name || "private lab",
-      role: "owner",
-      channels: [
-        {
-          name: "#general",
-          kind: "Text",
-          retention_status: `${request.retention || fallbackSnapshot.retention.selected}; older messages lock, not vanish`,
-        },
-        {
-          name: "Voice Lobby",
-          kind: "Voice",
-          retention_status:
-            "Session-state only; media-frame E2E gate required before production voice claims",
-        },
-      ],
-    });
-    return fallbackSnapshot;
-  });
+export async function savePreferences(
+  request: SavePreferencesRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("save_preferences", { request }, () =>
+    mutateFallback((state) => {
+      state.preferences = request;
+      pushEvent(state, "preferences.saved", "Theme/template preferences saved");
+    }),
+  );
 }
 
-export async function joinGroup(
-  request: JoinGroupRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("join_group", { request }, () => {
-    fallbackSnapshot.servers.unshift({
-      name: request.invite_code.includes("enclave")
-        ? "joined enclave"
-        : "joined group",
-      role: "member",
-      channels: [
-        {
-          name: "#general",
-          kind: "Text",
-          retention_status: `${fallbackSnapshot.retention.selected}; older messages lock, not vanish`,
-        },
-        {
-          name: "Voice Lobby",
-          kind: "Voice",
-          retention_status:
-            "Session-state only; media-frame E2E gate required before production voice claims",
-        },
-      ],
-    });
-    return fallbackSnapshot;
-  });
+export async function startDm(request: StartDmRequest): Promise<AppState> {
+  return invokeOrFallback<AppState>("start_dm", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const displayName = request.display_name.trim() || "Bob";
+      const dmId = `dm-${slugify(displayName)}`;
+      if (!state.dms.some((dm) => dm.dm_id === dmId)) {
+        state.dms.push({
+          dm_id: dmId,
+          participant_id: slugify(displayName),
+          display_name: displayName,
+          local_only_copy: "Local harness-backed DM; no remote delivery is claimed",
+        });
+      }
+      state.active_context = { kind: "dm", group_id: null, channel_id: null, dm_id: dmId };
+      pushEvent(state, "dm.started", `Opened local DM with ${displayName}`);
+    }),
+  );
+}
+
+export async function createGroup(
+  request: CreateGroupRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("create_group", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const name = request.name.trim() || "private lab";
+      const groupId = `group-${slugify(name)}`;
+      if (!state.groups.some((group) => group.group_id === groupId)) {
+        state.groups.push({ group_id: groupId, name, role: "owner", channels: [] });
+      }
+      state.active_context = { kind: "group", group_id: groupId, channel_id: null, dm_id: null };
+      pushEvent(state, "group.created", `Created group ${name}`);
+    }),
+  );
+}
+
+export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
+  return invokeOrFallback<AppState>("join_group", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const name =
+        request.group_name?.trim() ||
+        (request.invite_code.includes("enclave") ? "joined enclave" : "joined group");
+      const groupId = `group-${slugify(name)}`;
+      if (!state.groups.some((group) => group.group_id === groupId)) {
+        state.groups.push({ group_id: groupId, name, role: "member", channels: [] });
+      }
+      state.active_context = { kind: "group", group_id: groupId, channel_id: null, dm_id: null };
+      pushEvent(state, "group.joined", `Joined ${name} via ${request.invite_code}`);
+    }),
+  );
+}
+
+export async function createInvite(
+  request: CreateInviteRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("create_invite", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const groupId = request.group_id ?? state.groups[0]?.group_id;
+      if (!groupId) return;
+      const group = state.groups.find((item) => item.group_id === groupId);
+      const inviteId = `invite-${state.invites.length + 1}`;
+      state.invites.push({
+        invite_id: inviteId,
+        group_id: groupId,
+        code: `discrypt://join/${inviteId}-${slugify(group?.name ?? "group")}`,
+        expires: request.expires || fallbackState.snapshot.invite.expires,
+        max_use: request.max_use || fallbackState.snapshot.invite.max_use,
+        admission_copy: fallbackState.snapshot.invite.welcome_required,
+      });
+      pushEvent(state, "invite.created", `Invite created for ${group?.name ?? "group"}`);
+    }),
+  );
 }
 
 export async function createChannel(
   request: CreateChannelRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("create_channel", { request }, () => {
-    const server =
-      fallbackSnapshot.servers.find(
-        (item) => item.name === request.server_name,
-      ) ?? fallbackSnapshot.servers[0];
-    const name =
-      request.kind === "Text"
-        ? `#${request.name.replace(/^#/, "") || "secure-room"}`
-        : request.name || "Voice Lobby";
-    if (!server.channels.some((channel) => channel.name === name)) {
-      server.channels.push({
-        name,
-        kind: request.kind,
-        retention_status: `${fallbackSnapshot.retention.selected}; older messages lock, not vanish`,
-      });
-    }
-    return fallbackSnapshot;
-  });
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("create_channel", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const group = state.groups.find((item) => item.group_id === request.group_id);
+      if (!group) return;
+      const name =
+        request.kind === "Text"
+          ? `#${request.name.replace(/^#/, "") || "secure-room"}`
+          : request.name || "Voice Lobby";
+      if (!group.channels.some((channel) => channel.name === name)) {
+        group.channels.push({
+          channel_id: `channel-${slugify(name)}`,
+          name,
+          kind: request.kind,
+          retention_status: request.retention_status,
+        });
+      }
+      const channel = group.channels.find((item) => item.name === name);
+      state.active_context = {
+        kind: request.kind === "Text" ? "text_channel" : "voice_channel",
+        group_id: group.group_id,
+        channel_id: channel?.channel_id ?? null,
+        dm_id: null,
+      };
+      pushEvent(state, "channel.created", `Created channel ${name}`);
+    }),
+  );
 }
 
-export async function savePreferences(
-  request: SavePreferencesRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("save_preferences", { request }, () => {
-    fallbackSnapshot.preferences = request;
-    return fallbackSnapshot;
-  });
+export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
+  return invokeOrFallback<AppState>("join_voice", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      state.voice_session = {
+        session_id: `voice-${request.channel_id}`,
+        group_id: request.group_id,
+        channel_id: request.channel_id,
+        joined: true,
+        self_muted: state.voice_session?.self_muted ?? false,
+        participants: [
+          { id: "local-user", name: "You", role: "you", speaking: true, muted: false, volume: 82 },
+          { id: "bob", name: "Bob", role: "friend", speaking: false, muted: false, volume: 68 },
+          { id: "ops", name: "Ops relay", role: "route", speaking: false, muted: true, volume: 38 },
+        ],
+        route_copy: "STUN → peer relay overlay → TURN; route is harness-backed",
+        status_copy:
+          "Voice session state joined; real audio-frame media remains release-gated",
+      };
+      state.active_context = {
+        kind: "voice_channel",
+        group_id: request.group_id,
+        channel_id: request.channel_id,
+        dm_id: null,
+      };
+      pushEvent(state, "voice.joined", "Joined command-backed local voice session");
+    }),
+  );
 }
 
-export async function joinVoice(): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("join_voice", undefined, () => {
-    fallbackSnapshot.voice_session.joined = true;
-    return fallbackSnapshot;
-  });
+export async function leaveVoice(request: LeaveVoiceRequest): Promise<AppState> {
+  return invokeOrFallback<AppState>("leave_voice", { request }, () =>
+    mutateFallback((state) => {
+      if (!state.voice_session || state.voice_session.session_id !== request.session_id) return;
+      state.voice_session.joined = false;
+      state.voice_session.status_copy =
+        "Not joined; transport/media unavailable until real adapter gates pass";
+      state.voice_session.participants = state.voice_session.participants.map((participant) => ({
+        ...participant,
+        speaking: false,
+      }));
+      pushEvent(state, "voice.left", "Left command-backed local voice session");
+    }),
+  );
 }
 
-export async function leaveVoice(): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("leave_voice", undefined, () => {
-    fallbackSnapshot.voice_session.joined = false;
-    return fallbackSnapshot;
-  });
-}
-
-export async function setSelfMute(
-  request: SelfMuteRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("set_self_mute", { request }, () => {
-    fallbackSnapshot.voice_session.participants =
-      fallbackSnapshot.voice_session.participants.map((participant) =>
-        participant.id === "alice"
+export async function setSelfMute(request: SelfMuteRequest): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_self_mute", { request }, () =>
+    mutateFallback((state) => {
+      if (!state.voice_session || state.voice_session.session_id !== request.session_id) return;
+      state.voice_session.self_muted = request.muted;
+      state.voice_session.participants = state.voice_session.participants.map((participant) =>
+        participant.id === "local-user"
           ? {
               ...participant,
               muted: request.muted,
-              speaking: fallbackSnapshot.voice_session.joined && !request.muted,
+              speaking: state.voice_session?.joined === true && !request.muted,
             }
           : participant,
       );
-    return fallbackSnapshot;
-  });
+      pushEvent(state, "voice.self_mute", request.muted ? "Self muted" : "Self unmuted");
+    }),
+  );
 }
 
 export async function setSpeakerVolume(
   request: SpeakerVolumeRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>(
-    "set_speaker_volume",
-    { request },
-    () => {
-      fallbackSnapshot.voice_session.participants =
-        fallbackSnapshot.voice_session.participants.map((participant) =>
-          participant.id === request.participant_id
-            ? { ...participant, volume: request.volume }
-            : participant,
-        );
-      return fallbackSnapshot;
-    },
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_speaker_volume", { request }, () =>
+    mutateFallback((state) => {
+      if (!state.voice_session || state.voice_session.session_id !== request.session_id) return;
+      state.voice_session.participants = state.voice_session.participants.map((participant) =>
+        participant.id === request.participant_id
+          ? { ...participant, volume: Math.max(0, Math.min(100, request.volume)) }
+          : participant,
+      );
+      pushEvent(state, "voice.volume", `Set ${request.participant_id} volume`);
+    }),
   );
 }
 
 export async function sendMessage(
   request: SendMessageRequest,
-): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("send_message", { request }, () => {
-    fallbackSnapshot.messages.push({
-      id: `fallback-${fallbackSnapshot.messages.length + 1}`,
-      channel: request.channel,
-      author: "Alice",
-      body: request.body,
-      state:
-        "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness",
-    });
-    return fallbackSnapshot;
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("send_message", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const body = request.body.trim();
+      if (!body) return;
+      state.messages.push({
+        message_id: `fallback-${state.messages.length + 1}`,
+        target: request.target,
+        author_id: "local-user",
+        author: state.profile?.display_name ?? "Alice",
+        body,
+        status:
+          "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness",
+        sent_at: `local-${state.messages.length + 1}`,
+      });
+      pushEvent(state, "message.sent", "Message appended to local encrypted timeline facade");
+    }),
+  );
+}
+
+export async function pollAppEvents(): Promise<AppEventView[]> {
+  return invokeOrFallback<AppEventView[]>("poll_app_events", undefined, () =>
+    cloneState(syncSnapshot(fallbackState)).events,
+  );
+}
+
+export async function deletionWarning(): Promise<string> {
+  return invokeOrFallback<string>("deletion_warning", undefined, () =>
+    fallbackState.security_copy.deletion,
+  );
+}
+
+export async function metadataWarning(): Promise<string> {
+  return invokeOrFallback<string>("metadata_warning", undefined, () =>
+    fallbackState.security_copy.metadata,
+  );
+}
+
+export async function commandHealth(): Promise<CommandHealth> {
+  return invokeOrFallback<CommandHealth>("command_health", undefined, () => ({
+    app_state_ready: true,
+    identity_ready: true,
+    collaboration_ready: true,
+    voice_ready: true,
+    honest_copy_ready: true,
+  }));
+}
+
+export async function resetAppState(): Promise<AppState> {
+  return invokeOrFallback<AppState>("reset_app_state", undefined, () => {
+    fallbackState.lifecycle = "first_run";
+    fallbackState.profile = null;
+    fallbackState.dms = [];
+    fallbackState.groups = [];
+    fallbackState.active_context = null;
+    fallbackState.messages = [];
+    fallbackState.voice_session = null;
+    fallbackState.invites = [];
+    fallbackState.devices = [];
+    fallbackState.events = [
+      {
+        sequence: 1,
+        kind: "app.first_run",
+        summary: "No local profile exists; setup/recovery is required",
+      },
+    ];
+    return cloneState(syncSnapshot(fallbackState));
   });
 }
