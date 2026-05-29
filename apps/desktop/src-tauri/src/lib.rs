@@ -497,7 +497,7 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "owner".to_owned(),
-                channels: Vec::new(),
+                channels: default_group_channels(state.next_sequence),
             });
         }
         let active_group_id = state
@@ -526,23 +526,33 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
         let invite_code = normalize_label(&request.invite_code, "manual invite");
+        if let Some(invite) = state.invites.iter().find(|invite| invite.code == invite_code).cloned() {
+            let group_name = state
+                .groups
+                .iter()
+                .find(|group| group.group_id == invite.group_id)
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| "group".to_owned());
+            state.active_context = Some(ActiveContextView {
+                kind: "group".to_owned(),
+                group_id: Some(invite.group_id.clone()),
+                channel_id: None,
+                dm_id: None,
+            });
+            state.push_event("group.opened_from_invite", format!("Opened {group_name} from local invite"));
+            return;
+        }
         let name = request
             .group_name
             .map(|value| normalize_label(&value, "joined enclave"))
-            .unwrap_or_else(|| {
-                if invite_code.contains("enclave") {
-                    "joined enclave".to_owned()
-                } else {
-                    "joined group".to_owned()
-                }
-            });
+            .unwrap_or_else(|| parse_invite_group_name(&invite_code));
         let group_id = stable_id("group", &name, state.next_sequence);
         if !state.groups.iter().any(|group| group.name == name) {
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "member".to_owned(),
-                channels: Vec::new(),
+                channels: default_group_channels(state.next_sequence),
             });
         }
         let active_group_id = state
@@ -690,8 +700,8 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             joined: true,
             self_muted,
             participants: default_voice_participants(!self_muted),
-            route_copy: "STUN → peer relay overlay → TURN; route is harness-backed".to_owned(),
-            status_copy: "Voice session state joined; real audio-frame media remains release-gated"
+            route_copy: "Local voice controls only; network media route is not connected in this build".to_owned(),
+            status_copy: "Voice session state joined locally; real audio-frame media remains release-gated"
                 .to_owned(),
         });
         state.active_context = Some(ActiveContextView {
@@ -711,7 +721,7 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
             if session.session_id == request.session_id {
                 session.joined = false;
                 session.status_copy =
-                    "Not joined; transport/media unavailable until real adapter gates pass"
+                    "Not joined; command-backed local voice controls are idle"
                         .to_owned();
                 for participant in &mut session.participants {
                     participant.speaking = false;
@@ -1083,8 +1093,8 @@ impl PersistedAppState {
                         volume: participant.volume,
                     })
                     .collect(),
-                status_copy: "Not joined; voice session is optional and shell-safe".to_owned(),
-                route_copy: "Route copy is harness-backed until socket/media adapter E2E passes"
+                status_copy: "Not joined; command-backed local voice controls are idle".to_owned(),
+                route_copy: "Local voice controls only; network media route is not connected in this build"
                     .to_owned(),
             }
         };
@@ -1237,33 +1247,42 @@ fn state_path() -> PathBuf {
     PathBuf::from("discrypt-app-state.json")
 }
 
-fn default_voice_participants(local_speaking: bool) -> Vec<VoiceParticipantView> {
+fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
     vec![
-        VoiceParticipantView {
-            id: "local-user".to_owned(),
-            name: "You".to_owned(),
-            role: "you".to_owned(),
-            speaking: local_speaking,
-            muted: false,
-            volume: 82,
+        ChannelStateView {
+            channel_id: stable_id("channel", "general", sequence),
+            name: "#general".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "7 days".to_owned(),
         },
-        VoiceParticipantView {
-            id: "bob".to_owned(),
-            name: "Bob".to_owned(),
-            role: "friend".to_owned(),
-            speaking: false,
-            muted: false,
-            volume: 68,
-        },
-        VoiceParticipantView {
-            id: "ops".to_owned(),
-            name: "Ops relay".to_owned(),
-            role: "route".to_owned(),
-            speaking: false,
-            muted: true,
-            volume: 38,
+        ChannelStateView {
+            channel_id: stable_id("channel", "Voice Lobby", sequence),
+            name: "Voice Lobby".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
         },
     ]
+}
+
+fn default_voice_participants(local_speaking: bool) -> Vec<VoiceParticipantView> {
+    vec![VoiceParticipantView {
+        id: "local-user".to_owned(),
+        name: "You".to_owned(),
+        role: "you".to_owned(),
+        speaking: local_speaking,
+        muted: false,
+        volume: 82,
+    }]
+}
+
+fn parse_invite_group_name(invite_code: &str) -> String {
+    invite_code
+        .rsplit('/')
+        .next()
+        .and_then(|tail| tail.split_once('-').map(|(_, slug)| slug))
+        .map(|slug| slug.replace('-', " "))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "joined group".to_owned())
 }
 
 fn snapshot_channel_label(message: &MessageView, state: &PersistedAppState) -> String {
@@ -1541,7 +1560,7 @@ mod tests {
             .unwrap_or(false));
         let volume = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id: session_id.clone(),
-            participant_id: "bob".to_owned(),
+            participant_id: "local-user".to_owned(),
             volume: 55,
         });
         assert_eq!(
@@ -1551,7 +1570,7 @@ mod tests {
                 .and_then(|session| session
                     .participants
                     .iter()
-                    .find(|participant| participant.id == "bob"))
+                    .find(|participant| participant.id == "local-user"))
                 .map(|participant| participant.volume),
             Some(55)
         );

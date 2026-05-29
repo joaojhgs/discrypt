@@ -338,17 +338,19 @@ const fallbackSnapshot: AppSnapshot = {
       "Shortening re-locks older messages retroactively; lengthening applies only to future messages",
   },
   voice: {
-    route: "STUN → peer relay overlay → TURN",
+    route:
+      "Local voice controls only; network media route is not connected in this build",
     relay_copy:
-      "Relays see SFrame ciphertext only in harness gates; production media waits for real media-frame E2E",
+      "No relay is active in the desktop harness until real media/socket E2E gates pass",
     android_path:
-      "Android uses encoded transforms when available, otherwise the native webrtc-rs contingency",
+      "Android media routing remains release-gated until platform E2E passes",
   },
   voice_session: {
     joined: false,
     participants: [],
-    status_copy: "Not joined; voice session is optional and shell-safe",
-    route_copy: "Route copy is harness-backed until socket/media adapter E2E passes",
+    status_copy: "Not joined; command-backed local voice controls are idle",
+    route_copy:
+      "Route copy is harness-backed until socket/media adapter E2E passes",
   },
   preferences: { theme_id: "graphite-calm", template_id: "command-center" },
   messages: [],
@@ -439,8 +441,9 @@ function syncSnapshot(state: AppState): AppState {
     : {
         joined: false,
         participants: [],
-        status_copy: "Not joined; voice session is optional and shell-safe",
-        route_copy: "Route copy is harness-backed until socket/media adapter E2E passes",
+        status_copy: "Not joined; command-backed local voice controls are idle",
+        route_copy:
+          "Local voice controls only; network media route is not connected in this build",
       };
   state.snapshot.activity_feed = state.events
     .slice()
@@ -464,6 +467,31 @@ function slugify(value: string): string {
   );
 }
 
+function defaultGroupChannels(): ChannelStateView[] {
+  return [
+    {
+      channel_id: "channel-general",
+      name: "#general",
+      kind: "Text",
+      retention_status: "7 days",
+    },
+    {
+      channel_id: "channel-voice-lobby",
+      name: "Voice Lobby",
+      kind: "Voice",
+      retention_status: "session",
+    },
+  ];
+}
+
+function parseInviteGroupName(inviteCode: string): string {
+  const tail = inviteCode.trim().split("/").filter(Boolean).at(-1) ?? "";
+  const name = tail.includes("-")
+    ? tail.slice(tail.indexOf("-") + 1).replace(/-/g, " ")
+    : "joined group";
+  return name.trim() || "joined group";
+}
+
 function invokeOrFallback<T>(
   command: string,
   args: Record<string, unknown> | undefined,
@@ -481,24 +509,34 @@ function mutateFallback(update: (state: AppState) => void): AppState {
   return cloneState(syncSnapshot(fallbackState));
 }
 
-function ensureFallbackReady(displayName = "Alice", deviceName = "Desktop"): void {
+function ensureFallbackReady(
+  displayName = "Alice",
+  deviceName = "Desktop",
+): void {
   if (fallbackState.lifecycle === "ready") return;
   fallbackState.lifecycle = "ready";
   fallbackState.profile = {
     user_id: `user-${slugify(displayName)}`,
     display_name: displayName,
     device_name: deviceName,
-    recovery_status: "New local profile; recovery export remains a local placeholder",
+    recovery_status:
+      "New local profile; recovery export remains a local placeholder",
   };
   fallbackState.devices = [
-    { device_id: slugify(deviceName), leaf_index: 1, local: true, authorized: true },
+    {
+      device_id: slugify(deviceName),
+      leaf_index: 1,
+      local: true,
+      authorized: true,
+    },
   ];
   fallbackState.dms = [
     {
       dm_id: "dm-bob",
       participant_id: "bob",
       display_name: "Bob",
-      local_only_copy: "Default local DM fixture; no remote delivery is claimed",
+      local_only_copy:
+        "Default local DM fixture; no remote delivery is claimed",
     },
   ];
   fallbackState.active_context = {
@@ -507,7 +545,11 @@ function ensureFallbackReady(displayName = "Alice", deviceName = "Desktop"): voi
     channel_id: null,
     dm_id: "dm-bob",
   };
-  pushEvent(fallbackState, "identity.created", `Profile ready for ${displayName}`);
+  pushEvent(
+    fallbackState,
+    "identity.created",
+    `Profile ready for ${displayName}`,
+  );
 }
 
 export async function loadAppState(): Promise<AppState> {
@@ -517,8 +559,10 @@ export async function loadAppState(): Promise<AppState> {
 }
 
 export async function loadCompatibilityAppSnapshot(): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>("app_snapshot", undefined, () =>
-    cloneState(syncSnapshot(fallbackState)).snapshot,
+  return invokeOrFallback<AppSnapshot>(
+    "app_snapshot",
+    undefined,
+    () => cloneState(syncSnapshot(fallbackState)).snapshot,
   );
 }
 
@@ -527,7 +571,9 @@ export async function loadAppSnapshot(): Promise<AppSnapshot> {
   return state.snapshot;
 }
 
-export async function createUser(request: CreateUserRequest): Promise<AppState> {
+export async function createUser(
+  request: CreateUserRequest,
+): Promise<AppState> {
   return invokeOrFallback<AppState>("create_user", { request }, () =>
     mutateFallback((state) => {
       const displayName = request.display_name.trim() || "Alice";
@@ -601,10 +647,16 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
           dm_id: dmId,
           participant_id: slugify(displayName),
           display_name: displayName,
-          local_only_copy: "Local harness-backed DM; no remote delivery is claimed",
+          local_only_copy:
+            "Local harness-backed DM; no remote delivery is claimed",
         });
       }
-      state.active_context = { kind: "dm", group_id: null, channel_id: null, dm_id: dmId };
+      state.active_context = {
+        kind: "dm",
+        group_id: null,
+        channel_id: null,
+        dm_id: dmId,
+      };
       pushEvent(state, "dm.started", `Opened local DM with ${displayName}`);
     }),
   );
@@ -619,9 +671,19 @@ export async function createGroup(
       const name = request.name.trim() || "private lab";
       const groupId = `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
-        state.groups.push({ group_id: groupId, name, role: "owner", channels: [] });
+        state.groups.push({
+          group_id: groupId,
+          name,
+          role: "owner",
+          channels: defaultGroupChannels(),
+        });
       }
-      state.active_context = { kind: "group", group_id: groupId, channel_id: null, dm_id: null };
+      state.active_context = {
+        kind: "group",
+        group_id: groupId,
+        channel_id: null,
+        dm_id: null,
+      };
       pushEvent(state, "group.created", `Created group ${name}`);
     }),
   );
@@ -631,15 +693,45 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("join_group", { request }, () =>
     mutateFallback((state) => {
       ensureFallbackReady();
+      const localInvite = state.invites.find(
+        (invite) => invite.code === request.invite_code.trim(),
+      );
+      if (localInvite) {
+        state.active_context = {
+          kind: "group",
+          group_id: localInvite.group_id,
+          channel_id: null,
+          dm_id: null,
+        };
+        pushEvent(
+          state,
+          "group.opened_from_invite",
+          "Opened group from local invite",
+        );
+        return;
+      }
       const name =
-        request.group_name?.trim() ||
-        (request.invite_code.includes("enclave") ? "joined enclave" : "joined group");
+        request.group_name?.trim() || parseInviteGroupName(request.invite_code);
       const groupId = `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
-        state.groups.push({ group_id: groupId, name, role: "member", channels: [] });
+        state.groups.push({
+          group_id: groupId,
+          name,
+          role: "member",
+          channels: defaultGroupChannels(),
+        });
       }
-      state.active_context = { kind: "group", group_id: groupId, channel_id: null, dm_id: null };
-      pushEvent(state, "group.joined", `Joined ${name} via ${request.invite_code}`);
+      state.active_context = {
+        kind: "group",
+        group_id: groupId,
+        channel_id: null,
+        dm_id: null,
+      };
+      pushEvent(
+        state,
+        "group.joined",
+        `Joined ${name} via ${request.invite_code}`,
+      );
     }),
   );
 }
@@ -662,7 +754,11 @@ export async function createInvite(
         max_use: request.max_use || fallbackState.snapshot.invite.max_use,
         admission_copy: fallbackState.snapshot.invite.welcome_required,
       });
-      pushEvent(state, "invite.created", `Invite created for ${group?.name ?? "group"}`);
+      pushEvent(
+        state,
+        "invite.created",
+        `Invite created for ${group?.name ?? "group"}`,
+      );
     }),
   );
 }
@@ -673,7 +769,9 @@ export async function createChannel(
   return invokeOrFallback<AppState>("create_channel", { request }, () =>
     mutateFallback((state) => {
       ensureFallbackReady();
-      const group = state.groups.find((item) => item.group_id === request.group_id);
+      const group = state.groups.find(
+        (item) => item.group_id === request.group_id,
+      );
       if (!group) return;
       const name =
         request.kind === "Text"
@@ -710,13 +808,19 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
         joined: true,
         self_muted: state.voice_session?.self_muted ?? false,
         participants: [
-          { id: "local-user", name: "You", role: "you", speaking: true, muted: false, volume: 82 },
-          { id: "bob", name: "Bob", role: "friend", speaking: false, muted: false, volume: 68 },
-          { id: "ops", name: "Ops relay", role: "route", speaking: false, muted: true, volume: 38 },
+          {
+            id: "local-user",
+            name: "You",
+            role: "you",
+            speaking: true,
+            muted: false,
+            volume: 82,
+          },
         ],
-        route_copy: "STUN → peer relay overlay → TURN; route is harness-backed",
+        route_copy:
+          "Local voice controls only; network media route is not connected in this build",
         status_copy:
-          "Voice session state joined; real audio-frame media remains release-gated",
+          "Voice session state joined locally; real audio-frame media remains release-gated",
       };
       state.active_context = {
         kind: "voice_channel",
@@ -724,22 +828,34 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
         channel_id: request.channel_id,
         dm_id: null,
       };
-      pushEvent(state, "voice.joined", "Joined command-backed local voice session");
+      pushEvent(
+        state,
+        "voice.joined",
+        "Joined command-backed local voice session",
+      );
     }),
   );
 }
 
-export async function leaveVoice(request: LeaveVoiceRequest): Promise<AppState> {
+export async function leaveVoice(
+  request: LeaveVoiceRequest,
+): Promise<AppState> {
   return invokeOrFallback<AppState>("leave_voice", { request }, () =>
     mutateFallback((state) => {
-      if (!state.voice_session || state.voice_session.session_id !== request.session_id) return;
+      if (
+        !state.voice_session ||
+        state.voice_session.session_id !== request.session_id
+      )
+        return;
       state.voice_session.joined = false;
       state.voice_session.status_copy =
-        "Not joined; transport/media unavailable until real adapter gates pass";
-      state.voice_session.participants = state.voice_session.participants.map((participant) => ({
-        ...participant,
-        speaking: false,
-      }));
+        "Not joined; command-backed local voice controls are idle";
+      state.voice_session.participants = state.voice_session.participants.map(
+        (participant) => ({
+          ...participant,
+          speaking: false,
+        }),
+      );
       pushEvent(state, "voice.left", "Left command-backed local voice session");
     }),
   );
@@ -748,18 +864,28 @@ export async function leaveVoice(request: LeaveVoiceRequest): Promise<AppState> 
 export async function setSelfMute(request: SelfMuteRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("set_self_mute", { request }, () =>
     mutateFallback((state) => {
-      if (!state.voice_session || state.voice_session.session_id !== request.session_id) return;
+      if (
+        !state.voice_session ||
+        state.voice_session.session_id !== request.session_id
+      )
+        return;
       state.voice_session.self_muted = request.muted;
-      state.voice_session.participants = state.voice_session.participants.map((participant) =>
-        participant.id === "local-user"
-          ? {
-              ...participant,
-              muted: request.muted,
-              speaking: state.voice_session?.joined === true && !request.muted,
-            }
-          : participant,
+      state.voice_session.participants = state.voice_session.participants.map(
+        (participant) =>
+          participant.id === "local-user"
+            ? {
+                ...participant,
+                muted: request.muted,
+                speaking:
+                  state.voice_session?.joined === true && !request.muted,
+              }
+            : participant,
       );
-      pushEvent(state, "voice.self_mute", request.muted ? "Self muted" : "Self unmuted");
+      pushEvent(
+        state,
+        "voice.self_mute",
+        request.muted ? "Self muted" : "Self unmuted",
+      );
     }),
   );
 }
@@ -769,11 +895,19 @@ export async function setSpeakerVolume(
 ): Promise<AppState> {
   return invokeOrFallback<AppState>("set_speaker_volume", { request }, () =>
     mutateFallback((state) => {
-      if (!state.voice_session || state.voice_session.session_id !== request.session_id) return;
-      state.voice_session.participants = state.voice_session.participants.map((participant) =>
-        participant.id === request.participant_id
-          ? { ...participant, volume: Math.max(0, Math.min(100, request.volume)) }
-          : participant,
+      if (
+        !state.voice_session ||
+        state.voice_session.session_id !== request.session_id
+      )
+        return;
+      state.voice_session.participants = state.voice_session.participants.map(
+        (participant) =>
+          participant.id === request.participant_id
+            ? {
+                ...participant,
+                volume: Math.max(0, Math.min(100, request.volume)),
+              }
+            : participant,
       );
       pushEvent(state, "voice.volume", `Set ${request.participant_id} volume`);
     }),
@@ -798,26 +932,36 @@ export async function sendMessage(
           "plaintext allowed by current local retention cache; encrypted envelope facade recorded by harness",
         sent_at: `local-${state.messages.length + 1}`,
       });
-      pushEvent(state, "message.sent", "Message appended to local encrypted timeline facade");
+      pushEvent(
+        state,
+        "message.sent",
+        "Message appended to local encrypted timeline facade",
+      );
     }),
   );
 }
 
 export async function pollAppEvents(): Promise<AppEventView[]> {
-  return invokeOrFallback<AppEventView[]>("poll_app_events", undefined, () =>
-    cloneState(syncSnapshot(fallbackState)).events,
+  return invokeOrFallback<AppEventView[]>(
+    "poll_app_events",
+    undefined,
+    () => cloneState(syncSnapshot(fallbackState)).events,
   );
 }
 
 export async function deletionWarning(): Promise<string> {
-  return invokeOrFallback<string>("deletion_warning", undefined, () =>
-    fallbackState.security_copy.deletion,
+  return invokeOrFallback<string>(
+    "deletion_warning",
+    undefined,
+    () => fallbackState.security_copy.deletion,
   );
 }
 
 export async function metadataWarning(): Promise<string> {
-  return invokeOrFallback<string>("metadata_warning", undefined, () =>
-    fallbackState.security_copy.metadata,
+  return invokeOrFallback<string>(
+    "metadata_warning",
+    undefined,
+    () => fallbackState.security_copy.metadata,
   );
 }
 

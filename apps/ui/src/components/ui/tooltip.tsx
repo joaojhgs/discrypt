@@ -1,12 +1,23 @@
-import * as React from 'react';
-import * as TooltipPrimitive from '@radix-ui/react-tooltip';
-import { cn } from '@/lib/utils';
-
-const TooltipProvider = TooltipPrimitive.Provider;
-const Tooltip = TooltipPrimitive.Root;
-const TooltipTrigger = TooltipPrimitive.Trigger;
-const TooltipContent = React.forwardRef<React.ElementRef<typeof TooltipPrimitive.Content>, React.ComponentPropsWithoutRef<typeof TooltipPrimitive.Content>>(({ className, sideOffset = 4, ...props }, ref) => (
-  <TooltipPrimitive.Content ref={ref} sideOffset={sideOffset} className={cn('z-50 overflow-hidden rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--popover))] px-3 py-1.5 text-xs text-[hsl(var(--popover-foreground))] shadow-md', className)} {...props} />
-));
-TooltipContent.displayName = TooltipPrimitive.Content.displayName;
+import * as React from "react";
+const TooltipProvider = ({
+  children,
+}: {
+  children: React.ReactNode;
+  delayDuration?: number;
+}) => <>{children}</>;
+const Tooltip = ({ children }: { children: React.ReactNode }) => (
+  <>{children}</>
+);
+const TooltipTrigger = ({
+  children,
+}: {
+  children: React.ReactNode;
+  asChild?: boolean;
+}) => <>{children}</>;
+const TooltipContent = ({
+  children,
+}: {
+  children: React.ReactNode;
+  side?: string;
+}) => <span className="sr-only">{children}</span>;
 export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider };

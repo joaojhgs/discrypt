@@ -745,40 +745,22 @@ fn seed_state() -> AppState {
                 transition_copy: "Shortening re-locks older messages retroactively; lengthening applies only to future messages".to_owned(),
             },
             voice: VoiceRoomView {
-                route: "STUN → peer relay overlay → TURN".to_owned(),
-                relay_copy: "Relays see SFrame ciphertext only in harness gates; production media waits for real audio-frame E2E".to_owned(),
-                android_path: "Android uses encoded transforms when available, otherwise the native webrtc-rs contingency".to_owned(),
+                route: "Local voice controls only; network media route is not connected in this build".to_owned(),
+                relay_copy: "No relay is active in the desktop harness until real media/socket E2E gates pass".to_owned(),
+                android_path: "Android media routing remains release-gated until platform E2E passes".to_owned(),
             },
             voice_session: VoiceSessionView {
-                joined: true,
-                participants: vec![
-                    VoiceParticipantView {
-                        id: "alice".to_owned(),
-                        name: "Alice".to_owned(),
-                        role: "you".to_owned(),
-                        speaking: true,
-                        muted: false,
-                        volume: 82,
-                    },
-                    VoiceParticipantView {
-                        id: "bob".to_owned(),
-                        name: "Bob".to_owned(),
-                        role: "friend".to_owned(),
-                        speaking: true,
-                        muted: false,
-                        volume: 68,
-                    },
-                    VoiceParticipantView {
-                        id: "ops".to_owned(),
-                        name: "Ops relay".to_owned(),
-                        role: "route".to_owned(),
-                        speaking: false,
-                        muted: true,
-                        volume: 38,
-                    },
-                ],
-                status_copy: "Voice session state is command-backed; real audio-frame transport remains release-gated".to_owned(),
-                route_copy: "Route copy is harness-backed until socket/media adapter E2E passes".to_owned(),
+                joined: false,
+                participants: vec![VoiceParticipantView {
+                    id: "alice".to_owned(),
+                    name: "Alice".to_owned(),
+                    role: "you".to_owned(),
+                    speaking: false,
+                    muted: false,
+                    volume: 82,
+                }],
+                status_copy: "Not joined; command-backed local voice controls are idle".to_owned(),
+                route_copy: "Local voice controls only; network media route is not connected in this build".to_owned(),
             },
             preferences: PreferencesView {
                 theme_id: DEFAULT_THEME_ID.to_owned(),
@@ -950,14 +932,14 @@ mod tests {
             .iter()
             .any(|participant| participant.id == "alice" && participant.muted));
         let volume = service.set_speaker_volume(SpeakerVolumeRequest {
-            participant_id: "bob".to_owned(),
+            participant_id: "alice".to_owned(),
             volume: 41,
         })?;
         assert!(volume
             .voice_session
             .participants
             .iter()
-            .any(|participant| participant.id == "bob" && participant.volume == 41));
+            .any(|participant| participant.id == "alice" && participant.volume == 41));
         let text = service.send_message(SendMessageRequest {
             channel: "#general".to_owned(),
             body: "hello command-backed timeline".to_owned(),
