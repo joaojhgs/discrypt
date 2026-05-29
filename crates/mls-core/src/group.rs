@@ -163,9 +163,9 @@ mod tests {
             0,
         );
         let mut group = GroupState::new("room");
-        let before = group.export(ExportLabel::SFrame, b"call");
+        let before = group.export(ExportLabel::Media, b"call");
         assert_eq!(group.add_leaf(leaf.clone()), Ok(()));
-        let after_add = group.export(ExportLabel::SFrame, b"call");
+        let after_add = group.export(ExportLabel::Media, b"call");
         assert_ne!(before, after_add);
         assert_eq!(group.remove_leaf(leaf.leaf_index), Ok(()));
         assert_eq!(group.epoch, 2);
@@ -220,8 +220,8 @@ mod tests {
 
         assert_eq!(group.members().len(), 16);
         assert_eq!(group.epoch, 16);
-        let first = group.export(ExportLabel::SFrame, b"call");
-        let second = group.export(ExportLabel::SFrame, b"call");
+        let first = group.export(ExportLabel::Media, b"call");
+        let second = group.export(ExportLabel::Media, b"call");
         assert_eq!(first, second);
 
         for leaf in leaves.into_iter().take(4) {
@@ -230,7 +230,7 @@ mod tests {
 
         assert_eq!(group.members().len(), 12);
         assert_eq!(group.epoch, 20);
-        assert_ne!(first, group.export(ExportLabel::SFrame, b"call"));
+        assert_ne!(first, group.export(ExportLabel::Media, b"call"));
     }
 
     #[test]
@@ -250,7 +250,7 @@ mod tests {
             group.validate_sender(compromised.leaf_index, group.epoch),
             Ok(())
         );
-        let before_rotation = group.export(ExportLabel::Content, b"text");
+        let before_rotation = group.export(ExportLabel::Text, b"text");
 
         let rotation = devices.rotate_compromised_device(
             &identity,
@@ -265,7 +265,7 @@ mod tests {
             Ok(())
         );
 
-        assert_ne!(before_rotation, group.export(ExportLabel::Content, b"text"));
+        assert_ne!(before_rotation, group.export(ExportLabel::Text, b"text"));
         assert!(!group.sender_may_send(compromised.leaf_index, group.epoch));
         assert_eq!(
             group.validate_sender(compromised.leaf_index, group.epoch),

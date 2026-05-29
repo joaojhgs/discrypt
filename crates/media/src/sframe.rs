@@ -115,7 +115,7 @@ impl SFrameKey {
         binding.validate()?;
         let context = binding_context(binding);
         Ok(Self {
-            bytes: derive_epoch_secret(epoch_secret, ExportLabel::SFrame, &context),
+            bytes: derive_epoch_secret(epoch_secret, ExportLabel::Media, &context),
             kid: binding.kid.clone(),
             binding_hash: binding_hash(binding),
         })

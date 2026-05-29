@@ -8,6 +8,7 @@
 
 pub mod production_status;
 use chrono::{DateTime, Duration, Utc};
+use mls_core::{derive_epoch_secret, ExportLabel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,15 +63,18 @@ pub enum KeyState {
     RateLimited,
 }
 
-/// Deterministic content key derivation for tests/facade.
+/// Deterministic content-key derivation for tests/facade.
+///
+/// Content keys are derived through the MLS exporter facade using the
+/// content-key service label. Raw exporter bytes stay inside Rust-owned
+/// content-key logic rather than crossing command/UI boundaries.
 #[must_use]
 pub fn derive_content_key(author: u32, message_id: &str, epoch_secret: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"discrypt-content-key");
-    h.update(author.to_be_bytes());
-    h.update(message_id.as_bytes());
-    h.update(epoch_secret);
-    h.finalize().into()
+    let mut context = Vec::with_capacity(12 + message_id.len());
+    context.extend_from_slice(&author.to_be_bytes());
+    context.extend_from_slice(&(message_id.len() as u64).to_be_bytes());
+    context.extend_from_slice(message_id.as_bytes());
+    derive_epoch_secret(epoch_secret, ExportLabel::ContentKey, &context)
 }
 
 /// Apply retention to message timestamp.

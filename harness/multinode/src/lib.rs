@@ -509,7 +509,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     let text_plaintext = b"hello from app-level encrypted text";
     let text_key = derive_epoch_secret(
         &[33; 32],
-        ExportLabel::Content,
+        ExportLabel::Text,
         b"room=lab;epoch=7;m=alice-1",
     );
     let text_ciphertext = xor_text_ciphertext(&text_key, text_plaintext);
@@ -1162,7 +1162,7 @@ pub fn phase_c_device_rotation_smoke() -> Result<PhaseCDeviceRotationSmoke, anyh
 
     let mut group = GroupState::new("phase-c-device-rotation");
     group.add_leaf(compromised.clone())?;
-    let before_rotation = group.export(ExportLabel::Content, b"phase-c-text-send");
+    let before_rotation = group.export(ExportLabel::Text, b"phase-c-text-send");
     let original_epoch = group.epoch;
 
     let rotation = devices.rotate_compromised_device(
@@ -1180,7 +1180,7 @@ pub fn phase_c_device_rotation_smoke() -> Result<PhaseCDeviceRotationSmoke, anyh
         .is_some_and(|device| device.status == DeviceStatus::Compromised)
         && !devices.device_may_send(compromised.device_id)
         && devices.device_may_send(rotation.replacement.device_id);
-    let group_rekeyed_after_rotation = group.export(ExportLabel::Content, b"phase-c-text-send")
+    let group_rekeyed_after_rotation = group.export(ExportLabel::Text, b"phase-c-text-send")
         != before_rotation
         && group.epoch == original_epoch.saturating_add(2);
     let old_device_send_blocked = group.validate_sender(compromised.leaf_index, group.epoch)
