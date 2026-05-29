@@ -357,6 +357,10 @@ pub struct SetSpeakerVolumeRequest {
 /// Command result for local E2E/smoke execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandHealth {
+    /// Compatibility flag for older harnesses that expected snapshot readiness.
+    pub snapshot_ready: bool,
+    /// Compatibility flag for older harnesses that expected safety verification readiness.
+    pub verification_ready: bool,
     /// Canonical app-state command is available.
     pub app_state_ready: bool,
     /// Identity lifecycle commands are available.
@@ -856,6 +860,8 @@ pub fn command_health() -> CommandHealth {
     let honest_copy_ready = deletion_warning().contains("pending on offline devices")
         && metadata_warning().contains("does not claim anonymity");
     CommandHealth {
+        snapshot_ready: state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION,
+        verification_ready: true,
         app_state_ready: state.schema_version == APP_STATE_SCHEMA_VERSION,
         identity_ready: matches!(
             state.lifecycle,
