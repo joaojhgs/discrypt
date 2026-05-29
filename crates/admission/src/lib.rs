@@ -58,6 +58,15 @@ pub enum InviteError {
     /// Password proof failed or exceeded rate limits.
     #[error("password gate rejected")]
     PasswordRejected,
+    /// Online helper proof does not match this admission gate.
+    #[error("helper proof does not match admission gate")]
+    HelperMismatch,
+    /// Online helper proof expired.
+    #[error("helper proof expired")]
+    HelperProofExpired,
+    /// Online helper proof signature is malformed or invalid.
+    #[error("helper proof signature invalid")]
+    InvalidHelperProofSignature,
     /// Final MLS add/Welcome authorization is absent.
     #[error("authorized MLS welcome required")]
     WelcomeRequired,
@@ -285,6 +294,183 @@ impl Invite {
     }
 }
 
+/// Signed proof from an online authorized helper that a subject passed the
+/// password/admission challenge without exposing an offline verifier in invites.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizedHelperProof {
+    /// Helper id expected by the invite's password gate.
+    pub helper_id: String,
+    /// Joining subject/device/session id.
+    pub subject: String,
+    /// Fresh challenge id supplied by the online helper.
+    pub challenge_id: Uuid,
+    /// Proof expiry.
+    pub expires_at: DateTime<Utc>,
+    /// Helper verification key.
+    pub helper_public_key: Vec<u8>,
+    /// Helper signature over the canonical proof payload.
+    pub signature: Vec<u8>,
+}
+
+impl AuthorizedHelperProof {
+    /// Verify helper id, subject, expiry, and Ed25519 signature.
+    pub fn verify(
+        &self,
+        expected_helper_id: &str,
+        expected_subject: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), InviteError> {
+        if self.helper_id != expected_helper_id || self.subject != expected_subject {
+            return Err(InviteError::HelperMismatch);
+        }
+        if now > self.expires_at {
+            return Err(InviteError::HelperProofExpired);
+        }
+        let verifying_key = VerifyingKey::from_bytes(
+            &self
+                .helper_public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| InviteError::InvalidHelperProofSignature)?,
+        )
+        .map_err(|_| InviteError::InvalidHelperProofSignature)?;
+        let signature = Signature::from_slice(&self.signature)
+            .map_err(|_| InviteError::InvalidHelperProofSignature)?;
+        verifying_key
+            .verify(&self.signing_bytes(), &signature)
+            .map_err(|_| InviteError::InvalidHelperProofSignature)
+    }
+
+    fn sign(
+        helper_id: String,
+        subject: String,
+        challenge_id: Uuid,
+        expires_at: DateTime<Utc>,
+        helper_key: &SigningKey,
+    ) -> Self {
+        let helper_public_key = helper_key.verifying_key().to_bytes().to_vec();
+        let mut proof = Self {
+            helper_id,
+            subject,
+            challenge_id,
+            expires_at,
+            helper_public_key,
+            signature: Vec::new(),
+        };
+        proof.signature = helper_key.sign(&proof.signing_bytes()).to_bytes().to_vec();
+        proof
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        canonical_helper_proof_bytes(
+            &self.helper_id,
+            &self.subject,
+            self.challenge_id,
+            self.expires_at,
+            &self.helper_public_key,
+        )
+    }
+}
+
+/// Online helper that rate-limits password attempts and returns short-lived
+/// signed admission proofs. It models the production server/helper side of the
+/// allowed non-OPAQUE path; invites still carry no offline verifier material.
+#[derive(Clone, Debug)]
+pub struct OnlineAdmissionHelper {
+    helper_id: String,
+    password_commitment: [u8; 32],
+    signing_key: SigningKey,
+    max_attempts: u32,
+    proof_ttl_seconds: i64,
+    attempts_by_subject: BTreeMap<String, u32>,
+}
+
+impl OnlineAdmissionHelper {
+    /// Create an online helper with a private password commitment.
+    #[must_use]
+    pub fn new(
+        helper_id: impl Into<String>,
+        password_secret: &[u8],
+        signing_key: SigningKey,
+        max_attempts: u32,
+        proof_ttl_seconds: i64,
+    ) -> Self {
+        Self {
+            helper_id: helper_id.into(),
+            password_commitment: password_secret_commitment(password_secret),
+            signing_key,
+            max_attempts: max_attempts.max(1),
+            proof_ttl_seconds: proof_ttl_seconds.max(1),
+            attempts_by_subject: BTreeMap::new(),
+        }
+    }
+
+    /// Return the helper id referenced by password gates.
+    #[must_use]
+    pub fn helper_id(&self) -> &str {
+        &self.helper_id
+    }
+
+    /// Return helper public key for pinning/trust metadata.
+    #[must_use]
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    /// Attempt the online helper password flow and receive a short-lived proof.
+    pub fn authorize(
+        &mut self,
+        subject: impl Into<String>,
+        password_attempt: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedHelperProof, InviteError> {
+        let subject = subject.into();
+        let attempts = self.attempts_by_subject.entry(subject.clone()).or_default();
+        *attempts = attempts.saturating_add(1);
+        if *attempts > self.max_attempts
+            || password_secret_commitment(password_attempt) != self.password_commitment
+        {
+            return Err(InviteError::PasswordRejected);
+        }
+        Ok(AuthorizedHelperProof::sign(
+            self.helper_id.clone(),
+            subject,
+            Uuid::new_v4(),
+            now + chrono::Duration::seconds(self.proof_ttl_seconds),
+            &self.signing_key,
+        ))
+    }
+}
+
+/// Domain-separated password commitment held by the online helper only.
+#[must_use]
+pub fn password_secret_commitment(password_secret: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-online-helper-password-v1");
+    hasher.update(password_secret);
+    hasher.finalize().into()
+}
+
+fn canonical_helper_proof_bytes(
+    helper_id: &str,
+    subject: &str,
+    challenge_id: Uuid,
+    expires_at: DateTime<Utc>,
+    helper_public_key: &[u8],
+) -> Vec<u8> {
+    let mut bytes = b"discrypt-online-helper-proof".to_vec();
+    bytes.push(1);
+    bytes.extend_from_slice(&(helper_id.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(helper_id.as_bytes());
+    bytes.extend_from_slice(&(subject.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(subject.as_bytes());
+    bytes.extend_from_slice(challenge_id.as_bytes());
+    bytes.extend_from_slice(&expires_at.timestamp_millis().to_le_bytes());
+    bytes.extend_from_slice(&(helper_public_key.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(helper_public_key);
+    bytes
+}
+
 /// Password admission mode; offline-copyable rate limits are forbidden by design.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PasswordGate {
@@ -360,6 +546,38 @@ impl AdmissionController {
             return Err(InviteError::PasswordRejected);
         }
         Ok(())
+    }
+
+    /// Attempt admission with a signed online-helper proof.
+    pub fn attempt_online_helper(
+        &mut self,
+        subject: impl Into<String>,
+        proof: &AuthorizedHelperProof,
+        now: DateTime<Utc>,
+    ) -> Result<(), InviteError> {
+        self.validate_gate()?;
+        let subject = subject.into();
+        let PasswordGate::OnlineAuthorizedHelper { helper_id } = &self.gate else {
+            return Err(InviteError::HelperMismatch);
+        };
+        proof.verify(helper_id, &subject, now)?;
+        Ok(())
+    }
+
+    /// Final admission through the online-helper path requires invite, helper proof, and Welcome/add.
+    pub fn finalize_helper_admission(
+        &mut self,
+        invite: &mut Invite,
+        now: DateTime<Utc>,
+        subject: impl Into<String>,
+        helper_proof: &AuthorizedHelperProof,
+        authorized_welcome: bool,
+    ) -> Result<(), InviteError> {
+        if !authorized_welcome {
+            return Err(InviteError::WelcomeRequired);
+        }
+        self.attempt_online_helper(subject, helper_proof, now)?;
+        invite.consume(now)
     }
 
     /// Final admission requires invite, password gate success, and authorized Welcome/add.
@@ -461,6 +679,84 @@ mod tests {
         assert_eq!(
             store.consume("not-present", now),
             Err(InviteError::NotFound)
+        );
+    }
+
+    #[test]
+    fn online_helper_flow_rate_limits_and_signs_expiring_proofs() {
+        let now = Utc::now();
+        let helper_key = SigningKey::generate(&mut OsRng);
+        let mut helper =
+            OnlineAdmissionHelper::new("helper-a", b"correct horse", helper_key, 2, 60);
+        let proof_result = helper.authorize("alice-device", b"correct horse", now);
+        assert!(proof_result.is_ok());
+        let Ok(proof) = proof_result else {
+            return;
+        };
+        assert!(proof.verify("helper-a", "alice-device", now).is_ok());
+        assert_eq!(
+            proof.verify("helper-b", "alice-device", now),
+            Err(InviteError::HelperMismatch)
+        );
+        assert_eq!(
+            proof.verify("helper-a", "bob-device", now),
+            Err(InviteError::HelperMismatch)
+        );
+        assert_eq!(
+            proof.verify("helper-a", "alice-device", now + Duration::seconds(61)),
+            Err(InviteError::HelperProofExpired)
+        );
+
+        assert_eq!(
+            helper.authorize("mallory", b"wrong", now),
+            Err(InviteError::PasswordRejected)
+        );
+        assert_eq!(
+            helper.authorize("mallory", b"wrong", now),
+            Err(InviteError::PasswordRejected)
+        );
+        assert_eq!(
+            helper.authorize("mallory", b"correct horse", now),
+            Err(InviteError::PasswordRejected)
+        );
+    }
+
+    #[test]
+    fn helper_admission_requires_matching_gate_and_welcome() {
+        let now = Utc::now();
+        let helper_key = SigningKey::generate(&mut OsRng);
+        let mut helper = OnlineAdmissionHelper::new("helper-a", b"secret", helper_key, 2, 60);
+        let proof_result = helper.authorize("alice", b"secret", now);
+        assert!(proof_result.is_ok());
+        let Ok(proof) = proof_result else {
+            return;
+        };
+        let mut invite = Invite::new(b"room", now + Duration::minutes(1), 1);
+        let mut controller = AdmissionController::new(
+            PasswordGate::OnlineAuthorizedHelper {
+                helper_id: "helper-a".into(),
+            },
+            3,
+        );
+        assert_eq!(
+            controller.finalize_helper_admission(&mut invite, now, "alice", &proof, false),
+            Err(InviteError::WelcomeRequired)
+        );
+        assert_eq!(
+            controller.finalize_helper_admission(&mut invite, now, "alice", &proof, true),
+            Ok(())
+        );
+
+        let mut wrong_controller = AdmissionController::new(
+            PasswordGate::OnlineAuthorizedHelper {
+                helper_id: "helper-b".into(),
+            },
+            3,
+        );
+        let mut invite = Invite::new(b"room", now + Duration::minutes(1), 1);
+        assert_eq!(
+            wrong_controller.finalize_helper_admission(&mut invite, now, "alice", &proof, true),
+            Err(InviteError::HelperMismatch)
         );
     }
 
