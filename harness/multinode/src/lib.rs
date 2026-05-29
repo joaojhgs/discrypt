@@ -97,6 +97,21 @@ pub struct RetentionShredSmoke {
     pub recovery_cannot_resurrect_content_keys: bool,
 }
 
+/// Deterministic Phase-B storage persistence verification result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoragePersistenceSmoke {
+    /// A fresh encrypted app DB starts empty before first profile creation.
+    pub fresh_install_starts_empty: bool,
+    /// A new store handle can restart and read the previously encrypted state.
+    pub restart_loads_encrypted_state: bool,
+    /// Plaintext app-state bytes are absent from DB, WAL, and temp sidecar paths.
+    pub no_plaintext_in_db_wal_or_temp: bool,
+    /// Malformed legacy/corrupt store bytes fail closed instead of seeding silently.
+    pub corrupted_store_rejected: bool,
+    /// Secure delete only passes after DB, WAL, and keychain material are all removed.
+    pub secure_delete_requires_db_wal_and_keychain: bool,
+}
+
 /// Deterministic Phase-5 governance/admission/recovery/abuse smoke result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceAdmissionSmoke {
@@ -206,6 +221,18 @@ impl RetentionShredSmoke {
             && self.live_key_membership_rate_limit_decoy
             && self.secure_delete_negative
             && self.recovery_cannot_resurrect_content_keys
+    }
+}
+
+impl StoragePersistenceSmoke {
+    /// True when every Phase-B storage persistence invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.fresh_install_starts_empty
+            && self.restart_loads_encrypted_state
+            && self.no_plaintext_in_db_wal_or_temp
+            && self.corrupted_store_rejected
+            && self.secure_delete_requires_db_wal_and_keychain
     }
 }
 
@@ -697,6 +724,80 @@ pub fn retention_shred_smoke() -> Result<RetentionShredSmoke, anyhow::Error> {
     })
 }
 
+/// Exercise Phase-B fresh install, restart, corruption, and storage/keychain
+/// secure-delete verification against the encrypted AppStore boundary.
+pub fn storage_persistence_smoke() -> Result<StoragePersistenceSmoke, anyhow::Error> {
+    use discrypt_storage::{
+        sqlite_wal_path, AppStore, EncryptedAppDb, MemoryAppDbKeychain, SecureDeleteSimulator,
+    };
+    use std::fs;
+
+    let path = std::env::temp_dir().join(format!(
+        "discrypt-phase-b-storage-{}-{}.sqlite",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let wal_path = sqlite_wal_path(&path);
+    let tmp_path = path.with_extension("json.tmp");
+    for candidate in [&path, &wal_path, &tmp_path] {
+        let _ = fs::remove_file(candidate);
+    }
+
+    let keychain = MemoryAppDbKeychain::default();
+    let mut fresh_db = EncryptedAppDb::new(&path, keychain.clone());
+    let fresh_install_starts_empty = fresh_db.load_app_state()?.is_none();
+
+    let sensitive_state = br#"{"schema_version":1,"profile":{"display_name":"Alice"},"messages":[{"body":"phase-b plaintext must not leak"}],"content_key":"forbidden-content-key"}"#;
+    fresh_db.save_app_state(sensitive_state)?;
+    let mut restarted_db = EncryptedAppDb::new(&path, keychain);
+    let restart_loads_encrypted_state = restarted_db.load_app_state()? == Some(sensitive_state.to_vec());
+
+    let path_contains = |candidate: &std::path::Path, needle: &[u8]| {
+        fs::read(candidate)
+            .map(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+            .unwrap_or(false)
+    };
+    let no_plaintext_in_db_wal_or_temp = [
+        b"Alice".as_slice(),
+        b"phase-b plaintext must not leak".as_slice(),
+        b"forbidden-content-key".as_slice(),
+    ]
+    .into_iter()
+    .all(|needle| {
+        !path_contains(&path, needle)
+            && !path_contains(&wal_path, needle)
+            && !path_contains(&tmp_path, needle)
+    });
+
+    fs::write(&path, br#"{"schema_version":0,"legacy":"plaintext-json"}"#)?;
+    let corrupted_store_rejected = restarted_db.load_app_state().is_err();
+
+    let mut delete = SecureDeleteSimulator::default();
+    delete.write("app.db", b"wrapped-content-key".to_vec());
+    delete.write("app.db-wal", b"wrapped-content-key-wal".to_vec());
+    delete.write("app.keychain", b"wrapped-content-key-keychain".to_vec());
+    let snapshot = delete.snapshot();
+    delete.secure_delete(["app.db", "app.db-wal"]);
+    let partial_delete_kept_keychain_material = delete.contains_material(b"wrapped-content-key");
+    delete.restore(snapshot);
+    delete.secure_delete(["app.db", "app.db-wal", "app.keychain"]);
+    let secure_delete_requires_db_wal_and_keychain = partial_delete_kept_keychain_material
+        && !delete.contains_material(b"wrapped-content-key")
+        && delete.deleted_all(["app.db", "app.db-wal", "app.keychain"]);
+
+    for candidate in [&path, &wal_path, &tmp_path] {
+        let _ = fs::remove_file(candidate);
+    }
+
+    Ok(StoragePersistenceSmoke {
+        fresh_install_starts_empty,
+        restart_loads_encrypted_state,
+        no_plaintext_in_db_wal_or_temp,
+        corrupted_store_rejected,
+        secure_delete_requires_db_wal_and_keychain,
+    })
+}
+
 /// Exercise Phase-5 governance, admission, recovery, and abuse controls.
 pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::Error> {
     use chrono::{Duration, Utc};
@@ -1055,12 +1156,14 @@ pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
     let overlay = relay_overlay_smoke()?;
     let text = text_history_delivery_smoke()?;
     let retention = retention_shred_smoke()?;
+    let storage = storage_persistence_smoke()?;
     let governance = governance_admission_smoke()?;
     let connectivity = connectivity_signaling_push_smoke()?;
     let all_phase_smokes_ready = media.ready()
         && overlay.ready()
         && text.ready()
         && retention.ready()
+        && storage.ready()
         && governance.ready()
         && connectivity.ready();
 
@@ -1154,6 +1257,21 @@ mod tests {
                 live_key_membership_rate_limit_decoy: true,
                 secure_delete_negative: true,
                 recovery_cannot_resurrect_content_keys: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn storage_persistence_smoke_covers_phase_b_gates() {
+        let smoke = storage_persistence_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(StoragePersistenceSmoke {
+                fresh_install_starts_empty: true,
+                restart_loads_encrypted_state: true,
+                no_plaintext_in_db_wal_or_temp: true,
+                corrupted_store_rejected: true,
+                secure_delete_requires_db_wal_and_keychain: true,
             })
         ));
     }
