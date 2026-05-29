@@ -82,21 +82,6 @@ impl SafetyNumber {
     }
 }
 
-#[cfg(test)]
-impl FriendCode {
-    #[must_use]
-    fn legacy_unchecked_verifying_key_for_tests(&self) -> Option<VerifyingKey> {
-        let identity_key_hex = self
-            .0
-            .split_once("?ik=")
-            .map(|(_, tail)| tail)
-            .and_then(|tail| tail.split('&').next())?;
-        let decoded = hex::decode(identity_key_hex).ok()?;
-        let key_bytes: [u8; 32] = decoded.try_into().ok()?;
-        VerifyingKey::from_bytes(&key_bytes).ok()
-    }
-}
-
 impl SafetyNumber {
     /// Return the safety number text.
     #[must_use]

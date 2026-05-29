@@ -1573,13 +1573,16 @@ impl PersistedAppState {
             );
         }
 
-        let local_device = self.devices.first().cloned().unwrap_or_else(|| DeviceView {
-            device_id: "desktop".to_owned(),
-            leaf_index: 1,
-            local: true,
-            authorized: true,
+        let local_device = self.devices.first().cloned().unwrap_or_else(|| {
+            let seed = self.identity_seed_bytes();
+            let identity = self.local_identity();
+            let device_key = command_device_key(&seed, "Desktop", self.next_sequence);
+            let leaf = self
+                .device_set
+                .add_authorized_device(&identity, device_key, "Desktop", 1);
+            device_view_from_leaf(&leaf, true, true)
         });
-        self.devices = vec![local_device];
+        self.devices = vec![local_device.clone()];
         for index in 2..=recovery.device_count.max(1) {
             let device_id = format!("recovered-device-{index}");
             if !self
@@ -1786,65 +1789,6 @@ fn app_store_path_with_env_override(allow_env_override: bool) -> PathBuf {
             .join(APP_STATE_STORE_FILENAME);
     }
     PathBuf::from(APP_STATE_STORE_FILENAME)
-}
-
-fn account_recovery_from_request(request: &RecoverUserRequest) -> AccountRecovery {
-    let rooms = request.recovery_room_memberships.clone();
-    let device_count = request.recovered_device_count.unwrap_or(1).max(1);
-    let recovered = if request.use_sealed_account_backup {
-        let seed: [u8; 32] = Sha256::digest(request.recovery_code.as_bytes()).into();
-        recover_account(RecoveryMaterial::SealedBackup(seal_account_backup(
-            &seed,
-            rooms,
-            device_count,
-        )))
-    } else {
-        RecoveryCodeVerifier::from_code(&request.recovery_code)
-            .and_then(|verifier| {
-                recovery_code_material(
-                    &request.recovery_code,
-                    &verifier,
-                    request.recovery_room_memberships.clone(),
-                    device_count,
-                )
-            })
-            .and_then(recover_account)
-    };
-    recovered.unwrap_or_else(|_| AccountRecovery {
-        account_access_restored: false,
-        room_memberships: Vec::new(),
-        device_count: 1,
-        content_keys_restored: false,
-    })
-}
-
-fn new_identity_seed_hex(display_name: &str, device_name: &str, sequence: u64) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"discrypt-desktop-identity-seed-v1");
-    hasher.update(display_name.as_bytes());
-    hasher.update(device_name.as_bytes());
-    hasher.update(sequence.to_be_bytes());
-    hasher.update(Uuid::new_v4().as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn hex_32(value: &str) -> Option<[u8; 32]> {
-    let decoded = hex::decode(value).ok()?;
-    decoded.try_into().ok()
-}
-
-fn command_device_key(
-    identity_seed: &[u8; 32],
-    label: &str,
-    sequence: u64,
-) -> ed25519_dalek::VerifyingKey {
-    let mut hasher = Sha256::new();
-    hasher.update(b"discrypt-desktop-device-key-v1");
-    hasher.update(identity_seed);
-    hasher.update(label.as_bytes());
-    hasher.update(sequence.to_be_bytes());
-    let key_bytes: [u8; 32] = hasher.finalize().into();
-    SigningKey::from_bytes(&key_bytes).verifying_key()
 }
 
 fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
