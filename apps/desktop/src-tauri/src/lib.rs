@@ -14,12 +14,16 @@ use discrypt_core::{
     MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
     SecurityCopyView, ServerView,
 };
-use discrypt_mls_core::{DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, Identity};
+use discrypt_mls_core::{DevicePairingPayload, DeviceSet, Identity};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
+use discrypt_storage::{
+    recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
+    RecoveryCodeVerifier, RecoveryMaterial,
+};
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -624,9 +628,12 @@ pub fn accept_device_pairing_payload(request: AcceptDevicePairingPayloadRequest)
                     .iter()
                     .any(|device| device.device_id == leaf.device_id.to_string())
                 {
-                    state
-                        .devices
-                        .push(device_view_from_leaf(&leaf, false, true));
+                    state.devices.push(DeviceView {
+                        device_id: leaf.device_id.to_string(),
+                        leaf_index: leaf.leaf_index,
+                        local: false,
+                        authorized: true,
+                    });
                 }
                 state.push_event(
                     "device.paired",
@@ -634,10 +641,7 @@ pub fn accept_device_pairing_payload(request: AcceptDevicePairingPayloadRequest)
                 );
             }
             Err(error) => {
-                state.push_event(
-                    "device.pairing_rejected",
-                    format!("Pairing rejected: {error}"),
-                );
+                state.push_event("device.pairing_rejected", format!("Pairing rejected: {error}"));
             }
         }
     })
@@ -1460,19 +1464,17 @@ impl PersistedAppState {
             },
         });
         self.lifecycle = AppLifecycle::Ready;
-        let base_device = core_app_snapshot().devices.into_iter().next();
+        self.identity_seed_hex = new_identity_seed_hex(&display_name, &device_name, self.next_sequence);
+        let identity = self.local_identity();
+        self.device_set = DeviceSet::new();
+        let seed = self.identity_seed_bytes();
+        let device_key = command_device_key(&seed, &device_name, self.next_sequence);
+        let leaf = self
+            .device_set
+            .add_authorized_device(&identity, device_key, &device_name, 1);
         self.devices = vec![DeviceView {
-            device_id: slugify(&device_name),
-            label: device_name.clone(),
-            leaf_index: 1,
-            identity_key: base_device
-                .as_ref()
-                .map(|device| device.identity_key.clone())
-                .unwrap_or_default(),
-            device_key: base_device
-                .as_ref()
-                .map(|device| device.device_key.clone())
-                .unwrap_or_default(),
+            device_id: leaf.device_id.to_string(),
+            leaf_index: leaf.leaf_index,
             local: true,
             authorized: true,
             revoked: false,
@@ -1538,8 +1540,7 @@ impl PersistedAppState {
                 .as_ref()
                 .map(|profile| profile.device_name.as_str())
                 .unwrap_or("Desktop");
-            self.identity_seed_hex =
-                new_identity_seed_hex(display_name, device_name, self.next_sequence);
+            self.identity_seed_hex = new_identity_seed_hex(display_name, device_name, self.next_sequence);
         }
         hex_32(&self.identity_seed_hex).unwrap_or_else(|| {
             let digest: [u8; 32] = Sha256::digest(self.identity_seed_hex.as_bytes()).into();
@@ -1572,7 +1573,12 @@ impl PersistedAppState {
             .device_set
             .add_authorized_device(identity, device_key, &device_name, 1);
         if self.devices.is_empty() {
-            self.devices.push(device_view_from_leaf(&leaf, true, true));
+            self.devices.push(DeviceView {
+                device_id: leaf.device_id.to_string(),
+                leaf_index: leaf.leaf_index,
+                local: true,
+                authorized: true,
+            });
         }
     }
 
