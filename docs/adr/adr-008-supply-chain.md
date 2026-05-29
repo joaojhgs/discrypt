@@ -107,16 +107,19 @@ Required gates for this decision:
    verifies SBOM generated for Rust, npm, and packaged artifacts, including a
    manifest with lockfile hashes, SBOM hashes, Linux bundle targets, and package
    artifact hashes when packages have been built.
-4. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
+4. `npm --prefix apps/ui run test:crypto-sensitive-g125` proves
+   Crypto-sensitive dependencies are pinned or vendored according to ADR-008 by
+   validating direct dependency specs, lockfile checksums, and vendoring policy.
+5. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
    wiring for cargo-audit, cargo-deny, npm audit, SBOM generation, license policy,
    source policy, lockfiles, and reproducibility assumptions.
-5. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
+6. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
    resolvable from `Cargo.lock` without lockfile mutation.
-6. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
+7. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
    set matches the current dependency graph.
-7. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
+8. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
    policy is configured, with duplicate versions still warnings.
-9. Full `cargo audit and advisory-deny clean runs remain release-blocking gates
+9. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
    handled by the later advisory/reproducibility stories.
 
 ## Consequences

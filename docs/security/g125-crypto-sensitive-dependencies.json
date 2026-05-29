@@ -1,0 +1,484 @@
+{
+  "schema": "discrypt.g125.crypto-sensitive-dependencies.v1",
+  "policy": "lockfile-first; vendoring is not the default unless release isolation requires it",
+  "cargoLockSha256": "3cfa910a9a45aaf558d919e1141faa734b3cfd4b7c6fa1eb9c1539aa160decf9",
+  "packageLockSha256": "e3ec401a884fbc8004868f6f03bd3ef09b4f24aa5999ce61b8eef943eda8bdf0",
+  "directCrates": [
+    {
+      "crate": "aes-gcm",
+      "reason": "AEAD payload protection",
+      "manifestConstraint": "0.10",
+      "lockedVersion": "0.10.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "ed25519-dalek",
+      "reason": "device and governance signatures",
+      "manifestConstraint": "2",
+      "lockedVersion": "2.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "libopus-rs",
+      "reason": "voice codec boundary",
+      "manifestConstraint": "0.0.1",
+      "lockedVersion": "0.0.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "openmls",
+      "reason": "MLS group state and epochs",
+      "manifestConstraint": "0.8.1",
+      "lockedVersion": "0.8.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "openmls_basic_credential",
+      "reason": "MLS credential support",
+      "manifestConstraint": "0.5.0",
+      "lockedVersion": "0.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "openmls_rust_crypto",
+      "reason": "OpenMLS crypto provider",
+      "manifestConstraint": "0.5.1",
+      "lockedVersion": "0.5.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "openmls_sqlite_storage",
+      "reason": "OpenMLS persistent storage",
+      "manifestConstraint": "0.2.0",
+      "lockedVersion": "0.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "openmls_traits",
+      "reason": "OpenMLS provider traits",
+      "manifestConstraint": "0.5.0",
+      "lockedVersion": "0.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "rand",
+      "reason": "randomness source wrapper",
+      "manifestConstraint": "0.8",
+      "lockedVersion": "0.8.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "rand_core",
+      "reason": "randomness trait boundary",
+      "manifestConstraint": "0.6",
+      "lockedVersion": "0.6.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "sha2",
+      "reason": "hashing and commitments",
+      "manifestConstraint": "0.10",
+      "lockedVersion": "0.10.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    },
+    {
+      "crate": "zeroize",
+      "reason": "secret memory clearing",
+      "manifestConstraint": "1",
+      "lockedVersion": "1.8.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "pinSource": "Cargo.lock",
+      "vendored": false
+    }
+  ],
+  "transitiveWatchlist": [
+    {
+      "name": "aead",
+      "version": "0.5.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "aes-gcm",
+      "version": "0.10.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "aes",
+      "version": "0.8.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "chacha20",
+      "version": "0.9.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "chacha20poly1305",
+      "version": "0.10.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "cipher",
+      "version": "0.4.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "crypto-bigint",
+      "version": "0.5.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "crypto-common",
+      "version": "0.1.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "digest",
+      "version": "0.10.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "ed25519-dalek",
+      "version": "2.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "ed25519",
+      "version": "2.2.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "fiat-crypto",
+      "version": "0.2.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.2.17",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.3.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.4.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hkdf",
+      "version": "0.12.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hmac",
+      "version": "0.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hpke-rs-crypto",
+      "version": "0.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hpke-rs-libcrux",
+      "version": "0.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hpke-rs-rust-crypto",
+      "version": "0.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hpke-rs",
+      "version": "0.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "k256",
+      "version": "0.13.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-aead",
+      "version": "0.0.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-aesgcm",
+      "version": "0.0.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-chacha20poly1305",
+      "version": "0.0.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-curve25519",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-ecdh",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-hacl-rs",
+      "version": "0.0.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-hkdf",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-hmac",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-intrinsics",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-kem",
+      "version": "0.0.7",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-macros",
+      "version": "0.0.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-ml-kem",
+      "version": "0.0.8",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-p256",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-platform",
+      "version": "0.0.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-poly1305",
+      "version": "0.0.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-secrets",
+      "version": "0.0.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-sha2",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-sha3",
+      "version": "0.0.8",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-traits",
+      "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libopus-rs",
+      "version": "0.0.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "openmls_basic_credential",
+      "version": "0.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "openmls_memory_storage",
+      "version": "0.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "openmls_rust_crypto",
+      "version": "0.5.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "openmls_sqlite_storage",
+      "version": "0.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "openmls_traits",
+      "version": "0.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "openmls",
+      "version": "0.8.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "p256",
+      "version": "0.13.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "poly1305",
+      "version": "0.8.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand_chacha",
+      "version": "0.10.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand_chacha",
+      "version": "0.3.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand_chacha",
+      "version": "0.9.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand_core",
+      "version": "0.10.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand_core",
+      "version": "0.6.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand_core",
+      "version": "0.9.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand",
+      "version": "0.10.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand",
+      "version": "0.8.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rand",
+      "version": "0.9.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "ring",
+      "version": "0.17.14",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rtc-dtls",
+      "version": "0.20.0-alpha.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rustls-pki-types",
+      "version": "1.14.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rustls-webpki",
+      "version": "0.103.13",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rustls",
+      "version": "0.23.40",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "sha2",
+      "version": "0.10.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "signature",
+      "version": "2.2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "tls_codec_derive",
+      "version": "0.4.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "tls_codec",
+      "version": "0.4.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "webrtc",
+      "version": "0.20.0-alpha.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "x25519-dalek",
+      "version": "2.0.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "zeroize_derive",
+      "version": "1.4.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "zeroize",
+      "version": "1.8.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+  ],
+  "npmLockSummary": {
+    "lockfileVersion": 3,
+    "packageCount": 88,
+    "allLockedEntriesHaveVersion": true,
+    "entriesWithoutIntegrity": []
+  }
+}

@@ -54,7 +54,8 @@
     "test:cargo-audit-g122": "node ../../scripts/check-cargo-audit-g122.mjs",
     "test:npm-audit-g123": "node ../../scripts/check-npm-audit-g123.mjs",
     "sbom:g124": "node ../../scripts/generate-sbom-g124.mjs --out-dir ../../target/sbom --require-packaged-artifacts",
-    "test:sbom-g124": "node ../../scripts/check-sbom-g124.mjs"
+    "test:sbom-g124": "node ../../scripts/check-sbom-g124.mjs",
+    "test:crypto-sensitive-g125": "node ../../scripts/check-crypto-sensitive-deps-g125.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
