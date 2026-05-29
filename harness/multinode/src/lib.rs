@@ -75,6 +75,18 @@ pub struct OverlayNodeProcessReport {
 pub struct TextHistoryDeliverySmoke {
     /// Two-node app text round-trips through encrypted bytes before entering stores.
     pub text_e2e_roundtrip: bool,
+    /// Two client processes exchange protected text bytes over the direct/STUN route.
+    pub direct_path_text_exchanged: bool,
+    /// Two client processes exchange protected text bytes over the peer-overlay route.
+    pub overlay_path_text_exchanged: bool,
+    /// Two client processes exchange protected text bytes over the TURN fallback route.
+    pub turn_path_text_exchanged: bool,
+    /// Offline recipient drains queued ciphertext from store-forward before TTL expiry.
+    pub offline_store_forward_within_ttl: bool,
+    /// Retention/shred policy locks old queued text instead of delivering it after the window.
+    pub retention_locks_old_store_forward: bool,
+    /// Pcap-style text transport capture contains no plaintext or key material.
+    pub text_pcap_no_plaintext: bool,
     /// Author/recipient storage and relay-visible samples do not contain plaintext.
     pub no_plaintext_in_text_surfaces: bool,
     /// Own devices merge one author's log without duplicate/lost entries.
@@ -254,6 +266,12 @@ impl TextHistoryDeliverySmoke {
     #[must_use]
     pub fn ready(&self) -> bool {
         self.text_e2e_roundtrip
+            && self.direct_path_text_exchanged
+            && self.overlay_path_text_exchanged
+            && self.turn_path_text_exchanged
+            && self.offline_store_forward_within_ttl
+            && self.retention_locks_old_store_forward
+            && self.text_pcap_no_plaintext
             && self.no_plaintext_in_text_surfaces
             && self.author_logs_merged
             && self.recipient_cache_bounded
@@ -830,9 +848,32 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         TextReceivedEnvelope, TextRenderState, TextRetentionMetadata, TextSelectedRoute,
         TextSendEventKind, WelcomePackage,
     };
+    use discrypt_relay_overlay::integrity::{RelayPayloadKind, RelayProtectedEnvelope};
+    use discrypt_relay_overlay::store_forward::{
+        StoreForwardEnvelope, StoreForwardError, StoreForwardPolicy, StoreForwardQueue,
+        VolunteerRelaySettings,
+    };
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
+    use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
+    use discrypt_transport::{
+        ConnectivityConfig, FallbackLeg, LocalProcessSocketAdapter, SimulatedNat,
+    };
     use std::collections::BTreeSet;
+
+    fn protected_text_payload(
+        counter: u64,
+        aad_metadata: &[u8],
+        ciphertext: Vec<u8>,
+    ) -> Result<RelayProtectedEnvelope, anyhow::Error> {
+        Ok(RelayProtectedEnvelope::new(
+            RelayPayloadKind::StoreForward,
+            b"text-store-forward-kid".to_vec(),
+            counter,
+            aad_metadata,
+            ciphertext,
+        )?)
+    }
 
     let text_plaintext = b"hello from app-level encrypted text";
     let text_key = derive_epoch_secret(&[33; 32], ExportLabel::Text, b"room=lab;epoch=7;m=alice-1");
@@ -926,6 +967,297 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         && text_envelope.content_ciphertext != text_plaintext
         && text_envelope.verify("lab", &text_signing_key.verifying_key()) == Ok(())
         && pipeline_send_ready;
+
+    let mut text_transport_pcap = AuditFixture::default();
+    let text_key_forbidden = text_key;
+    let forbidden_text_tokens: [&[u8]; 4] = [
+        text_plaintext.as_slice(),
+        text_key_forbidden.as_slice(),
+        b"content-key".as_slice(),
+        b"mls-epoch-secret".as_slice(),
+    ];
+    let mut verify_text_route = |route_label: &str,
+                                 nat: SimulatedNat,
+                                 expected_leg: FallbackLeg,
+                                 message_id: &str,
+                                 sequence: u64|
+     -> Result<bool, anyhow::Error> {
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport::default();
+        let mut events = InMemoryTextSendEvents::default();
+        let receipt = TextOutboundPipeline::new(&mut log, &mut transport, &mut events).send(
+            TextOutboundRequest {
+                group_id: "lab".to_owned(),
+                channel_id: "general".to_owned(),
+                epoch: 7,
+                sender_leaf: 1,
+                sender_device_id: "alice-laptop".to_owned(),
+                sequence,
+                message_id: message_id.to_owned(),
+                retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
+                plaintext: text_plaintext.to_vec(),
+                sent_at_ms: sequence,
+            },
+            TextSelectedRoute {
+                session_id: format!("text-{route_label}-session"),
+                route_label: route_label.to_owned(),
+                overlay_hops: if expected_leg == FallbackLeg::RelayOverlay {
+                    2
+                } else {
+                    0
+                },
+                ciphertext_only: true,
+            },
+            &text_key,
+            &text_signing_key,
+        )?;
+        let payload = receipt.envelope.canonical_signed_bytes();
+        let conformance = LocalProcessSocketAdapter::new(
+            ConnectivityConfig::default(),
+            nat,
+            text_plaintext.to_vec(),
+        )
+        .run_conformance(&payload)?;
+        let mut receive_state = TextReceiveState::default();
+        let mut receive_store = InMemoryTextRecipientStore::default();
+        let mut receive_events = InMemoryTextReceiveEvents::default();
+        let received =
+            TextInboundPipeline::new(&mut receive_state, &mut receive_store, &mut receive_events)
+                .receive(
+                TextInboundRequest {
+                    group_id: "lab".to_owned(),
+                    channel_id: "general".to_owned(),
+                    current_epoch: 7,
+                    authorized_sender_leaves: BTreeSet::from([1]),
+                    envelope: receipt.envelope.clone(),
+                    received_at_ms: sequence + 10,
+                    retention_allows_decrypt: true,
+                },
+                &text_key,
+                &text_signing_key.verifying_key(),
+            )?;
+        let (component, content, visible_bytes) = match expected_leg {
+            FallbackLeg::Stun => (
+                InfrastructureComponent::Stun,
+                ContentExposure::None,
+                b"text direct path stun binding; no app payload".to_vec(),
+            ),
+            FallbackLeg::RelayOverlay => (
+                InfrastructureComponent::PeerRelay,
+                ContentExposure::CiphertextOnly,
+                payload.clone(),
+            ),
+            FallbackLeg::Turn => (
+                InfrastructureComponent::Turn,
+                ContentExposure::CiphertextOnly,
+                payload.clone(),
+            ),
+        };
+        text_transport_pcap.push(PcapEvent {
+            component,
+            content,
+            visible_bytes,
+            ip_or_endpoint: true,
+            timing: true,
+            persists_linkage: false,
+        });
+
+        Ok(conformance.ready()
+            && conformance.route_report.selected == expected_leg
+            && conformance.ciphertext_delivered
+            && log.entries.len() == 1
+            && transport.frames.len() == 1
+            && events
+                .events
+                .iter()
+                .map(|event| &event.kind)
+                .collect::<Vec<_>>()
+                == vec![
+                    &TextSendEventKind::Pending,
+                    &TextSendEventKind::TransportAccepted,
+                ]
+            && receive_store.entries.len() == 1
+            && receive_events.events.len() == 1
+            && received.state == TextRenderState::Decrypted(text_plaintext.to_vec())
+            && receipt.route.route_label == route_label
+            && !receipt.envelope.contains_plaintext_sample(text_plaintext)
+            && !payload
+                .windows(text_plaintext.len())
+                .any(|window| window == text_plaintext))
+    };
+    let direct_path_text_exchanged = verify_text_route(
+        "direct",
+        SimulatedNat::direct(),
+        FallbackLeg::Stun,
+        "alice-direct-3",
+        3,
+    )?;
+    let overlay_path_text_exchanged = verify_text_route(
+        "overlay",
+        SimulatedNat::overlay_only(),
+        FallbackLeg::RelayOverlay,
+        "alice-overlay-4",
+        4,
+    )?;
+    let turn_path_text_exchanged = verify_text_route(
+        "turn",
+        SimulatedNat::turn_only(),
+        FallbackLeg::Turn,
+        "alice-turn-5",
+        5,
+    )?;
+
+    let mut volunteer = VolunteerRelaySettings::enabled("volunteer-relay-a");
+    volunteer.max_queue_envelopes = 4;
+    volunteer.max_fanout_per_message = 2;
+    volunteer.max_volunteer_relays = 2;
+    let store_forward_policy =
+        StoreForwardPolicy::new(["bob-device"], 1_000, 1_000, volunteer.clone());
+    let mut offline_queue = StoreForwardQueue::with_policy(store_forward_policy);
+    let mut offline_log = InMemoryTextAuthorLog::default();
+    let mut offline_transport = InMemoryTextTransport::default();
+    let mut offline_events = InMemoryTextSendEvents::default();
+    let offline_receipt = TextOutboundPipeline::new(
+        &mut offline_log,
+        &mut offline_transport,
+        &mut offline_events,
+    )
+    .send(
+        TextOutboundRequest {
+            group_id: "lab".to_owned(),
+            channel_id: "general".to_owned(),
+            epoch: 7,
+            sender_leaf: 1,
+            sender_device_id: "alice-laptop".to_owned(),
+            sequence: 6,
+            message_id: "alice-offline-6".to_owned(),
+            retention: TextRetentionMetadata::new("short text ttl", 1_000, Some(2_000), false),
+            plaintext: text_plaintext.to_vec(),
+            sent_at_ms: 1_000,
+        },
+        TextSelectedRoute {
+            session_id: "text-offline-store-forward".to_owned(),
+            route_label: "store-forward".to_owned(),
+            overlay_hops: 1,
+            ciphertext_only: true,
+        },
+        &text_key,
+        &text_signing_key,
+    )?;
+    let offline_payload = offline_receipt.envelope.canonical_signed_bytes();
+    offline_queue.enqueue_ciphertext_only(
+        StoreForwardEnvelope::new(
+            "alice-offline-6",
+            "bob-device",
+            protected_text_payload(
+                6,
+                b"text-store-forward:alice-offline-6",
+                offline_payload.clone(),
+            )?,
+            1_000,
+            900,
+            1,
+        )?,
+        text_plaintext,
+    )?;
+    let offline_delivered = offline_queue.drain_for_recipient("bob-device", 1_500);
+    let mut offline_receive_state = TextReceiveState::default();
+    let mut offline_receive_store = InMemoryTextRecipientStore::default();
+    let mut offline_receive_events = InMemoryTextReceiveEvents::default();
+    let offline_render = TextInboundPipeline::new(
+        &mut offline_receive_state,
+        &mut offline_receive_store,
+        &mut offline_receive_events,
+    )
+    .receive(
+        TextInboundRequest {
+            group_id: "lab".to_owned(),
+            channel_id: "general".to_owned(),
+            current_epoch: 7,
+            authorized_sender_leaves: BTreeSet::from([1]),
+            envelope: offline_receipt.envelope.clone(),
+            received_at_ms: 1_500,
+            retention_allows_decrypt: true,
+        },
+        &text_key,
+        &text_signing_key.verifying_key(),
+    )?;
+    if let Some(envelope) = offline_delivered.first() {
+        text_transport_pcap.push(PcapEvent {
+            component: InfrastructureComponent::VolunteerStorageRelay,
+            content: ContentExposure::CiphertextOnly,
+            visible_bytes: envelope.payload.visible_bytes(),
+            ip_or_endpoint: true,
+            timing: true,
+            persists_linkage: false,
+        });
+    }
+    let offline_store_forward_within_ttl = offline_delivered.len() == 1
+        && offline_delivered[0].payload.ciphertext == offline_payload
+        && offline_render.state == TextRenderState::Decrypted(text_plaintext.to_vec())
+        && offline_receive_store.entries.len() == 1
+        && offline_queue.is_empty();
+
+    let mut retention_queue = StoreForwardQueue::with_policy(StoreForwardPolicy::new(
+        ["bob-device"],
+        2_000,
+        500,
+        volunteer,
+    ));
+    let retention_overrun_rejected = retention_queue.enqueue(StoreForwardEnvelope::new(
+        "alice-retention-overrun",
+        "bob-device",
+        protected_text_payload(
+            7,
+            b"text-store-forward:retention-overrun",
+            b"ciphertext".to_vec(),
+        )?,
+        1_000,
+        1_000,
+        1,
+    )?) == Err(StoreForwardError::RetentionWindowExceeded);
+    retention_queue.enqueue_ciphertext_only(
+        StoreForwardEnvelope::new(
+            "alice-retention-lock",
+            "bob-device",
+            protected_text_payload(
+                8,
+                b"text-store-forward:retention-lock",
+                offline_payload.clone(),
+            )?,
+            1_000,
+            400,
+            1,
+        )?,
+        text_plaintext,
+    )?;
+    let locked_delivery = retention_queue.drain_for_recipient("bob-device", 1_300);
+    let mut locked_receive_state = TextReceiveState::default();
+    let mut locked_receive_store = InMemoryTextRecipientStore::default();
+    let mut locked_receive_events = InMemoryTextReceiveEvents::default();
+    let locked_render = TextInboundPipeline::new(
+        &mut locked_receive_state,
+        &mut locked_receive_store,
+        &mut locked_receive_events,
+    )
+    .receive(
+        TextInboundRequest {
+            group_id: "lab".to_owned(),
+            channel_id: "general".to_owned(),
+            current_epoch: 7,
+            authorized_sender_leaves: BTreeSet::from([1]),
+            envelope: offline_receipt.envelope.clone(),
+            received_at_ms: 1_300,
+            retention_allows_decrypt: false,
+        },
+        &text_key,
+        &text_signing_key.verifying_key(),
+    )?;
+    let retention_locks_old_store_forward = retention_overrun_rejected
+        && locked_delivery.len() == 1
+        && matches!(locked_render.state, TextRenderState::Locked { .. });
+    let text_pcap_no_plaintext =
+        text_transport_pcap.no_forbidden_content_egress(&forbidden_text_tokens);
 
     let laptop_entry = AuthorLogEntry::new(
         1,
@@ -1136,6 +1468,12 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
 
     Ok(TextHistoryDeliverySmoke {
         text_e2e_roundtrip,
+        direct_path_text_exchanged,
+        overlay_path_text_exchanged,
+        turn_path_text_exchanged,
+        offline_store_forward_within_ttl,
+        retention_locks_old_store_forward,
+        text_pcap_no_plaintext,
         no_plaintext_in_text_surfaces,
         author_logs_merged,
         recipient_cache_bounded,
@@ -1945,6 +2283,12 @@ mod tests {
             smoke,
             Ok(TextHistoryDeliverySmoke {
                 text_e2e_roundtrip: true,
+                direct_path_text_exchanged: true,
+                overlay_path_text_exchanged: true,
+                turn_path_text_exchanged: true,
+                offline_store_forward_within_ttl: true,
+                retention_locks_old_store_forward: true,
+                text_pcap_no_plaintext: true,
                 no_plaintext_in_text_surfaces: true,
                 author_logs_merged: true,
                 recipient_cache_bounded: true,
