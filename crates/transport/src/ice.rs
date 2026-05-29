@@ -4,6 +4,7 @@
 //! not create WebRTC offers, gather candidates, or open media transports.
 
 use crate::{ConnectivityConfig, Endpoint, EndpointOverrides, TransportError};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Signed invite/group policy containing ICE server endpoints joiners may use.
@@ -67,6 +68,15 @@ impl IceEndpointPolicy {
         Ok(())
     }
 
+    /// Validate endpoint schemes plus any time-limited TURN credentials at `now`.
+    pub fn validate_at(&self, now: DateTime<Utc>) -> Result<(), TransportError> {
+        self.validate()?;
+        for server in &self.turn_servers {
+            server.validate_credentials_at(now)?;
+        }
+        Ok(())
+    }
+
     /// Resolve typed ICE config, with non-empty group fields overriding invite fields.
     pub fn resolve(
         invite_policy: Option<&Self>,
@@ -94,6 +104,17 @@ impl IceEndpointPolicy {
             .unwrap_or_else(|| invite.turn_servers.clone());
 
         IceServerConfig::new(stun_servers, turn_servers)
+    }
+
+    /// Resolve typed ICE config and reject expired or incomplete TURN credentials.
+    pub fn resolve_at(
+        invite_policy: Option<&Self>,
+        group_policy: Option<&Self>,
+        now: DateTime<Utc>,
+    ) -> Result<IceServerConfig, TransportError> {
+        let config = Self::resolve(invite_policy, group_policy)?;
+        config.validate_credentials_at(now)?;
+        Ok(config)
     }
 
     /// Canonical bytes included in signed invite descriptors.
@@ -135,6 +156,23 @@ impl IceServerConfig {
             stun_servers: policy.stun_servers,
             turn_servers: policy.turn_servers,
         })
+    }
+
+    /// Validate time-limited TURN credentials at `now`.
+    pub fn validate_credentials_at(&self, now: DateTime<Utc>) -> Result<(), TransportError> {
+        for server in &self.turn_servers {
+            server.validate_credentials_at(now)?;
+        }
+        Ok(())
+    }
+
+    /// Convert the first STUN/TURN choices into the existing fallback planner config after credential validation.
+    pub fn to_connectivity_config_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<ConnectivityConfig, TransportError> {
+        self.validate_credentials_at(now)?;
+        Ok(self.to_connectivity_config())
     }
 
     /// Convert the first STUN/TURN choices into the existing fallback planner config.
@@ -204,13 +242,58 @@ impl TurnServerConfig {
     /// Validate endpoint scheme and credential field pairing.
     pub fn validate(&self) -> Result<(), TransportError> {
         validate_endpoint(&self.endpoint, EndpointKind::Turn)?;
+        self.validate_credential_shape()
+    }
+
+    /// Parse the TURN credential expiry timestamp when a time-limited credential is present.
+    pub fn parsed_credential_expiry(&self) -> Result<Option<DateTime<Utc>>, TransportError> {
+        self.credential_expires_at
+            .as_deref()
+            .map(|value| {
+                DateTime::parse_from_rfc3339(value)
+                    .map(|expires_at| expires_at.with_timezone(&Utc))
+                    .map_err(|_| {
+                        TransportError::InvalidIcePolicy(
+                            "TURN credential expiry must be RFC3339".to_owned(),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    /// Validate time-limited TURN credentials and reject expired or incomplete policy.
+    pub fn validate_credentials_at(&self, now: DateTime<Utc>) -> Result<(), TransportError> {
+        self.validate()?;
+        if !self.credentials_declared() {
+            return Ok(());
+        }
+        let Some(expires_at) = self.parsed_credential_expiry()? else {
+            return Err(TransportError::InvalidIcePolicy(
+                "TURN credential expiry is required when credentials are declared".to_owned(),
+            ));
+        };
+        if expires_at <= now {
+            return Err(TransportError::InvalidIcePolicy(
+                "TURN credential expired".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn credentials_declared(&self) -> bool {
+        self.username.is_some() || self.credential.is_some() || self.credential_expires_at.is_some()
+    }
+
+    fn validate_credential_shape(&self) -> Result<(), TransportError> {
+        if !self.credentials_declared() {
+            return Ok(());
+        }
         match (&self.username, &self.credential) {
             (Some(username), Some(credential))
                 if !username.trim().is_empty() && !credential.trim().is_empty() =>
             {
                 Ok(())
             }
-            (None, None) => Ok(()),
             _ => Err(TransportError::InvalidIcePolicy(
                 "TURN username and credential must be provided together".to_owned(),
             )),
@@ -267,6 +350,7 @@ fn push_optional_string(bytes: &mut Vec<u8>, value: Option<&str>) {
 mod tests {
     use super::*;
     use crate::{ConnectivityPlanner, FallbackLeg, SimulatedNat};
+    use chrono::Duration;
 
     #[test]
     fn parses_valid_stun_and_turn_policy_into_typed_config() -> Result<(), TransportError> {
@@ -350,6 +434,69 @@ mod tests {
             turn.endpoint,
             Endpoint::new("turn:group.example.invalid:3478")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conversion_rejects_missing_or_expired_turn_credentials() -> Result<(), TransportError> {
+        let now = Utc::now();
+        let missing_credential = IceServerConfig::new(
+            vec![Endpoint::new("stun:valid.example.invalid:3478")],
+            vec![TurnServerConfig::new(
+                Endpoint::new("turns:turn.example.invalid:5349"),
+                Some("joiner".to_owned()),
+                None,
+                Some((now + Duration::minutes(5)).to_rfc3339()),
+            )],
+        );
+        assert_eq!(
+            missing_credential.err(),
+            Some(TransportError::InvalidIcePolicy(
+                "TURN username and credential must be provided together".to_owned()
+            ))
+        );
+
+        let expired = IceServerConfig::new(
+            vec![Endpoint::new("stun:valid.example.invalid:3478")],
+            vec![TurnServerConfig::new(
+                Endpoint::new("turns:turn.example.invalid:5349"),
+                Some("joiner".to_owned()),
+                Some("secret".to_owned()),
+                Some((now - Duration::minutes(1)).to_rfc3339()),
+            )],
+        )?;
+        assert_eq!(
+            expired.to_connectivity_config_at(now).err(),
+            Some(TransportError::InvalidIcePolicy(
+                "TURN credential expired".to_owned()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unexpired_turn_credentials_convert_to_existing_endpoint_overrides(
+    ) -> Result<(), TransportError> {
+        let now = Utc::now();
+        let config = IceServerConfig::new(
+            vec![Endpoint::new("stun:valid.example.invalid:3478")],
+            vec![TurnServerConfig::new(
+                Endpoint::new("turns:turn.example.invalid:5349"),
+                Some("joiner".to_owned()),
+                Some("secret".to_owned()),
+                Some((now + Duration::minutes(5)).to_rfc3339()),
+            )],
+        )?;
+
+        let connectivity = config.to_connectivity_config_at(now)?;
+        let plan = ConnectivityPlanner::plan(&connectivity, SimulatedNat::turn_only())?;
+
+        assert_eq!(plan.selected, FallbackLeg::Turn);
+        assert_eq!(
+            plan.endpoint,
+            Endpoint::new("turns:turn.example.invalid:5349")
+        );
+        assert_eq!(connectivity.turn_endpoint(), plan.endpoint);
         Ok(())
     }
 }
