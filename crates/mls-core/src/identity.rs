@@ -16,6 +16,19 @@ impl FriendCode {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Extract the public identity key embedded in a v1 friend-code/QR payload.
+    #[must_use]
+    pub fn verifying_key(&self) -> Option<VerifyingKey> {
+        let identity_key_hex = self
+            .0
+            .split_once("?ik=")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split('&').next())?;
+        let decoded = hex::decode(identity_key_hex).ok()?;
+        let key_bytes: [u8; 32] = decoded.try_into().ok()?;
+        VerifyingKey::from_bytes(&key_bytes).ok()
+    }
 }
 
 /// A longer comparison string displayed during explicit MITM verification.
@@ -129,6 +142,13 @@ impl Identity {
             .join(" ");
         SafetyNumber(grouped)
     }
+
+    /// Safety number derived from the identity key embedded in a friend-code/QR payload.
+    #[must_use]
+    pub fn safety_number_from_friend_code(&self, peer: &FriendCode) -> Option<SafetyNumber> {
+        let peer_key = peer.verifying_key()?;
+        Some(self.safety_number(&peer_key))
+    }
 }
 
 fn slugify(label: &str) -> String {
@@ -173,6 +193,20 @@ mod tests {
             .as_str()
             .starts_with("discrypt://friend/v1/alice?ik="));
         assert!(alice.friend_code().as_str().contains("&fp="));
+    }
+
+    #[test]
+    fn friend_code_carries_identity_key_used_for_safety_number() {
+        let alice = Identity::generate("alice");
+        let bob = Identity::generate("bob");
+        let bob_code = bob.friend_code();
+
+        assert_eq!(bob_code.verifying_key(), Some(bob.verifying_key()));
+        assert_eq!(
+            alice.safety_number_from_friend_code(&bob_code),
+            Some(alice.safety_number(&bob.verifying_key()))
+        );
+        assert_eq!(FriendCode("not-a-code".to_owned()).verifying_key(), None);
     }
 
     #[test]
