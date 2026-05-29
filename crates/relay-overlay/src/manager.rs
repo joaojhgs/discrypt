@@ -1,0 +1,339 @@
+//! Live overlay manager fed by runtime relay observations.
+//!
+//! The deterministic topology, ranking, and failover modules remain pure, but
+//! production callers need a stateful owner that ingests measured peer health and
+//! route observations instead of relying on static test fixtures. This module is
+//! that boundary: it accepts runtime metrics from transport/media/text services,
+//! updates the content-blind relay topology, and returns auditable route/failover
+//! decisions without inspecting application plaintext.
+
+use crate::failover::{reroute_after_failure, FailoverDecision};
+use crate::ranking::RelayMetrics;
+use crate::topology::{RelayRoute, RelayTopology, TopologyError};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
+
+/// Runtime measurements collected for one potential relay peer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RelayRuntimeObservation {
+    /// Stable peer identifier from the authenticated overlay peer set.
+    pub peer_id: String,
+    /// Last measured round-trip latency in milliseconds.
+    pub latency_ms: u32,
+    /// Successful relay health probes in the current scoring window.
+    pub successful_probes: u32,
+    /// Failed relay health probes in the current scoring window.
+    pub failed_probes: u32,
+    /// Estimated local battery/CPU/network cost in basis points.
+    pub battery_cost_bps: u16,
+    /// Relay bytes this peer has contributed in the current accounting window.
+    pub contributed_bytes: u64,
+    /// Relay bytes this peer has consumed in the current accounting window.
+    pub consumed_bytes: u64,
+}
+
+impl RelayRuntimeObservation {
+    /// Convert runtime observations into deterministic ranking metrics.
+    #[must_use]
+    pub fn to_ranking_metrics(&self) -> RelayMetrics {
+        let total_probes = self
+            .successful_probes
+            .saturating_add(self.failed_probes)
+            .max(1);
+        let stability = (self.successful_probes as f32 / total_probes as f32).clamp(0.0, 1.0);
+        let battery_cost = self.battery_cost_bps as f32 / 10_000.0;
+        let freeload_penalty = if self.contributed_bytes == 0 && self.consumed_bytes > 0 {
+            1000.0
+        } else if self.consumed_bytes > self.contributed_bytes {
+            let deficit = self.consumed_bytes.saturating_sub(self.contributed_bytes) as f32;
+            let denominator = self.contributed_bytes.max(1) as f32;
+            (deficit / denominator).min(1000.0)
+        } else {
+            0.0
+        };
+        RelayMetrics {
+            peer_id: self.peer_id.clone(),
+            latency_ms: self.latency_ms.max(1),
+            stability,
+            battery_cost,
+            freeload_penalty,
+        }
+    }
+}
+
+/// Route decision produced by the live overlay manager.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OverlayRouteDecision {
+    /// Selected content-blind relay route.
+    pub route: RelayRoute,
+    /// Ranked next-hop candidates visible to the source at decision time.
+    pub ranked_source_neighbors: Vec<String>,
+    /// Sequence number of the manager state used for the decision.
+    pub manager_epoch: u64,
+}
+
+/// Failover decision plus manager epoch metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OverlayFailoverReport {
+    /// Reroute details returned by the deterministic failover module.
+    pub decision: FailoverDecision,
+    /// Sequence number of the manager state used for the decision.
+    pub manager_epoch: u64,
+}
+
+/// Errors returned by [`OverlayManager`].
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum OverlayManagerError {
+    /// Runtime observation was malformed or unauthenticated by the caller.
+    #[error("invalid relay runtime observation: {0}")]
+    InvalidObservation(String),
+    /// Underlying topology operation failed.
+    #[error(transparent)]
+    Topology(#[from] TopologyError),
+}
+
+/// Stateful overlay routing manager fed by runtime metrics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OverlayManager {
+    topology: RelayTopology,
+    observations: BTreeMap<String, RelayRuntimeObservation>,
+    failed_peers: BTreeSet<String>,
+    epoch: u64,
+}
+
+impl Default for OverlayManager {
+    fn default() -> Self {
+        Self::new(RelayTopology::default())
+    }
+}
+
+impl OverlayManager {
+    /// Create an overlay manager from an existing topology shell.
+    #[must_use]
+    pub fn new(topology: RelayTopology) -> Self {
+        Self {
+            topology,
+            observations: BTreeMap::new(),
+            failed_peers: BTreeSet::new(),
+            epoch: 0,
+        }
+    }
+
+    /// Current manager sequence number.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Number of peers with accepted runtime observations.
+    #[must_use]
+    pub fn peer_count(&self) -> usize {
+        self.observations.len()
+    }
+
+    /// Upsert one runtime observation and update deterministic ranking inputs.
+    pub fn upsert_observation(
+        &mut self,
+        observation: RelayRuntimeObservation,
+    ) -> Result<(), OverlayManagerError> {
+        validate_observation(&observation)?;
+        self.topology.upsert_peer(observation.to_ranking_metrics());
+        self.failed_peers.remove(&observation.peer_id);
+        self.observations
+            .insert(observation.peer_id.clone(), observation);
+        self.bump_epoch();
+        Ok(())
+    }
+
+    /// Connect two known peers in the local overlay graph.
+    pub fn connect_peers(&mut self, a: &str, b: &str) -> Result<(), OverlayManagerError> {
+        self.topology.connect(a, b)?;
+        self.bump_epoch();
+        Ok(())
+    }
+
+    /// Return source-neighbor order from the latest runtime observations.
+    #[must_use]
+    pub fn ranked_neighbors(&self, peer_id: &str) -> Vec<String> {
+        self.topology
+            .ranked_neighbors(peer_id)
+            .into_iter()
+            .map(|metrics| metrics.peer_id)
+            .collect()
+    }
+
+    /// Select a route using the latest runtime observations and failure set.
+    pub fn route(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> Result<OverlayRouteDecision, OverlayManagerError> {
+        let route = self
+            .topology
+            .route_avoiding(source, destination, &self.failed_peers)?;
+        Ok(OverlayRouteDecision {
+            route,
+            ranked_source_neighbors: self.ranked_neighbors(source),
+            manager_epoch: self.epoch,
+        })
+    }
+
+    /// Mark a peer failed and produce a bounded-hop replacement route.
+    pub fn mark_failed_and_reroute(
+        &mut self,
+        previous: RelayRoute,
+        failed_peer: &str,
+        observed_convergence_ms: u64,
+    ) -> Result<OverlayFailoverReport, OverlayManagerError> {
+        self.failed_peers.insert(failed_peer.to_owned());
+        let decision = reroute_after_failure(
+            &self.topology,
+            previous,
+            failed_peer,
+            observed_convergence_ms,
+        )?;
+        self.bump_epoch();
+        Ok(OverlayFailoverReport {
+            decision,
+            manager_epoch: self.epoch,
+        })
+    }
+
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+    }
+}
+
+fn validate_observation(observation: &RelayRuntimeObservation) -> Result<(), OverlayManagerError> {
+    if observation.peer_id.trim().is_empty() {
+        return Err(OverlayManagerError::InvalidObservation(
+            "peer id is required".to_owned(),
+        ));
+    }
+    if observation.successful_probes == 0 && observation.failed_probes == 0 {
+        return Err(OverlayManagerError::InvalidObservation(
+            "at least one relay health probe is required".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(
+        peer_id: &str,
+        latency_ms: u32,
+        successful: u32,
+        consumed: u64,
+    ) -> RelayRuntimeObservation {
+        RelayRuntimeObservation {
+            peer_id: peer_id.to_owned(),
+            latency_ms,
+            successful_probes: successful,
+            failed_probes: 0,
+            battery_cost_bps: 0,
+            contributed_bytes: 10_000,
+            consumed_bytes: consumed,
+        }
+    }
+
+    #[test]
+    fn live_manager_routes_from_runtime_observations() -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("slow-relay", 200, 10, 0),
+            observation("fast-relay", 20, 10, 0),
+            observation("bob", 5, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "slow-relay")?;
+        manager.connect_peers("slow-relay", "bob")?;
+        manager.connect_peers("alice", "fast-relay")?;
+        manager.connect_peers("fast-relay", "bob")?;
+
+        let decision = manager.route("alice", "bob")?;
+        assert_eq!(decision.route.path, ["alice", "fast-relay", "bob"]);
+        assert_eq!(decision.ranked_source_neighbors[0], "fast-relay");
+        assert!(decision.manager_epoch >= 8);
+        Ok(())
+    }
+
+    #[test]
+    fn updated_observations_change_route_without_rebuilding_graph(
+    ) -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("relay-a", 10, 10, 0),
+            observation("relay-b", 50, 10, 0),
+            observation("bob", 5, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "relay-a")?;
+        manager.connect_peers("relay-a", "bob")?;
+        manager.connect_peers("alice", "relay-b")?;
+        manager.connect_peers("relay-b", "bob")?;
+        assert_eq!(
+            manager.route("alice", "bob")?.route.path,
+            ["alice", "relay-a", "bob"]
+        );
+
+        manager.upsert_observation(observation("relay-a", 500, 1, 50_000))?;
+        assert_eq!(
+            manager.route("alice", "bob")?.route.path,
+            ["alice", "relay-b", "bob"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failover_report_avoids_failed_peer_and_records_convergence(
+    ) -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("primary", 10, 10, 0),
+            observation("backup", 30, 10, 0),
+            observation("bob", 5, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "primary")?;
+        manager.connect_peers("primary", "bob")?;
+        manager.connect_peers("alice", "backup")?;
+        manager.connect_peers("backup", "bob")?;
+
+        let previous = manager.route("alice", "bob")?.route;
+        let report = manager.mark_failed_and_reroute(previous, "primary", 2_400)?;
+        assert_eq!(report.decision.replacement.path, ["alice", "backup", "bob"]);
+        assert!(report.decision.converged_within_phase2_gate());
+        assert!(!manager
+            .route("alice", "bob")?
+            .route
+            .contains_peer("primary"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_or_unprobed_runtime_observations() {
+        let mut manager = OverlayManager::default();
+        let mut invalid = observation("", 10, 1, 0);
+        assert!(matches!(
+            manager.upsert_observation(invalid.clone()),
+            Err(OverlayManagerError::InvalidObservation(_))
+        ));
+        invalid.peer_id = "relay".to_owned();
+        invalid.successful_probes = 0;
+        invalid.failed_probes = 0;
+        assert!(matches!(
+            manager.upsert_observation(invalid),
+            Err(OverlayManagerError::InvalidObservation(_))
+        ));
+    }
+}

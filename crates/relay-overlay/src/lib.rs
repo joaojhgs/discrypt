@@ -15,6 +15,7 @@
 pub mod failover;
 pub mod gossip;
 pub mod integrity;
+pub mod manager;
 pub mod production_status;
 pub mod ranking;
 pub mod redelivery;
@@ -22,6 +23,10 @@ pub mod store_forward;
 pub mod topology;
 
 pub use gossip::{GossipItem, GossipMesh, GossipNode};
+pub use manager::{
+    OverlayFailoverReport, OverlayManager, OverlayManagerError, OverlayRouteDecision,
+    RelayRuntimeObservation,
+};
 pub use ranking::{rank, score, RelayMetrics};
 pub use topology::hop_limit_ok;
 
