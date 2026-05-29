@@ -873,8 +873,8 @@ function ensureFallbackReady(
     display_name: displayName,
     device_name: deviceName,
     recovery_status: recovered
-      ? "Account continuity restored; content keys restored: false"
-      : "New local profile; recovery export remains local account-continuity only",
+      ? "Account-continuity recovery accepted with verified local identity material; content keys restored: false"
+      : "New local identity generated from command signing material; recovery export is account-continuity only",
   };
   fallbackState.devices = [
     {

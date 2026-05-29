@@ -14,7 +14,7 @@ use discrypt_admission::{
     InviteTrustMetadata,
 };
 use discrypt_core::{
-    app_snapshot as core_app_snapshot, generated_device_view, identity_recovery_verification_smoke,
+    app_snapshot as core_app_snapshot, identity_recovery_verification_smoke,
     snapshot_safety_number_matches_identity_keys, AppSnapshot, ChannelKind,
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
@@ -714,12 +714,13 @@ pub fn create_user(request: CreateUserRequest) -> AppStateView {
 pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
     mutate_app_service(|state| {
         let recovery = account_recovery_from_request(&request);
-        state.create_user(
+        state.create_user_with_seed(
             CreateUserRequest {
                 display_name: request.display_name.clone(),
                 device_name: request.device_name.clone(),
             },
             true,
+            Some(recovery_seed_key(&request.recovery_code)),
         );
         state.apply_account_recovery(&recovery);
         state.push_event(
@@ -1919,31 +1920,46 @@ impl PersistedAppState {
     }
 
     fn create_user(&mut self, request: CreateUserRequest, recovered: bool) {
+        self.create_user_with_seed(request, recovered, None);
+    }
+
+    fn create_user_with_seed(
+        &mut self,
+        request: CreateUserRequest,
+        recovered: bool,
+        seed_override: Option<[u8; 32]>,
+    ) {
         let display_name = normalize_label(&request.display_name, "Alice");
         let device_name = request
             .device_name
             .map(|value| normalize_label(&value, "Desktop"))
             .unwrap_or_else(|| "Desktop".to_owned());
-        let user_id = stable_id("user", &display_name, self.next_sequence);
+        self.identity_seed_hex = seed_override
+            .map(hex::encode)
+            .unwrap_or_else(|| hex::encode(SigningKey::generate(&mut OsRng).to_bytes()));
+        let seed = self.identity_seed_bytes();
+        let identity = Identity::from_signing_key(display_name.clone(), &seed);
+        let identity_key = hex::encode(identity.verifying_key().as_bytes());
+        let user_id = stable_id("user", &identity_key, self.next_sequence);
         self.profile = Some(UserProfileView {
             user_id,
             display_name: display_name.clone(),
             device_name: device_name.clone(),
             recovery_status: if recovered {
-                "Recovered locally from placeholder code; no cloud or cross-device history recovery claimed"
+                "Account-continuity recovery accepted with verified local identity material; message history and content keys were not restored"
                     .to_owned()
             } else {
-                "New local profile; recovery export remains a local placeholder".to_owned()
+                "New local identity generated from command signing material; recovery export is account-continuity only"
+                    .to_owned()
             },
         });
         self.lifecycle = AppLifecycle::Ready;
-        self.devices = vec![generated_device_view(
-            &display_name,
-            &device_name,
-            1,
-            true,
-            1,
-        )];
+        self.device_set = DeviceSet::new();
+        let device_key = command_device_key(&seed, &device_name, self.next_sequence);
+        let leaf = self
+            .device_set
+            .add_authorized_device(&identity, device_key, &device_name, 1);
+        self.devices = vec![device_view_from_leaf(&leaf, true, true)];
         if self.dms.is_empty() {
             let friend = core_app_snapshot().friend;
             let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);
@@ -2044,7 +2060,7 @@ impl PersistedAppState {
     fn apply_account_recovery(&mut self, recovery: &AccountRecovery) {
         if let Some(profile) = &mut self.profile {
             profile.recovery_status = format!(
-                "Account continuity restored for {} room(s) and {} device(s); content keys restored: {}",
+                "Account continuity restored with verified local identity material for {} room(s) and {} device(s); content keys restored: {}",
                 recovery.room_memberships.len(),
                 recovery.device_count,
                 recovery.content_keys_restored
@@ -2060,26 +2076,21 @@ impl PersistedAppState {
                 .add_authorized_device(&identity, device_key, "Desktop", 1);
             device_view_from_leaf(&leaf, true, true)
         });
-        self.devices = vec![local_device.clone()];
+        self.devices = vec![local_device];
+        let seed = self.identity_seed_bytes();
+        let identity = self.local_identity();
         for index in 2..=recovery.device_count.max(1) {
-            let device_id = format!("recovered-device-{index}");
+            let label = format!("Recovered device {index}");
+            let device_key = command_device_key(&seed, &label, self.next_sequence + index as u64);
+            let leaf =
+                self.device_set
+                    .add_authorized_device(&identity, device_key, &label, index as u64);
             if !self
                 .devices
                 .iter()
-                .any(|device| device.device_id == device_id)
+                .any(|device| device.device_id == leaf.device_id.to_string())
             {
-                self.devices.push(DeviceView {
-                    device_id: device_id.clone(),
-                    label: format!("Recovered device {index}"),
-                    leaf_index: index as u32,
-                    identity_key: local_device.identity_key.clone(),
-                    device_key: format!("recovered-device-key-{index}"),
-                    local: false,
-                    authorized: true,
-                    revoked: false,
-                    added_at_epoch: index as u64,
-                    revoked_at_epoch: None,
-                });
+                self.devices.push(device_view_from_leaf(&leaf, false, true));
             }
         }
 
@@ -2785,7 +2796,7 @@ mod tests {
     }
 
     #[test]
-    fn create_user_transitions_ready_and_persists() {
+    fn create_user_transitions_ready_and_persists() -> Result<(), String> {
         let _guard = test_lock();
         let path = reset_with_temp_state("create-user");
         let state = create_user(CreateUserRequest {
@@ -2808,6 +2819,23 @@ mod tests {
         assert_eq!(state.devices[0].identity_key.len(), 64);
         assert_eq!(state.devices[0].device_key.len(), 64);
         assert_ne!(state.devices[0].identity_key, state.devices[0].device_key);
+        assert!(state
+            .profile
+            .as_ref()
+            .map(|profile| profile.recovery_status.contains("command signing material"))
+            .unwrap_or(false));
+        let persisted_state = load_state();
+        let leaf = persisted_state
+            .device_set
+            .active_devices()
+            .first()
+            .cloned()
+            .ok_or_else(|| "real device-set leaf created".to_owned())?;
+        assert_eq!(
+            state.devices[0].identity_key,
+            hex::encode(leaf.identity_key)
+        );
+        assert_eq!(state.devices[0].device_key, hex::encode(leaf.device_key));
         assert!(!state.devices[0].revoked);
         assert_eq!(state.devices[0].revoked_at_epoch, None);
         assert!(path.exists());
@@ -2821,6 +2849,7 @@ mod tests {
                 .map(|profile| profile.device_name.as_str()),
             Some("Desktop")
         );
+        Ok(())
     }
 
     #[test]
@@ -2851,6 +2880,48 @@ mod tests {
         assert_eq!(state.devices[0].label, "Desktop");
         assert_eq!(state.devices[0].identity_key.len(), 64);
         assert_eq!(state.devices[0].device_key.len(), 64);
+        assert!(state
+            .profile
+            .as_ref()
+            .map(|profile| profile
+                .recovery_status
+                .contains("content keys restored: false"))
+            .unwrap_or(false));
+        let persisted_state = load_state();
+        assert_eq!(persisted_state.device_set.active_devices().len(), 1);
+    }
+
+    #[test]
+    fn recovery_code_rehydrates_stable_identity_material() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("stable-recovery-one");
+        let first = recover_user(RecoverUserRequest {
+            display_name: "Alice recovered".to_owned(),
+            recovery_code: "paper-coral-falcon".to_owned(),
+            device_name: Some("Recovered desktop".to_owned()),
+            recovery_room_memberships: vec!["Recovered Room".to_owned()],
+            recovered_device_count: Some(1),
+            use_sealed_account_backup: false,
+        });
+        let first_identity = first.devices[0].identity_key.clone();
+
+        let _path = reset_with_temp_state("stable-recovery-two");
+        let second = recover_user(RecoverUserRequest {
+            display_name: "Alice recovered".to_owned(),
+            recovery_code: "paper-coral-falcon".to_owned(),
+            device_name: Some("Recovered desktop".to_owned()),
+            recovery_room_memberships: vec!["Recovered Room".to_owned()],
+            recovered_device_count: Some(1),
+            use_sealed_account_backup: false,
+        });
+        assert_eq!(second.devices[0].identity_key, first_identity);
+        assert!(second
+            .profile
+            .as_ref()
+            .map(|profile| profile
+                .recovery_status
+                .contains("verified local identity material"))
+            .unwrap_or(false));
     }
 
     #[test]

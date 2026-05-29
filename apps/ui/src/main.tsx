@@ -159,7 +159,7 @@ function App() {
   const [draftDisplayName, setDraftDisplayName] = useState("Alice");
   const [draftDeviceName, setDraftDeviceName] = useState("Desktop");
   const [draftRecoveryCode, setDraftRecoveryCode] = useState(
-    "local recovery placeholder",
+    "paper-coral-falcon",
   );
   const [draftDmName, setDraftDmName] = useState("New contact");
   const [resetPhrase, setResetPhrase] = useState("");
