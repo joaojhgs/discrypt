@@ -30,7 +30,8 @@
     "test:malicious-member-g098": "node ../../scripts/check-malicious-member-g098.mjs",
     "test:retention-shred-g099": "node ../../scripts/check-retention-shred-g099.mjs",
     "test:performance-soak-g100": "node ../../scripts/check-performance-soak-g100.mjs",
-    "test:ac-dashboard-g101": "node ../../scripts/check-ac-dashboard-g101.mjs"
+    "test:ac-dashboard-g101": "node ../../scripts/check-ac-dashboard-g101.mjs",
+    "test:adr-001-webrtc-media-path": "node ../../scripts/check-adr-001-webrtc-media-path.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

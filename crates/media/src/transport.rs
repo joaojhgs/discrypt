@@ -11,6 +11,104 @@ pub enum MediaTransportPath {
     NativeWebRtcRsContingency,
 }
 
+/// Selected capture backend for the voice media path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceCaptureBackend {
+    /// Runtime WebView owns `getUserMedia`; Rust receives encoded frames through Encoded Transform.
+    WebviewGetUserMedia,
+    /// Native Android contingency owns capture through the Rust `webrtc` crate path.
+    AndroidNativeWebRtcRs,
+}
+
+/// Selected playback backend for the voice media path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoicePlaybackBackend {
+    /// Runtime WebView owns audio output selection and playback.
+    WebviewAudioOutput,
+    /// Native Android contingency owns playback through the Rust `webrtc` crate path.
+    AndroidNativeWebRtcRs,
+}
+
+/// Selected Opus codec owner for encoded voice frames that cross the Rust media boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceCodecBackend {
+    /// Rust Opus encode/decode uses the workspace-pinned `libopus-rs` crate.
+    RustLibopusRs,
+    /// WebRTC runtime supplies already-encoded Opus frames to the keyless transform bridge.
+    WebRtcRuntimeOpus,
+}
+
+/// Auditable ADR-001 media path decision exported to UI/ops evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebRtcMediaPathDecision {
+    /// Runtime platform label used for the decision.
+    pub platform: String,
+    /// Transport/media engine selected for voice.
+    pub path: MediaTransportPath,
+    /// Whether the desktop/mobile WebView `RTCPeerConnection` Encoded Transform path is active.
+    pub webview_rtc_peer_connection: bool,
+    /// Whether the Rust `webrtc` crate is active as an Android media contingency.
+    pub native_webrtc_rs_contingency: bool,
+    /// Whether WebRTC Encoded Transform support must be present for this path.
+    pub encoded_transform_required: bool,
+    /// Capture backend selected by the ADR.
+    pub capture_backend: VoiceCaptureBackend,
+    /// Playback backend selected by the ADR.
+    pub playback_backend: VoicePlaybackBackend,
+    /// Opus codec owner for frames crossing the Rust media boundary.
+    pub codec_backend: VoiceCodecBackend,
+    /// Raw SFrame and MLS exporter keys stay in Rust-owned state.
+    pub rust_sframe_key_owner: bool,
+    /// JavaScript may only see encoded frame bytes, KIDs, and counters.
+    pub js_raw_key_export_allowed: bool,
+}
+
+impl WebRtcMediaPathDecision {
+    /// Build the ADR-001 media path decision from runtime capabilities.
+    #[must_use]
+    pub fn for_runtime(platform: impl Into<String>, encoded_transform_supported: bool) -> Self {
+        let platform = platform.into();
+        let android_native =
+            platform.eq_ignore_ascii_case("android") && !encoded_transform_supported;
+        if android_native {
+            Self {
+                platform,
+                path: MediaTransportPath::NativeWebRtcRsContingency,
+                webview_rtc_peer_connection: false,
+                native_webrtc_rs_contingency: true,
+                encoded_transform_required: false,
+                capture_backend: VoiceCaptureBackend::AndroidNativeWebRtcRs,
+                playback_backend: VoicePlaybackBackend::AndroidNativeWebRtcRs,
+                codec_backend: VoiceCodecBackend::RustLibopusRs,
+                rust_sframe_key_owner: true,
+                js_raw_key_export_allowed: false,
+            }
+        } else {
+            Self {
+                platform,
+                path: MediaTransportPath::WebviewEncodedTransform,
+                webview_rtc_peer_connection: true,
+                native_webrtc_rs_contingency: false,
+                encoded_transform_required: true,
+                capture_backend: VoiceCaptureBackend::WebviewGetUserMedia,
+                playback_backend: VoicePlaybackBackend::WebviewAudioOutput,
+                codec_backend: VoiceCodecBackend::WebRtcRuntimeOpus,
+                rust_sframe_key_owner: true,
+                js_raw_key_export_allowed: false,
+            }
+        }
+    }
+
+    /// True only when the selected path preserves the no-raw-key JavaScript boundary.
+    #[must_use]
+    pub const fn preserves_rust_sframe_boundary(&self) -> bool {
+        self.rust_sframe_key_owner && !self.js_raw_key_export_allowed
+    }
+}
+
 /// Browser/native microphone permission state reported before joining voice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +263,12 @@ pub struct AndroidVoiceContingency {
 }
 
 impl AndroidVoiceContingency {
+    /// Return the complete ADR-001 media path decision for this runtime.
+    #[must_use]
+    pub fn media_path_decision(&self) -> WebRtcMediaPathDecision {
+        WebRtcMediaPathDecision::for_runtime(&self.platform, self.encoded_transform_supported)
+    }
+
     /// Select webview transforms unless Android lacks encoded-frame hooks.
     #[must_use]
     pub fn selected_path(&self) -> MediaTransportPath {
@@ -409,5 +513,47 @@ mod tests {
         assert!(granted.can_join_voice());
         assert!(granted.status_copy().contains("Studio microphone"));
         assert!(granted.status_copy().contains("Desk speakers"));
+    }
+
+    #[test]
+    fn adr_001_desktop_decision_uses_webview_peer_connection_and_rust_sframe_boundary() {
+        let decision = WebRtcMediaPathDecision::for_runtime("linux", true);
+        assert_eq!(decision.path, MediaTransportPath::WebviewEncodedTransform);
+        assert!(decision.webview_rtc_peer_connection);
+        assert!(!decision.native_webrtc_rs_contingency);
+        assert!(decision.encoded_transform_required);
+        assert_eq!(
+            decision.capture_backend,
+            VoiceCaptureBackend::WebviewGetUserMedia
+        );
+        assert_eq!(
+            decision.playback_backend,
+            VoicePlaybackBackend::WebviewAudioOutput
+        );
+        assert_eq!(decision.codec_backend, VoiceCodecBackend::WebRtcRuntimeOpus);
+        assert!(decision.preserves_rust_sframe_boundary());
+    }
+
+    #[test]
+    fn adr_001_android_without_encoded_transform_uses_native_webrtc_rs_and_libopus() {
+        let contingency = AndroidVoiceContingency {
+            platform: "android".into(),
+            encoded_transform_supported: false,
+        };
+        let decision = contingency.media_path_decision();
+        assert_eq!(decision.path, MediaTransportPath::NativeWebRtcRsContingency);
+        assert!(!decision.webview_rtc_peer_connection);
+        assert!(decision.native_webrtc_rs_contingency);
+        assert!(!decision.encoded_transform_required);
+        assert_eq!(
+            decision.capture_backend,
+            VoiceCaptureBackend::AndroidNativeWebRtcRs
+        );
+        assert_eq!(
+            decision.playback_backend,
+            VoicePlaybackBackend::AndroidNativeWebRtcRs
+        );
+        assert_eq!(decision.codec_backend, VoiceCodecBackend::RustLibopusRs);
+        assert!(decision.preserves_rust_sframe_boundary());
     }
 }
