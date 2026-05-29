@@ -1496,6 +1496,10 @@ function SetupPanel({
                 title="Residual presence risk"
                 copy={snapshot.security_copy.malicious_member}
               />
+              <InfoRow
+                title="Sybil-resistance posture"
+                copy={snapshot.security_copy.sybil_resistance}
+              />
             </div>
           </CardContent>
         </Card>
@@ -2030,6 +2034,10 @@ function ChannelPanel({
             title="Residual presence risk"
             copy={snapshot.security_copy.malicious_member}
           />
+          <InfoRow
+            title="Sybil-resistance posture"
+            copy={snapshot.security_copy.sybil_resistance}
+          />
           <Separator />
           {channels.length === 0 ? (
             <p className="text-sm text-[hsl(var(--muted-foreground))]">
@@ -2389,6 +2397,8 @@ function InspectorRail({
               <p>{snapshot.security_copy.deletion}</p>
               <Separator />
               <p>{snapshot.security_copy.malicious_member}</p>
+              <Separator />
+              <p>{snapshot.security_copy.sybil_resistance}</p>
             </CardContent>
           </Card>
           <Card className="border-[hsl(var(--destructive)/0.35)]">

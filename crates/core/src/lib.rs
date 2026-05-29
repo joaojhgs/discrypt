@@ -225,6 +225,8 @@ pub struct SecurityCopyView {
     pub deletion: String,
     /// Malicious-recipient caveat.
     pub malicious_member: String,
+    /// Sybil-resistance caveat for abuse controls.
+    pub sybil_resistance: String,
 }
 
 /// Snapshot returned by the Tauri command surface and consumed by the React shell.
@@ -975,6 +977,7 @@ fn seed_state() -> AppState {
                 metadata: "Passive infrastructure can see IPs and timing; discrypt does not claim anonymity".to_owned(),
                 deletion: "Deleted on your online devices now; pending on offline devices until they reconnect".to_owned(),
                 malicious_member: "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient. Authorized members can still infer some liveness from archival live-key behavior; this is not metadata anonymity.".to_owned(),
+                sybil_resistance: "Abuse controls slow invite creation, invite use, admission-helper attempts, signaling publish/take, text bursts, and relay freeloading. They do not solve Sybil attacks without a central identity or reputation service; one person can still create many accounts or devices.".to_owned(),
             },
         },
         next_message_sequence: 1,
@@ -1106,6 +1109,18 @@ mod tests {
             .security_copy
             .malicious_member
             .contains("infer some liveness"));
+        assert!(snapshot
+            .security_copy
+            .sybil_resistance
+            .contains("do not solve Sybil attacks without a central identity"));
+        assert!(snapshot
+            .security_copy
+            .sybil_resistance
+            .contains("invite creation"));
+        assert!(snapshot
+            .security_copy
+            .sybil_resistance
+            .contains("relay freeloading"));
         assert!(snapshot
             .voice_session
             .status_copy

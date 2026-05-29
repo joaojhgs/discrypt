@@ -61,5 +61,11 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
   admission descriptor covers opaque ids, room-secret commitments, expiry, max-use,
   issuer signatures, and revocation/use accounting; it does not yet claim signed
   endpoint policy or trust-fingerprint coverage.
-- Abuse controls are local deterministic primitives; production Sybil resistance remains
-  documented posture rather than a cryptographic guarantee.
+- Abuse controls prevent unbounded local bursts only within the dimensions they can
+  authenticate: invite creation, invite consumption, admission-helper attempts,
+  signaling publish/take requests, text sends, live-key probing, and relay freeloading. Those actions are rate-limited or ranked down, not globally banned.
+- Sybil resistance is intentionally not claimed. Without a central identity,
+  reputation, payment, proof-of-work, or operator-issued credential service, one
+  person can still create many accounts, devices, invite attempts, or relay
+  identities. Discrypt therefore documents Sybil resistance as an honest operational
+  posture, not a cryptographic guarantee or metadata-anonymity property.

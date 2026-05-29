@@ -1778,7 +1778,11 @@ pub fn command_health() -> CommandHealth {
         && state
             .security_copy
             .malicious_member
-            .contains("not metadata anonymity");
+            .contains("not metadata anonymity")
+        && state
+            .security_copy
+            .sybil_resistance
+            .contains("do not solve Sybil attacks without a central identity");
     let app_state_ready = state.schema_version == APP_STATE_SCHEMA_VERSION;
     let identity_ready = matches!(
         state.lifecycle,

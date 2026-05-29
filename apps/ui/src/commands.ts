@@ -105,6 +105,7 @@ export type SecurityCopyView = {
   metadata: string;
   deletion: string;
   malicious_member: string;
+  sybil_resistance: string;
 };
 
 export type AppSnapshot = {
@@ -537,6 +538,8 @@ const fallbackSnapshot: AppSnapshot = {
       "Deleted on your online devices now; pending on offline devices until they reconnect",
     malicious_member:
       "Crypto-shred cannot erase screenshots, exports, modified clients, or plaintext already saved by a recipient. Authorized members can still infer some liveness from archival live-key behavior; this is not metadata anonymity.",
+    sybil_resistance:
+      "Abuse controls slow invite creation, invite use, admission-helper attempts, signaling publish/take, text bursts, and relay freeloading. They do not solve Sybil attacks without a central identity or reputation service; one person can still create many accounts or devices.",
   },
 };
 
@@ -2196,7 +2199,10 @@ export async function commandHealth(): Promise<CommandHealth> {
     honest_copy_ready:
       fallbackState.security_copy.deletion.includes("pending on offline devices") &&
       fallbackState.security_copy.metadata.includes("does not claim anonymity") &&
-      fallbackState.security_copy.malicious_member.includes("not metadata anonymity"),
+      fallbackState.security_copy.malicious_member.includes("not metadata anonymity") &&
+      fallbackState.security_copy.sybil_resistance.includes(
+        "do not solve Sybil attacks without a central identity",
+      ),
   }));
 }
 
