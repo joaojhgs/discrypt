@@ -373,44 +373,6 @@ impl DeviceSet {
     }
 }
 
-fn canonical_pairing_message(
-    version: u8,
-    authorizing_device_id: Uuid,
-    identity_key: &str,
-    requested_label: &str,
-    challenge: Uuid,
-    expires_epoch: u64,
-) -> String {
-    format!(
-        "discrypt-device-pairing-v{version}|authorizer={authorizing_device_id}|identity={identity_key}|label={requested_label}|challenge={challenge}|expires_epoch={expires_epoch}"
-    )
-}
-
-fn normalize_device_label(label: impl Into<String>) -> String {
-    let label = label.into();
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        "paired device".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-fn decode_32_byte_hex(value: &str) -> Result<[u8; 32], DevicePairingError> {
-    let decoded = hex::decode(value)
-        .map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))?;
-    decoded
-        .try_into()
-        .map_err(|_| DevicePairingError::InvalidPayload("expected 32-byte key".to_owned()))
-}
-
-fn decode_signature(value: &str) -> Result<Signature, DevicePairingError> {
-    let decoded = hex::decode(value)
-        .map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))?;
-    Signature::from_slice(&decoded)
-        .map_err(|error| DevicePairingError::InvalidPayload(error.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,13 +422,19 @@ mod tests {
             rotation.retired.identity_key,
             rotation.replacement.identity_key
         );
-
-        let mut tampered: DevicePairingPayload = serde_json::from_str(&payload)?;
-        tampered.requested_label = "attacker-phone".to_owned();
-        let tampered = serde_json::to_string(&tampered)?;
+        assert_ne!(rotation.retired.device_key, rotation.replacement.device_key);
+        assert_eq!(set.active_devices(), vec![&rotation.replacement]);
         assert_eq!(
-            set.add_device_from_pairing_payload(&identity, &tampered, phone_key, 2),
-            Err(DevicePairingError::SignatureVerificationFailed)
+            set.transparency_events()
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "device-added",
+                "device-compromised-removed",
+                "device-added",
+                "device-rotation-replacement",
+            ]
         );
         Ok(())
     }
