@@ -120,3 +120,88 @@ fn serialized_invite_descriptor_redacts_room_secret_but_keeps_join_metadata(
     assert!(!serialized.contains("room_secret="));
     Ok(())
 }
+
+#[test]
+fn signed_invite_metadata_resolves_typed_ice_config_with_group_precedence(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use discrypt_transport::{
+        ConnectivityPlanner, Endpoint, FallbackLeg, IceEndpointPolicy, SimulatedNat,
+        TurnServerConfig,
+    };
+
+    let issuer = SigningKey::generate(&mut OsRng);
+    let now = Utc::now();
+    let endpoint = "https://signal.example.invalid/v1/rendezvous";
+    let invite_ice = IceEndpointPolicy::new(
+        vec![Endpoint::new("stun:invite.example.invalid:3478")],
+        vec![TurnServerConfig::new(
+            Endpoint::new("turns:invite.example.invalid:5349"),
+            Some("invite-user".to_owned()),
+            Some("invite-turn-secret".to_owned()),
+            Some("2026-05-29T17:00:00Z".to_owned()),
+        )],
+    )?;
+    let metadata = InviteSignalingMetadata::new(
+        endpoint,
+        InviteEndpointPolicy::ProductionTls,
+        trust_for(endpoint)?,
+    )?
+    .with_ice_endpoint_policy(invite_ice)?;
+    let mut store = InviteStore::new();
+    let invite = store.issue_invite_with_metadata(
+        b"room secret never serialized",
+        now + Duration::minutes(5),
+        3,
+        metadata,
+        &issuer,
+    )?;
+
+    let group_ice = IceEndpointPolicy::new(
+        vec![Endpoint::new("stuns:group.example.invalid:5349")],
+        vec![TurnServerConfig::new(
+            Endpoint::new("turn:group.example.invalid:3478"),
+            None,
+            None,
+            None,
+        )],
+    )?;
+    let ice_config = invite.ice_server_config(Some(&group_ice))?;
+    let connectivity = ice_config.to_connectivity_config();
+    let direct = ConnectivityPlanner::plan(&connectivity, SimulatedNat::direct())?;
+    let turn = ConnectivityPlanner::plan(&connectivity, SimulatedNat::turn_only())?;
+
+    assert_eq!(
+        direct.endpoint,
+        Endpoint::new("stuns:group.example.invalid:5349")
+    );
+    assert_eq!(turn.selected, FallbackLeg::Turn);
+    assert_eq!(
+        turn.endpoint,
+        Endpoint::new("turn:group.example.invalid:3478")
+    );
+    assert!(!format!("{ice_config:?}").contains("invite-turn-secret"));
+    Ok(())
+}
+
+#[test]
+fn invite_metadata_rejects_invalid_signed_ice_endpoint_policy(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use discrypt_transport::{Endpoint, IceEndpointPolicy};
+
+    let endpoint = "https://signal.example.invalid/v1/rendezvous";
+    let invalid_ice = IceEndpointPolicy {
+        stun_servers: vec![Endpoint::new("https://not-stun.example.invalid")],
+        turn_servers: vec![],
+    };
+
+    assert_eq!(
+        InviteSignalingMetadata::new(
+            endpoint,
+            InviteEndpointPolicy::ProductionTls,
+            trust_for(endpoint)?,
+        )?
+        .with_ice_endpoint_policy(invalid_ice),
+        Err(InviteError::InvalidEndpointPolicy)
+    );
+    Ok(())
+}

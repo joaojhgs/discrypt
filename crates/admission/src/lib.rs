@@ -8,6 +8,7 @@
 
 pub mod production_status;
 use chrono::{DateTime, Utc};
+use discrypt_transport::{IceEndpointPolicy, IceServerConfig};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -167,6 +168,9 @@ pub struct InviteSignalingMetadata {
     pub endpoint_policy: InviteEndpointPolicy,
     /// Joiner-visible endpoint trust material.
     pub trust: InviteTrustMetadata,
+    /// Signed ICE/STUN/TURN endpoint policy used to build typed transport config.
+    #[serde(default)]
+    pub ice_endpoint_policy: IceEndpointPolicy,
 }
 
 impl InviteSignalingMetadata {
@@ -180,6 +184,7 @@ impl InviteSignalingMetadata {
             signaling_endpoint: signaling_endpoint.into(),
             endpoint_policy,
             trust,
+            ice_endpoint_policy: IceEndpointPolicy::default_production(),
         };
         metadata.validate()?;
         Ok(metadata)
@@ -197,10 +202,24 @@ impl InviteSignalingMetadata {
                 signaling_fingerprint: fingerprint,
                 trust_status: "signed endpoint fingerprint; verify before MLS Welcome".to_owned(),
             },
+            ice_endpoint_policy: IceEndpointPolicy::default_production(),
         }
     }
 
-    /// Validate endpoint, policy, and trust metadata without exposing invite secrets.
+    /// Return this signaling metadata with an explicit signed ICE endpoint policy.
+    pub fn with_ice_endpoint_policy(
+        mut self,
+        ice_endpoint_policy: IceEndpointPolicy,
+    ) -> Result<Self, InviteError> {
+        ice_endpoint_policy
+            .validate()
+            .map_err(|_| InviteError::InvalidEndpointPolicy)?;
+        self.ice_endpoint_policy = ice_endpoint_policy;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validate endpoint, policy, trust metadata, and ICE endpoint policy without exposing invite secrets.
     pub fn validate(&self) -> Result<(), InviteError> {
         if self.signaling_endpoint.trim() != self.signaling_endpoint
             || self.signaling_endpoint.is_empty()
@@ -214,7 +233,10 @@ impl InviteSignalingMetadata {
         {
             return Err(InviteError::InvalidSignalingEndpoint);
         }
-        self.trust.validate()
+        self.trust.validate()?;
+        self.ice_endpoint_policy
+            .validate()
+            .map_err(|_| InviteError::InvalidEndpointPolicy)
     }
 }
 
@@ -258,6 +280,19 @@ impl StoredInvite {
         verifying_key
             .verify(&self.signing_bytes(), &signature)
             .map_err(|_| InviteError::InvalidIssuerSignature)
+    }
+
+    /// Verify the signed invite descriptor and resolve its ICE endpoint policy into typed transport config.
+    pub fn ice_server_config(
+        &self,
+        group_policy: Option<&IceEndpointPolicy>,
+    ) -> Result<IceServerConfig, InviteError> {
+        self.verify_issuer_signature()?;
+        IceEndpointPolicy::resolve(
+            Some(&self.signaling_metadata.ice_endpoint_policy),
+            group_policy,
+        )
+        .map_err(|_| InviteError::InvalidEndpointPolicy)
     }
 
     /// True when the invite has a revocation governance event.
@@ -455,6 +490,9 @@ fn canonical_invite_signing_bytes(
     bytes.extend_from_slice(signaling_metadata.trust.signaling_fingerprint.as_bytes());
     bytes.extend_from_slice(&(signaling_metadata.trust.trust_status.len() as u64).to_le_bytes());
     bytes.extend_from_slice(signaling_metadata.trust.trust_status.as_bytes());
+    let ice_policy = signaling_metadata.ice_endpoint_policy.signing_bytes();
+    bytes.extend_from_slice(&(ice_policy.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&ice_policy);
     bytes.extend_from_slice(&expires_at.timestamp_millis().to_le_bytes());
     bytes.extend_from_slice(&max_uses.to_le_bytes());
     bytes
