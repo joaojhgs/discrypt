@@ -473,8 +473,8 @@ pub fn recover_user(request: RecoverUserRequest) -> AppStateView {
 /// Tauri command: verify a user-confirmed safety-number comparison and persist success.
 pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerificationResult {
     let snapshot = app_snapshot();
-    let verified =
-        request.friend_id == snapshot.friend.friend_code && request.provided == snapshot.friend.safety_number;
+    let verified = request.friend_id == snapshot.friend.friend_code
+        && request.provided == snapshot.friend.safety_number;
     let result = SafetyVerificationResult {
         verified,
         message: if verified {
@@ -510,7 +510,8 @@ pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
 pub fn start_dm(request: StartDmRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
-        let display_name = normalize_label(&request.display_name, &core_app_snapshot().friend.alias);
+        let display_name =
+            normalize_label(&request.display_name, &core_app_snapshot().friend.alias);
         let dm_id = stable_id("dm", &display_name, state.next_sequence);
         if !state.dms.iter().any(|dm| dm.display_name == display_name) {
             state.dms.push(DirectConversationView {
@@ -1417,7 +1418,10 @@ fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
     ]
 }
 
-fn default_voice_participants(local_user_id: &str, local_speaking: bool) -> Vec<VoiceParticipantView> {
+fn default_voice_participants(
+    local_user_id: &str,
+    local_speaking: bool,
+) -> Vec<VoiceParticipantView> {
     vec![VoiceParticipantView {
         id: local_user_id.to_owned(),
         name: "You".to_owned(),
@@ -1434,7 +1438,10 @@ fn participant_id_from_friend_code(friend_code: &str) -> String {
         .nth(1)
         .and_then(|tail| tail.split('&').next())
         .unwrap_or(friend_code);
-    format!("friend-{}", fingerprint.chars().take(10).collect::<String>())
+    format!(
+        "friend-{}",
+        fingerprint.chars().take(10).collect::<String>()
+    )
 }
 
 fn invite_expiration_horizon(label: &str) -> String {

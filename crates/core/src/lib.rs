@@ -694,7 +694,10 @@ fn seed_state() -> AppState {
     let peer_friend_code = peer.friend_code();
     let local_device_id = device_id_from_friend_code(local_friend_code.as_str(), "desktop");
     let peer_device_id = device_id_from_friend_code(peer_friend_code.as_str(), "primary");
-    let safety_number = local.safety_number(&peer.verifying_key()).as_str().to_owned();
+    let safety_number = local
+        .safety_number(&peer.verifying_key())
+        .as_str()
+        .to_owned();
     AppState {
         snapshot: AppSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
