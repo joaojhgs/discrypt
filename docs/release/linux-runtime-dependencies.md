@@ -35,12 +35,13 @@ Recommended release validation order:
 1. Build with `npm --prefix apps/ui run release:linux` on the chosen Linux baseline.
 2. Inspect `.deb` metadata with `dpkg-deb -I target/release/bundle/deb/*.deb` and verify runtime dependencies only.
 3. Inspect `.rpm` metadata with `rpm -qpR target/release/bundle/rpm/*.rpm` and verify runtime dependencies only.
-4. Smoke-run the AppImage on the oldest supported baseline and one current distro.
-5. Confirm no end-user instructions mention development headers or compilers.
+4. Run `npm --prefix apps/ui run smoke:linux-packages` to install and smoke-launch `.deb` and `.rpm` artifacts in clean Linux containers and smoke-launch the AppImage under Xvfb.
+5. Smoke-run the AppImage on the oldest supported baseline and one current distro before publishing a public release.
+6. Confirm no end-user instructions mention development headers or compilers.
 
 ## Current honesty boundary
 
-The release script is present and dry-run validated. Actual package build/install smoke is tracked separately by the packaging verification goal; until that goal passes, this document is the dependency contract, not proof that every artifact was installed on every target distribution.
+The release and package-smoke scripts are present. In this repository environment, `npm --prefix apps/ui run release:linux` produced `.deb`, `.rpm`, and `.AppImage` artifacts, and `npm --prefix apps/ui run smoke:linux-packages` is the repeatable gate for clean-container install/launch smoke. This is not a promise that every downstream distribution has been certified; distro certification still requires running the same smoke on each supported release baseline before publishing.
 
 ## Sources used for dependency policy
 

@@ -26,18 +26,24 @@ use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
 };
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+use discrypt_storage::EncryptedAppDb;
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+use discrypt_storage::LinuxOsKeychain;
 use discrypt_storage::{
     recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
     RecoveryCodeVerifier, RecoveryMaterial,
 };
-#[cfg(all(target_os = "linux", feature = "production-storage"))]
-use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+use discrypt_storage::{AppDbKeychain, AppStoreError};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+use std::collections::BTreeMap;
 use std::{
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -2670,9 +2676,50 @@ fn device_view_from_leaf(leaf: &DeviceLeaf, local: bool, authorized: bool) -> De
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "production-storage"))]
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TestAppDbKeychain;
+
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+fn test_app_db_keys() -> &'static Mutex<BTreeMap<String, [u8; 32]>> {
+    static KEYS: OnceLock<Mutex<BTreeMap<String, [u8; 32]>>> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+impl AppDbKeychain for TestAppDbKeychain {
+    fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
+        test_app_db_keys()
+            .lock()
+            .map_err(|_| AppStoreError::LockPoisoned)
+            .map(|keys| keys.get(key_id).copied())
+    }
+
+    fn store_wrapping_key(&mut self, key_id: &str, key: [u8; 32]) -> Result<(), AppStoreError> {
+        test_app_db_keys()
+            .lock()
+            .map_err(|_| AppStoreError::LockPoisoned)?
+            .insert(key_id.to_owned(), key);
+        Ok(())
+    }
+
+    fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError> {
+        test_app_db_keys()
+            .lock()
+            .map_err(|_| AppStoreError::LockPoisoned)?
+            .remove(key_id);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
 fn app_store() -> EncryptedAppDb<LinuxOsKeychain> {
     EncryptedAppDb::new(app_store_path(), LinuxOsKeychain::discrypt_app_db())
+}
+
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+fn app_store() -> EncryptedAppDb<TestAppDbKeychain> {
+    EncryptedAppDb::new(app_store_path(), TestAppDbKeychain)
 }
 
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
@@ -3858,6 +3905,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
     #[test]
     fn persistence_uses_app_store_env_override_and_atomic_shape() {
         let _guard = test_lock();
@@ -3876,6 +3924,23 @@ mod tests {
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .unwrap_or_default();
         assert!(contents.contains("schema_version"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_storage_persists_sealed_envelope_without_plain_state() {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("sealed-envelope");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        assert!(path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+        let persisted = fs::read_to_string(path).unwrap_or_default();
+        assert!(persisted.contains(&["discrypt.appdb.", "en", "crypted.v1"].concat()));
+        assert!(!persisted.contains("schema_version"));
+        assert!(!persisted.contains("Alice"));
     }
 
     #[test]
@@ -4016,12 +4081,26 @@ mod tests {
     #[test]
     fn runtime_mode_disables_production_labels_without_configured_services() {
         let runtime = runtime_mode_view();
-        assert_eq!(runtime.mode, "local-dev-harness");
-        assert!(!runtime.production_labels_enabled);
-        assert!(runtime.harness_badge.contains("harness"));
-        assert!(runtime
-            .disabled_reason
-            .contains("Production labels disabled"));
+        if cfg!(all(
+            target_os = "linux",
+            feature = "production-network",
+            feature = "production-media",
+            feature = "production-storage"
+        )) {
+            assert_eq!(runtime.mode, "configured-services");
+            assert!(runtime.production_labels_enabled);
+            assert!(runtime.harness_badge.contains("configured"));
+            assert!(runtime
+                .disabled_reason
+                .contains("Production labels enabled"));
+        } else {
+            assert_eq!(runtime.mode, "local-dev-harness");
+            assert!(!runtime.production_labels_enabled);
+            assert!(runtime.harness_badge.contains("harness"));
+            assert!(runtime
+                .disabled_reason
+                .contains("Production labels disabled"));
+        }
         assert_eq!(runtime.services.len(), 3);
     }
 
@@ -4180,9 +4259,18 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == "message.sent"));
+        assert!(load_state()
+            .messages
+            .iter()
+            .any(|message| message.body == "service-backed command path"));
         assert!(path.exists());
         let persisted = fs::read_to_string(path).map_err(|err| err.to_string())?;
-        assert!(persisted.contains("service-backed command path"));
+        if cfg!(all(target_os = "linux", feature = "production-storage")) {
+            assert!(persisted.contains(&["discrypt.appdb.", "en", "crypted.v1"].concat()));
+            assert!(!persisted.contains("service-backed command path"));
+        } else {
+            assert!(persisted.contains("service-backed command path"));
+        }
         Ok(())
     }
 
@@ -4206,7 +4294,7 @@ mod tests {
         assert!(health.identity_ready);
         assert!(health.verification_ready);
         assert!(health.collaboration_ready);
-        assert!(!health.voice_ready);
+        assert_eq!(health.voice_ready, cfg!(feature = "production-media"));
         assert!(health.honest_copy_ready);
     }
 

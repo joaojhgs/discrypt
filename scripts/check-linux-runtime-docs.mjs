@@ -21,7 +21,9 @@ for (const token of [
   "glibc",
   "dpkg-deb -I",
   "rpm -qpR",
-  "Actual package build/install smoke is tracked separately",
+  "npm --prefix apps/ui run smoke:linux-packages",
+  "clean Linux containers",
+  "distro certification still requires running the same smoke",
 ]) {
   if (!doc.includes(token)) failures.push(`missing runtime dependency documentation token: ${token}`);
 }
