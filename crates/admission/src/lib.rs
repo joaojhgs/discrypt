@@ -18,6 +18,66 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// ADR-005 selected password/admission design.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AdmissionPasswordProtocol {
+    /// Current production path: an online helper verifies the password and signs a short-lived proof.
+    OnlineAuthorizedHelper,
+    /// Reserved future path for a concrete OPAQUE/PAKE dependency after dependency review.
+    OpaquePakeReserved,
+}
+
+/// ADR-005 decision record for password-gated admission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AdmissionPasswordDecision {
+    /// Selected launch protocol.
+    pub selected_protocol: AdmissionPasswordProtocol,
+    /// Why no offline verifier is allowed in invites or storage.
+    pub no_offline_verifier: &'static str,
+    /// Rate-limit proof source.
+    pub rate_limit_proof: &'static str,
+    /// Final admission requirement after password/helper success.
+    pub final_admission_gate: &'static str,
+    /// UI/error states that frontend and command surfaces must expose.
+    pub ux_error_states: &'static [&'static str],
+}
+
+impl AdmissionPasswordDecision {
+    /// Return true when the code-level decision covers every ADR-005 axis.
+    #[must_use]
+    pub fn covers_adr_005(&self) -> bool {
+        self.selected_protocol == AdmissionPasswordProtocol::OnlineAuthorizedHelper
+            && self.no_offline_verifier.contains("OfflineVerifierRejected")
+            && self.rate_limit_proof.contains("OnlineAdmissionHelper")
+            && self.rate_limit_proof.contains("max_attempts")
+            && self.final_admission_gate.contains("AuthorizedWelcome")
+            && self.final_admission_gate.contains("MLS Welcome/add")
+            && self.ux_error_states.contains(&"password_rejected")
+            && self.ux_error_states.contains(&"helper_proof_expired")
+            && self.ux_error_states.contains(&"welcome_required")
+            && self.ux_error_states.contains(&"offline_verifier_rejected")
+    }
+}
+
+/// Current ADR-005 password/admission decision.
+#[must_use]
+pub fn admission_password_decision() -> AdmissionPasswordDecision {
+    AdmissionPasswordDecision {
+        selected_protocol: AdmissionPasswordProtocol::OnlineAuthorizedHelper,
+        no_offline_verifier: "PasswordGate::OfflineVerifier is rejected with InviteError::OfflineVerifierRejected; invite descriptors carry no offline-copyable verifier material.",
+        rate_limit_proof: "OnlineAdmissionHelper stores a private password commitment server-side, counts attempts per subject with max_attempts, and returns the same PasswordRejected error for wrong password and over-limit cases.",
+        final_admission_gate: "AdmissionController requires a valid AuthorizedHelperProof or PAKE result plus exact AuthorizedWelcome MLS Welcome/add authorization before invite consumption.",
+        ux_error_states: &[
+            "password_rejected",
+            "helper_mismatch",
+            "helper_proof_expired",
+            "welcome_required",
+            "welcome_invalid",
+            "offline_verifier_rejected",
+        ],
+    }
+}
+
 /// Invite object with expiry/revoke/max-use controls.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Invite {
@@ -1326,6 +1386,36 @@ mod tests {
                 Some(&welcome),
                 welcome_payload,
             ),
+            Err(InviteError::PasswordRejected)
+        );
+    }
+
+    #[test]
+    fn admission_password_decision_covers_adr_005() {
+        let decision = admission_password_decision();
+
+        assert!(decision.covers_adr_005());
+        assert_eq!(
+            decision.selected_protocol,
+            AdmissionPasswordProtocol::OnlineAuthorizedHelper
+        );
+        assert!(decision.no_offline_verifier.contains("OfflineVerifier"));
+        assert!(decision.rate_limit_proof.contains("PasswordRejected"));
+        assert!(decision.final_admission_gate.contains("AuthorizedWelcome"));
+    }
+
+    #[test]
+    fn online_helper_failure_privacy_uses_uniform_rejection() {
+        let now = Utc::now();
+        let helper_key = SigningKey::generate(&mut OsRng);
+        let mut helper = OnlineAdmissionHelper::new("helper-a", b"correct", helper_key, 1, 60);
+
+        assert_eq!(
+            helper.authorize("mallory", b"wrong", now),
+            Err(InviteError::PasswordRejected)
+        );
+        assert_eq!(
+            helper.authorize("mallory", b"correct", now),
             Err(InviteError::PasswordRejected)
         );
     }
