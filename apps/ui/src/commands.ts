@@ -61,11 +61,23 @@ export type VoiceParticipantView = {
   volume: number;
 };
 
+export type VoiceDeviceKind = "audio_input" | "audio_output";
+
+export type VoiceDeviceDescriptor = {
+  device_id: string;
+  label: string;
+  kind: VoiceDeviceKind;
+};
+
 export type SnapshotVoiceSessionView = {
   joined: boolean;
+  microphone_permission: string;
+  input_device: VoiceDeviceDescriptor | null;
+  output_device: VoiceDeviceDescriptor | null;
   participants: VoiceParticipantView[];
   status_copy: string;
   route_copy: string;
+  permission_denied_copy: string;
 };
 
 export type PreferencesView = {
@@ -187,9 +199,13 @@ export type VoiceSessionView = {
   channel_id: string;
   joined: boolean;
   self_muted: boolean;
+  microphone_permission: string;
+  input_device: VoiceDeviceDescriptor | null;
+  output_device: VoiceDeviceDescriptor | null;
   participants: VoiceParticipantView[];
   route_copy: string;
   status_copy: string;
+  permission_denied_copy: string;
 };
 
 export type AppEventView = {
@@ -303,6 +319,11 @@ export type SendMessageRequest = {
 export type JoinVoiceRequest = {
   group_id: string;
   channel_id: string;
+  microphone_permission: "granted" | "denied" | "prompt" | "unknown";
+  input_device_id?: string | null;
+  input_device_label?: string | null;
+  output_device_id?: string | null;
+  output_device_label?: string | null;
 };
 
 export type LeaveVoiceRequest = {
@@ -395,10 +416,14 @@ const fallbackSnapshot: AppSnapshot = {
   },
   voice_session: {
     joined: false,
+    microphone_permission: "unknown",
+    input_device: null,
+    output_device: null,
     participants: [],
     status_copy: "Not joined; command-backed local voice controls are idle",
     route_copy:
       "Route copy is harness-backed until socket/media adapter E2E passes",
+    permission_denied_copy: "",
   },
   preferences: { theme_id: "graphite-calm", template_id: "command-center" },
   messages: [],
@@ -482,16 +507,24 @@ function syncSnapshot(state: AppState): AppState {
   state.snapshot.voice_session = state.voice_session
     ? {
         joined: state.voice_session.joined,
+        microphone_permission: state.voice_session.microphone_permission,
+        input_device: state.voice_session.input_device,
+        output_device: state.voice_session.output_device,
         participants: state.voice_session.participants,
         status_copy: state.voice_session.status_copy,
         route_copy: state.voice_session.route_copy,
+        permission_denied_copy: state.voice_session.permission_denied_copy,
       }
     : {
         joined: false,
+        microphone_permission: "unknown",
+        input_device: null,
+        output_device: null,
         participants: [],
         status_copy: "Not joined; command-backed local voice controls are idle",
         route_copy:
           "Local voice controls only; network media route is not connected in this build",
+        permission_denied_copy: "",
       };
   state.snapshot.activity_feed = state.events
     .slice()
@@ -1358,26 +1391,51 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("join_voice", { request }, () =>
     mutateFallback((state) => {
       ensureFallbackReady();
+      const captureAllowed =
+        request.microphone_permission === "granted" &&
+        Boolean(request.input_device_id || request.input_device_label);
+      const inputDevice = request.input_device_id || request.input_device_label
+        ? {
+            device_id: request.input_device_id ?? "default",
+            label: request.input_device_label ?? "Default microphone",
+            kind: "audio_input" as const,
+          }
+        : null;
+      const outputDevice = request.output_device_id || request.output_device_label
+        ? {
+            device_id: request.output_device_id ?? "default",
+            label: request.output_device_label ?? "Default speaker",
+            kind: "audio_output" as const,
+          }
+        : null;
       state.voice_session = {
         session_id: `voice-${request.channel_id}`,
         group_id: request.group_id,
         channel_id: request.channel_id,
-        joined: true,
+        joined: captureAllowed,
         self_muted: state.voice_session?.self_muted ?? false,
+        microphone_permission: request.microphone_permission,
+        input_device: inputDevice,
+        output_device: outputDevice,
         participants: [
           {
             id: localUserId(state),
             name: "You",
             role: "you",
-            speaking: true,
+            speaking: captureAllowed,
             muted: false,
             volume: 82,
           },
         ],
-        route_copy:
-          "Local voice controls only; network media route is not connected in this build",
-        status_copy:
-          "Voice session state joined locally; real audio-frame media remains release-gated",
+        route_copy: captureAllowed
+          ? "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E"
+          : "No voice route opened because microphone permission/input selection is not granted",
+        status_copy: captureAllowed
+          ? `Microphone capture authorized using ${inputDevice?.label ?? "Default microphone"} and playback routed to ${outputDevice?.label ?? "system default"}`
+          : "Microphone permission denied; voice was not joined and no capture is running",
+        permission_denied_copy: captureAllowed
+          ? ""
+          : "Grant microphone permission and select an input device before joining voice",
       };
       state.active_context = {
         kind: "voice_channel",
@@ -1387,8 +1445,10 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
       };
       pushEvent(
         state,
-        "voice.joined",
-        "Joined command-backed local voice session",
+        captureAllowed ? "voice.joined" : "voice.permission_denied",
+        captureAllowed
+          ? "Joined command-backed local voice session"
+          : "Microphone permission/input device required before joining voice",
       );
     }),
   );

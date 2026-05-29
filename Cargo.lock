@@ -1128,6 +1128,7 @@ dependencies = [
  "chrono",
  "discrypt-admission",
  "discrypt-core",
+ "discrypt-media",
  "discrypt-mls-core",
  "external-signaling",
  "discrypt-storage",

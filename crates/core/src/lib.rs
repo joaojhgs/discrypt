@@ -149,17 +149,36 @@ pub struct VoiceParticipantView {
     pub volume: u8,
 }
 
+/// Redacted audio device row for voice setup/status surfaces.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceDeviceView {
+    /// Runtime device id or `default`.
+    pub device_id: String,
+    /// User-facing device label.
+    pub label: String,
+    /// Device kind, e.g. `audio_input` or `audio_output`.
+    pub kind: String,
+}
+
 /// Command-backed voice session state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSessionView {
     /// Whether the local user has joined the voice room session state.
     pub joined: bool,
+    /// Microphone permission state observed before join.
+    pub microphone_permission: String,
+    /// Selected microphone/input device.
+    pub input_device: Option<VoiceDeviceView>,
+    /// Selected speaker/output device.
+    pub output_device: Option<VoiceDeviceView>,
     /// Participants emitted by the app service.
     pub participants: Vec<VoiceParticipantView>,
     /// Honest status copy scoped to command-backed session state.
     pub status_copy: String,
     /// Honest route/media copy scoped to the current adapter readiness.
     pub route_copy: String,
+    /// Permission-denied state copy, empty when capture is allowed.
+    pub permission_denied_copy: String,
 }
 
 /// Persisted UI preferences.
@@ -906,6 +925,9 @@ fn seed_state() -> AppState {
             },
             voice_session: VoiceSessionView {
                 joined: false,
+                microphone_permission: "unknown".to_owned(),
+                input_device: None,
+                output_device: None,
                 participants: vec![VoiceParticipantView {
                     id: "alice".to_owned(),
                     name: "Alice".to_owned(),
@@ -916,6 +938,7 @@ fn seed_state() -> AppState {
                 }],
                 status_copy: "Not joined; command-backed local voice controls are idle".to_owned(),
                 route_copy: "Local voice controls only; network media route is not connected in this build".to_owned(),
+                permission_denied_copy: String::new(),
             },
             preferences: PreferencesView {
                 theme_id: DEFAULT_THEME_ID.to_owned(),

@@ -21,4 +21,7 @@ pub use sframe::{
     SFrameSender, SenderBinding, VerifiedFrame,
 };
 pub use transform_bridge::{BridgeClearFrame, BridgeProtectedFrame, RustTransformBridge};
-pub use transport::{AndroidVoiceContingency, MediaTransportPath, NativeWebRtcRsSkeleton};
+pub use transport::{
+    AndroidVoiceContingency, MediaTransportPath, MicrophonePermissionState, NativeWebRtcRsSkeleton,
+    VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
+};

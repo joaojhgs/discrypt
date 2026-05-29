@@ -19,6 +19,9 @@ use discrypt_core::{
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
+use discrypt_media::{
+    MicrophonePermissionState, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
+};
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
@@ -294,12 +297,24 @@ pub struct VoiceSessionView {
     pub joined: bool,
     /// Whether the local participant muted themself.
     pub self_muted: bool,
+    /// Browser/native microphone permission state used for this join attempt.
+    #[serde(default = "default_microphone_permission")]
+    pub microphone_permission: String,
+    /// Selected microphone/input device after runtime enumeration.
+    #[serde(default)]
+    pub input_device: Option<VoiceDeviceDescriptor>,
+    /// Selected speaker/output device after runtime enumeration.
+    #[serde(default)]
+    pub output_device: Option<VoiceDeviceDescriptor>,
     /// Participant roster.
     pub participants: Vec<VoiceParticipantView>,
     /// Honest route/status copy.
     pub route_copy: String,
     /// Honest media/session status copy.
     pub status_copy: String,
+    /// Permission-denied state copy, empty when capture is allowed.
+    #[serde(default)]
+    pub permission_denied_copy: String,
 }
 
 /// Runtime event emitted by mutation commands and available through polling.
@@ -496,6 +511,21 @@ pub struct JoinVoiceRequest {
     pub group_id: String,
     /// Voice channel id.
     pub channel_id: String,
+    /// Browser/native microphone permission observed by the UI shell.
+    #[serde(default = "default_microphone_permission")]
+    pub microphone_permission: String,
+    /// Selected microphone device id.
+    #[serde(default)]
+    pub input_device_id: Option<String>,
+    /// Selected microphone label.
+    #[serde(default)]
+    pub input_device_label: Option<String>,
+    /// Selected speaker/output device id.
+    #[serde(default)]
+    pub output_device_id: Option<String>,
+    /// Selected speaker/output label.
+    #[serde(default)]
+    pub output_device_label: Option<String>,
 }
 
 /// Request to leave a voice session.
@@ -523,6 +553,10 @@ pub struct SetSpeakerVolumeRequest {
     pub participant_id: String,
     /// Volume 0-100.
     pub volume: u8,
+}
+
+fn default_microphone_permission() -> String {
+    "unknown".to_owned()
 }
 
 /// Command-surface health for local E2E/smoke execution.
@@ -1118,6 +1152,8 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_state(|state| {
         state.ensure_ready_profile();
         let session_id = stable_id("voice", &request.channel_id, state.next_sequence);
+        let selection = voice_device_selection(&request);
+        let capture_allowed = selection.can_join_voice();
         let self_muted = state
             .voice_session
             .as_ref()
@@ -1128,15 +1164,29 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             session_id: session_id.clone(),
             group_id: request.group_id.clone(),
             channel_id: request.channel_id.clone(),
-            joined: true,
+            joined: capture_allowed,
             self_muted,
-            participants: default_voice_participants(&local_user_id, !self_muted),
-            route_copy:
-                "Local voice controls only; network media route is not connected in this build"
-                    .to_owned(),
-            status_copy:
-                "Voice session state joined locally; real audio-frame media remains release-gated"
-                    .to_owned(),
+            microphone_permission: format!("{:?}", selection.microphone_permission)
+                .to_ascii_lowercase(),
+            input_device: selection.input_device.clone(),
+            output_device: selection.output_device.clone(),
+            participants: default_voice_participants(
+                &local_user_id,
+                capture_allowed && !self_muted,
+            ),
+            route_copy: if capture_allowed {
+                "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E".to_owned()
+            } else {
+                "No voice route opened because microphone permission/input selection is not granted"
+                    .to_owned()
+            },
+            status_copy: selection.status_copy(),
+            permission_denied_copy: if capture_allowed {
+                String::new()
+            } else {
+                "Grant microphone permission and select an input device before joining voice"
+                    .to_owned()
+            },
         });
         state.active_context = Some(ActiveContextView {
             kind: "voice_channel".to_owned(),
@@ -1144,7 +1194,14 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             channel_id: Some(request.channel_id),
             dm_id: None,
         });
-        state.push_event("voice.joined", format!("Joined voice session {session_id}"));
+        if capture_allowed {
+            state.push_event("voice.joined", format!("Joined voice session {session_id}"));
+        } else {
+            state.push_event(
+                "voice.permission_denied",
+                "Microphone permission/input device required before joining voice",
+            );
+        }
     })
 }
 
@@ -1557,6 +1614,9 @@ impl PersistedAppState {
         snapshot.voice_session = if let Some(session) = &self.voice_session {
             discrypt_core::VoiceSessionView {
                 joined: session.joined,
+                microphone_permission: session.microphone_permission.clone(),
+                input_device: session.input_device.as_ref().map(core_voice_device_view),
+                output_device: session.output_device.as_ref().map(core_voice_device_view),
                 participants: session
                     .participants
                     .iter()
@@ -1571,10 +1631,14 @@ impl PersistedAppState {
                     .collect(),
                 status_copy: session.status_copy.clone(),
                 route_copy: session.route_copy.clone(),
+                permission_denied_copy: session.permission_denied_copy.clone(),
             }
         } else {
             discrypt_core::VoiceSessionView {
                 joined: false,
+                microphone_permission: "unknown".to_owned(),
+                input_device: None,
+                output_device: None,
                 participants: default_voice_participants(&self.local_user_id(), false)
                     .into_iter()
                     .map(|participant| discrypt_core::VoiceParticipantView {
@@ -1590,6 +1654,7 @@ impl PersistedAppState {
                 route_copy:
                     "Local voice controls only; network media route is not connected in this build"
                         .to_owned(),
+                permission_denied_copy: String::new(),
             }
         };
         snapshot.activity_feed = self
@@ -1995,6 +2060,67 @@ fn default_voice_participants(
         muted: false,
         volume: 82,
     }]
+}
+
+fn voice_device_selection(request: &JoinVoiceRequest) -> VoiceDeviceSelection {
+    let permission = match request
+        .microphone_permission
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "granted" => MicrophonePermissionState::Granted,
+        "prompt" => MicrophonePermissionState::Prompt,
+        "denied" => MicrophonePermissionState::Denied,
+        _ => MicrophonePermissionState::Unknown,
+    };
+    let input_device = request
+        .input_device_id
+        .as_ref()
+        .or(request.input_device_label.as_ref())
+        .map(|_| {
+            VoiceDeviceDescriptor::new(
+                request
+                    .input_device_id
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+                request
+                    .input_device_label
+                    .clone()
+                    .unwrap_or_else(|| "Default microphone".to_owned()),
+                VoiceDeviceKind::AudioInput,
+            )
+        });
+    let output_device = request
+        .output_device_id
+        .as_ref()
+        .or(request.output_device_label.as_ref())
+        .map(|_| {
+            VoiceDeviceDescriptor::new(
+                request
+                    .output_device_id
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+                request
+                    .output_device_label
+                    .clone()
+                    .unwrap_or_else(|| "Default speaker".to_owned()),
+                VoiceDeviceKind::AudioOutput,
+            )
+        });
+    VoiceDeviceSelection::new(permission, input_device, output_device)
+}
+
+fn core_voice_device_view(device: &VoiceDeviceDescriptor) -> discrypt_core::VoiceDeviceView {
+    discrypt_core::VoiceDeviceView {
+        device_id: device.device_id.clone(),
+        label: device.label.clone(),
+        kind: match device.kind {
+            VoiceDeviceKind::AudioInput => "audio_input",
+            VoiceDeviceKind::AudioOutput => "audio_output",
+        }
+        .to_owned(),
+    }
 }
 
 fn participant_id_from_friend_code(friend_code: &str) -> String {
@@ -2724,6 +2850,11 @@ mod tests {
         let joined = join_voice(JoinVoiceRequest {
             group_id,
             channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
         });
         let session_id = joined
             .voice_session
@@ -2781,6 +2912,53 @@ mod tests {
     }
 
     #[test]
+    fn voice_join_requires_microphone_permission_and_input_device() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("voice-permission-denied");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "7 days".to_owned(),
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let denied = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "denied".to_owned(),
+            input_device_id: None,
+            input_device_label: None,
+            output_device_id: None,
+            output_device_label: None,
+        });
+        let session = denied
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "permission-denied voice session state".to_owned())?;
+        assert!(!session.joined);
+        assert_eq!(session.microphone_permission, "denied");
+        assert!(session.permission_denied_copy.contains("Grant microphone"));
+        assert!(session
+            .participants
+            .iter()
+            .all(|participant| !participant.speaking));
+        assert!(denied
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.permission_denied"));
+        Ok(())
+    }
+
+    #[test]
     fn voice_sessions_are_channel_scoped() -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("voice-scoped");
@@ -2810,6 +2988,11 @@ mod tests {
         let joined = join_voice(JoinVoiceRequest {
             group_id,
             channel_id: first_channel.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
         });
         let session = joined
             .voice_session

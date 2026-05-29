@@ -16,6 +16,7 @@ import {
   GroupView,
   InviteView,
   VoiceParticipantView,
+  VoiceSessionView,
   createChannel as createChannelCommand,
   createGroup,
   createInvite,
@@ -55,6 +56,13 @@ import "./styles.css";
 type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 type SetupStepView = { label: string; complete: boolean; detail: string };
 type VoiceParticipant = VoiceParticipantView;
+type VoiceDeviceAccess = {
+  microphone_permission: "granted" | "denied" | "prompt" | "unknown";
+  input_device_id: string | null;
+  input_device_label: string | null;
+  output_device_id: string | null;
+  output_device_label: string | null;
+};
 
 function asThemeId(value: string): ThemeId {
   return discryptUiConfig.themes.some((theme) => theme.id === value)
@@ -66,6 +74,50 @@ function asTemplateId(value: string): TemplateId {
   return discryptUiConfig.templates.some((template) => template.id === value)
     ? (value as TemplateId)
     : discryptUiConfig.activeTemplate;
+}
+
+async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return {
+      microphone_permission: "denied",
+      input_device_id: null,
+      input_device_label: null,
+      output_device_id: null,
+      output_device_label: null,
+    };
+  }
+
+  let stream: MediaStream | null = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const input =
+      devices.find((device) => device.kind === "audioinput" && device.deviceId) ??
+      devices.find((device) => device.kind === "audioinput");
+    const output =
+      devices.find((device) => device.kind === "audiooutput" && device.deviceId) ??
+      devices.find((device) => device.kind === "audiooutput");
+    return {
+      microphone_permission: "granted",
+      input_device_id: input?.deviceId || "default",
+      input_device_label: input?.label || "Default microphone",
+      output_device_id: output?.deviceId || "default",
+      output_device_label: output?.label || "Default speaker",
+    };
+  } catch {
+    return {
+      microphone_permission: "denied",
+      input_device_id: null,
+      input_device_label: null,
+      output_device_id: null,
+      output_device_label: null,
+    };
+  } finally {
+    stream?.getTracks().forEach((track) => track.stop());
+  }
 }
 
 function Icon({
@@ -419,10 +471,12 @@ function App() {
         setCommandError("Voice channel creation did not return a channel.");
         return;
       }
+      const voiceAccess = await requestVoiceDeviceAccess();
       void applyCommand(
         joinVoice({
           group_id: activeGroup.group_id,
           channel_id: voiceChannel.channel_id,
+          ...voiceAccess,
         }),
         () => setWorkflow("voice"),
       );
@@ -589,6 +643,7 @@ function App() {
                 currentSnapshot.voice.route
               }
               participants={participants}
+              voiceSession={appState.voice_session}
               voiceJoined={voiceJoined}
               selfMuted={selfMuted}
               setVoiceJoined={toggleVoiceJoin}
@@ -1744,6 +1799,7 @@ function VoicePanel({
   activeVoiceChannel,
   route,
   participants,
+  voiceSession,
   voiceJoined,
   selfMuted,
   setVoiceJoined,
@@ -1754,6 +1810,7 @@ function VoicePanel({
   activeVoiceChannel: ChannelStateView | null;
   route: string;
   participants: VoiceParticipant[];
+  voiceSession: VoiceSessionView | null;
   voiceJoined: boolean;
   selfMuted: boolean;
   setVoiceJoined: (joined: boolean) => void;
@@ -1761,6 +1818,12 @@ function VoicePanel({
   setVolume: (id: string, value: number[]) => void;
 }) {
   const visibleParticipants = voiceJoined ? participants : [];
+  const permissionDenied = Boolean(voiceSession?.permission_denied_copy);
+  const deviceCopy = voiceSession?.input_device
+    ? `${voiceSession.input_device.label} → ${
+        voiceSession.output_device?.label ?? "System default speaker"
+      }`
+    : "Microphone and speaker will be selected before joining.";
   return (
     <div className="grid gap-4 py-5 xl:grid-cols-[minmax(0,1fr)_340px]">
       <Card>
@@ -1780,8 +1843,13 @@ function VoicePanel({
         <CardContent className="grid gap-3">
           {!voiceJoined ? (
             <EmptyState
-              title="Not in voice"
-              copy="Join to create a local voice session. No remote friend/relay members are fabricated."
+              title={permissionDenied ? "Microphone blocked" : "Not in voice"}
+              copy={
+                permissionDenied
+                  ? (voiceSession?.permission_denied_copy ??
+                    "Grant microphone permission before joining voice.")
+                  : "Join to request microphone permission and create a local voice session. No remote friend/relay members are fabricated."
+              }
             />
           ) : null}
           {voiceJoined && visibleParticipants.length === 0 ? (
@@ -1862,8 +1930,15 @@ function VoicePanel({
             {voiceJoined ? "Leave call" : "Join call"}
           </Button>
           <InfoRow
+            title="Selected devices"
+            copy={deviceCopy}
+          />
+          <InfoRow
             title="Voice honesty"
-            copy="Phase-1 SFrame/relay media security is implemented in the Rust harness; this UI currently controls the local voice session until native media-frame E2E is wired into the Tauri shell. No relay/member is shown unless returned by state."
+            copy={
+              voiceSession?.status_copy ??
+              "Join voice to request microphone permission and select capture/playback devices."
+            }
           />
         </CardContent>
       </Card>
