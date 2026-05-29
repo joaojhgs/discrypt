@@ -8,7 +8,7 @@
 
 pub mod production_status;
 use admission::Invite;
-use mls_core::{verifying_key_from_hex, DeviceSet, GroupState, Identity, SafetyNumber};
+use mls_core::{DeviceSet, GroupState, Identity};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use storage::{recover_account, AppStore, AppStoreError, MemoryAppStore, RecoveryMaterial};
@@ -730,13 +730,12 @@ pub fn identity_recovery_verification_smoke() -> IdentityRecoveryVerification {
         && phone.label == "Phone"
         && phone.added_at_epoch == 2;
 
-    let recovery_without_content_keys = recover_account(RecoveryMaterial::RecoveryCode {
-        code_hash: [7u8; 32],
-        room_memberships: vec!["recovered room".to_owned()],
-        device_count: 2,
-    })
-    .map(|recovery| recovery.account_access_restored && !recovery.content_keys_restored)
-    .unwrap_or(false);
+    let recovery_without_content_keys =
+        recover_account(RecoveryMaterial::RecoveryCode {
+            code_hash: [7u8; 32],
+        })
+        .map(|recovery| recovery.account_access_restored && !recovery.content_keys_restored)
+        .unwrap_or(false);
 
     let removed = devices.remove_device(phone.device_id, 3);
     let compromised_device_revoked = removed
@@ -752,66 +751,6 @@ pub fn identity_recovery_verification_smoke() -> IdentityRecoveryVerification {
         recovery_without_content_keys,
         compromised_device_revoked,
     }
-}
-
-/// Generate a device row with real account and per-device identity keys.
-#[must_use]
-pub fn generated_device_view(
-    account_label: &str,
-    device_label: &str,
-    leaf_index: u32,
-    local: bool,
-    added_at_epoch: u64,
-) -> DeviceView {
-    let account = Identity::generate(account_label);
-    let device = Identity::generate(format!("{account_label} {device_label} device"));
-    DeviceView {
-        device_id: device_id_from_friend_code(account.friend_code().as_str(), device_label),
-        label: device_label.to_owned(),
-        leaf_index,
-        identity_key: hex_encode(account.verifying_key().as_bytes()),
-        device_key: hex_encode(device.verifying_key().as_bytes()),
-        local,
-        authorized: true,
-        revoked: false,
-        added_at_epoch,
-        revoked_at_epoch: None,
-    }
-}
-
-/// Validate that a snapshot safety number matches its local and peer identity keys.
-#[must_use]
-pub fn snapshot_safety_number_matches_identity_keys(snapshot: &AppSnapshot) -> bool {
-    let Some(safety_number) = snapshot
-        .devices
-        .iter()
-        .find(|device| device.local && !device.revoked)
-        .and_then(|device| {
-            safety_number_for_identity_hex_and_friend_code(
-                &device.identity_key,
-                &snapshot.friend.friend_code,
-            )
-        })
-    else {
-        return false;
-    };
-    safety_number == snapshot.friend.safety_number
-}
-
-/// Derive a safety number from a local identity key and peer friend-code payload.
-#[must_use]
-pub fn safety_number_for_identity_hex_and_friend_code(
-    local_identity_key_hex: &str,
-    friend_code: &str,
-) -> Option<String> {
-    let local_identity_key = verifying_key_from_hex(local_identity_key_hex)?;
-    let peer_identity_key =
-        mls_core::FriendCode::from_payload(friend_code.to_owned()).verifying_key()?;
-    Some(
-        SafetyNumber::from_identity_keys(&local_identity_key, &peer_identity_key)
-            .as_str()
-            .to_owned(),
-    )
 }
 
 /// Build an in-memory app service seeded with the deterministic fixture.
