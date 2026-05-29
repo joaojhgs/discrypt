@@ -34,6 +34,10 @@ pub enum GovernanceAction {
     },
     /// Ban/evict a member.
     Ban { target: LeafIndex },
+    /// Add an active device id under a member leaf.
+    AddDevice { owner: LeafIndex, device_id: String },
+    /// Remove an active device id under a member leaf.
+    RemoveDevice { owner: LeafIndex, device_id: String },
 }
 
 /// Governance errors.
@@ -207,6 +211,18 @@ fn append_governance_action_bytes(bytes: &mut Vec<u8>, action: &GovernanceAction
             bytes.push(3);
             bytes.extend_from_slice(&target.to_le_bytes());
         }
+        GovernanceAction::AddDevice { owner, device_id } => {
+            bytes.push(4);
+            bytes.extend_from_slice(&owner.to_le_bytes());
+            bytes.extend_from_slice(&(device_id.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(device_id.as_bytes());
+        }
+        GovernanceAction::RemoveDevice { owner, device_id } => {
+            bytes.push(5);
+            bytes.extend_from_slice(&owner.to_le_bytes());
+            bytes.extend_from_slice(&(device_id.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(device_id.as_bytes());
+        }
     }
 }
 
@@ -276,6 +292,7 @@ pub struct GovernanceState {
     banned: BTreeSet<LeafIndex>,
     revoked_invites: BTreeSet<String>,
     retention_seconds: BTreeMap<LeafIndex, Option<u64>>,
+    member_devices: BTreeMap<LeafIndex, BTreeSet<String>>,
 }
 
 impl GovernanceState {
@@ -288,6 +305,7 @@ impl GovernanceState {
             banned: BTreeSet::new(),
             revoked_invites: BTreeSet::new(),
             retention_seconds: BTreeMap::new(),
+            member_devices: BTreeMap::new(),
         }
     }
 
@@ -307,6 +325,20 @@ impl GovernanceState {
     #[must_use]
     pub fn invite_revoked(&self, invite_id: &str) -> bool {
         self.revoked_invites.contains(invite_id)
+    }
+
+    /// Effective per-author retention override recorded by governance.
+    #[must_use]
+    pub fn retention_seconds(&self, author: LeafIndex) -> Option<Option<u64>> {
+        self.retention_seconds.get(&author).copied()
+    }
+
+    /// True when the device id is currently active for the member leaf.
+    #[must_use]
+    pub fn device_active(&self, owner: LeafIndex, device_id: &str) -> bool {
+        self.member_devices
+            .get(&owner)
+            .is_some_and(|devices| devices.contains(device_id))
     }
 
     /// Apply one event after validation.
@@ -361,18 +393,69 @@ impl GovernanceState {
             GovernanceAction::Ban { target } => {
                 self.banned.insert(target);
                 self.roles.remove(&target);
+                self.member_devices.remove(&target);
+            }
+            GovernanceAction::AddDevice { owner, device_id } => {
+                self.member_devices
+                    .entry(owner)
+                    .or_default()
+                    .insert(device_id);
+            }
+            GovernanceAction::RemoveDevice { owner, device_id } => {
+                if let Some(devices) = self.member_devices.get_mut(&owner) {
+                    devices.remove(&device_id);
+                }
             }
         }
         Ok(())
     }
 
     fn authorized(&self, committer: LeafIndex, action: &GovernanceAction) -> bool {
-        match (self.role(committer), action) {
-            (Some(Role::Owner), _) => true,
-            (Some(Role::Admin), GovernanceAction::SetRole { .. }) => false,
-            (Some(Role::Admin), _) => true,
-            _ => false,
+        if self.banned.contains(&target_leaf(action)) {
+            return false;
         }
+        match self.role(committer) {
+            Some(Role::Owner) => true,
+            Some(Role::Admin) => self.admin_authorized(committer, action),
+            Some(Role::Member) => self.member_authorized(committer, action),
+            None => false,
+        }
+    }
+
+    fn admin_authorized(&self, committer: LeafIndex, action: &GovernanceAction) -> bool {
+        match action {
+            GovernanceAction::SetRole { .. } => false,
+            GovernanceAction::RevokeInvite { .. } => true,
+            GovernanceAction::SetRetentionSeconds { author, .. } => {
+                *author == committer || self.role(*author) == Some(Role::Member)
+            }
+            GovernanceAction::Ban { target } => self.role(*target) == Some(Role::Member),
+            GovernanceAction::AddDevice { owner, .. }
+            | GovernanceAction::RemoveDevice { owner, .. } => {
+                *owner == committer || self.role(*owner) == Some(Role::Member)
+            }
+        }
+    }
+
+    fn member_authorized(&self, committer: LeafIndex, action: &GovernanceAction) -> bool {
+        match action {
+            GovernanceAction::SetRetentionSeconds { author, .. } => *author == committer,
+            GovernanceAction::AddDevice { owner, .. }
+            | GovernanceAction::RemoveDevice { owner, .. } => *owner == committer,
+            GovernanceAction::SetRole { .. }
+            | GovernanceAction::RevokeInvite { .. }
+            | GovernanceAction::Ban { .. } => false,
+        }
+    }
+}
+
+fn target_leaf(action: &GovernanceAction) -> LeafIndex {
+    match action {
+        GovernanceAction::SetRole { target, .. } | GovernanceAction::Ban { target } => *target,
+        GovernanceAction::SetRetentionSeconds { author, .. }
+        | GovernanceAction::AddDevice { owner: author, .. }
+        | GovernanceAction::RemoveDevice { owner: author, .. } => *author,
+        GovernanceAction::RevokeInvite { .. } => LeafIndex::MAX,
     }
 }
 
@@ -533,6 +616,189 @@ mod tests {
         assert_eq!(
             event.verify_signature(),
             Err(GovernanceError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn enforces_role_retention_invite_ban_and_device_authority() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let admin = SigningKey::generate(&mut OsRng);
+        let member = SigningKey::generate(&mut OsRng);
+        let mut state = GovernanceState::new(12, 1);
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                1,
+                GovernanceAction::SetRole {
+                    target: 2,
+                    role: Role::Admin,
+                },
+                &owner,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                1,
+                GovernanceAction::SetRole {
+                    target: 3,
+                    role: Role::Member,
+                },
+                &owner,
+            )),
+            Ok(())
+        );
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                3,
+                GovernanceAction::RevokeInvite {
+                    invite_id: "member-nope".into(),
+                },
+                &member,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                2,
+                GovernanceAction::SetRole {
+                    target: 3,
+                    role: Role::Admin,
+                },
+                &admin,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                2,
+                GovernanceAction::Ban { target: 1 },
+                &admin,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                3,
+                GovernanceAction::SetRetentionSeconds {
+                    author: 3,
+                    seconds: Some(3_600),
+                },
+                &member,
+            )),
+            Ok(())
+        );
+        assert_eq!(state.retention_seconds(3), Some(Some(3_600)));
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                3,
+                GovernanceAction::SetRetentionSeconds {
+                    author: 2,
+                    seconds: Some(7_200),
+                },
+                &member,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                2,
+                GovernanceAction::SetRetentionSeconds {
+                    author: 3,
+                    seconds: None,
+                },
+                &admin,
+            )),
+            Ok(())
+        );
+        assert_eq!(state.retention_seconds(3), Some(None));
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                3,
+                GovernanceAction::AddDevice {
+                    owner: 3,
+                    device_id: "phone".into(),
+                },
+                &member,
+            )),
+            Ok(())
+        );
+        assert!(state.device_active(3, "phone"));
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                12,
+                2,
+                GovernanceAction::RemoveDevice {
+                    owner: 3,
+                    device_id: "phone".into(),
+                },
+                &admin,
+            )),
+            Ok(())
+        );
+        assert!(!state.device_active(3, "phone"));
+    }
+
+    #[test]
+    fn banned_leaf_cannot_regain_role_or_devices() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let mut state = GovernanceState::new(15, 1);
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                15,
+                1,
+                GovernanceAction::SetRole {
+                    target: 2,
+                    role: Role::Member,
+                },
+                &owner,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                15,
+                1,
+                GovernanceAction::Ban { target: 2 },
+                &owner
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                15,
+                1,
+                GovernanceAction::SetRole {
+                    target: 2,
+                    role: Role::Member,
+                },
+                &owner,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                15,
+                1,
+                GovernanceAction::AddDevice {
+                    owner: 2,
+                    device_id: "resurrected".into(),
+                },
+                &owner,
+            )),
+            Err(GovernanceError::Unauthorized)
         );
     }
 
