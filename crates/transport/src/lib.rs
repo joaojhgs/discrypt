@@ -11,6 +11,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod ice;
 pub mod production_status;
 pub mod session;
 
@@ -24,6 +25,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
+pub use ice::{IceEndpointPolicy, IceServerConfig, TurnServerConfig};
 use thiserror::Error;
 
 /// Transport address or provider URI.
@@ -53,6 +55,9 @@ pub enum TransportError {
     /// Every Phase-6 fallback leg failed under the simulated NAT condition.
     #[error("no viable STUN, relay-overlay, or TURN path")]
     NoViablePath,
+    /// ICE/STUN/TURN endpoint policy is malformed or unsupported.
+    #[error("invalid ICE endpoint policy: {0}")]
+    InvalidIcePolicy(String),
     /// A transport session event was invalid for the current state.
     #[error(transparent)]
     InvalidSessionTransition(#[from] TransportSessionError),
