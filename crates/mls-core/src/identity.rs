@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-/// Human-shareable short fingerprint used for out-of-band discovery.
+/// Human-shareable friend-code/QR payload used for out-of-band discovery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FriendCode(String);
 
@@ -91,11 +91,17 @@ impl Identity {
         bytes.zeroize();
     }
 
-    /// Friend code: short public-key hash prefix.
+    /// Friend code: QR-friendly payload containing the public identity key.
     #[must_use]
     pub fn friend_code(&self) -> FriendCode {
-        let digest = Sha256::digest(self.verifying_key().as_bytes());
-        FriendCode(hex::encode(&digest[..10]))
+        let verifying_key = self.verifying_key();
+        let public_key = hex::encode(verifying_key.as_bytes());
+        let fingerprint = Sha256::digest(verifying_key.as_bytes());
+        FriendCode(format!(
+            "discrypt://friend/v1/{}?ik={public_key}&fp={}",
+            slugify(self.display_name()),
+            hex::encode(&fingerprint[..10])
+        ))
     }
 
     /// Safety number: pairwise sorted public-key fingerprint.
@@ -119,6 +125,31 @@ impl Identity {
     }
 }
 
+fn slugify(label: &str) -> String {
+    let slug = label
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else if character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "contact".to_owned()
+    } else {
+        slug
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,7 +162,11 @@ mod tests {
             alice.safety_number(&bob.verifying_key()),
             bob.safety_number(&alice.verifying_key())
         );
-        assert!(!alice.friend_code().as_str().is_empty());
+        assert!(alice
+            .friend_code()
+            .as_str()
+            .starts_with("discrypt://friend/v1/alice?ik="));
+        assert!(alice.friend_code().as_str().contains("&fp="));
     }
 
     #[test]
