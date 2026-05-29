@@ -487,8 +487,19 @@ mod tests {
                 coordinator_leaf: 7
             }
         );
+        assert_eq!(plan.winner, b);
+        assert_eq!(
+            plan.reproposed_events,
+            order_application_events(vec![ApplicationEvent::new(
+                2,
+                3,
+                "msg",
+                b"ciphertext".to_vec()
+            )])
+        );
         assert!(!plan.replays_divergent_mls_commits);
         let repaired = repair_to_winner(4, &plan);
+        assert_eq!(repaired, vec![plan.winner.clone(); 4]);
         assert!(equal_confirmation_tags(&repaired));
     }
 
@@ -505,6 +516,10 @@ mod tests {
         assert_eq!(
             state.apply_commit(CommitEnvelope::new(summary(1, 1, 1), 1, Vec::new())),
             Err(DeliveryError::DowngradeOrReplay(1))
+        );
+        assert_eq!(
+            state.apply_commit(CommitEnvelope::new(summary(2, 2, 2), 1, Vec::new())),
+            Err(DeliveryError::DowngradeOrReplay(2))
         );
         assert_eq!(
             state.apply_commit(CommitEnvelope::new(summary(2, 9, 2), 1, Vec::new())),
