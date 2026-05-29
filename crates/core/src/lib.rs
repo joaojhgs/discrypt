@@ -7,6 +7,7 @@
 //! feature matching the claimed runtime capability.
 
 pub mod production_status;
+pub mod services;
 use admission::Invite;
 use mls_core::{verifying_key_from_hex, DeviceSet, GroupState, Identity, SafetyNumber};
 use serde::{Deserialize, Serialize};

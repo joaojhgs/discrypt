@@ -528,7 +528,6 @@ mod tests {
         }
     }
 
-
     fn hex_for_test(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -590,7 +589,6 @@ mod tests {
                 epoch_summary: commit.commit,
             })
         }
-
     }
 
     impl RustExporterSecretProvider for BoundaryHarness {
