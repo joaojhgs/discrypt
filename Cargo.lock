@@ -796,6 +796,7 @@ dependencies = [
 name = "discrypt-storage"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "discrypt-content-keys",
  "discrypt-mls-core",
  "hex",
