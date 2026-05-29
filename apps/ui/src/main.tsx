@@ -20,19 +20,24 @@ import {
 } from "./app-config";
 import {
   AppSnapshot,
+  AppState,
   ChannelView,
   MessageView,
   VoiceParticipantView,
   createChannel as createChannelCommand,
   createGroup,
+  createInvite,
+  createUser,
   joinGroup,
   joinVoice,
   leaveVoice,
-  loadAppSnapshot,
+  loadAppState,
+  recoverUser,
   savePreferences,
   sendMessage,
   setSelfMute,
   setSpeakerVolume,
+  startDm,
   verifySafetyNumber,
 } from "./commands";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -78,7 +83,7 @@ import {
 import { cn } from "@/lib/utils";
 import "./styles.css";
 
-type Workflow = "setup" | "join" | "create-group" | "channel" | "voice";
+type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 
 type VoiceParticipant = VoiceParticipantView;
 
@@ -95,7 +100,7 @@ function asTemplateId(value: string): TemplateId {
 }
 
 function App() {
-  const [commandState, setCommandState] = useState<AppSnapshot | null>(null);
+  const [commandState, setCommandState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
@@ -104,11 +109,15 @@ function App() {
   const [draftMessage, setDraftMessage] = useState('Hello from the command-backed UI');
   const [draftGroup, setDraftGroup] = useState('private lab');
   const [draftInvite, setDraftInvite] = useState('invite:joined-enclave');
+  const [draftDisplayName, setDraftDisplayName] = useState('Alice');
+  const [draftDeviceName, setDraftDeviceName] = useState('Desktop');
+  const [draftRecoveryCode, setDraftRecoveryCode] = useState('local recovery placeholder');
+  const [draftDmName, setDraftDmName] = useState('Bob');
 
   useEffect(() => {
     let mounted = true;
-    loadAppSnapshot()
-      .then((loaded: AppSnapshot) => {
+    loadAppState()
+      .then((loaded: AppState) => {
         if (mounted) {
           setCommandState(loaded);
         }
@@ -123,7 +132,7 @@ function App() {
     };
   }, []);
 
-  async function applyCommand(command: Promise<AppSnapshot>, success?: (state: AppSnapshot) => void) {
+  async function applyCommand(command: Promise<AppState>, success?: (state: AppState) => void) {
     try {
       setCommandError(null);
       const nextState = await command;
@@ -142,20 +151,26 @@ function App() {
     return <main className="grid min-h-dvh place-items-center bg-[hsl(var(--background))] p-6 text-[hsl(var(--foreground))]">Loading discrypt…</main>;
   }
 
-  const currentSnapshot = commandState;
-  const activeServer = currentSnapshot.servers[0];
+  const currentSnapshot = commandState.snapshot;
+  const activeGroup = commandState.active_context?.group_id
+    ? commandState.groups.find((group) => group.group_id === commandState.active_context?.group_id) ?? commandState.groups[0] ?? null
+    : commandState.groups[0] ?? null;
+  const activeServer = currentSnapshot.servers[0] ?? { name: 'No group selected', role: 'local profile', channels: [] };
   const textChannels = activeServer.channels.filter((channel) => channel.kind === 'Text');
   const voiceChannels = activeServer.channels.filter((channel) => channel.kind === 'Voice');
-  const groupLabel = activeServer.name;
-  const participants = currentSnapshot.voice_session.participants;
-  const voiceJoined = currentSnapshot.voice_session.joined;
-  const selfMuted = participants.find((participant) => participant.id === 'alice')?.muted ?? false;
-  const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === currentSnapshot.preferences.theme_id) ?? discryptUiConfig.themes[0];
-  const activeTemplate = discryptUiConfig.templates.find((template) => template.id === currentSnapshot.preferences.template_id) ?? discryptUiConfig.templates[0];
+  const activeTextChannel = activeGroup?.channels.find((channel) => channel.kind === 'Text') ?? null;
+  const activeVoiceChannel = activeGroup?.channels.find((channel) => channel.kind === 'Voice') ?? null;
+  const groupLabel = activeGroup?.name ?? 'Local profile';
+  const participants = commandState.voice_session?.participants ?? currentSnapshot.voice_session.participants;
+  const voiceJoined = commandState.voice_session?.joined ?? false;
+  const selfMuted = commandState.voice_session?.self_muted ?? participants.find((participant) => participant.id === 'local-user' || participant.id === 'alice')?.muted ?? false;
+  const activeTheme = discryptUiConfig.themes.find((theme) => theme.id === commandState.preferences.theme_id) ?? discryptUiConfig.themes[0];
+  const activeTemplate = discryptUiConfig.templates.find((template) => template.id === commandState.preferences.template_id) ?? discryptUiConfig.templates[0];
   const themeStyle = activeTheme.cssVars as React.CSSProperties;
   const completedSteps = [
+    commandState.profile !== null,
     currentSnapshot.friend.verified,
-    currentSnapshot.devices.length >= 2,
+    commandState.devices.length >= 1,
     currentSnapshot.invite.welcome_required.length > 0,
     currentSnapshot.retention.selected.length > 0,
   ].filter(Boolean).length;
@@ -168,11 +183,19 @@ function App() {
       });
       setVerifyMessage(result.message);
       if (result.verified) {
-        await applyCommand(loadAppSnapshot());
+        await applyCommand(loadAppState());
       }
     } catch (error: unknown) {
       setVerifyMessage(`Safety verification command failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
+  }
+
+  function createCommandUser() {
+    void applyCommand(createUser({ display_name: draftDisplayName, device_name: draftDeviceName }), () => setWorkflow('setup'));
+  }
+
+  function recoverCommandUser() {
+    void applyCommand(recoverUser({ display_name: draftDisplayName, device_name: draftDeviceName, recovery_code: draftRecoveryCode }), () => setWorkflow('setup'));
   }
 
   function createCommandGroup() {
@@ -180,34 +203,93 @@ function App() {
   }
 
   function joinCommandGroup() {
-    void applyCommand(joinGroup({ invite_code: draftInvite }), () => setWorkflow('setup'));
+    void applyCommand(joinGroup({ invite_code: draftInvite, group_name: draftInvite.includes('enclave') ? 'joined enclave' : 'joined group' }), () => setWorkflow('setup'));
+  }
+
+  function startCommandDm() {
+    void applyCommand(startDm({ display_name: draftDmName }), () => setWorkflow('dm'));
   }
 
   function createCommandChannel() {
+    if (!activeGroup) {
+      setCommandError('Create or join a group before adding a channel.');
+      return;
+    }
     const name = draftChannel.trim().replace(/^#/, '') || 'secure-room';
-    void applyCommand(createChannelCommand({ server_name: activeServer.name, name, kind: 'Text' }), () => setWorkflow('channel'));
+    void applyCommand(createChannelCommand({ group_id: activeGroup.group_id, name, kind: 'Text', retention_status: currentSnapshot.retention.selected }), () => setWorkflow('channel'));
   }
 
   function sendCommandMessage(channelName: string) {
     const body = draftMessage.trim();
     if (!body) return;
-    void applyCommand(sendMessage({ channel: channelName, body }), () => setDraftMessage(''));
+    if (!activeGroup || !activeTextChannel) {
+      setCommandError('Create a text channel before sending a group message.');
+      return;
+    }
+    void applyCommand(sendMessage({
+      target: { kind: 'channel', dm_id: null, group_id: activeGroup.group_id, channel_id: activeTextChannel.channel_id },
+      body,
+    }), () => setDraftMessage(''));
+  }
+
+  function sendCommandDm() {
+    const body = draftMessage.trim();
+    const dm = commandState.dms[0];
+    if (!body || !dm) return;
+    void applyCommand(sendMessage({
+      target: { kind: 'dm', dm_id: dm.dm_id, group_id: null, channel_id: null },
+      body,
+    }), () => setDraftMessage(''));
   }
 
   function createCommandInvite() {
-    setCommandError('Create invite command is awaiting worker-2 DTO/service export; MLS Welcome gate copy remains visible and no production invite claim is made.');
+    if (!activeGroup) {
+      setCommandError('Create or join a group before creating an invite.');
+      return;
+    }
+    void applyCommand(createInvite({ group_id: activeGroup.group_id, expires: currentSnapshot.invite.expires, max_use: currentSnapshot.invite.max_use }), () => setWorkflow('join'));
   }
 
   function setVolume(id: string, value: number[]) {
-    void applyCommand(setSpeakerVolume({ participant_id: id, volume: value[0] ?? 0 }));
+    const sessionId = commandState.voice_session?.session_id;
+    if (!sessionId) {
+      setCommandError('Join a voice channel before changing volume.');
+      return;
+    }
+    void applyCommand(setSpeakerVolume({ session_id: sessionId, participant_id: id, volume: value[0] ?? 0 }));
   }
 
   function toggleSelfMute(checked: boolean) {
-    void applyCommand(setSelfMute({ muted: checked }));
+    const sessionId = commandState.voice_session?.session_id;
+    if (!sessionId) {
+      setCommandError('Join a voice channel before muting.');
+      return;
+    }
+    void applyCommand(setSelfMute({ session_id: sessionId, muted: checked }));
   }
 
-  function toggleVoiceJoin(joined: boolean) {
-    void applyCommand(joined ? joinVoice() : leaveVoice());
+  async function toggleVoiceJoin(joined: boolean) {
+    if (joined) {
+      if (!activeGroup) {
+        setCommandError('Create or join a group before joining voice.');
+        return;
+      }
+      let voiceChannel = activeVoiceChannel;
+      if (!voiceChannel) {
+        const withVoice = await createChannelCommand({ group_id: activeGroup.group_id, name: 'Voice Lobby', kind: 'Voice', retention_status: 'session' });
+        setCommandState(withVoice);
+        voiceChannel = withVoice.groups.find((group) => group.group_id === activeGroup.group_id)?.channels.find((channel) => channel.kind === 'Voice') ?? null;
+      }
+      if (!voiceChannel) {
+        setCommandError('Voice channel creation did not return a channel.');
+        return;
+      }
+      void applyCommand(joinVoice({ group_id: activeGroup.group_id, channel_id: voiceChannel.channel_id }), () => setWorkflow('voice'));
+      return;
+    }
+    const sessionId = commandState.voice_session?.session_id;
+    if (!sessionId) return;
+    void applyCommand(leaveVoice({ session_id: sessionId }), () => setWorkflow('voice'));
   }
 
   function chooseTheme(nextTheme: ThemeId) {
@@ -216,6 +298,23 @@ function App() {
 
   function chooseTemplate(nextTemplate: TemplateId) {
     void applyCommand(savePreferences({ theme_id: activeTheme.id, template_id: nextTemplate }));
+  }
+
+  if (commandState.lifecycle === 'first_run') {
+    return (
+      <FirstRunPanel
+        themeStyle={themeStyle}
+        displayName={draftDisplayName}
+        setDisplayName={setDraftDisplayName}
+        deviceName={draftDeviceName}
+        setDeviceName={setDraftDeviceName}
+        recoveryCode={draftRecoveryCode}
+        setRecoveryCode={setDraftRecoveryCode}
+        commandError={commandError}
+        onCreate={createCommandUser}
+        onRecover={recoverCommandUser}
+      />
+    );
   }
 
   return (
@@ -243,7 +342,7 @@ function App() {
           voiceJoined={voiceJoined}
           participants={participants}
         />
-        <ScrollArea className="h-dvh min-w-0">
+        <ScrollArea className="h-dvh">
           <section className="min-h-dvh bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)] p-4 md:p-6">
             <TopBar
               groupLabel={groupLabel}
@@ -256,9 +355,11 @@ function App() {
               onOpenChannel={() => setWorkflow('channel')}
             />
             {commandError ? <p className="mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">Command note: {commandError}</p> : null}
+            {commandState.invites[0] ? <p className="mt-3 rounded-xl border border-emerald-300/30 bg-emerald-300/10 p-3 text-sm text-emerald-100">Invite ready: {commandState.invites[0].code}</p> : null}
             <Tabs value={workflow} onValueChange={(value) => setWorkflow(value as Workflow)} className="mt-5">
               <TabsList className="flex w-full justify-start overflow-x-auto md:w-auto">
                 <TabsTrigger value="setup">Setup</TabsTrigger>
+                <TabsTrigger value="dm">DMs</TabsTrigger>
                 <TabsTrigger value="join">Join</TabsTrigger>
                 <TabsTrigger value="create-group">Create group</TabsTrigger>
                 <TabsTrigger value="channel">Channels</TabsTrigger>
@@ -267,8 +368,11 @@ function App() {
               <TabsContent value="setup">
                 <SetupPanel snapshot={currentSnapshot} completedSteps={completedSteps} verifyMessage={verifyMessage} onVerify={confirmSafetyNumber} />
               </TabsContent>
+              <TabsContent value="dm">
+                <DmPanel dms={commandState.dms} messages={commandState.messages} draftDmName={draftDmName} setDraftDmName={setDraftDmName} draftMessage={draftMessage} setDraftMessage={setDraftMessage} onStartDm={startCommandDm} onSendDm={sendCommandDm} />
+              </TabsContent>
               <TabsContent value="join">
-                <JoinPanel snapshot={currentSnapshot} onJoin={joinCommandGroup} />
+                <JoinPanel snapshot={currentSnapshot} onJoin={joinCommandGroup} onCreateInvite={createCommandInvite} />
               </TabsContent>
               <TabsContent value="create-group">
                 <CreateGroupPanel snapshot={currentSnapshot} onCreate={createCommandGroup} />
