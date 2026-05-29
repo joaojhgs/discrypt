@@ -22,7 +22,8 @@
     "test:desktop-package-ci": "node ../../scripts/check-desktop-package-ci.mjs",
     "test:android-gate": "node ../../scripts/check-android-gate.mjs",
     "test:signaling-relay-ops": "node ../../scripts/check-signaling-relay-ops.mjs",
-    "test:release-governance": "node ../../scripts/check-release-governance.mjs"
+    "test:release-governance": "node ../../scripts/check-release-governance.mjs",
+    "test:release-verification-matrix": "node ../../scripts/check-release-verification-matrix.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
