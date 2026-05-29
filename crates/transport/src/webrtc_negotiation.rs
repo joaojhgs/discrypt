@@ -7,11 +7,15 @@
 use crate::{
     Endpoint, IceServerConfig, TransportError, TransportSession, TransportSessionSnapshot,
 };
+use async_trait::async_trait;
+use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::{timeout, Duration};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit,
@@ -299,6 +303,229 @@ fn aad_for_kind(kind: WebRtcNegotiationPayloadKind) -> &'static str {
     }
 }
 
+/// App-facing text/control data transport over an established encrypted WebRTC DataChannel.
+#[async_trait]
+pub trait TextControlDataTransport: Send + Sync {
+    /// Send one already-protected text/control frame as opaque bytes.
+    async fn send_text_control_frame(&self, frame: Vec<u8>) -> Result<(), TransportError>;
+
+    /// Receive the next opaque text/control frame.
+    async fn recv_text_control_frame(&self) -> Result<Vec<u8>, TransportError>;
+
+    /// Return current DataChannel transport metrics for UI/service state.
+    async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics;
+}
+
+/// DataChannel transport metrics visible to app-service adapters.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebRtcDataTransportMetrics {
+    /// Snapshot schema version for app-service/Tauri consumers.
+    pub schema_version: u16,
+    /// Configured channel label.
+    pub label: String,
+    /// Number of currently attached WebRTC DataChannel handles.
+    pub attached_channels: u64,
+    /// Whether at least one DataChannel has reached the open state.
+    pub open: bool,
+    /// Total opaque frames sent by the app-facing data transport.
+    pub frames_sent: u64,
+    /// Total opaque frames received by the app-facing data transport.
+    pub frames_received: u64,
+    /// Total opaque bytes sent by the app-facing data transport.
+    pub bytes_sent: u64,
+    /// Total opaque bytes received by the app-facing data transport.
+    pub bytes_received: u64,
+    /// Last DataChannel state/event observed.
+    pub last_state: String,
+}
+
+impl WebRtcDataTransportMetrics {
+    /// Current metrics schema.
+    pub const SCHEMA_VERSION: u16 = 1;
+}
+
+#[derive(Clone, Debug)]
+struct DataTransportMetricsState {
+    label: String,
+    attached_channels: u64,
+    open: bool,
+    frames_sent: u64,
+    frames_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    last_state: String,
+}
+
+impl DataTransportMetricsState {
+    fn new(label: String) -> Self {
+        Self {
+            label,
+            attached_channels: 0,
+            open: false,
+            frames_sent: 0,
+            frames_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_state: "new".to_owned(),
+        }
+    }
+
+    fn snapshot(&self) -> WebRtcDataTransportMetrics {
+        WebRtcDataTransportMetrics {
+            schema_version: WebRtcDataTransportMetrics::SCHEMA_VERSION,
+            label: self.label.clone(),
+            attached_channels: self.attached_channels,
+            open: self.open,
+            frames_sent: self.frames_sent,
+            frames_received: self.frames_received,
+            bytes_sent: self.bytes_sent,
+            bytes_received: self.bytes_received,
+            last_state: self.last_state.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DataChannelHub {
+    label: String,
+    channels: Arc<Mutex<Vec<Arc<dyn DataChannel>>>>,
+    inbound_tx: mpsc::Sender<Vec<u8>>,
+    inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    metrics: Arc<Mutex<DataTransportMetricsState>>,
+    open_notify: Arc<Notify>,
+}
+
+impl DataChannelHub {
+    fn new(label: String) -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+        Self {
+            metrics: Arc::new(Mutex::new(DataTransportMetricsState::new(label.clone()))),
+            label,
+            channels: Arc::new(Mutex::new(Vec::new())),
+            inbound_tx,
+            inbound_rx: Arc::new(Mutex::new(inbound_rx)),
+            open_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn attach(&self, channel: Arc<dyn DataChannel>) {
+        let label = channel.label().await.unwrap_or_else(|_| self.label.clone());
+        if label != self.label {
+            return;
+        }
+        {
+            let mut channels = self.channels.lock().await;
+            channels.push(Arc::clone(&channel));
+            let mut metrics = self.metrics.lock().await;
+            metrics.attached_channels = channels.len() as u64;
+            metrics.last_state = "attached".to_owned();
+        }
+        let inbound_tx = self.inbound_tx.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let open_notify = Arc::clone(&self.open_notify);
+        tokio::spawn(async move {
+            while let Some(event) = channel.poll().await {
+                match event {
+                    DataChannelEvent::OnOpen => {
+                        let mut metrics = metrics.lock().await;
+                        metrics.open = true;
+                        metrics.last_state = "open".to_owned();
+                        drop(metrics);
+                        open_notify.notify_waiters();
+                    }
+                    DataChannelEvent::OnMessage(message) => {
+                        let bytes = message.data.to_vec();
+                        {
+                            let mut metrics = metrics.lock().await;
+                            metrics.frames_received = metrics.frames_received.saturating_add(1);
+                            metrics.bytes_received =
+                                metrics.bytes_received.saturating_add(bytes.len() as u64);
+                            metrics.last_state = "message".to_owned();
+                        }
+                        if inbound_tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    DataChannelEvent::OnClose => {
+                        let mut metrics = metrics.lock().await;
+                        metrics.open = false;
+                        metrics.last_state = "closed".to_owned();
+                        break;
+                    }
+                    DataChannelEvent::OnClosing => {
+                        metrics.lock().await.last_state = "closing".to_owned();
+                    }
+                    DataChannelEvent::OnError => {
+                        metrics.lock().await.last_state = "error".to_owned();
+                    }
+                    DataChannelEvent::OnBufferedAmountLow => {
+                        metrics.lock().await.last_state = "buffered_amount_low".to_owned();
+                    }
+                    DataChannelEvent::OnBufferedAmountHigh => {
+                        metrics.lock().await.last_state = "buffered_amount_high".to_owned();
+                    }
+                }
+            }
+        });
+    }
+
+    async fn wait_open(&self, duration: Duration) -> Result<(), TransportError> {
+        if self.metrics.lock().await.open {
+            return Ok(());
+        }
+        timeout(duration, self.open_notify.notified())
+            .await
+            .map_err(|_| TransportError::Unavailable("DataChannel did not open".to_owned()))?;
+        Ok(())
+    }
+
+    async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        if frame.is_empty() {
+            return Err(TransportError::Unavailable(
+                "text/control data frame is empty".to_owned(),
+            ));
+        }
+        self.wait_open(Duration::from_secs(10)).await?;
+        let channels = self.channels.lock().await;
+        let channel = channels
+            .first()
+            .cloned()
+            .ok_or_else(|| TransportError::Unavailable("no DataChannel attached".to_owned()))?;
+        drop(channels);
+        if channel.ready_state().await.map_err(data_channel_error)? != RTCDataChannelState::Open {
+            return Err(TransportError::Unavailable(
+                "DataChannel is not open".to_owned(),
+            ));
+        }
+        let sent_len = frame.len();
+        channel
+            .send(BytesMut::from(frame.as_slice()))
+            .await
+            .map_err(data_channel_error)?;
+        let mut metrics = self.metrics.lock().await;
+        metrics.frames_sent = metrics.frames_sent.saturating_add(1);
+        metrics.bytes_sent = metrics.bytes_sent.saturating_add(sent_len as u64);
+        metrics.last_state = "sent".to_owned();
+        Ok(())
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        let mut inbound_rx = self.inbound_rx.lock().await;
+        inbound_rx
+            .recv()
+            .await
+            .ok_or_else(|| TransportError::Unavailable("DataChannel receive closed".to_owned()))
+    }
+
+    async fn snapshot(&self) -> WebRtcDataTransportMetrics {
+        self.metrics.lock().await.snapshot()
+    }
+}
+
+fn data_channel_error(error: impl fmt::Display) -> TransportError {
+    TransportError::Unavailable(format!("WebRTC DataChannel failed: {error}"))
+}
+
 /// Direct ICE/WebRTC state and metrics visible to app-service adapters.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WebRtcDirectPathMetrics {
@@ -436,6 +663,7 @@ pub struct WebRtcNegotiator {
     peer_connection: Box<dyn PeerConnection>,
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
+    data_channels: DataChannelHub,
     data_channel_label: String,
     turn_endpoints: Vec<Endpoint>,
 }
@@ -450,9 +678,11 @@ impl WebRtcNegotiator {
                 config.ice_servers.turn_servers.len() as u64,
             ),
         ));
+        let data_channels = DataChannelHub::new(config.data_channel_label.clone());
         let handler = Arc::new(CandidateCollector {
             candidates: Arc::clone(&candidates),
             metrics: Arc::clone(&metrics),
+            data_channels: data_channels.clone(),
         });
         let mut media = MediaEngine::default();
         media.register_default_codecs().map_err(|err| {
@@ -481,6 +711,7 @@ impl WebRtcNegotiator {
             peer_connection: Box::new(peer_connection),
             candidates,
             metrics,
+            data_channels,
             data_channel_label: config.data_channel_label,
             turn_endpoints: config
                 .ice_servers
@@ -500,6 +731,7 @@ impl WebRtcNegotiator {
             .map_err(|err| {
                 TransportError::Unavailable(format!("create data channel failed: {err}"))
             })?;
+        self.data_channels.attach(_channel).await;
         let offer = self
             .peer_connection
             .create_offer(None)
@@ -627,12 +859,35 @@ impl WebRtcNegotiator {
             .map_err(Into::into)
     }
 
+    /// Wait for the app-facing text/control DataChannel to open.
+    pub async fn wait_text_control_transport_ready(
+        &self,
+        duration: Duration,
+    ) -> Result<(), TransportError> {
+        self.data_channels.wait_open(duration).await
+    }
+
     /// Close the peer connection.
     pub async fn close(&self) -> Result<(), TransportError> {
         self.peer_connection
             .close()
             .await
             .map_err(|err| TransportError::Unavailable(format!("close WebRTC peer failed: {err}")))
+    }
+}
+
+#[async_trait]
+impl TextControlDataTransport for WebRtcNegotiator {
+    async fn send_text_control_frame(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        self.data_channels.send(frame).await
+    }
+
+    async fn recv_text_control_frame(&self) -> Result<Vec<u8>, TransportError> {
+        self.data_channels.recv().await
+    }
+
+    async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics {
+        self.data_channels.snapshot().await
     }
 }
 
@@ -679,10 +934,15 @@ impl WebRtcIceCandidate {
 struct CandidateCollector {
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
+    data_channels: DataChannelHub,
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl PeerConnectionEventHandler for CandidateCollector {
+    async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
+        self.data_channels.attach(channel).await;
+    }
+
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         self.metrics.lock().await.ice_gathering_state = state;
     }
@@ -843,6 +1103,73 @@ mod tests {
                 .remote_candidates_applied
                 > 0
         );
+
+        offerer.close().await?;
+        answerer.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn text_control_data_transport_exchanges_opaque_frames_over_datachannel(
+    ) -> Result<(), TransportError> {
+        let offerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let answerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let offer = offerer.create_offer().await?;
+        let answer = answerer.create_answer(offer).await?;
+        offerer.accept_answer(answer).await?;
+
+        let mut connected = false;
+        for _attempt in 0..80 {
+            for candidate in offerer.drain_local_candidates().await {
+                answerer.add_remote_candidate(candidate).await?;
+            }
+            for candidate in answerer.drain_local_candidates().await {
+                offerer.add_remote_candidate(candidate).await?;
+            }
+            if offerer.direct_path_metrics().await.direct_path_ready
+                && answerer.direct_path_metrics().await.direct_path_ready
+            {
+                connected = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(connected, "WebRTC peers did not connect for data transport");
+        offerer
+            .wait_text_control_transport_ready(Duration::from_secs(5))
+            .await?;
+        answerer
+            .wait_text_control_transport_ready(Duration::from_secs(5))
+            .await?;
+
+        let outbound = b"ciphertext:text-control-frame:v1".to_vec();
+        offerer.send_text_control_frame(outbound.clone()).await?;
+        let received =
+            tokio::time::timeout(Duration::from_secs(5), answerer.recv_text_control_frame())
+                .await
+                .map_err(|_| {
+                    TransportError::Unavailable("timed out receiving frame".to_owned())
+                })??;
+        assert_eq!(received, outbound);
+
+        let ack = b"ciphertext:control-ack:v1".to_vec();
+        answerer.send_text_control_frame(ack.clone()).await?;
+        let received_ack =
+            tokio::time::timeout(Duration::from_secs(5), offerer.recv_text_control_frame())
+                .await
+                .map_err(|_| TransportError::Unavailable("timed out receiving ack".to_owned()))??;
+        assert_eq!(received_ack, ack);
+
+        let offerer_metrics = offerer.text_control_transport_metrics().await;
+        let answerer_metrics = answerer.text_control_transport_metrics().await;
+        assert!(offerer_metrics.open);
+        assert!(answerer_metrics.open);
+        assert_eq!(offerer_metrics.frames_sent, 1);
+        assert_eq!(offerer_metrics.frames_received, 1);
+        assert_eq!(answerer_metrics.frames_sent, 1);
+        assert_eq!(answerer_metrics.frames_received, 1);
 
         offerer.close().await?;
         answerer.close().await?;

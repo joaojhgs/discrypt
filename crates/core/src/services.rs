@@ -326,6 +326,26 @@ pub struct TransportLeg {
     pub ciphertext_only: bool,
 }
 
+/// App-facing text/control data frame kind carried by the selected transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TextControlFrameKind {
+    /// Encrypted user text/message delivery frame.
+    Text,
+    /// Encrypted control/governance/transport coordination frame.
+    Control,
+}
+
+/// Opaque text/control frame for the selected data transport.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextControlFrame {
+    /// Transport session carrying the frame.
+    pub session_id: SessionId,
+    /// Frame class visible to local app logic.
+    pub kind: TextControlFrameKind,
+    /// Already-protected opaque bytes.
+    pub payload: OpaqueBytes,
+}
+
 /// Store record addressed by the app-state store boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoreRecord {
@@ -701,6 +721,18 @@ pub trait TransportService {
     ) -> ServiceResult<transport::TransportSessionSnapshot>;
 }
 
+/// Single app-facing data transport seam for encrypted text/control frames.
+pub trait TextControlTransportService {
+    /// Send one opaque text/control frame through an opened transport session.
+    fn send_text_control_frame(&mut self, frame: TextControlFrame) -> ServiceResult<()>;
+
+    /// Poll opaque text/control frames received for a transport session.
+    fn poll_text_control_frames(
+        &mut self,
+        session_id: &SessionId,
+    ) -> ServiceResult<Vec<TextControlFrame>>;
+}
+
 /// Durable app-state store boundary.
 pub trait AppStateStoreService {
     /// Load a namespaced record.
@@ -752,6 +784,7 @@ pub trait AppServiceBoundary:
     + OverlayService
     + SignalingService
     + TransportService
+    + TextControlTransportService
     + AppStateStoreService
     + KeychainService
     + EventBusService
@@ -773,6 +806,7 @@ mod tests {
         secrets: BTreeMap<SecretName, OpaqueBytes>,
         signals: Vec<SignalEnvelope>,
         transport_snapshots: BTreeMap<SessionId, transport::TransportSessionSnapshot>,
+        text_control_frames: Vec<TextControlFrame>,
         events: Vec<AppEvent>,
         next_event_sequence: u64,
     }
@@ -785,6 +819,7 @@ mod tests {
                 secrets: BTreeMap::new(),
                 signals: Vec::new(),
                 transport_snapshots: BTreeMap::new(),
+                text_control_frames: Vec::new(),
                 events: Vec::new(),
                 next_event_sequence: 0,
             }
@@ -1114,6 +1149,36 @@ mod tests {
         }
     }
 
+    impl TextControlTransportService for BoundaryHarness {
+        fn send_text_control_frame(&mut self, frame: TextControlFrame) -> ServiceResult<()> {
+            let snapshot = self.transport_state(&frame.session_id)?;
+            if !snapshot.connected() {
+                return Err(ServiceBoundaryError::AdapterUnavailable(
+                    "text/control transport session is not connected".to_owned(),
+                ));
+            }
+            if frame.payload.0.is_empty() {
+                return Err(ServiceBoundaryError::InvalidRequest(
+                    "text/control frame must be non-empty opaque bytes".to_owned(),
+                ));
+            }
+            self.text_control_frames.push(frame);
+            Ok(())
+        }
+
+        fn poll_text_control_frames(
+            &mut self,
+            session_id: &SessionId,
+        ) -> ServiceResult<Vec<TextControlFrame>> {
+            Ok(self
+                .text_control_frames
+                .iter()
+                .filter(|frame| &frame.session_id == session_id)
+                .cloned()
+                .collect())
+        }
+    }
+
     impl AppStateStoreService for BoundaryHarness {
         fn load_record(&self, key: &str) -> ServiceResult<Option<StoreRecord>> {
             Ok(self.records.get(key).cloned())
@@ -1388,6 +1453,32 @@ mod tests {
                 .map(|route| route.endpoint.0.as_str()),
             Some("turns:relay.example.invalid:5349")
         );
+        boundary.send_text_control_frame(TextControlFrame {
+            session_id: turn_session_id.clone(),
+            kind: TextControlFrameKind::Text,
+            payload: OpaqueBytes(b"ciphertext:text-frame".to_vec()),
+        })?;
+        boundary.send_text_control_frame(TextControlFrame {
+            session_id: turn_session_id.clone(),
+            kind: TextControlFrameKind::Control,
+            payload: OpaqueBytes(b"ciphertext:control-frame".to_vec()),
+        })?;
+        assert_eq!(
+            boundary
+                .poll_text_control_frames(&turn_session_id)?
+                .iter()
+                .map(|frame| frame.kind)
+                .collect::<Vec<_>>(),
+            vec![TextControlFrameKind::Text, TextControlFrameKind::Control]
+        );
+        assert!(matches!(
+            boundary.send_text_control_frame(TextControlFrame {
+                session_id: SessionId("not-open".to_owned()),
+                kind: TextControlFrameKind::Control,
+                payload: OpaqueBytes(b"ciphertext:closed".to_vec()),
+            }),
+            Err(ServiceBoundaryError::AdapterUnavailable(_))
+        ));
 
         let media = boundary.join_media(MediaSessionRequest {
             group_id: group.group_id.clone(),

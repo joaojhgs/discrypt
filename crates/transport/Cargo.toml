@@ -24,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true }
 webrtc = { version = "0.20.0-alpha.1" }
 
