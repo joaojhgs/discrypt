@@ -10,6 +10,7 @@ pub mod production_status;
 use admission::Invite;
 use mls_core::{GroupState, Identity};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use storage::{AppStore, AppStoreError, MemoryAppStore};
 use thiserror::Error;
 
@@ -311,10 +312,9 @@ struct AppState {
 }
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
-const FIXTURE_BOB_FRIEND_CODE: &str = "friend:bob:stable-fixture";
-const FIXTURE_BOB_SAFETY_NUMBER: &str = "0231 1597 2653 5897";
 const DEFAULT_THEME_ID: &str = "graphite-calm";
 const DEFAULT_TEMPLATE_ID: &str = "command-center";
+static PROCESS_IDENTITY_STATE: OnceLock<AppState> = OnceLock::new();
 
 /// App-service errors surfaced through commands.
 #[derive(Debug, Error)]
@@ -659,7 +659,7 @@ pub fn summarize(group: &GroupState) -> RoomSummary {
 /// Build the deterministic command snapshot used by Tauri and the E2E harness.
 #[must_use]
 pub fn app_snapshot() -> AppSnapshot {
-    snapshot_from_state(&seed_state())
+    snapshot_from_state(PROCESS_IDENTITY_STATE.get_or_init(seed_state))
 }
 
 fn snapshot_from_state(state: &AppState) -> AppSnapshot {
@@ -688,24 +688,31 @@ pub fn in_memory_app_service() -> Result<AppService<MemoryAppStore>, AppServiceE
 }
 
 fn seed_state() -> AppState {
+    let local = Identity::generate("Alice");
+    let peer = Identity::generate("New contact");
+    let local_friend_code = local.friend_code();
+    let peer_friend_code = peer.friend_code();
+    let local_device_id = device_id_from_friend_code(local_friend_code.as_str(), "desktop");
+    let peer_device_id = device_id_from_friend_code(peer_friend_code.as_str(), "primary");
+    let safety_number = local.safety_number(&peer.verifying_key()).as_str().to_owned();
     AppState {
         snapshot: AppSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             friend: FriendView {
-                alias: "Bob".to_owned(),
-                friend_code: FIXTURE_BOB_FRIEND_CODE.to_owned(),
-                safety_number: FIXTURE_BOB_SAFETY_NUMBER.to_owned(),
+                alias: peer.display_name().to_owned(),
+                friend_code: peer_friend_code.as_str().to_owned(),
+                safety_number,
                 verified: false,
             },
             devices: vec![
                 DeviceView {
-                    device_id: "alice-laptop".to_owned(),
+                    device_id: local_device_id,
                     leaf_index: 1,
                     local: true,
                     authorized: true,
                 },
                 DeviceView {
-                    device_id: "alice-phone".to_owned(),
+                    device_id: peer_device_id,
                     leaf_index: 2,
                     local: false,
                     authorized: true,
@@ -785,7 +792,7 @@ fn seed_state() -> AppState {
                 MessageView {
                     id: "locked-msg-1".to_owned(),
                     channel: "#general".to_owned(),
-                    author: "Bob".to_owned(),
+                    author: peer.display_name().to_owned(),
                     body: "Locked placeholder — author device must be online for a live-key request.".to_owned(),
                     state: "locked".to_owned(),
                 },
@@ -811,6 +818,16 @@ fn seed_state() -> AppState {
     }
 }
 
+fn device_id_from_friend_code(friend_code: &str, label: &str) -> String {
+    let fingerprint = friend_code
+        .split("&fp=")
+        .nth(1)
+        .and_then(|tail| tail.split('&').next())
+        .unwrap_or("identity");
+    let suffix = fingerprint.chars().take(10).collect::<String>();
+    format!("device-{}-{suffix}", slugify(label))
+}
+
 fn normalize_label(input: &str, fallback: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -833,6 +850,31 @@ fn normalize_channel(input: &str) -> String {
         })
         .collect();
     normalize_label(&sanitized, "secure-room")
+}
+
+fn slugify(label: &str) -> String {
+    let slug = label
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else if character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "local".to_owned()
+    } else {
+        slug
+    }
 }
 
 fn retention_status(selected: &str) -> String {
