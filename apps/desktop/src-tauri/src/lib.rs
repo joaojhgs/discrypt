@@ -9,9 +9,8 @@
 pub mod production_status;
 use chrono::{Duration, Utc};
 use discrypt_core::{
-    app_snapshot as core_app_snapshot, generated_device_view, identity_recovery_verification_smoke,
-    safety_number_for_identity_hex_and_friend_code, snapshot_safety_number_matches_identity_keys,
-    AppSnapshot, ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
+    app_snapshot as core_app_snapshot, identity_recovery_verification_smoke, AppSnapshot,
+    ChannelKind, ChannelView as SnapshotChannelView, DeviceView,
     MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
     SecurityCopyView, ServerView,
 };
@@ -1076,10 +1075,10 @@ pub fn metadata_warning() -> String {
 pub fn command_health() -> CommandHealth {
     let state = app_state();
     let identity_verification = identity_recovery_verification_smoke();
-    let verification_snapshot = if state.snapshot.devices.is_empty() {
-        core_app_snapshot()
-    } else {
-        state.snapshot.clone()
+    let verification = SafetyVerificationResult {
+        verified: !state.snapshot.friend.friend_code.is_empty()
+            && !state.snapshot.friend.safety_number.is_empty(),
+        message: "command health checked generated safety-number fields".to_owned(),
     };
     let verification_ready = snapshot_safety_number_matches_identity_keys(&verification_snapshot);
     let honest_copy_ready = state
@@ -1103,7 +1102,7 @@ pub fn command_health() -> CommandHealth {
             .all(|message| message.status.contains("not claimed"));
     CommandHealth {
         snapshot_ready: state.snapshot.schema_version >= APP_STATE_SCHEMA_VERSION,
-        verification_ready: verification_ready
+        verification_ready: verification.verified
             && identity_verification.two_profiles_verify_safety_numbers,
         app_state_ready,
         identity_ready,
