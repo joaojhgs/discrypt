@@ -14,11 +14,7 @@ use discrypt_core::{
     MessageView as SnapshotMessageView, SafetyVerificationRequest, SafetyVerificationResult,
     SecurityCopyView, ServerView,
 };
-use discrypt_storage::AppStore;
-#[cfg(not(all(target_os = "linux", feature = "production-storage")))]
-use discrypt_storage::FileAppStore;
-#[cfg(all(target_os = "linux", feature = "production-storage"))]
-use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
+use discrypt_storage::{AppStore, FileAppStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1336,12 +1332,6 @@ fn persist_state(state: &PersistedAppState) {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "production-storage"))]
-fn app_store() -> EncryptedAppDb<LinuxOsKeychain> {
-    EncryptedAppDb::new(app_store_path(), LinuxOsKeychain::discrypt_app_db())
-}
-
-#[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 fn app_store() -> FileAppStore {
     FileAppStore::new(app_store_path())
 }
