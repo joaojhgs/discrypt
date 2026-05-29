@@ -212,6 +212,23 @@ pub struct ConnectivitySignalingPushSmoke {
     pub route_reporting_honest: bool,
 }
 
+/// Deterministic Phase-N pcap acceptance matrix result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcapAcceptanceMatrixSmoke {
+    /// AC1: identity/DM setup requires explicit safety-number verification and no directory/content egress.
+    pub ac1_identity_dm_safety_pcap_clean: bool,
+    /// AC8: relay/TURN/media observations contain protected bytes only.
+    pub ac8_relay_media_ciphertext_only: bool,
+    /// AC15: Android wake provider-visible bytes are content-free.
+    pub ac15_android_wake_content_free: bool,
+    /// AC18: signaling at-rest inspection has no identity-room-topology linkage.
+    pub ac18_signaling_zero_linkage_at_rest: bool,
+    /// AC-METADATA: observed pcap rows match the approved infrastructure metadata matrix.
+    pub ac_metadata_matrix_validated: bool,
+    /// Forbidden-byte scanner includes identity, message, media, and key sentinels.
+    pub forbidden_scanner_covers_release_tokens: bool,
+}
+
 /// Deterministic Phase-C device-rotation integration verification result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseCDeviceRotationSmoke {
@@ -389,6 +406,19 @@ impl ConnectivitySignalingPushSmoke {
             && self.relays_ciphertext_only
             && self.socket_local_process_conformant
             && self.route_reporting_honest
+    }
+}
+
+impl PcapAcceptanceMatrixSmoke {
+    /// True when every Phase-N pcap acceptance invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.ac1_identity_dm_safety_pcap_clean
+            && self.ac8_relay_media_ciphertext_only
+            && self.ac15_android_wake_content_free
+            && self.ac18_signaling_zero_linkage_at_rest
+            && self.ac_metadata_matrix_validated
+            && self.forbidden_scanner_covers_release_tokens
     }
 }
 
@@ -2640,6 +2670,92 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
     })
 }
 
+/// Exercise the Phase-N pcap acceptance matrix for AC1, AC8, AC15, AC18, and AC-METADATA.
+pub fn pcap_acceptance_matrix_smoke() -> Result<PcapAcceptanceMatrixSmoke, anyhow::Error> {
+    use discrypt_core::{app_snapshot, verify_safety_number, SafetyVerificationRequest};
+    use external_signaling::{
+        contains_any_token, AuditFixture, ContentExposure, InfrastructureComponent, MetadataMatrix,
+        PcapEvent,
+    };
+
+    let snapshot = app_snapshot();
+    let safety_verified = verify_safety_number(SafetyVerificationRequest {
+        friend_id: snapshot.friend.friend_code.clone(),
+        provided: snapshot.friend.safety_number.clone(),
+    })
+    .verified;
+
+    let forbidden_release_tokens: Vec<Vec<u8>> = vec![
+        snapshot.friend.alias.as_bytes().to_vec(),
+        snapshot.friend.friend_code.as_bytes().to_vec(),
+        snapshot.friend.safety_number.as_bytes().to_vec(),
+        b"hello from app-level encrypted text".to_vec(),
+        b"harness encoded voice frame".to_vec(),
+        b"phase2 encoded voice frame".to_vec(),
+        b"content-key".to_vec(),
+        b"mls-epoch-secret".to_vec(),
+        b"sframe-key".to_vec(),
+        b"identity-private-key".to_vec(),
+        b"room-plaintext".to_vec(),
+        b"topology-link".to_vec(),
+        b"message-body".to_vec(),
+        b"fcm-message-id".to_vec(),
+    ];
+    let forbidden_refs: Vec<&[u8]> = forbidden_release_tokens.iter().map(Vec::as_slice).collect();
+
+    let mut ac1_fixture = AuditFixture::default();
+    ac1_fixture.push(PcapEvent {
+        component: InfrastructureComponent::Signaling,
+        content: ContentExposure::None,
+        visible_bytes: b"opaque-dm-rendezvous-without-directory-account".to_vec(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    ac1_fixture.push(PcapEvent {
+        component: InfrastructureComponent::Stun,
+        content: ContentExposure::None,
+        visible_bytes: b"binding-only-no-dm-content".to_vec(),
+        ip_or_endpoint: true,
+        timing: true,
+        persists_linkage: false,
+    });
+    let no_directory_or_account_component = ac1_fixture.events().iter().all(|event| {
+        matches!(
+            event.component,
+            InfrastructureComponent::Signaling | InfrastructureComponent::Stun
+        )
+    });
+    let ac1_identity_dm_safety_pcap_clean = safety_verified
+        && no_directory_or_account_component
+        && ac1_fixture.no_forbidden_content_egress(&forbidden_refs)
+        && ac1_fixture.matches_matrix(&MetadataMatrix::approved_v1());
+
+    let voice = voice_media_e2e_smoke()?;
+    let text = text_history_delivery_smoke()?;
+    let connectivity = connectivity_signaling_push_smoke()?;
+    let ac8_relay_media_ciphertext_only = voice.relay_pcap_protected_only
+        && text.text_pcap_no_plaintext
+        && connectivity.relays_ciphertext_only;
+    let ac15_android_wake_content_free = connectivity.android_wake_content_free;
+    let ac18_signaling_zero_linkage_at_rest = connectivity.signaling_zero_linkage_at_rest;
+    let ac_metadata_matrix_validated =
+        connectivity.metadata_matrix_validated && connectivity.pcap_no_central_content;
+    let forbidden_scanner_covers_release_tokens = forbidden_release_tokens.len() >= 14
+        && !contains_any_token(b"sealed protected ciphertext", &forbidden_refs)
+        && contains_any_token(b"prefix message-body suffix", &forbidden_refs)
+        && contains_any_token(b"prefix mls-epoch-secret suffix", &forbidden_refs);
+
+    Ok(PcapAcceptanceMatrixSmoke {
+        ac1_identity_dm_safety_pcap_clean,
+        ac8_relay_media_ciphertext_only,
+        ac15_android_wake_content_free,
+        ac18_signaling_zero_linkage_at_rest,
+        ac_metadata_matrix_validated,
+        forbidden_scanner_covers_release_tokens,
+    })
+}
+
 fn xor_text_ciphertext(key: &[u8; 32], input: &[u8]) -> Vec<u8> {
     input
         .iter()
@@ -2985,6 +3101,22 @@ mod tests {
                 relays_ciphertext_only: true,
                 socket_local_process_conformant: true,
                 route_reporting_honest: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn pcap_acceptance_matrix_covers_ac1_ac8_ac15_ac18_and_metadata() {
+        let smoke = pcap_acceptance_matrix_smoke();
+        assert!(matches!(
+            smoke,
+            Ok(PcapAcceptanceMatrixSmoke {
+                ac1_identity_dm_safety_pcap_clean: true,
+                ac8_relay_media_ciphertext_only: true,
+                ac15_android_wake_content_free: true,
+                ac18_signaling_zero_linkage_at_rest: true,
+                ac_metadata_matrix_validated: true,
+                forbidden_scanner_covers_release_tokens: true,
             })
         ));
     }
