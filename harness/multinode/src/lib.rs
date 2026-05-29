@@ -838,6 +838,7 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
     use discrypt_mls_core::governance::{
         GovernanceAction, GovernanceError, GovernanceEvent, GovernanceLog, GovernanceState, Role,
     };
+    use discrypt_mls_core::OpenMlsGroupEngine;
     use discrypt_storage::{
         recover_account, recovery_code_material, seal_account_backup, AccountRecovery,
         RecoveryCodeVerifier, RecoveryError, RecoveryMaterial,
@@ -921,48 +922,88 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
         },
         1,
     );
-    let welcome_payload = b"openmls-welcome";
+    let admission_run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let alice_path = std::env::temp_dir().join(format!(
+        "discrypt-harness-phase5-alice-{}-{admission_run_id}",
+        std::process::id()
+    ));
+    let bob_path = std::env::temp_dir().join(format!(
+        "discrypt-harness-phase5-bob-{}-{admission_run_id}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&alice_path);
+    let _ = std::fs::remove_file(&bob_path);
+    let mut alice_openmls = OpenMlsGroupEngine::open(&alice_path)?;
+    let mut bob_openmls = OpenMlsGroupEngine::open(&bob_path)?;
+    let created_openmls = alice_openmls.create_group("phase5-admission", b"alice")?;
+    let bob_package = bob_openmls.generate_member_package(b"bob")?;
+    let added_openmls = alice_openmls.add_member_package("phase5-admission", &bob_package)?;
+    let Some(welcome_payload) = added_openmls.welcome.as_deref() else {
+        return Err(anyhow::anyhow!(
+            "OpenMLS add did not produce admission Welcome"
+        ));
+    };
     let welcome = AuthorizedWelcome::sign(
         invite.id.to_string(),
-        b"group-a".to_vec(),
+        b"phase5-admission".to_vec(),
         welcome_payload,
         now + Duration::minutes(1),
         &SigningKey::generate(&mut OsRng),
     );
-    let password_and_welcome_gate = offline.finalize_admission(
+    let link_only_rejected =
+        pake.finalize_admission(&mut invite, now, "alice", true, None, welcome_payload)
+            == Err(InviteError::WelcomeRequired);
+    let tampered_welcome_rejected = pake.finalize_admission(
+        &mut invite,
+        now,
+        "alice",
+        true,
+        Some(&welcome),
+        b"tampered-welcome",
+    ) == Err(InviteError::InvalidWelcomeAuthorization);
+    let offline_rejected = offline.finalize_admission(
         &mut invite,
         now,
         "alice",
         true,
         Some(&welcome),
         welcome_payload,
-    ) == Err(InviteError::OfflineVerifierRejected)
-        && pake.finalize_admission(&mut invite, now, "alice", true, None, welcome_payload)
-            == Err(InviteError::WelcomeRequired)
-        && pake.finalize_admission(
-            &mut invite,
-            now,
-            "alice",
-            true,
-            Some(&welcome),
-            b"tampered-welcome",
-        ) == Err(InviteError::InvalidWelcomeAuthorization)
-        && pake.finalize_admission(
-            &mut invite,
-            now,
-            "alice",
-            true,
-            Some(&welcome),
-            welcome_payload,
-        ) == Ok(())
-        && pake.finalize_admission(
-            &mut invite,
-            now,
-            "alice",
-            true,
-            Some(&welcome),
-            welcome_payload,
-        ) == Err(InviteError::PasswordRejected);
+    ) == Err(InviteError::OfflineVerifierRejected);
+    let final_admission_accepted = pake.finalize_admission(
+        &mut invite,
+        now,
+        "alice",
+        true,
+        Some(&welcome),
+        welcome_payload,
+    ) == Ok(());
+    let joined_openmls = bob_openmls.join_from_welcome(
+        "phase5-admission",
+        bob_package.signer_public_key(),
+        welcome_payload,
+    )?;
+    let openmls_welcome_converged = joined_openmls.epoch == added_openmls.state.epoch
+        && added_openmls.state.epoch == created_openmls.epoch + 1
+        && joined_openmls.confirmation_tag == added_openmls.state.confirmation_tag;
+    let exhausted_after_welcome = pake.finalize_admission(
+        &mut invite,
+        now,
+        "alice",
+        true,
+        Some(&welcome),
+        welcome_payload,
+    ) == Err(InviteError::PasswordRejected);
+    let _ = std::fs::remove_file(&alice_path);
+    let _ = std::fs::remove_file(&bob_path);
+    let password_and_welcome_gate = offline_rejected
+        && link_only_rejected
+        && tampered_welcome_rejected
+        && final_admission_accepted
+        && openmls_welcome_converged
+        && exhausted_after_welcome;
 
     let backup = seal_account_backup(&[8; 32], vec!["room".into()], 2);
     let recovery_code = RecoveryCodeVerifier::from_code("paper-coral-falcon")?;
