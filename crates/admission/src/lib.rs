@@ -149,8 +149,7 @@ impl InviteTrustMetadata {
     }
 
     fn validate(&self) -> Result<(), InviteError> {
-        if !is_hex_fingerprint(&self.signaling_fingerprint) || self.trust_status.trim().is_empty()
-        {
+        if !is_hex_fingerprint(&self.signaling_fingerprint) || self.trust_status.trim().is_empty() {
             return Err(InviteError::InvalidTrustMetadata);
         }
         Ok(())
@@ -207,7 +206,10 @@ impl InviteSignalingMetadata {
         {
             return Err(InviteError::InvalidSignalingEndpoint);
         }
-        if !self.endpoint_policy.validates_endpoint(&self.signaling_endpoint) {
+        if !self
+            .endpoint_policy
+            .validates_endpoint(&self.signaling_endpoint)
+        {
             return Err(InviteError::InvalidSignalingEndpoint);
         }
         self.trust.validate()

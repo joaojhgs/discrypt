@@ -7,16 +7,17 @@
 //! feature matching the claimed runtime capability.
 
 pub mod production_status;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
+use discrypt_admission::{
+    signaling_fingerprint_for_endpoint, InviteEndpointPolicy, InviteSignalingMetadata, InviteStore,
+    InviteTrustMetadata,
+};
 use discrypt_core::{
     app_snapshot as core_app_snapshot, generated_device_view, identity_recovery_verification_smoke,
     snapshot_safety_number_matches_identity_keys, AppSnapshot, ChannelKind,
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
-};
-use discrypt_admission::{
-    InviteEndpointPolicy, InviteSignalingMetadata, InviteStore, InviteTrustMetadata,
-    signaling_fingerprint_for_endpoint,
 };
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
@@ -922,36 +923,59 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
         let signaling_endpoint = default_signaling_endpoint();
         let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
-        let signaling_metadata = InviteSignalingMetadata::new(
+        let trust_metadata = match InviteTrustMetadata::new(
+            signaling_trust_fingerprint.clone(),
+            "signed endpoint fingerprint; verify before MLS Welcome",
+        ) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.push_event(
+                    "invite.rejected",
+                    format!("Invalid signaling trust metadata: {error}"),
+                );
+                return;
+            }
+        };
+        let signaling_metadata = match InviteSignalingMetadata::new(
             signaling_endpoint.clone(),
             InviteEndpointPolicy::ProductionTls,
-            InviteTrustMetadata::new(
-                signaling_trust_fingerprint.clone(),
-                "signed endpoint fingerprint; verify before MLS Welcome",
-            )
-            .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
-        )
-        .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
+            trust_metadata,
+        ) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.push_event(
+                    "invite.rejected",
+                    format!("Invalid signaling endpoint metadata: {error}"),
+                );
+                return;
+            }
+        };
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
-        let descriptor = invite_store
-            .issue_invite_with_metadata(
-                room_secret.as_bytes(),
-                Utc::now() + Duration::days(7),
-                max_uses,
-                signaling_metadata.clone(),
-                &issuer,
-            )
-            .unwrap_or_else(|_| {
-                invite_store.issue_invite(
-                    room_secret.as_bytes(),
-                    Utc::now() + Duration::days(7),
-                    max_uses,
-                    &issuer,
-                )
-            });
+        let descriptor = match invite_store.issue_invite_with_metadata(
+            room_secret.as_bytes(),
+            Utc::now() + Duration::days(7),
+            max_uses,
+            signaling_metadata,
+            &issuer,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                state.push_event(
+                    "invite.rejected",
+                    format!("Could not sign invite descriptor: {error}"),
+                );
+                return;
+            }
+        };
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let invite_code = production_invite_link(&descriptor, expires_at.as_str(), max_uses);
+        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
+            Ok(code) => code,
+            Err(error) => {
+                state.push_event("invite.rejected", error);
+                return;
+            }
+        };
         let invite = InviteView {
             invite_id: format!("invite-{}", descriptor.invite_id),
             invite_key: descriptor.invite_id.clone(),
@@ -1971,6 +1995,52 @@ fn parse_max_uses(label: &str) -> u32 {
         .unwrap_or(5)
 }
 
+fn default_signaling_endpoint() -> String {
+    let configured = std::env::var("EXTERNAL_SIGNALING_PUBLIC_ENDPOINT")
+        .ok()
+        .filter(|endpoint| {
+            InviteSignalingMetadata::new(
+                endpoint.clone(),
+                InviteEndpointPolicy::ProductionTls,
+                InviteTrustMetadata {
+                    signaling_fingerprint: signaling_fingerprint_for_endpoint(endpoint),
+                    trust_status: "signed endpoint fingerprint; verify before MLS Welcome"
+                        .to_owned(),
+                },
+            )
+            .is_ok()
+        });
+    configured.unwrap_or_else(|| InviteSignalingMetadata::default_production().signaling_endpoint)
+}
+
+fn production_invite_link(
+    descriptor: &discrypt_admission::StoredInvite,
+    expires_at: &str,
+    max_uses: u32,
+) -> Result<String, String> {
+    let descriptor_bytes = serde_json::to_vec(descriptor)
+        .map_err(|error| format!("Could not encode signed invite descriptor: {error}"))?;
+    let encoded_descriptor = URL_SAFE_NO_PAD.encode(descriptor_bytes);
+    Ok(format!(
+        "discrypt://join/v1/{}?d={encoded_descriptor}&exp={}&max={max_uses}",
+        descriptor.invite_id,
+        url_component(expires_at)
+    ))
+}
+
+fn url_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        let character = char::from(*byte);
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~') {
+            encoded.push(character);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn parse_invite_group_name(invite_code: &str) -> String {
     invite_code
         .rsplit('/')
@@ -2293,7 +2363,16 @@ mod tests {
         assert!(invite_state.invites[0]
             .code
             .starts_with("discrypt://join/v1/"));
-        assert!(invite_state.invites[0].code.contains("room_secret="));
+        assert!(invite_state.invites[0].code.contains("?d="));
+        assert!(!invite_state.invites[0].code.contains("room_secret="));
+        assert!(invite_state.invites[0]
+            .signaling_endpoint
+            .starts_with("https://"));
+        assert_eq!(invite_state.invites[0].endpoint_policy, "production_tls");
+        assert_eq!(
+            invite_state.invites[0].signaling_trust_fingerprint.len(),
+            64
+        );
         assert_eq!(invite_state.invites[0].uses, 0);
         assert!(!invite_state.invites[0].room_secret_hash.is_empty());
         let channel_state = create_channel(CreateChannelRequest {

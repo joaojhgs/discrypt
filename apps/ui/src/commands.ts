@@ -169,6 +169,10 @@ export type InviteView = {
   group_id: string;
   code: string;
   room_secret_hash: string;
+  signaling_endpoint: string;
+  signaling_trust_fingerprint: string;
+  signaling_trust_status: string;
+  endpoint_policy: string;
   expires: string;
   expires_at: string;
   max_use: string;
@@ -774,17 +778,29 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
   }
   const localDevice = fallbackState.devices[0] ?? {
     device_id: slugify(request.device_name ?? "Desktop"),
+    label: request.device_name ?? "Desktop",
     leaf_index: 1,
+    identity_key: stableHash(`${request.display_name ?? "Recovered"}:account-key`),
+    device_key: randomHex(32),
     local: true,
     authorized: true,
+    revoked: false,
+    added_at_epoch: 1,
+    revoked_at_epoch: null,
   };
   fallbackState.devices = [localDevice];
   for (let index = 2; index <= deviceCount; index += 1) {
     fallbackState.devices.push({
       device_id: `recovered-device-${index}`,
+      label: `Recovered device ${index}`,
       leaf_index: index,
+      identity_key: stableHash(`recovered-device-${index}:identity`),
+      device_key: randomHex(32),
       local: false,
       authorized: true,
+      revoked: false,
+      added_at_epoch: 1,
+      revoked_at_epoch: null,
     });
   }
   for (const room of rooms) {
@@ -1177,17 +1193,51 @@ export async function createInvite(
       const roomSecretHash = stableHash(
         `${groupId}:${inviteKey}:${state.invites.length}`,
       );
-      const roomSecret = roomSecretHash.slice(0, 32);
+      const signalingEndpoint =
+        "https://signaling.discrypt.invalid/v1/rendezvous";
+      const signalingTrustFingerprint = stableHash(
+        `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
+      );
       const expires = request.expires || fallbackState.snapshot.invite.expires;
       const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
+      const expiresAt = inviteExpirationHorizon(expires);
+      const descriptor = {
+        invite_id: inviteKey,
+        room_secret_commitment: roomSecretHash,
+        signaling_metadata: {
+          signaling_endpoint: signalingEndpoint,
+          endpoint_policy: "production_tls",
+          trust: {
+            signaling_fingerprint: signalingTrustFingerprint,
+            trust_status:
+              "signed endpoint fingerprint; verify before MLS Welcome",
+          },
+        },
+        expires_at: expiresAt,
+        max_uses: parseMaxUses(maxUse),
+      };
+      const descriptorBytes = new TextEncoder().encode(
+        JSON.stringify(descriptor),
+      );
+      const descriptorPayload = btoa(
+        String.fromCharCode(...descriptorBytes),
+      )
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
       state.invites.push({
         invite_id: `invite-${inviteKey}`,
         invite_key: inviteKey,
         group_id: groupId,
-        code: `discrypt://join/v1/${inviteKey}?room_secret=${roomSecret}&exp=${encodeURIComponent(inviteExpirationHorizon(expires))}&max=${parseMaxUses(maxUse)}`,
+        code: `discrypt://join/v1/${inviteKey}?d=${descriptorPayload}&exp=${encodeURIComponent(expiresAt)}&max=${parseMaxUses(maxUse)}`,
         room_secret_hash: roomSecretHash,
+        signaling_endpoint: signalingEndpoint,
+        signaling_trust_fingerprint: signalingTrustFingerprint,
+        signaling_trust_status:
+          "signed endpoint fingerprint; verify before MLS Welcome",
+        endpoint_policy: "production_tls",
         expires,
-        expires_at: inviteExpirationHorizon(expires),
+        expires_at: expiresAt,
         max_use: maxUse,
         uses: 0,
         revoked: false,

@@ -1476,9 +1476,20 @@ function JoinPanel({
                 <span>Expires: {latestInvite.expires_at}</span>
                 <span>Max uses: {latestInvite.max_use}</span>
                 <span>Uses: {latestInvite.uses}</span>
+                <span>
+                  Signaling: {latestInvite.signaling_endpoint || "not provided"}
+                </span>
+                <span>
+                  Endpoint policy: {latestInvite.endpoint_policy || "unknown"}
+                </span>
               </div>
               <p className="mt-2 break-all text-[11px] text-emerald-50/70">
-                Room secret hash: {latestInvite.room_secret_hash}
+                Signaling trust:{" "}
+                {latestInvite.signaling_trust_status || "not verified"} (
+                {latestInvite.signaling_trust_fingerprint || "no fingerprint"})
+              </p>
+              <p className="mt-1 break-all text-[11px] text-emerald-50/60">
+                Room secret commitment: {latestInvite.room_secret_hash}
               </p>
             </div>
           ) : null}

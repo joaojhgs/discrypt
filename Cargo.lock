@@ -962,13 +962,16 @@ dependencies = [
 name = "discrypt-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "discrypt-admission",
  "discrypt-core",
  "discrypt-mls-core",
  "external-signaling",
  "discrypt-storage",
  "ed25519-dalek",
  "hex",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",
