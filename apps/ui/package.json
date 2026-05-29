@@ -11,7 +11,10 @@
     "test:command-coverage": "node scripts/command-coverage-check.mjs",
     "test:production-copy": "node scripts/command-coverage-check.mjs",
     "test:e2e": "VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 vite build && playwright test",
-    "test:honesty": "node scripts/honesty-gates.mjs"
+    "test:honesty": "node scripts/honesty-gates.mjs",
+    "release:linux": "node ../../scripts/release-linux.mjs",
+    "release:linux:dry-run": "node ../../scripts/release-linux.mjs --dry-run",
+    "test:release-linux": "node ../../scripts/check-release-linux.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
