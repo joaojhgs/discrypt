@@ -723,10 +723,11 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         repair_to_winner, summary, ApplicationEvent, CatchUpBundle, CommitEnvelope, DeliveryError,
         DeliveryState, ForkEvidence, ForkStatus, InMemoryTextAuthorLog, InMemoryTextReceiveEvents,
         InMemoryTextRecipientStore, InMemoryTextSendEvents, InMemoryTextTransport,
+        TextAuthorLogEnvelope, TextHistoryMergeEventKind, TextHistoryMergeState,
         TextInboundPipeline, TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput,
         TextOutboundPipeline, TextOutboundRequest, TextReceiveEventKind, TextReceiveState,
-        TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEventKind,
-        WelcomePackage,
+        TextReceivedEnvelope, TextRenderState, TextRetentionMetadata, TextSelectedRoute,
+        TextSendEventKind, WelcomePackage,
     };
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
@@ -830,8 +831,27 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         "alice-1",
         text_envelope.content_ciphertext.clone(),
     );
-    let phone_entry =
-        AuthorLogEntry::new(1, "alice-phone", 2, 7, "alice-2", b"ciphertext-b".to_vec());
+    let phone_text_envelope = TextMessageEnvelope::sign(
+        "lab",
+        TextMessageEnvelopeInput {
+            epoch: 7,
+            sender_leaf: 1,
+            sender_device_id: "alice-phone".to_owned(),
+            sequence: 2,
+            message_id: "alice-2".to_owned(),
+            retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
+            content_ciphertext: b"ciphertext-b".to_vec(),
+        },
+        &text_signing_key,
+    )?;
+    let phone_entry = AuthorLogEntry::new(
+        1,
+        "alice-phone",
+        2,
+        7,
+        "alice-2",
+        phone_text_envelope.content_ciphertext.clone(),
+    );
     let mut laptop = LocalStore::default();
     laptop.append_sent(laptop_entry.clone());
     laptop.cache_received(RecipientCacheEntry::new(
@@ -849,25 +869,85 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
             .recipient_cache()
             .get("alice-1")
             .is_some_and(|entry| !contains_bytes(&entry.ciphertext, text_plaintext));
-    let mut phone = LocalStore::default();
-    phone.append_sent(phone_entry.clone());
-    let inserted = laptop.merge_author_logs(phone.author_log_snapshot());
-    let author_logs_merged = inserted == 1
-        && laptop.author_message_ids()
-            == BTreeSet::from(["alice-1".to_owned(), "alice-2".to_owned()]);
+    let laptop_text_entry = TextAuthorLogEnvelope {
+        channel_id: "general".to_owned(),
+        envelope: text_envelope.clone(),
+        sent_at_ms: 0,
+    };
+    let phone_text_entry = TextAuthorLogEnvelope {
+        channel_id: "general".to_owned(),
+        envelope: phone_text_envelope.clone(),
+        sent_at_ms: 1,
+    };
+    let divergent_phone_entry = TextAuthorLogEnvelope {
+        channel_id: "general".to_owned(),
+        envelope: TextMessageEnvelope::sign(
+            "lab",
+            TextMessageEnvelopeInput {
+                epoch: 7,
+                sender_leaf: 1,
+                sender_device_id: "alice-phone".to_owned(),
+                sequence: 2,
+                message_id: "alice-2-fork".to_owned(),
+                retention: TextRetentionMetadata::new("7 day default", 0, Some(604_800_000), false),
+                content_ciphertext: b"forked-ciphertext".to_vec(),
+            },
+            &text_signing_key,
+        )?,
+        sent_at_ms: 2,
+    };
+    let mut text_history = TextHistoryMergeState::with_recipient_cache_capacity(3);
+    let merge_report = text_history.merge_author_log(vec![
+        phone_text_entry.clone(),
+        laptop_text_entry,
+        phone_text_entry.clone(),
+        divergent_phone_entry,
+    ]);
+    let author_logs_merged = merge_report.inserted == 2
+        && merge_report.duplicates_suppressed == 1
+        && merge_report.repair_events == 1
+        && merge_report
+            .events
+            .iter()
+            .any(|event| event.kind == TextHistoryMergeEventKind::RepairRequested)
+        && text_history
+            .author_log_snapshot()
+            .iter()
+            .map(|entry| entry.envelope.message_id.clone())
+            .collect::<Vec<_>>()
+            == vec!["alice-1".to_owned(), "alice-2".to_owned()];
 
-    let mut cache_store = LocalStore::with_recipient_cache_capacity(3);
+    let mut cache_entries = Vec::new();
     for idx in 0..4 {
-        cache_store.cache_received(RecipientCacheEntry::new(
-            format!("cached-{idx}"),
-            vec![idx as u8, 42],
-            KeyState::Cached([idx as u8; 32]),
-            idx,
-        ));
+        let envelope = TextMessageEnvelope::sign(
+            "lab",
+            TextMessageEnvelopeInput {
+                epoch: 7,
+                sender_leaf: 1,
+                sender_device_id: "alice-cache".to_owned(),
+                sequence: 10 + idx,
+                message_id: format!("cached-{idx}"),
+                retention: TextRetentionMetadata::new("7 day default", idx, None, false),
+                content_ciphertext: vec![idx as u8, 42],
+            },
+            &text_signing_key,
+        )?;
+        cache_entries.push(TextReceivedEnvelope {
+            channel_id: "general".to_owned(),
+            envelope,
+            received_at_ms: idx,
+        });
     }
-    let recipient_cache_bounded = cache_store.recipient_cache().len() == 3
-        && cache_store.recipient_cache().get("cached-0").is_none()
-        && cache_store.recipient_cache().get("cached-3").is_some();
+    let cache_report = text_history.merge_received_cache(cache_entries);
+    let recipient_cache_ids = text_history
+        .recipient_cache_snapshot()
+        .iter()
+        .map(|entry| entry.envelope.message_id.clone())
+        .collect::<Vec<_>>();
+    let recipient_cache_bounded = recipient_cache_ids.len() == 3
+        && !recipient_cache_ids.contains(&"cached-0".to_owned())
+        && recipient_cache_ids.contains(&"cached-3".to_owned())
+        && cache_report.evicted_from_recipient_cache == 1;
 
     let peers = (0..16).map(|idx| format!("peer-{idx}")).collect::<Vec<_>>();
     let mut mesh = GossipMesh::new(peers.clone());

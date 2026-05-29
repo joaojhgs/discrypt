@@ -75,6 +75,9 @@ pub enum DeliveryError {
     /// Text payload decryption failed.
     #[error("text message decryption failed")]
     TextMessageDecryptionFailed,
+    /// Text history merge detected a divergent per-author slot or message id.
+    #[error("text history divergence requires repair: {0}")]
+    TextHistoryDivergence(String),
 }
 
 /// Compact state summary exchanged during catch-up.
@@ -1020,6 +1023,293 @@ impl TextReceiveEventSink for InMemoryTextReceiveEvents {
     }
 }
 
+/// Causal slot for one author's text history.
+///
+/// The same `(sender_leaf, sequence)` slot may only contain one signed
+/// ciphertext envelope. A different envelope in the same slot is a fork that
+/// must be repaired explicitly instead of being silently overwritten.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TextAuthorLogSlot {
+    /// Sender MLS leaf.
+    pub sender_leaf: u32,
+    /// Per-author sequence.
+    pub sequence: u64,
+}
+
+impl From<&TextMessageEnvelope> for TextAuthorLogSlot {
+    fn from(envelope: &TextMessageEnvelope) -> Self {
+        Self {
+            sender_leaf: envelope.sender_leaf,
+            sequence: envelope.sequence,
+        }
+    }
+}
+
+/// History merge lifecycle event kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextHistoryMergeEventKind {
+    /// A new author-log or recipient-cache envelope was accepted.
+    Inserted,
+    /// An exact duplicate signed envelope was ignored.
+    DuplicateSuppressed,
+    /// A conflicting slot/message requires repair before it may be accepted.
+    RepairRequested,
+    /// A recipient cache entry was evicted because the cache reached its bound.
+    RecipientCacheEvicted,
+}
+
+/// Explicit history merge event emitted for UI/service reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextHistoryMergeEvent {
+    /// Event kind.
+    pub kind: TextHistoryMergeEventKind,
+    /// Message id involved in the merge decision.
+    pub message_id: String,
+    /// Sender MLS leaf involved in the merge decision.
+    pub sender_leaf: u32,
+    /// Per-author sequence involved in the merge decision.
+    pub sequence: u64,
+    /// Operator-facing repair/dedupe detail.
+    pub detail: String,
+}
+
+impl TextHistoryMergeEvent {
+    fn inserted(envelope: &TextMessageEnvelope) -> Self {
+        Self {
+            kind: TextHistoryMergeEventKind::Inserted,
+            message_id: envelope.message_id.clone(),
+            sender_leaf: envelope.sender_leaf,
+            sequence: envelope.sequence,
+            detail: "accepted into causal history".to_owned(),
+        }
+    }
+
+    fn duplicate(envelope: &TextMessageEnvelope) -> Self {
+        Self {
+            kind: TextHistoryMergeEventKind::DuplicateSuppressed,
+            message_id: envelope.message_id.clone(),
+            sender_leaf: envelope.sender_leaf,
+            sequence: envelope.sequence,
+            detail: "exact signed envelope duplicate suppressed".to_owned(),
+        }
+    }
+
+    fn repair(envelope: &TextMessageEnvelope, detail: impl Into<String>) -> Self {
+        Self {
+            kind: TextHistoryMergeEventKind::RepairRequested,
+            message_id: envelope.message_id.clone(),
+            sender_leaf: envelope.sender_leaf,
+            sequence: envelope.sequence,
+            detail: detail.into(),
+        }
+    }
+
+    fn evicted(entry: &TextReceivedEnvelope) -> Self {
+        Self {
+            kind: TextHistoryMergeEventKind::RecipientCacheEvicted,
+            message_id: entry.envelope.message_id.clone(),
+            sender_leaf: entry.envelope.sender_leaf,
+            sequence: entry.envelope.sequence,
+            detail: "evicted oldest recipient ciphertext cache entry".to_owned(),
+        }
+    }
+}
+
+/// Summary returned from an author-log/recipient-cache merge operation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextHistoryMergeReport {
+    /// Newly accepted envelopes.
+    pub inserted: usize,
+    /// Exact duplicates suppressed without changing state.
+    pub duplicates_suppressed: usize,
+    /// Divergent slots/message ids that require repair.
+    pub repair_events: usize,
+    /// Recipient cache evictions caused by bounded capacity.
+    pub evicted_from_recipient_cache: usize,
+    /// Ordered explicit events for service/UI reconciliation.
+    pub events: Vec<TextHistoryMergeEvent>,
+}
+
+impl TextHistoryMergeReport {
+    fn push(&mut self, event: TextHistoryMergeEvent) {
+        match event.kind {
+            TextHistoryMergeEventKind::Inserted => self.inserted += 1,
+            TextHistoryMergeEventKind::DuplicateSuppressed => self.duplicates_suppressed += 1,
+            TextHistoryMergeEventKind::RepairRequested => self.repair_events += 1,
+            TextHistoryMergeEventKind::RecipientCacheEvicted => {
+                self.evicted_from_recipient_cache += 1;
+            }
+        }
+        self.events.push(event);
+    }
+}
+
+/// Stateful merge service for text history replicated across devices/recipients.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextHistoryMergeState {
+    author_log: BTreeMap<TextAuthorLogSlot, TextAuthorLogEnvelope>,
+    message_index: BTreeMap<String, TextAuthorLogSlot>,
+    recipient_cache_capacity: usize,
+    recipient_cache: BTreeMap<String, TextReceivedEnvelope>,
+}
+
+impl Default for TextHistoryMergeState {
+    fn default() -> Self {
+        Self::with_recipient_cache_capacity(256)
+    }
+}
+
+impl TextHistoryMergeState {
+    /// Create merge state with a bounded recipient ciphertext cache.
+    #[must_use]
+    pub fn with_recipient_cache_capacity(recipient_cache_capacity: usize) -> Self {
+        Self {
+            author_log: BTreeMap::new(),
+            message_index: BTreeMap::new(),
+            recipient_cache_capacity: recipient_cache_capacity.max(1),
+            recipient_cache: BTreeMap::new(),
+        }
+    }
+
+    /// Merge author-log envelopes from local devices, recipients, or gossip peers.
+    ///
+    /// Exact duplicate signed envelopes are suppressed. A conflicting envelope in
+    /// the same author sequence slot, or a reused message id in another slot,
+    /// emits an explicit repair event and is not accepted.
+    pub fn merge_author_log<I>(&mut self, entries: I) -> TextHistoryMergeReport
+    where
+        I: IntoIterator<Item = TextAuthorLogEnvelope>,
+    {
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            TextAuthorLogSlot::from(&left.envelope)
+                .cmp(&TextAuthorLogSlot::from(&right.envelope))
+                .then_with(|| left.envelope.epoch.cmp(&right.envelope.epoch))
+                .then_with(|| left.envelope.message_id.cmp(&right.envelope.message_id))
+        });
+
+        let mut report = TextHistoryMergeReport::default();
+        for entry in entries {
+            self.merge_one_author_entry(entry, &mut report);
+        }
+        report
+    }
+
+    fn merge_one_author_entry(
+        &mut self,
+        entry: TextAuthorLogEnvelope,
+        report: &mut TextHistoryMergeReport,
+    ) {
+        let slot = TextAuthorLogSlot::from(&entry.envelope);
+        if let Some(existing) = self.author_log.get(&slot) {
+            if existing.envelope.canonical_signed_bytes() == entry.envelope.canonical_signed_bytes()
+            {
+                report.push(TextHistoryMergeEvent::duplicate(&entry.envelope));
+            } else {
+                report.push(TextHistoryMergeEvent::repair(
+                    &entry.envelope,
+                    format!(
+                        "author slot fork at leaf {} sequence {}; kept {}, rejected {}",
+                        slot.sender_leaf,
+                        slot.sequence,
+                        existing.envelope.message_id,
+                        entry.envelope.message_id
+                    ),
+                ));
+            }
+            return;
+        }
+
+        if let Some(existing_slot) = self.message_index.get(&entry.envelope.message_id) {
+            report.push(TextHistoryMergeEvent::repair(
+                &entry.envelope,
+                format!(
+                    "message id reused in slot {}:{}, rejected slot {}:{}",
+                    existing_slot.sender_leaf,
+                    existing_slot.sequence,
+                    slot.sender_leaf,
+                    slot.sequence
+                ),
+            ));
+            return;
+        }
+
+        self.message_index
+            .insert(entry.envelope.message_id.clone(), slot.clone());
+        report.push(TextHistoryMergeEvent::inserted(&entry.envelope));
+        self.author_log.insert(slot, entry);
+    }
+
+    /// Cache received ciphertext envelopes with duplicate suppression and bounds.
+    pub fn merge_received_cache<I>(&mut self, entries: I) -> TextHistoryMergeReport
+    where
+        I: IntoIterator<Item = TextReceivedEnvelope>,
+    {
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.received_at_ms, entry.envelope.message_id.clone()));
+
+        let mut report = TextHistoryMergeReport::default();
+        for entry in entries {
+            self.cache_one_received(entry, &mut report);
+        }
+        report
+    }
+
+    fn cache_one_received(
+        &mut self,
+        entry: TextReceivedEnvelope,
+        report: &mut TextHistoryMergeReport,
+    ) {
+        if let Some(existing) = self.recipient_cache.get(&entry.envelope.message_id) {
+            if existing.envelope.canonical_signed_bytes() == entry.envelope.canonical_signed_bytes()
+            {
+                report.push(TextHistoryMergeEvent::duplicate(&entry.envelope));
+            } else {
+                report.push(TextHistoryMergeEvent::repair(
+                    &entry.envelope,
+                    "recipient cache message-id fork; kept existing ciphertext",
+                ));
+            }
+            return;
+        }
+
+        report.push(TextHistoryMergeEvent::inserted(&entry.envelope));
+        self.recipient_cache
+            .insert(entry.envelope.message_id.clone(), entry);
+        self.evict_recipient_cache(report);
+    }
+
+    fn evict_recipient_cache(&mut self, report: &mut TextHistoryMergeReport) {
+        while self.recipient_cache.len() > self.recipient_cache_capacity {
+            let Some(evict_id) = self
+                .recipient_cache
+                .values()
+                .min_by_key(|entry| (entry.received_at_ms, entry.envelope.message_id.clone()))
+                .map(|entry| entry.envelope.message_id.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = self.recipient_cache.remove(&evict_id) {
+                report.push(TextHistoryMergeEvent::evicted(&evicted));
+            }
+        }
+    }
+
+    /// Causally ordered author-log snapshot.
+    #[must_use]
+    pub fn author_log_snapshot(&self) -> Vec<TextAuthorLogEnvelope> {
+        self.author_log.values().cloned().collect()
+    }
+
+    /// Ordered recipient cache snapshot by receive time then message id.
+    #[must_use]
+    pub fn recipient_cache_snapshot(&self) -> Vec<TextReceivedEnvelope> {
+        let mut entries = self.recipient_cache.values().cloned().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.received_at_ms, entry.envelope.message_id.clone()));
+        entries
+    }
+}
+
 /// Decrypt a verified text envelope using the same exporter-derived key used on send.
 pub fn decrypt_text_envelope(
     group_id: &str,
@@ -1793,6 +2083,118 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == TextReceiveEventKind::Error));
+        Ok(())
+    }
+
+    fn signed_log_entry(
+        sequence: u64,
+        message_id: &str,
+        ciphertext: &[u8],
+    ) -> Result<TextAuthorLogEnvelope, DeliveryError> {
+        Ok(TextAuthorLogEnvelope {
+            channel_id: "general".to_owned(),
+            envelope: TextMessageEnvelope::sign(
+                "group/private-lab",
+                TextMessageEnvelopeInput {
+                    epoch: 7,
+                    sender_leaf: 1,
+                    sender_device_id: format!("alice-device-{sequence}"),
+                    sequence,
+                    message_id: message_id.to_owned(),
+                    retention: retention(),
+                    content_ciphertext: ciphertext.to_vec(),
+                },
+                &signing_key(42),
+            )?,
+            sent_at_ms: sequence * 10,
+        })
+    }
+
+    #[test]
+    fn text_history_merge_orders_and_suppresses_duplicates() -> Result<(), DeliveryError> {
+        let entry_1 = signed_log_entry(1, "msg-1", b"ciphertext-1")?;
+        let entry_2 = signed_log_entry(2, "msg-2", b"ciphertext-2")?;
+        let entry_3 = signed_log_entry(3, "msg-3", b"ciphertext-3")?;
+        let mut merge = TextHistoryMergeState::default();
+        let report = merge.merge_author_log(vec![
+            entry_3.clone(),
+            entry_1.clone(),
+            entry_2.clone(),
+            entry_2.clone(),
+        ]);
+
+        assert_eq!(report.inserted, 3);
+        assert_eq!(report.duplicates_suppressed, 1);
+        assert_eq!(report.repair_events, 0);
+        assert_eq!(
+            merge
+                .author_log_snapshot()
+                .iter()
+                .map(|entry| entry.envelope.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg-1", "msg-2", "msg-3"]
+        );
+        assert!(report
+            .events
+            .iter()
+            .any(|event| event.kind == TextHistoryMergeEventKind::DuplicateSuppressed));
+        Ok(())
+    }
+
+    #[test]
+    fn text_history_merge_requests_repair_for_divergent_slots_and_ids() -> Result<(), DeliveryError>
+    {
+        let accepted = signed_log_entry(5, "msg-5", b"ciphertext-a")?;
+        let same_slot_fork = signed_log_entry(5, "msg-5-fork", b"ciphertext-b")?;
+        let reused_message_id = signed_log_entry(6, "msg-5", b"ciphertext-c")?;
+        let mut merge = TextHistoryMergeState::default();
+        assert_eq!(merge.merge_author_log(vec![accepted.clone()]).inserted, 1);
+        let report =
+            merge.merge_author_log(vec![same_slot_fork.clone(), reused_message_id.clone()]);
+
+        assert_eq!(report.inserted, 0);
+        assert_eq!(report.repair_events, 2);
+        assert_eq!(merge.author_log_snapshot(), vec![accepted]);
+        assert!(report.events.iter().all(|event| {
+            event.kind == TextHistoryMergeEventKind::RepairRequested
+                && event.detail.contains("rejected")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn text_history_merge_bounds_recipient_cache_and_reports_evictions() -> Result<(), DeliveryError>
+    {
+        let mut merge = TextHistoryMergeState::with_recipient_cache_capacity(3);
+        let received = (0..4)
+            .map(|idx| {
+                signed_log_entry(idx + 1, &format!("cached-{idx}"), &[idx as u8 + 1]).map(|entry| {
+                    TextReceivedEnvelope {
+                        channel_id: entry.channel_id,
+                        envelope: entry.envelope,
+                        received_at_ms: idx,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let duplicate = received[3].clone();
+        let report = merge.merge_received_cache(received.into_iter().chain([duplicate]));
+
+        assert_eq!(report.inserted, 4);
+        assert_eq!(report.duplicates_suppressed, 1);
+        assert_eq!(report.evicted_from_recipient_cache, 1);
+        assert_eq!(
+            merge
+                .recipient_cache_snapshot()
+                .iter()
+                .map(|entry| entry.envelope.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cached-1", "cached-2", "cached-3"]
+        );
+        assert!(report
+            .events
+            .iter()
+            .any(|event| event.kind == TextHistoryMergeEventKind::RecipientCacheEvicted));
         Ok(())
     }
 
