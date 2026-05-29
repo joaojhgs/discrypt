@@ -101,6 +101,12 @@ impl RelayTopology {
         Ok(())
     }
 
+    /// Number of currently connected neighbors for a peer.
+    #[must_use]
+    pub fn peer_degree(&self, peer_id: &str) -> Option<usize> {
+        self.links.get(peer_id).map(BTreeSet::len)
+    }
+
     /// Return ranked neighbors for deterministic relay selection.
     #[must_use]
     pub fn ranked_neighbors(&self, peer_id: &str) -> Vec<RelayMetrics> {

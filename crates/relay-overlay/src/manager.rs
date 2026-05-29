@@ -7,7 +7,9 @@
 //! updates the content-blind relay topology, and returns auditable route/failover
 //! decisions without inspecting application plaintext.
 
-use crate::capability::{CapabilityAdvertisementError, RelayCapabilityAdvertisement};
+use crate::capability::{
+    CapabilityAdvertisementBook, CapabilityAdvertisementError, RelayCapabilityAdvertisement,
+};
 use crate::failover::{reroute_after_failure, FailoverDecision};
 use crate::ranking::RelayMetrics;
 use crate::topology::{RelayRoute, RelayTopology, TopologyError};
@@ -83,6 +85,42 @@ pub struct OverlayFailoverReport {
     pub manager_epoch: u64,
 }
 
+/// Overlay route payload class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayRouteUse {
+    /// Text messages and command/control frames.
+    TextControl,
+    /// Protected voice/media frames.
+    VoiceMedia,
+}
+
+impl OverlayRouteUse {
+    /// Minimum egress budget required from every relay hop.
+    #[must_use]
+    pub const fn min_egress_bytes_per_second(self) -> u64 {
+        match self {
+            Self::TextControl => 1_024,
+            Self::VoiceMedia => 32_000,
+        }
+    }
+}
+
+/// Capacity-checked overlay route ready for text/control or voice media.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConstructedOverlayRoute {
+    /// Route use case.
+    pub use_case: OverlayRouteUse,
+    /// Selected content-blind route.
+    pub route: RelayRoute,
+    /// Number of relay hops/edges in the route.
+    pub hop_count: usize,
+    /// Minimum relay egress capacity seen across intermediate relay hops.
+    pub bottleneck_egress_bytes_per_second: Option<u64>,
+    /// Manager epoch used for route construction.
+    pub manager_epoch: u64,
+}
+
 /// Errors returned by [`OverlayManager`].
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum OverlayManagerError {
@@ -95,6 +133,9 @@ pub enum OverlayManagerError {
     /// Capability advertisement validation/storage failed.
     #[error(transparent)]
     Capability(#[from] CapabilityAdvertisementError),
+    /// Route cannot satisfy hop, fanout, or capacity policy.
+    #[error("overlay route capacity check failed: {0}")]
+    RouteCapacity(String),
 }
 
 /// Stateful overlay routing manager fed by runtime metrics.
@@ -102,6 +143,7 @@ pub enum OverlayManagerError {
 pub struct OverlayManager {
     topology: RelayTopology,
     observations: BTreeMap<String, RelayRuntimeObservation>,
+    capabilities: CapabilityAdvertisementBook,
     failed_peers: BTreeSet<String>,
     epoch: u64,
 }
@@ -119,6 +161,7 @@ impl OverlayManager {
         Self {
             topology,
             observations: BTreeMap::new(),
+            capabilities: CapabilityAdvertisementBook::default(),
             failed_peers: BTreeSet::new(),
             epoch: 0,
         }
@@ -156,8 +199,9 @@ impl OverlayManager {
         advertisement: RelayCapabilityAdvertisement,
         now_ms: u64,
     ) -> Result<(), OverlayManagerError> {
-        advertisement.validate_at(now_ms)?;
-        self.upsert_observation(advertisement.to_runtime_observation())
+        let observation = advertisement.to_runtime_observation();
+        self.capabilities.accept(advertisement, now_ms)?;
+        self.upsert_observation(observation)
     }
 
     /// Connect two known peers in the local overlay graph.
@@ -193,6 +237,53 @@ impl OverlayManager {
         })
     }
 
+    /// Construct a capacity-checked route for text/control or voice media.
+    pub fn construct_route(
+        &self,
+        use_case: OverlayRouteUse,
+        source: &str,
+        destination: &str,
+    ) -> Result<ConstructedOverlayRoute, OverlayManagerError> {
+        let decision = self.route(source, destination)?;
+        if !decision.route.within_hop_limit() {
+            return Err(OverlayManagerError::RouteCapacity(
+                "route exceeds three-hop overlay limit".to_owned(),
+            ));
+        }
+        let mut bottleneck = None;
+        for relay_peer in intermediate_relays(&decision.route) {
+            let advertisement = self.capabilities.get(relay_peer).ok_or_else(|| {
+                OverlayManagerError::RouteCapacity(format!(
+                    "missing capability advertisement for relay {relay_peer}"
+                ))
+            })?;
+            let degree = self.topology.peer_degree(relay_peer).unwrap_or_default();
+            if degree > usize::from(advertisement.relay_capacity.max_fanout) {
+                return Err(OverlayManagerError::RouteCapacity(format!(
+                    "relay {relay_peer} exceeds advertised fanout"
+                )));
+            }
+            if advertisement.relay_capacity.egress_bytes_per_second
+                < use_case.min_egress_bytes_per_second()
+            {
+                return Err(OverlayManagerError::RouteCapacity(format!(
+                    "relay {relay_peer} lacks egress capacity for {use_case:?}"
+                )));
+            }
+            bottleneck = Some(bottleneck.map_or(
+                advertisement.relay_capacity.egress_bytes_per_second,
+                |current: u64| current.min(advertisement.relay_capacity.egress_bytes_per_second),
+            ));
+        }
+        Ok(ConstructedOverlayRoute {
+            use_case,
+            hop_count: decision.route.hop_count(),
+            route: decision.route,
+            bottleneck_egress_bytes_per_second: bottleneck,
+            manager_epoch: self.epoch,
+        })
+    }
+
     /// Mark a peer failed and produce a bounded-hop replacement route.
     pub fn mark_failed_and_reroute(
         &mut self,
@@ -217,6 +308,16 @@ impl OverlayManager {
     fn bump_epoch(&mut self) {
         self.epoch = self.epoch.saturating_add(1);
     }
+}
+
+fn intermediate_relays(route: &RelayRoute) -> impl Iterator<Item = &str> {
+    let len = route.path.len();
+    route
+        .path
+        .iter()
+        .enumerate()
+        .filter(move |(idx, _peer)| *idx != 0 && *idx + 1 != len)
+        .map(|(_idx, peer)| peer.as_str())
 }
 
 fn validate_observation(observation: &RelayRuntimeObservation) -> Result<(), OverlayManagerError> {
@@ -339,6 +440,84 @@ mod tests {
             manager.route("alice", "bob")?.route.path,
             ["alice", "relay-a", "bob"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn constructs_text_and_voice_routes_with_hop_and_capacity_checks(
+    ) -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for (peer_id, rtt, egress) in [
+            ("alice", 5, 64_000),
+            ("relay-a", 25, 64_000),
+            ("relay-b", 30, 48_000),
+            ("bob", 5, 64_000),
+        ] {
+            manager.upsert_capability_advertisement(
+                RelayCapabilityAdvertisement {
+                    peer_id: peer_id.to_owned(),
+                    sequence: 1,
+                    issued_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                    relay_capacity: crate::RelayCapacityAdvertisement {
+                        max_fanout: 8,
+                        egress_bytes_per_second: egress,
+                        accepts_store_forward: true,
+                    },
+                    battery_doze: crate::BatteryDozePosture::BatteryNormal,
+                    observed_rtt_ms: rtt,
+                    packet_loss_bps: 0,
+                    contributed_bytes: 10_000,
+                    consumed_bytes: 0,
+                },
+                1_500,
+            )?;
+        }
+        manager.connect_peers("alice", "relay-a")?;
+        manager.connect_peers("relay-a", "relay-b")?;
+        manager.connect_peers("relay-b", "bob")?;
+
+        let text = manager.construct_route(OverlayRouteUse::TextControl, "alice", "bob")?;
+        assert_eq!(text.hop_count, 3);
+        assert_eq!(text.bottleneck_egress_bytes_per_second, Some(48_000));
+        let voice = manager.construct_route(OverlayRouteUse::VoiceMedia, "alice", "bob")?;
+        assert_eq!(voice.route.path, ["alice", "relay-a", "relay-b", "bob"]);
+        Ok(())
+    }
+
+    #[test]
+    fn voice_route_rejects_under_capacity_relay() -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for (peer_id, egress) in [("alice", 64_000), ("relay", 8_000), ("bob", 64_000)] {
+            manager.upsert_capability_advertisement(
+                RelayCapabilityAdvertisement {
+                    peer_id: peer_id.to_owned(),
+                    sequence: 1,
+                    issued_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                    relay_capacity: crate::RelayCapacityAdvertisement {
+                        max_fanout: 8,
+                        egress_bytes_per_second: egress,
+                        accepts_store_forward: true,
+                    },
+                    battery_doze: crate::BatteryDozePosture::BatteryNormal,
+                    observed_rtt_ms: 20,
+                    packet_loss_bps: 0,
+                    contributed_bytes: 10_000,
+                    consumed_bytes: 0,
+                },
+                1_500,
+            )?;
+        }
+        manager.connect_peers("alice", "relay")?;
+        manager.connect_peers("relay", "bob")?;
+        assert!(matches!(
+            manager.construct_route(OverlayRouteUse::VoiceMedia, "alice", "bob"),
+            Err(OverlayManagerError::RouteCapacity(_))
+        ));
+        assert!(manager
+            .construct_route(OverlayRouteUse::TextControl, "alice", "bob")
+            .is_ok());
         Ok(())
     }
 

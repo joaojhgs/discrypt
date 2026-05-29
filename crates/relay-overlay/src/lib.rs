@@ -29,8 +29,8 @@ pub use capability::{
 };
 pub use gossip::{GossipItem, GossipMesh, GossipNode};
 pub use manager::{
-    OverlayFailoverReport, OverlayManager, OverlayManagerError, OverlayRouteDecision,
-    RelayRuntimeObservation,
+    ConstructedOverlayRoute, OverlayFailoverReport, OverlayManager, OverlayManagerError,
+    OverlayRouteDecision, OverlayRouteUse, RelayRuntimeObservation,
 };
 pub use ranking::{rank, score, RelayMetrics};
 pub use topology::hop_limit_ok;
