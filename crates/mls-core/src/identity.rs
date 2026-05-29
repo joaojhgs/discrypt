@@ -11,6 +11,12 @@ use zeroize::Zeroize;
 pub struct FriendCode(String);
 
 impl FriendCode {
+    /// Wrap an externally supplied friend-code/QR payload for validation.
+    #[must_use]
+    pub fn from_payload(payload: impl Into<String>) -> Self {
+        Self(payload.into())
+    }
+
     /// Return the encoded friend code.
     #[must_use]
     pub fn as_str(&self) -> &str {
