@@ -1,6 +1,8 @@
 //! Signed governance event ordering and authority primitives.
 
 use crate::LeafIndex;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
@@ -37,7 +39,7 @@ pub enum GovernanceAction {
 /// Governance errors.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum GovernanceError {
-    /// Signature is absent/invalid in the deterministic facade.
+    /// Signature is absent, malformed, or does not verify over the canonical event.
     #[error("invalid governance signature")]
     InvalidSignature,
     /// Event epoch does not match the accepted epoch.
@@ -51,8 +53,12 @@ pub enum GovernanceError {
     EvictedCommitter,
 }
 
-/// Signed event placeholder. Phase facades verify deterministic signature bytes;
-/// production wiring replaces this with MLS credentials.
+/// Governance event signed by a concrete device credential.
+///
+/// The signature covers a domain-separated canonical payload containing the epoch,
+/// committer leaf, signer device public key, and action. The signature bytes are no
+/// longer a deterministic content-hash facade; tampering with any signed field or
+/// swapping the signer key invalidates the event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GovernanceEvent {
     /// Event epoch.
@@ -61,36 +67,102 @@ pub struct GovernanceEvent {
     pub committer: LeafIndex,
     /// Governance action.
     pub action: GovernanceAction,
-    /// Deterministic signature bytes.
+    /// Ed25519 device verification key that signed this event.
+    pub signer_public_key: Vec<u8>,
+    /// Ed25519 signature over the canonical event payload.
     pub signature: Vec<u8>,
 }
 
 impl GovernanceEvent {
-    /// Construct and deterministically sign an event for harnesses.
+    /// Construct a governance event signed by the supplied device signing key.
     #[must_use]
-    pub fn signed(epoch: u64, committer: LeafIndex, action: GovernanceAction) -> Self {
-        let mut event = Self {
+    pub fn signed_by(
+        epoch: u64,
+        committer: LeafIndex,
+        action: GovernanceAction,
+        signing_key: &SigningKey,
+    ) -> Self {
+        let signer_public_key = signing_key.verifying_key().to_bytes().to_vec();
+        let signature = signing_key
+            .sign(&Self::canonical_signing_bytes(
+                epoch,
+                committer,
+                &action,
+                &signer_public_key,
+            ))
+            .to_bytes()
+            .to_vec();
+        Self {
             epoch,
             committer,
             action,
-            signature: Vec::new(),
-        };
-        event.signature = event.content_hash().to_vec();
-        event
+            signer_public_key,
+            signature,
+        }
+    }
+
+    /// Construct a real-signed event with a throwaway key for harness scenarios that
+    /// only exercise governance ordering/authority. Production call sites should use
+    /// [`Self::signed_by`] with the local device key so peers can bind the signer to
+    /// a device leaf.
+    #[must_use]
+    pub fn signed(epoch: u64, committer: LeafIndex, action: GovernanceAction) -> Self {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        Self::signed_by(epoch, committer, action, &signing_key)
     }
 
     /// Content hash used in the canonical comparator.
     #[must_use]
     pub fn content_hash(&self) -> [u8; 32] {
-        let encoded =
-            serde_json::to_vec(&(self.epoch, self.committer, &self.action)).unwrap_or_default();
-        Sha256::digest(encoded).into()
+        Sha256::digest(self.signing_bytes()).into()
     }
 
-    /// Validate deterministic signature placeholder.
+    /// Verify the Ed25519 signature over the canonical governance event payload.
+    pub fn verify_signature(&self) -> Result<(), GovernanceError> {
+        let verifying_key = VerifyingKey::from_bytes(
+            &self
+                .signer_public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| GovernanceError::InvalidSignature)?,
+        )
+        .map_err(|_| GovernanceError::InvalidSignature)?;
+        let signature = Signature::from_slice(&self.signature)
+            .map_err(|_| GovernanceError::InvalidSignature)?;
+        verifying_key
+            .verify(&self.signing_bytes(), &signature)
+            .map_err(|_| GovernanceError::InvalidSignature)
+    }
+
+    /// Validate the real device signature.
     #[must_use]
     pub fn signature_valid(&self) -> bool {
-        self.signature == self.content_hash()
+        self.verify_signature().is_ok()
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        Self::canonical_signing_bytes(
+            self.epoch,
+            self.committer,
+            &self.action,
+            &self.signer_public_key,
+        )
+    }
+
+    fn canonical_signing_bytes(
+        epoch: u64,
+        committer: LeafIndex,
+        action: &GovernanceAction,
+        signer_public_key: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = b"discrypt-governance-event".to_vec();
+        bytes.push(1);
+        bytes.extend_from_slice(&epoch.to_le_bytes());
+        bytes.extend_from_slice(&committer.to_le_bytes());
+        bytes.extend_from_slice(&(signer_public_key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(signer_public_key);
+        append_governance_action_bytes(&mut bytes, action);
+        bytes
     }
 
     /// Comparator reference anchored to an accepted tree.
@@ -100,6 +172,40 @@ impl GovernanceEvent {
             epoch: self.epoch,
             committer: self.committer,
             content_hash: self.content_hash(),
+        }
+    }
+}
+
+fn append_governance_action_bytes(bytes: &mut Vec<u8>, action: &GovernanceAction) {
+    match action {
+        GovernanceAction::SetRole { target, role } => {
+            bytes.push(0);
+            bytes.extend_from_slice(&target.to_le_bytes());
+            bytes.push(match role {
+                Role::Owner => 0,
+                Role::Admin => 1,
+                Role::Member => 2,
+            });
+        }
+        GovernanceAction::RevokeInvite { invite_id } => {
+            bytes.push(1);
+            bytes.extend_from_slice(&(invite_id.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(invite_id.as_bytes());
+        }
+        GovernanceAction::SetRetentionSeconds { author, seconds } => {
+            bytes.push(2);
+            bytes.extend_from_slice(&author.to_le_bytes());
+            match seconds {
+                Some(seconds) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&seconds.to_le_bytes());
+                }
+                None => bytes.push(0),
+            }
+        }
+        GovernanceAction::Ban { target } => {
+            bytes.push(3);
+            bytes.extend_from_slice(&target.to_le_bytes());
         }
     }
 }
@@ -222,9 +328,7 @@ impl GovernanceState {
         event: GovernanceEvent,
         evicted_this_epoch: &BTreeSet<LeafIndex>,
     ) -> Result<(), GovernanceError> {
-        if !event.signature_valid() {
-            return Err(GovernanceError::InvalidSignature);
-        }
+        event.verify_signature()?;
         if event.epoch != self.epoch {
             return Err(GovernanceError::OutOfEpoch);
         }
@@ -274,6 +378,64 @@ mod tests {
         log.append(a);
         log.append(b);
         assert_eq!(log.events()[0].committer, 1);
+    }
+
+    #[test]
+    fn real_device_signature_rejects_tampering_and_key_swaps() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let other_key = SigningKey::generate(&mut OsRng);
+        let mut event = GovernanceEvent::signed_by(
+            7,
+            1,
+            GovernanceAction::RevokeInvite {
+                invite_id: "invite-a".into(),
+            },
+            &signing_key,
+        );
+
+        assert!(event.signature_valid());
+
+        let mut tampered_action = event.clone();
+        tampered_action.action = GovernanceAction::RevokeInvite {
+            invite_id: "invite-b".into(),
+        };
+        assert_eq!(
+            tampered_action.verify_signature(),
+            Err(GovernanceError::InvalidSignature)
+        );
+
+        event.signer_public_key = other_key.verifying_key().to_bytes().to_vec();
+        assert_eq!(
+            event.verify_signature(),
+            Err(GovernanceError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_governance_signature_material() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut event = GovernanceEvent::signed_by(
+            1,
+            1,
+            GovernanceAction::SetRetentionSeconds {
+                author: 1,
+                seconds: Some(60),
+            },
+            &signing_key,
+        );
+        event.signature.truncate(8);
+        assert_eq!(
+            event.verify_signature(),
+            Err(GovernanceError::InvalidSignature)
+        );
+
+        let mut event =
+            GovernanceEvent::signed_by(1, 1, GovernanceAction::Ban { target: 2 }, &signing_key);
+        event.signer_public_key.truncate(8);
+        assert_eq!(
+            event.verify_signature(),
+            Err(GovernanceError::InvalidSignature)
+        );
     }
 
     #[test]
