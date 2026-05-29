@@ -36,6 +36,8 @@ pub struct MediaSecuritySmoke {
     pub mute_suppresses_outbound_media: bool,
     /// Per-speaker playback volume is applied after authenticated receive/decode.
     pub playback_volume_mixer_ready: bool,
+    /// Speaking indicators come from real PCM audio-level/VAD events, not fixtures.
+    pub speaking_indicator_from_vad: bool,
     /// Receiver plaintext after successful authentication and replay acceptance.
     pub plaintext: Vec<u8>,
 }
@@ -236,6 +238,7 @@ impl MediaSecuritySmoke {
             && self.receive_decode_jitter_playback_ready
             && self.mute_suppresses_outbound_media
             && self.playback_volume_mixer_ready
+            && self.speaking_indicator_from_vad
     }
 }
 
@@ -592,7 +595,15 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         HarnessPlaybackSink::default(),
     );
     let volume_queued = volume_receive.receive_protected_frame(volume_sink.sent[0].clone())?;
+    let volume_activity = volume_receive
+        .last_voice_activity(&volume_binding)?
+        .cloned();
     let volume_playback_sink = volume_receive.into_sink();
+    let speaking_indicator_from_vad = capture_report.audio_level.speaking
+        && capture_report.audio_level.rms_i16 > 0
+        && volume_activity
+            .as_ref()
+            .is_some_and(|event| event.speaking && event.rms_i16 > 0 && event.counter == Some(0));
     let playback_volume_mixer_ready = volume_queued == 1
         && volume_playback_sink.played.len() == 1
         && volume_playback_sink.played[0].sender.device_id == "volume-device"
@@ -609,6 +620,7 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         receive_decode_jitter_playback_ready,
         mute_suppresses_outbound_media,
         playback_volume_mixer_ready,
+        speaking_indicator_from_vad,
         plaintext: opened.plaintext,
     })
 }
@@ -2435,6 +2447,7 @@ mod tests {
                 receive_decode_jitter_playback_ready: true,
                 mute_suppresses_outbound_media: true,
                 playback_volume_mixer_ready: true,
+                speaking_indicator_from_vad: true,
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
         ));

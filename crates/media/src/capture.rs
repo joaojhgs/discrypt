@@ -387,6 +387,158 @@ fn apply_volume(sample: i16, volume_millipercent: u16) -> i16 {
     scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
+/// Source of a voice activity/audio-level event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum VoiceActivitySource {
+    /// Local microphone capture before Opus encode.
+    LocalCapture,
+    /// Remote decoded media before local playback-volume mixing.
+    RemotePlayback,
+}
+
+/// Audio-level event produced from real PCM samples and VAD state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceActivityLevel {
+    /// Where this event was observed.
+    pub source: VoiceActivitySource,
+    /// Authenticated speaker key for remote playback; local capture uses `None`.
+    pub speaker: Option<SpeakerPlaybackKey>,
+    /// SFrame counter for remote playback events.
+    pub counter: Option<u64>,
+    /// Local capture timestamp for capture events.
+    pub captured_at_ms: Option<u64>,
+    /// Root-mean-square level over the observed PCM frame.
+    pub rms_i16: u16,
+    /// Peak absolute sample value over the observed PCM frame.
+    pub peak_i16: u16,
+    /// VAD decision after threshold and hangover.
+    pub speaking: bool,
+}
+
+/// Deterministic PCM-level VAD used for voice speaking indicators.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceActivityDetector {
+    speaking_threshold_rms_i16: u16,
+    hangover_frames: u8,
+    hangover_remaining: u8,
+}
+
+impl Default for VoiceActivityDetector {
+    fn default() -> Self {
+        Self::voice_defaults()
+    }
+}
+
+impl VoiceActivityDetector {
+    /// Default VAD threshold/hangover for 48 kHz voice frames.
+    #[must_use]
+    pub const fn voice_defaults() -> Self {
+        Self {
+            speaking_threshold_rms_i16: 512,
+            hangover_frames: 2,
+            hangover_remaining: 0,
+        }
+    }
+
+    /// Construct a VAD with an explicit RMS threshold and hangover.
+    pub fn new(speaking_threshold_rms_i16: u16, hangover_frames: u8) -> Result<Self, MediaError> {
+        if speaking_threshold_rms_i16 == 0 {
+            return Err(MediaError::InvalidAudioFrame(
+                "VAD threshold must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            speaking_threshold_rms_i16,
+            hangover_frames,
+            hangover_remaining: 0,
+        })
+    }
+
+    /// Observe one real local capture frame and produce a speaking event.
+    pub fn observe_local_capture(
+        &mut self,
+        frame: &CapturedAudioFrame,
+    ) -> Result<VoiceActivityLevel, MediaError> {
+        validate_pcm_len(frame.format, &frame.pcm_i16)?;
+        let (rms_i16, peak_i16) = pcm_level_metrics(&frame.pcm_i16);
+        let speaking = self.update_speaking(rms_i16);
+        Ok(VoiceActivityLevel {
+            source: VoiceActivitySource::LocalCapture,
+            speaker: None,
+            counter: None,
+            captured_at_ms: Some(frame.captured_at_ms),
+            rms_i16,
+            peak_i16,
+            speaking,
+        })
+    }
+
+    /// Observe one authenticated remote decoded frame and produce a speaking event.
+    pub fn observe_remote_playback(
+        &mut self,
+        sender: &crate::SenderBinding,
+        counter: u64,
+        format: AudioCaptureFormat,
+        pcm_i16: &[i16],
+    ) -> Result<VoiceActivityLevel, MediaError> {
+        sender.validate()?;
+        validate_pcm_len(format, pcm_i16)?;
+        let (rms_i16, peak_i16) = pcm_level_metrics(pcm_i16);
+        let speaking = self.update_speaking(rms_i16);
+        Ok(VoiceActivityLevel {
+            source: VoiceActivitySource::RemotePlayback,
+            speaker: Some(SpeakerPlaybackKey::from_sender(sender)?),
+            counter: Some(counter),
+            captured_at_ms: None,
+            rms_i16,
+            peak_i16,
+            speaking,
+        })
+    }
+
+    fn update_speaking(&mut self, rms_i16: u16) -> bool {
+        if rms_i16 >= self.speaking_threshold_rms_i16 {
+            self.hangover_remaining = self.hangover_frames;
+            true
+        } else if self.hangover_remaining > 0 {
+            self.hangover_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn validate_pcm_len(format: AudioCaptureFormat, pcm_i16: &[i16]) -> Result<(), MediaError> {
+    format.validate()?;
+    if pcm_i16.len() == format.interleaved_samples_per_frame() {
+        Ok(())
+    } else {
+        Err(MediaError::InvalidAudioFrame(format!(
+            "expected {} interleaved PCM samples for audio-level event, got {}",
+            format.interleaved_samples_per_frame(),
+            pcm_i16.len()
+        )))
+    }
+}
+
+fn pcm_level_metrics(pcm_i16: &[i16]) -> (u16, u16) {
+    if pcm_i16.is_empty() {
+        return (0, 0);
+    }
+    let mut sum_squares = 0_u128;
+    let mut peak = 0_u16;
+    for sample in pcm_i16 {
+        let abs = (*sample as i32).abs().min(i16::MAX as i32) as u16;
+        peak = peak.max(abs);
+        let abs_u128 = u128::from(abs);
+        sum_squares += abs_u128 * abs_u128;
+    }
+    let mean_square = sum_squares as f64 / pcm_i16.len() as f64;
+    let rms = mean_square.sqrt().round().min(i16::MAX as f64) as u16;
+    (rms, peak)
+}
+
 /// Small deterministic jitter buffer ordered by authenticated SFrame counter per speaker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VoiceJitterBuffer {
@@ -485,6 +637,8 @@ pub struct VoiceReceiveSFramePipeline<S> {
     bridge: RustTransformBridge,
     playback_format: AudioCaptureFormat,
     decoders_by_speaker: BTreeMap<SpeakerPlaybackKey, OpusAudioDecoder>,
+    vad_by_speaker: BTreeMap<SpeakerPlaybackKey, VoiceActivityDetector>,
+    last_voice_activity_by_speaker: BTreeMap<SpeakerPlaybackKey, VoiceActivityLevel>,
     jitter: VoiceJitterBuffer,
     volume_mixer: PlaybackVolumeMixer,
     sink: S,
@@ -515,6 +669,8 @@ impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
             bridge,
             playback_format: decoder.format,
             decoders_by_speaker: BTreeMap::new(),
+            vad_by_speaker: BTreeMap::new(),
+            last_voice_activity_by_speaker: BTreeMap::new(),
             jitter,
             volume_mixer,
             sink,
@@ -536,6 +692,24 @@ impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
         self.volume_mixer.volume_for_sender(sender)
     }
 
+    /// Return the most recent audio-level/VAD event for an authenticated speaker.
+    pub fn last_voice_activity(
+        &self,
+        sender: &crate::SenderBinding,
+    ) -> Result<Option<&VoiceActivityLevel>, MediaError> {
+        let key = SpeakerPlaybackKey::from_sender(sender)?;
+        Ok(self.last_voice_activity_by_speaker.get(&key))
+    }
+
+    /// Return every speaker currently considered active by the latest VAD event.
+    #[must_use]
+    pub fn speaking_speakers(&self) -> Vec<SpeakerPlaybackKey> {
+        self.last_voice_activity_by_speaker
+            .iter()
+            .filter_map(|(speaker, level)| level.speaking.then_some(speaker.clone()))
+            .collect()
+    }
+
     /// Verify sender binding, reject replays, decrypt, decode, jitter, and queue playback.
     pub fn receive_protected_frame(
         &mut self,
@@ -554,6 +728,15 @@ impl<S: PlaybackAudioSink> VoiceReceiveSFramePipeline<S> {
             .get_mut(&speaker_key)
             .ok_or_else(|| MediaError::OpusDecodeFailed("missing per-speaker decoder".into()))?;
         let pcm_i16 = decoder.decode(&verified.clear.bytes)?;
+        let vad = self.vad_by_speaker.entry(speaker_key.clone()).or_default();
+        let voice_activity = vad.observe_remote_playback(
+            &verified.sender,
+            verified.counter,
+            self.playback_format,
+            &pcm_i16,
+        )?;
+        self.last_voice_activity_by_speaker
+            .insert(speaker_key, voice_activity);
         let decoded = DecodedAudioFrame {
             sender: verified.sender,
             counter: verified.counter,
@@ -609,6 +792,8 @@ pub struct VoiceCaptureSendReport {
     pub kid: Vec<u8>,
     /// SFrame sender counter copied from Rust media sender state.
     pub counter: u64,
+    /// Local audio-level/VAD event computed from the captured PCM that was sent.
+    pub audio_level: VoiceActivityLevel,
 }
 
 /// Result of applying media-path mute control to one captured frame.
@@ -631,6 +816,7 @@ pub struct VoiceCaptureSFramePipeline<S> {
     bridge: RustTransformBridge,
     sink: S,
     muted: bool,
+    vad: VoiceActivityDetector,
 }
 
 impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
@@ -642,6 +828,7 @@ impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
             bridge,
             sink,
             muted: false,
+            vad: VoiceActivityDetector::voice_defaults(),
         }
     }
 
@@ -667,6 +854,7 @@ impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
                 dropped_pcm_samples: frame.pcm_i16.len(),
             });
         }
+        let audio_level = self.vad.observe_local_capture(&frame)?;
         let encoded = self.encoder.encode(frame)?;
         let sequence = encoded.sequence;
         let captured_at_ms = encoded.captured_at_ms;
@@ -681,6 +869,7 @@ impl<S: ProtectedMediaFrameSink> VoiceCaptureSFramePipeline<S> {
             protected_payload_len: protected.bytes.len(),
             kid: protected.kid.clone(),
             counter: protected.counter,
+            audio_level,
         };
         self.sink.send_protected_media_frame(protected)?;
         Ok(VoiceCaptureSendOutcome::Sent(report))
@@ -773,6 +962,23 @@ mod tests {
     }
 
     #[test]
+    fn voice_activity_detector_uses_real_pcm_levels_and_hangover() -> Result<(), MediaError> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let mut vad = VoiceActivityDetector::new(512, 1)?;
+        let silence =
+            CapturedAudioFrame::new(vec![0; format.interleaved_samples_per_frame()], format, 10)?;
+        let speech = CapturedAudioFrame::new(sine_frame(format), format, 30)?;
+        assert!(!vad.observe_local_capture(&silence)?.speaking);
+        let speech_event = vad.observe_local_capture(&speech)?;
+        assert!(speech_event.speaking);
+        assert_eq!(speech_event.source, VoiceActivitySource::LocalCapture);
+        assert!(speech_event.rms_i16 >= 512);
+        assert!(vad.observe_local_capture(&silence)?.speaking);
+        assert!(!vad.observe_local_capture(&silence)?.speaking);
+        Ok(())
+    }
+
+    #[test]
     fn capture_encodes_real_opus_and_sends_only_sframe_protected_bytes() -> Result<(), MediaError> {
         let format = AudioCaptureFormat::mono_20ms_48khz();
         let mut encoder = OpusAudioEncoder::new(format)?;
@@ -801,6 +1007,10 @@ mod tests {
         assert_eq!(report.captured_at_ms, 1_234);
         assert!(report.protected_payload_len > report.opus_payload_len);
         assert_eq!(report.counter, 0);
+        assert_eq!(report.audio_level.source, VoiceActivitySource::LocalCapture);
+        assert_eq!(report.audio_level.captured_at_ms, Some(1_234));
+        assert!(report.audio_level.speaking);
+        assert!(report.audio_level.rms_i16 > 0);
         let sink = pipeline.into_sink();
         assert_eq!(sink.sent.len(), 1);
         assert_ne!(sink.sent[0].bytes, original_opus);
@@ -904,6 +1114,20 @@ mod tests {
         pipeline.set_speaker_volume(&capture_binding, 0)?;
         assert_eq!(pipeline.speaker_volume(&capture_binding)?, 0);
         assert_eq!(pipeline.receive_protected_frame(protected)?, 1);
+        let activity = pipeline
+            .last_voice_activity(&capture_binding)?
+            .ok_or_else(|| MediaError::PlaybackFailed("missing VAD event".into()))?;
+        assert_eq!(activity.source, VoiceActivitySource::RemotePlayback);
+        assert_eq!(
+            activity.speaker,
+            Some(SpeakerPlaybackKey::from_sender(&capture_binding)?)
+        );
+        assert_eq!(activity.counter, Some(0));
+        assert!(activity.speaking);
+        assert_eq!(
+            pipeline.speaking_speakers(),
+            vec![SpeakerPlaybackKey::from_sender(&capture_binding)?]
+        );
         let sink = pipeline.into_sink();
         assert_eq!(sink.played.len(), 1);
         assert!(sink.played[0].pcm_i16.iter().all(|sample| *sample == 0));

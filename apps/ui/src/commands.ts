@@ -1422,13 +1422,13 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
             id: localUserId(state),
             name: "You",
             role: "you",
-            speaking: captureAllowed,
+            speaking: false,
             muted: false,
             volume: 82,
           },
         ],
         route_copy: captureAllowed
-          ? "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E"
+          ? "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E; speaking indicators wait for media audio-level/VAD events"
           : "No voice route opened because microphone permission/input selection is not granted",
         status_copy: captureAllowed
           ? `Microphone capture authorized using ${inputDevice?.label ?? "Default microphone"} and playback routed to ${outputDevice?.label ?? "system default"}`
@@ -1493,8 +1493,7 @@ export async function setSelfMute(request: SelfMuteRequest): Promise<AppState> {
             ? {
                 ...participant,
                 muted: request.muted,
-                speaking:
-                  state.voice_session?.joined === true && !request.muted,
+                speaking: request.muted ? false : participant.speaking,
               }
             : participant,
       );

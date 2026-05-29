@@ -276,7 +276,7 @@ pub struct VoiceParticipantView {
     pub name: String,
     /// Role label.
     pub role: String,
-    /// Whether the participant is currently speaking.
+    /// Whether the participant is currently speaking according to the latest media VAD event.
     pub speaking: bool,
     /// Whether the participant is muted.
     pub muted: bool,
@@ -1170,12 +1170,9 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
                 .to_ascii_lowercase(),
             input_device: selection.input_device.clone(),
             output_device: selection.output_device.clone(),
-            participants: default_voice_participants(
-                &local_user_id,
-                capture_allowed && !self_muted,
-            ),
+            participants: default_voice_participants(&local_user_id, false),
             route_copy: if capture_allowed {
-                "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E".to_owned()
+                "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E; speaking indicators wait for media audio-level/VAD events".to_owned()
             } else {
                 "No voice route opened because microphone permission/input selection is not granted"
                     .to_owned()
@@ -1239,7 +1236,9 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
                 for participant in &mut session.participants {
                     if participant.id == local_user_id {
                         participant.muted = request.muted;
-                        participant.speaking = session.joined && !request.muted;
+                        if request.muted {
+                            participant.speaking = false;
+                        }
                     }
                 }
                 let summary = if request.muted {
