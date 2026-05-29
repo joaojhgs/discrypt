@@ -279,6 +279,8 @@ export type SpeakerVolumeRequest = {
 };
 
 export type CommandHealth = {
+  snapshot_ready: boolean;
+  verification_ready: boolean;
   app_state_ready: boolean;
   identity_ready: boolean;
   collaboration_ready: boolean;
@@ -821,6 +823,8 @@ export async function metadataWarning(): Promise<string> {
 
 export async function commandHealth(): Promise<CommandHealth> {
   return invokeOrFallback<CommandHealth>("command_health", undefined, () => ({
+    snapshot_ready: true,
+    verification_ready: true,
     app_state_ready: true,
     identity_ready: true,
     collaboration_ready: true,

@@ -344,7 +344,7 @@ function App() {
           participants={participants}
         />
         <ScrollArea className="h-dvh">
-          <section className="min-h-dvh bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)] p-4 md:p-6">
+          <section className="min-h-dvh bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)] p-4 pb-52 md:p-6 md:pb-56">
             <TopBar
               groupLabel={groupLabel}
               themeId={asThemeId(activeTheme.id)}

@@ -8,7 +8,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test:command-coverage": "node scripts/command-coverage-check.mjs"
+    "test:command-coverage": "node scripts/command-coverage-check.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@radix-ui/react-avatar": "^1.1.11",
