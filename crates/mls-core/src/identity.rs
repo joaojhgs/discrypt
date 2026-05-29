@@ -20,6 +20,72 @@ impl FriendCode {
     /// Extract the public identity key embedded in a v1 friend-code/QR payload.
     #[must_use]
     pub fn verifying_key(&self) -> Option<VerifyingKey> {
+        let (path, query) = self.0.strip_prefix("discrypt://friend/v1/")?.split_once("?ik=")?;
+        if path.trim().is_empty() {
+            return None;
+        }
+        let (identity_key_hex, fingerprint_hex) = query.split_once("&fp=")?;
+        if identity_key_hex.len() != 64 || fingerprint_hex.len() != 20 {
+            return None;
+        }
+        let decoded = hex::decode(identity_key_hex).ok()?;
+        let expected = Sha256::digest(&decoded);
+        if fingerprint_hex != hex::encode(&expected[..10]) {
+            return None;
+        }
+        let key_bytes: [u8; 32] = decoded.try_into().ok()?;
+        VerifyingKey::from_bytes(&key_bytes).ok()
+    }
+
+    /// Build a friend-code/QR payload from a display label and identity key.
+    #[must_use]
+    pub fn from_verifying_key(display_name: &str, verifying_key: &VerifyingKey) -> Self {
+        let public_key = hex::encode(verifying_key.as_bytes());
+        let fingerprint = Sha256::digest(verifying_key.as_bytes());
+        Self(format!(
+            "discrypt://friend/v1/{}?ik={public_key}&fp={}",
+            slugify(display_name),
+            hex::encode(&fingerprint[..10])
+        ))
+    }
+}
+
+/// A longer comparison string displayed during explicit MITM verification.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SafetyNumber(String);
+
+/// Parse a hex-encoded Ed25519 identity key.
+#[must_use]
+pub fn verifying_key_from_hex(identity_key_hex: &str) -> Option<VerifyingKey> {
+    let decoded = hex::decode(identity_key_hex).ok()?;
+    let key_bytes: [u8; 32] = decoded.try_into().ok()?;
+    VerifyingKey::from_bytes(&key_bytes).ok()
+}
+
+impl SafetyNumber {
+    /// Derive a pairwise safety number directly from two public identity keys.
+    #[must_use]
+    pub fn from_identity_keys(ours: &VerifyingKey, peer: &VerifyingKey) -> Self {
+        let mut keys = [ours.as_bytes().to_vec(), peer.as_bytes().to_vec()];
+        keys.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(&keys[0]);
+        hasher.update(&keys[1]);
+        let digest = hex::encode(hasher.finalize());
+        let grouped = digest
+            .as_bytes()
+            .chunks(4)
+            .take(12)
+            .map(|c| core::str::from_utf8(c).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self(grouped)
+    }
+}
+
+impl FriendCode {
+    #[must_use]
+    fn legacy_unchecked_verifying_key_for_tests(&self) -> Option<VerifyingKey> {
         let identity_key_hex = self
             .0
             .split_once("?ik=")
@@ -30,10 +96,6 @@ impl FriendCode {
         VerifyingKey::from_bytes(&key_bytes).ok()
     }
 }
-
-/// A longer comparison string displayed during explicit MITM verification.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SafetyNumber(String);
 
 impl SafetyNumber {
     /// Return the safety number text.
@@ -113,34 +175,13 @@ impl Identity {
     /// Friend code: QR-friendly payload containing the public identity key.
     #[must_use]
     pub fn friend_code(&self) -> FriendCode {
-        let verifying_key = self.verifying_key();
-        let public_key = hex::encode(verifying_key.as_bytes());
-        let fingerprint = Sha256::digest(verifying_key.as_bytes());
-        FriendCode(format!(
-            "discrypt://friend/v1/{}?ik={public_key}&fp={}",
-            slugify(self.display_name()),
-            hex::encode(&fingerprint[..10])
-        ))
+        FriendCode::from_verifying_key(self.display_name(), &self.verifying_key())
     }
 
     /// Safety number: pairwise sorted public-key fingerprint.
     #[must_use]
     pub fn safety_number(&self, peer: &VerifyingKey) -> SafetyNumber {
-        let ours = self.verifying_key();
-        let mut keys = [ours.as_bytes().to_vec(), peer.as_bytes().to_vec()];
-        keys.sort();
-        let mut hasher = Sha256::new();
-        hasher.update(&keys[0]);
-        hasher.update(&keys[1]);
-        let digest = hex::encode(hasher.finalize());
-        let grouped = digest
-            .as_bytes()
-            .chunks(4)
-            .take(12)
-            .map(|c| core::str::from_utf8(c).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(" ");
-        SafetyNumber(grouped)
+        SafetyNumber::from_identity_keys(&self.verifying_key(), peer)
     }
 
     /// Safety number derived from the identity key embedded in a friend-code/QR payload.
@@ -207,6 +248,13 @@ mod tests {
             Some(alice.safety_number(&bob.verifying_key()))
         );
         assert_eq!(FriendCode("not-a-code".to_owned()).verifying_key(), None);
+        let mut tampered = bob_code.as_str().to_owned();
+        tampered.pop();
+        tampered.push('0');
+        assert!(FriendCode(tampered)
+            .legacy_unchecked_verifying_key_for_tests()
+            .is_some());
+        assert_eq!(FriendCode(tampered).verifying_key(), None);
     }
 
     #[test]
