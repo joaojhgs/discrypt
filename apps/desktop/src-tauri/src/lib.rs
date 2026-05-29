@@ -14,6 +14,10 @@ use discrypt_core::{
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
+use discrypt_admission::{
+    InviteEndpointPolicy, InviteSignalingMetadata, InviteStore, InviteTrustMetadata,
+    signaling_fingerprint_for_endpoint,
+};
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
@@ -27,6 +31,7 @@ use discrypt_storage::{
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{EncryptedAppDb, LinuxOsKeychain};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -211,6 +216,18 @@ pub struct InviteView {
     /// Hash of the room secret; the plan requires secret-derived admission, not incremental ids.
     #[serde(default)]
     pub room_secret_hash: String,
+    /// Signed signaling rendezvous endpoint joiners should use.
+    #[serde(default)]
+    pub signaling_endpoint: String,
+    /// Signed signaling endpoint fingerprint joiners should verify before MLS Welcome.
+    #[serde(default)]
+    pub signaling_trust_fingerprint: String,
+    /// Honest trust posture for the signaling endpoint.
+    #[serde(default)]
+    pub signaling_trust_status: String,
+    /// Signed endpoint policy that constrains allowed endpoint schemes.
+    #[serde(default)]
+    pub endpoint_policy: String,
     /// Expiry label.
     pub expires: String,
     /// Machine-readable expiration timestamp/relative horizon for the invite.
@@ -897,22 +914,55 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .find(|group| group.group_id == group_id)
             .map(|group| group.name.clone())
             .unwrap_or_else(|| "group".to_owned());
-        let invite_key = Uuid::new_v4().to_string();
-        let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
-        let room_secret_hash = hex::encode(Sha256::digest(room_secret.as_bytes()));
-        let room_secret_token = &room_secret_hash[..32];
         let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
         let max_use = normalize_label(&request.max_use, "Max-use is enforced before MLS admission");
         let expires_at = invite_expiration_horizon(&expires);
         let max_uses = parse_max_uses(&max_use);
+        let invite_key = Uuid::new_v4().to_string();
+        let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
+        let signaling_endpoint = default_signaling_endpoint();
+        let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
+        let signaling_metadata = InviteSignalingMetadata::new(
+            signaling_endpoint.clone(),
+            InviteEndpointPolicy::ProductionTls,
+            InviteTrustMetadata::new(
+                signaling_trust_fingerprint.clone(),
+                "signed endpoint fingerprint; verify before MLS Welcome",
+            )
+            .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
+        )
+        .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
+        let mut invite_store = InviteStore::new();
+        let issuer = SigningKey::generate(&mut OsRng);
+        let descriptor = invite_store
+            .issue_invite_with_metadata(
+                room_secret.as_bytes(),
+                Utc::now() + Duration::days(7),
+                max_uses,
+                signaling_metadata.clone(),
+                &issuer,
+            )
+            .unwrap_or_else(|_| {
+                invite_store.issue_invite(
+                    room_secret.as_bytes(),
+                    Utc::now() + Duration::days(7),
+                    max_uses,
+                    &issuer,
+                )
+            });
+        let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
+        let invite_code = production_invite_link(&descriptor, expires_at.as_str(), max_uses);
         let invite = InviteView {
-            invite_id: format!("invite-{invite_key}"),
-            invite_key: invite_key.clone(),
+            invite_id: format!("invite-{}", descriptor.invite_id),
+            invite_key: descriptor.invite_id.clone(),
             group_id: group_id.clone(),
-            code: format!(
-                "discrypt://join/v1/{invite_key}?room_secret={room_secret_token}&exp={expires_at}&max={max_uses}"
-            ),
+            code: invite_code,
             room_secret_hash,
+            signaling_endpoint,
+            signaling_trust_fingerprint,
+            signaling_trust_status: "signed endpoint fingerprint; verify before MLS Welcome"
+                .to_owned(),
+            endpoint_policy: "production_tls".to_owned(),
             expires,
             expires_at,
             max_use,

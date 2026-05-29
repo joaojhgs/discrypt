@@ -19,12 +19,14 @@ tauri-runtime = ["dep:tauri", "dep:tauri-build", "tauri/wry"]
 
 [dependencies]
 discrypt-core = { path = "../../../crates/core", version = "0.1.0" }
+discrypt-admission = { path = "../../../crates/admission", version = "0.1.0" }
 discrypt-mls-core = { path = "../../../crates/mls-core", version = "0.1.0" }
 discrypt-storage = { path = "../../../crates/storage", version = "0.1.0" }
 external-signaling = { path = "../../../external/signaling-repository", version = "0.1.0" }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }

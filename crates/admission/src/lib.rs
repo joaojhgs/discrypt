@@ -994,6 +994,97 @@ mod tests {
     }
 
     #[test]
+    fn invite_descriptor_signs_signaling_metadata_and_rejects_invalid_values() {
+        let issuer = SigningKey::generate(&mut OsRng);
+        let now = Utc::now();
+        let endpoint = "https://signal.example.invalid/v1/rendezvous";
+        let trust = InviteTrustMetadata::new(
+            signaling_fingerprint_for_endpoint(endpoint),
+            "signed endpoint fingerprint; verify before MLS Welcome",
+        );
+        assert!(trust.is_ok());
+        let Ok(trust) = trust else {
+            return;
+        };
+        let metadata =
+            InviteSignalingMetadata::new(endpoint, InviteEndpointPolicy::ProductionTls, trust);
+        assert!(metadata.is_ok());
+        let Ok(metadata) = metadata else {
+            return;
+        };
+        let mut store = InviteStore::new();
+        let invite_result = store.issue_invite_with_metadata(
+            b"room secret",
+            now + Duration::minutes(5),
+            2,
+            metadata,
+            &issuer,
+        );
+        assert!(invite_result.is_ok());
+        let Ok(invite) = invite_result else {
+            return;
+        };
+        assert!(invite.verify_issuer_signature().is_ok());
+
+        let mut tampered_endpoint = invite.clone();
+        tampered_endpoint.signaling_metadata.signaling_endpoint =
+            "https://evil.example.invalid/v1/rendezvous".to_owned();
+        assert_eq!(
+            tampered_endpoint.verify_issuer_signature(),
+            Err(InviteError::InvalidIssuerSignature)
+        );
+
+        let mut tampered_fingerprint = invite.clone();
+        tampered_fingerprint
+            .signaling_metadata
+            .trust
+            .signaling_fingerprint = signaling_fingerprint_for_endpoint("https://evil.example");
+        assert_eq!(
+            tampered_fingerprint.verify_issuer_signature(),
+            Err(InviteError::InvalidIssuerSignature)
+        );
+
+        let invalid_endpoint = InviteSignalingMetadata::new(
+            "http://example.invalid/rendezvous",
+            InviteEndpointPolicy::ProductionTls,
+            InviteTrustMetadata::new(
+                signaling_fingerprint_for_endpoint("http://example.invalid/rendezvous"),
+                "signed endpoint fingerprint",
+            )
+            .unwrap_or_else(|_| InviteTrustMetadata {
+                signaling_fingerprint: signaling_fingerprint_for_endpoint("fallback"),
+                trust_status: "fallback".to_owned(),
+            }),
+        );
+        assert_eq!(invalid_endpoint, Err(InviteError::InvalidSignalingEndpoint));
+
+        assert_eq!(
+            InviteTrustMetadata::new("not-a-fingerprint", "signed endpoint fingerprint"),
+            Err(InviteError::InvalidTrustMetadata)
+        );
+    }
+
+    #[test]
+    fn invite_descriptor_serialization_does_not_leak_raw_room_secret() {
+        let issuer = SigningKey::generate(&mut OsRng);
+        let now = Utc::now();
+        let raw_secret = b"raw-room-secret-never-in-descriptor";
+        let mut store = InviteStore::new();
+        let invite = store.issue_invite(raw_secret, now + Duration::minutes(5), 1, &issuer);
+
+        let serialized = serde_json::to_string(&invite);
+        assert!(serialized.is_ok());
+        let Ok(serialized) = serialized else {
+            return;
+        };
+        assert!(!serialized.contains("raw-room-secret-never-in-descriptor"));
+        assert!(!format!("{invite:?}").contains("raw-room-secret-never-in-descriptor"));
+        assert!(serialized.contains("signaling_endpoint"));
+        assert!(serialized.contains("signaling_fingerprint"));
+        assert!(serialized.contains("endpoint_policy"));
+    }
+
+    #[test]
     fn online_helper_flow_rate_limits_and_signs_expiring_proofs() {
         let now = Utc::now();
         let helper_key = SigningKey::generate(&mut OsRng);
