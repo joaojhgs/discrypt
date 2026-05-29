@@ -833,6 +833,55 @@ mod tests {
     }
 
     #[test]
+    fn malicious_non_member_live_key_probes_are_uniform_and_non_decryptable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut members = BTreeMap::new();
+        members.insert(31, BTreeSet::from([1]));
+        let member_signer = SigningKey::from_bytes(&[0x31; 32]);
+        let attacker_signer = SigningKey::from_bytes(&[0x32; 32]);
+        let mut oracle = LiveKeyOracle::new(members, 1)
+            .with_failure_response_mode(LiveKeyFailureResponseMode::UniformUnavailable);
+        assert!(oracle.authorize_member_device(31, 1, &member_signer.verifying_key()));
+        let commitment = oracle
+            .epoch_group_commitment(31)
+            .ok_or_else(|| std::io::Error::other("epoch commitment missing"))?;
+        let protected_key = [0x91; 32];
+        let legitimate = MembershipProof::sign(1, 31, "room-probes", commitment, &member_signer);
+        assert!(oracle.request_key(&legitimate, protected_key).authorized);
+
+        let non_member = MembershipProof::sign(99, 31, "room-probes", commitment, &attacker_signer);
+        let unregistered_device =
+            MembershipProof::sign(1, 31, "room-probes", commitment, &attacker_signer);
+        let stale_epoch = MembershipProof::sign(1, 30, "room-probes", commitment, &member_signer);
+        let mut invalid_signature = legitimate;
+        invalid_signature.signature[0] ^= 0x40;
+
+        let responses = [
+            oracle.request_key_for_author(&non_member, 1, Some("attacker-net"), protected_key),
+            oracle.request_key_for_author(
+                &unregistered_device,
+                1,
+                Some("attacker-net"),
+                protected_key,
+            ),
+            oracle.request_key_for_author(&stale_epoch, 1, Some("attacker-net"), protected_key),
+            oracle.request_key_for_author(
+                &invalid_signature,
+                1,
+                Some("attacker-net"),
+                protected_key,
+            ),
+            oracle.generic_failure_response(),
+        ];
+        for response in responses {
+            assert_eq!(response.state, KeyState::Unavailable);
+            assert!(!response.authorized);
+            assert_ne!(response.state, KeyState::Cached(protected_key));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn live_key_oracle_rate_limits_by_requester_epoch_author_and_network(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut members = BTreeMap::new();

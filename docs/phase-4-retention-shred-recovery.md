@@ -40,7 +40,8 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   Rate limiting is scoped by requester, epoch, author, and hashed network identity;
   Raw network identity strings are not stored. Over-limit responses do not return keys.
   Uniform unavailable mode makes invalid proof, non-member, over-limit, and generic
-  failure responses indistinguishable.
+  failure responses indistinguishable. Malicious non-member probes covering invalid proof, stale epoch, unregistered device, non-member, and generic reachability all collapse
+  without returning a decryptable key.
 - AC-SHRED-PERSIST: SQLite/WAL/key-store material is removed in the simulator; failed
   verification can restore the snapshot before final destroy.
 - AC-RECOVERY/AC12 foundation: backups are account-continuity only and do not contain
@@ -56,6 +57,7 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   resolved governance state; it must not add online membership/presence lookups that
   would leak which user is asking for an archival key. Raw network identity strings
   are hashed before entering live-key rate-limit state. Use uniform unavailable mode
-  when non-members cannot distinguish authorization failure from generic reachability.
+  when non-members cannot distinguish authorization failure from generic reachability;
+  malicious non-member probes must observe only the generic failure shape.
 - Cross-device shred remains cooperative; UX must keep the approved copy: deleted on
   online devices now, pending on offline devices until reconnect.
