@@ -32,7 +32,8 @@ pub use integrity::{RelayPacket, RelayPayloadKind, RelayProtectedEnvelope};
 pub use manager::{
     ChurnDampingPolicy, ConstructedOverlayRoute, FailoverRecoveryPolicy, MediaConcealmentReport,
     OverlayFailoverReport, OverlayManager, OverlayManagerError, OverlayRouteDecision,
-    OverlayRouteUse, RelayRuntimeObservation, TopologyChangeReason, TopologyChangeReport,
+    OverlayRouteUse, RelayContributionAccountingSnapshot, RelayRuntimeObservation,
+    TopologyChangeReason, TopologyChangeReport,
 };
 pub use ranking::{rank, score, RelayMetrics};
 pub use topology::hop_limit_ok;

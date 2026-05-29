@@ -23,6 +23,14 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
 - `crates/abuse/src/lib.rs`
   - fixed-window invite/spam controls;
   - relay contribution accounting produces freeload penalties for ranking.
+- `crates/relay-overlay/src/manager.rs`
+  - `record_relay_contribution` records same-unit relayed/consumed counters for
+    authenticated peers;
+  - `RelayContributionAccountingSnapshot` exposes only content-free peer,
+    counter, and derived penalty data;
+  - `RelayRuntimeObservation::to_ranking_metrics_with_contribution` feeds the
+    abuse crate's `freeload_penalty` into `RelayMetrics` so overlay route ranking
+    can prefer contributing relays over freeloaders.
 - `harness/multinode/src/lib.rs`
   - `governance_admission_smoke` covers AC-GOV, AC3, AC-RECOVERY, AC-ABUSE, and
     removed-admin race behavior.
@@ -35,7 +43,10 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
   admission requiring authorized Welcome/add.
 - AC-RECOVERY: no-material recovery fails; sealed backup restores membership/device
   continuity without archival content keys.
-- AC-ABUSE: invite/spam rate limits and relay-freeloading penalties are deterministic.
+- AC-ABUSE: invite/spam rate limits and relay-freeloading penalties are deterministic;
+  G117 wires relay contribution accounting into overlay ranking through
+  `record_relay_contribution` without exposing content, room ids, or packet
+  payloads in snapshots.
 
 ## Production-hardening notes
 

@@ -17,6 +17,7 @@ production-media = []
 production-storage = []
 
 [dependencies]
+discrypt-abuse = { path = "../abuse", version = "0.1.0" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }

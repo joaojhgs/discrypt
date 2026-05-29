@@ -13,6 +13,7 @@ mutated.
 | Hop limit | `crates/relay-overlay/src/lib.rs::hop_limit_ok` enforces `<= 3`. | Foundation present. Callers still need route construction tests proving every generated path respects the limit. |
 | Ciphertext-only relay behavior | `crates/relay-overlay/src/integrity.rs` forwards opaque bytes and only inspects for plaintext in tests; `crates/media/src/sframe.rs` owns authentication and replay checks. | Good boundary. Relays remain content-blind and receiver-owned SFrame state rejects tamper/replay. |
 | Media harness integration | `harness/multinode::media_security_smoke` protects a media frame, forwards relay-visible ciphertext, rejects replay, and rejects active tamper. | Deterministic smoke present. It re-validates Phase 1 media security through relay packet plumbing. |
+| Relay contribution accounting | `crates/relay-overlay/src/manager.rs::record_relay_contribution` accepts content-free relay contribution counters, emits `RelayContributionAccountingSnapshot`, and feeds the derived `freeload_penalty` into `RelayMetrics` before route ranking and route selection. | G117 production gate present. Ranking can penalize freeloaders without exposing message, group, or media content. |
 | Failover/redelivery | No `failover.rs` or `redelivery.rs` module yet. | Pending. AC7 still needs route convergence, per-packet sequence/retransmit, duplicate/stale rejection at overlay level, and lossy-network tests. |
 | Store-and-forward TTL/fanout | No `store_forward.rs` module yet. | Pending/future Phase 3-adjacent foundation. AC9 still needs ciphertext-only queues, membership gates, TTL expiry, fanout bounds, and retention-window interaction tests. |
 | Topology construction | No `topology.rs` module yet. | Pending. AC6 still needs capacity-aware tree construction, hop-depth checks, churn damping, and instrumentation for p50/p95 hop latency. |
@@ -36,6 +37,10 @@ mutated.
 - `RelayMetrics` inputs should be range-checked before production routing uses
   them. NaN or infinite metric values must not degrade ranking into
   input-order-dependent ties.
+- Relay contribution accounting must stay content-free. `record_relay_contribution`
+  should only accept authenticated peer ids and same-unit relayed/consumed
+  counters, and `RelayContributionAccountingSnapshot` must not grow message ids,
+  group ids, plaintext, key ids, packet payloads, or media-frame metadata.
 - The current harness relays ciphertext byte slices, not whole protected-frame
   records. Phase 2 overlay tests should carry KID/counter/AAD metadata with the
   ciphertext so sender binding and replay windows are exercised end-to-end.

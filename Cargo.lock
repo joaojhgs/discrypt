@@ -1236,6 +1236,7 @@ name = "discrypt-relay-overlay"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "discrypt-abuse",
  "hex",
  "serde",
  "sha2",

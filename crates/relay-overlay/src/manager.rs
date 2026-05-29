@@ -13,6 +13,7 @@ use crate::capability::{
 use crate::failover::{reroute_after_failure, FailoverDecision};
 use crate::ranking::RelayMetrics;
 use crate::topology::{RelayRoute, RelayTopology, TopologyError};
+use discrypt_abuse::RelayContribution;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -40,27 +41,57 @@ impl RelayRuntimeObservation {
     /// Convert runtime observations into deterministic ranking metrics.
     #[must_use]
     pub fn to_ranking_metrics(&self) -> RelayMetrics {
+        self.to_ranking_metrics_with_contribution(RelayContribution {
+            relayed_for_others: self.contributed_bytes,
+            consumed_from_others: self.consumed_bytes,
+        })
+    }
+
+    /// Convert runtime observations into ranking metrics with an authoritative
+    /// relay contribution accounting snapshot. This is the production seam that
+    /// feeds freeload penalties into route selection without exposing content.
+    #[must_use]
+    pub fn to_ranking_metrics_with_contribution(
+        &self,
+        contribution: RelayContribution,
+    ) -> RelayMetrics {
         let total_probes = self
             .successful_probes
             .saturating_add(self.failed_probes)
             .max(1);
         let stability = (self.successful_probes as f32 / total_probes as f32).clamp(0.0, 1.0);
         let battery_cost = self.battery_cost_bps as f32 / 10_000.0;
-        let freeload_penalty = if self.contributed_bytes == 0 && self.consumed_bytes > 0 {
-            1000.0
-        } else if self.consumed_bytes > self.contributed_bytes {
-            let deficit = self.consumed_bytes.saturating_sub(self.contributed_bytes) as f32;
-            let denominator = self.contributed_bytes.max(1) as f32;
-            (deficit / denominator).min(1000.0)
-        } else {
-            0.0
-        };
+        let freeload_penalty = contribution.freeload_penalty().min(1000.0);
         RelayMetrics {
             peer_id: self.peer_id.clone(),
             latency_ms: self.latency_ms.max(1),
             stability,
             battery_cost,
             freeload_penalty,
+        }
+    }
+}
+
+/// Content-free relay contribution accounting snapshot for one peer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelayContributionAccountingSnapshot {
+    /// Stable authenticated peer id.
+    pub peer_id: String,
+    /// Packets or bytes this peer relayed for others in the accounting window.
+    pub relayed_for_others: u64,
+    /// Packets or bytes this peer consumed from other relays in the accounting window.
+    pub consumed_from_others: u64,
+    /// Derived freeload penalty applied to overlay ranking.
+    pub freeload_penalty: f32,
+}
+
+impl RelayContributionAccountingSnapshot {
+    fn from_contribution(peer_id: impl Into<String>, contribution: RelayContribution) -> Self {
+        Self {
+            peer_id: peer_id.into(),
+            relayed_for_others: contribution.relayed_for_others,
+            consumed_from_others: contribution.consumed_from_others,
+            freeload_penalty: contribution.freeload_penalty().min(1000.0),
         }
     }
 }
@@ -245,6 +276,7 @@ pub enum OverlayManagerError {
 pub struct OverlayManager {
     topology: RelayTopology,
     observations: BTreeMap<String, RelayRuntimeObservation>,
+    relay_contributions: BTreeMap<String, RelayContribution>,
     capabilities: CapabilityAdvertisementBook,
     churn_policy: ChurnDampingPolicy,
     last_planned_topology_change_ms: Option<u64>,
@@ -265,6 +297,7 @@ impl OverlayManager {
         Self {
             topology,
             observations: BTreeMap::new(),
+            relay_contributions: BTreeMap::new(),
             capabilities: CapabilityAdvertisementBook::default(),
             churn_policy: ChurnDampingPolicy::default(),
             last_planned_topology_change_ms: None,
@@ -291,7 +324,16 @@ impl OverlayManager {
         observation: RelayRuntimeObservation,
     ) -> Result<(), OverlayManagerError> {
         validate_observation(&observation)?;
-        self.topology.upsert_peer(observation.to_ranking_metrics());
+        let contribution = self
+            .relay_contributions
+            .get(&observation.peer_id)
+            .copied()
+            .unwrap_or(RelayContribution {
+                relayed_for_others: observation.contributed_bytes,
+                consumed_from_others: observation.consumed_bytes,
+            });
+        self.topology
+            .upsert_peer(observation.to_ranking_metrics_with_contribution(contribution));
         self.failed_peers.remove(&observation.peer_id);
         self.observations
             .insert(observation.peer_id.clone(), observation);
@@ -308,6 +350,56 @@ impl OverlayManager {
         let observation = advertisement.to_runtime_observation();
         self.capabilities.accept(advertisement, now_ms)?;
         self.upsert_observation(observation)
+    }
+
+    /// Record content-free relay contribution accounting and immediately feed
+    /// the derived freeload penalty into overlay ranking for this peer. Values
+    /// may be packets or byte-equivalent counters, but must use the same unit in
+    /// both fields for the current accounting window.
+    pub fn record_relay_contribution(
+        &mut self,
+        peer_id: impl Into<String>,
+        relayed_for_others: u64,
+        consumed_from_others: u64,
+    ) -> Result<RelayContributionAccountingSnapshot, OverlayManagerError> {
+        let peer_id = peer_id.into();
+        if peer_id.trim().is_empty() {
+            return Err(OverlayManagerError::InvalidObservation(
+                "peer id is required".to_owned(),
+            ));
+        }
+        let contribution = RelayContribution {
+            relayed_for_others,
+            consumed_from_others,
+        };
+        self.relay_contributions
+            .insert(peer_id.clone(), contribution);
+        if let Some(observation) = self.observations.get_mut(&peer_id) {
+            observation.contributed_bytes = relayed_for_others;
+            observation.consumed_bytes = consumed_from_others;
+            self.topology
+                .upsert_peer(observation.to_ranking_metrics_with_contribution(contribution));
+            self.bump_epoch();
+        }
+        Ok(RelayContributionAccountingSnapshot::from_contribution(
+            peer_id,
+            contribution,
+        ))
+    }
+
+    /// Return relay contribution accounting snapshots without content, group, or
+    /// message identifiers.
+    #[must_use]
+    pub fn relay_contribution_snapshots(&self) -> Vec<RelayContributionAccountingSnapshot> {
+        self.relay_contributions
+            .iter()
+            .map(|(peer_id, contribution)| {
+                RelayContributionAccountingSnapshot::from_contribution(
+                    peer_id.clone(),
+                    *contribution,
+                )
+            })
+            .collect()
     }
 
     /// Connect two known peers in the local overlay graph.
@@ -619,6 +711,40 @@ mod tests {
             manager.route("alice", "bob")?.route.path,
             ["alice", "relay-b", "bob"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_contribution_accounting_penalizes_freeloaders_in_route_ranking(
+    ) -> Result<(), OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            observation("alice", 5, 10, 0),
+            observation("relay-a", 10, 10, 0),
+            observation("relay-b", 30, 10, 0),
+            observation("bob", 5, 10, 0),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "relay-a")?;
+        manager.connect_peers("relay-a", "bob")?;
+        manager.connect_peers("alice", "relay-b")?;
+        manager.connect_peers("relay-b", "bob")?;
+        assert_eq!(
+            manager.route("alice", "bob")?.route.path,
+            ["alice", "relay-a", "bob"]
+        );
+
+        let snapshot = manager.record_relay_contribution("relay-a", 0, 50_000)?;
+        assert_eq!(snapshot.peer_id, "relay-a");
+        assert_eq!(snapshot.relayed_for_others, 0);
+        assert_eq!(snapshot.consumed_from_others, 50_000);
+        assert!(snapshot.freeload_penalty > 0.0);
+        assert_eq!(
+            manager.route("alice", "bob")?.route.path,
+            ["alice", "relay-b", "bob"]
+        );
+        assert_eq!(manager.relay_contribution_snapshots().len(), 1);
         Ok(())
     }
 
