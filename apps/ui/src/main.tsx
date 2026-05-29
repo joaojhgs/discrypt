@@ -1485,10 +1485,13 @@ function JoinPanel({
               </div>
               <p className="mt-2 break-all text-[11px] text-emerald-50/70">
                 Signaling trust:{" "}
-                {latestInvite.signaling_trust_status || "not verified"} (
-                {latestInvite.signaling_trust_fingerprint || "no fingerprint"})
+                {latestInvite.signaling_trust_status || "not provided"}
               </p>
-              <p className="mt-1 break-all text-[11px] text-emerald-50/60">
+              <p className="mt-2 break-all text-[11px] text-emerald-50/70">
+                Signaling fingerprint:{" "}
+                {latestInvite.signaling_trust_fingerprint || "not provided"}
+              </p>
+              <p className="mt-2 break-all text-[11px] text-emerald-50/70">
                 Room secret commitment: {latestInvite.room_secret_hash}
               </p>
             </div>

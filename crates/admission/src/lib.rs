@@ -101,7 +101,9 @@ pub enum InviteEndpointPolicy {
 }
 
 impl InviteEndpointPolicy {
-    fn canonical_name(&self) -> &'static str {
+    /// Stable string encoded into signed descriptors and invite links.
+    #[must_use]
+    pub fn canonical_name(&self) -> &'static str {
         match self {
             Self::ProductionTls => "production_tls",
             Self::LocalDevLoopback => "local_dev_loopback",

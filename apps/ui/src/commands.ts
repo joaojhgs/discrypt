@@ -684,6 +684,65 @@ function parseInviteGroupName(inviteCode: string): string {
   return name.trim() || "joined group";
 }
 
+type ParsedInviteMetadata = {
+  inviteKey: string;
+  roomSecretHash: string;
+  signalingEndpoint: string;
+  signalingTrustFingerprint: string;
+  signalingTrustStatus: string;
+  endpointPolicy: string;
+  expiresAt: string;
+  maxUses: number;
+};
+
+function defaultSignalingEndpoint(): string {
+  return "https://signaling.discrypt.invalid/v1/rendezvous";
+}
+
+function productionInviteLink(metadata: ParsedInviteMetadata): string {
+  const query = new URLSearchParams({
+    endpoint: metadata.signalingEndpoint,
+    policy: metadata.endpointPolicy,
+    trust_fp: metadata.signalingTrustFingerprint,
+    trust: metadata.signalingTrustStatus,
+    commitment: metadata.roomSecretHash,
+    exp: metadata.expiresAt,
+    max: String(metadata.maxUses),
+  });
+  return `discrypt://join/v1/${metadata.inviteKey}?${query.toString()}`;
+}
+
+function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
+  const trimmed = inviteCode.trim();
+  const [path, query = ""] = trimmed.split("?", 2);
+  if (!path.startsWith("discrypt://join/v1/") || !query) return null;
+  const inviteKey = path.split("/").filter(Boolean).at(-1);
+  if (!inviteKey) return null;
+  const params = new URLSearchParams(query);
+  const signalingEndpoint = params.get("endpoint") ?? "";
+  const endpointPolicy = params.get("policy") ?? "";
+  const signalingTrustFingerprint = params.get("trust_fp") ?? "";
+  const signalingTrustStatus = params.get("trust") ?? "";
+  if (
+    !signalingEndpoint ||
+    !endpointPolicy ||
+    !/^[a-fA-F0-9]{64}$/.test(signalingTrustFingerprint) ||
+    !signalingTrustStatus
+  ) {
+    return null;
+  }
+  return {
+    inviteKey,
+    roomSecretHash: params.get("commitment") ?? "",
+    signalingEndpoint,
+    signalingTrustFingerprint,
+    signalingTrustStatus,
+    endpointPolicy,
+    expiresAt: params.get("exp") ?? "",
+    maxUses: Number(params.get("max") ?? 1) || 1,
+  };
+}
+
 function invokeOrFallback<T>(
   command: string,
   args: Record<string, unknown> | undefined,
@@ -1112,8 +1171,9 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("join_group", { request }, () =>
     mutateFallback((state) => {
       ensureFallbackReady();
+      const inviteCode = request.invite_code.trim();
       const localInvite = state.invites.find(
-        (invite) => invite.code === request.invite_code.trim(),
+        (invite) => invite.code === inviteCode,
       );
       if (localInvite) {
         state.active_context = {
@@ -1129,6 +1189,7 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         );
         return;
       }
+      const parsedInvite = parseInviteMetadata(inviteCode);
       const name =
         request.group_name?.trim() || parseInviteGroupName(request.invite_code);
       const groupId = `group-${slugify(name)}`;
@@ -1146,6 +1207,26 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         channel_id: null,
         dm_id: null,
       };
+      if (parsedInvite) {
+        state.invites.push({
+          invite_id: `invite-${parsedInvite.inviteKey}`,
+          invite_key: parsedInvite.inviteKey,
+          group_id: groupId,
+          code: inviteCode,
+          room_secret_hash: parsedInvite.roomSecretHash,
+          signaling_endpoint: parsedInvite.signalingEndpoint,
+          signaling_trust_fingerprint: parsedInvite.signalingTrustFingerprint,
+          signaling_trust_status: parsedInvite.signalingTrustStatus,
+          endpoint_policy: parsedInvite.endpointPolicy,
+          expires: "Invite expiry from signed descriptor",
+          expires_at: parsedInvite.expiresAt,
+          max_use: String(parsedInvite.maxUses),
+          uses: 1,
+          revoked: false,
+          admission_copy:
+            "Parsed production invite metadata; final admission still requires authorized MLS Welcome/add",
+        });
+      }
       pushEvent(
         state,
         "group.joined",
@@ -1193,49 +1274,35 @@ export async function createInvite(
       const roomSecretHash = stableHash(
         `${groupId}:${inviteKey}:${state.invites.length}`,
       );
-      const signalingEndpoint =
-        "https://signaling.discrypt.invalid/v1/rendezvous";
-      const signalingTrustFingerprint = stableHash(
-        `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
-      );
       const expires = request.expires || fallbackState.snapshot.invite.expires;
       const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
       const expiresAt = inviteExpirationHorizon(expires);
-      const descriptor = {
-        invite_id: inviteKey,
-        room_secret_commitment: roomSecretHash,
-        signaling_metadata: {
-          signaling_endpoint: signalingEndpoint,
-          endpoint_policy: "production_tls",
-          trust: {
-            signaling_fingerprint: signalingTrustFingerprint,
-            trust_status:
-              "signed endpoint fingerprint; verify before MLS Welcome",
-          },
-        },
-        expires_at: expiresAt,
-        max_uses: parseMaxUses(maxUse),
-      };
-      const descriptorBytes = new TextEncoder().encode(
-        JSON.stringify(descriptor),
+      const signalingEndpoint = defaultSignalingEndpoint();
+      const signalingTrustFingerprint = stableHash(
+        `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
       );
-      const descriptorPayload = btoa(
-        String.fromCharCode(...descriptorBytes),
-      )
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/g, "");
+      const endpointPolicy = "production_tls";
+      const trustStatus =
+        "signed endpoint fingerprint; verify before MLS Welcome";
       state.invites.push({
         invite_id: `invite-${inviteKey}`,
         invite_key: inviteKey,
         group_id: groupId,
-        code: `discrypt://join/v1/${inviteKey}?d=${descriptorPayload}&exp=${encodeURIComponent(expiresAt)}&max=${parseMaxUses(maxUse)}`,
+        code: productionInviteLink({
+          inviteKey,
+          signalingEndpoint,
+          endpointPolicy,
+          signalingTrustFingerprint,
+          signalingTrustStatus: trustStatus,
+          roomSecretHash,
+          expiresAt,
+          maxUses: parseMaxUses(maxUse),
+        }),
         room_secret_hash: roomSecretHash,
         signaling_endpoint: signalingEndpoint,
         signaling_trust_fingerprint: signalingTrustFingerprint,
-        signaling_trust_status:
-          "signed endpoint fingerprint; verify before MLS Welcome",
-        endpoint_policy: "production_tls",
+        signaling_trust_status: trustStatus,
+        endpoint_policy: endpointPolicy,
         expires,
         expires_at: expiresAt,
         max_use: maxUse,

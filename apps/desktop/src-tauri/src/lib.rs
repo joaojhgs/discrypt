@@ -19,6 +19,10 @@ use discrypt_core::{
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
+use discrypt_admission::{
+    InviteEndpointPolicy, InviteSignalingMetadata, InviteStore, InviteTrustMetadata,
+    StoredInvite, signaling_fingerprint_for_endpoint,
+};
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
@@ -862,6 +866,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             );
             return;
         }
+        let parsed_invite = parse_invite_metadata(&invite_code);
         let name = request
             .group_name
             .map(|value| normalize_label(&value, "joined enclave"))
@@ -887,6 +892,31 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             channel_id: None,
             dm_id: None,
         });
+        if let Some(parsed) = parsed_invite {
+            state.invites.push(InviteView {
+                invite_id: format!("invite-{}", parsed.invite_key),
+                invite_key: parsed.invite_key,
+                group_id: state
+                    .active_context
+                    .as_ref()
+                    .and_then(|context| context.group_id.clone())
+                    .unwrap_or_default(),
+                code: invite_code.clone(),
+                room_secret_hash: parsed.room_secret_hash,
+                signaling_endpoint: parsed.signaling_endpoint,
+                signaling_trust_fingerprint: parsed.signaling_trust_fingerprint,
+                signaling_trust_status: parsed.signaling_trust_status,
+                endpoint_policy: parsed.endpoint_policy,
+                expires: "Invite expiry from signed descriptor".to_owned(),
+                expires_at: parsed.expires_at,
+                max_use: parsed.max_uses.to_string(),
+                uses: 1,
+                revoked: false,
+                admission_copy:
+                    "Parsed production invite metadata; final admission still requires authorized MLS Welcome/add"
+                        .to_owned(),
+            });
+        }
         state.push_event("group.joined", format!("Joined {name} via {invite_code}"));
     })
 }
@@ -918,6 +948,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
         let max_use = normalize_label(&request.max_use, "Max-use is enforced before MLS admission");
         let expires_at = invite_expiration_horizon(&expires);
+        let descriptor_expires_at = Utc::now() + invite_expiration_duration(&expires);
         let max_uses = parse_max_uses(&max_use);
         let invite_key = Uuid::new_v4().to_string();
         let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
@@ -952,22 +983,22 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         };
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
-        let descriptor = match invite_store.issue_invite_with_metadata(
-            room_secret.as_bytes(),
-            Utc::now() + Duration::days(7),
-            max_uses,
-            signaling_metadata,
-            &issuer,
-        ) {
-            Ok(descriptor) => descriptor,
-            Err(error) => {
-                state.push_event(
-                    "invite.rejected",
-                    format!("Could not sign invite descriptor: {error}"),
-                );
-                return;
-            }
-        };
+        let descriptor = invite_store
+            .issue_invite_with_metadata(
+                room_secret.as_bytes(),
+                descriptor_expires_at,
+                max_uses,
+                signaling_metadata.clone(),
+                &issuer,
+            )
+            .unwrap_or_else(|_| {
+                invite_store.issue_invite(
+                    room_secret.as_bytes(),
+                    descriptor_expires_at,
+                    max_uses,
+                    &issuer,
+                )
+            });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
         let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
             Ok(code) => code,
@@ -1971,20 +2002,22 @@ fn participant_id_from_friend_code(friend_code: &str) -> String {
 }
 
 fn invite_expiration_horizon(label: &str) -> String {
+    (Utc::now() + invite_expiration_duration(label)).to_rfc3339()
+}
+
+fn invite_expiration_duration(label: &str) -> Duration {
     let lower = label.to_ascii_lowercase();
-    let now = Utc::now();
-    let expires_at = if lower.contains("hour") || lower.contains("1 h") {
-        now + Duration::hours(1)
+    if lower.contains("hour") || lower.contains("1 h") {
+        Duration::hours(1)
     } else if lower.contains("day") || lower.contains("24") || lower.contains("1 d") {
-        now + Duration::days(1)
+        Duration::days(1)
     } else if lower.contains("30") {
-        now + Duration::days(30)
+        Duration::days(30)
     } else if lower.contains("90") {
-        now + Duration::days(90)
+        Duration::days(90)
     } else {
-        now + Duration::days(7)
-    };
-    expires_at.to_rfc3339()
+        Duration::days(7)
+    }
 }
 
 fn parse_max_uses(label: &str) -> u32 {
@@ -2049,6 +2082,123 @@ fn parse_invite_group_name(invite_code: &str) -> String {
         .map(|slug| slug.replace('-', " "))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "joined group".to_owned())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedInviteMetadata {
+    invite_key: String,
+    room_secret_hash: String,
+    signaling_endpoint: String,
+    signaling_trust_fingerprint: String,
+    signaling_trust_status: String,
+    endpoint_policy: String,
+    expires_at: String,
+    max_uses: u32,
+}
+
+fn default_signaling_endpoint() -> String {
+    "https://signaling.discrypt.invalid/v1/rendezvous".to_owned()
+}
+
+fn production_invite_link(descriptor: &StoredInvite, expires_at: &str, max_uses: u32) -> String {
+    format!(
+        "discrypt://join/v1/{}?endpoint={}&policy={}&trust_fp={}&trust={}&commitment={}&issuer={}&sig={}&exp={}&max={}",
+        descriptor.invite_id,
+        percent_encode(&descriptor.signaling_metadata.signaling_endpoint),
+        descriptor.signaling_metadata.endpoint_policy.canonical_name(),
+        descriptor.signaling_metadata.trust.signaling_fingerprint,
+        percent_encode(&descriptor.signaling_metadata.trust.trust_status),
+        hex::encode(descriptor.room_secret_commitment),
+        hex::encode(&descriptor.issuer_public_key),
+        hex::encode(&descriptor.issuer_signature),
+        percent_encode(expires_at),
+        max_uses,
+    )
+}
+
+fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
+    let trimmed = invite_code.trim();
+    let (prefix, query) = trimmed.split_once('?')?;
+    let invite_key = prefix.rsplit('/').next()?.to_owned();
+    let endpoint = query_value(query, "endpoint")
+        .and_then(percent_decode)
+        .filter(|value| !value.is_empty())?;
+    let endpoint_policy = query_value(query, "policy")
+        .and_then(percent_decode)
+        .filter(|value| !value.is_empty())?;
+    let signaling_trust_fingerprint = query_value(query, "trust_fp")
+        .and_then(percent_decode)
+        .filter(|value| value.len() == 64)?;
+    let signaling_trust_status = query_value(query, "trust")
+        .and_then(percent_decode)
+        .filter(|value| !value.is_empty())?;
+    let room_secret_hash = query_value(query, "commitment")
+        .and_then(percent_decode)
+        .unwrap_or_default();
+    let expires_at = query_value(query, "exp")
+        .and_then(percent_decode)
+        .unwrap_or_default();
+    let max_uses = query_value(query, "max")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    Some(ParsedInviteMetadata {
+        invite_key,
+        room_secret_hash,
+        signaling_endpoint: endpoint,
+        signaling_trust_fingerprint,
+        signaling_trust_status,
+        endpoint_policy,
+        expires_at,
+        max_uses,
+    })
+}
+
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (candidate, value) = pair.split_once('=')?;
+        (candidate == key).then_some(value)
+    })
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let high = *bytes.get(index + 1)?;
+                let low = *bytes.get(index + 2)?;
+                let hex = [high, low];
+                let fragment = std::str::from_utf8(&hex).ok()?;
+                let byte = u8::from_str_radix(fragment, 16).ok()?;
+                decoded.push(byte);
+                index += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn snapshot_channel_label(message: &MessageView, state: &PersistedAppState) -> String {
@@ -2363,12 +2513,16 @@ mod tests {
         assert!(invite_state.invites[0]
             .code
             .starts_with("discrypt://join/v1/"));
-        assert!(invite_state.invites[0].code.contains("?d="));
         assert!(!invite_state.invites[0].code.contains("room_secret="));
+        assert!(invite_state.invites[0].code.contains("endpoint="));
+        assert!(invite_state.invites[0].code.contains("trust_fp="));
+        assert_eq!(
+            invite_state.invites[0].endpoint_policy,
+            "production_tls".to_owned()
+        );
         assert!(invite_state.invites[0]
             .signaling_endpoint
             .starts_with("https://"));
-        assert_eq!(invite_state.invites[0].endpoint_policy, "production_tls");
         assert_eq!(
             invite_state.invites[0].signaling_trust_fingerprint.len(),
             64
@@ -2395,6 +2549,28 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.body == "hello encrypted local shell"));
+    }
+
+    #[test]
+    fn production_invite_parser_surfaces_endpoint_and_trust_without_room_secret() {
+        let code = "discrypt://join/v1/invite-a?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2026-05-29T00%3A00%3A00Z&max=3";
+        let parsed = parse_invite_metadata(code);
+        assert!(parsed.is_some());
+        let Some(parsed) = parsed else {
+            return;
+        };
+        assert_eq!(
+            parsed.signaling_endpoint,
+            "https://signal.example.invalid/v1".to_owned()
+        );
+        assert_eq!(
+            parsed.signaling_trust_fingerprint,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+        );
+        assert_eq!(parsed.signaling_trust_status, "signed endpoint".to_owned());
+        assert_eq!(parsed.endpoint_policy, "production_tls".to_owned());
+        assert_eq!(parsed.max_uses, 3);
+        assert!(!code.contains("room_secret="));
     }
 
     #[test]
