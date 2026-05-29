@@ -13,10 +13,6 @@ use discrypt_core::{
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
 };
-use discrypt_storage::{
-    recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
-    RecoveryCodeVerifier, RecoveryMaterial,
-};
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
 use discrypt_storage::FileAppStore;
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
