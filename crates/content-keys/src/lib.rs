@@ -62,6 +62,8 @@ pub enum KeyState {
     Decoy([u8; 32]),
     /// Rate limit consumed without revealing author liveness/decryptability.
     RateLimited,
+    /// Uniform live-key failure response that does not reveal auth vs reachability.
+    Unavailable,
 }
 
 /// Deterministic content-key derivation for tests/facade.
@@ -363,10 +365,21 @@ fn derive_membership_group_commitment(epoch: u64, members: &BTreeSet<u32>) -> [u
 /// Live-key oracle response with explicit authorization flag.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveKeyResponse {
-    /// Returned state, real key/decoy/rate-limited.
+    /// Returned state, real key/decoy/rate-limited/unavailable.
     pub state: KeyState,
     /// True only for locally authorized members under the limit.
     pub authorized: bool,
+}
+
+/// Failure-shaping policy for live-key requests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LiveKeyFailureResponseMode {
+    /// Unauthorized callers receive a decoy key; rate limits remain explicit.
+    #[default]
+    DecoyKey,
+    /// Unauthorized, invalid, over-limit, and generic transport failures all render
+    /// the same unavailable response.
+    UniformUnavailable,
 }
 
 /// Errors while building live-key authorization from local MLS/governance state.
@@ -453,6 +466,7 @@ pub struct LiveKeyOracle {
     requests_by_rate_key: BTreeMap<LiveKeyRateLimitKey, usize>,
     max_requests: usize,
     decoy_key: [u8; 32],
+    failure_response_mode: LiveKeyFailureResponseMode,
 }
 
 impl LiveKeyOracle {
@@ -516,6 +530,7 @@ impl LiveKeyOracle {
             requests_by_rate_key: BTreeMap::new(),
             max_requests: max_requests.max(1),
             decoy_key: [0xD; 32],
+            failure_response_mode: LiveKeyFailureResponseMode::DecoyKey,
         }
     }
 
@@ -548,6 +563,19 @@ impl LiveKeyOracle {
         true
     }
 
+    /// Configure how unauthorized/failed live-key requests are shaped.
+    #[must_use]
+    pub fn with_failure_response_mode(mut self, mode: LiveKeyFailureResponseMode) -> Self {
+        self.failure_response_mode = mode;
+        self
+    }
+
+    /// Return the generic failure response for this oracle's failure-shaping mode.
+    #[must_use]
+    pub fn generic_failure_response(&self) -> LiveKeyResponse {
+        self.failure_response(false)
+    }
+
     /// Request an archival key using the default requester+epoch rate scope.
     pub fn request_key(&mut self, proof: &MembershipProof, key: [u8; 32]) -> LiveKeyResponse {
         self.request_key_scoped(proof, &LiveKeyRequestScope::new(), key)
@@ -578,23 +606,34 @@ impl LiveKeyOracle {
         key: [u8; 32],
     ) -> LiveKeyResponse {
         if !self.proof_authorized(proof) {
-            return LiveKeyResponse {
-                state: KeyState::Decoy(self.decoy_key),
-                authorized: false,
-            };
+            return self.failure_response(false);
         }
         let rate_key = LiveKeyRateLimitKey::from_proof_scope(proof, scope);
         let counter = self.requests_by_rate_key.entry(rate_key).or_default();
         *counter = counter.saturating_add(1);
         if *counter > self.max_requests {
-            return LiveKeyResponse {
-                state: KeyState::RateLimited,
-                authorized: false,
-            };
+            return self.failure_response(true);
         }
         LiveKeyResponse {
             state: KeyState::Cached(key),
             authorized: true,
+        }
+    }
+
+    fn failure_response(&self, rate_limited: bool) -> LiveKeyResponse {
+        match self.failure_response_mode {
+            LiveKeyFailureResponseMode::DecoyKey if rate_limited => LiveKeyResponse {
+                state: KeyState::RateLimited,
+                authorized: false,
+            },
+            LiveKeyFailureResponseMode::DecoyKey => LiveKeyResponse {
+                state: KeyState::Decoy(self.decoy_key),
+                authorized: false,
+            },
+            LiveKeyFailureResponseMode::UniformUnavailable => LiveKeyResponse {
+                state: KeyState::Unavailable,
+                authorized: false,
+            },
         }
     }
 
@@ -747,6 +786,49 @@ mod tests {
         let rejected = oracle.request_key(&tampered_signature, key);
         assert!(matches!(rejected.state, KeyState::Decoy(_)));
         assert!(!rejected.authorized);
+        Ok(())
+    }
+
+    #[test]
+    fn live_key_oracle_can_shape_failures_as_uniform_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut members = BTreeMap::new();
+        members.insert(23, BTreeSet::from([1]));
+        let signer = SigningKey::from_bytes(&[0x23; 32]);
+        let mut oracle = LiveKeyOracle::new(members, 1)
+            .with_failure_response_mode(LiveKeyFailureResponseMode::UniformUnavailable);
+        assert!(oracle.authorize_member_device(23, 1, &signer.verifying_key()));
+        let commitment = oracle
+            .epoch_group_commitment(23)
+            .ok_or_else(|| std::io::Error::other("epoch commitment missing"))?;
+        let key = [0x23; 32];
+        let proof = MembershipProof::sign(1, 23, "room-uniform", commitment, &signer);
+        let allowed = oracle.request_key(&proof, key);
+        assert_eq!(allowed.state, KeyState::Cached(key));
+        assert!(allowed.authorized);
+
+        let over_limit = oracle.request_key(&proof, key);
+        let non_member = MembershipProof::sign(
+            99,
+            23,
+            "room-uniform",
+            commitment,
+            &SigningKey::from_bytes(&[0x24; 32]),
+        );
+        let non_member_response = oracle.request_key(&non_member, key);
+        let mut invalid_signature = proof;
+        invalid_signature.signature[0] ^= 0x01;
+        let invalid_signature_response = oracle.request_key(&invalid_signature, key);
+        let generic_failure = oracle.generic_failure_response();
+        for response in [
+            over_limit,
+            non_member_response,
+            invalid_signature_response,
+            generic_failure,
+        ] {
+            assert_eq!(response.state, KeyState::Unavailable);
+            assert!(!response.authorized);
+        }
         Ok(())
     }
 

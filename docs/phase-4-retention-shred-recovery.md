@@ -16,7 +16,7 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   - `LiveKeyOracle` checks local epoch membership through a signed Ed25519 device proof
     bound to the epoch group-state commitment, rate-limits authorized signed members,
     and returns decoys for non-members, unregistered signer keys, or invalid proofs.
-    The production constructor derives its allow-list from repaired local MLS group state plus resolved governance state and does not perform an online lookup. Live-key request limits are keyed by requester, epoch, author, and hashed network identity when those dimensions are available.
+    The production constructor derives its allow-list from repaired local MLS group state plus resolved governance state and does not perform an online lookup. Live-key request limits are keyed by requester, epoch, author, and hashed network identity when those dimensions are available. Decoy mode remains the default, and callers may opt into uniform unavailable mode.
 - `crates/storage/src/lib.rs`
   - `SecureDeleteSimulator` snapshots local stores, supports restore on failed
     verification, and proves SQLite/WAL/key-store paths no longer contain key bytes
@@ -39,6 +39,8 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   state, and unrepaired epoch mismatches are rejected before any key is served.
   Rate limiting is scoped by requester, epoch, author, and hashed network identity;
   Raw network identity strings are not stored. Over-limit responses do not return keys.
+  Uniform unavailable mode makes invalid proof, non-member, over-limit, and generic
+  failure responses indistinguishable.
 - AC-SHRED-PERSIST: SQLite/WAL/key-store material is removed in the simulator; failed
   verification can restore the snapshot before final destroy.
 - AC-RECOVERY/AC12 foundation: backups are account-continuity only and do not contain
@@ -53,6 +55,7 @@ OS-level secure deletion beyond the simulated stores enumerated here.
   Native production integration must feed it current or repaired MLS group state plus
   resolved governance state; it must not add online membership/presence lookups that
   would leak which user is asking for an archival key. Raw network identity strings
-  are hashed before entering live-key rate-limit state.
+  are hashed before entering live-key rate-limit state. Use uniform unavailable mode
+  when non-members cannot distinguish authorization failure from generic reachability.
 - Cross-device shred remains cooperative; UX must keep the approved copy: deleted on
   online devices now, pending on offline devices until reconnect.
