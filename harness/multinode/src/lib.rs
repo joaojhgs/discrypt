@@ -38,6 +38,8 @@ pub struct MediaSecuritySmoke {
     pub playback_volume_mixer_ready: bool,
     /// Speaking indicators come from real PCM audio-level/VAD events, not fixtures.
     pub speaking_indicator_from_vad: bool,
+    /// Android native WebRTC fallback is selected/configured when webview encoded transforms are unavailable.
+    pub android_native_contingency_ready: bool,
     /// Receiver plaintext after successful authentication and replay acceptance.
     pub plaintext: Vec<u8>,
 }
@@ -239,6 +241,7 @@ impl MediaSecuritySmoke {
             && self.mute_suppresses_outbound_media
             && self.playback_volume_mixer_ready
             && self.speaking_indicator_from_vad
+            && self.android_native_contingency_ready
     }
 }
 
@@ -386,11 +389,12 @@ impl UxE2eHardeningSmoke {
 /// Exercise passive relay opacity, active tamper rejection, and anti-replay checks.
 pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::MediaError> {
     use discrypt_media::{
-        AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, DecodedAudioFrame,
-        MediaKeyRegistry, OpusAudioDecoder, OpusAudioEncoder, PlaybackAudioSink,
-        PlaybackVolumeMixer, ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge,
-        SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
-        VoiceCaptureSendOutcome, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
+        AndroidVoiceContingency, AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame,
+        DecodedAudioFrame, MediaKeyRegistry, MicrophonePermissionState, OpusAudioDecoder,
+        OpusAudioEncoder, PlaybackAudioSink, PlaybackVolumeMixer, ProtectedMediaFrameSink,
+        ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender, SenderBinding,
+        VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceDeviceDescriptor,
+        VoiceDeviceKind, VoiceDeviceSelection, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
     };
     use discrypt_relay_overlay::integrity::{
         contains_plaintext, RelayPacket, RelayPayloadKind, RelayProtectedEnvelope,
@@ -612,6 +616,33 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
             .iter()
             .all(|sample| *sample == 0);
 
+    let android_native_contingency_ready = AndroidVoiceContingency {
+        platform: "android".to_owned(),
+        encoded_transform_supported: false,
+    }
+    .native_plan(
+        vec![
+            "stun:stun.discrypt.invalid:3478".to_owned(),
+            "turns:turn.discrypt.invalid:5349".to_owned(),
+        ],
+        VoiceDeviceSelection::new(
+            MicrophonePermissionState::Granted,
+            Some(VoiceDeviceDescriptor::new(
+                "android-mic",
+                "Android microphone",
+                VoiceDeviceKind::AudioInput,
+            )),
+            Some(VoiceDeviceDescriptor::new(
+                "android-speaker",
+                "Android speaker",
+                VoiceDeviceKind::AudioOutput,
+            )),
+        ),
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|plan| plan.ready_for_protected_media() && plan.rust_sframe_required);
+
     Ok(MediaSecuritySmoke {
         passive_relay_cannot_read,
         replay_rejected,
@@ -621,6 +652,7 @@ pub fn media_security_smoke() -> Result<MediaSecuritySmoke, discrypt_media::Medi
         mute_suppresses_outbound_media,
         playback_volume_mixer_ready,
         speaking_indicator_from_vad,
+        android_native_contingency_ready,
         plaintext: opened.plaintext,
     })
 }
@@ -2448,6 +2480,7 @@ mod tests {
                 mute_suppresses_outbound_media: true,
                 playback_volume_mixer_ready: true,
                 speaking_indicator_from_vad: true,
+                android_native_contingency_ready: true,
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
         ));

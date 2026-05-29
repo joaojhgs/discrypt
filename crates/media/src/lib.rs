@@ -32,6 +32,7 @@ pub use transform_bridge::{
     BridgeClearFrame, BridgeProtectedFrame, BridgeVerifiedFrame, RustTransformBridge,
 };
 pub use transport::{
-    AndroidVoiceContingency, MediaTransportPath, MicrophonePermissionState, NativeWebRtcRsSkeleton,
-    VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
+    AndroidVoiceContingency, MediaTransportPath, MicrophonePermissionState,
+    NativeWebRtcRsContingency, NativeWebRtcRsContingencyError, VoiceDeviceDescriptor,
+    VoiceDeviceKind, VoiceDeviceSelection,
 };

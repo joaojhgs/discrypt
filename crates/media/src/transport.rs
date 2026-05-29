@@ -1,4 +1,4 @@
-//! Media transport path selection and native WebRTC contingency skeleton.
+//! Media transport path selection and native Android WebRTC contingency configuration.
 
 use serde::{Deserialize, Serialize};
 
@@ -155,7 +155,7 @@ fn normalize_device_field(value: String, fallback: &str) -> String {
     }
 }
 
-/// Android voice contingency selector documented by the Phase-1 gate.
+/// Runtime capabilities used to select the voice media transport path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AndroidVoiceContingency {
     /// Runtime platform label (`android`, `linux`, `windows`, `macos`, ...).
@@ -168,32 +168,131 @@ impl AndroidVoiceContingency {
     /// Select webview transforms unless Android lacks encoded-frame hooks.
     #[must_use]
     pub fn selected_path(&self) -> MediaTransportPath {
-        if self.platform.eq_ignore_ascii_case("android") && !self.encoded_transform_supported {
+        if self.requires_native_contingency() {
             MediaTransportPath::NativeWebRtcRsContingency
         } else {
             MediaTransportPath::WebviewEncodedTransform
         }
     }
-}
 
-/// Minimal native WebRTC skeleton used by harnesses and the Android fallback track.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NativeWebRtcRsSkeleton {
-    /// STUN/TURN endpoint URLs the native path would feed into ICE.
-    pub ice_servers: Vec<String>,
-    /// Whether this path must keep SFrame protection in Rust.
-    pub rust_sframe_required: bool,
-}
-
-impl NativeWebRtcRsSkeleton {
-    /// Construct a skeleton that preserves the no-raw-JS-key invariant.
+    /// True when Android must bypass webview media transforms and use native WebRTC plumbing.
     #[must_use]
-    pub fn android_contingency(ice_servers: Vec<String>) -> Self {
-        Self {
+    pub fn requires_native_contingency(&self) -> bool {
+        self.platform.eq_ignore_ascii_case("android") && !self.encoded_transform_supported
+    }
+
+    /// Build a validated native Android media path plan when the runtime needs it.
+    pub fn native_plan(
+        &self,
+        ice_servers: Vec<String>,
+        voice_selection: VoiceDeviceSelection,
+    ) -> Result<Option<NativeWebRtcRsContingency>, NativeWebRtcRsContingencyError> {
+        if !self.requires_native_contingency() {
+            return Ok(None);
+        }
+        NativeWebRtcRsContingency::android(ice_servers, voice_selection).map(Some)
+    }
+}
+
+/// Error returned when the native Android media contingency cannot be configured safely.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum NativeWebRtcRsContingencyError {
+    /// Native fallback is only valid for Android runtimes lacking encoded transforms.
+    #[error("native WebRTC contingency is only valid for Android without encoded transforms")]
+    UnsupportedRuntime,
+    /// The user/runtime has not granted capture or has no microphone device.
+    #[error("native WebRTC contingency requires granted microphone permission and input device")]
+    CaptureNotAllowed,
+    /// No usable STUN/TURN endpoint was supplied.
+    #[error("native WebRTC contingency requires at least one STUN/TURN ICE endpoint")]
+    MissingIceServer,
+    /// ICE endpoint URL is unsupported.
+    #[error("invalid native WebRTC ICE endpoint: {0}")]
+    InvalidIceServer(String),
+}
+
+/// Validated Android native WebRTC media contingency path.
+///
+/// This is the Rust-owned fallback for Android WebViews that cannot expose encoded
+/// transform hooks. It is intentionally explicit about capture/playback ownership and
+/// SFrame: media frames still pass through the Rust Opus/SFrame path before network
+/// transit; JavaScript never receives raw media keys.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeWebRtcRsContingency {
+    /// Selected media path.
+    pub path: MediaTransportPath,
+    /// Sanitized STUN/TURN endpoint URLs fed into native ICE.
+    pub ice_servers: Vec<String>,
+    /// Runtime capture/output devices approved for this native path.
+    pub voice_selection: VoiceDeviceSelection,
+    /// Whether Rust SFrame protection is mandatory before any network transit.
+    pub rust_sframe_required: bool,
+    /// Native capture is required because webview encoded transforms are unavailable.
+    pub native_capture_required: bool,
+    /// Native playback is required because decoded frames cannot be handed to webview transforms.
+    pub native_playback_required: bool,
+    /// Honest status copy safe for UI/ops surfaces.
+    pub status_copy: String,
+}
+
+impl NativeWebRtcRsContingency {
+    /// Construct the production-shaped Android fallback plan.
+    pub fn android(
+        ice_servers: Vec<String>,
+        voice_selection: VoiceDeviceSelection,
+    ) -> Result<Self, NativeWebRtcRsContingencyError> {
+        if !voice_selection.can_join_voice() {
+            return Err(NativeWebRtcRsContingencyError::CaptureNotAllowed);
+        }
+        let ice_servers = sanitize_ice_servers(ice_servers)?;
+        Ok(Self {
+            path: MediaTransportPath::NativeWebRtcRsContingency,
             ice_servers,
+            voice_selection,
             rust_sframe_required: true,
+            native_capture_required: true,
+            native_playback_required: true,
+            status_copy: "Android native WebRTC media path selected because webview encoded transforms are unavailable; Rust Opus/SFrame remains mandatory".to_owned(),
+        })
+    }
+
+    /// True when the fallback is ready to carry protected media frames.
+    #[must_use]
+    pub fn ready_for_protected_media(&self) -> bool {
+        self.path == MediaTransportPath::NativeWebRtcRsContingency
+            && self.rust_sframe_required
+            && self.native_capture_required
+            && self.native_playback_required
+            && !self.ice_servers.is_empty()
+            && self.voice_selection.can_join_voice()
+    }
+}
+
+fn sanitize_ice_servers(
+    ice_servers: Vec<String>,
+) -> Result<Vec<String>, NativeWebRtcRsContingencyError> {
+    let mut sanitized = ice_servers
+        .into_iter()
+        .map(|server| server.trim().to_owned())
+        .filter(|server| !server.is_empty())
+        .collect::<Vec<_>>();
+    sanitized.sort();
+    sanitized.dedup();
+    if sanitized.is_empty() {
+        return Err(NativeWebRtcRsContingencyError::MissingIceServer);
+    }
+    for server in &sanitized {
+        if !(server.starts_with("stun:")
+            || server.starts_with("stuns:")
+            || server.starts_with("turn:")
+            || server.starts_with("turns:"))
+        {
+            return Err(NativeWebRtcRsContingencyError::InvalidIceServer(
+                server.clone(),
+            ));
         }
     }
+    Ok(sanitized)
 }
 
 #[cfg(test)]
@@ -201,7 +300,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn android_without_encoded_transform_selects_native_contingency() {
+    fn android_without_encoded_transform_selects_native_contingency(
+    ) -> Result<(), NativeWebRtcRsContingencyError> {
         let decision = AndroidVoiceContingency {
             platform: "android".into(),
             encoded_transform_supported: false,
@@ -210,9 +310,68 @@ mod tests {
             decision.selected_path(),
             MediaTransportPath::NativeWebRtcRsContingency
         );
-        assert!(
-            NativeWebRtcRsSkeleton::android_contingency(vec!["stun:example".into()])
-                .rust_sframe_required
+        let plan = decision
+            .native_plan(
+                vec![
+                    " turn:relay.example:3478 ".into(),
+                    "stun:stun.example:3478".into(),
+                ],
+                VoiceDeviceSelection::new(
+                    MicrophonePermissionState::Granted,
+                    Some(VoiceDeviceDescriptor::new(
+                        "android-mic",
+                        "Android microphone",
+                        VoiceDeviceKind::AudioInput,
+                    )),
+                    Some(VoiceDeviceDescriptor::new(
+                        "android-speaker",
+                        "Android speaker",
+                        VoiceDeviceKind::AudioOutput,
+                    )),
+                ),
+            )?
+            .ok_or(NativeWebRtcRsContingencyError::UnsupportedRuntime)?;
+        assert!(plan.ready_for_protected_media());
+        assert!(plan.rust_sframe_required);
+        assert!(plan.native_capture_required);
+        assert!(plan.native_playback_required);
+        assert_eq!(
+            plan.ice_servers,
+            vec![
+                "stun:stun.example:3478".to_owned(),
+                "turn:relay.example:3478".to_owned()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn android_native_contingency_rejects_unsafe_missing_inputs() {
+        assert_eq!(
+            NativeWebRtcRsContingency::android(
+                vec!["stun:stun.example:3478".into()],
+                VoiceDeviceSelection::denied(),
+            ),
+            Err(NativeWebRtcRsContingencyError::CaptureNotAllowed)
+        );
+        let selection = VoiceDeviceSelection::new(
+            MicrophonePermissionState::Granted,
+            Some(VoiceDeviceDescriptor::new(
+                "android-mic",
+                "Android microphone",
+                VoiceDeviceKind::AudioInput,
+            )),
+            None,
+        );
+        assert_eq!(
+            NativeWebRtcRsContingency::android(Vec::new(), selection.clone()),
+            Err(NativeWebRtcRsContingencyError::MissingIceServer)
+        );
+        assert_eq!(
+            NativeWebRtcRsContingency::android(vec!["https://not-ice".into()], selection),
+            Err(NativeWebRtcRsContingencyError::InvalidIceServer(
+                "https://not-ice".to_owned()
+            ))
         );
     }
 
