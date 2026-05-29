@@ -57,6 +57,15 @@ jobs:
       - run: cargo audit
       - run: cargo deny check
       - run: cargo sbom --output-format spdx_json_2_3 > discrypt.spdx.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - run: npm ci
+        working-directory: apps/ui
+      - run: npm audit --audit-level=high --omit=dev
+        working-directory: apps/ui
       - uses: actions/upload-artifact@v4
         with:
           name: discrypt-sbom
