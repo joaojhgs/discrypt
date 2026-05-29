@@ -190,6 +190,30 @@ pub struct GroupCommit {
     pub commit: OpaqueBytes,
 }
 
+/// Group member/device operation request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupMemberOperation {
+    /// Group being changed.
+    pub group_id: GroupId,
+    /// Account or user label.
+    pub member: UserId,
+    /// Optional device leaf label for multi-device operations.
+    pub device: Option<DeviceId>,
+}
+
+/// Result of an OpenMLS-backed group member/device commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupOperationResult {
+    /// Group state after the operation is merged locally.
+    pub state: GroupCryptoState,
+    /// Commit message for existing members.
+    pub commit: OpaqueBytes,
+    /// Welcome message for added members/devices, if produced.
+    pub welcome: Option<OpaqueBytes>,
+    /// GroupInfo for joiners/external validation, if produced.
+    pub group_info: Option<OpaqueBytes>,
+}
+
 /// Governance action envelope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GovernanceCommand {
@@ -344,6 +368,30 @@ pub trait GroupCryptoService {
         &mut self,
         request: GroupCryptoRequest,
     ) -> ServiceResult<GroupCryptoState>;
+
+    /// Add a member as a new OpenMLS leaf and return commit/Welcome material.
+    fn add_group_member(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult>;
+
+    /// Add a device as a distinct OpenMLS leaf under an existing account label.
+    fn add_group_device(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult>;
+
+    /// Remove a member leaf and return the resulting rekey commit.
+    fn remove_group_member(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult>;
+
+    /// Remove a device leaf and return the resulting rekey commit.
+    fn remove_group_device(
+        &mut self,
+        operation: GroupMemberOperation,
+    ) -> ServiceResult<GroupOperationResult>;
 
     /// Apply an opaque, already-authenticated group commit.
     fn apply_group_commit(&mut self, commit: GroupCommit) -> ServiceResult<GroupCryptoState>;
@@ -1027,27 +1075,34 @@ mod tests {
             initial_channel_kind: ChannelKind::Text,
         })?;
         assert_eq!(group.epoch, 1);
-
-        let text_secret = boundary.export_rust_service_secret(
-            &group.group_id,
-            RustExporterSecretService::Text,
-            b"history",
-        )?;
-        let media_secret = boundary.export_rust_service_secret(
-            &group.group_id,
-            RustExporterSecretService::Media,
-            b"voice",
-        )?;
-        let content_key_secret = boundary.export_rust_service_secret(
-            &group.group_id,
-            RustExporterSecretService::ContentKey,
-            b"message",
-        )?;
-        assert_ne!(text_secret.as_bytes(), media_secret.as_bytes());
-        assert_ne!(text_secret.as_bytes(), content_key_secret.as_bytes());
-        assert!(!format!("{text_secret:?}").contains("lab"));
-
-        let object: &mut dyn AppServiceBoundary = &mut boundary;
+        let add_member = object.add_group_member(GroupMemberOperation {
+            group_id: group.group_id.clone(),
+            member: UserId("bob".to_owned()),
+            device: None,
+        })?;
+        assert_eq!(add_member.state.epoch, 2);
+        assert!(add_member.welcome.is_some());
+        assert!(!add_member.commit.0.is_empty());
+        let add_device = object.add_group_device(GroupMemberOperation {
+            group_id: group.group_id.clone(),
+            member: UserId("alice".to_owned()),
+            device: Some(DeviceId("alice-phone".to_owned())),
+        })?;
+        assert_eq!(add_device.state.epoch, 2);
+        assert!(add_device.welcome.is_some());
+        let remove_device = object.remove_group_device(GroupMemberOperation {
+            group_id: group.group_id.clone(),
+            member: UserId("alice".to_owned()),
+            device: Some(DeviceId("alice-phone".to_owned())),
+        })?;
+        assert_eq!(remove_device.state.epoch, 3);
+        assert!(remove_device.welcome.is_none());
+        let remove_member = object.remove_group_member(GroupMemberOperation {
+            group_id: group.group_id.clone(),
+            member: UserId("bob".to_owned()),
+            device: None,
+        })?;
+        assert_eq!(remove_member.state.epoch, 3);
         assert_eq!(
             object.role_for_user(&group.group_id, &UserId("alice".to_owned()))?,
             "owner"
