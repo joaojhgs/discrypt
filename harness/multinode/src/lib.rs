@@ -189,6 +189,23 @@ pub struct GovernanceAdmissionSmoke {
     pub abuse_controls_enforced: bool,
 }
 
+/// Deterministic G119 abuse E2E smoke result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbuseE2eSmoke {
+    /// Invite flood attempts are rate-limited after the allowed burst.
+    pub invite_flood_rate_limited: bool,
+    /// Text spam bursts are rate-limited after the allowed burst.
+    pub spam_burst_rate_limited: bool,
+    /// Online admission-helper brute force returns uniform rejection and remains locked out.
+    pub admission_helper_bruteforce_rejected: bool,
+    /// Signaling opaque blob floods are rate-limited per client token.
+    pub signaling_blob_flood_rate_limited: bool,
+    /// Relay freeloading feeds route ranking and downranks the freeloader.
+    pub relay_freeloading_downranked: bool,
+    /// Oversized service requests fail before JSON parsing or storage.
+    pub service_request_size_exhaustion_rejected: bool,
+}
+
 /// Deterministic Phase-6 connectivity/signaling/push/metadata smoke result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectivitySignalingPushSmoke {
@@ -460,6 +477,19 @@ impl GovernanceAdmissionSmoke {
             && self.password_and_welcome_gate
             && self.recovery_trust_model
             && self.abuse_controls_enforced
+    }
+}
+
+impl AbuseE2eSmoke {
+    /// True when every G119 abuse E2E invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.invite_flood_rate_limited
+            && self.spam_burst_rate_limited
+            && self.admission_helper_bruteforce_rejected
+            && self.signaling_blob_flood_rate_limited
+            && self.relay_freeloading_downranked
+            && self.service_request_size_exhaustion_rejected
     }
 }
 
@@ -3353,6 +3383,160 @@ pub fn governance_admission_smoke() -> Result<GovernanceAdmissionSmoke, anyhow::
     })
 }
 
+/// Exercise G119 abuse E2E gates across abuse, admission, signaling, and overlay routing.
+pub fn abuse_e2e_smoke() -> Result<AbuseE2eSmoke, anyhow::Error> {
+    use chrono::{Duration, Utc};
+    use discrypt_abuse::AbuseControls;
+    use discrypt_admission::{InviteError, OnlineAdmissionHelper};
+    use discrypt_relay_overlay::{OverlayManager, OverlayManagerError, RelayRuntimeObservation};
+    use external_signaling::server::{handle_http_request, ServerConfig, SharedSignalingService};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn http_request(method: &str, path: &str, body: &str) -> String {
+        format!(
+            "{method} {path} HTTP/1.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn publish_signal_body(nonce: &[u8], key: &[u8], payload: &[u8]) -> String {
+        let expires_at = Utc::now() + Duration::seconds(60);
+        serde_json::json!({
+            "client_token_hex": hex::encode(b"g119-opaque-client-token"),
+            "nonce_hex": hex::encode(nonce),
+            "kind": "admission_helper",
+            "key_hex": hex::encode(key),
+            "payload_hex": hex::encode(payload),
+            "expires_at": expires_at,
+        })
+        .to_string()
+    }
+
+    fn relay_observation(peer_id: &str, latency_ms: u32) -> RelayRuntimeObservation {
+        RelayRuntimeObservation {
+            peer_id: peer_id.to_owned(),
+            latency_ms,
+            successful_probes: 10,
+            failed_probes: 0,
+            battery_cost_bps: 0,
+            contributed_bytes: 10,
+            consumed_bytes: 0,
+        }
+    }
+
+    fn route_after_freeload_penalty() -> Result<bool, OverlayManagerError> {
+        let mut manager = OverlayManager::default();
+        for peer in [
+            relay_observation("alice", 5),
+            relay_observation("relay-a", 10),
+            relay_observation("relay-b", 30),
+            relay_observation("bob", 5),
+        ] {
+            manager.upsert_observation(peer)?;
+        }
+        manager.connect_peers("alice", "relay-a")?;
+        manager.connect_peers("relay-a", "bob")?;
+        manager.connect_peers("alice", "relay-b")?;
+        manager.connect_peers("relay-b", "bob")?;
+        let initially_prefers_fast_relay =
+            manager.route("alice", "bob")?.route.path == ["alice", "relay-a", "bob"];
+        let snapshot = manager.record_relay_contribution("relay-a", 0, 100_000)?;
+        let downranked = manager.route("alice", "bob")?.route.path == ["alice", "relay-b", "bob"];
+        Ok(initially_prefers_fast_relay && snapshot.freeload_penalty > 0.0 && downranked)
+    }
+
+    let now = Utc::now();
+    let mut abuse = AbuseControls::new(2, 2, Duration::minutes(1));
+    let invite_flood_rate_limited = abuse.allow_invite("attacker", now)
+        && abuse.allow_invite("attacker", now)
+        && !abuse.allow_invite("attacker", now);
+    let spam_burst_rate_limited = abuse.allow_message("attacker", now)
+        && abuse.allow_message("attacker", now)
+        && !abuse.allow_message("attacker", now);
+
+    let mut helper = OnlineAdmissionHelper::new(
+        "helper-g119",
+        b"correct horse",
+        SigningKey::generate(&mut OsRng),
+        2,
+        60,
+    );
+    let admission_helper_bruteforce_rejected = helper.authorize("mallory-device", b"wrong-1", now)
+        == Err(InviteError::PasswordRejected)
+        && helper.authorize("mallory-device", b"wrong-2", now)
+            == Err(InviteError::PasswordRejected)
+        && helper.authorize("mallory-device", b"correct horse", now)
+            == Err(InviteError::PasswordRejected);
+
+    let service = SharedSignalingService::new();
+    let flood_config = ServerConfig {
+        rate_limit_max_requests: 2,
+        ..ServerConfig::default()
+    };
+    let flood_one = handle_http_request(
+        &service,
+        &flood_config,
+        http_request(
+            "POST",
+            "/v1/signals/publish",
+            &publish_signal_body(b"nonce-1", b"flood-key-1", b"opaque-payload-1"),
+        )
+        .as_bytes(),
+    );
+    let flood_two = handle_http_request(
+        &service,
+        &flood_config,
+        http_request(
+            "POST",
+            "/v1/signals/publish",
+            &publish_signal_body(b"nonce-2", b"flood-key-2", b"opaque-payload-2"),
+        )
+        .as_bytes(),
+    );
+    let flood_three = handle_http_request(
+        &service,
+        &flood_config,
+        http_request(
+            "POST",
+            "/v1/signals/publish",
+            &publish_signal_body(b"nonce-3", b"flood-key-3", b"opaque-payload-3"),
+        )
+        .as_bytes(),
+    );
+    let flood_one = String::from_utf8_lossy(&flood_one);
+    let flood_two = String::from_utf8_lossy(&flood_two);
+    let flood_three = String::from_utf8_lossy(&flood_three);
+    let signaling_blob_flood_rate_limited = flood_one.contains("HTTP/1.1 201 Created")
+        && flood_two.contains("HTTP/1.1 201 Created")
+        && flood_three.contains("HTTP/1.1 429 Too Many Requests")
+        && flood_three.contains("rate_limited")
+        && !flood_three.contains("opaque-payload");
+
+    let size_config = ServerConfig {
+        max_body_bytes: 8,
+        ..ServerConfig::default()
+    };
+    let size_response = handle_http_request(
+        &SharedSignalingService::new(),
+        &size_config,
+        http_request("POST", "/v1/signals/publish", "123456789").as_bytes(),
+    );
+    let size_text = String::from_utf8_lossy(&size_response);
+    let service_request_size_exhaustion_rejected = size_text
+        .contains("HTTP/1.1 413 Payload Too Large")
+        && size_text.contains("request_too_large");
+
+    Ok(AbuseE2eSmoke {
+        invite_flood_rate_limited,
+        spam_burst_rate_limited,
+        admission_helper_bruteforce_rejected,
+        signaling_blob_flood_rate_limited,
+        relay_freeloading_downranked: route_after_freeload_penalty()?,
+        service_request_size_exhaustion_rejected,
+    })
+}
+
 /// Exercise Phase-6 signaling, fallback, push, and metadata audit gates.
 pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSmoke, anyhow::Error>
 {
@@ -3950,6 +4134,24 @@ mod tests {
                 abuse_controls_enforced: true,
             })
         ));
+    }
+
+    #[test]
+    fn abuse_e2e_smoke_covers_g119_gate() -> Result<(), anyhow::Error> {
+        let smoke = abuse_e2e_smoke()?;
+        assert_eq!(
+            smoke,
+            AbuseE2eSmoke {
+                invite_flood_rate_limited: true,
+                spam_burst_rate_limited: true,
+                admission_helper_bruteforce_rejected: true,
+                signaling_blob_flood_rate_limited: true,
+                relay_freeloading_downranked: true,
+                service_request_size_exhaustion_rejected: true,
+            }
+        );
+        assert!(smoke.ready());
+        Ok(())
     }
 
     #[test]

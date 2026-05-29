@@ -47,6 +47,9 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
   G117 wires relay contribution accounting into overlay ranking through
   `record_relay_contribution` without exposing content, room ids, or packet
   payloads in snapshots.
+- G119 abuse E2E: `harness/multinode::abuse_e2e_smoke` covers invite flood,
+  spam burst, online admission-helper brute force, signaling opaque blob flood,
+  relay freeloading route downranking, and service-level request size exhaustion.
 
 ## Production-hardening notes
 
@@ -69,3 +72,6 @@ hardened admission, account-continuity recovery, and abuse/freeload controls.
   person can still create many accounts, devices, invite attempts, or relay
   identities. Discrypt therefore documents Sybil resistance as an honest operational
   posture, not a cryptographic guarantee or metadata-anonymity property.
+- G119 keeps the abuse E2E scenarios deterministic and content-free: flood tests
+  assert structured rate-limit or `request_too_large` responses and verify rejected
+  signaling responses do not echo opaque payload bytes.

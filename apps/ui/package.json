@@ -47,7 +47,8 @@
     "test:presence-g115": "node ../../scripts/check-presence-g115.mjs",
     "test:abuse-g116": "node ../../scripts/check-abuse-g116.mjs",
     "test:abuse-g117": "node ../../scripts/check-abuse-g117.mjs",
-    "test:abuse-g118": "node ../../scripts/check-abuse-g118.mjs"
+    "test:abuse-g118": "node ../../scripts/check-abuse-g118.mjs",
+    "test:abuse-g119": "node ../../scripts/check-abuse-g119.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
