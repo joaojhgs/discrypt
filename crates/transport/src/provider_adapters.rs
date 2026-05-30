@@ -496,74 +496,70 @@ pub async fn probe_provider_adapter_roundtrip(
 ) -> Result<ProviderAdapterRoundtripProbe, TransportError> {
     profile.validate()?;
     scope.validate()?;
+    let factory = SignalingAdapterFactory::for_kind(profile.kind);
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
         feature = "ipfs-pubsub-adapter"
     )))]
     let _ = (bootstrap_secret, random_entropy);
-    let kind = profile.kind;
-    match kind {
-        SignalingAdapterKind::Mqtt => {
+    probe_provider_adapter_roundtrip_with_factory(
+        factory,
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+    )
+    .await
+}
+
+async fn probe_provider_adapter_roundtrip_with_factory(
+    factory: SignalingAdapterFactory,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+) -> Result<ProviderAdapterRoundtripProbe, TransportError> {
+    #[cfg(not(any(
+        feature = "mqtt-adapter",
+        feature = "nostr-adapter",
+        feature = "ipfs-pubsub-adapter"
+    )))]
+    let _ = (profile, scope, bootstrap_secret, random_entropy);
+    match factory {
+        SignalingAdapterFactory::Mqtt(adapter) => {
             #[cfg(feature = "mqtt-adapter")]
             {
-                return probe_with_adapter(
-                    MqttProviderAdapter,
-                    profile,
-                    scope,
-                    bootstrap_secret,
-                    random_entropy,
-                )
-                .await;
+                probe_with_adapter(adapter, profile, scope, bootstrap_secret, random_entropy).await
             }
             #[cfg(not(feature = "mqtt-adapter"))]
             {
-                Err(FeatureGatedProviderAdapter::new(kind)
-                    .boundary()
-                    .unavailable_error())
+                Err(adapter.boundary().unavailable_error())
             }
         }
-        SignalingAdapterKind::Nostr => {
+        SignalingAdapterFactory::Nostr(adapter) => {
             #[cfg(feature = "nostr-adapter")]
             {
-                return probe_with_adapter(
-                    NostrProviderAdapter,
-                    profile,
-                    scope,
-                    bootstrap_secret,
-                    random_entropy,
-                )
-                .await;
+                probe_with_adapter(adapter, profile, scope, bootstrap_secret, random_entropy).await
             }
             #[cfg(not(feature = "nostr-adapter"))]
             {
-                Err(FeatureGatedProviderAdapter::new(kind)
-                    .boundary()
-                    .unavailable_error())
+                Err(adapter.boundary().unavailable_error())
             }
         }
-        SignalingAdapterKind::IpfsPubsub => {
+        SignalingAdapterFactory::IpfsPubsub(adapter) => {
             #[cfg(feature = "ipfs-pubsub-adapter")]
             {
-                return probe_with_adapter(
-                    IpfsPubsubProviderAdapter,
-                    profile,
-                    scope,
-                    bootstrap_secret,
-                    random_entropy,
-                )
-                .await;
+                probe_with_adapter(adapter, profile, scope, bootstrap_secret, random_entropy).await
             }
             #[cfg(not(feature = "ipfs-pubsub-adapter"))]
             {
-                Err(FeatureGatedProviderAdapter::new(kind)
-                    .boundary()
-                    .unavailable_error())
+                Err(adapter.boundary().unavailable_error())
             }
         }
-        SignalingAdapterKind::DiscryptQuicRendezvous => Err(FeatureGatedProviderAdapter::new(kind)
-            .boundary()
-            .unavailable_error()),
+        SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
+            Err(adapter.boundary().unavailable_error())
+        }
     }
 }
 
@@ -648,6 +644,7 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
     profile.validate()?;
     scope.validate()?;
     ice_servers.validate_credentials_at(chrono::Utc::now())?;
+    let factory = SignalingAdapterFactory::for_kind(profile.kind);
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
@@ -656,17 +653,53 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
     let _ = (
         bootstrap_secret,
         random_entropy,
+        &ice_servers,
+        &text_control_frame,
+        &receipt_control_frame,
+    );
+    probe_provider_webrtc_datachannel_request_response_with_factory(
+        factory,
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        ice_servers,
+        text_control_frame,
+        receipt_control_frame,
+    )
+    .await
+}
+
+async fn probe_provider_webrtc_datachannel_request_response_with_factory(
+    factory: SignalingAdapterFactory,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
+    receipt_control_frame: Vec<u8>,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    #[cfg(not(any(
+        feature = "mqtt-adapter",
+        feature = "nostr-adapter",
+        feature = "ipfs-pubsub-adapter"
+    )))]
+    let _ = (
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
         ice_servers,
         text_control_frame,
         receipt_control_frame,
     );
-    let kind = profile.kind;
-    match kind {
-        SignalingAdapterKind::Mqtt => {
+    match factory {
+        SignalingAdapterFactory::Mqtt(adapter) => {
             #[cfg(feature = "mqtt-adapter")]
             {
-                return probe_webrtc_with_adapter(
-                    MqttProviderAdapter,
+                probe_webrtc_with_adapter(
+                    adapter,
                     profile,
                     scope,
                     bootstrap_secret,
@@ -675,20 +708,18 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
                     text_control_frame,
                     receipt_control_frame,
                 )
-                .await;
+                .await
             }
             #[cfg(not(feature = "mqtt-adapter"))]
             {
-                Err(FeatureGatedProviderAdapter::new(kind)
-                    .boundary()
-                    .unavailable_error())
+                Err(adapter.boundary().unavailable_error())
             }
         }
-        SignalingAdapterKind::Nostr => {
+        SignalingAdapterFactory::Nostr(adapter) => {
             #[cfg(feature = "nostr-adapter")]
             {
-                return probe_webrtc_with_adapter(
-                    NostrProviderAdapter,
+                probe_webrtc_with_adapter(
+                    adapter,
                     profile,
                     scope,
                     bootstrap_secret,
@@ -697,20 +728,18 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
                     text_control_frame,
                     receipt_control_frame,
                 )
-                .await;
+                .await
             }
             #[cfg(not(feature = "nostr-adapter"))]
             {
-                Err(FeatureGatedProviderAdapter::new(kind)
-                    .boundary()
-                    .unavailable_error())
+                Err(adapter.boundary().unavailable_error())
             }
         }
-        SignalingAdapterKind::IpfsPubsub => {
+        SignalingAdapterFactory::IpfsPubsub(adapter) => {
             #[cfg(feature = "ipfs-pubsub-adapter")]
             {
-                return probe_webrtc_with_adapter(
-                    IpfsPubsubProviderAdapter,
+                probe_webrtc_with_adapter(
+                    adapter,
                     profile,
                     scope,
                     bootstrap_secret,
@@ -719,18 +748,16 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
                     text_control_frame,
                     receipt_control_frame,
                 )
-                .await;
+                .await
             }
             #[cfg(not(feature = "ipfs-pubsub-adapter"))]
             {
-                Err(FeatureGatedProviderAdapter::new(kind)
-                    .boundary()
-                    .unavailable_error())
+                Err(adapter.boundary().unavailable_error())
             }
         }
-        SignalingAdapterKind::DiscryptQuicRendezvous => Err(FeatureGatedProviderAdapter::new(kind)
-            .boundary()
-            .unavailable_error()),
+        SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
+            Err(adapter.boundary().unavailable_error())
+        }
     }
 }
 

@@ -3458,12 +3458,15 @@ impl PersistedAppState {
                 .to_owned()
         })?;
         let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
-        let profile_view = self
-            .select_signaling_profile(&connectivity, requested_kind)
-            .ok_or_else(|| {
+        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
+        else {
+            let error =
                 "No signaling profile matches the requested adapter kind and build readiness"
-                    .to_owned()
-            })?;
+                    .to_owned();
+            self.latest_signaling_probe = None;
+            self.latest_signaling_probe_error = Some(error.clone());
+            return Err(error);
+        };
         let profile = transport_profile_from_view(&profile_view)?;
         let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
             .map_err(|error| error.to_string())?;
@@ -3540,12 +3543,15 @@ impl PersistedAppState {
                 .to_owned()
         })?;
         let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
-        let profile_view = self
-            .select_signaling_profile(&connectivity, requested_kind)
-            .ok_or_else(|| {
+        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
+        else {
+            let error =
                 "No signaling profile matches the requested adapter kind and build readiness"
-                    .to_owned()
-            })?;
+                    .to_owned();
+            self.latest_data_channel_probe = None;
+            self.latest_data_channel_probe_error = Some(error.clone());
+            return Err(error);
+        };
         let profile = transport_profile_from_view(&profile_view)?;
         let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
             .map_err(|error| error.to_string())?;

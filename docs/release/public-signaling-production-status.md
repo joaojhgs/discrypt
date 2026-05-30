@@ -255,7 +255,7 @@ npm --prefix apps/ui run test:command-coverage
 
 ### P0: app integration gaps
 
-- [ ] Add an adapter registry/factory used by Tauri/backend runtime, not only transport tests.
+- [x] Add an adapter registry/factory used by Tauri/backend runtime, not only transport tests. Tauri provider diagnostics now enter `probe_provider_adapter_roundtrip` / `probe_provider_webrtc_datachannel_request_response_roundtrip`, which validate the runtime profile and dispatch through `SignalingAdapterFactory::for_kind(...)` before selecting a real MQTT/Nostr/IPFS implementation or a fail-closed QUIC/feature boundary.
 - [x] Make per-DM/per-group/per-channel connectivity policy select from configured real adapter profiles and exclude unconfigured IPFS/QUIC placeholder endpoints from default app/invite profiles.
 - [x] Carry selected adapter state into UI status honestly: backend `transport_status` now includes an `adapter` row with the selected provider plus readiness/fallback attempts, and transport diagnostics continue to expose selected provider, readiness, fallback state, and failure class for UI rendering without claiming a route/media connection.
 - [ ] Run two actual app profiles/instances through:
