@@ -1009,6 +1009,22 @@ enum BackendTransportMode {
     Text,
 }
 
+impl BackendTransportMode {
+    fn session_id_prefix(self) -> &'static str {
+        match self {
+            Self::Signaling => "signaling-session",
+            Self::Text => "text-session",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Signaling => "signaling",
+            Self::Text => "text",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct TransportSessionRecord {
     session_id: String,
@@ -1024,6 +1040,10 @@ impl TransportSessionRecord {
 
     fn state(&self) -> TransportSessionState {
         self.snapshot().state
+    }
+
+    fn connected_route(&self) -> Option<TransportRoute> {
+        self.snapshot().route.and_then(|route| Some(route.route))
     }
 }
 
@@ -2590,6 +2610,155 @@ impl PersistedAppState {
             runtime_mode: runtime_mode_view(),
             snapshot: self.to_snapshot(),
         }
+    }
+
+    fn transport_session_mut(
+        &mut self,
+        mode: BackendTransportMode,
+    ) -> &mut Option<TransportSessionRecord> {
+        match mode {
+            BackendTransportMode::Signaling => &mut self.signaling_session,
+            BackendTransportMode::Text => &mut self.text_session,
+        }
+    }
+
+    fn transport_session(
+        &self,
+        mode: BackendTransportMode,
+    ) -> Option<&TransportSessionRecord> {
+        match mode {
+            BackendTransportMode::Signaling => self.signaling_session.as_ref(),
+            BackendTransportMode::Text => self.text_session.as_ref(),
+        }
+    }
+
+    fn start_transport_session(
+        &mut self,
+        mode: BackendTransportMode,
+        scope_label: Option<String>,
+    ) -> Result<String, String> {
+        let label = normalize_label(&scope_label.unwrap_or_else(|| "default".to_owned()), "default");
+        self.ensure_ready_profile();
+
+        let slot = self.transport_session_mut(mode);
+        if let Some(existing) = slot.as_ref() {
+            if existing.scope_label == label {
+                match existing.state() {
+                    TransportSessionState::Signaling
+                    | TransportSessionState::IceGathering
+                    | TransportSessionState::Checking
+                    | TransportSessionState::Direct
+                    | TransportSessionState::OverlayRelay
+                    | TransportSessionState::TurnRelay
+                    | TransportSessionState::Reconnecting => {
+                        return Ok(existing.session_id.clone());
+                    }
+                    TransportSessionState::Idle => {
+                        if existing.session.begin_signaling().is_ok() {
+                            return Ok(existing.session_id.clone());
+                        }
+                    }
+                    TransportSessionState::Disconnected
+                    | TransportSessionState::Failed
+                    | TransportSessionState::Cancelled => {
+                        // Intentionally recreate to represent a fresh session lifecycle.
+                    }
+                }
+            }
+        }
+
+        let session_id = stable_id(mode.session_id_prefix(), &label, self.next_sequence);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let mut session = TransportSession::new();
+        if let Err(error) = session.begin_signaling() {
+            return Err(format!("failed to start {mode} transport session: {error}"));
+        }
+        *slot = Some(TransportSessionRecord {
+            session_id: session_id.clone(),
+            scope_label: label,
+            mode,
+            session,
+        });
+        self.push_event(
+            format!("{mode}.session_started"),
+            format!("Started {mode} transport session").to_owned(),
+        );
+        Ok(session_id)
+    }
+
+    fn stop_transport_session(
+        &mut self,
+        mode: BackendTransportMode,
+        session_id: Option<String>,
+    ) {
+        let slot = self.transport_session_mut(mode);
+        let Some(record) = slot.as_mut() else {
+            return;
+        };
+        if let Some(requested_id) = session_id
+            && requested_id != record.session_id
+        {
+            return;
+        }
+
+        if matches!(record.state(), TransportSessionState::Failed | TransportSessionState::Cancelled) {
+            return;
+        }
+
+        if record.session.tear_down("stop requested").is_ok() {
+            self.push_event(
+                format!("{mode}.session_stopped"),
+                format!("Stopped {mode} transport session {}", record.session_id),
+            );
+        }
+    }
+
+    fn transport_session_route(&self) -> Option<TransportRoute> {
+        if let Some(route) = self
+            .signaling_session
+            .as_ref()
+            .and_then(|session| session.connected_route())
+        {
+            return Some(route);
+        }
+        self.text_session
+            .as_ref()
+            .and_then(|session| session.connected_route())
+    }
+
+    fn has_transport_reconnect(&self) -> bool {
+        self.transport_session(BackendTransportMode::Signaling)
+            .is_some_and(|session| session.state() == TransportSessionState::Reconnecting)
+            || self
+                .transport_session(BackendTransportMode::Text)
+                .is_some_and(|session| session.state() == TransportSessionState::Reconnecting)
+    }
+
+    fn transport_session_connected(&self) -> bool {
+        self.transport_session(BackendTransportMode::Signaling)
+            .is_some_and(|session| session.state().is_connected())
+            || self
+                .transport_session(BackendTransportMode::Text)
+                .is_some_and(|session| session.state().is_connected())
+    }
+
+    fn transport_session_error(&self) -> Option<String> {
+        self.signaling_session
+            .as_ref()
+            .and_then(|session| session.snapshot().last_error)
+            .or_else(|| {
+                self.text_session
+                    .as_ref()
+                    .and_then(|session| session.snapshot().last_error)
+            })
+    }
+
+    fn transport_session_failed(&self) -> bool {
+        self.transport_session(BackendTransportMode::Signaling)
+            .is_some_and(|session| session.state() == TransportSessionState::Failed)
+            || self
+                .transport_session(BackendTransportMode::Text)
+                .is_some_and(|session| session.state() == TransportSessionState::Failed)
     }
 
     fn transport_status(&self) -> Vec<TransportStatusView> {
