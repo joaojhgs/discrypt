@@ -2022,7 +2022,9 @@ where
     let bob_webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
 
-    let offer = alice_webrtc.create_offer().await?;
+    let offer = alice_webrtc
+        .create_complete_offer(Duration::from_secs(45))
+        .await?;
     let sealed_offer = sealer.seal_description(&offer)?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
@@ -2044,7 +2046,9 @@ where
             match signal.payload.kind {
                 WebRtcNegotiationPayloadKind::Offer => {
                     let offer = sealer.open_description(&signal.payload)?;
-                    let answer = bob_webrtc.create_answer(offer).await?;
+                    let answer = bob_webrtc
+                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .await?;
                     let sealed_answer = sealer.seal_description(&answer)?;
                     captured_sealed_answer = Some(sealed_answer.clone());
                     bob_room.send_signal(alice.clone(), sealed_answer).await?;
@@ -7118,6 +7122,118 @@ mod tests {
         assert!(probe.text_control_frame_roundtrip);
         assert!(probe.receipt_frame_roundtrip);
 
+        topic_peer_room.leave().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_direct_topic_peer_runtime_pair_text_control_roundtrip(
+    ) -> Result<(), TransportError> {
+        let adapter = IpfsPubsubProviderAdapter;
+        let topic_peer = SignalingPeerId::new("runtime-topic-peer-device")?;
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"ipfs direct topic peer runtime pair",
+                "runtime split pair",
+            ),
+        )?;
+        let bootstrap_secret =
+            b"ipfs direct topic peer runtime pair bootstrap secret with thirty two bytes";
+        let random_entropy = b"ipfs direct topic peer runtime pair entropy";
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::IpfsPubsub,
+            bootstrap_secret,
+            random_entropy,
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new(
+                "ipfs_pubsub",
+                "direct topic-peer runtime pair rust-libp2p gossipsub",
+            )?,
+        )?;
+
+        let topic_peer_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-topic-peer-runtime-pair".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("/ip4/127.0.0.1/tcp/0"),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "local topic-peer listener")?,
+        };
+        let topic_peer_room = adapter
+            .connect(topic_peer_profile)
+            .await?
+            .join(scope.clone(), capability, topic_peer)
+            .await?;
+        let topic_peer_addr = topic_peer_room
+            .direct_topic_peer_multiaddrs_for_tests()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                TransportError::SignalingAdapter(
+                    "missing IPFS /p2p direct topic-peer multiaddr for runtime pair proof"
+                        .to_owned(),
+                )
+            })?;
+
+        let runtime_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-direct-topic-peer-runtime-pair".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new(topic_peer_addr),
+                SignalingEndpointSecurity::SelfHostedExplicit,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "explicit direct topic peer")?,
+        };
+
+        let runtime = start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
+            runtime_profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            WebRtcNegotiationConfig::new(IceServerConfig::new(
+                vec![Endpoint::new("stun:stun.l.google.com:19302")],
+                vec![],
+            )?),
+            SignalingPeerId::new("runtime-pair-ipfs-alice")?,
+            SignalingPeerId::new("runtime-pair-ipfs-bob")?,
+            |frame| {
+                Ok(format!(
+                    "ciphertext:ipfs-direct-topic-peer-runtime-receipt:{}",
+                    sha256_hex(&frame)
+                )
+                .into_bytes())
+            },
+        )
+        .await?;
+
+        assert_eq!(runtime.evidence().kind, SignalingAdapterKind::IpfsPubsub);
+        assert!(runtime.evidence().offerer_direct_path_ready);
+        assert!(runtime.evidence().answerer_direct_path_ready);
+        assert!(runtime.evidence().offerer_data_channel_open);
+        assert!(runtime.evidence().answerer_data_channel_open);
+
+        let frame = b"ciphertext:ipfs-direct-topic-peer-runtime-frame".to_vec();
+        let expected_receipt = format!(
+            "ciphertext:ipfs-direct-topic-peer-runtime-receipt:{}",
+            sha256_hex(&frame)
+        )
+        .into_bytes();
+        let transport = runtime.transport();
+        transport.send_text_control_frame(frame).await?;
+        let received = transport.recv_text_control_frame().await?;
+        assert_eq!(received, expected_receipt);
+
+        runtime.close().await?;
         topic_peer_room.leave().await?;
         Ok(())
     }

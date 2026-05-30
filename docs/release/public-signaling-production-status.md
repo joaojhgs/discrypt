@@ -786,3 +786,29 @@ long-lived role-split Tauri text runtime, not installed GUI two-window E2E, and
 not real voice/audio capture/playback. Public IPFS still requires an explicit
 reachable Discrypt topic-peer multiaddr until public discovery/rendezvous is
 implemented and audited.
+
+## 2026-05-30 update: IPFS direct topic-peer runtime-pair text/control proof passed
+
+The local/self-hosted IPFS direct topic-peer path now also exercises the
+transport runtime-pair primitive instead of only the one-shot WebRTC diagnostic
+probe. The runtime-pair constructor was hardened to exchange complete SDP
+offer/answer descriptions before applying them, which makes the direct-topic-peer
+path tolerant of non-trickle provider latency. The new regression starts an
+explicit `/p2p/<peer-id>` topic-peer, attaches an IPFS provider-signaled
+offerer/answerer runtime pair, sends an opaque text/control frame through the
+returned app-facing `TextControlDataTransport`, and receives the answerer receipt
+frame back over that same runtime.
+
+Verification run:
+
+- `cargo fmt --all --check` — passed
+- `cargo check -q -p discrypt-transport --features ipfs-pubsub-adapter` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_direct_topic_peer_runtime_pair_text_control_roundtrip -- --nocapture` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_direct_topic_peer_webrtc_text_control_roundtrip -- --nocapture` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_direct_topic_peer_multiaddr_roundtrip -- --nocapture` — passed
+
+Remaining gap: this closes the local/self-hosted IPFS direct-topic-peer
+runtime-pair text/control proof. It is still not a public Internet IPFS
+topic-peer proof, not a two-installed-Tauri-process runtime ownership proof, not
+deployed QUIC rendezvous, not credentialed TURN relay-only, and not real
+voice/audio capture/playback E2E.
