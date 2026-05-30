@@ -111,7 +111,7 @@ if (failures.length === 0) {
   const signalingRepoRoot = resolveSiblingRepoRoot("discrypt-signaling");
   const run = spawnSync("cargo", [
     "test",
-    "--manifest-path", "../discrypt-signaling/Cargo.toml",
+    "--manifest-path", "Cargo.toml",
     "-p", "discrypt-signaling",
     "config_parses_cli_values",
     "--quiet",
