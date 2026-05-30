@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use std::collections::BTreeMap;
-#[cfg(test)]
+use std::fmt;
 use std::sync::Arc;
 use std::{
     path::PathBuf,
@@ -1453,6 +1453,21 @@ impl TransportSessionRecord {
     }
 }
 
+#[derive(Clone)]
+struct TextControlTransportRuntime {
+    transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+    session_id: String,
+}
+
+impl fmt::Debug for TextControlTransportRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TextControlTransportRuntime")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct TextDeliveryEnvelopeRecord {
     message_id: String,
@@ -1530,6 +1545,7 @@ static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 #[derive(Debug)]
 struct TauriAppService {
     state: PersistedAppState,
+    text_control_transport_runtime: Option<TextControlTransportRuntime>,
     #[cfg(test)]
     state_path_override: Option<PathBuf>,
 }
@@ -1538,6 +1554,7 @@ impl TauriAppService {
     fn load() -> Self {
         Self {
             state: load_state(),
+            text_control_transport_runtime: None,
             #[cfg(test)]
             state_path_override: None,
         }
@@ -1548,6 +1565,7 @@ impl TauriAppService {
         let mut store = FileAppStore::new(&path);
         Self {
             state: load_state_from_store(&mut store),
+            text_control_transport_runtime: None,
             state_path_override: Some(path),
         }
     }
@@ -1571,6 +1589,129 @@ impl TauriAppService {
             return;
         }
         persist_state(&self.state);
+    }
+
+    #[cfg(test)]
+    fn attach_text_control_transport_runtime(
+        &mut self,
+        transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+        session_id: impl Into<String>,
+    ) {
+        self.text_control_transport_runtime = Some(TextControlTransportRuntime {
+            transport,
+            session_id: session_id.into(),
+        });
+    }
+
+    #[cfg(test)]
+    fn clear_text_control_transport_runtime(&mut self) {
+        self.text_control_transport_runtime = None;
+    }
+
+    fn pump_text_control_transport_once(
+        &mut self,
+        request: ListPendingTextControlFramesRequest,
+    ) -> TextControlTransportPumpReportView {
+        fn failure_report(label: &str, message: String) -> TextControlTransportPumpReportView {
+            TextControlTransportPumpReportView {
+                pending_before: 0,
+                frames_sent: 0,
+                response_frames_received: 0,
+                receipts_applied: 0,
+                failures: vec![message],
+                metrics: discrypt_transport::WebRtcDataTransportMetrics {
+                    schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+                    label: label.to_owned(),
+                    attached_channels: 0,
+                    open: false,
+                    frames_sent: 0,
+                    frames_received: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    last_state: "unavailable".to_owned(),
+                },
+            }
+        }
+
+        let Some(runtime) = self.text_control_transport_runtime.clone() else {
+            let message = "text/control transport runtime is not attached".to_owned();
+            self.state.push_command_error(
+                "message.transport_pump_unavailable",
+                "pump_text_control_transport_once",
+                "transport_runtime_missing",
+                message.clone(),
+                "Start the text transport session and attach a transport runtime before trying to pump pending outbox frames",
+            );
+            let report = failure_report("unattached-text-control-runtime", message);
+            self.persist();
+            return report;
+        };
+
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            let message = "text transport session is not active".to_owned();
+            self.state.push_command_error(
+                "message.transport_pump_unavailable",
+                "pump_text_control_transport_once",
+                "text_session_missing",
+                message.clone(),
+                "Call start_text_session before pumping the outbox",
+            );
+            let report = failure_report("inactive-text-session", message);
+            self.persist();
+            return report;
+        };
+
+        if matches!(
+            session.state(),
+            TransportSessionState::Idle
+                | TransportSessionState::Disconnected
+                | TransportSessionState::Failed
+                | TransportSessionState::Cancelled
+        ) {
+            let message = format!(
+                "text transport session {} is not active",
+                session.session_id
+            );
+            self.state.push_command_error(
+                "message.transport_pump_unavailable",
+                "pump_text_control_transport_once",
+                "text_session_inactive",
+                message.clone(),
+                "Call start_text_session and attach a live transport runtime before pumping pending frames",
+            );
+            let report = failure_report("inactive-text-session", message);
+            self.persist();
+            return report;
+        }
+
+        let transport = runtime.transport.clone();
+        let transport_session_id = runtime.session_id.clone();
+        let executor = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let message = format!("could not start text/control pump runtime: {error}");
+                self.state.push_command_error(
+                    "message.transport_pump_unavailable",
+                    "pump_text_control_transport_once",
+                    "transport_runtime_unavailable",
+                    message.clone(),
+                    "Retry after the backend runtime can construct a local pump executor",
+                );
+                let report = failure_report("text-control-pump-runtime-error", message);
+                self.persist();
+                return report;
+            }
+        };
+        let report = executor.block_on(async {
+            self.state
+                .pump_text_control_transport_once(transport.as_ref(), request, transport_session_id)
+                .await
+        });
+        self.persist();
+        report
     }
 }
 
@@ -2723,6 +2864,17 @@ pub fn list_pending_text_control_frames(
     })
 }
 
+/// Tauri command: pump pending text/control frames through the app-service-owned runtime.
+pub fn pump_text_control_transport_once(
+    request: ListPendingTextControlFramesRequest,
+) -> TextControlTransportPumpReportView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.pump_text_control_transport_once(request)
+}
+
 /// Tauri command: mark an outbound text/control frame as handed to transport.
 pub fn mark_text_control_frame_sent(request: MarkTextControlFrameSentRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -3285,6 +3437,13 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn pump_text_control_transport_once(
+        request: ListPendingTextControlFramesRequest,
+    ) -> TextControlTransportPumpReportView {
+        super::pump_text_control_transport_once(request)
+    }
+
+    #[tauri::command]
     pub(super) fn mark_text_control_frame_sent(
         request: MarkTextControlFrameSentRequest,
     ) -> AppStateView {
@@ -3379,6 +3538,7 @@ pub fn run() {
             ipc_commands::apply_text_delivery_receipt,
             ipc_commands::receive_text_delivery_envelope,
             ipc_commands::list_pending_text_control_frames,
+            ipc_commands::pump_text_control_transport_once,
             ipc_commands::mark_text_control_frame_sent,
             ipc_commands::handle_text_control_frame,
             ipc_commands::join_voice,
@@ -4364,7 +4524,6 @@ impl PersistedAppState {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) async fn pump_text_control_transport_once<T>(
         &mut self,
         transport: &T,
@@ -4372,7 +4531,7 @@ impl PersistedAppState {
         transport_session_id: impl Into<String>,
     ) -> TextControlTransportPumpReportView
     where
-        T: discrypt_transport::TextControlDataTransport,
+        T: discrypt_transport::TextControlDataTransport + ?Sized,
     {
         let transport_session_id = transport_session_id.into();
         let pending = self.list_pending_text_control_frames(&request);
@@ -7101,6 +7260,25 @@ mod tests {
         path
     }
 
+    fn attach_text_control_transport_runtime_for_test(
+        transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+        session_id: impl Into<String>,
+    ) {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.attach_text_control_transport_runtime(transport, session_id);
+    }
+
+    fn clear_text_control_transport_runtime_for_test() {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clear_text_control_transport_runtime();
+    }
+
     #[derive(Debug)]
     struct ReceiverBackedTextControlTransport {
         receiver: Mutex<TauriAppService>,
@@ -9064,27 +9242,22 @@ mod tests {
                 false,
             );
         });
-        let transport = ReceiverBackedTextControlTransport::new(bob);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("could not start text/control pump runtime: {error}"))?;
-
-        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
-        let report = runtime.block_on(async {
-            alice
-                .state
-                .pump_text_control_transport_once(
-                    &transport,
-                    ListPendingTextControlFramesRequest {
-                        target: Some(target),
-                        limit: None,
-                    },
-                    "text-control-transport-trait-test",
-                )
-                .await
+        let transport = Arc::new(ReceiverBackedTextControlTransport::new(bob));
+        attach_text_control_transport_runtime_for_test(
+            transport.clone(),
+            "text-control-transport-trait-test",
+        );
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("text-control-transport-trait-test".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
         });
-        alice.persist();
+        assert!(started.last_command_error.is_none(), "{started:?}");
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: None,
+        });
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.pending_before, 1);
@@ -9097,10 +9270,9 @@ mod tests {
         assert!(report.metrics.bytes_sent > 0);
         assert!(report.metrics.bytes_received > 0);
 
-        let receipted_message = alice
-            .state
+        let receipted_message = load_state()
             .messages
-            .iter()
+            .into_iter()
             .find(|message| message.message_id == message_id)
             .ok_or_else(|| "sender message row missing after transport pump".to_owned())?;
         assert_eq!(receipted_message.state_key, "peer_receipt");
@@ -9128,6 +9300,7 @@ mod tests {
             .text_delivery_receipts
             .iter()
             .any(|receipt| receipt.message_id == message_id));
+        clear_text_control_transport_runtime_for_test();
         Ok(())
     }
 

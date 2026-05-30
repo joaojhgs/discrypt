@@ -650,6 +650,27 @@ export type ListPendingTextControlFramesResponse = {
   frames: TextControlOutboxFrameView[];
 };
 
+export type WebRtcDataTransportMetrics = {
+  schema_version: number;
+  label: string;
+  attached_channels: number;
+  open: boolean;
+  frames_sent: number;
+  frames_received: number;
+  bytes_sent: number;
+  bytes_received: number;
+  last_state: string;
+};
+
+export type TextControlTransportPumpReportView = {
+  pending_before: number;
+  frames_sent: number;
+  response_frames_received: number;
+  receipts_applied: number;
+  failures: string[];
+  metrics: WebRtcDataTransportMetrics;
+};
+
 export type MarkTextControlFrameSentRequest = {
   message_id: string;
   frame_sha256: string;
@@ -3054,6 +3075,47 @@ export async function listPendingTextControlFrames(
         );
       });
       return { state, frames: [] };
+    },
+  );
+}
+
+export async function pumpTextControlTransportOnce(
+  request: ListPendingTextControlFramesRequest = {},
+): Promise<TextControlTransportPumpReportView> {
+  return invokeOrFallback<TextControlTransportPumpReportView>(
+    "pump_text_control_transport_once",
+    { request },
+    () => {
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "message.transport_pump_unavailable",
+          "pump_text_control_transport_once",
+          "text_control_transport_runtime_unavailable",
+          "Local fallback web runtime cannot pump signed text/control frames through the Rust transport runtime",
+          "Run the native app with an active text transport session",
+        );
+      });
+      return {
+        pending_before: 0,
+        frames_sent: 0,
+        response_frames_received: 0,
+        receipts_applied: 0,
+        failures: [
+          "Local fallback web runtime cannot pump signed text/control frames through the Rust transport runtime",
+        ],
+        metrics: {
+          schema_version: 1,
+          label: "fallback-text-control-runtime",
+          attached_channels: 0,
+          open: false,
+          frames_sent: 0,
+          frames_received: 0,
+          bytes_sent: 0,
+          bytes_received: 0,
+          last_state: "unavailable",
+        },
+      };
     },
   );
 }
