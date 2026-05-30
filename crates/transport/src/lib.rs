@@ -46,6 +46,7 @@ pub use provider_adapters::{
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     required_provider_adapter_registry, resume_text_control_runtime_from_probe,
     resume_text_control_runtime_from_spec,
+    start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer,
     start_provider_webrtc_text_control_runtime_pair_with_answerer, AdapterReadinessState,
     FeatureGatedProviderAdapter, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
     ProviderAdapterBoundary, ProviderAdapterReadiness, ProviderAdapterRoundtripProbe,

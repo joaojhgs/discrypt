@@ -1103,11 +1103,48 @@ pub async fn start_provider_webrtc_text_control_runtime_pair_with_answerer<F>(
 where
     F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
 {
+    start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        negotiation_config,
+        SignalingPeerId::new("runtime-webrtc-live-alice")?,
+        SignalingPeerId::new("runtime-webrtc-live-bob")?,
+        answerer,
+    )
+    .await
+}
+
+/// Build a live provider-backed text/control transport runtime pair for explicit peers.
+///
+/// This is the production-oriented variant of the runtime-pair constructor: the
+/// caller supplies stable, scoped local/remote peer ids instead of relying on
+/// test-harness defaults. This prevents unrelated app instances from colliding
+/// on provider-visible peer ids while still keeping payloads sealed and opaque.
+pub async fn start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer<F>(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    offerer_peer_id: SignalingPeerId,
+    answerer_peer_id: SignalingPeerId,
+    answerer: F,
+) -> Result<ProviderTextControlRuntimePair, TransportError>
+where
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
     profile.validate()?;
     scope.validate()?;
     negotiation_config
         .ice_servers
         .validate_credentials_at(chrono::Utc::now())?;
+    if offerer_peer_id == answerer_peer_id {
+        return Err(TransportError::InvalidConnectivityPolicy(
+            "text/control runtime peer ids must be distinct".to_owned(),
+        ));
+    }
     let factory = SignalingAdapterFactory::for_kind(profile.kind);
     start_provider_webrtc_text_control_runtime_pair_with_factory(
         factory,
@@ -1116,6 +1153,8 @@ where
         bootstrap_secret,
         random_entropy,
         negotiation_config,
+        offerer_peer_id,
+        answerer_peer_id,
         answerer,
     )
     .await
@@ -1128,6 +1167,8 @@ async fn start_provider_webrtc_text_control_runtime_pair_with_factory<F>(
     bootstrap_secret: &[u8],
     random_entropy: &[u8],
     negotiation_config: WebRtcNegotiationConfig,
+    offerer_peer_id: SignalingPeerId,
+    answerer_peer_id: SignalingPeerId,
     answerer: F,
 ) -> Result<ProviderTextControlRuntimePair, TransportError>
 where
@@ -1144,6 +1185,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 )
                 .await
@@ -1156,6 +1199,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 );
                 Err(adapter.boundary().unavailable_error())
@@ -1171,6 +1216,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 )
                 .await
@@ -1183,6 +1230,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 );
                 Err(adapter.boundary().unavailable_error())
@@ -1198,6 +1247,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 )
                 .await
@@ -1210,6 +1261,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 );
                 Err(adapter.boundary().unavailable_error())
@@ -1225,6 +1278,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 )
                 .await
@@ -1237,6 +1292,8 @@ where
                     bootstrap_secret,
                     random_entropy,
                     negotiation_config,
+                    offerer_peer_id,
+                    answerer_peer_id,
                     answerer,
                 );
                 Err(adapter.boundary().unavailable_error())
@@ -1469,6 +1526,8 @@ async fn start_provider_webrtc_text_control_runtime_pair_with_adapter<A, F>(
     bootstrap_secret: &[u8],
     random_entropy: &[u8],
     negotiation_config: WebRtcNegotiationConfig,
+    offerer_peer_id: SignalingPeerId,
+    answerer_peer_id: SignalingPeerId,
     answerer: F,
 ) -> Result<ProviderTextControlRuntimePair, TransportError>
 where
@@ -1490,8 +1549,8 @@ where
         profile.trust_label.clone(),
     )?;
     let rendezvous_topic = capability.topic.clone();
-    let alice = SignalingPeerId::new("runtime-webrtc-live-alice")?;
-    let bob = SignalingPeerId::new("runtime-webrtc-live-bob")?;
+    let alice = offerer_peer_id;
+    let bob = answerer_peer_id;
     let alice_session = adapter.connect(profile.clone()).await?;
     let bob_session = adapter.connect(profile.clone()).await?;
     let alice_room = alice_session
@@ -7282,6 +7341,8 @@ mod tests {
                 vec![Endpoint::new("stun:127.0.0.1:3478")],
                 vec![],
             )?),
+            SignalingPeerId::new("alice-device")?,
+            SignalingPeerId::new("bob-device")?,
             move |frame| {
                 answerer_received
                     .lock()
