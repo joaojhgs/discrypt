@@ -1213,6 +1213,45 @@ mod tests {
     }
 
     #[test]
+    fn voice_session_state_persists_across_restart() -> Result<(), AppServiceError> {
+        let store = MemoryAppStore::default();
+        let mut service = AppService::load_or_seed(store.clone())?;
+
+        let joined = service.join_voice()?;
+        assert!(joined.voice_session.joined);
+        assert!(joined
+            .voice_session
+            .participants
+            .iter()
+            .any(|participant| participant.id == "alice" && participant.speaking));
+
+        let muted = service.set_self_mute(SelfMuteRequest { muted: true })?;
+        assert!(muted
+            .voice_session
+            .participants
+            .iter()
+            .any(|participant| participant.id == "alice"
+                && participant.muted
+                && !participant.speaking));
+
+        let reloaded = AppService::load_or_seed(store)?;
+        let snapshot = reloaded.snapshot();
+        assert!(snapshot.voice_session.joined);
+        assert!(snapshot
+            .voice_session
+            .participants
+            .iter()
+            .any(|participant| participant.id == "alice"
+                && participant.muted
+                && !participant.speaking));
+        assert!(snapshot
+            .activity_feed
+            .iter()
+            .any(|entry| entry.contains("Muted local microphone state through voice command")));
+        Ok(())
+    }
+
+    #[test]
     fn phase_c_identity_recovery_verification_smoke_passes() {
         let verification = identity_recovery_verification_smoke();
         assert!(verification.two_profiles_verify_safety_numbers);

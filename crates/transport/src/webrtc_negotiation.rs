@@ -1433,6 +1433,33 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn turn_route_selection_stays_fail_closed_without_relay_evidence(
+    ) -> Result<(), TransportError> {
+        let mut config = WebRtcNegotiationConfig::new(test_ice_config()?);
+        config.ice_transport_policy = WebRtcIceTransportPolicy::RelayOnly;
+        config.ice_servers.turn_servers.push(TurnServerConfig::new(
+            Endpoint::new("turn:relay.example.invalid:3478"),
+            Some("turn-user".to_owned()),
+            Some("turn-secret".to_owned()),
+            None,
+        ));
+        let negotiator = WebRtcNegotiator::new(config).await?;
+
+        let mut session = TransportSession::new();
+        session.begin_signaling()?;
+        session.begin_ice_gathering()?;
+        session.begin_checking()?;
+
+        assert!(negotiator
+            .select_turn_route_if_ready(&mut session)
+            .await?
+            .is_none());
+        assert!(!negotiator.direct_path_metrics().await.turn_fallback_ready);
+
+        Ok(())
+    }
+
     #[test]
     fn sealed_relay_candidate_keeps_turn_metadata_ciphertext_only() -> Result<(), TransportError> {
         let relay_candidate = WebRtcIceCandidate {
