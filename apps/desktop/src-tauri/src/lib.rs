@@ -49,6 +49,7 @@ use discrypt_storage::{
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
+    probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityScopeLevel, ConversationScope,
     Endpoint, FallbackLeg, IceServerConfig, ProviderMetadataPosture, SignalingAdapterCapabilities,
@@ -3406,6 +3407,19 @@ impl PersistedAppState {
         requested_kind: Option<&str>,
         text_control_frame: Vec<u8>,
     ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
+        self.probe_active_webrtc_data_channel_request_response(
+            requested_kind,
+            text_control_frame,
+            None,
+        )
+    }
+
+    fn probe_active_webrtc_data_channel_request_response(
+        &mut self,
+        requested_kind: Option<&str>,
+        text_control_frame: Vec<u8>,
+        receipt_control_frame: Option<Vec<u8>>,
+    ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
         let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
             "No active DM/group/invite connectivity policy is available for WebRTC data-channel probe"
                 .to_owned()
@@ -3442,14 +3456,26 @@ impl PersistedAppState {
             &profile.profile_id,
             16,
         );
-        let probe = run_provider_webrtc_data_channel_probe(
-            profile,
-            scope,
-            bootstrap_secret,
-            random_entropy,
-            ice_config,
-            text_control_frame,
-        )
+        let probe = if let Some(receipt_control_frame) = receipt_control_frame {
+            run_provider_webrtc_data_channel_request_response_probe(
+                profile,
+                scope,
+                bootstrap_secret,
+                random_entropy,
+                ice_config,
+                text_control_frame,
+                receipt_control_frame,
+            )
+        } else {
+            run_provider_webrtc_data_channel_probe(
+                profile,
+                scope,
+                bootstrap_secret,
+                random_entropy,
+                ice_config,
+                text_control_frame,
+            )
+        }
         .map_err(|error| {
             self.latest_data_channel_probe = None;
             self.latest_data_channel_probe_error = Some(error.clone());
@@ -3479,6 +3505,57 @@ impl PersistedAppState {
             ),
         );
         Ok(view)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn prove_text_delivery_receipt_over_data_channel_with_receiver(
+        &mut self,
+        receiver: &PersistedAppState,
+        message_id: &str,
+        requested_kind: Option<&str>,
+    ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
+        let envelope_record = self
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .cloned()
+            .ok_or_else(|| "no persisted text envelope for receipt message id".to_owned())?;
+        let mut receiver_state = receiver.clone();
+        let receiver_signer = SigningKey::from_bytes(&receiver_state.identity_seed_bytes());
+        let receipt = TextDeliveryReceipt::sign(
+            &envelope_record.group_id,
+            TextDeliveryReceiptInput {
+                message_id: message_id.to_owned(),
+                recipient_leaf: 2,
+                recipient_device_id: receiver.local_user_id(),
+                received_at_ms: self.next_sequence.saturating_add(42_000),
+                envelope_ciphertext_hash: envelope_record.envelope.ciphertext_hash(),
+            },
+            &receiver_signer,
+        )
+        .map_err(|error| error.to_string())?;
+        let envelope_frame = serde_json::to_vec(&envelope_record.envelope)
+            .map_err(|error| format!("could not encode text envelope frame: {error}"))?;
+        let receipt_frame = serde_json::to_vec(&receipt)
+            .map_err(|error| format!("could not encode text receipt frame: {error}"))?;
+        let probe = self.probe_active_webrtc_data_channel_request_response(
+            requested_kind,
+            envelope_frame,
+            Some(receipt_frame),
+        )?;
+        if !probe.text_control_frame_roundtrip || !probe.receipt_frame_roundtrip {
+            return Err(
+                "provider-signaled DataChannel did not carry both envelope and receipt frames"
+                    .to_owned(),
+            );
+        }
+        self.apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.to_owned(),
+            receipt,
+            recipient_verifying_key_hex: hex::encode(receiver_signer.verifying_key().as_bytes()),
+        })?;
+        Ok(probe)
     }
 
     fn text_delivery_envelope_record(
@@ -5035,6 +5112,41 @@ fn run_provider_webrtc_data_channel_probe(
     })
     .join()
     .map_err(|_| "Provider WebRTC data-channel probe thread panicked".to_owned())?
+}
+
+fn run_provider_webrtc_data_channel_request_response_probe(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: Vec<u8>,
+    random_entropy: Vec<u8>,
+    ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
+    receipt_control_frame: Vec<u8>,
+) -> Result<discrypt_transport::ProviderWebRtcDataChannelProbe, String> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                format!("Could not start WebRTC data-channel probe runtime: {error}")
+            })?;
+        runtime
+            .block_on(
+                probe_provider_webrtc_datachannel_request_response_roundtrip(
+                    profile,
+                    scope,
+                    &bootstrap_secret,
+                    &random_entropy,
+                    ice_servers,
+                    text_control_frame,
+                    receipt_control_frame,
+                ),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .map_err(|_| "Provider WebRTC data-channel request/response probe thread panicked".to_owned())?
 }
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> Option<String> {
@@ -6863,6 +6975,82 @@ mod tests {
                 .map(|receipt| { receipt.recipient_key_fingerprint.as_str() }),
             Some(key_fingerprint(&bob_signer.verifying_key()).as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "mqtt-adapter")]
+    fn public_mqtt_two_profile_receipt_crosses_provider_webrtc_when_enabled() -> Result<(), String>
+    {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public MQTT two-profile receipt proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E=1 to run"
+            );
+            return Ok(());
+        }
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("public-mqtt-two-profile-receipt-alice");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "provider receipt proof".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let bob_path = fresh_state_path("public-mqtt-two-profile-receipt-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let proof = guard
+            .state
+            .prove_text_delivery_receipt_over_data_channel_with_receiver(
+                &bob.state,
+                &message_id,
+                Some("mqtt"),
+            )?;
+        assert_eq!(proof.kind, "mqtt");
+        assert!(proof.text_control_frame_roundtrip);
+        assert!(proof.receipt_frame_roundtrip);
+        let view = guard.mutate(|_| {});
+        let message = view
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        assert!(message.peer_receipt.is_some());
         Ok(())
     }
 

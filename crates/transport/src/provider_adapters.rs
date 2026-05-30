@@ -32,12 +32,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-#[cfg(any(
-    feature = "mqtt-adapter",
-    feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
-))]
-use sha2::Digest;
 use std::collections::BTreeMap;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 use std::collections::BTreeSet;
@@ -580,9 +574,42 @@ pub async fn probe_provider_webrtc_datachannel_text_frame_roundtrip(
     ice_servers: IceServerConfig,
     text_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    let response_frame = default_receipt_control_frame(&text_control_frame);
+    probe_provider_webrtc_datachannel_request_response_roundtrip(
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        ice_servers,
+        text_control_frame,
+        response_frame,
+    )
+    .await
+}
+
+/// Run a provider-signaled WebRTC DataChannel request/response proof with caller-supplied opaque frames.
+///
+/// This exercises the production-shaped text/control direction plus the receipt/control
+/// return direction without interpreting either payload at the transport layer. Callers
+/// can pass an encrypted message envelope as the request and a signed receipt/control
+/// payload as the response, then verify the payload semantics at the app layer.
+pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
+    receipt_control_frame: Vec<u8>,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
     if text_control_frame.is_empty() {
         return Err(TransportError::Unavailable(
             "text/control proof frame must be non-empty opaque bytes".to_owned(),
+        ));
+    }
+    if receipt_control_frame.is_empty() {
+        return Err(TransportError::Unavailable(
+            "receipt/control proof frame must be non-empty opaque bytes".to_owned(),
         ));
     }
     profile.validate()?;
@@ -598,6 +625,7 @@ pub async fn probe_provider_webrtc_datachannel_text_frame_roundtrip(
         random_entropy,
         ice_servers,
         text_control_frame,
+        receipt_control_frame,
     );
     let kind = profile.kind;
     match kind {
@@ -612,6 +640,7 @@ pub async fn probe_provider_webrtc_datachannel_text_frame_roundtrip(
                     random_entropy,
                     ice_servers,
                     text_control_frame,
+                    receipt_control_frame,
                 )
                 .await;
             }
@@ -633,6 +662,7 @@ pub async fn probe_provider_webrtc_datachannel_text_frame_roundtrip(
                     random_entropy,
                     ice_servers,
                     text_control_frame,
+                    receipt_control_frame,
                 )
                 .await;
             }
@@ -654,6 +684,7 @@ pub async fn probe_provider_webrtc_datachannel_text_frame_roundtrip(
                     random_entropy,
                     ice_servers,
                     text_control_frame,
+                    receipt_control_frame,
                 )
                 .await;
             }
@@ -780,6 +811,7 @@ async fn probe_webrtc_with_adapter<A>(
     random_entropy: &[u8],
     ice_servers: IceServerConfig,
     text_control_frame: Vec<u8>,
+    receipt_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
 where
     A: SignalingAdapter,
@@ -913,11 +945,7 @@ where
     }
 
     let frame = text_control_frame;
-    let frame_sha256 = {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&frame);
-        hex::encode(hasher.finalize())
-    };
+    let frame_sha256 = sha256_hex(&frame);
     alice_webrtc.send_text_control_frame(frame.clone()).await?;
     let received = timeout(Duration::from_secs(5), bob_webrtc.recv_text_control_frame())
         .await
@@ -926,13 +954,8 @@ where
         })??;
     let frame_roundtrip = received == frame;
 
-    let receipt_frame =
-        format!("ciphertext:provider-webrtc-receipt:v1:{frame_sha256}").into_bytes();
-    let receipt_frame_sha256 = {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&receipt_frame);
-        hex::encode(hasher.finalize())
-    };
+    let receipt_frame = receipt_control_frame;
+    let receipt_frame_sha256 = sha256_hex(&receipt_frame);
     bob_webrtc
         .send_text_control_frame(receipt_frame.clone())
         .await?;
@@ -973,6 +996,20 @@ where
         receipt_frame_roundtrip,
         receipt_frame_sha256,
     })
+}
+
+fn default_receipt_control_frame(text_control_frame: &[u8]) -> Vec<u8> {
+    format!(
+        "ciphertext:provider-webrtc-receipt:v1:{}",
+        sha256_hex(text_control_frame)
+    )
+    .into_bytes()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(any(
@@ -1595,6 +1632,7 @@ fn nostr_client_secret(
     material.extend_from_slice(b"discrypt-nostr-signaling-v1");
     material.extend_from_slice(topic.as_bytes());
     material.extend_from_slice(peer.0.as_bytes());
+    use sha2::Digest as _;
     let digest = sha2::Sha256::digest(&material);
     let hex_secret = hex::encode(digest);
     nostr_sdk::Keys::parse(&hex_secret).map_err(|err| nostr_err("client key derivation", err))
@@ -1606,6 +1644,7 @@ fn nostr_subscription_id(topic: &str, peer: &SignalingPeerId) -> nostr_sdk::Subs
     material.extend_from_slice(b"discrypt-nostr-subscription-v1");
     material.extend_from_slice(topic.as_bytes());
     material.extend_from_slice(peer.0.as_bytes());
+    use sha2::Digest as _;
     let digest = sha2::Sha256::digest(&material);
     nostr_sdk::SubscriptionId::new(format!("dc-{}", &hex::encode(digest)[..24]))
 }
@@ -1747,6 +1786,7 @@ fn ipfs_pubsub_no_topic_mesh_error(
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
 fn ipfs_message_fingerprint(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
     let digest = sha2::Sha256::digest(bytes);
     hex::encode(digest)
 }
