@@ -989,6 +989,12 @@ pub struct ListPendingTextControlFramesRequest {
     /// Optional result cap. Defaults to 50 and is clamped to 200.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Optional per-send/receive transport operation timeout in milliseconds.
+    ///
+    /// Defaults to five seconds and is clamped to 100..=60000ms so a broken
+    /// peer/runtime cannot hang the app-service command or the UI indefinitely.
+    #[serde(default)]
+    pub operation_timeout_ms: Option<u64>,
 }
 
 /// Response containing state plus outbound frames still needing transport work.
@@ -2097,6 +2103,7 @@ fn start_text_control_transport_runtime_pump() {
         let request = ListPendingTextControlFramesRequest {
             target: None,
             limit: Some(16),
+            operation_timeout_ms: None,
         };
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1_250));
@@ -4797,6 +4804,17 @@ impl PersistedAppState {
             .collect()
     }
 
+    fn text_control_transport_operation_timeout(
+        request: &ListPendingTextControlFramesRequest,
+    ) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            request
+                .operation_timeout_ms
+                .unwrap_or(5_000)
+                .clamp(100, 60_000),
+        )
+    }
+
     fn mark_text_control_frame_sent(
         &mut self,
         request: MarkTextControlFrameSentRequest,
@@ -4858,6 +4876,7 @@ impl PersistedAppState {
         let mut response_frames_received = 0_usize;
         let mut receipts_applied = 0_usize;
         let mut failures = Vec::new();
+        let operation_timeout = Self::text_control_transport_operation_timeout(&request);
 
         for frame in &pending {
             let outbound = match serde_json::to_vec(&frame.frame) {
@@ -4870,7 +4889,18 @@ impl PersistedAppState {
                     continue;
                 }
             };
-            if let Err(error) = transport.send_text_control_frame(outbound).await {
+            let send_result = tokio::time::timeout(
+                operation_timeout,
+                transport.send_text_control_frame(outbound),
+            )
+            .await;
+            if let Err(error) = match send_result {
+                Ok(result) => result,
+                Err(_) => Err(discrypt_transport::TransportError::Unavailable(format!(
+                    "send text/control frame timed out after {} ms",
+                    operation_timeout.as_millis()
+                ))),
+            } {
                 failures.push(format!(
                     "{}: send text/control frame failed: {error}",
                     frame.message_id
@@ -4889,12 +4919,22 @@ impl PersistedAppState {
                 ));
                 continue;
             }
-            let inbound = match transport.recv_text_control_frame().await {
-                Ok(inbound) => inbound,
-                Err(error) => {
+            let recv_result =
+                tokio::time::timeout(operation_timeout, transport.recv_text_control_frame()).await;
+            let inbound = match recv_result {
+                Ok(Ok(inbound)) => inbound,
+                Ok(Err(error)) => {
                     failures.push(format!(
                         "{}: receive text/control response failed: {error}",
                         frame.message_id
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    failures.push(format!(
+                        "{}: receive text/control response failed: receive text/control response timed out after {} ms",
+                        frame.message_id,
+                        operation_timeout.as_millis()
                     ));
                     continue;
                 }
@@ -7709,6 +7749,64 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HangingResponseTextControlTransport {
+        metrics: Mutex<discrypt_transport::WebRtcDataTransportMetrics>,
+    }
+
+    impl HangingResponseTextControlTransport {
+        fn new() -> Self {
+            Self {
+                metrics: Mutex::new(discrypt_transport::WebRtcDataTransportMetrics {
+                    schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+                    label: "hanging-text-control-datachannel".to_owned(),
+                    attached_channels: 1,
+                    open: true,
+                    frames_sent: 0,
+                    frames_received: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    last_state: "open".to_owned(),
+                }),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl discrypt_transport::TextControlDataTransport for HangingResponseTextControlTransport {
+        async fn send_text_control_frame(
+            &self,
+            frame: Vec<u8>,
+        ) -> Result<(), discrypt_transport::TransportError> {
+            let mut metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            metrics.frames_sent = metrics.frames_sent.saturating_add(1);
+            metrics.bytes_sent = metrics.bytes_sent.saturating_add(frame.len() as u64);
+            metrics.last_state = "sent".to_owned();
+            Ok(())
+        }
+
+        async fn recv_text_control_frame(
+            &self,
+        ) -> Result<Vec<u8>, discrypt_transport::TransportError> {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Err(discrypt_transport::TransportError::Unavailable(
+                "hanging test transport unexpectedly woke".to_owned(),
+            ))
+        }
+
+        async fn text_control_transport_metrics(
+            &self,
+        ) -> discrypt_transport::WebRtcDataTransportMetrics {
+            self.metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
     #[test]
     fn test_harness_can_run_two_isolated_app_profiles() {
         let _guard = test_lock();
@@ -9410,6 +9508,7 @@ mod tests {
         let listed = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
             target: Some(target),
             limit: None,
+            operation_timeout_ms: None,
         });
         assert!(listed.state.last_command_error.is_none());
         assert_eq!(listed.frames.len(), 1);
@@ -9425,6 +9524,7 @@ mod tests {
             reloaded.list_pending_text_control_frames(&ListPendingTextControlFramesRequest {
                 target: None,
                 limit: Some(10),
+                operation_timeout_ms: None,
             });
         assert_eq!(pending_after_reload.len(), 1);
         assert_eq!(pending_after_reload[0].message_id, message_id);
@@ -9458,6 +9558,7 @@ mod tests {
         let listed = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
             target: None,
             limit: None,
+            operation_timeout_ms: None,
         });
         let outbox_frame = listed
             .frames
@@ -9481,6 +9582,7 @@ mod tests {
             list_pending_text_control_frames(ListPendingTextControlFramesRequest {
                 target: None,
                 limit: None,
+                operation_timeout_ms: None,
             })
             .frames
             .is_empty()
@@ -9579,6 +9681,7 @@ mod tests {
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
             limit: None,
+            operation_timeout_ms: None,
         });
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -9666,6 +9769,7 @@ mod tests {
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
             limit: Some(8),
+            operation_timeout_ms: None,
         });
 
         assert!(
@@ -9694,6 +9798,80 @@ mod tests {
             .expect("missing transport runtime should be reported as a command error");
         assert_eq!(command_error.command, "pump_text_control_transport_once");
         assert_eq!(command_error.code, "transport_runtime_missing");
+    }
+
+    #[test]
+    fn text_control_pump_times_out_hanging_response_without_blocking_ui() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-transport-pump-timeout");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let message_id = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "transport runtime timeout".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        })
+        .messages
+        .first()
+        .map(|message| message.message_id.clone())
+        .unwrap();
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("timeout-text-session".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active");
+        let transport = Arc::new(HangingResponseTextControlTransport::new());
+        attach_text_control_transport_runtime_for_test(transport, active_session_id);
+
+        let started_at = std::time::Instant::now();
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(8),
+            operation_timeout_ms: Some(100),
+        });
+
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_secs(2),
+            "pump must return on the configured timeout instead of hanging"
+        );
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 0);
+        assert_eq!(report.receipts_applied, 0);
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("timed out after 100 ms")));
+        assert_eq!(report.metrics.frames_sent, 1);
+
+        let message = load_state()
+            .messages
+            .into_iter()
+            .find(|message| message.message_id == message_id)
+            .expect("message row should remain persisted");
+        assert_eq!(message.state_key, "transport_frame_sent");
+        assert_ne!(message.state_key, "peer_receipt");
+
+        clear_text_control_transport_runtime_for_test();
     }
 
     #[test]
@@ -9743,6 +9921,7 @@ mod tests {
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
             limit: Some(8),
+            operation_timeout_ms: None,
         });
 
         assert!(
@@ -9826,6 +10005,7 @@ mod tests {
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
             limit: Some(8),
+            operation_timeout_ms: None,
         });
 
         assert!(

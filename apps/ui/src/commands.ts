@@ -647,6 +647,7 @@ export type TextControlOutboxFrameView = {
 export type ListPendingTextControlFramesRequest = {
   target?: MessageTargetView | null;
   limit?: number | null;
+  operation_timeout_ms?: number | null;
 };
 
 export type ListPendingTextControlFramesResponse = {
