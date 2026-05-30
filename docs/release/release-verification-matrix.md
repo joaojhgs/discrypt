@@ -12,6 +12,8 @@ output with the release candidate commit and artifact hashes.
 | Android APK runner | `npm --prefix apps/ui run test:android-gate` plus `.github/workflows/android.yml` | Android emulator APK install, activity start, `RECORD_AUDIO` permission evidence, APK/logcat artifact. | Local shell validates the runner contract and Android media path tests. |
 | Signaling/relay deployment smoke | `npm --prefix apps/ui run test:release-verification-matrix` | `/healthz`, `/metrics`, and server process startup without identity, message, media, key, or admin-token leakage. | Runs locally against loopback signaling server. |
 | Update/rollback/privacy/secrets | `npm --prefix apps/ui run test:release-governance` | Policy and machine-readable secrets inventory validation. | Does not enable updater or crash upload. |
+| STUN/TURN/provider privacy gate (G132) | `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132`<br>`cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet`<br>`cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Harness proof, transport fallback contract, and provider-privacy evidence required. | Real-provider MQTT proof is opt-in via `DISCRYPT_PUBLIC_SIGNALING_E2E=1`.<br>Missing production adapters are explicitly reported as out-of-scope for this local gate. |
+| G132 real-signaling matrix | `npm --prefix apps/ui run test:signaling-e2e-matrix-g132` | Verifies command matrix coverage and explicitly reports missing adapter gates (Nostr/IPFS/QUIC/MQTT when not enabled). | Keep optional/public checks opt-in to preserve deterministic CI.
 
 ## Sensitive data exclusion
 
