@@ -12,6 +12,7 @@
 //! feature matching the claimed runtime capability.
 
 pub mod ice;
+pub mod policy;
 pub mod production_status;
 pub mod session;
 pub mod signaling;
@@ -22,6 +23,13 @@ pub use ice::{
     turn_stun_credential_decision, IceEndpointPolicy, IceServerConfig, TurnCredentialIssuer,
     TurnCredentialIssuerConfig, TurnCredentialMode, TurnServerConfig, TurnStunCredentialDecision,
 };
+pub use policy::{
+    derive_scope_commitment, AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityPolicy,
+    ConnectivityPolicySource, ConnectivityPolicyStore, ConnectivityScopeLevel, ConversationScope,
+    EffectiveConnectivityPolicy, IceProfile, ProviderMetadataPosture, RendezvousCapability,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingProviderEndpoint,
+};
 use serde::{Deserialize, Serialize};
 pub use session::{
     ReconnectBackoffPolicy, ReconnectDecision, TransportRoute, TransportRouteStatus,
@@ -29,10 +37,9 @@ pub use session::{
     TransportSessionState,
 };
 pub use signaling::{
-    AdapterConformanceReport, AdapterFailure, AdapterHealth, AdapterMessage, AdapterScope,
-    AdapterSelection, AdapterSelectionError, ConnectivityPolicy, IceProfile,
-    InMemorySignalingAdapter, RendezvousCapability, SignalingAdapter, SignalingAdapterKind,
-    SignalingAdapterProfile, SignalingProviderEndpoint,
+    AdapterSession, OpaqueSignalingPayload, PeerSignal, PresenceEvent, RendezvousRoom,
+    SignalingAdapter, SignalingHealth, SignalingHealthState, SignalingObservability,
+    SignalingPeerId,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -76,6 +83,12 @@ pub enum TransportError {
     /// ICE/STUN/TURN endpoint policy is malformed or unsupported.
     #[error("invalid ICE endpoint policy: {0}")]
     InvalidIcePolicy(String),
+    /// Connectivity/signaling policy is malformed or unsupported.
+    #[error("invalid connectivity policy: {0}")]
+    InvalidConnectivityPolicy(String),
+    /// Signaling adapter contract failed.
+    #[error("signaling adapter failed: {0}")]
+    SignalingAdapter(String),
     /// A transport session event was invalid for the current state.
     #[error(transparent)]
     InvalidSessionTransition(#[from] TransportSessionError),
