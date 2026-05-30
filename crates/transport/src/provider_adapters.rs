@@ -1810,13 +1810,31 @@ fn mqtt_options_from_endpoint(
     client_id: &str,
 ) -> Result<rumqttc::MqttOptions, TransportError> {
     let _ = rumqttc::tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let separator = if endpoint.contains('?') { '&' } else { '?' };
-    let url = format!("{endpoint}{separator}client_id={client_id}");
+    let (parse_endpoint, secure_transport) = if let Some(rest) = endpoint.strip_prefix("mqtts://") {
+        (format!("mqtt://{rest}"), Some("tls"))
+    } else if let Some(rest) = endpoint.strip_prefix("ssl://") {
+        (format!("mqtt://{rest}"), Some("tls"))
+    } else if let Some(rest) = endpoint.strip_prefix("wss://") {
+        (format!("ws://{rest}"), Some("wss"))
+    } else {
+        (endpoint.to_owned(), None)
+    };
+    let separator = if parse_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    let url = format!("{parse_endpoint}{separator}client_id={client_id}");
     let mut options =
         rumqttc::MqttOptions::parse_url(url).map_err(|err| mqtt_err("endpoint parse", err))?;
-    options.set_keep_alive(std::time::Duration::from_secs(10));
-    options.set_clean_session(true);
-    options.set_max_packet_size(64 * 1024, 64 * 1024);
+    match secure_transport {
+        Some("tls") => options.set_transport(rumqttc::Transport::tls_with_default_config()),
+        Some("wss") => options.set_transport(rumqttc::Transport::wss_with_default_config()),
+        _ => &mut options,
+    };
+    options.set_keep_alive(10);
+    options.set_clean_start(true);
+    options.set_max_packet_size(Some(64 * 1024));
     Ok(options)
 }
 
@@ -3047,7 +3065,7 @@ impl AdapterSession for MqttProviderSession {
         let client_id = mqtt_client_id(&rendezvous.topic, &local_peer_id);
         let options = mqtt_options_from_endpoint(&endpoint.endpoint.0, &client_id)?;
         let topics = mqtt_topics(&rendezvous, &local_peer_id);
-        let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 64);
+        let (client, mut eventloop) = rumqttc::AsyncClient::builder(options).capacity(64).build();
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
         tokio::spawn(async move {
             loop {
@@ -3055,7 +3073,7 @@ impl AdapterSession for MqttProviderSession {
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
                         if event_tx
                             .send(MqttProviderEvent::Publish {
-                                topic: publish.topic,
+                                topic: String::from_utf8_lossy(publish.topic.as_ref()).into_owned(),
                                 payload: publish.payload.to_vec(),
                             })
                             .await
