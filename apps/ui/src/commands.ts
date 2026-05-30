@@ -264,6 +264,9 @@ export type TransportDiagnosticsView = {
   adapter_probe_status: string;
   adapter_probe_detail: string;
   adapter_probe: SignalingAdapterProbeView | null;
+  data_channel_probe_status: string;
+  data_channel_probe_detail: string;
+  data_channel_probe: ProviderWebRtcDataChannelProbeView | null;
 };
 
 export type SignalingAdapterProbeView = {
@@ -275,6 +278,18 @@ export type SignalingAdapterProbeView = {
   presence_roundtrip: boolean;
   signal_roundtrip: boolean;
   control_roundtrip: boolean;
+};
+
+export type ProviderWebRtcDataChannelProbeView = {
+  kind: string;
+  profile_id: string;
+  endpoint_label: string;
+  rendezvous_topic: string;
+  offerer_direct_path_ready: boolean;
+  answerer_direct_path_ready: boolean;
+  offerer_data_channel_open: boolean;
+  answerer_data_channel_open: boolean;
+  text_control_frame_roundtrip: boolean;
 };
 
 export type JoinProgressStepView = {
@@ -495,6 +510,7 @@ export type StartDmRequest = {
 export type StartSignalingSessionRequest = {
   scope_label?: string | null;
   adapter_probe?: boolean;
+  data_channel_probe?: boolean;
   adapter_kind?: string | null;
 };
 
@@ -693,6 +709,10 @@ const fallbackState: AppState = {
     adapter_probe_detail:
       "Tauri IPC is not connected; local fallback cannot run a provider adapter probe",
     adapter_probe: null,
+    data_channel_probe_status: "webrtc-datachannel-not-run",
+    data_channel_probe_detail:
+      "Tauri IPC is not connected; local fallback cannot run a provider-signaled WebRTC DataChannel probe",
+    data_channel_probe: null,
   },
   join_progress: [],
   text_state_legend: textStateLegend(),
@@ -1108,6 +1128,13 @@ function deriveTransportDiagnostics(state: AppState): TransportDiagnosticsView {
       state.transport_diagnostics?.adapter_probe_detail ??
       "Tauri IPC is not connected; local fallback cannot run a provider adapter probe",
     adapter_probe: state.transport_diagnostics?.adapter_probe ?? null,
+    data_channel_probe_status:
+      state.transport_diagnostics?.data_channel_probe_status ??
+      "webrtc-datachannel-not-run",
+    data_channel_probe_detail:
+      state.transport_diagnostics?.data_channel_probe_detail ??
+      "Tauri IPC is not connected; local fallback cannot run a provider-signaled WebRTC DataChannel probe",
+    data_channel_probe: state.transport_diagnostics?.data_channel_probe ?? null,
   };
 }
 

@@ -15,10 +15,20 @@
 use crate::SignalingProviderEndpoint;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
-    ConversationScope, OpaqueSignalingPayload, PeerSignal, PresenceEvent, RendezvousCapability,
-    RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingAdapterCapabilities,
-    SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity, SignalingHealth,
-    SignalingHealthState, SignalingObservability, SignalingPeerId, TransportError,
+    ConversationScope, IceServerConfig, OpaqueSignalingPayload, PeerSignal, PresenceEvent,
+    RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
+    SignalingPeerId, TransportError,
+};
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+use crate::{
+    TextControlDataTransport, WebRtcNegotiationConfig, WebRtcNegotiationPayloadKind,
+    WebRtcNegotiationSealer, WebRtcNegotiator,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -324,6 +334,37 @@ pub struct ProviderAdapterRoundtripProbe {
     pub control_roundtrip: bool,
 }
 
+/// Evidence returned by a provider-signaled WebRTC DataChannel probe.
+///
+/// Unlike [`ProviderAdapterRoundtripProbe`], this proves that the selected
+/// provider can carry encrypted WebRTC negotiation payloads far enough for two
+/// local transport peers to open a real WebRTC DataChannel and exchange one
+/// opaque text/control frame. It is still a transport-layer proof, not a
+/// Tauri UI, installed-device, or voice/media proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderWebRtcDataChannelProbe {
+    /// Adapter that completed the probe.
+    pub kind: SignalingAdapterKind,
+    /// Profile id supplied by app/runtime policy.
+    pub profile_id: String,
+    /// Redacted provider endpoint label used by the profile.
+    pub endpoint_label: String,
+    /// Committed scope used to derive the rendezvous topic.
+    pub scope_commitment: String,
+    /// Provider-visible derived rendezvous topic/tag.
+    pub rendezvous_topic: String,
+    /// WebRTC direct path reached connected/completed state on the offer side.
+    pub offerer_direct_path_ready: bool,
+    /// WebRTC direct path reached connected/completed state on the answer side.
+    pub answerer_direct_path_ready: bool,
+    /// Offer-side DataChannel opened.
+    pub offerer_data_channel_open: bool,
+    /// Answer-side DataChannel opened.
+    pub answerer_data_channel_open: bool,
+    /// Opaque text/control frame crossed the DataChannel.
+    pub text_control_frame_roundtrip: bool,
+}
+
 impl SignalingAdapterFallbackPlan {
     /// True when at least one candidate was selected.
     #[must_use]
@@ -489,6 +530,97 @@ pub async fn probe_provider_adapter_roundtrip(
     }
 }
 
+/// Run a provider-signaled WebRTC DataChannel roundtrip for a runtime-selected profile.
+///
+/// The probe uses the selected adapter as the encrypted rendezvous path for
+/// SDP offer/answer exchange, then requires a real WebRTC DataChannel to open
+/// and carry one opaque text/control frame. It deliberately uses a real network
+/// UDP bind (`0.0.0.0:0`) so public STUN endpoints are not accidentally tested
+/// through loopback-only sockets.
+pub async fn probe_provider_webrtc_datachannel_roundtrip(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    ice_servers: IceServerConfig,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    profile.validate()?;
+    scope.validate()?;
+    ice_servers.validate_credentials_at(chrono::Utc::now())?;
+    #[cfg(not(any(
+        feature = "mqtt-adapter",
+        feature = "nostr-adapter",
+        feature = "ipfs-pubsub-adapter"
+    )))]
+    let _ = (bootstrap_secret, random_entropy, ice_servers);
+    let kind = profile.kind;
+    match kind {
+        SignalingAdapterKind::Mqtt => {
+            #[cfg(feature = "mqtt-adapter")]
+            {
+                return probe_webrtc_with_adapter(
+                    MqttProviderAdapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    ice_servers,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "mqtt-adapter"))]
+            {
+                Err(FeatureGatedProviderAdapter::new(kind)
+                    .boundary()
+                    .unavailable_error())
+            }
+        }
+        SignalingAdapterKind::Nostr => {
+            #[cfg(feature = "nostr-adapter")]
+            {
+                return probe_webrtc_with_adapter(
+                    NostrProviderAdapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    ice_servers,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "nostr-adapter"))]
+            {
+                Err(FeatureGatedProviderAdapter::new(kind)
+                    .boundary()
+                    .unavailable_error())
+            }
+        }
+        SignalingAdapterKind::IpfsPubsub => {
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            {
+                return probe_webrtc_with_adapter(
+                    IpfsPubsubProviderAdapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    ice_servers,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+            {
+                Err(FeatureGatedProviderAdapter::new(kind)
+                    .boundary()
+                    .unavailable_error())
+            }
+        }
+        SignalingAdapterKind::DiscryptQuicRendezvous => Err(FeatureGatedProviderAdapter::new(kind)
+            .boundary()
+            .unavailable_error()),
+    }
+}
+
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
@@ -583,6 +715,185 @@ where
         presence_roundtrip,
         signal_roundtrip,
         control_roundtrip,
+    })
+}
+
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+async fn probe_webrtc_with_adapter<A>(
+    adapter: A,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    ice_servers: IceServerConfig,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
+where
+    A: SignalingAdapter,
+{
+    let endpoint_label = profile
+        .endpoints
+        .first()
+        .map(|endpoint| redacted_endpoint_label(&endpoint.endpoint.0))
+        .unwrap_or_else(|| "endpoint#missing".to_owned());
+    let capability = RendezvousCapability::derive(
+        scope.clone(),
+        profile.kind,
+        bootstrap_secret,
+        random_entropy,
+        120,
+        profile.metadata_posture,
+        profile.trust_label.clone(),
+    )?;
+    let rendezvous_topic = capability.topic.clone();
+    let alice = SignalingPeerId::new("runtime-webrtc-probe-alice")?;
+    let bob = SignalingPeerId::new("runtime-webrtc-probe-bob")?;
+    let alice_session = adapter.connect(profile.clone()).await?;
+    let bob_session = adapter.connect(profile.clone()).await?;
+    let alice_room = alice_session
+        .join(scope.clone(), capability.clone(), alice.clone())
+        .await?;
+    let bob_room = bob_session
+        .join(scope.clone(), capability, bob.clone())
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut alice_config = WebRtcNegotiationConfig::new(ice_servers.clone());
+    alice_config.udp_addrs = vec!["0.0.0.0:0".to_owned()];
+    let mut bob_config = WebRtcNegotiationConfig::new(ice_servers);
+    bob_config.udp_addrs = vec!["0.0.0.0:0".to_owned()];
+    let alice_webrtc = WebRtcNegotiator::new(alice_config).await?;
+    let bob_webrtc = WebRtcNegotiator::new(bob_config).await?;
+    let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
+
+    let offer = alice_webrtc
+        .create_complete_offer(Duration::from_secs(45))
+        .await?;
+    let sealed_offer = sealer.seal_description(&offer)?;
+    let opaque_offer = sealed_offer.to_opaque_bytes()?;
+    if opaque_offer.windows(3).any(|window| window == b"v=0") {
+        return Err(TransportError::PlaintextLeak);
+    }
+    alice_room.send_signal(bob.clone(), sealed_offer).await?;
+
+    let mut answer_applied = false;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        for signal in bob_room.take_signals().await? {
+            if signal.from_peer != alice || signal.to_peer != bob {
+                continue;
+            }
+            match signal.payload.kind {
+                WebRtcNegotiationPayloadKind::Offer => {
+                    let offer = sealer.open_description(&signal.payload)?;
+                    let answer = bob_webrtc
+                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .await?;
+                    bob_room
+                        .send_signal(alice.clone(), sealer.seal_description(&answer)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Candidate => {
+                    bob_webrtc
+                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Answer => {}
+            }
+        }
+
+        for signal in alice_room.take_signals().await? {
+            if signal.from_peer != bob || signal.to_peer != alice {
+                continue;
+            }
+            match signal.payload.kind {
+                WebRtcNegotiationPayloadKind::Answer if !answer_applied => {
+                    alice_webrtc
+                        .accept_answer(sealer.open_description(&signal.payload)?)
+                        .await?;
+                    answer_applied = true;
+                }
+                WebRtcNegotiationPayloadKind::Candidate => {
+                    alice_webrtc
+                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Offer | WebRtcNegotiationPayloadKind::Answer => {}
+            }
+        }
+
+        for candidate in alice_webrtc.drain_local_candidates().await {
+            alice_room
+                .send_signal(bob.clone(), sealer.seal_candidate(&candidate)?)
+                .await?;
+        }
+        for candidate in bob_webrtc.drain_local_candidates().await {
+            bob_room
+                .send_signal(alice.clone(), sealer.seal_candidate(&candidate)?)
+                .await?;
+        }
+
+        if answer_applied
+            && alice_webrtc.direct_path_metrics().await.direct_path_ready
+            && bob_webrtc.direct_path_metrics().await.direct_path_ready
+        {
+            alice_webrtc
+                .wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            bob_webrtc
+                .wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let offerer_data = alice_webrtc.text_control_transport_metrics().await;
+    let answerer_data = bob_webrtc.text_control_transport_metrics().await;
+    if !offerer_data.open || !answerer_data.open {
+        return Err(TransportError::Unavailable(format!(
+            "provider-signaled WebRTC data channel did not open: alice={:?} bob={:?}",
+            alice_webrtc.direct_path_metrics().await,
+            bob_webrtc.direct_path_metrics().await
+        )));
+    }
+
+    let frame = b"ciphertext:public-provider-signaled-webrtc-text-frame:v1".to_vec();
+    alice_webrtc.send_text_control_frame(frame.clone()).await?;
+    let received = timeout(Duration::from_secs(5), bob_webrtc.recv_text_control_frame())
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable("timed out receiving WebRTC data frame".to_owned())
+        })??;
+    let frame_roundtrip = received == frame;
+
+    let alice_direct = alice_webrtc.direct_path_metrics().await;
+    let bob_direct = bob_webrtc.direct_path_metrics().await;
+    let offerer_data = alice_webrtc.text_control_transport_metrics().await;
+    let answerer_data = bob_webrtc.text_control_transport_metrics().await;
+
+    alice_webrtc.tear_down().await?;
+    bob_webrtc.tear_down().await?;
+    alice_room.leave().await?;
+    bob_room.leave().await?;
+    alice_session.close().await?;
+    bob_session.close().await?;
+
+    Ok(ProviderWebRtcDataChannelProbe {
+        kind: profile.kind,
+        profile_id: profile.profile_id,
+        endpoint_label,
+        scope_commitment: scope.scope_id_commitment,
+        rendezvous_topic,
+        offerer_direct_path_ready: alice_direct.direct_path_ready,
+        answerer_direct_path_ready: bob_direct.direct_path_ready,
+        offerer_data_channel_open: offerer_data.open,
+        answerer_data_channel_open: answerer_data.open,
+        text_control_frame_roundtrip: frame_roundtrip,
     })
 }
 

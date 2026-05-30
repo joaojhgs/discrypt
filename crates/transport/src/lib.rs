@@ -39,11 +39,12 @@ pub use provider_adapters::MqttProviderAdapter;
 pub use provider_adapters::NostrProviderAdapter;
 pub use provider_adapters::{
     adapter_boundary_for_kind, plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
-    required_provider_adapter_boundaries, required_provider_adapter_registry,
-    AdapterReadinessState, FeatureGatedProviderAdapter, LocalConformanceProviderAdapter,
-    LocalConformanceProviderBus, ProviderAdapterBoundary, ProviderAdapterReadiness,
-    ProviderAdapterRoundtripProbe, SignalingAdapterFactory, SignalingAdapterFallbackAttempt,
-    SignalingAdapterFallbackPlan, SignalingAdapterRegistryEntry,
+    probe_provider_webrtc_datachannel_roundtrip, required_provider_adapter_boundaries,
+    required_provider_adapter_registry, AdapterReadinessState, FeatureGatedProviderAdapter,
+    LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,
+    ProviderAdapterReadiness, ProviderAdapterRoundtripProbe, ProviderWebRtcDataChannelProbe,
+    SignalingAdapterFactory, SignalingAdapterFallbackAttempt, SignalingAdapterFallbackPlan,
+    SignalingAdapterRegistryEntry,
 };
 use serde::{Deserialize, Serialize};
 pub use session::{

@@ -44,11 +44,12 @@ use discrypt_storage::{
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
-    required_provider_adapter_boundaries, AdapterFallbackBehavior, AdapterTrustLabel,
-    ConnectivityScopeLevel, ConversationScope, Endpoint, FallbackLeg, ProviderMetadataPosture,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportRoute, TransportSession,
-    TransportSessionSnapshot, TransportSessionState,
+    probe_provider_webrtc_datachannel_roundtrip, required_provider_adapter_boundaries,
+    AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityScopeLevel, ConversationScope,
+    Endpoint, FallbackLeg, IceServerConfig, ProviderMetadataPosture, SignalingAdapterCapabilities,
+    SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity,
+    SignalingProviderEndpoint, TransportRoute, TransportSession, TransportSessionSnapshot,
+    TransportSessionState,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -887,6 +888,12 @@ pub struct StartSignalingSessionRequest {
     /// using the selected DM/group/invite connectivity policy.
     #[serde(default)]
     pub adapter_probe: bool,
+    /// When true, run a real provider-signaled WebRTC DataChannel smoke after
+    /// the adapter roundtrip, using the selected connectivity policy and ICE
+    /// STUN configuration. This proves transport-layer text/control delivery,
+    /// not installed-app UI or voice/media delivery.
+    #[serde(default)]
+    pub data_channel_probe: bool,
     /// Optional adapter kind override for the probe (`mqtt`, `nostr`,
     /// `ipfs_pubsub`, or `discrypt_quic_rendezvous`).
     #[serde(default)]
@@ -996,6 +1003,13 @@ pub struct TransportDiagnosticsView {
     /// Structured latest provider-adapter probe evidence, when available.
     #[serde(default)]
     pub adapter_probe: Option<SignalingAdapterProbeView>,
+    /// Latest provider-signaled WebRTC DataChannel probe status.
+    pub data_channel_probe_status: String,
+    /// Evidence or blocker from the latest WebRTC DataChannel probe.
+    pub data_channel_probe_detail: String,
+    /// Structured latest provider-signaled WebRTC DataChannel proof.
+    #[serde(default)]
+    pub data_channel_probe: Option<ProviderWebRtcDataChannelProbeView>,
 }
 
 /// Readiness and selection metadata for a fallback signaling adapter attempt.
@@ -1032,6 +1046,29 @@ pub struct SignalingAdapterProbeView {
     pub signal_roundtrip: bool,
     /// Sealed control proof flag.
     pub control_roundtrip: bool,
+}
+
+/// Backend evidence from a provider-signaled WebRTC DataChannel probe.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderWebRtcDataChannelProbeView {
+    /// Adapter kind.
+    pub kind: String,
+    /// Policy profile id.
+    pub profile_id: String,
+    /// Redacted endpoint label.
+    pub endpoint_label: String,
+    /// Provider-visible derived rendezvous topic/tag.
+    pub rendezvous_topic: String,
+    /// Offerer WebRTC direct path readiness.
+    pub offerer_direct_path_ready: bool,
+    /// Answerer WebRTC direct path readiness.
+    pub answerer_direct_path_ready: bool,
+    /// Offerer DataChannel open state.
+    pub offerer_data_channel_open: bool,
+    /// Answerer DataChannel open state.
+    pub answerer_data_channel_open: bool,
+    /// Opaque text/control frame crossed the DataChannel.
+    pub text_control_frame_roundtrip: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1167,6 +1204,10 @@ struct PersistedAppState {
     #[serde(default)]
     latest_signaling_probe_error: Option<String>,
     #[serde(default)]
+    latest_data_channel_probe: Option<ProviderWebRtcDataChannelProbeView>,
+    #[serde(default)]
+    latest_data_channel_probe_error: Option<String>,
+    #[serde(default)]
     abuse: PersistedAbuseState,
     friend_verified: bool,
     next_sequence: u64,
@@ -1238,6 +1279,19 @@ pub fn start_signaling_session(request: StartSignalingSessionRequest) -> AppStat
                     "adapter_probe_failed",
                     error,
                     "Check adapter feature flags, provider endpoint reachability, and per-scope connectivity policy before claiming signaling",
+                );
+            }
+        }
+        if request.data_channel_probe {
+            if let Err(error) =
+                state.probe_active_webrtc_data_channel(request.adapter_kind.as_deref())
+            {
+                state.push_command_error(
+                    "transport.data_channel_probe_failed",
+                    "start_signaling_session",
+                    "data_channel_probe_failed",
+                    error,
+                    "Check provider reachability, STUN/ICE policy, and the selected per-scope connectivity profile before claiming text/control transport",
                 );
             }
         }
@@ -2762,6 +2816,8 @@ impl PersistedAppState {
             text_session: None,
             latest_signaling_probe: None,
             latest_signaling_probe_error: None,
+            latest_data_channel_probe: None,
+            latest_data_channel_probe_error: None,
             abuse: PersistedAbuseState::default(),
             friend_verified: false,
             next_sequence: 2,
@@ -2846,6 +2902,8 @@ impl PersistedAppState {
         let (route_proof_status, route_proof_detail, turn_required) =
             self.route_proof_status(self.signaling_session.as_ref(), self.text_session.as_ref());
         let (adapter_probe_status, adapter_probe_detail) = self.signaling_probe_status();
+        let (data_channel_probe_status, data_channel_probe_detail) =
+            self.data_channel_probe_status();
         TransportDiagnosticsView {
             adapter_boundaries,
             adapter_fallback_attempts,
@@ -2856,6 +2914,9 @@ impl PersistedAppState {
             adapter_probe_status,
             adapter_probe_detail,
             adapter_probe: self.latest_signaling_probe.clone(),
+            data_channel_probe_status,
+            data_channel_probe_detail,
+            data_channel_probe: self.latest_data_channel_probe.clone(),
         }
     }
 
@@ -2881,6 +2942,33 @@ impl PersistedAppState {
         (
             "provider-roundtrip-not-run".to_owned(),
             "Start signaling with adapter_probe=true to verify the selected provider adapter without claiming WebRTC/media connectivity".to_owned(),
+        )
+    }
+
+    fn data_channel_probe_status(&self) -> (String, String) {
+        if let Some(probe) = &self.latest_data_channel_probe {
+            return (
+                "webrtc-datachannel-proofed".to_owned(),
+                format!(
+                    "adapter={} profile={} endpoint={} topic={} offerer_direct={} answerer_direct={} offerer_open={} answerer_open={} frame={}",
+                    probe.kind,
+                    probe.profile_id,
+                    probe.endpoint_label,
+                    probe.rendezvous_topic,
+                    probe.offerer_direct_path_ready,
+                    probe.answerer_direct_path_ready,
+                    probe.offerer_data_channel_open,
+                    probe.answerer_data_channel_open,
+                    probe.text_control_frame_roundtrip
+                ),
+            );
+        }
+        if let Some(error) = &self.latest_data_channel_probe_error {
+            return ("webrtc-datachannel-failed".to_owned(), error.clone());
+        }
+        (
+            "webrtc-datachannel-not-run".to_owned(),
+            "Start signaling with data_channel_probe=true to verify provider-signaled WebRTC text/control delivery without claiming UI or voice/media delivery".to_owned(),
         )
     }
 
@@ -3134,6 +3222,81 @@ impl PersistedAppState {
             "transport.signaling_probe_ok",
             format!(
                 "Provider adapter roundtrip proofed for {} profile {}",
+                view.kind, view.profile_id
+            ),
+        );
+        Ok(())
+    }
+
+    fn probe_active_webrtc_data_channel(
+        &mut self,
+        requested_kind: Option<&str>,
+    ) -> Result<(), String> {
+        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
+            "No active DM/group/invite connectivity policy is available for WebRTC data-channel probe"
+                .to_owned()
+        })?;
+        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
+        let profile_view = self
+            .select_signaling_profile(&connectivity, requested_kind)
+            .ok_or_else(|| {
+                "No signaling profile matches the requested adapter kind and build readiness"
+                    .to_owned()
+            })?;
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let ice_config = IceServerConfig::new(
+            connectivity
+                .ice_stun_servers
+                .iter()
+                .cloned()
+                .map(Endpoint::new)
+                .collect(),
+            Vec::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        let bootstrap_secret = self.probe_material(
+            "discrypt-runtime-webrtc-probe-bootstrap-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = self.probe_material(
+            "discrypt-runtime-webrtc-probe-entropy-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            16,
+        );
+        let probe = run_provider_webrtc_data_channel_probe(
+            profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            ice_config,
+        )
+        .map_err(|error| {
+            self.latest_data_channel_probe = None;
+            self.latest_data_channel_probe_error = Some(error.clone());
+            error
+        })?;
+        let view = ProviderWebRtcDataChannelProbeView {
+            kind: probe.kind.canonical_name().to_owned(),
+            profile_id: probe.profile_id,
+            endpoint_label: probe.endpoint_label,
+            rendezvous_topic: probe.rendezvous_topic,
+            offerer_direct_path_ready: probe.offerer_direct_path_ready,
+            answerer_direct_path_ready: probe.answerer_direct_path_ready,
+            offerer_data_channel_open: probe.offerer_data_channel_open,
+            answerer_data_channel_open: probe.answerer_data_channel_open,
+            text_control_frame_roundtrip: probe.text_control_frame_roundtrip,
+        };
+        self.latest_data_channel_probe_error = None;
+        self.latest_data_channel_probe = Some(view.clone());
+        self.push_event(
+            "transport.data_channel_probe_ok",
+            format!(
+                "Provider-signaled WebRTC DataChannel proofed for {} profile {}",
                 view.kind, view.profile_id
             ),
         );
@@ -4504,6 +4667,35 @@ fn run_provider_adapter_probe(
     })
     .join()
     .map_err(|_| "Provider adapter probe thread panicked".to_owned())?
+}
+
+fn run_provider_webrtc_data_channel_probe(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: Vec<u8>,
+    random_entropy: Vec<u8>,
+    ice_servers: IceServerConfig,
+) -> Result<discrypt_transport::ProviderWebRtcDataChannelProbe, String> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                format!("Could not start WebRTC data-channel probe runtime: {error}")
+            })?;
+        runtime
+            .block_on(probe_provider_webrtc_datachannel_roundtrip(
+                profile,
+                scope,
+                &bootstrap_secret,
+                &random_entropy,
+                ice_servers,
+            ))
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .map_err(|_| "Provider WebRTC data-channel probe thread panicked".to_owned())?
 }
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
@@ -6267,6 +6459,7 @@ mod tests {
         let started = start_signaling_session(StartSignalingSessionRequest {
             scope_label: Some("dm:alice-bob".to_owned()),
             adapter_probe: false,
+            data_channel_probe: false,
             adapter_kind: None,
         });
         assert!(started.last_command_error.is_none());
@@ -6317,6 +6510,7 @@ mod tests {
         let state = start_signaling_session(StartSignalingSessionRequest {
             scope_label: Some("dm:bob".to_owned()),
             adapter_probe: true,
+            data_channel_probe: false,
             adapter_kind: Some("discrypt_quic_rendezvous".to_owned()),
         });
 
@@ -6334,6 +6528,42 @@ mod tests {
             "route-proof-not-available"
         );
         assert!(state.transport_diagnostics.adapter_probe.is_none());
+    }
+
+    #[test]
+    fn data_channel_probe_surfaces_runtime_blocker_without_route_or_media_claim() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("data-channel-probe");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = start_signaling_session(StartSignalingSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            adapter_probe: false,
+            data_channel_probe: true,
+            adapter_kind: Some("discrypt_quic_rendezvous".to_owned()),
+        });
+
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("QUIC data-channel probe must fail closed until sibling client is wired");
+        assert_eq!(error.code, "data_channel_probe_failed");
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-failed"
+        );
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-proof-not-available"
+        );
+        assert!(state.transport_diagnostics.data_channel_probe.is_none());
+        assert!(state.voice_session.is_none());
     }
 
     #[test]

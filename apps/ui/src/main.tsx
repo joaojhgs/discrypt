@@ -225,6 +225,23 @@ function App() {
       startSignalingSession({
         scope_label: scopeLabel,
         adapter_probe: true,
+        data_channel_probe: false,
+        adapter_kind: null,
+      }),
+    );
+  }
+
+  async function probeSelectedDataChannel() {
+    const scopeLabel =
+      commandState?.active_context?.dm_id ??
+      commandState?.active_context?.group_id ??
+      commandState?.active_context?.channel_id ??
+      "active-scope";
+    await applyCommand(
+      startSignalingSession({
+        scope_label: scopeLabel,
+        adapter_probe: false,
+        data_channel_probe: true,
         adapter_kind: null,
       }),
     );
@@ -627,6 +644,7 @@ function App() {
           statuses={appState.transport_status}
           diagnostics={appState.transport_diagnostics}
           onProbeAdapter={probeSelectedAdapter}
+          onProbeDataChannel={probeSelectedDataChannel}
         />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
@@ -1303,10 +1321,12 @@ function TransportStatusStrip({
   statuses,
   diagnostics,
   onProbeAdapter,
+  onProbeDataChannel,
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
   onProbeAdapter: () => void;
+  onProbeDataChannel: () => void;
 }) {
   const ordered = statuses.length
     ? statuses
@@ -1338,6 +1358,9 @@ function TransportStatusStrip({
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="outline" onClick={onProbeAdapter}>
             Probe adapter
+          </Button>
+          <Button size="sm" variant="outline" onClick={onProbeDataChannel}>
+            Probe data channel
           </Button>
           <Badge variant="outline">honest status</Badge>
         </div>
@@ -1423,6 +1446,23 @@ function TransportStatusStrip({
                 {diagnostics.adapter_probe_detail}
               </p>
             </div>
+            <div className="mt-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-[0.12em] text-[hsl(var(--muted-foreground))]">
+                  DataChannel probe
+                </span>
+                <Badge
+                  variant={transportBadgeVariant(
+                    diagnostics.data_channel_probe_status,
+                  )}
+                >
+                  {diagnostics.data_channel_probe_status}
+                </Badge>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                {diagnostics.data_channel_probe_detail}
+              </p>
+            </div>
             {diagnostics.adapter_fallback_attempts.length ? (
               <div className="mt-3 space-y-1">
                 {diagnostics.adapter_fallback_attempts.map((attempt) => (
@@ -1453,6 +1493,7 @@ function transportBadgeVariant(
     "available",
     "route-proofed",
     "provider-roundtrip-proofed",
+    "webrtc-datachannel-proofed",
   ].includes(status)) {
     return "success";
   }
@@ -1461,6 +1502,7 @@ function transportBadgeVariant(
     "last-command-error",
     "media-gated",
     "provider-roundtrip-failed",
+    "webrtc-datachannel-failed",
   ].includes(status)) {
     return "warning";
   }

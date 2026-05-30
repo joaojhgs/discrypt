@@ -82,6 +82,10 @@ Behavior:
 - Extends `start_signaling_session` with `adapter_probe=true` and optional `adapter_kind` so the Tauri backend can run the selected DM/group/invite signaling profile instead of only showing static readiness.
 - Persists structured `adapter_probe_status`, `adapter_probe_detail`, and redacted probe evidence into transport diagnostics.
 - Adds a UI "Probe adapter" action in the transport status panel.
+- Adds a UI "Probe data channel" action and `start_signaling_session(..., data_channel_probe=true)`
+  command path that reuses the Rust transport WebRTC probe through Tauri diagnostics. This proves
+  provider-signaled WebRTC text/control delivery for the selected per-scope policy, while still
+  keeping installed-app UI and voice/media claims separate.
 - Uses public Nostr (`wss://relay.damus.io`) first and public MQTT (`mqtts://broker.emqx.io:8883`) second as zero-config default endpoint candidates when no `DISCRYPT_DEFAULT_*`/`VITE_DISCRYPT_DEFAULT_*` override is supplied; IPFS and QUIC still require explicit endpoint configuration because no production default pubsub rendezvous mesh or self-hosted endpoint has been accepted yet.
 - Keeps route/media claims separate: a successful adapter probe proves provider rendezvous only; it does not mark ICE, data-channel, or voice media as connected.
 
@@ -92,6 +96,8 @@ cargo test -q -p discrypt-transport provider_adapter_roundtrip_probe_quic_fails_
 cargo test -q -p discrypt-desktop signaling_adapter_probe_surfaces_runtime_blocker_without_route_claim
 npm --prefix apps/ui run typecheck
 cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter
+cargo test -q -p discrypt-desktop probe -- --nocapture
+npm --prefix apps/ui run typecheck
 ```
 
 ### Public real-network tests
@@ -156,6 +162,7 @@ Public provider-signaled WebRTC data-channel status:
 - `wss://relay.damus.io` was not counted as a failure of the WebRTC path in the latest rerun because it rejected the smoke with Nostr relay rate limiting (`rate-limited: you are noting too much`).
 - The test uses `stun:stun.l.google.com:19302`, waits for completed local ICE SDP where possible, exchanges sealed offer/answer through the selected public provider, opens the WebRTC DataChannel, and sends an opaque text/control frame.
 - The previous `set remote answer failed: Disconnected(WriteNotify)` failure was traced to exercising public STUN while binding WebRTC UDP to `127.0.0.1:0`; the public-provider test now binds `0.0.0.0:0` so STUN and host candidate gathering can use the actual network interface.
+- The same transport proof is exposed to Tauri as an explicit `data_channel_probe` diagnostic. It is not run automatically because public providers can rate-limit and the probe is network-dependent.
 
 ## What remains open before production
 
