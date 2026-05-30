@@ -133,11 +133,19 @@ export type UserProfileView = {
   recovery_status: string;
 };
 
+export type DmRuntimePeerView = {
+  peer_id: string;
+  role: string;
+  is_local: boolean;
+  source: string;
+};
+
 export type DirectConversationView = {
   dm_id: string;
   participant_id: string;
   display_name: string;
   local_only_copy: string;
+  runtime_peers?: DmRuntimePeerView[];
   connectivity?: ConnectivityPolicyView | null;
 };
 
@@ -1609,6 +1617,37 @@ function runtimePeerIdFromCommitment(label: string, commitment: string): string 
   return `peer-${hashCommitment("discrypt-runtime-peer-id-v1", [label, commitment]).slice(0, 16)}`;
 }
 
+function dmRuntimePeers(
+  connectivity: ConnectivityPolicyView | null | undefined,
+  localRole: "inviter" | "reply" | string,
+): DmRuntimePeerView[] {
+  const bootstrap = connectivity?.dm_bootstrap;
+  if (!bootstrap) return [];
+  const inviterPeerId = runtimePeerIdFromCommitment(
+    "dm-inviter-runtime-peer",
+    bootstrap.inviter_identity_commitment,
+  );
+  const replyPeerId = runtimePeerIdFromCommitment(
+    "dm-reply-runtime-peer",
+    bootstrap.reply_rendezvous_commitment,
+  );
+  const localIsInviter = localRole === "inviter";
+  return [
+    {
+      peer_id: inviterPeerId,
+      role: "inviter",
+      is_local: localIsInviter,
+      source: "signed_dm_bootstrap_v1",
+    },
+    {
+      peer_id: replyPeerId,
+      role: "reply",
+      is_local: !localIsInviter,
+      source: "signed_dm_bootstrap_v1",
+    },
+  ];
+}
+
 function groupRuntimePeers(
   connectivity: ConnectivityPolicyView | null | undefined,
   localRole: "owner" | "member" | string,
@@ -2316,13 +2355,16 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
         request.display_name.trim() || state.snapshot.friend.alias;
       const dmId = `dm-${slugify(displayName)}`;
       if (!state.dms.some((dm) => dm.dm_id === dmId)) {
+        const participantId = slugify(displayName);
+        const connectivity = dmConnectivityPolicy(dmId, participantId);
         state.dms.push({
           dm_id: dmId,
-          participant_id: slugify(displayName),
+          participant_id: participantId,
           display_name: displayName,
           local_only_copy:
             "Local harness-backed DM; no remote delivery is claimed",
-          connectivity: dmConnectivityPolicy(dmId, slugify(displayName)),
+          runtime_peers: dmRuntimePeers(connectivity, "inviter"),
+          connectivity,
         });
       }
       state.active_context = {
@@ -2713,6 +2755,7 @@ export async function acceptDmInvite(
           display_name: displayName,
           local_only_copy:
             "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt proof",
+          runtime_peers: dmRuntimePeers(parsedInvite.connectivity, "reply"),
           connectivity: parsedInvite.connectivity,
         });
       }

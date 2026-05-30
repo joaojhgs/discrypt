@@ -648,3 +648,41 @@ Verification run:
 Remaining gap: this is browser fallback E2E for invite/bootstrap state and UI
 reciprocal runtime peer fields, not an installed Tauri two-process public-provider
 DataChannel receipt proof.
+
+## 2026-05-30 update: backend DM runtime peers are persisted and E2E-asserted
+
+Direct-message state now mirrors the group runtime-peer contract. `DirectConversationView`
+returns a backend-owned `runtime_peers` list derived from signed DM bootstrap
+commitments:
+
+- inviter peer: signed `inviter_identity_commitment`
+- reply peer: signed `reply_rendezvous_commitment`
+- `is_local` marks inviter-local on locally started/seeded DMs and reply-local
+  on accepted DM contact invites
+- `source=signed_dm_bootstrap_v1` records the evidence boundary
+
+The React runtime attach controls now prefer backend-returned DM runtime peers
+before falling back to bootstrap derivation. The two-profile Playwright flow now
+checks reciprocal DM runtime peer ids after Alice creates a DM invite and Bob
+accepts it, then checks reciprocal group runtime peer ids after group invite
+join.
+
+Verification added:
+
+- `dm_invite_accept_persists_signed_runtime_peers` proves Alice inviter and Bob
+  reply DM peers are reciprocal, derived from signed DM invite bootstrap, and
+  survive reload.
+
+Verification run:
+
+- `cargo fmt --all --check`
+- `cargo check -q -p discrypt-desktop`
+- `cargo test -q -p discrypt-desktop dm_invite_accept_persists_signed_runtime_peers -- --nocapture`
+- `npm --prefix apps/ui run typecheck`
+- `VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npm --prefix apps/ui run build`
+- `cd apps/ui && CI=1 VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npx playwright test tests/e2e/two-profile-flow.spec.ts --workers=1`
+- `npm --prefix apps/ui run test:command-coverage`
+
+Remaining gap: this closes backend/UI reciprocal peer derivation for basic DM
+invite attach setup, but it is still not an installed Tauri two-process public
+provider receipt proof and not real media/voice E2E.

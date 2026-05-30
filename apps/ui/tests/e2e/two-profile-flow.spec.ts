@@ -156,7 +156,7 @@ async function readRuntimePeers(page: Page) {
   };
 }
 
-async function expectReciprocalGroupRuntimePeers(owner: Page, member: Page) {
+async function expectReciprocalRuntimePeers(owner: Page, member: Page) {
   const ownerPeers = await readRuntimePeers(owner);
   const memberPeers = await readRuntimePeers(member);
   expect(ownerPeers.local).toMatch(/^peer-[a-f0-9]{16}$/);
@@ -280,6 +280,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 
     const dmInvite = await createDmInviteForActiveContact(alice.page, "Bob");
     await acceptDmInvite(bob.page, dmInvite, "Alice verified contact");
+    await expectReciprocalRuntimePeers(alice.page, bob.page);
     await sendDm(bob.page, "Alice verified contact", "bob accepted dm invite reply");
     await expect(
       bob.page.getByText("bob accepted dm invite reply"),
@@ -290,7 +291,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await expectReciprocalGroupRuntimePeers(alice.page, bob.page);
+    await expectReciprocalRuntimePeers(alice.page, bob.page);
     await sendGroupMessage(alice.page, "alice group channel command ping");
     await sendGroupMessage(bob.page, "bob group channel command pong");
     await expect(
@@ -342,6 +343,7 @@ test("two isolated profiles finish invite and channel text flows without claimin
 
     const dmInvite = await createDmInviteForActiveContact(alice.page, "Bob");
     await acceptDmInvite(bob.page, dmInvite, "Alice verified contact");
+    await expectReciprocalRuntimePeers(alice.page, bob.page);
     await sendDm(
       bob.page,
       "Alice verified contact",
@@ -354,7 +356,7 @@ test("two isolated profiles finish invite and channel text flows without claimin
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await expectReciprocalGroupRuntimePeers(alice.page, bob.page);
+    await expectReciprocalRuntimePeers(alice.page, bob.page);
     await sendGroupMessage(alice.page, "alice group local text proof");
     await sendGroupMessage(bob.page, "bob group local text proof");
     await expectMessageStaysLocal(

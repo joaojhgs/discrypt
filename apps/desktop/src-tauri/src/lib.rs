@@ -167,6 +167,19 @@ pub struct UserProfileView {
     pub recovery_status: String,
 }
 
+/// Signed runtime peer row for DM text/control attachment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmRuntimePeerView {
+    /// Stable provider peer id derived from signed DM bootstrap metadata.
+    pub peer_id: String,
+    /// Role this peer represents for the current first-contact invite bootstrap.
+    pub role: String,
+    /// Whether this peer is the local device/profile role in this installed state.
+    pub is_local: bool,
+    /// Backend evidence source for this peer id.
+    pub source: String,
+}
+
 /// Direct-message conversation row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DirectConversationView {
@@ -178,6 +191,9 @@ pub struct DirectConversationView {
     pub display_name: String,
     /// Honest local/harness capability copy.
     pub local_only_copy: String,
+    /// Backend-returned local/remote runtime peers for attaching DM text/control DataChannels.
+    #[serde(default)]
+    pub runtime_peers: Vec<DmRuntimePeerView>,
     /// Persisted DM connectivity policy from the contact invite/acceptance flow.
     #[serde(default)]
     pub connectivity: Option<ConnectivityPolicyView>,
@@ -2622,13 +2638,16 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
         let dm_id = stable_id("dm", &display_name, state.next_sequence);
         if !state.dms.iter().any(|dm| dm.display_name == display_name) {
             let participant_id = stable_id("participant", &display_name, state.next_sequence);
+            let connectivity = dm_connectivity_policy(&dm_id, &participant_id);
+            let runtime_peers = dm_runtime_peers(Some(&connectivity), "inviter");
             state.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
                 participant_id: participant_id.clone(),
                 display_name: display_name.clone(),
                 local_only_copy: "Local harness-backed DM; no remote delivery is claimed"
                     .to_owned(),
-                connectivity: Some(dm_connectivity_policy(&dm_id, &participant_id)),
+                runtime_peers,
+                connectivity: Some(connectivity),
             });
         }
         let active_dm_id = state
@@ -3204,11 +3223,13 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
                 .map(|policy| &policy.scope_id_commitment)
                 == Some(&parsed.connectivity.scope_id_commitment)
         }) {
+            let runtime_peers = dm_runtime_peers(Some(&parsed.connectivity), "reply");
             state.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
                 participant_id,
                 display_name: display_name.clone(),
                 local_only_copy: "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt proof".to_owned(),
+                runtime_peers,
                 connectivity: Some(parsed.connectivity.clone()),
             });
         }
@@ -6420,12 +6441,15 @@ impl PersistedAppState {
             let friend = core_app_snapshot().friend;
             let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);
             let participant_id = participant_id_from_friend_code(&friend.friend_code);
+            let connectivity = dm_connectivity_policy(&dm_id, &participant_id);
+            let runtime_peers = dm_runtime_peers(Some(&connectivity), "inviter");
             self.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
                 participant_id: participant_id.clone(),
                 display_name: friend.alias,
                 local_only_copy: "Local DM seeded from a generated friend-code/QR payload; no remote delivery is claimed".to_owned(),
-                connectivity: Some(dm_connectivity_policy(&dm_id, &participant_id)),
+                runtime_peers,
+                connectivity: Some(connectivity),
             });
             self.active_context = Some(ActiveContextView {
                 kind: "dm".to_owned(),
@@ -7682,6 +7706,38 @@ fn runtime_peer_id_from_commitment(label: &str, commitment: &str) -> String {
     let digest = hash_commitment("discrypt-runtime-peer-id-v1", &[label, commitment]);
     let short = digest.get(..16).unwrap_or(digest.as_str());
     format!("peer-{short}")
+}
+
+fn dm_runtime_peers(
+    connectivity: Option<&ConnectivityPolicyView>,
+    local_role: &str,
+) -> Vec<DmRuntimePeerView> {
+    let Some(dm_bootstrap) = connectivity.and_then(|policy| policy.dm_bootstrap.as_ref()) else {
+        return Vec::new();
+    };
+    let inviter_peer_id = runtime_peer_id_from_commitment(
+        "dm-inviter-runtime-peer",
+        &dm_bootstrap.inviter_identity_commitment,
+    );
+    let reply_peer_id = runtime_peer_id_from_commitment(
+        "dm-reply-runtime-peer",
+        &dm_bootstrap.reply_rendezvous_commitment,
+    );
+    let local_is_inviter = local_role == "inviter";
+    vec![
+        DmRuntimePeerView {
+            peer_id: inviter_peer_id,
+            role: "inviter".to_owned(),
+            is_local: local_is_inviter,
+            source: "signed_dm_bootstrap_v1".to_owned(),
+        },
+        DmRuntimePeerView {
+            peer_id: reply_peer_id,
+            role: "reply".to_owned(),
+            is_local: !local_is_inviter,
+            source: "signed_dm_bootstrap_v1".to_owned(),
+        },
+    ]
 }
 
 fn group_runtime_peers(
@@ -9195,6 +9251,91 @@ mod tests {
             .as_ref()
             .map(|policy| policy.invite_kind.as_str())
             == Some("dm_contact")));
+    }
+
+    #[test]
+    fn dm_invite_accept_persists_signed_runtime_peers() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("dm-runtime-peers-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let opened = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        assert!(opened.last_command_error.is_none(), "{opened:?}");
+        let inviter_dm = opened
+            .dms
+            .iter()
+            .find(|dm| dm.display_name == "Bob")
+            .ok_or_else(|| "inviter DM missing".to_owned())?;
+        assert_eq!(inviter_dm.runtime_peers.len(), 2);
+        let inviter_local_peer = inviter_dm
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "inviter local runtime peer missing".to_owned())?;
+        assert_eq!(inviter_local_peer.role, "inviter");
+        assert_eq!(inviter_local_peer.source, "signed_dm_bootstrap_v1");
+        let inviter_remote_peer = inviter_dm
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "inviter remote runtime peer missing".to_owned())?;
+        assert_eq!(inviter_remote_peer.role, "reply");
+
+        let invited = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(inviter_dm.dm_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "1".to_owned(),
+        });
+        assert!(invited.last_command_error.is_none(), "{invited:?}");
+        let invite_code = invited
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "DM invite code missing".to_owned())?;
+
+        reset_with_temp_state("dm-runtime-peers-bob");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let accepted = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code,
+            display_name: Some("Alice".to_owned()),
+        });
+        assert!(accepted.last_command_error.is_none(), "{accepted:?}");
+        let reply_dm = accepted
+            .dms
+            .iter()
+            .find(|dm| dm.display_name == "Alice")
+            .ok_or_else(|| "reply DM missing".to_owned())?;
+        assert_eq!(reply_dm.runtime_peers.len(), 2);
+        let reply_local_peer = reply_dm
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "reply local runtime peer missing".to_owned())?;
+        assert_eq!(reply_local_peer.role, "reply");
+        assert_eq!(reply_local_peer.peer_id, inviter_remote_peer.peer_id);
+        let reply_remote_peer = reply_dm
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "reply remote runtime peer missing".to_owned())?;
+        assert_eq!(reply_remote_peer.role, "inviter");
+        assert_eq!(reply_remote_peer.peer_id, inviter_local_peer.peer_id);
+
+        let reloaded = load_state().to_view();
+        let persisted_dm = reloaded
+            .dms
+            .iter()
+            .find(|dm| dm.display_name == "Alice")
+            .ok_or_else(|| "persisted reply DM missing".to_owned())?;
+        assert_eq!(persisted_dm.runtime_peers, reply_dm.runtime_peers);
+        Ok(())
     }
 
     #[test]
