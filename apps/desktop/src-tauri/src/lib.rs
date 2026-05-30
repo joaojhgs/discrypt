@@ -1509,6 +1509,15 @@ struct TextControlTransportRuntime {
     remote_peer_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingTextControlTransportRuntime {
+    session_id: String,
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: String,
+    remote_peer_id: String,
+}
+
+#[derive(Clone)]
 struct TextControlRuntimeAttachInputs {
     profile: SignalingAdapterProfile,
     scope: ConversationScope,
@@ -1612,6 +1621,7 @@ static TEXT_CONTROL_RUNTIME_PUMP_STARTED: OnceLock<()> = OnceLock::new();
 struct TauriAppService {
     state: PersistedAppState,
     text_control_transport_runtime: Option<TextControlTransportRuntime>,
+    pending_text_control_transport_runtime: Option<PendingTextControlTransportRuntime>,
     #[cfg(test)]
     state_path_override: Option<PathBuf>,
 }
@@ -1621,6 +1631,7 @@ impl TauriAppService {
         Self {
             state: load_state(),
             text_control_transport_runtime: None,
+            pending_text_control_transport_runtime: None,
             #[cfg(test)]
             state_path_override: None,
         }
@@ -1632,6 +1643,7 @@ impl TauriAppService {
         Self {
             state: load_state_from_store(&mut store),
             text_control_transport_runtime: None,
+            pending_text_control_transport_runtime: None,
             state_path_override: Some(path),
         }
     }
@@ -1699,6 +1711,22 @@ impl TauriAppService {
                 | TransportSessionState::Failed
                 | TransportSessionState::Cancelled
         );
+        if let Some(pending) = &self.pending_text_control_transport_runtime {
+            if session_active && pending.session_id == session.session_id {
+                return TransportStatusView {
+                    label: "text/control runtime".to_owned(),
+                    status: "attaching".to_owned(),
+                    detail: format!(
+                        "Backend is starting provider-backed runtime session {} role={} local_peer={} remote_peer={}; no delivery claim is made until the DataChannel attaches",
+                        pending.session_id,
+                        runtime_role_label(Some(pending.role)),
+                        pending.local_peer_id,
+                        pending.remote_peer_id
+                    ),
+                };
+            }
+        }
+
         match (&self.text_control_transport_runtime, session_active) {
             (Some(runtime), true) if runtime.session_id == session.session_id => TransportStatusView {
                 label: "text/control runtime".to_owned(),
@@ -1756,6 +1784,7 @@ impl TauriAppService {
         transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
         session_id: impl Into<String>,
     ) {
+        self.pending_text_control_transport_runtime = None;
         self.text_control_transport_runtime = Some(TextControlTransportRuntime {
             transport,
             owned_runtime: None,
@@ -1778,6 +1807,7 @@ impl TauriAppService {
         let remote_peer_id = runtime.evidence().remote_peer_id.0.clone();
         let owned_runtime = Arc::new(runtime);
         let transport = owned_runtime.transport();
+        self.pending_text_control_transport_runtime = None;
         self.text_control_transport_runtime = Some(TextControlTransportRuntime {
             transport,
             owned_runtime: Some(owned_runtime),
@@ -1792,6 +1822,7 @@ impl TauriAppService {
     #[cfg_attr(not(test), allow(dead_code))]
     fn clear_text_control_transport_runtime(&mut self) {
         self.text_control_transport_runtime = None;
+        self.pending_text_control_transport_runtime = None;
     }
 
     fn clear_text_control_transport_runtime_if_session_mismatch(
@@ -1799,10 +1830,18 @@ impl TauriAppService {
         active_session_id: Option<&str>,
     ) {
         let Some(runtime) = &self.text_control_transport_runtime else {
+            if self
+                .pending_text_control_transport_runtime
+                .as_ref()
+                .is_some_and(|pending| Some(pending.session_id.as_str()) != active_session_id)
+            {
+                self.pending_text_control_transport_runtime = None;
+            }
             return;
         };
         if Some(runtime.session_id.as_str()) != active_session_id {
             self.text_control_transport_runtime = None;
+            self.pending_text_control_transport_runtime = None;
         }
     }
 
@@ -2201,65 +2240,99 @@ pub fn attach_text_control_transport_runtime(
                 return guard.to_view();
             }
         };
-        let executor = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-        {
-            Ok(executor) => Arc::new(executor),
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_unavailable",
-                    "attach_text_control_transport_runtime",
-                    "transport_runtime_executor_unavailable",
-                    format!("Could not start text/control runtime executor: {error}"),
-                    "Retry after the backend can construct a Tokio executor for the live provider runtime",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
+        let pending = PendingTextControlTransportRuntime {
+            session_id: active_session_id.clone(),
+            role,
+            local_peer_id: local_peer_id.0.clone(),
+            remote_peer_id: remote_peer_id.0.clone(),
         };
+        guard.pending_text_control_transport_runtime = Some(pending.clone());
+        guard.state.push_event(
+            "transport.text_runtime_attach_started",
+            format!(
+                "Starting provider-backed text/control runtime session {} as {} local_peer={} remote_peer={}",
+                active_session_id,
+                runtime_role_label(Some(role)),
+                pending.local_peer_id,
+                pending.remote_peer_id
+            ),
+        );
+        guard.persist();
+        let view = guard.to_view();
         drop(guard);
 
-        let runtime_result = start_role_split_text_control_runtime(
-            executor.clone(),
-            runtime_inputs,
-            role,
-            local_peer_id,
-            remote_peer_id,
-        );
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match runtime_result {
-            Ok(runtime) => {
-                guard.attach_owned_text_control_transport_runtime(
-                    runtime,
-                    executor,
-                    active_session_id.clone(),
-                );
-                guard.state.push_event(
-                    "transport.text_runtime_attached",
-                    format!(
-                        "Attached provider-backed text/control runtime session {} as {}",
-                        active_session_id,
-                        runtime_role_label(Some(role))
-                    ),
-                );
+        std::thread::spawn(move || {
+            let executor = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(executor) => Arc::new(executor),
+                Err(error) => {
+                    let service = app_service();
+                    let mut guard = service
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.pending_text_control_transport_runtime = None;
+                    guard.state.push_command_error(
+                        "transport.text_runtime_attach_unavailable",
+                        "attach_text_control_transport_runtime",
+                        "transport_runtime_executor_unavailable",
+                        format!("Could not start text/control runtime executor: {error}"),
+                        "Retry after the backend can construct a Tokio executor for the live provider runtime",
+                    );
+                    guard.persist();
+                    return;
+                }
+            };
+
+            let runtime_result = start_role_split_text_control_runtime(
+                executor.clone(),
+                runtime_inputs,
+                role,
+                local_peer_id,
+                remote_peer_id,
+            );
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match runtime_result {
+                Ok(runtime) => {
+                    guard.attach_owned_text_control_transport_runtime(
+                        runtime,
+                        executor,
+                        active_session_id.clone(),
+                    );
+                    guard.state.push_event(
+                        "transport.text_runtime_attached",
+                        format!(
+                            "Attached provider-backed text/control runtime session {} as {}",
+                            active_session_id,
+                            runtime_role_label(Some(role))
+                        ),
+                    );
+                }
+                Err(error) => {
+                    if guard
+                        .pending_text_control_transport_runtime
+                        .as_ref()
+                        .is_some_and(|pending| pending.session_id == active_session_id)
+                    {
+                        guard.pending_text_control_transport_runtime = None;
+                    }
+                    guard.state.push_command_error(
+                        "transport.text_runtime_attach_unavailable",
+                        "attach_text_control_transport_runtime",
+                        "transport_runtime_attach_failed",
+                        error,
+                        "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and STUN/TURN policy allows WebRTC",
+                    );
+                }
             }
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_unavailable",
-                    "attach_text_control_transport_runtime",
-                    "transport_runtime_attach_failed",
-                    error,
-                    "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and STUN/TURN policy allows WebRTC",
-                );
-            }
-        }
-        guard.persist();
-        return guard.to_view();
+            guard.persist();
+        });
+        return view;
     }
 
     let attachment = guard.state.latest_data_channel_probe.as_ref().map_or_else(
