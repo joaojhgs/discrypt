@@ -580,6 +580,10 @@ export type StopTextSessionRequest = {
   session_id?: string | null;
 };
 
+export type AttachTextControlTransportRuntimeRequest = {
+  session_id?: string | null;
+};
+
 export type SendMessageRequest = {
   target: MessageTargetView;
   body: string;
@@ -1976,6 +1980,26 @@ export async function stopTextSession(
         "Local fallback recorded text transport stop; no backend transport session was active",
       );
     }),
+  );
+}
+
+export async function attachTextControlTransportRuntime(
+  request: AttachTextControlTransportRuntimeRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "attach_text_control_transport_runtime",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "transport.runtime_attach_rejected",
+          "attach_text_control_transport_runtime",
+          "transport_runtime_unavailable",
+          "Local fallback web runtime cannot attach a long-lived text/control transport runtime; native Rust/Tauri command path is required",
+          "Run the native app and attach the backend runtime before claiming delivery",
+        );
+      }),
   );
 }
 

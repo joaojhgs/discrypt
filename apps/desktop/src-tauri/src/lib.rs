@@ -4617,12 +4617,14 @@ impl PersistedAppState {
             move |received| {
                 let received_frame: TextControlFrameView = serde_json::from_slice(&received)
                     .map_err(|error| {
-                        format!("receiver could not decode delivered text/control frame: {error}")
+                        format!(
+                            "receiver could not decode local delivered text/control frame: {error}"
+                        )
                     })?;
                 let receipt_frame = receiver_state
                     .handle_text_control_frame(received_frame)
                     .ok_or_else(|| {
-                        "receiver did not accept delivered envelope or generate receipt frame"
+                        "receiver did not accept local delivered envelope or generate receipt frame"
                             .to_owned()
                     })?;
                 *answerer_receipt_slot
