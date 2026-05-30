@@ -31,6 +31,8 @@ pub use policy::{
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingProviderEndpoint,
 };
+#[cfg(feature = "ipfs-pubsub-adapter")]
+pub use provider_adapters::IpfsPubsubProviderAdapter;
 #[cfg(feature = "mqtt-adapter")]
 pub use provider_adapters::MqttProviderAdapter;
 #[cfg(feature = "nostr-adapter")]

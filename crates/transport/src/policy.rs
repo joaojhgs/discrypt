@@ -725,6 +725,8 @@ fn is_loopback_cleartext(value: &str) -> bool {
         || ["http://[::1]:", "ws://[::1]:", "mqtt://[::1]:"]
             .iter()
             .any(|prefix| value.starts_with(prefix))
+        || value.starts_with("/ip4/127.0.0.1/")
+        || value.starts_with("/ip6/::1/")
 }
 
 fn lower_hex(bytes: &[u8]) -> String {

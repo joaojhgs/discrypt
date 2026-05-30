@@ -2,12 +2,16 @@
 //!
 //! Each required provider has a concrete adapter boundary that validates
 //! profiles, exposes redacted health, and fails closed unless an audited
-//! provider client is compiled behind its explicit Cargo feature. MQTT and Nostr
-//! now have real provider clients behind `mqtt-adapter` and `nostr-adapter`;
-//! IPFS/libp2p PubSub and the Rust QUIC rendezvous adapter remain explicit
-//! fail-closed boundaries until their real clients land.
+//! provider client is compiled behind its explicit Cargo feature. MQTT, Nostr,
+//! and IPFS/libp2p PubSub now have real provider clients behind explicit
+//! adapter features; the Rust QUIC rendezvous adapter remains an explicit
+//! fail-closed boundary until its sibling-service client lands.
 
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
 use crate::SignalingProviderEndpoint;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
@@ -18,14 +22,26 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "nostr-adapter")]
+#[cfg(any(feature = "nostr-adapter", feature = "ipfs-pubsub-adapter"))]
 use sha2::Digest;
 use std::collections::BTreeMap;
+#[cfg(feature = "ipfs-pubsub-adapter")]
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::Instant;
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+use tokio::time::{timeout, Duration};
 
 /// End-to-end readiness state used by registry and fallback planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,7 +148,11 @@ pub enum SignalingAdapterFactory {
     /// Nostr fail-closed boundary when feature is disabled.
     #[cfg(not(feature = "nostr-adapter"))]
     Nostr(FeatureGatedProviderAdapter),
-    /// IPFS/libp2p PubSub boundary until real client is wired.
+    /// IPFS/libp2p PubSub real implementation when feature-gated client is enabled.
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    IpfsPubsub(IpfsPubsubProviderAdapter),
+    /// IPFS/libp2p PubSub fail-closed boundary when feature is disabled.
+    #[cfg(not(feature = "ipfs-pubsub-adapter"))]
     IpfsPubsub(FeatureGatedProviderAdapter),
     /// Rust QUIC rendezvous boundary until real client is wired.
     DiscryptQuicRendezvous(FeatureGatedProviderAdapter),
@@ -164,7 +184,14 @@ impl SignalingAdapterFactory {
                 }
             }
             SignalingAdapterKind::IpfsPubsub => {
-                Self::IpfsPubsub(FeatureGatedProviderAdapter::new(kind))
+                #[cfg(feature = "ipfs-pubsub-adapter")]
+                {
+                    Self::IpfsPubsub(IpfsPubsubProviderAdapter)
+                }
+                #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+                {
+                    Self::IpfsPubsub(FeatureGatedProviderAdapter::new(kind))
+                }
             }
             SignalingAdapterKind::DiscryptQuicRendezvous => {
                 Self::DiscryptQuicRendezvous(FeatureGatedProviderAdapter::new(kind))
@@ -184,6 +211,9 @@ impl SignalingAdapterFactory {
             Self::Nostr(_) => adapter_boundary_for_kind(SignalingAdapterKind::Nostr),
             #[cfg(not(feature = "nostr-adapter"))]
             Self::Nostr(adapter) => adapter.boundary(),
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            Self::IpfsPubsub(_) => adapter_boundary_for_kind(SignalingAdapterKind::IpfsPubsub),
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
             Self::IpfsPubsub(adapter) => adapter.boundary(),
             Self::DiscryptQuicRendezvous(adapter) => adapter.boundary(),
         }
@@ -432,7 +462,7 @@ pub const fn adapter_boundary_for_kind(kind: SignalingAdapterKind) -> ProviderAd
         SignalingAdapterKind::IpfsPubsub => ProviderAdapterBoundary {
             kind,
             cargo_feature: "ipfs-pubsub-adapter",
-            readiness: feature_readiness(cfg!(feature = "ipfs-pubsub-adapter")),
+            readiness: ipfs_pubsub_feature_readiness(),
         },
         SignalingAdapterKind::DiscryptQuicRendezvous => ProviderAdapterBoundary {
             kind,
@@ -471,6 +501,14 @@ const fn mqtt_feature_readiness() -> ProviderAdapterReadiness {
 
 const fn nostr_feature_readiness() -> ProviderAdapterReadiness {
     if cfg!(feature = "nostr-adapter") {
+        ProviderAdapterReadiness::ImplementationAvailable
+    } else {
+        ProviderAdapterReadiness::FeatureDisabled
+    }
+}
+
+const fn ipfs_pubsub_feature_readiness() -> ProviderAdapterReadiness {
+    if cfg!(feature = "ipfs-pubsub-adapter") {
         ProviderAdapterReadiness::ImplementationAvailable
     } else {
         ProviderAdapterReadiness::FeatureDisabled
@@ -759,6 +797,73 @@ enum NostrWireEnvelope {
     },
 }
 
+#[cfg(feature = "ipfs-pubsub-adapter")]
+/// Real IPFS/libp2p PubSub signaling adapter.
+///
+/// This adapter uses rust-libp2p gossipsub over configured bootstrap
+/// multiaddrs. The PubSub topic is derived from [`RendezvousCapability`] and
+/// every published message is a Discrypt-specific JSON envelope containing
+/// only already-sealed presence, WebRTC negotiation, or control bytes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IpfsPubsubProviderAdapter;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[derive(Clone, Debug)]
+pub struct IpfsPubsubProviderSession {
+    profile: SignalingAdapterProfile,
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+pub struct IpfsPubsubProviderRoom {
+    local_peer_id: SignalingPeerId,
+    commands: tokio::sync::mpsc::Sender<IpfsPubsubCommand>,
+    inbox: Arc<AsyncMutex<IpfsPubsubInbox>>,
+    listen_addresses: Arc<AsyncMutex<Vec<String>>>,
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[derive(Debug, Default)]
+struct IpfsPubsubInbox {
+    presence: Vec<PresenceEvent>,
+    signals: Vec<PeerSignal>,
+    controls: Vec<ControlBroadcast>,
+    seen_messages: BTreeSet<String>,
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+enum IpfsPubsubCommand {
+    Publish {
+        payload: Vec<u8>,
+        result: tokio::sync::oneshot::Sender<Result<(), TransportError>>,
+    },
+    Leave {
+        result: tokio::sync::oneshot::Sender<Result<(), TransportError>>,
+    },
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum IpfsPubsubWireEnvelope {
+    Presence {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    },
+    Signal {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    },
+    Control {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+    },
+}
+
 #[cfg(feature = "nostr-adapter")]
 const NOSTR_DISCRYPT_EVENT_KIND: u16 = 31_733;
 
@@ -900,6 +1005,441 @@ fn mqtt_signal_topic(rendezvous_topic: &str, peer_id: &SignalingPeerId) -> Strin
         "discrypt/v1/rendezvous/{rendezvous_topic}/signal/{}",
         peer_id.0
     )
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_EVENT_SCHEMA: u8 = 1;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_err(context: &str, err: impl std::fmt::Display) -> TransportError {
+    TransportError::SignalingAdapter(format!("ipfs_pubsub {context} failed: {err}"))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_topic(rendezvous: &RendezvousCapability) -> libp2p::gossipsub::IdentTopic {
+    libp2p::gossipsub::IdentTopic::new(format!("discrypt/v1/rendezvous/{}", rendezvous.topic))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_multiaddr_from_endpoint(
+    endpoint: &SignalingProviderEndpoint,
+) -> Result<libp2p::Multiaddr, TransportError> {
+    let value = endpoint.endpoint.0.as_str();
+    let multiaddr = value.strip_prefix("libp2p://").unwrap_or(value);
+    multiaddr
+        .parse::<libp2p::Multiaddr>()
+        .map_err(|err| ipfs_err("multiaddr parse", err))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_should_dial(addr: &libp2p::Multiaddr) -> bool {
+    let text = addr.to_string();
+    !(text.contains("/tcp/0") || text.contains("/udp/0"))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_message_fingerprint(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    hex::encode(digest)
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_encode_envelope(envelope: &IpfsPubsubWireEnvelope) -> Result<Vec<u8>, TransportError> {
+    let bytes =
+        serde_json::to_vec(envelope).map_err(|err| ipfs_err("wire envelope encode", err))?;
+    if bytes.len() > IPFS_PUBSUB_MAX_MESSAGE_BYTES {
+        return Err(TransportError::SignalingAdapter(
+            "ipfs_pubsub envelope exceeds max message size".to_owned(),
+        ));
+    }
+    reject_forbidden_plaintext(&bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+async fn ipfs_command(
+    commands: &tokio::sync::mpsc::Sender<IpfsPubsubCommand>,
+    payload: Vec<u8>,
+) -> Result<(), TransportError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(IpfsPubsubCommand::Publish {
+            payload,
+            result: tx,
+        })
+        .await
+        .map_err(|_| {
+            TransportError::SignalingAdapter("ipfs_pubsub swarm task stopped".to_owned())
+        })?;
+    rx.await.map_err(|_| {
+        TransportError::SignalingAdapter("ipfs_pubsub publish result dropped".to_owned())
+    })?
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+impl IpfsPubsubProviderRoom {
+    /// Return local libp2p listen multiaddrs for integration tests and diagnostics.
+    #[must_use]
+    pub fn listen_addresses_for_tests(&self) -> Vec<String> {
+        self.listen_addresses
+            .try_lock()
+            .map(|addresses| addresses.clone())
+            .unwrap_or_default()
+    }
+
+    async fn record_message(
+        inbox: &Arc<AsyncMutex<IpfsPubsubInbox>>,
+        local_peer_id: &SignalingPeerId,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&bytes)?;
+        let fingerprint = ipfs_message_fingerprint(&bytes);
+        let envelope: IpfsPubsubWireEnvelope =
+            serde_json::from_slice(&bytes).map_err(|err| ipfs_err("wire envelope decode", err))?;
+        let mut inbox = inbox.lock().await;
+        if !inbox.seen_messages.insert(fingerprint) {
+            return Ok(());
+        }
+        match envelope {
+            IpfsPubsubWireEnvelope::Presence {
+                schema,
+                from_peer,
+                payload,
+                ttl_seconds,
+            } if schema == IPFS_PUBSUB_EVENT_SCHEMA && from_peer != *local_peer_id => {
+                inbox.presence.push(PresenceEvent {
+                    peer_id: from_peer,
+                    encrypted_presence: payload,
+                    ttl_seconds,
+                });
+            }
+            IpfsPubsubWireEnvelope::Signal {
+                schema,
+                from_peer,
+                to_peer,
+                payload,
+            } if schema == IPFS_PUBSUB_EVENT_SCHEMA && to_peer == *local_peer_id => {
+                inbox.signals.push(PeerSignal {
+                    from_peer,
+                    to_peer,
+                    payload,
+                });
+            }
+            IpfsPubsubWireEnvelope::Control {
+                schema,
+                from_peer,
+                payload,
+            } if schema == IPFS_PUBSUB_EVENT_SCHEMA && from_peer != *local_peer_id => {
+                inbox.controls.push(ControlBroadcast { from_peer, payload });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+async fn spawn_ipfs_pubsub_room(
+    profile: SignalingAdapterProfile,
+    rendezvous: RendezvousCapability,
+    local_peer_id: SignalingPeerId,
+) -> Result<IpfsPubsubProviderRoom, TransportError> {
+    let topic = ipfs_topic(&rendezvous);
+    let mut config = libp2p::gossipsub::ConfigBuilder::default();
+    config
+        .heartbeat_initial_delay(Duration::from_millis(200))
+        .heartbeat_interval(Duration::from_millis(300))
+        .max_transmit_size(IPFS_PUBSUB_MAX_MESSAGE_BYTES)
+        .validation_mode(libp2p::gossipsub::ValidationMode::Strict);
+    let gossipsub_config = config
+        .build()
+        .map_err(|err| ipfs_err("gossipsub config", err))?;
+    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .map_err(|err| ipfs_err("tcp transport", err))?
+        .with_behaviour(|keypair| {
+            libp2p::gossipsub::Behaviour::<
+                libp2p::gossipsub::IdentityTransform,
+                libp2p::gossipsub::AllowAllSubscriptionFilter,
+            >::new(
+                libp2p::gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+                gossipsub_config,
+            )
+            .unwrap_or_else(|error| {
+                panic!("validated ipfs_pubsub gossipsub config failed: {error}")
+            })
+        })
+        .map_err(|error| ipfs_err("swarm behaviour", error))?
+        .build();
+    swarm
+        .behaviour_mut()
+        .subscribe(&topic)
+        .map_err(|err| ipfs_err("subscribe topic", err))?;
+    swarm
+        .listen_on(
+            "/ip4/127.0.0.1/tcp/0"
+                .parse::<libp2p::Multiaddr>()
+                .map_err(|err| ipfs_err("listen multiaddr parse", err))?,
+        )
+        .map_err(|err| ipfs_err("listen", err))?;
+    for endpoint in &profile.endpoints {
+        let addr = ipfs_multiaddr_from_endpoint(endpoint)?;
+        if ipfs_should_dial(&addr) {
+            let _ = swarm.dial(addr);
+        }
+    }
+
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(128);
+    let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
+    let inbox = Arc::new(AsyncMutex::new(IpfsPubsubInbox::default()));
+    let task_inbox = inbox.clone();
+    let listen_addresses = Arc::new(AsyncMutex::new(Vec::<String>::new()));
+    let task_listen_addresses = listen_addresses.clone();
+    let task_local_peer_id = local_peer_id.clone();
+    let mut listen_tx = Some(listen_tx);
+    let task_topic = topic.clone();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        loop {
+            tokio::select! {
+                command = command_rx.recv() => {
+                    let Some(command) = command else { break; };
+                    match command {
+                        IpfsPubsubCommand::Publish { payload, result } => {
+                            let outcome = swarm
+                                .behaviour_mut()
+                                .publish(task_topic.clone(), payload)
+                                .map(|_| ())
+                                .map_err(|err| ipfs_err("publish", err));
+                            let _ = result.send(outcome);
+                        }
+                        IpfsPubsubCommand::Leave { result } => {
+                            let outcome = swarm
+                                .behaviour_mut()
+                                .unsubscribe(&task_topic)
+                                .map(|_| ())
+                                .map_err(|err| ipfs_err("unsubscribe", err));
+                            let _ = result.send(outcome);
+                            break;
+                        }
+                    }
+                }
+                event = swarm.select_next_some() => {
+                    match event {
+                        libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
+                            let address = address.to_string();
+                            task_listen_addresses.lock().await.push(address.clone());
+                            if let Some(sender) = listen_tx.take() {
+                                let _ = sender.send(address);
+                            }
+                        }
+                        libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            swarm.behaviour_mut().add_explicit_peer(&peer_id);
+                        }
+                        libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            swarm.behaviour_mut().remove_explicit_peer(&peer_id);
+                        }
+                        libp2p::swarm::SwarmEvent::Behaviour(libp2p::gossipsub::Event::Message { message, .. }) => {
+                            let _ = IpfsPubsubProviderRoom::record_message(
+                                &task_inbox,
+                                &task_local_peer_id,
+                                message.data,
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    timeout(Duration::from_secs(5), listen_rx)
+        .await
+        .map_err(|_| {
+            TransportError::SignalingAdapter("ipfs_pubsub listen address timed out".to_owned())
+        })?
+        .map_err(|_| {
+            TransportError::SignalingAdapter("ipfs_pubsub listen address dropped".to_owned())
+        })?;
+
+    Ok(IpfsPubsubProviderRoom {
+        local_peer_id,
+        commands: command_tx,
+        inbox,
+        listen_addresses,
+    })
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[async_trait]
+impl SignalingAdapter for IpfsPubsubProviderAdapter {
+    type Session = IpfsPubsubProviderSession;
+
+    async fn connect(
+        &self,
+        profile: SignalingAdapterProfile,
+    ) -> Result<Self::Session, TransportError> {
+        profile.validate()?;
+        if profile.kind != SignalingAdapterKind::IpfsPubsub {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "adapter profile kind {} does not match ipfs_pubsub adapter",
+                profile.kind.canonical_name()
+            )));
+        }
+        for endpoint in &profile.endpoints {
+            let _ = ipfs_multiaddr_from_endpoint(endpoint)?;
+        }
+        Ok(IpfsPubsubProviderSession { profile })
+    }
+
+    fn capabilities(&self) -> SignalingAdapterCapabilities {
+        SignalingAdapterCapabilities::production_required()
+    }
+
+    fn observability_redacted(&self) -> SignalingObservability {
+        SignalingObservability {
+            adapter_kind: SignalingAdapterKind::IpfsPubsub,
+            endpoint_label: "ipfs_pubsub#configured_profile".to_owned(),
+            health: SignalingHealthState::Healthy,
+            trust_label: AdapterTrustLabel {
+                label: "ipfs_pubsub".to_owned(),
+                posture: "real rust-libp2p gossipsub client; peers see topic hashes and opaque Discrypt envelopes".to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[async_trait]
+impl AdapterSession for IpfsPubsubProviderSession {
+    type Room = IpfsPubsubProviderRoom;
+
+    async fn join(
+        &self,
+        scope: ConversationScope,
+        rendezvous: RendezvousCapability,
+        local_peer_id: SignalingPeerId,
+    ) -> Result<Self::Room, TransportError> {
+        scope.validate()?;
+        if rendezvous.scope != scope {
+            return Err(TransportError::SignalingAdapter(
+                "rendezvous capability scope mismatch".to_owned(),
+            ));
+        }
+        if rendezvous.adapter_kind != SignalingAdapterKind::IpfsPubsub {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "rendezvous capability kind {} does not match ipfs_pubsub adapter",
+                rendezvous.adapter_kind.canonical_name()
+            )));
+        }
+        spawn_ipfs_pubsub_room(self.profile.clone(), rendezvous, local_peer_id).await
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> SignalingHealth {
+        SignalingHealth {
+            adapter_kind: SignalingAdapterKind::IpfsPubsub,
+            state: SignalingHealthState::Healthy,
+            latency_bucket: "unknown".to_owned(),
+            failure_class: None,
+        }
+    }
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[async_trait]
+impl RendezvousRoom for IpfsPubsubProviderRoom {
+    async fn publish_presence(
+        &self,
+        encrypted_presence: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        if ttl_seconds == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "presence ttl must be non-zero".to_owned(),
+            ));
+        }
+        reject_forbidden_plaintext(&encrypted_presence.bytes)?;
+        let payload = ipfs_encode_envelope(&IpfsPubsubWireEnvelope::Presence {
+            schema: IPFS_PUBSUB_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            payload: encrypted_presence,
+            ttl_seconds,
+        })?;
+        ipfs_command(&self.commands, payload).await
+    }
+
+    async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.presence))
+    }
+
+    async fn send_signal(
+        &self,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&payload.ciphertext)?;
+        let payload = ipfs_encode_envelope(&IpfsPubsubWireEnvelope::Signal {
+            schema: IPFS_PUBSUB_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            to_peer,
+            payload,
+        })?;
+        ipfs_command(&self.commands, payload).await
+    }
+
+    async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.signals))
+    }
+
+    async fn broadcast_control(
+        &self,
+        sealed_payload: OpaqueSignalingPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        let payload = ipfs_encode_envelope(&IpfsPubsubWireEnvelope::Control {
+            schema: IPFS_PUBSUB_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            payload: sealed_payload,
+        })?;
+        ipfs_command(&self.commands, payload).await
+    }
+
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.controls))
+    }
+
+    async fn leave(&self) -> Result<(), TransportError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(IpfsPubsubCommand::Leave { result: tx })
+            .await
+            .map_err(|_| {
+                TransportError::SignalingAdapter("ipfs_pubsub swarm task stopped".to_owned())
+            })?;
+        rx.await.map_err(|_| {
+            TransportError::SignalingAdapter("ipfs_pubsub leave result dropped".to_owned())
+        })?
+    }
 }
 
 #[cfg(feature = "nostr-adapter")]
@@ -1865,9 +2405,7 @@ mod tests {
         match kind {
             SignalingAdapterKind::Mqtt => "wss://mqtt.example.invalid",
             SignalingAdapterKind::Nostr => "wss://nostr.example.invalid",
-            SignalingAdapterKind::IpfsPubsub => {
-                "/dns/bootstrap.example.invalid/tcp/4001/p2p/12D3KooWBootstrap"
-            }
+            SignalingAdapterKind::IpfsPubsub => "/dns/bootstrap.example.invalid/tcp/4001",
             SignalingAdapterKind::DiscryptQuicRendezvous => "quic://signal.example.invalid",
         }
     }
@@ -1924,7 +2462,9 @@ mod tests {
         };
         if matches!(
             boundary.kind,
-            SignalingAdapterKind::Mqtt | SignalingAdapterKind::Nostr
+            SignalingAdapterKind::Mqtt
+                | SignalingAdapterKind::Nostr
+                | SignalingAdapterKind::IpfsPubsub
         ) && feature_enabled
         {
             ProviderAdapterReadiness::ImplementationAvailable
@@ -2230,42 +2770,130 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "ipfs-pubsub-adapter")]
-    async fn ipfs_pubsub_feature_gate_remains_fail_closed_until_real_pubsub_runtime_is_wired(
+    async fn ipfs_pubsub_adapter_feature_is_selectable_with_real_libp2p_client(
     ) -> Result<(), TransportError> {
         let boundary = adapter_boundary_for_kind(SignalingAdapterKind::IpfsPubsub);
         assert_eq!(
             boundary.readiness,
-            ProviderAdapterReadiness::ImplementationUnavailable
+            ProviderAdapterReadiness::ImplementationAvailable
         );
-        assert_eq!(boundary.failure_class(), "implementation_unavailable");
-        assert!(!SignalingAdapterFactory::for_kind(SignalingAdapterKind::IpfsPubsub).selectable());
+        assert_eq!(boundary.failure_class(), "implementation_available");
+        assert!(SignalingAdapterFactory::for_kind(SignalingAdapterKind::IpfsPubsub).selectable());
 
         let plan = plan_signaling_adapter_fallback(
             &[SignalingAdapterKind::IpfsPubsub],
             AdapterFallbackBehavior::ManualOnly,
             Some(SignalingAdapterKind::IpfsPubsub),
         );
-        assert_eq!(plan.selected, None);
+        assert_eq!(plan.selected, Some(SignalingAdapterKind::IpfsPubsub));
         assert_eq!(plan.attempts.len(), 1);
-        assert_eq!(
-            plan.attempts[0].readiness,
-            AdapterReadinessState::ImplementationUnavailable
-        );
-        assert!(!plan.attempts[0].selected);
+        assert_eq!(plan.attempts[0].readiness, AdapterReadinessState::Available);
+        assert!(plan.attempts[0].selected);
 
-        let adapter = FeatureGatedProviderAdapter::new(SignalingAdapterKind::IpfsPubsub);
-        let error = adapter
+        let adapter = IpfsPubsubProviderAdapter;
+        let session = adapter
             .connect(valid_profile(SignalingAdapterKind::IpfsPubsub)?)
-            .await;
-        assert!(matches!(error, Err(TransportError::SignalingAdapter(_))));
-        let message = error
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
-        assert!(message.contains("ipfs_pubsub"));
-        assert!(message.contains("no audited production provider client is wired"));
+            .await?;
+        assert_eq!(session.health().await.state, SignalingHealthState::Healthy);
+        let observability = adapter.observability_redacted();
+        assert_eq!(observability.adapter_kind, SignalingAdapterKind::IpfsPubsub);
+        assert!(!observability.endpoint_label.contains("example.invalid"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip(
+    ) -> Result<(), TransportError> {
+        let adapter = IpfsPubsubProviderAdapter;
+        let alice = SignalingPeerId::new("alice-device")?;
+        let bob = SignalingPeerId::new("bob-device")?;
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(ConnectivityScopeLevel::Dm, b"ipfs local dm", "test"),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::IpfsPubsub,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("ipfs_pubsub", "local rust-libp2p gossipsub")?,
+        )?;
+
+        let alice_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-alice-local".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("/ip4/127.0.0.1/tcp/0"),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "local rust-libp2p gossipsub")?,
+        };
+        let alice_room = adapter
+            .connect(alice_profile)
+            .await?
+            .join(scope.clone(), capability.clone(), alice.clone())
+            .await?;
+        let alice_addr = alice_room
+            .listen_addresses_for_tests()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                TransportError::SignalingAdapter("missing alice listen address".to_owned())
+            })?;
+        let bob_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-bob-local".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new(alice_addr),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "local rust-libp2p gossipsub")?,
+        };
+        let bob_room = adapter
+            .connect(bob_profile)
+            .await?
+            .join(scope, capability, bob.clone())
+            .await?;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        alice_room
+            .publish_presence(
+                OpaqueSignalingPayload::new(b"sealed-presence-alice".to_vec())?,
+                120,
+            )
+            .await?;
+        let bob_presence = bob_room.subscribe_presence().await?;
+        assert!(bob_presence.iter().any(|event| event.peer_id == alice));
+
+        let offer = SealedWebRtcNegotiationPayload {
+            version: 1,
+            kind: WebRtcNegotiationPayloadKind::Offer,
+            nonce: [7; 12],
+            ciphertext: b"sealed-ipfs-offer".to_vec(),
+        };
+        alice_room.send_signal(bob.clone(), offer.clone()).await?;
+        let bob_signals = bob_room.take_signals().await?;
+        assert!(bob_signals.iter().any(|signal| signal.payload == offer));
+
+        bob_room
+            .broadcast_control(OpaqueSignalingPayload::new(b"sealed-control-bob".to_vec())?)
+            .await?;
+        let alice_controls = alice_room.take_control_payloads().await?;
+        assert!(alice_controls
+            .iter()
+            .any(|control| control.from_peer == bob));
+
+        alice_room.leave().await?;
+        bob_room.leave().await?;
         Ok(())
     }
 

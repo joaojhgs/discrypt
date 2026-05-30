@@ -4,11 +4,11 @@ _Last updated: 2026-05-30_
 
 ## Executive status
 
-Discrypt is **not production-complete** for the full serverless P2P encrypted app target yet. This update made the first real public-provider signaling path work at the Rust transport boundary:
+Discrypt is **not production-complete** for the full serverless P2P encrypted app target yet. This update has real MQTT, Nostr, and IPFS/libp2p signaling paths at the Rust transport boundary, but it is still not a complete installed-app proof:
 
 - **MQTT public signaling: implemented behind `mqtt-adapter` and verified against a real public broker.**
 - **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
-- **IPFS/libp2p PubSub signaling: fail-closed groundwork is locked by `ipfs-pubsub-adapter` feature tests; no real pubsub client/runtime is wired yet.**
+- **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; public bootstrap smoke exists but still requires configured bootstrap multiaddrs.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
 - **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof is at the transport signaling adapter layer, not the complete UI/backend/media plane.
 
@@ -41,7 +41,7 @@ Behavior:
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
 - **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
 
-### Nostr real adapter and remaining fail-closed adapter readiness groundwork
+### Nostr and IPFS real adapters plus remaining fail-closed QUIC readiness groundwork
 
 Files:
 
@@ -55,12 +55,15 @@ Commands:
 cargo test -q -p discrypt-transport --features nostr-adapter \
   nostr_adapter_feature_is_selectable_with_real_relay_client
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
-  ipfs_pubsub_feature_gate_remains_fail_closed_until_real_pubsub_runtime_is_wired
+  ipfs_pubsub_adapter_feature_is_selectable_with_real_libp2p_client
+
+cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
+  ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
   quic_rendezvous_feature_gate_remains_fail_closed_until_sibling_client_is_wired
 ```
 
-Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p and QUIC still pass fail-closed guards proving those adapters remain non-selectable until real provider clients are implemented and tested.
+Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; QUIC still passes fail-closed guards proving it remains non-selectable until the sibling-service client is implemented and tested.
 
 ### Public real-network test
 
@@ -102,12 +105,13 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
   - add multi-relay soak/fallback evidence beyond the single public relay smoke,
   - add provider-visible capture scans.
 - [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
-- [ ] Implement real IPFS/libp2p PubSub adapter:
-  - choose and audit Rust or JS/libp2p runtime,
-  - configure bootstrap peers/resource limits,
-  - support topic cleanup and duplicate suppression,
+- [x] Implement real IPFS/libp2p PubSub adapter with rust-libp2p gossipsub, derived topics, opaque envelopes, unsubscribe, duplicate suppression, and local two-node transport E2E.
+- [ ] Complete IPFS/libp2p production hardening:
+  - configure public/default bootstrap peer policy and resource limits,
+  - map libp2p bootstrap/resource/message failures to typed health,
   - define what “public default IPFS” means without requiring a user-hosted Kubo API,
-  - add realistic multi-node or public-swarm E2E.
+  - run public-swarm E2E with configured bootstrap multiaddrs,
+  - add provider-visible metadata capture scans.
 - [x] Lock separate Rust QUIC rendezvous feature-gate/fail-closed readiness and document production requirements.
 - [ ] Wire separate Rust QUIC rendezvous adapter:
   - use the sibling signaling service as an explicit/self-hosted adapter,
@@ -165,10 +169,11 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 | Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
 | Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Opaque transport behavior under a live broker when enabled |
 | Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed once against `wss://relay.damus.io`; `wss://nostr.oxtr.dev` returned blocked |
-| Planned IPFS public-provider proof | `cargo test -p discrypt-transport public_ipfs_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal/control only |
+| IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Test exists; public bootstrap run still missing until bootstrap endpoints are selected/configured |
 | Planned QUIC public-provider proof | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
 
-- Real producer/adapter route proofs still missing in this release gate: multi-relay Nostr soak plus live IPFS/QUIC public-provider route proofs and end-to-end mobile transport smoke (tracked separately).
+- Real producer/adapter route proofs still missing in this release gate: multi-relay Nostr soak, live IPFS public-bootstrap proof, live QUIC public-provider proof, and end-to-end mobile/installed-app transport smoke (tracked separately).
 - Missing adapter check status is intentionally exposed as blockers instead of fake green signals in this phase.
 
 ## How to rerun the current real MQTT proof
