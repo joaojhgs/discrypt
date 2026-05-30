@@ -56,4 +56,5 @@ panic = "warn"
 unwrap_used = "warn"
 expect_used = "warn"
 [patch.crates-io]
+libp2p = { path = "third_party/libp2p-0.56.0-discrypt" }
 hpke-rs-libcrux = { path = "third_party/hpke-rs-libcrux-0.6.1-discrypt" }
