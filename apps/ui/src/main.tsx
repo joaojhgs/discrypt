@@ -55,6 +55,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectItem } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
@@ -917,22 +918,23 @@ function ServerRail({
       )
         .slice(0, 6)
         .map((group) => (
-          <button
+          <Button
             key={group.group_id}
-            type="button"
+            variant="outline"
+            size="icon"
             title={group.name}
             aria-label={`Open ${group.name} group`}
             onClick={() => onSelectGroup(group.group_id)}
             disabled={group.group_id === "local"}
             className={cn(
-              "grid h-11 w-11 place-items-center rounded-2xl border text-xs font-bold transition hover:border-[hsl(var(--primary)/0.6)] hover:text-[hsl(var(--foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] disabled:cursor-default",
+              "h-11 w-11 rounded-2xl text-xs font-bold disabled:cursor-default",
               group.group_id === activeGroup?.group_id
                 ? "border-[hsl(var(--primary)/0.6)] bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))]"
                 : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
             )}
           >
             {group.name.slice(0, 2).toUpperCase()}
-          </button>
+          </Button>
         ))}
       <div
         className="mt-auto grid h-10 w-10 place-items-center rounded-xl border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
@@ -1255,21 +1257,24 @@ function ConfigSelect({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="flex items-center gap-2 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.35)] px-2 py-1 text-xs text-[hsl(var(--muted-foreground))]">
-      <span className="px-1">{label}</span>
-      <select
+    <div className="flex items-center gap-2 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.35)] px-2 py-1 text-xs text-[hsl(var(--muted-foreground))]">
+      <Label className="px-1 text-xs" htmlFor={`config-${label.toLowerCase()}`}>
+        {label}
+      </Label>
+      <Select
+        id={`config-${label.toLowerCase()}`}
         aria-label={label}
         value={value}
-        onChange={(event) => onChange(event.currentTarget.value)}
-        className="h-8 min-w-36 rounded-lg border-0 bg-transparent px-2 text-[hsl(var(--foreground))] outline-none"
+        onValueChange={onChange}
+        className="h-8 min-w-36 border-0 bg-transparent px-2 text-xs"
       >
         {options.map((option) => (
-          <option key={option.value} value={option.value}>
+          <SelectItem key={option.value} value={option.value}>
             {option.label}
-          </option>
+          </SelectItem>
         ))}
-      </select>
-    </label>
+      </Select>
+    </div>
   );
 }
 

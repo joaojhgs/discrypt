@@ -34,6 +34,7 @@ for (const token of [
   "npm --prefix apps/ui run test:honesty",
   "npm --prefix apps/ui run test:command-coverage",
   "npm --prefix apps/ui run test:release-no-fallback-g129",
+  "npm --prefix apps/ui run test:ui-integration-g130",
   "npm --prefix apps/ui run build",
   "cargo test -p discrypt-desktop --features",
   "npx --yes @tauri-apps/cli@2.11.2 build",

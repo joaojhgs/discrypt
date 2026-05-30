@@ -91,6 +91,7 @@ steps.push(
   run("npm", ["--prefix", "apps/ui", "run", "test:honesty"]),
   run("npm", ["--prefix", "apps/ui", "run", "test:command-coverage"]),
   run("npm", ["--prefix", "apps/ui", "run", "test:release-no-fallback-g129"]),
+  run("npm", ["--prefix", "apps/ui", "run", "test:ui-integration-g130"]),
   run("npm", ["--prefix", "apps/ui", "run", "build"]),
   run("cargo", ["test", "-p", "discrypt-desktop", "--features", releaseFeatures.join(",")]),
   run("npx", [

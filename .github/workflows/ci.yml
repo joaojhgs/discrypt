@@ -97,3 +97,5 @@ jobs:
         working-directory: apps/ui
       - run: npm run test:release-no-fallback-g129
         working-directory: apps/ui
+      - run: npm run test:ui-integration-g130
+        working-directory: apps/ui
