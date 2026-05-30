@@ -84,7 +84,7 @@ if (/ignore = \[[^\]]+\]/.test(files.deny)) failures.push('deny.toml advisory ig
 run('cargo metadata locked', 'cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps']);
 run('cargo deny licenses', 'cargo', ['deny', 'check', 'licenses', '--hide-inclusion-graph']);
 run('cargo deny bans sources', 'cargo', ['deny', 'check', 'bans', 'sources', '--hide-inclusion-graph']);
-run('npm production audit', 'npm', ['--prefix', 'apps/ui', 'audit', '--audit-level=high', '--omit=dev']);
+run('npm advisory gate', 'node', ['scripts/check-npm-audit-g123.mjs']);
 
 if (failures.length > 0) {
   console.error('ADR-008 supply-chain check failed:');
