@@ -22,7 +22,8 @@ The gate checks:
 - the configurable theme/template system remains in `apps/ui/src/app-config.ts`;
 - Playwright specs cover setup/recovery, DM, group invite/join, channel creation,
   text send, voice controls, fake-member absence, responsive navigation,
-  persistence, and transport-status honesty; and
+  persistence, transport-status honesty, and route/join-state evidence gating (policy-only
+  claims until backend proof exists); and
 - CI runs `test:ui-integration-g130`.
 
 Run:

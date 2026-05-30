@@ -280,3 +280,45 @@ test("transport status surfaces signaling not-ready state before invite metadata
     page.getByRole("button", { name: /create invite for active group/i }),
   ).toBeDisabled();
 });
+
+test("transport and join progress stay evidence-based after invite creation", async ({
+  page,
+}) => {
+  const transportStrip = page.locator(
+    "section[aria-label='Backend-derived transport status']",
+  );
+  await expect(transportStrip.getByText(/waiting-for-invite/i)).toBeVisible();
+
+  await page
+    .getByRole("navigation", { name: /workspace sections/i })
+    .getByRole("button", { name: "Groups", exact: true })
+    .click();
+  await page.getByLabel("Group name").fill("Policy Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general" })).toBeVisible();
+
+  await page
+    .getByRole("navigation", { name: /workspace sections/i })
+    .getByRole("button", { name: "Invites", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: /create invite for active group/i })
+    .click();
+  await expect(
+    page.getByText(/invite ready: discrypt:\/\/join\/v1/i),
+  ).toBeVisible();
+
+  await expect(transportStrip.getByText(/signaling/i)).toBeVisible();
+  await expect(transportStrip.getByText(/signed-endpoint-ready/i)).toBeVisible();
+  await expect(transportStrip.getByText(/no-direct-proof/i)).toBeVisible();
+  await expect(transportStrip.getByText(/not-configured/i)).toBeVisible();
+  await expect(
+    page.getByText(/waiting-route-proof/i).first(),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/Rendezvous link/i),
+  ).toBeVisible();
+});

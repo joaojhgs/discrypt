@@ -39,6 +39,7 @@ Behavior:
 - Keeps the public broker away from raw SDP, ICE credentials, display names, group names, invite secrets, message plaintext, and audio plaintext.
 - Marks MQTT boundary readiness as `implementation_available` only when compiled with `mqtt-adapter`.
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
+- **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
 
 ### Public real-network test
 
