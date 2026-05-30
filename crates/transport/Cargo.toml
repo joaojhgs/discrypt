@@ -15,6 +15,10 @@ local-dev = []
 production-network = []
 production-media = []
 production-storage = []
+mqtt-adapter = ["production-network"]
+nostr-adapter = ["production-network"]
+ipfs-pubsub-adapter = ["production-network"]
+discrypt-quic-rendezvous-adapter = ["production-network"]
 
 [dependencies]
 rand = { workspace = true }
