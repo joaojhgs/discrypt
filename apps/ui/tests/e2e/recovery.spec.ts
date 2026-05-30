@@ -16,13 +16,9 @@ test("first-run recovery restores account continuity without content-key claims"
   await page.getByRole("button", { name: /recover existing user/i }).click();
 
   await expect(
-    page.getByRole("navigation", { name: /workspace sections/i }),
+    page.getByRole("heading", { name: /finish the local trust setup/i }),
   ).toBeVisible();
   await expect(page.getByText(/Recovered Private Lab/i).first()).toBeVisible();
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Setup", exact: true })
-    .click();
   await expect(
     page.getByText(/2 authorized local devices available/i),
   ).toBeVisible();

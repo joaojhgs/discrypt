@@ -41,6 +41,8 @@ import {
   savePreferences,
   sendMessage,
   setActiveGroup,
+  setActiveChannel,
+  setActiveDm,
   setSelfMute,
   setSpeakerVolume,
   updateVoiceActivity,
@@ -351,7 +353,13 @@ function App() {
   useEffect(() => {
     let mounted = true;
     loadAppState()
-      .then((loaded) => mounted && setCommandState(loaded))
+      .then((loaded) => {
+        if (!mounted) return;
+        setCommandState(loaded);
+        if (loaded.groups.length > 0 && loaded.lifecycle !== "first_run") {
+          setWorkflow("channel");
+        }
+      })
       .catch(
         (error: unknown) =>
           mounted &&
@@ -627,6 +635,29 @@ function App() {
     );
   }
 
+  function focusCommandChannel(channelId: string, kind: ChannelKind) {
+    if (!activeGroup) return;
+    const targetWorkflow = kind === "Voice" ? "voice" : "channel";
+    void applyCommand(
+      setActiveChannel({ group_id: activeGroup.group_id, channel_id: channelId }),
+      () => {
+        setWorkflow(targetWorkflow);
+        if (targetWorkflow === "channel" && window.__TAURI__?.core?.invoke) {
+          void attachTextRuntime("answerer");
+        }
+      },
+    );
+  }
+
+  function focusCommandDm(dmId: string) {
+    void applyCommand(setActiveDm({ dm_id: dmId }), () => {
+      setWorkflow("dm");
+      if (window.__TAURI__?.core?.invoke) {
+        void attachTextRuntime("answerer");
+      }
+    });
+  }
+
   function createCommandChannel(kind: ChannelKind = "Text") {
     if (!activeGroup) {
       setCommandError("Create or join a group before adding a channel.");
@@ -881,7 +912,7 @@ function App() {
       className={cn(
         "grid min-h-dvh overflow-hidden bg-[hsl(var(--background))] text-[hsl(var(--foreground))]",
         showInspector
-          ? "grid-cols-1 lg:grid-cols-[72px_300px_minmax(0,1fr)] 2xl:grid-cols-[72px_300px_minmax(0,1fr)_330px]"
+          ? "grid-cols-1 lg:grid-cols-[72px_300px_minmax(0,1fr)_280px]"
           : "grid-cols-1 lg:grid-cols-[72px_300px_minmax(0,1fr)]",
       )}
     >
@@ -896,12 +927,17 @@ function App() {
         role={activeGroup?.role ?? "local profile"}
         textChannels={textChannels}
         voiceChannels={voiceChannels}
+        dms={appState.dms}
+        activeDmId={activeDm?.dm_id ?? null}
+        activeChannelId={activeTextChannel?.channel_id ?? null}
         selectedWorkflow={workflow}
         onSelectWorkflow={setWorkflow}
         onOpenCreateGroup={() => setWorkflow("create-group")}
         onOpenJoin={() => setWorkflow("join")}
-        onOpenChannel={() => setWorkflow("channel")}
-        onOpenDm={() => setWorkflow("dm")}
+        onSelectTextChannel={(channelId) => focusCommandChannel(channelId, "Text")}
+        onSelectVoiceChannel={(channelId) => focusCommandChannel(channelId, "Voice")}
+        onSelectDm={focusCommandDm}
+        onOpenNewDm={() => setWorkflow("dm")}
         voiceJoined={voiceJoined}
         participants={participants}
         setupSteps={setupSteps}
@@ -921,7 +957,6 @@ function App() {
           inspectorOpen={inspectorOpen}
           canCreateInvite={Boolean(activeGroup)}
         />
-        <RuntimeModeBanner runtimeMode={appState.runtime_mode} />
         {commandError ? (
           <p className="mx-4 mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 md:mx-6">
             Command note: {commandError}
@@ -932,20 +967,6 @@ function App() {
             Invite ready: {appState.invites.at(-1)?.code}
           </p>
         ) : null}
-        <TransportStatusStrip
-          statuses={appState.transport_status}
-          diagnostics={appState.transport_diagnostics}
-          localPeerId={runtimeLocalPeerId || runtimePeerDefaults.local}
-          remotePeerId={runtimeRemotePeerId || runtimePeerDefaults.remote}
-          onLocalPeerIdChange={setRuntimeLocalPeerId}
-          onRemotePeerIdChange={setRuntimeRemotePeerId}
-          onProbeAdapter={probeSelectedAdapter}
-          onProbeDataChannel={probeSelectedDataChannel}
-          onStartTextTransport={startTextTransportProof}
-          onAttachOfferer={() => attachTextRuntime("offerer")}
-          onAttachAnswerer={() => attachTextRuntime("answerer")}
-        />
-        <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
           {workflow === "setup" ? (
             <SetupPanel
@@ -1046,6 +1067,15 @@ function App() {
           resetPhrase={resetPhrase}
           setResetPhrase={setResetPhrase}
           onResetState={resetCommandState}
+          localPeerId={runtimeLocalPeerId || runtimePeerDefaults.local}
+          remotePeerId={runtimeRemotePeerId || runtimePeerDefaults.remote}
+          onLocalPeerIdChange={setRuntimeLocalPeerId}
+          onRemotePeerIdChange={setRuntimeRemotePeerId}
+          onProbeAdapter={probeSelectedAdapter}
+          onProbeDataChannel={probeSelectedDataChannel}
+          onStartTextTransport={startTextTransportProof}
+          onAttachOfferer={() => attachTextRuntime("offerer")}
+          onAttachAnswerer={() => attachTextRuntime("answerer")}
         />
       ) : null}
     </main>
@@ -1296,12 +1326,17 @@ function ChannelSidebar({
   role,
   textChannels,
   voiceChannels,
+  dms,
+  activeDmId,
+  activeChannelId,
   selectedWorkflow,
   onSelectWorkflow,
   onOpenCreateGroup,
   onOpenJoin,
-  onOpenChannel,
-  onOpenDm,
+  onSelectTextChannel,
+  onSelectVoiceChannel,
+  onSelectDm,
+  onOpenNewDm,
   voiceJoined,
   participants,
   setupSteps,
@@ -1311,12 +1346,17 @@ function ChannelSidebar({
   role: string;
   textChannels: ChannelStateView[];
   voiceChannels: ChannelStateView[];
+  dms: DirectConversationView[];
+  activeDmId: string | null;
+  activeChannelId: string | null;
   selectedWorkflow: Workflow;
   onSelectWorkflow: (workflow: Workflow) => void;
   onOpenCreateGroup: () => void;
   onOpenJoin: () => void;
-  onOpenChannel: () => void;
-  onOpenDm: () => void;
+  onSelectTextChannel: (channelId: string) => void;
+  onSelectVoiceChannel: (channelId: string) => void;
+  onSelectDm: (dmId: string) => void;
+  onOpenNewDm: () => void;
   voiceJoined: boolean;
   participants: VoiceParticipant[];
   setupSteps: SetupStepView[];
@@ -1380,13 +1420,30 @@ function ChannelSidebar({
               </SidebarButton>
             </CardContent>
           </Card>
-          <SidebarButton
-            active={selectedWorkflow === "dm"}
-            onClick={onOpenDm}
-            meta="direct conversation"
+          <SectionLabel>Direct messages</SectionLabel>
+          {dms.length === 0 ? (
+            <p className="px-2 text-xs text-[hsl(var(--muted-foreground))]">
+              No direct messages yet.
+            </p>
+          ) : null}
+          {dms.map((dm) => (
+            <SidebarButton
+              key={dm.dm_id}
+              active={selectedWorkflow === "dm" && activeDmId === dm.dm_id}
+              onClick={() => onSelectDm(dm.dm_id)}
+              meta="direct message"
+            >
+              {dm.display_name}
+            </SidebarButton>
+          ))}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="mt-1 w-full justify-start"
+            onClick={onOpenNewDm}
           >
-            Direct messages
-          </SidebarButton>
+            <Icon>+</Icon>New message
+          </Button>
           <SectionLabel>Text channels</SectionLabel>
           {textChannels.length === 0 ? (
             <p className="px-2 text-xs text-[hsl(var(--muted-foreground))]">
@@ -1396,8 +1453,8 @@ function ChannelSidebar({
           {textChannels.map((channel) => (
             <SidebarButton
               key={channel.channel_id}
-              active={selectedWorkflow === "channel"}
-              onClick={onOpenChannel}
+              active={selectedWorkflow === "channel" && activeChannelId === channel.channel_id}
+              onClick={() => onSelectTextChannel(channel.channel_id)}
               meta={channel.retention_status}
             >
               {channel.name}
@@ -1407,7 +1464,7 @@ function ChannelSidebar({
             variant="ghost"
             size="sm"
             className="mt-1 w-full justify-start"
-            onClick={onOpenChannel}
+            onClick={() => onSelectWorkflow("channel")}
           >
             <Icon>+</Icon>Create channel
           </Button>
@@ -1421,7 +1478,7 @@ function ChannelSidebar({
             <SidebarButton
               key={channel.channel_id}
               active={selectedWorkflow === "voice"}
-              onClick={() => onSelectWorkflow("voice")}
+              onClick={() => onSelectVoiceChannel(channel.channel_id)}
               meta={voiceJoined ? `${speaking} speaking` : "not joined"}
             >
               {channel.name}
@@ -2978,6 +3035,15 @@ function InspectorRail({
   resetPhrase,
   setResetPhrase,
   onResetState,
+  localPeerId,
+  remotePeerId,
+  onLocalPeerIdChange,
+  onRemotePeerIdChange,
+  onProbeAdapter,
+  onProbeDataChannel,
+  onStartTextTransport,
+  onAttachOfferer,
+  onAttachAnswerer,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
@@ -2988,15 +3054,38 @@ function InspectorRail({
   resetPhrase: string;
   setResetPhrase: (value: string) => void;
   onResetState: () => void;
+  localPeerId: string;
+  remotePeerId: string;
+  onLocalPeerIdChange: (value: string) => void;
+  onRemotePeerIdChange: (value: string) => void;
+  onProbeAdapter: () => void;
+  onProbeDataChannel: () => void;
+  onStartTextTransport: () => void;
+  onAttachOfferer: () => void;
+  onAttachAnswerer: () => void;
 }) {
   const latestEvents = useMemo(
     () => appState.events.slice(-10).reverse(),
     [appState.events],
   );
   return (
-    <aside className="hidden h-dvh border-l border-[hsl(var(--border))] bg-[hsl(var(--card)/0.62)] p-4 backdrop-blur-xl 2xl:block">
+    <aside className="hidden h-dvh border-l border-[hsl(var(--border))] bg-[hsl(var(--card)/0.62)] p-4 backdrop-blur-xl lg:block">
       <ScrollArea className="h-full">
         <div className="grid gap-4">
+          <RuntimeModeBanner runtimeMode={appState.runtime_mode} />
+          <TransportStatusStrip
+            statuses={appState.transport_status}
+            diagnostics={appState.transport_diagnostics}
+            localPeerId={localPeerId}
+            remotePeerId={remotePeerId}
+            onLocalPeerIdChange={onLocalPeerIdChange}
+            onRemotePeerIdChange={onRemotePeerIdChange}
+            onProbeAdapter={onProbeAdapter}
+            onProbeDataChannel={onProbeDataChannel}
+            onStartTextTransport={onStartTextTransport}
+            onAttachOfferer={onAttachOfferer}
+            onAttachAnswerer={onAttachAnswerer}
+          />
           <Card>
             <CardHeader>
               <CardTitle>Workspace state</CardTitle>

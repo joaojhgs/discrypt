@@ -863,6 +863,19 @@ pub struct SetActiveGroupRequest {
     pub group_id: String,
 }
 
+/// Request to focus a specific text or voice channel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetActiveChannelRequest {
+    pub group_id: String,
+    pub channel_id: String,
+}
+
+/// Request to focus a specific DM conversation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetActiveDmRequest {
+    pub dm_id: String,
+}
+
 /// Request to join a local-first group/server from an invite.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JoinGroupRequest {
@@ -2733,6 +2746,68 @@ pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
     })
 }
 
+/// Tauri command: focus a specific text or voice channel within a group.
+pub fn set_active_channel(request: SetActiveChannelRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let group = state
+            .groups
+            .iter()
+            .find(|g| g.group_id == request.group_id);
+        let channel = group.and_then(|g| {
+            g.channels.iter().find(|c| c.channel_id == request.channel_id)
+        });
+        if let Some(ch) = channel {
+            let kind = match ch.kind {
+                ChannelKind::Voice => "voice_channel",
+                ChannelKind::Text => "text_channel",
+            };
+            state.active_context = Some(ActiveContextView {
+                kind: kind.to_owned(),
+                group_id: Some(request.group_id.clone()),
+                channel_id: Some(request.channel_id.clone()),
+                dm_id: None,
+            });
+            state.push_event(
+                "channel.focused",
+                format!("Focused channel {}", ch.name),
+            );
+        } else {
+            state.push_command_error(
+                "channel.focus_missing",
+                "set_active_channel",
+                "channel_not_found",
+                "Requested channel does not exist in the group",
+                "Select a channel that belongs to the active group",
+            );
+        }
+    })
+}
+
+/// Tauri command: focus a specific DM conversation.
+pub fn set_active_dm(request: SetActiveDmRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        if state.dms.iter().any(|dm| dm.dm_id == request.dm_id) {
+            state.active_context = Some(ActiveContextView {
+                kind: "dm".to_owned(),
+                group_id: None,
+                channel_id: None,
+                dm_id: Some(request.dm_id.clone()),
+            });
+            state.push_event("dm.focused", format!("Focused DM {}", request.dm_id));
+        } else {
+            state.push_command_error(
+                "dm.focus_missing",
+                "set_active_dm",
+                "dm_not_found",
+                "Requested DM does not exist",
+                "Select a DM that already exists",
+            );
+        }
+    })
+}
+
 /// Tauri command: join a local-first group from an invite.
 pub fn join_group(request: JoinGroupRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -4023,6 +4098,16 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn set_active_channel(request: SetActiveChannelRequest) -> AppStateView {
+        super::set_active_channel(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn set_active_dm(request: SetActiveDmRequest) -> AppStateView {
+        super::set_active_dm(request)
+    }
+
+    #[tauri::command]
     pub(super) fn join_group(request: JoinGroupRequest) -> AppStateView {
         super::join_group(request)
     }
@@ -4170,6 +4255,8 @@ pub fn run() {
             ipc_commands::start_dm,
             ipc_commands::create_group,
             ipc_commands::set_active_group,
+            ipc_commands::set_active_channel,
+            ipc_commands::set_active_dm,
             ipc_commands::join_group,
             ipc_commands::create_invite,
             ipc_commands::create_dm_invite,
