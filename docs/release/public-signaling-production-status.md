@@ -285,7 +285,7 @@ npm --prefix apps/ui run test:command-coverage
 - [x] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
   for deterministic harness evidence and optional public-provider MQTT validation. `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132` passed and runs both local cargo gates by default; real distinct-machine STUN/TURN release evidence remains tracked separately above.
 - [x] Provider-visible metadata capture/PCAP tests for MQTT, Nostr, IPFS, and QUIC. `npm --prefix apps/ui run test:provider-metadata-capture-g133` now runs deterministic provider-visible conformance capture plus plaintext-rejection tests across all four adapter boundaries; external host packet captures remain a release-run artifact, not a local CI claim.
-- [ ] Abuse/rate-limit handling against public relays/brokers.
+- [x] Abuse/rate-limit handling against public relays/brokers. Existing G119/G120 abuse gates passed, and provider failure classification maps public relay/broker rate-limit/auth/message-size/trust failures into typed health/readiness states; public multi-relay soak evidence remains tracked under Nostr/IPFS hardening rather than this local handling gate.
 - [ ] Full release matrix across Linux desktop package and Android once mobile exists.
 
 #### G132 status
