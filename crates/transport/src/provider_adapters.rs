@@ -283,7 +283,7 @@ pub fn plan_signaling_adapter_fallback(
         let attempted = match behavior {
             AdapterFallbackBehavior::TryAll => true,
             AdapterFallbackBehavior::FirstHealthy => selected.is_none(),
-            AdapterFallbackBehavior::ManualOnly => is_selected,
+            AdapterFallbackBehavior::ManualOnly => true,
         };
 
         attempts.push(SignalingAdapterFallbackAttempt {
@@ -306,8 +306,8 @@ pub fn plan_signaling_adapter_fallback(
         }
     }
 
-    // The contract currently records only selection and ordering in this layer.
-    // Attempts carry full readiness through typed telemetry attached by callers.
+    // The contract records ordered attempts and selected leg metadata for
+    // transport-level diagnostics and session persistence.
     SignalingAdapterFallbackPlan {
         behavior,
         attempts,
