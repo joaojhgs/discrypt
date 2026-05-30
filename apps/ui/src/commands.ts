@@ -1292,6 +1292,7 @@ function dmConnectivityPolicy(
   };
 }
 
+
 function productionInviteLink(metadata: ParsedInviteMetadata): string {
   const query = new URLSearchParams({
     endpoint: metadata.signalingEndpoint,
@@ -1465,6 +1466,10 @@ function ensureFallbackReady(
       display_name: fallbackState.snapshot.friend.alias,
       local_only_copy:
         "Local DM seeded from a generated friend-code/QR payload; no remote delivery is claimed",
+      connectivity: dmConnectivityPolicy(
+        dmId,
+        participantIdFromFriendCode(fallbackState.snapshot.friend.friend_code),
+      ),
     },
   ];
   fallbackState.active_context = {
@@ -1536,6 +1541,7 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
           retention_status: "session",
         },
       ],
+      connectivity: groupConnectivityPolicy(groupId),
     });
   }
 }
@@ -1609,6 +1615,7 @@ export async function recoverUser(
             name,
             role: "member",
             channels: defaultGroupChannels(),
+            connectivity: groupConnectivityPolicy(groupId),
           });
         }
       }
@@ -1797,6 +1804,7 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
           display_name: displayName,
           local_only_copy:
             "Local harness-backed DM; no remote delivery is claimed",
+          connectivity: dmConnectivityPolicy(dmId, slugify(displayName)),
         });
       }
       state.active_context = {
@@ -1824,6 +1832,7 @@ export async function createGroup(
           name,
           role: "owner",
           channels: defaultGroupChannels(),
+          connectivity: groupConnectivityPolicy(groupId),
         });
       }
       state.active_context = {
@@ -1869,6 +1878,7 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
           name,
           role: "member",
           channels: defaultGroupChannels(),
+          connectivity: parsedInvite?.connectivity ?? groupConnectivityPolicy(groupId),
         });
       }
       state.active_context = {
@@ -1882,6 +1892,7 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
           invite_id: `invite-${parsedInvite.inviteKey}`,
           invite_key: parsedInvite.inviteKey,
           group_id: groupId,
+          dm_id: null,
           connectivity_schema_version: parsedInvite.connectivity.connectivity_schema_version,
           invite_kind: parsedInvite.connectivity.invite_kind,
           scope_id_commitment: parsedInvite.connectivity.scope_id_commitment,
@@ -1968,6 +1979,7 @@ export async function createInvite(
         return;
       }
       const group = state.groups.find((item) => item.group_id === groupId);
+      const connectivity = group?.connectivity ?? groupConnectivityPolicy(groupId);
       const inviteKey =
         crypto.randomUUID?.() ?? `local-${state.invites.length + 1}`;
       const roomSecretHash = stableHash(
@@ -1983,7 +1995,6 @@ export async function createInvite(
       const endpointPolicy = "production_tls";
       const trustStatus =
         "signed endpoint fingerprint; verify before MLS Welcome";
-      const connectivity = groupConnectivityPolicy(groupId);
       const inviteMetadata: ParsedInviteMetadata = {
         inviteKey,
         signalingEndpoint,
@@ -2001,6 +2012,7 @@ export async function createInvite(
         invite_id: `invite-${inviteKey}`,
         invite_key: inviteKey,
         group_id: groupId,
+        dm_id: null,
         connectivity_schema_version: connectivity.connectivity_schema_version,
         invite_kind: connectivity.invite_kind,
         scope_id_commitment: connectivity.scope_id_commitment,
@@ -2029,6 +2041,194 @@ export async function createInvite(
         "invite.created",
         `Invite created for ${group?.name ?? "group"}`,
       );
+    }),
+  );
+}
+
+export async function createDmInvite(
+  request: CreateDmInviteRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("create_dm_invite", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const dmId =
+        request.dm_id ?? state.active_context?.dm_id ?? state.dms[0]?.dm_id;
+      if (!dmId) {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "create_dm_invite",
+          "dm_not_found",
+          "No DM contact exists for invite creation",
+          "Start or select a DM before creating a contact invite",
+        );
+        return;
+      }
+      const dm = state.dms.find((item) => item.dm_id === dmId);
+      if (!dm) {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "create_dm_invite",
+          "dm_not_found",
+          "Requested DM contact does not exist",
+          "Pick a contact from the DM list before creating an invite",
+        );
+        return;
+      }
+      const connectivity =
+        dm.connectivity ?? dmConnectivityPolicy(dm.dm_id, dm.participant_id);
+      const inviteKey =
+        crypto.randomUUID?.() ?? `dm-local-${state.invites.length + 1}`;
+      const roomSecretHash = stableHash(
+        `${dm.dm_id}:${inviteKey}:${state.invites.length}`,
+      );
+      const expires = request.expires || fallbackState.snapshot.invite.expires;
+      const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
+      const expiresAt = inviteExpirationHorizon(expires);
+      const signalingEndpoint = defaultSignalingEndpoint();
+      const signalingTrustFingerprint = stableHash(
+        `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
+      );
+      const endpointPolicy = "production_tls";
+      const trustStatus = "signed endpoint fingerprint; verify before DM accept";
+      const inviteMetadata: ParsedInviteMetadata = {
+        inviteKey,
+        signalingEndpoint,
+        endpointPolicy,
+        signalingTrustFingerprint,
+        signalingTrustStatus: trustStatus,
+        iceStunServers: defaultIceStunServers(),
+        iceTurnServers: defaultRedactedTurnServers(),
+        roomSecretHash,
+        connectivity,
+        expiresAt,
+        maxUses: parseMaxUses(maxUse),
+      };
+      state.invites.push({
+        invite_id: `invite-${inviteKey}`,
+        invite_key: inviteKey,
+        group_id: "",
+        dm_id: dm.dm_id,
+        connectivity_schema_version: connectivity.connectivity_schema_version,
+        invite_kind: connectivity.invite_kind,
+        scope_id_commitment: connectivity.scope_id_commitment,
+        signaling_profiles: connectivity.signaling_profiles,
+        privacy_label: connectivity.privacy_label,
+        dm_bootstrap: connectivity.dm_bootstrap,
+        group_bootstrap: connectivity.group_bootstrap,
+        code: productionInviteLink(inviteMetadata),
+        room_secret_hash: roomSecretHash,
+        signaling_endpoint: signalingEndpoint,
+        signaling_trust_fingerprint: signalingTrustFingerprint,
+        signaling_trust_status: trustStatus,
+        endpoint_policy: endpointPolicy,
+        ice_stun_servers: defaultIceStunServers(),
+        ice_turn_servers: defaultRedactedTurnServers(),
+        expires,
+        expires_at: expiresAt,
+        max_use: maxUse,
+        uses: 0,
+        revoked: false,
+        admission_copy:
+          "Final DM acceptance still requires a sealed reply rendezvous and verified contact identity; the link alone is insufficient",
+      });
+      pushEvent(
+        state,
+        "invite.dm_created",
+        `DM contact invite created for ${dm.display_name}`,
+      );
+    }),
+  );
+}
+
+export async function acceptDmInvite(
+  request: AcceptDmInviteRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("accept_dm_invite", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const inviteCode = request.invite_code.trim();
+      const parsedInvite = parseInviteMetadata(inviteCode);
+      if (!parsedInvite) {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "accept_dm_invite",
+          "invite_parse_failed",
+          "DM contact invite metadata could not be parsed",
+          "Paste a signed DM contact invite descriptor before accepting",
+        );
+        return;
+      }
+      if (parsedInvite.connectivity.invite_kind !== "dm_contact") {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "accept_dm_invite",
+          "invite_kind_mismatch",
+          "Invite is not a DM contact invite",
+          "Use group join for group invites or request a DM contact invite",
+        );
+        return;
+      }
+      const displayName = request.display_name?.trim() || "DM contact";
+      const participantId = hashCommitment(
+        "discrypt-accepted-dm-participant-id-v1",
+        [parsedInvite.connectivity.scope_id_commitment],
+      );
+      const existing = state.dms.find(
+        (dm) =>
+          dm.connectivity?.scope_id_commitment ===
+          parsedInvite.connectivity.scope_id_commitment,
+      );
+      const dmId = existing?.dm_id ?? `dm-${slugify(parsedInvite.inviteKey)}`;
+      if (!existing) {
+        state.dms.push({
+          dm_id: dmId,
+          participant_id: participantId,
+          display_name: displayName,
+          local_only_copy:
+            "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt proof",
+          connectivity: parsedInvite.connectivity,
+        });
+      }
+      state.active_context = {
+        kind: "dm",
+        group_id: null,
+        channel_id: null,
+        dm_id: dmId,
+      };
+      state.invites.push({
+        invite_id: `invite-${parsedInvite.inviteKey}`,
+        invite_key: parsedInvite.inviteKey,
+        group_id: "",
+        dm_id: dmId,
+        connectivity_schema_version:
+          parsedInvite.connectivity.connectivity_schema_version,
+        invite_kind: parsedInvite.connectivity.invite_kind,
+        scope_id_commitment: parsedInvite.connectivity.scope_id_commitment,
+        signaling_profiles: parsedInvite.connectivity.signaling_profiles,
+        privacy_label: parsedInvite.connectivity.privacy_label,
+        dm_bootstrap: parsedInvite.connectivity.dm_bootstrap,
+        group_bootstrap: parsedInvite.connectivity.group_bootstrap,
+        code: inviteCode,
+        room_secret_hash: parsedInvite.roomSecretHash,
+        signaling_endpoint: parsedInvite.signalingEndpoint,
+        signaling_trust_fingerprint: parsedInvite.signalingTrustFingerprint,
+        signaling_trust_status: parsedInvite.signalingTrustStatus,
+        endpoint_policy: parsedInvite.endpointPolicy,
+        ice_stun_servers: parsedInvite.iceStunServers,
+        ice_turn_servers: parsedInvite.iceTurnServers,
+        expires: "Invite expiry from signed descriptor",
+        expires_at: parsedInvite.expiresAt,
+        max_use: String(parsedInvite.maxUses),
+        uses: 1,
+        revoked: false,
+        admission_copy:
+          "Parsed DM contact invite metadata; final acceptance still requires sealed reply rendezvous/contact verification",
+      });
+      pushEvent(state, "dm.invite_accepted", `Opened DM contact ${displayName}`);
     }),
   );
 }

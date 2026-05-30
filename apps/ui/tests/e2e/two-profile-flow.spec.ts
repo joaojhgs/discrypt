@@ -109,7 +109,7 @@ async function joinInvite(page: Page, invite: string) {
     .getByRole("button", { name: "Invites", exact: true })
     .click();
   await page.getByLabel("Invite URL or code").fill(invite);
-  await page.getByLabel("Group display name").fill("Two Profile Lab");
+  await page.getByLabel("Joined group label").fill("Two Profile Lab");
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
 }
@@ -121,7 +121,11 @@ async function attemptVoice(page: Page) {
     .click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
-  await expect(page.getByText(/command-backed local voice session/i)).toBeVisible();
+  await expect(
+    page.getByText(/Join command creates a local voice session/i),
+  ).toBeVisible();
+  await expect(page.getByText(/waiting-route-proof/i)).toBeVisible();
+  await expect(page.getByText("policy-only", { exact: true })).toBeVisible();
   await expect(
     page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
   ).toBeVisible();
