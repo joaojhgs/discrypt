@@ -1845,6 +1845,45 @@ const IPFS_PUBSUB_EVENT_SCHEMA: u8 = 1;
 const IPFS_PUBSUB_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_MAX_BOOTSTRAP_ENDPOINTS: usize = 16;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_COMMAND_QUEUE_DEPTH: usize = 128;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_HISTORY_LENGTH: usize = 8;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_HISTORY_GOSSIP: usize = 3;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_MESH_N_LOW: usize = 2;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_MESH_N: usize = 4;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_MESH_N_HIGH: usize = 8;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_DUPLICATE_CACHE_SECS: u64 = 60;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS: u64 = 20;
+
+/// Versioned public bootstrap policy for explicit IPFS/libp2p adapter profiles.
+///
+/// These are generic libp2p bootstrap peers only. They are discovery seeds, not a
+/// guarantee that any peer relays arbitrary Discrypt gossipsub topics; production
+/// group/DM policy still needs a reachable Discrypt topic peer or rendezvous path.
+#[cfg(feature = "ipfs-pubsub-adapter")]
+pub const IPFS_PUBSUB_BOOTSTRAP_POLICY_VERSION: u8 = 1;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+pub const IPFS_PUBSUB_PUBLIC_BOOTSTRAP_MULTIADDRS: &[&str] =
+    &["/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfJPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"];
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
 fn ipfs_err(context: &str, err: impl std::fmt::Display) -> TransportError {
     TransportError::SignalingAdapter(format!("ipfs_pubsub {context} failed: {err}"))
 }
@@ -1868,6 +1907,58 @@ fn ipfs_multiaddr_from_endpoint(
     multiaddr
         .parse::<libp2p::Multiaddr>()
         .map_err(|err| ipfs_err("multiaddr parse", err))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_pubsub_gossipsub_config() -> Result<libp2p::gossipsub::Config, TransportError> {
+    let mut config = libp2p::gossipsub::ConfigBuilder::default();
+    config
+        .heartbeat_initial_delay(Duration::from_millis(200))
+        .heartbeat_interval(Duration::from_millis(300))
+        .history_length(IPFS_PUBSUB_HISTORY_LENGTH)
+        .history_gossip(IPFS_PUBSUB_HISTORY_GOSSIP)
+        .mesh_n_low(IPFS_PUBSUB_MESH_N_LOW)
+        .mesh_n(IPFS_PUBSUB_MESH_N)
+        .mesh_n_high(IPFS_PUBSUB_MESH_N_HIGH)
+        .max_transmit_size(IPFS_PUBSUB_MAX_MESSAGE_BYTES)
+        .duplicate_cache_time(Duration::from_secs(IPFS_PUBSUB_DUPLICATE_CACHE_SECS))
+        .validation_mode(libp2p::gossipsub::ValidationMode::Strict)
+        .flood_publish(false);
+    config
+        .build()
+        .map_err(|err| ipfs_err("gossipsub config", err))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_validate_bootstrap_policy(addrs: &[libp2p::Multiaddr]) -> Result<(), TransportError> {
+    if addrs.len() > IPFS_PUBSUB_MAX_BOOTSTRAP_ENDPOINTS {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "ipfs_pubsub bootstrap endpoint count exceeds resource policy limit: max={}",
+            IPFS_PUBSUB_MAX_BOOTSTRAP_ENDPOINTS
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for addr in addrs {
+        let text = addr.to_string();
+        if !seen.insert(text.clone()) {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "ipfs_pubsub duplicate bootstrap endpoint rejected by resource policy: {text}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+pub fn ipfs_pubsub_default_bootstrap_addrs() -> Result<Vec<libp2p::Multiaddr>, TransportError> {
+    IPFS_PUBSUB_PUBLIC_BOOTSTRAP_MULTIADDRS
+        .iter()
+        .map(|endpoint| {
+            endpoint
+                .parse::<libp2p::Multiaddr>()
+                .map_err(|err| ipfs_err("default bootstrap multiaddr parse", err))
+        })
+        .collect()
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -2015,20 +2106,13 @@ async fn spawn_ipfs_pubsub_room(
 ) -> Result<IpfsPubsubProviderRoom, TransportError> {
     let topic = ipfs_topic(&rendezvous);
     let provider_key = ipfs_provider_key(&topic);
-    let mut config = libp2p::gossipsub::ConfigBuilder::default();
-    config
-        .heartbeat_initial_delay(Duration::from_millis(200))
-        .heartbeat_interval(Duration::from_millis(300))
-        .max_transmit_size(IPFS_PUBSUB_MAX_MESSAGE_BYTES)
-        .validation_mode(libp2p::gossipsub::ValidationMode::Strict);
-    let gossipsub_config = config
-        .build()
-        .map_err(|err| ipfs_err("gossipsub config", err))?;
+    let gossipsub_config = ipfs_pubsub_gossipsub_config()?;
     let bootstrap_addrs = profile
         .endpoints
         .iter()
         .map(ipfs_multiaddr_from_endpoint)
         .collect::<Result<Vec<_>, _>>()?;
+    ipfs_validate_bootstrap_policy(&bootstrap_addrs)?;
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -2053,7 +2137,7 @@ async fn spawn_ipfs_pubsub_room(
             });
             let mut kad_config = libp2p::kad::Config::new(libp2p::kad::PROTOCOL_NAME);
             kad_config
-                .set_query_timeout(Duration::from_secs(20))
+                .set_query_timeout(Duration::from_secs(IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS))
                 .set_replication_factor(NonZeroUsize::new(3).expect("non-zero replication"));
             let kademlia = libp2p::kad::Behaviour::with_config(
                 local_peer_id,
@@ -2109,7 +2193,7 @@ async fn spawn_ipfs_pubsub_room(
         .kademlia
         .get_providers(provider_key.clone());
 
-    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(128);
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(IPFS_PUBSUB_COMMAND_QUEUE_DEPTH);
     let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
     let inbox = Arc::new(AsyncMutex::new(IpfsPubsubInbox::default()));
     let task_inbox = inbox.clone();
@@ -3916,6 +4000,66 @@ mod tests {
         assert_eq!(observability.adapter_kind, SignalingAdapterKind::IpfsPubsub);
         assert!(!observability.endpoint_label.contains("example.invalid"));
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_resource_policy_is_bounded_and_default_bootstrap_is_parseable() {
+        assert_eq!(IPFS_PUBSUB_BOOTSTRAP_POLICY_VERSION, 1);
+        assert!(IPFS_PUBSUB_MAX_MESSAGE_BYTES <= 64 * 1024);
+        assert!(IPFS_PUBSUB_MAX_BOOTSTRAP_ENDPOINTS <= 16);
+        assert!(IPFS_PUBSUB_COMMAND_QUEUE_DEPTH <= 128);
+
+        let config = ipfs_pubsub_gossipsub_config().expect("gossipsub config");
+        assert_eq!(config.max_transmit_size(), IPFS_PUBSUB_MAX_MESSAGE_BYTES);
+        assert_eq!(config.history_length(), IPFS_PUBSUB_HISTORY_LENGTH);
+        assert_eq!(config.history_gossip(), IPFS_PUBSUB_HISTORY_GOSSIP);
+        assert_eq!(config.mesh_n_low(), IPFS_PUBSUB_MESH_N_LOW);
+        assert_eq!(config.mesh_n(), IPFS_PUBSUB_MESH_N);
+        assert_eq!(config.mesh_n_high(), IPFS_PUBSUB_MESH_N_HIGH);
+        assert_eq!(
+            config.duplicate_cache_time(),
+            Duration::from_secs(IPFS_PUBSUB_DUPLICATE_CACHE_SECS)
+        );
+        assert!(matches!(
+            config.validation_mode(),
+            libp2p::gossipsub::ValidationMode::Strict
+        ));
+        assert!(!config.flood_publish());
+
+        let defaults = ipfs_pubsub_default_bootstrap_addrs().expect("default bootstrap addrs");
+        assert_eq!(
+            defaults.len(),
+            IPFS_PUBSUB_PUBLIC_BOOTSTRAP_MULTIADDRS.len()
+        );
+        assert!(
+            defaults.iter().all(ipfs_should_dial),
+            "default bootstrap peers must be dialable discovery seeds"
+        );
+        ipfs_validate_bootstrap_policy(&defaults).expect("default bootstrap policy");
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_bootstrap_policy_rejects_duplicates_and_overflow() {
+        let duplicate = "/ip4/127.0.0.1/tcp/4001"
+            .parse::<libp2p::Multiaddr>()
+            .expect("multiaddr");
+        let error = ipfs_validate_bootstrap_policy(&[duplicate.clone(), duplicate])
+            .expect_err("duplicate bootstrap endpoint must be rejected");
+        assert!(format!("{error}").contains("duplicate bootstrap endpoint"));
+
+        let mut too_many = Vec::new();
+        for port in 0..=IPFS_PUBSUB_MAX_BOOTSTRAP_ENDPOINTS {
+            too_many.push(
+                format!("/ip4/127.0.0.1/tcp/{}", 4000 + port)
+                    .parse::<libp2p::Multiaddr>()
+                    .expect("multiaddr"),
+            );
+        }
+        let error = ipfs_validate_bootstrap_policy(&too_many)
+            .expect_err("too many bootstrap endpoints must be rejected");
+        assert!(format!("{error}").contains("resource policy limit"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
