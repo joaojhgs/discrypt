@@ -1,6 +1,51 @@
 # Public signaling production status
 
-_Last updated: 2026-05-30_
+_Last updated: 2026-05-30T20:45Z_
+
+## Checkpoint 2026-05-30T20:45Z — OMC session evidence sweep
+
+### What passed in this session
+
+All the following tests were run and passed during this session:
+
+**Tauri dev build fix:**
+- `tauri.conf.json` `build.features` now includes `tauri-runtime`; `cargo tauri dev` DevCommand is `cargo run --no-default-features --features tauri-runtime`
+- `cargo check -p discrypt-desktop --features tauri-runtime` — passed
+- `cargo fmt --all --check` — passed
+
+**Playwright two-profile UI E2E (local-dev browser, no real transport):**
+- `cd apps/ui && VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npx playwright test tests/e2e/two-profile-flow.spec.ts --workers=1` — 2/2 passed
+- Covers: account creation, DM local send/receive, DM invite create/accept, reciprocal runtime peers, group create/join, group channel local text, voice join/mute/leave/speaking indicators
+
+**Voice session tests:**
+- `cargo test -q -p discrypt-desktop voice_join_mute_volume_leave_flow_does_not_clear_state` — passed
+- `cargo test -q -p discrypt-core voice_session_state_persists_across_restart` — passed
+
+**Relay overlay tests:**
+- `cargo test -q -p discrypt-relay-overlay` — 34/34 passed (gossip, store-forward, integrity, topology, capability, ranking, failover, manager, redelivery)
+
+**Public provider DM receipt (env-gated, requires real providers):**
+- `DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled` — passed
+- `DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled` — passed
+
+**Public provider group receipt (env-gated, requires real providers):**
+- `DISCRYPT_DESKTOP_PUBLIC_MQTT_GROUP_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled` — passed (7.85s)
+- `DISCRYPT_DESKTOP_PUBLIC_NOSTR_GROUP_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled` — passed (11.02s)
+
+**Public transport role-split text runtime (env-gated):**
+- `DISCRYPT_PUBLIC_MQTT_ROLE_SPLIT_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_role_split_text_runtime_roundtrip` — passed
+
+### Still not production-complete in this session
+
+The following require external infrastructure not available in this environment:
+
+- **Real hardware audio pipeline**: microphone capture → Opus encode → WebRTC media transport → Opus decode → speaker playback — no audio hardware available for E2E proof
+- **Credentialed TURN relay-only**: TURN server credentials not configured; fail-closed gate exists and is tested
+- **IPFS public rendezvous**: requires externally reachable Discrypt topic-peer `/p2p/<peer-id>` multiaddr; direct-topic-peer local roundtrip is proven
+- **Deployed QUIC rendezvous**: requires deployed HTTPS/WSS sibling rendezvous endpoint; local loopback binary roundtrip is proven
+- **Full installed Tauri two-window UI E2E**: requires two real GUI processes with display; backend same-process proofs are the current evidence
+
+---
 
 ## Executive status
 
