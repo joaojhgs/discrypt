@@ -41,6 +41,7 @@ import {
   setSelfMute,
   setSpeakerVolume,
   startSignalingSession,
+  startTextSession,
   startDm,
   verifySafetyNumber,
 } from "./commands";
@@ -232,16 +233,30 @@ function App() {
     );
   }
 
-  async function probeSelectedDataChannel() {
-    const scopeLabel =
+  function activeScopeLabel() {
+    return (
       commandState?.active_context?.dm_id ??
       commandState?.active_context?.group_id ??
       commandState?.active_context?.channel_id ??
-      "active-scope";
+      "active-scope"
+    );
+  }
+
+  async function probeSelectedDataChannel() {
     await applyCommand(
       startSignalingSession({
-        scope_label: scopeLabel,
+        scope_label: activeScopeLabel(),
         adapter_probe: false,
+        data_channel_probe: true,
+        adapter_kind: null,
+      }),
+    );
+  }
+
+  async function startTextTransportProof() {
+    await applyCommand(
+      startTextSession({
+        scope_label: activeScopeLabel(),
         data_channel_probe: true,
         adapter_kind: null,
       }),
@@ -650,6 +665,7 @@ function App() {
           diagnostics={appState.transport_diagnostics}
           onProbeAdapter={probeSelectedAdapter}
           onProbeDataChannel={probeSelectedDataChannel}
+          onStartTextTransport={startTextTransportProof}
         />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
@@ -1331,11 +1347,13 @@ function TransportStatusStrip({
   diagnostics,
   onProbeAdapter,
   onProbeDataChannel,
+  onStartTextTransport,
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
+  onStartTextTransport: () => void;
 }) {
   const ordered = statuses.length
     ? statuses
@@ -1370,6 +1388,9 @@ function TransportStatusStrip({
           </Button>
           <Button size="sm" variant="outline" onClick={onProbeDataChannel}>
             Probe data channel
+          </Button>
+          <Button size="sm" onClick={onStartTextTransport}>
+            Start text proof
           </Button>
           <Badge variant="outline">honest status</Badge>
         </div>
