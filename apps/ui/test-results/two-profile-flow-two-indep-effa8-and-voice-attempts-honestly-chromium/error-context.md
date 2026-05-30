@@ -12,179 +12,279 @@
 # Error details
 
 ```
-Error: expect(locator).toBeVisible() failed
-
-Locator: getByRole('heading', { name: /set up your local discrypt profile/i })
-Expected: visible
-Timeout: 5000ms
-Error: element(s) not found
-
-Call log:
-  - Expect "toBeVisible" with timeout 5000ms
-  - waiting for getByRole('heading', { name: /set up your local discrypt profile/i })
-
+Test timeout of 30000ms exceeded.
 ```
+
+# Page snapshot
 
 ```yaml
-- main: "discrypt command surface failed: Tauri IPC unavailable for app_state; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev/test harness"
-```
-
-# Test source
-
-```ts
-  1   | import { Browser, expect, Page, test } from "playwright/test";
-  2   | 
-  3   | async function installVoiceDevices(page: Page, profile: string) {
-  4   |   await page.addInitScript((profileName) => {
-  5   |     const audioTrack = {
-  6   |       kind: "audio",
-  7   |       enabled: true,
-  8   |       stop: () => undefined,
-  9   |     };
-  10  |     Object.defineProperty(navigator, "mediaDevices", {
-  11  |       configurable: true,
-  12  |       value: {
-  13  |         getUserMedia: async () => ({
-  14  |           getTracks: () => [audioTrack],
-  15  |         }),
-  16  |         enumerateDevices: async () => [
-  17  |           {
-  18  |             kind: "audioinput",
-  19  |             deviceId: `${profileName.toLowerCase()}-mic`,
-  20  |             label: `${profileName} E2E microphone`,
-  21  |             groupId: `${profileName.toLowerCase()}-audio`,
-  22  |             toJSON: () => ({}),
-  23  |           },
-  24  |           {
-  25  |             kind: "audiooutput",
-  26  |             deviceId: `${profileName.toLowerCase()}-speaker`,
-  27  |             label: `${profileName} E2E speaker`,
-  28  |             groupId: `${profileName.toLowerCase()}-audio`,
-  29  |             toJSON: () => ({}),
-  30  |           },
-  31  |         ],
-  32  |       },
-  33  |     });
-  34  |   }, profile);
-  35  | }
-  36  | 
-  37  | async function openProfile(
-  38  |   browser: Browser,
-  39  |   displayName: string,
-  40  |   deviceName: string,
-  41  | ) {
-  42  |   const context = await browser.newContext({ baseURL: "http://127.0.0.1:4173" });
-  43  |   const page = await context.newPage();
-  44  |   const errors: string[] = [];
-  45  |   page.on("pageerror", (error) => errors.push(error.message));
-  46  |   page.on("console", (message) => {
-  47  |     if (message.type() === "error") errors.push(message.text());
-  48  |   });
-  49  | 
-  50  |   await installVoiceDevices(page, displayName);
-  51  |   await page.goto("/");
-  52  |   await expect(
-  53  |     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
-> 54  |   ).toBeVisible();
-      |     ^ Error: expect(locator).toBeVisible() failed
-  55  |   await page.getByLabel("Display name").fill(displayName);
-  56  |   await page.getByLabel("Device name").fill(deviceName);
-  57  |   await page.getByRole("button", { name: /create new user/i }).click();
-  58  |   await expect(
-  59  |     page.getByRole("navigation", { name: /workspace sections/i }),
-  60  |   ).toBeVisible();
-  61  |   return { context, page, errors };
-  62  | }
-  63  | 
-  64  | async function sendDm(page: Page, contactName: string, body: string) {
-  65  |   await page
-  66  |     .getByRole("navigation", { name: /workspace sections/i })
-  67  |     .getByRole("button", { name: "DMs", exact: true })
-  68  |     .click();
-  69  |   await page.getByLabel("Contact name").fill(contactName);
-  70  |   await page.getByRole("button", { name: /start\/open dm/i }).click();
-  71  |   await page.getByRole("textbox", { name: "Message" }).fill(body);
-  72  |   await page.getByRole("button", { name: /send dm message/i }).click();
-  73  |   await expect(page.getByText(body)).toBeVisible();
-  74  |   await expect(
-  75  |     page.getByText(/remote delivery\/read receipts not claimed/i).first(),
-  76  |   ).toBeVisible();
-  77  | }
-  78  | 
-  79  | async function createInvite(page: Page) {
-  80  |   await page
-  81  |     .getByRole("navigation", { name: /workspace sections/i })
-  82  |     .getByRole("button", { name: "Groups", exact: true })
-  83  |     .click();
-  84  |   await page.getByLabel("Group name").fill("Two Profile Lab");
-  85  |   await page
-  86  |     .getByRole("button", { name: /^Create group$/ })
-  87  |     .last()
-  88  |     .click();
-  89  |   await page
-  90  |     .getByRole("navigation", { name: /workspace sections/i })
-  91  |     .getByRole("button", { name: "Invites", exact: true })
-  92  |     .click();
-  93  |   await page
-  94  |     .getByRole("button", { name: /create invite for active group/i })
-  95  |     .click();
-  96  |   const inviteText = await page
-  97  |     .getByText(/invite ready: discrypt:\/\/join\/v1/i)
-  98  |     .first()
-  99  |     .textContent();
-  100 |   const invite = inviteText?.match(/discrypt:\/\/join\/v1\/\S+/)?.[0];
-  101 |   expect(invite).toBeTruthy();
-  102 |   return invite ?? "";
-  103 | }
-  104 | 
-  105 | async function joinInvite(page: Page, invite: string) {
-  106 |   await page
-  107 |     .getByRole("navigation", { name: /workspace sections/i })
-  108 |     .getByRole("button", { name: "Invites", exact: true })
-  109 |     .click();
-  110 |   await page.getByLabel("Invite URL or code").fill(invite);
-  111 |   await page.getByLabel("Group display name").fill("Two Profile Lab");
-  112 |   await page.getByRole("button", { name: /join\/open group/i }).click();
-  113 |   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
-  114 | }
-  115 | 
-  116 | async function attemptVoice(page: Page, profile: string) {
-  117 |   await page
-  118 |     .getByRole("navigation", { name: /workspace sections/i })
-  119 |     .getByRole("button", { name: "Voice", exact: true })
-  120 |     .click();
-  121 |   await page.getByRole("button", { name: /join call/i }).click();
-  122 |   await expect(page.getByText(/You · you/)).toBeVisible();
-  123 |   await expect(page.getByText(`${profile} E2E microphone`)).toBeVisible();
-  124 |   await expect(
-  125 |     page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
-  126 |   ).toBeVisible();
-  127 |   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
-  128 |   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
-  129 | }
-  130 | 
-  131 | test("two independent profiles exercise DM, invite join, and voice attempts honestly", async ({
-  132 |   browser,
-  133 | }) => {
-  134 |   const alice = await openProfile(browser, "Alice", "Alice Desktop");
-  135 |   const bob = await openProfile(browser, "Bob", "Bob Laptop");
-  136 |   try {
-  137 |     await sendDm(alice.page, "Bob", "alice to bob local DM harness ping");
-  138 |     await sendDm(bob.page, "Alice", "bob to alice local DM harness pong");
-  139 |     await expect(
-  140 |       alice.page.getByText("bob to alice local DM harness pong"),
-  141 |     ).toHaveCount(0);
-  142 |     await expect(
-  143 |       bob.page.getByText("alice to bob local DM harness ping"),
-  144 |     ).toHaveCount(0);
-  145 | 
-  146 |     const invite = await createInvite(alice.page);
-  147 |     await joinInvite(bob.page, invite);
-  148 |     await attemptVoice(alice.page, "Alice");
-  149 |     await attemptVoice(bob.page, "Bob");
-  150 | 
-  151 |     expect(alice.errors).toEqual([]);
-  152 |     expect(bob.errors).toEqual([]);
-  153 |   } finally {
-  154 |     await alice.context.close();
+- main [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]: d
+    - button "Open Two Profile Lab group" [ref=e6] [cursor=pointer]: TW
+    - generic "Graphite calm" [ref=e7]: cfg
+  - complementary [ref=e8]:
+    - generic [ref=e9]:
+      - generic [ref=e10]:
+        - generic [ref=e11]:
+          - generic [ref=e12]:
+            - heading "Two Profile Lab" [level=1] [ref=e13]
+            - paragraph [ref=e14]: owner · command-backed state
+          - generic [ref=e15]: ready
+        - generic [ref=e16]:
+          - button "Create" [ref=e17] [cursor=pointer]:
+            - generic [ref=e18]: +
+            - text: Create
+          - button "Join" [ref=e19] [cursor=pointer]
+      - generic [ref=e20]:
+        - generic [ref=e21]:
+          - generic [ref=e23]:
+            - heading "Setup" [level=3] [ref=e24]
+            - generic [ref=e25]: 3 of 4
+          - button "Setup checklist trust checklist" [ref=e29] [cursor=pointer]:
+            - generic [ref=e30]:
+              - generic [ref=e31]: Setup checklist
+              - generic [ref=e32]: trust checklist
+        - button "Direct messages direct conversation" [ref=e33] [cursor=pointer]:
+          - generic [ref=e34]:
+            - generic [ref=e35]: Direct messages
+            - generic [ref=e36]: direct conversation
+        - paragraph [ref=e37]: Text channels
+        - button "#general 7 days" [ref=e38] [cursor=pointer]:
+          - generic [ref=e39]:
+            - generic [ref=e40]: "#general"
+            - generic [ref=e41]: 7 days
+        - button "Create channel" [ref=e42] [cursor=pointer]:
+          - generic [ref=e43]: +
+          - text: Create channel
+        - paragraph [ref=e44]: Voice rooms
+        - button "Voice Lobby not joined" [ref=e45] [cursor=pointer]:
+          - generic [ref=e46]:
+            - generic [ref=e47]: Voice Lobby
+            - generic [ref=e48]: not joined
+  - generic [ref=e49]:
+    - generic [ref=e51]:
+      - generic [ref=e52]:
+        - heading "Two Profile Lab" [level=2] [ref=e53]
+        - paragraph [ref=e54]: Local-first workspace · persisted through the Tauri command service
+      - generic [ref=e55]:
+        - button "Create group" [ref=e56] [cursor=pointer]:
+          - generic [ref=e57]: +
+          - text: Create group
+        - button "Join group" [ref=e58] [cursor=pointer]
+        - button "Create invite" [ref=e59] [cursor=pointer]
+        - generic [ref=e60]:
+          - generic [ref=e61]: Theme
+          - combobox "Theme" [ref=e62] [cursor=pointer]:
+            - option "Midnight steel"
+            - option "Graphite calm" [selected]
+            - option "Ocean contrast"
+        - generic [ref=e63]:
+          - generic [ref=e64]: Template
+          - combobox "Template" [ref=e65] [cursor=pointer]:
+            - option "Command center" [selected]
+            - option "Compact ops"
+        - button "Inspector" [ref=e66] [cursor=pointer]
+    - generic [ref=e68]:
+      - generic [ref=e69]:
+        - generic [ref=e70]:
+          - generic [ref=e71]: local-dev / harness mode
+          - generic [ref=e72]: "runtime mode: local-dev-harness"
+        - paragraph [ref=e73]: Production labels disabled until backend state proves network, media, and storage services are configured
+      - generic [ref=e74]:
+        - generic "Signaling/relay service labels require configured network features and backend state" [ref=e75]:
+          - paragraph [ref=e76]: Network services
+          - paragraph [ref=e77]: not-configured
+        - generic "Voice media labels require configured media features and route evidence" [ref=e78]:
+          - paragraph [ref=e79]: Media services
+          - paragraph [ref=e80]: not-configured
+        - generic "Storage service labels require production storage feature on supported targets" [ref=e81]:
+          - paragraph [ref=e82]: Storage services
+          - paragraph [ref=e83]: not-configured
+    - paragraph [ref=e84]: "Invite ready: discrypt://join/v1/08da00fd-90ca-416e-9da3-a2276bf4f489?endpoint=https%3A%2F%2Fsignaling.discrypt.invalid%2Fv1%2Frendezvous&policy=production_tls&trust_fp=c06607eec06607eec06607eec06607eec06607eec06607eec06607eec06607ee&trust=signed+endpoint+fingerprint%3B+verify+before+MLS+Welcome&commitment=6f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac7&exp=2026-06-06T02%3A50%3A33.390Z&max=5&stun=stun%3Adefault.discrypt.invalid%3A3478&turn=turns%3Adefault.discrypt.invalid%3A5349"
+    - region "Backend-derived transport status" [ref=e85]:
+      - generic [ref=e86]:
+        - generic [ref=e87]:
+          - paragraph [ref=e88]: Transport status
+          - paragraph [ref=e89]: Backend-derived state only; route and media claims stay quiet until command state provides evidence.
+        - generic [ref=e90]: honest status
+      - generic [ref=e91]:
+        - generic [ref=e92]:
+          - generic [ref=e93]:
+            - generic [ref=e94]: signaling
+            - generic [ref=e95]: signed-endpoint-ready
+          - paragraph [ref=e96]: Signed endpoint https://signaling.discrypt.invalid/v1/rendezvous with trust fingerprint c06607eec06607eec06607eec06607eec06607eec06607eec06607eec06607ee; no identity-room topology is stored by the signaling service
+        - generic [ref=e97]:
+          - generic [ref=e98]:
+            - generic [ref=e99]: ICE
+            - generic [ref=e100]: configured
+          - paragraph [ref=e101]: 1 STUN and 1 redacted TURN endpoint(s) parsed from signed invite metadata
+        - generic [ref=e102]:
+          - generic [ref=e103]:
+            - generic [ref=e104]: direct
+            - generic [ref=e105]: no-direct-proof
+          - paragraph [ref=e106]: Direct path is only shown as connected after backend state proves it; this command state has no direct route proof yet
+        - generic [ref=e107]:
+          - generic [ref=e108]:
+            - generic [ref=e109]: overlay
+            - generic [ref=e110]: available-policy
+          - paragraph [ref=e111]: Relay-overlay policy is listed as a fallback path; ciphertext-only route proof is required before claiming active relay use
+        - generic [ref=e112]:
+          - generic [ref=e113]:
+            - generic [ref=e114]: TURN
+            - generic [ref=e115]: configured
+          - paragraph [ref=e116]: TURN endpoints are redacted from signed invite metadata and are not treated as active without backend route evidence
+        - generic [ref=e117]:
+          - generic [ref=e118]:
+            - generic [ref=e119]: degraded
+            - generic [ref=e120]: clear
+          - paragraph [ref=e121]: No degraded command state is currently reported
+        - generic [ref=e122]:
+          - generic [ref=e123]:
+            - generic [ref=e124]: reconnecting
+            - generic [ref=e125]: idle
+          - paragraph [ref=e126]: Reconnect orchestration is displayed only when event state reports reconnect attempts
+        - generic [ref=e127]:
+          - generic [ref=e128]:
+            - generic [ref=e129]: failed
+            - generic [ref=e130]: clear
+          - paragraph [ref=e131]: No failed transport command is currently reported
+    - navigation "Workspace sections" [ref=e132]:
+      - button "Setup" [ref=e133] [cursor=pointer]
+      - button "DMs" [ref=e134] [cursor=pointer]
+      - button "Text" [ref=e135] [cursor=pointer]
+      - button "Voice" [ref=e136] [cursor=pointer]
+      - button "Invites" [ref=e137] [cursor=pointer]
+      - button "Groups" [ref=e138] [cursor=pointer]
+    - generic [ref=e140]:
+      - generic [ref=e141]:
+        - generic [ref=e142]:
+          - heading "Invites and joining" [level=3] [ref=e143]
+          - paragraph [ref=e144]: Create an invite for the active group or paste an invite to join/open a group.
+        - generic [ref=e145]:
+          - generic [ref=e146]:
+            - text: Invite URL or code
+            - textbox "Invite URL or code" [ref=e147]: discrypt://join/v1/08da00fd-90ca-416e-9da3-a2276bf4f489?endpoint=https%3A%2F%2Fsignaling.discrypt.invalid%2Fv1%2Frendezvous&policy=production_tls&trust_fp=c06607eec06607eec06607eec06607eec06607eec06607eec06607eec06607ee&trust=signed+endpoint+fingerprint%3B+verify+before+MLS+Welcome&commitment=6f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac7&exp=2026-06-06T02%3A50%3A33.390Z&max=5&stun=stun%3Adefault.discrypt.invalid%3A3478&turn=turns%3Adefault.discrypt.invalid%3A5349
+          - generic [ref=e148]:
+            - text: Joined group label
+            - textbox "Joined group label" [ref=e149]: joined enclave
+          - generic [ref=e150]:
+            - button "Join/open group" [ref=e151] [cursor=pointer]
+            - button "Create invite for active group" [active] [ref=e152] [cursor=pointer]
+            - button "Use latest invite" [ref=e153] [cursor=pointer]
+          - generic [ref=e154]:
+            - generic [ref=e155]:
+              - heading "Group join progress" [level=3] [ref=e156]
+              - paragraph [ref=e157]: Invite parsing, rendezvous, authorization, Welcome, MLS, and route stages stay evidence-gated by command state.
+            - generic [ref=e158]:
+              - generic [ref=e159]:
+                - generic [ref=e160]: ✓
+                - generic [ref=e161]:
+                  - generic [ref=e162]:
+                    - paragraph [ref=e163]: Invite parsed
+                    - generic [ref=e164]: complete
+                  - paragraph [ref=e165]: Invite 08da00fd-90ca-416e-9da3-a2276bf4f489 parsed with signaling endpoint https://signaling.discrypt.invalid/v1/rendezvous
+              - generic [ref=e166]:
+                - generic [ref=e167]: "2"
+                - generic [ref=e168]:
+                  - generic [ref=e169]:
+                    - paragraph [ref=e170]: Rendezvous link
+                    - generic [ref=e171]: waiting-for-backend-event
+                  - paragraph [ref=e172]: Rendezvous connected is marked only when backend state reports an authenticated publish/take exchange
+              - generic [ref=e173]:
+                - generic [ref=e174]: "3"
+                - generic [ref=e175]:
+                  - generic [ref=e176]:
+                    - paragraph [ref=e177]: Authorized member
+                    - generic [ref=e178]: waiting-for-authorized-member
+                  - paragraph [ref=e179]: Waiting for an authorized member or helper to approve admission; the invite link alone is insufficient
+              - generic [ref=e180]:
+                - generic [ref=e181]: "4"
+                - generic [ref=e182]:
+                  - generic [ref=e183]:
+                    - paragraph [ref=e184]: Welcome package
+                    - generic [ref=e185]: pending-welcome
+                  - paragraph [ref=e186]: Welcome received becomes complete only after backend state records a verified MLS Welcome/add
+              - generic [ref=e187]:
+                - generic [ref=e188]: "5"
+                - generic [ref=e189]:
+                  - generic [ref=e190]:
+                    - paragraph [ref=e191]: MLS group state
+                    - generic [ref=e192]: local-group-open
+                  - paragraph [ref=e193]: MLS joined requires command state for the active group plus epoch/member verification
+              - generic [ref=e194]:
+                - generic [ref=e195]: "6"
+                - generic [ref=e196]:
+                  - generic [ref=e197]:
+                    - paragraph [ref=e198]: Transport route
+                    - generic [ref=e199]: waiting-route-proof
+                  - paragraph [ref=e200]: Transport connected is shown only after backend state provides direct, overlay, or TURN route evidence
+          - generic [ref=e201]:
+            - generic [ref=e202]:
+              - generic [ref=e203]:
+                - generic [ref=e204]:
+                  - heading "Latest invite descriptor" [level=3] [ref=e205]
+                  - paragraph [ref=e206]: Signaling, limits, revocation, password-gate, and MLS admission state are shown from command state.
+                - generic [ref=e207]:
+                  - generic [ref=e208]: not revoked
+                  - generic [ref=e209]: uses 0
+              - paragraph [ref=e210]: discrypt://join/v1/08da00fd-90ca-416e-9da3-a2276bf4f489?endpoint=https%3A%2F%2Fsignaling.discrypt.invalid%2Fv1%2Frendezvous&policy=production_tls&trust_fp=c06607eec06607eec06607eec06607eec06607eec06607eec06607eec06607ee&trust=signed+endpoint+fingerprint%3B+verify+before+MLS+Welcome&commitment=6f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac7&exp=2026-06-06T02%3A50%3A33.390Z&max=5&stun=stun%3Adefault.discrypt.invalid%3A3478&turn=turns%3Adefault.discrypt.invalid%3A5349
+            - generic [ref=e211]:
+              - generic [ref=e212]:
+                - generic [ref=e213]:
+                  - paragraph [ref=e214]: Signaling endpoint
+                  - paragraph [ref=e215]: https://signaling.discrypt.invalid/v1/rendezvous
+                - generic [ref=e216]:
+                  - paragraph [ref=e217]: Endpoint policy
+                  - paragraph [ref=e218]: production_tls
+                - generic [ref=e219]:
+                  - paragraph [ref=e220]: Expiry label
+                  - paragraph [ref=e221]: Invite expires and can be revoked
+                - generic [ref=e222]:
+                  - paragraph [ref=e223]: Expires at
+                  - paragraph [ref=e224]: 2026-06-06T02:50:33.390Z
+                - generic [ref=e225]:
+                  - paragraph [ref=e226]: Max-use limit
+                  - paragraph [ref=e227]: Max-use is enforced before MLS admission
+                - generic [ref=e228]:
+                  - paragraph [ref=e229]: Remaining local uses
+                  - paragraph [ref=e230]: not parsed
+                - generic [ref=e231]:
+                  - paragraph [ref=e232]: Revocation status
+                  - paragraph [ref=e233]: usable while expiry and max-use checks pass
+                - generic [ref=e234]:
+                  - paragraph [ref=e235]: Password-gate status
+                  - paragraph [ref=e236]: Password rooms use OPAQUE/PAKE or an online authorized helper; no offline verifier
+              - generic [ref=e237]:
+                - generic [ref=e238]:
+                  - paragraph [ref=e239]: MLS admission state
+                  - paragraph [ref=e240]: Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient
+                - generic [ref=e241]:
+                  - paragraph [ref=e242]: Signaling trust
+                  - paragraph [ref=e243]: signed endpoint fingerprint; verify before MLS Welcome
+                - generic [ref=e244]:
+                  - paragraph [ref=e245]: Trust fingerprint
+                  - paragraph [ref=e246]: c06607eec06607eec06607eec06607eec06607eec06607eec06607eec06607ee
+                - generic [ref=e247]:
+                  - paragraph [ref=e248]: Room secret commitment
+                  - paragraph [ref=e249]: 6f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac76f73dac7
+              - generic [ref=e250]:
+                - generic [ref=e251]:
+                  - paragraph [ref=e252]: ICE/STUN metadata
+                  - paragraph [ref=e253]: stun:default.discrypt.invalid:3478
+                - generic [ref=e254]:
+                  - paragraph [ref=e255]: TURN metadata
+                  - paragraph [ref=e256]: turns:default.discrypt.invalid:5349 (no raw credential exposed)
+      - generic [ref=e257]:
+        - heading "Admission rules" [level=3] [ref=e259]
+        - generic [ref=e260]:
+          - generic [ref=e261]:
+            - paragraph [ref=e262]: Expiry
+            - paragraph [ref=e263]: Invite expires and can be revoked
+          - generic [ref=e264]:
+            - paragraph [ref=e265]: Max use
+            - paragraph [ref=e266]: Max-use is enforced before MLS admission
+          - generic [ref=e267]:
+            - paragraph [ref=e268]: MLS admission
+            - paragraph [ref=e269]: Final admission still requires an authorized MLS Welcome/add
 ```
