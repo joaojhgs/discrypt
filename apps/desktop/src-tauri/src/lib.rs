@@ -6841,6 +6841,58 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn public_nostr_message_send_proves_provider_webrtc_transport_when_enabled() {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_MESSAGE_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public Nostr message transport proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_MESSAGE_E2E=1 to run"
+            );
+            return;
+        }
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("desktop-public-nostr-message-proof");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm.dms[0].dm_id.clone();
+
+        let state = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "nostr transport proof message".to_owned(),
+            transport_proof: true,
+            adapter_kind: Some("nostr".to_owned()),
+        });
+
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
+        );
+        assert_eq!(state.messages[0].state_key, "transport_probe_verified");
+        let proof = state
+            .transport_diagnostics
+            .data_channel_probe
+            .expect("send transport proof should update diagnostics");
+        assert_eq!(proof.kind, "nostr");
+        assert!(proof.text_control_frame_roundtrip);
+        assert_eq!(proof.text_control_frame_sha256.len(), 64);
+    }
+
+    #[test]
     #[cfg(feature = "mqtt-adapter")]
     fn mqtt_adapter_feature_reaches_app_state_diagnostics() {
         let _guard = test_lock();

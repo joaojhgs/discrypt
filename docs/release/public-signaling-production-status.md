@@ -11,7 +11,7 @@ Discrypt is **not production-complete** for the full serverless P2P encrypted ap
 - **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; `/dnsaddr` bootstrap multiaddrs are accepted, but the latest public bootstrap smoke failed with `InsufficientPeers` because public IPFS bootstrap peers are not enough by themselves to form a topic mesh.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
 - **Provider-signaled WebRTC data-channel proof: MQTT and Nostr are now green in live public-provider tests when using public STUN and a real network UDP bind.**
-- **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof reaches the Rust transport signaling adapter layer, sealed WebRTC offer/answer exchange, a real WebRTC DataChannel frame over public MQTT/Nostr rendezvous, and an opt-in Tauri `send_message(..., transport_proof=true)` path that sends an opaque message-derived frame through public MQTT WebRTC diagnostics; it is still not the complete two-installed-profile peer receipt or voice/media-plane proof.
+- **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof reaches the Rust transport signaling adapter layer, sealed WebRTC offer/answer exchange, a real WebRTC DataChannel frame over public MQTT/Nostr rendezvous, and an opt-in Tauri `send_message(..., transport_proof=true)` path that sends an opaque message-derived frame through public MQTT and Nostr WebRTC diagnostics; it is still not the complete two-installed-profile peer receipt or voice/media-plane proof.
 
 ## What was implemented now
 
@@ -106,6 +106,10 @@ DISCRYPT_DESKTOP_PUBLIC_MQTT_MESSAGE_E2E=1 \
 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 \
   cargo test -q -p discrypt-desktop --features mqtt-adapter \
   public_mqtt_message_send_proves_provider_webrtc_transport_when_enabled -- --nocapture
+DISCRYPT_DESKTOP_PUBLIC_NOSTR_MESSAGE_E2E=1 \
+DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol \
+  cargo test -q -p discrypt-desktop --features nostr-adapter \
+  public_nostr_message_send_proves_provider_webrtc_transport_when_enabled -- --nocapture
 npm --prefix apps/ui run typecheck
 ```
 
@@ -172,7 +176,7 @@ Public provider-signaled WebRTC data-channel status:
 - The test uses `stun:stun.l.google.com:19302`, waits for completed local ICE SDP where possible, exchanges sealed offer/answer through the selected public provider, opens the WebRTC DataChannel, and sends an opaque text/control frame.
 - The previous `set remote answer failed: Disconnected(WriteNotify)` failure was traced to exercising public STUN while binding WebRTC UDP to `127.0.0.1:0`; the public-provider test now binds `0.0.0.0:0` so STUN and host candidate gathering can use the actual network interface.
 - The same transport proof is exposed to Tauri as an explicit `data_channel_probe` diagnostic. It is not run automatically because public providers can rate-limit and the probe is network-dependent.
-- The message composer can now opt into the same backend proof per send. Latest live Tauri MQTT message-proof run passed with `DISCRYPT_DESKTOP_PUBLIC_MQTT_MESSAGE_E2E=1` against `mqtts://broker.emqx.io:8883`, setting `transport_probe_verified` and recording a frame SHA-256 in diagnostics. This is a command/backend transport proof, not a signed remote peer receipt.
+- The message composer can now opt into the same backend proof per send. Latest live Tauri MQTT message-proof run passed with `DISCRYPT_DESKTOP_PUBLIC_MQTT_MESSAGE_E2E=1` against `mqtts://broker.emqx.io:8883`; latest live Tauri Nostr message-proof run passed with `DISCRYPT_DESKTOP_PUBLIC_NOSTR_MESSAGE_E2E=1` against `wss://nos.lol`. Both set `transport_probe_verified` and record a frame SHA-256 in diagnostics. This is a command/backend transport proof, not a signed remote peer receipt.
 
 ## What remains open before production
 
