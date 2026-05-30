@@ -1008,12 +1008,6 @@ enum BackendTransportMode {
     Text,
 }
 
-impl std::fmt::Display for BackendTransportMode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str((*self).label())
-    }
-}
-
 impl BackendTransportMode {
     fn session_id_prefix(self) -> &'static str {
         match self {
@@ -2645,30 +2639,28 @@ impl PersistedAppState {
         let label = normalize_label(&scope_label.unwrap_or_else(|| "default".to_owned()), "default");
         self.ensure_ready_profile();
 
-        {
-            let slot = self.transport_session_mut(mode);
-            if let Some(existing) = slot.as_mut() {
-                if existing.scope_label == label {
-                    match existing.state() {
-                        TransportSessionState::Signaling
-                        | TransportSessionState::IceGathering
-                        | TransportSessionState::Checking
-                        | TransportSessionState::Direct
-                        | TransportSessionState::OverlayRelay
-                        | TransportSessionState::TurnRelay
-                        | TransportSessionState::Reconnecting => {
+        let slot = self.transport_session_mut(mode);
+        if let Some(existing) = slot.as_ref() {
+            if existing.scope_label == label {
+                match existing.state() {
+                    TransportSessionState::Signaling
+                    | TransportSessionState::IceGathering
+                    | TransportSessionState::Checking
+                    | TransportSessionState::Direct
+                    | TransportSessionState::OverlayRelay
+                    | TransportSessionState::TurnRelay
+                    | TransportSessionState::Reconnecting => {
+                        return Ok(existing.session_id.clone());
+                    }
+                    TransportSessionState::Idle => {
+                        if existing.session.begin_signaling().is_ok() {
                             return Ok(existing.session_id.clone());
                         }
-                        TransportSessionState::Idle => {
-                            if existing.session.begin_signaling().is_ok() {
-                                return Ok(existing.session_id.clone());
-                            }
-                        }
-                        TransportSessionState::Disconnected
-                        | TransportSessionState::Failed
-                        | TransportSessionState::Cancelled => {
-                            // Intentionally recreate to represent a fresh session lifecycle.
-                        }
+                    }
+                    TransportSessionState::Disconnected
+                    | TransportSessionState::Failed
+                    | TransportSessionState::Cancelled => {
+                        // Intentionally recreate to represent a fresh session lifecycle.
                     }
                 }
             }
@@ -2680,7 +2672,7 @@ impl PersistedAppState {
         if let Err(error) = session.begin_signaling() {
             return Err(format!("failed to start {mode} transport session: {error}"));
         }
-        *self.transport_session_mut(mode) = Some(TransportSessionRecord {
+        *slot = Some(TransportSessionRecord {
             session_id: session_id.clone(),
             scope_label: label,
             mode,
@@ -2698,36 +2690,24 @@ impl PersistedAppState {
         mode: BackendTransportMode,
         session_id: Option<String>,
     ) {
-        let stopped_session_id = {
-            let slot = self.transport_session_mut(mode);
-            let Some(record) = slot.as_mut() else {
-                return;
-            };
-            if session_id
-                .as_ref()
-                .is_some_and(|requested_id| requested_id != &record.session_id)
-            {
-                return;
-            }
-
-            if matches!(
-                record.state(),
-                TransportSessionState::Failed | TransportSessionState::Cancelled
-            ) {
-                return;
-            }
-
-            if record.session.tear_down("stop requested").is_ok() {
-                Some(record.session_id.clone())
-            } else {
-                None
-            }
+        let slot = self.transport_session_mut(mode);
+        let Some(record) = slot.as_mut() else {
+            return;
         };
+        if let Some(requested_id) = session_id
+            && requested_id != record.session_id
+        {
+            return;
+        }
 
-        if let Some(stopped_session_id) = stopped_session_id {
+        if matches!(record.state(), TransportSessionState::Failed | TransportSessionState::Cancelled) {
+            return;
+        }
+
+        if record.session.tear_down("stop requested").is_ok() {
             self.push_event(
                 format!("{mode}.session_stopped"),
-                format!("Stopped {mode} transport session {stopped_session_id}"),
+                format!("Stopped {mode} transport session {}", record.session_id),
             );
         }
     }
