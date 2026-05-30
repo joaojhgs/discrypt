@@ -1745,8 +1745,25 @@ impl TauriAppService {
             return report;
         }
 
+        if runtime.session_id != session.session_id {
+            let message = format!(
+                "text transport runtime session id {} does not match active text session {}",
+                runtime.session_id, session.session_id
+            );
+            self.state.push_command_error(
+                "message.transport_pump_unavailable",
+                "pump_text_control_transport_once",
+                "text_session_id_mismatch",
+                message.clone(),
+                "Stop the previous session and restart the text session before pumping",
+            );
+            let report = failure_report("text-control-runtime-session-mismatch", message);
+            self.persist();
+            return report;
+        }
+
         let transport = runtime.transport.clone();
-        let transport_session_id = runtime.session_id.clone();
+        let transport_session_id = session.session_id.clone();
         let executor = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -9309,16 +9326,18 @@ mod tests {
             );
         });
         let transport = Arc::new(ReceiverBackedTextControlTransport::new(bob));
-        attach_text_control_transport_runtime_for_test(
-            transport.clone(),
-            "text-control-transport-trait-test",
-        );
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("text-control-transport-trait-test".to_owned()),
             data_channel_probe: false,
             adapter_kind: None,
         });
         assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        attach_text_control_transport_runtime_for_test(transport.clone(), active_session_id);
 
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
@@ -9511,6 +9530,89 @@ mod tests {
             .expect("missing text session should be reported as a command error");
         assert_eq!(command_error.command, "pump_text_control_transport_once");
         assert_eq!(command_error.code, "text_session_missing");
+
+        clear_text_control_transport_runtime_for_test();
+    }
+
+    #[test]
+    fn text_control_pump_reports_session_id_mismatch() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-transport-pump-session-mismatch");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let message_id = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "session id mismatch".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        })
+        .messages
+        .first()
+        .map(|message| message.message_id.clone())
+        .unwrap();
+
+        let receiver_state_path =
+            fresh_state_path("text-control-transport-pump-session-mismatch-bob");
+        let _ = fs::remove_file(&receiver_state_path);
+        let transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(receiver_state_path),
+        ));
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("matching-text-session".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        attach_text_control_transport_runtime_for_test(transport, "mismatched-text-session");
+
+        let state_before = load_state();
+        assert!(
+            state_before
+                .text_control_outbox
+                .iter()
+                .any(|frame| frame.message_id == message_id),
+            "expected unsent frame in text control outbox",
+        );
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(8),
+        });
+
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("does not match active text session")),
+            "expected session id mismatch failure detail",
+        );
+        assert_eq!(
+            report.frames_sent, 0,
+            "no frames should send with session id mismatch"
+        );
+        assert_eq!(
+            report.response_frames_received, 0,
+            "no response frames should be received with session id mismatch"
+        );
+
+        let state_after = load_state();
+        let command_error = state_after
+            .last_command_error
+            .expect("session id mismatch should be reported as a command error");
+        assert_eq!(command_error.command, "pump_text_control_transport_once");
+        assert_eq!(command_error.code, "text_session_id_mismatch");
 
         clear_text_control_transport_runtime_for_test();
     }
