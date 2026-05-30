@@ -59,7 +59,7 @@ required artifacts are not wired into the repository.
 ## Evidence from this G131 run
 
 The final local verification run on 2026-05-30 passed the complete command set
-above. The browser/UI portion reported **8 Chromium tests passed** across:
+above. The browser/UI portion reported **9 Chromium tests passed** across:
 
 - first-run setup without blank screen;
 - account recovery without content-key recovery claims;
@@ -71,6 +71,9 @@ above. The browser/UI portion reported **8 Chromium tests passed** across:
 - small-window navigation;
 - local-dev persistence after reload; and
 - transport-status honesty before invite metadata exists.
+- two independent browser profiles using isolated local stores for DM send
+  attempts, invite join/open, and voice/media attempts without fabricated
+  remote members or relay rows.
 
 The multi-process/multi-host coverage is represented by maintained Rust/process
 harness gates rather than by the browser-only UI test: `test:pcap-suite-g096`,

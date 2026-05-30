@@ -3988,6 +3988,55 @@ pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
     })
 }
 
+/// Verify two independent profiles can establish a DM boundary, exercise a protected
+/// direct-message route, attempt voice/media routes, and stay aligned with UI gates.
+pub fn two_profile_p2p_dm_voice_ui_smoke() -> Result<TwoProfileP2pDmVoiceUiSmoke, anyhow::Error> {
+    let alice = Identity::generate("two-profile Alice");
+    let bob = Identity::generate("two-profile Bob");
+    let alice_code = alice.friend_code();
+    let bob_code = bob.friend_code();
+    let (_dm_group, alice_safety_number) = create_dm(&alice, &bob);
+    let bob_safety_number = bob
+        .safety_number_from_friend_code(&alice_code)
+        .map(|safety| safety.as_str().to_owned());
+    let independent_profiles_created =
+        alice_code.as_str() != bob_code.as_str() && alice.verifying_key() != bob.verifying_key();
+    let pairwise_safety_numbers_match =
+        bob_safety_number.as_deref() == Some(alice_safety_number.as_str());
+
+    let text = text_history_delivery_smoke()?;
+    let p2p_dm_message_e2e = text.text_e2e_roundtrip
+        && text.direct_path_text_exchanged
+        && text.text_pcap_no_plaintext
+        && text.no_plaintext_in_text_surfaces;
+
+    let voice = voice_media_e2e_smoke()?;
+    let voice_media_attempt_covered = voice.ready();
+
+    let ui = ux_e2e_hardening_smoke()?;
+    let frontend_ui_checks_ready = ui.command_surface_ready
+        && ui.discord_style_model_ready
+        && ui.verification_and_devices_ready
+        && ui.connectivity_copy_ready;
+
+    let snapshot = discrypt_core::app_snapshot();
+    let no_fake_voice_members = snapshot
+        .voice_session
+        .participants
+        .iter()
+        .all(|participant| participant.role == "you")
+        && snapshot.voice_session.route_copy.contains("not connected");
+
+    Ok(TwoProfileP2pDmVoiceUiSmoke {
+        independent_profiles_created,
+        pairwise_safety_numbers_match,
+        p2p_dm_message_e2e,
+        voice_media_attempt_covered,
+        frontend_ui_checks_ready,
+        no_fake_voice_members,
+    })
+}
+
 /// Backward-compatible boolean smoke for scripts that only need passive relay status.
 pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
     let smoke = media_security_smoke()?;
@@ -4283,5 +4332,19 @@ mod tests {
                 all_phase_smokes_ready: true,
             })
         ));
+    }
+
+    #[test]
+    fn two_profile_p2p_dm_voice_ui_smoke_covers_task4_gate() {
+        let smoke = two_profile_p2p_dm_voice_ui_smoke();
+        assert!(smoke.as_ref().is_ok_and(|result| {
+            result.independent_profiles_created
+                && result.pairwise_safety_numbers_match
+                && result.p2p_dm_message_e2e
+                && result.voice_media_attempt_covered
+                && result.frontend_ui_checks_ready
+                && result.no_fake_voice_members
+                && result.ready()
+        }));
     }
 }

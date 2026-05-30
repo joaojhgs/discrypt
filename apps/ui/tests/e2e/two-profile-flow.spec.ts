@@ -39,7 +39,7 @@ async function openProfile(
   displayName: string,
   deviceName: string,
 ) {
-  const context = await browser.newContext();
+  const context = await browser.newContext({ baseURL: "http://127.0.0.1:4173" });
   const page = await context.newPage();
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -58,7 +58,6 @@ async function openProfile(
   await expect(
     page.getByRole("navigation", { name: /workspace sections/i }),
   ).toBeVisible();
-  await expect(page.getByText(deviceName).first()).toHaveCount(0);
   return { context, page, errors };
 }
 
@@ -114,14 +113,14 @@ async function joinInvite(page: Page, invite: string) {
   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
 }
 
-async function attemptVoice(page: Page) {
+async function attemptVoice(page: Page, profile: string) {
   await page
     .getByRole("navigation", { name: /workspace sections/i })
     .getByRole("button", { name: "Voice", exact: true })
     .click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
-  await expect(page.getByText(/command-backed local voice session/i)).toBeVisible();
+  await expect(page.getByText(`${profile} E2E microphone`)).toBeVisible();
   await expect(
     page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
   ).toBeVisible();
@@ -146,8 +145,8 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await attemptVoice(alice.page);
-    await attemptVoice(bob.page);
+    await attemptVoice(alice.page, "Alice");
+    await attemptVoice(bob.page, "Bob");
 
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);

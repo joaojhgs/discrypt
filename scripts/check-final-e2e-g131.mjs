@@ -126,7 +126,8 @@ function run() {
 
   for (const token of [
     "G131 final E2E verification",
-    "8 Chromium tests passed",
+    "9 Chromium tests passed",
+    "two independent browser profiles",
     "multi-process/multi-host coverage is represented by maintained Rust/process\nharness gates",
     "cargo clippy --workspace --all-targets --quiet -- -D warnings",
   ]) requireText(failures, "G131 final verification doc", g131Doc, token);

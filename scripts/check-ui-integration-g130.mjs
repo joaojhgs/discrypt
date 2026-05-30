@@ -10,6 +10,7 @@ const files = {
   commands: read("apps/ui/src/commands.ts"),
   config: read("apps/ui/src/app-config.ts"),
   statefulE2e: read("apps/ui/tests/e2e/stateful-ui.spec.ts"),
+  twoProfileE2e: read("apps/ui/tests/e2e/two-profile-flow.spec.ts"),
   recoveryE2e: read("apps/ui/tests/e2e/recovery.spec.ts"),
   packageJson: read("apps/ui/package.json"),
   workflow: read(".github/workflows/ci.yml"),
@@ -96,6 +97,16 @@ for (const token of [
   "Ops relay",
   "toHaveCount(0)",
 ]) requireText("statefulE2e", token);
+for (const token of [
+  "two independent profiles exercise DM, invite join, and voice attempts honestly",
+  "browser.newContext",
+  "alice to bob local DM harness ping",
+  "bob to alice local DM harness pong",
+  "encrypted media transport remains gated by media-frame E2E",
+  "New contact · friend",
+  "Ops relay",
+  "toHaveCount(0)",
+]) requireText("twoProfileE2e", token);
 for (const token of [
   "first-run recovery restores account continuity without content-key claims",
   "recover existing user",
