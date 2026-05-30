@@ -450,3 +450,26 @@ cargo test -q -p discrypt-desktop attach_text_control_transport_runtime -- --noc
 npm --prefix apps/ui run test:command-coverage
 npm --prefix apps/ui run typecheck
 ```
+
+### 2026-05-30 public role-split text runtime evidence
+
+- [x] Added executable public-provider role-split text/control runtime gates for all required signaling adapter families:
+  - MQTT: `public_mqtt_role_split_text_runtime_roundtrip`
+  - Nostr: `public_nostr_role_split_text_runtime_roundtrip`
+  - IPFS/libp2p: `public_ipfs_role_split_text_runtime_roundtrip`
+  - separate Discrypt rendezvous: `public_quic_rendezvous_role_split_text_runtime_roundtrip`
+- [x] Ran the real public MQTT role-split runtime gate against `mqtts://broker.emqx.io:8883`; two separately-started offerer/answerer peers negotiated through the public broker, opened a WebRTC DataChannel with public STUN, sent an opaque text/control frame, and received an opaque receipt.
+- [x] Ran the real public Nostr role-split runtime gate against `wss://nos.lol`; two separately-started offerer/answerer peers negotiated through the public relay, opened a WebRTC DataChannel with public STUN, sent an opaque text/control frame, and received an opaque receipt.
+- [ ] IPFS/libp2p and separate Discrypt rendezvous role-split gates are executable but remain unproven against public/deployed infrastructure in this environment because they require explicit direct topic-peer multiaddrs and a deployed HTTPS/WSS rendezvous endpoint respectively.
+
+Verification added/run:
+
+```bash
+cargo fmt --all --check
+cargo check -q -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter
+cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_role_split_text_runtime_roundtrip -- --nocapture
+DISCRYPT_PUBLIC_MQTT_ROLE_SPLIT_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_role_split_text_runtime_roundtrip -- --nocapture
+DISCRYPT_PUBLIC_NOSTR_ROLE_SPLIT_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-transport --features nostr-adapter --test public_webrtc_datachannel_e2e public_nostr_role_split_text_runtime_roundtrip -- --nocapture
+cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter --test public_webrtc_datachannel_e2e public_ipfs_role_split_text_runtime_roundtrip -- --nocapture
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter --test public_webrtc_datachannel_e2e public_quic_rendezvous_role_split_text_runtime_roundtrip -- --nocapture
+```

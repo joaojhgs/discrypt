@@ -13,10 +13,12 @@
 ))]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_roundtrip;
 use discrypt_transport::{
-    derive_scope_commitment, probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel,
-    ConnectivityScopeLevel, ConversationScope, Endpoint, IceServerConfig,
+    derive_scope_commitment, probe_provider_webrtc_datachannel_roundtrip,
+    start_provider_webrtc_text_control_answer_runtime_with_answerer,
+    start_provider_webrtc_text_control_offer_runtime, AdapterTrustLabel, ConnectivityScopeLevel,
+    ConversationScope, Endpoint, IceServerConfig, ProviderTextControlRuntimePeerRole,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+    SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
 };
 #[cfg(feature = "mqtt-adapter")]
 use discrypt_transport::{
@@ -182,6 +184,114 @@ async fn run_provider_signaled_webrtc_datachannel_roundtrip(
     Ok(())
 }
 
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+async fn run_provider_signaled_role_split_text_runtime_roundtrip(
+    profile: SignalingAdapterProfile,
+) -> Result<(), TransportError> {
+    let scope_secret = random_bytes::<32>();
+    let scope = ConversationScope::new(
+        ConnectivityScopeLevel::Dm,
+        derive_scope_commitment(
+            ConnectivityScopeLevel::Dm,
+            &scope_secret,
+            "public-role-split-text-runtime-e2e",
+        ),
+    )?;
+    let ice = discrypt_transport::WebRtcNegotiationConfig::new(IceServerConfig::new(
+        vec![Endpoint::new("stun:stun.l.google.com:19302")],
+        vec![],
+    )?);
+    let bootstrap_secret = random_bytes::<32>();
+    let random_entropy = random_bytes::<16>();
+    let offerer_peer_id = SignalingPeerId::new("public-role-split-offerer")?;
+    let answerer_peer_id = SignalingPeerId::new("public-role-split-answerer")?;
+    let answerer_remote_peer_id = offerer_peer_id.clone();
+    let answerer_local_peer_id = answerer_peer_id.clone();
+    let answerer_profile = profile.clone();
+    let answerer_scope = scope.clone();
+    let answerer_bootstrap_secret = bootstrap_secret;
+    let answerer_random_entropy = random_entropy;
+    let answerer_ice = ice.clone();
+    let answerer_task = tokio::spawn(async move {
+        start_provider_webrtc_text_control_answer_runtime_with_answerer(
+            answerer_profile,
+            answerer_scope,
+            &answerer_bootstrap_secret,
+            &answerer_random_entropy,
+            answerer_ice,
+            answerer_local_peer_id,
+            answerer_remote_peer_id,
+            |frame| {
+                let mut receipt = b"ciphertext:role-split-public-receipt:".to_vec();
+                receipt.extend_from_slice(&frame);
+                Ok(receipt)
+            },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let offerer = start_provider_webrtc_text_control_offer_runtime(
+        profile,
+        scope,
+        &bootstrap_secret,
+        &random_entropy,
+        ice,
+        offerer_peer_id,
+        answerer_peer_id,
+    )
+    .await?;
+    let answerer = tokio::time::timeout(std::time::Duration::from_secs(20), answerer_task)
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable(
+                "timed out waiting for public role-split answerer attach".to_owned(),
+            )
+        })?
+        .map_err(|error| {
+            TransportError::Unavailable(format!(
+                "public role-split answerer task join failed: {error}"
+            ))
+        })??;
+    assert_eq!(
+        offerer.evidence().role,
+        ProviderTextControlRuntimePeerRole::Offerer
+    );
+    assert_eq!(
+        answerer.evidence().role,
+        ProviderTextControlRuntimePeerRole::Answerer
+    );
+    assert!(offerer.evidence().direct_path_ready);
+    assert!(answerer.evidence().direct_path_ready);
+    assert!(offerer.evidence().data_channel_open);
+    assert!(answerer.evidence().data_channel_open);
+
+    let transport = offerer.transport();
+    let frame = b"ciphertext:role-split-public-frame".to_vec();
+    transport.send_text_control_frame(frame.clone()).await?;
+    let receipt = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        transport.recv_text_control_frame(),
+    )
+    .await
+    .map_err(|_| {
+        TransportError::Unavailable(
+            "timed out waiting for public role-split text/control receipt".to_owned(),
+        )
+    })??;
+    assert!(receipt.starts_with(b"ciphertext:role-split-public-receipt:"));
+    assert!(receipt.ends_with(&frame));
+
+    offerer.close().await?;
+    answerer.close().await?;
+    Ok(())
+}
+
 #[cfg(feature = "mqtt-adapter")]
 fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportError> {
     let endpoint = std::env::var("DISCRYPT_PUBLIC_TURN_ENDPOINT").map_err(|_| {
@@ -328,6 +438,60 @@ async fn public_mqtt_signals_real_webrtc_datachannel_roundtrip() -> Result<(), T
     let endpoint = std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
         .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned());
     run_provider_signaled_webrtc_datachannel_roundtrip(public_mqtt_profile(endpoint)?).await
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_mqtt_role_split_text_runtime_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_MQTT_ROLE_SPLIT_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public MQTT role-split runtime E2E; set DISCRYPT_PUBLIC_MQTT_ROLE_SPLIT_E2E=1 to run");
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+        .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned());
+    run_provider_signaled_role_split_text_runtime_roundtrip(public_mqtt_profile(endpoint)?).await
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_nostr_role_split_text_runtime_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_NOSTR_ROLE_SPLIT_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Nostr role-split runtime E2E; set DISCRYPT_PUBLIC_NOSTR_ROLE_SPLIT_E2E=1 to run");
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+        .unwrap_or_else(|_| "wss://nos.lol".to_owned());
+    run_provider_signaled_role_split_text_runtime_roundtrip(public_nostr_profile(endpoint)?).await
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_ipfs_role_split_text_runtime_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_IPFS_ROLE_SPLIT_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public IPFS/libp2p role-split runtime E2E; set DISCRYPT_PUBLIC_IPFS_ROLE_SPLIT_E2E=1 and DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS to run");
+        return Ok(());
+    }
+    let endpoints = public_ipfs_direct_topic_peer_endpoints()?;
+    run_provider_signaled_role_split_text_runtime_roundtrip(public_ipfs_profile(endpoints)?).await
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_quic_rendezvous_role_split_text_runtime_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ROLE_SPLIT_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Discrypt rendezvous role-split runtime E2E; set DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ROLE_SPLIT_E2E=1 and DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... to run");
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT").map_err(|_| {
+        TransportError::SignalingAdapter(
+            "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT is required for deployed Discrypt rendezvous role-split runtime E2E"
+                .to_owned(),
+        )
+    })?;
+    run_provider_signaled_role_split_text_runtime_roundtrip(public_discrypt_rendezvous_profile(
+        endpoint,
+    )?)
+    .await
 }
 
 #[cfg(feature = "mqtt-adapter")]
