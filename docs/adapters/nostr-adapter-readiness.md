@@ -16,6 +16,8 @@ cargo test -q -p discrypt-transport --features nostr-adapter \
   nostr_profile_preserves_all_configured_relays_for_room_join
 DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport \
   --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture
+DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E=1 cargo test -q -p discrypt-transport \
+  --features nostr-adapter public_nostr_blocked_relay_maps_to_auth_required -- --nocapture
 cargo test -q -p discrypt-transport \
   provider_failure_classes_map_to_typed_health_states -- --nocapture
 DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol \
@@ -40,7 +42,7 @@ The relay must not receive group names, channel names, display names, safety num
 
 - Keep the opt-in public relay two-peer smoke tests (`DISCRYPT_PUBLIC_NOSTR_E2E=1` and `DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1`) in release verification; latest WebRTC/DataChannel pass used `wss://nos.lol`, while an earlier relay tried at `wss://nostr.oxtr.dev` returned `blocked`.
 - Public multi-relay fallback evidence now exists: `DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture` passed on 2026-05-30 with the default relay set `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`, proving a configured degraded relay does not prevent two peers from exchanging sealed presence, signaling, and control messages via the healthy relay set.
-- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible. Conservative string classification, structured `NOTICE`/`CLOSED`/negative `OK` relay-message extraction, and all-relay Nostr publish/subscribe failure labeling are implemented; still needed for full release hardening: explicit public rate-limit/auth relay evidence.
+- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible. Conservative string classification, structured `NOTICE`/`CLOSED`/negative `OK` relay-message extraction, and all-relay Nostr publish/subscribe failure labeling are implemented. Public auth/block evidence now exists: `DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_blocked_relay_maps_to_auth_required -- --nocapture` passed on 2026-05-30 against `wss://nostr.oxtr.dev` with `failure_class=provider_auth_required` and no payload leakage. Explicit reproducible public rate-limit evidence remains opportunistic because public relays do not provide deterministic test accounts for rate-limit triggering.
 - Provider-visible capture scans are covered by G133 (`npm --prefix apps/ui run test:provider-metadata-capture-g133`) for event tags/content/log-adjacent adapter captures. External host packet capture remains a separate release-run artifact.
 - Wire this adapter through the Tauri runtime factory and UI selection path for actual app use, not only transport-level conformance.
 

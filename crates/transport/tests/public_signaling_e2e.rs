@@ -317,6 +317,44 @@ async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result
 
 #[cfg(feature = "nostr-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_nostr_blocked_relay_maps_to_auth_required() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Nostr rejection evidence; set DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E=1 to run");
+        return Ok(());
+    }
+
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_NOSTR_REJECTION_ENDPOINT")
+        .unwrap_or_else(|_| "wss://nostr.oxtr.dev".to_owned());
+    let profile = public_nostr_profile(
+        vec![endpoint],
+        "public-nostr-rejection-e2e",
+        "public relay expected to reject custom Discrypt events; typed failure evidence only",
+    )?;
+    let error = run_public_nostr_two_peer_roundtrip(
+        profile,
+        "public-nostr-rejection-e2e",
+        "hashed topic and opaque payloads; rejection path must stay redacted",
+    )
+    .await
+    .expect_err("configured rejection relay unexpectedly accepted the Discrypt event");
+    let message = format!("{error}");
+    assert!(
+        message.contains("failure_class=provider_auth_required"),
+        "expected provider_auth_required failure class, got: {message}"
+    );
+    assert!(
+        message.contains("health_state=ProviderAuthRequired"),
+        "expected ProviderAuthRequired health state, got: {message}"
+    );
+    assert!(
+        !message.contains("sealed-nostr-offer-ciphertext"),
+        "typed public rejection evidence must not leak opaque payload bytes: {message}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_nostr_multi_relay_degraded_fallback_soak() -> Result<(), TransportError> {
     if std::env::var("DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E").as_deref() != Ok("1") {
         eprintln!("skipping public Nostr multi-relay soak; set DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 to run");
