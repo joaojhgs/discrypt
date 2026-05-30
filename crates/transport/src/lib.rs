@@ -40,6 +40,7 @@ pub use provider_adapters::NostrProviderAdapter;
 pub use provider_adapters::{
     adapter_boundary_for_kind, plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
     probe_provider_webrtc_datachannel_request_response_roundtrip,
+    probe_provider_webrtc_datachannel_request_response_with_config,
     probe_provider_webrtc_datachannel_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     required_provider_adapter_registry, AdapterReadinessState, FeatureGatedProviderAdapter,
@@ -68,7 +69,7 @@ use std::time::Duration;
 use thiserror::Error;
 pub use webrtc_negotiation::{
     SealedWebRtcNegotiationPayload, TextControlDataTransport, WebRtcDataTransportMetrics,
-    WebRtcDirectPathMetrics, WebRtcIceCandidate, WebRtcNegotiationConfig,
+    WebRtcDirectPathMetrics, WebRtcIceCandidate, WebRtcIceTransportPolicy, WebRtcNegotiationConfig,
     WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator, WebRtcSdpType,
     WebRtcSessionDescription,
 };

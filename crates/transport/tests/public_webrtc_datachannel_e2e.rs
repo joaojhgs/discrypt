@@ -1,10 +1,12 @@
 #![cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 
 use discrypt_transport::{
-    derive_scope_commitment, probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel,
-    ConnectivityScopeLevel, ConversationScope, Endpoint, IceServerConfig,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+    derive_scope_commitment, probe_provider_webrtc_datachannel_request_response_with_config,
+    probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel, ConnectivityScopeLevel,
+    ConversationScope, Endpoint, IceServerConfig, SignalingAdapterCapabilities,
+    SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity,
+    SignalingProviderEndpoint, TransportError, TurnServerConfig, WebRtcIceTransportPolicy,
+    WebRtcNegotiationConfig,
 };
 use rand::RngCore;
 
@@ -81,6 +83,30 @@ async fn run_provider_signaled_webrtc_datachannel_roundtrip(
     Ok(())
 }
 
+#[cfg(feature = "mqtt-adapter")]
+fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportError> {
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_TURN_ENDPOINT").map_err(|_| {
+        TransportError::InvalidIcePolicy(
+            "set DISCRYPT_PUBLIC_TURN_ENDPOINT for public TURN relay-only E2E".to_owned(),
+        )
+    })?;
+    let username = std::env::var("DISCRYPT_PUBLIC_TURN_USERNAME").ok();
+    let credential = std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL").ok();
+    let credential_expires_at = std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL_EXPIRES_AT").ok();
+    let ice = IceServerConfig::new(
+        Vec::new(),
+        vec![TurnServerConfig::new(
+            Endpoint::new(endpoint),
+            username,
+            credential,
+            credential_expires_at,
+        )],
+    )?;
+    let mut config = WebRtcNegotiationConfig::new(ice);
+    config.ice_transport_policy = WebRtcIceTransportPolicy::RelayOnly;
+    Ok(config)
+}
+
 #[cfg(feature = "nostr-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_nostr_signals_real_webrtc_datachannel_roundtrip() -> Result<(), TransportError> {
@@ -105,4 +131,56 @@ async fn public_mqtt_signals_real_webrtc_datachannel_roundtrip() -> Result<(), T
     let endpoint = std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
         .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned());
     run_provider_signaled_webrtc_datachannel_roundtrip(public_mqtt_profile(endpoint)?).await
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_mqtt_relay_only_turn_fallback_roundtrip_when_configured(
+) -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_TURN_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping public TURN relay-only E2E; set DISCRYPT_PUBLIC_TURN_E2E=1 with TURN envs to run"
+        );
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+        .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned());
+    let scope_secret = random_bytes::<32>();
+    let scope = ConversationScope::new(
+        ConnectivityScopeLevel::Dm,
+        derive_scope_commitment(
+            ConnectivityScopeLevel::Dm,
+            &scope_secret,
+            "public-turn-relay-only-e2e",
+        ),
+    )?;
+    let probe = probe_provider_webrtc_datachannel_request_response_with_config(
+        public_mqtt_profile(endpoint)?,
+        scope,
+        &random_bytes::<32>(),
+        &random_bytes::<16>(),
+        public_turn_config_from_env()?,
+        b"ciphertext:relay-only-turn-request".to_vec(),
+        b"ciphertext:relay-only-turn-receipt".to_vec(),
+    )
+    .await?;
+    assert!(probe.offerer_data_channel_open);
+    assert!(probe.answerer_data_channel_open);
+    assert!(probe.text_control_frame_roundtrip);
+    assert!(probe.receipt_frame_roundtrip);
+    assert!(probe.offerer_configured_turn_servers > 0);
+    assert!(probe.answerer_configured_turn_servers > 0);
+    assert!(probe.offerer_turn_fallback_ready);
+    assert!(probe.answerer_turn_fallback_ready);
+    assert!(
+        probe.offerer_local_relay_candidates_gathered
+            + probe.offerer_remote_relay_candidates_applied
+            > 0
+    );
+    assert!(
+        probe.answerer_local_relay_candidates_gathered
+            + probe.answerer_remote_relay_candidates_applied
+            > 0
+    );
+    Ok(())
 }

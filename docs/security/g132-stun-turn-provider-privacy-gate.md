@@ -6,7 +6,7 @@ This gate is intentionally narrow:
 
 - It validates local process harness conformance for STUN/overlay/TURN ordering and evidence reporting.
 - It validates transport-level fallback policy selection and relay-leg ciphertext-only obligations.
-- It optionally validates real public-provider MQTT, Nostr, explicit-IPFS-topic-peer, and deployed Discrypt rendezvous signaling paths when their opt-in environment gates are set.
+- It optionally validates real public-provider MQTT, Nostr, explicit-IPFS-topic-peer, deployed Discrypt rendezvous signaling paths, and relay-only TURN WebRTC transport when their opt-in environment gates are set.
 
 ## Acceptance criteria
 
@@ -14,6 +14,7 @@ This gate is intentionally narrow:
 - **Provider privacy:** signaling path artifacts and route reports do not leak forbidden names/content tokens (`alice`, `bob`, room/topology identifiers, message/plaintext tokens).
 - **Route report honesty:** fallback chain and relay/TURN ciphertext-only assertions remain unchanged under route-report and transport conformance checks.
 - **Optional public-provider proof (opt-in):** public MQTT/Nostr signaling smokes, explicit IPFS topic-peer smokes, and deployed Discrypt rendezvous smokes can prove opaque transport/signaling behavior on real providers when explicitly enabled.
+- **Optional relay-only TURN proof (opt-in):** `DISCRYPT_PUBLIC_TURN_E2E=1` with a real TURN endpoint/credential proves the WebRTC DataChannel can open with `WebRtcIceTransportPolicy::RelayOnly` and reports relay candidate evidence; the local gate also rejects relay-only policy without TURN instead of silently claiming hard-NAT support.
 
 ## Test entry points
 
@@ -25,6 +26,7 @@ This gate is intentionally narrow:
   - `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=<wss://...> cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture`
   - `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-topic-peer-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture`
   - `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=<https://...> cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter public_quic_two_peer_signaling_smoke -- --nocapture`
+  - `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<turns://...> DISCRYPT_PUBLIC_TURN_USERNAME=<user> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<secret> cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture`
 
 ## Current evidence notes
 
@@ -43,3 +45,4 @@ This gate is intentionally narrow:
 | Public Nostr two-profile signal/control | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=<wss://...> cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Optional (real provider; latest evidence tracked in release status) |
 | Public IPFS two-profile signal/control | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-topic-peer-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Optional but still blocked until a reachable Discrypt topic-peer/rendezvous multiaddr is supplied |
 | Public QUIC two-profile signal/control | `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=<https://...> cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter public_quic_two_peer_signaling_smoke -- --nocapture` | Optional but still blocked until a staged deployed service endpoint is supplied |
+| Public MQTT relay-only TURN WebRTC DataChannel | `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<turns://...> DISCRYPT_PUBLIC_TURN_USERNAME=<user> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<secret> cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture` | Optional; requires real TURN credentials and asserts relay candidate evidence |

@@ -11,6 +11,7 @@ const docs = read("docs/security/g132-stun-turn-provider-privacy-gate.md");
 const packageJson = JSON.parse(read("apps/ui/package.json"));
 const harness = read("harness/multinode/src/lib.rs");
 const transportTests = read("crates/transport/tests/connectivity_flows.rs");
+const publicWebrtcTests = read("crates/transport/tests/public_webrtc_datachannel_e2e.rs");
 const failures = [];
 
 function requireText(name, text, token) {
@@ -25,6 +26,8 @@ for (const token of [
   "provider-visible",
   "ciphertext-only",
   "public-provider proof",
+  "relay-only TURN",
+  "DISCRYPT_PUBLIC_TURN_E2E",
 ]) {
   requireText("g132-doc", docs, token);
 }
@@ -48,6 +51,15 @@ for (const token of [
   "ciphertext_only",
 ]) {
   requireText("transport-tests", transportTests, token);
+}
+
+for (const token of [
+  "WebRtcIceTransportPolicy::RelayOnly",
+  "public_mqtt_relay_only_turn_fallback_roundtrip_when_configured",
+  "DISCRYPT_PUBLIC_TURN_ENDPOINT",
+  "offerer_turn_fallback_ready",
+]) {
+  requireText("public-webrtc-tests", publicWebrtcTests, token);
 }
 
 if (!packageJson.scripts?.["test:stun-turn-provider-privacy-g132"]) {
@@ -108,6 +120,27 @@ if (process.env.DISCRYPT_PUBLIC_SIGNALING_E2E === "1") {
         DISCRYPT_PUBLIC_MQTT_ENDPOINT: endpoint,
       },
     }
+  );
+}
+
+if (process.env.DISCRYPT_PUBLIC_TURN_E2E === "1") {
+  run(
+    "Public MQTT relay-only TURN fallback E2E (opt-in)",
+    "cargo",
+    [
+      "test",
+      "-q",
+      "-p",
+      "discrypt-transport",
+      "--features",
+      "mqtt-adapter",
+      "--test",
+      "public_webrtc_datachannel_e2e",
+      "public_mqtt_relay_only_turn_fallback_roundtrip_when_configured",
+      "--",
+      "--nocapture",
+    ],
+    { env: { ...process.env, DISCRYPT_PUBLIC_TURN_E2E: "1" } }
   );
 }
 

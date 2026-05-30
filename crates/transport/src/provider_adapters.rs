@@ -18,7 +18,7 @@ use crate::{
     RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
-    SignalingPeerId, TransportError,
+    SignalingPeerId, TransportError, WebRtcNegotiationConfig,
 };
 #[cfg(any(
     feature = "mqtt-adapter",
@@ -27,8 +27,8 @@ use crate::{
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
 use crate::{
-    TextControlDataTransport, WebRtcNegotiationConfig, WebRtcNegotiationPayloadKind,
-    WebRtcNegotiationSealer, WebRtcNegotiator,
+    TextControlDataTransport, WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer,
+    WebRtcNegotiator,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -410,6 +410,22 @@ pub struct ProviderWebRtcDataChannelProbe {
     pub offerer_direct_path_ready: bool,
     /// WebRTC direct path reached connected/completed state on the answer side.
     pub answerer_direct_path_ready: bool,
+    /// Offer-side TURN relay evidence exists with TURN configured.
+    pub offerer_turn_fallback_ready: bool,
+    /// Answer-side TURN relay evidence exists with TURN configured.
+    pub answerer_turn_fallback_ready: bool,
+    /// Offer-side configured TURN server count.
+    pub offerer_configured_turn_servers: u64,
+    /// Answer-side configured TURN server count.
+    pub answerer_configured_turn_servers: u64,
+    /// Offer-side gathered relay candidates.
+    pub offerer_local_relay_candidates_gathered: u64,
+    /// Answer-side gathered relay candidates.
+    pub answerer_local_relay_candidates_gathered: u64,
+    /// Offer-side applied remote relay candidates.
+    pub offerer_remote_relay_candidates_applied: u64,
+    /// Answer-side applied remote relay candidates.
+    pub answerer_remote_relay_candidates_applied: u64,
     /// Offer-side DataChannel opened.
     pub offerer_data_channel_open: bool,
     /// Answer-side DataChannel opened.
@@ -662,6 +678,31 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
     text_control_frame: Vec<u8>,
     receipt_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    probe_provider_webrtc_datachannel_request_response_with_config(
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        WebRtcNegotiationConfig::new(ice_servers),
+        text_control_frame,
+        receipt_control_frame,
+    )
+    .await
+}
+
+/// Run the provider-signaled WebRTC request/response proof with explicit WebRTC policy.
+///
+/// This is used by release-only TURN gates that need relay-only candidate
+/// gathering while keeping the normal production probe on all candidates.
+pub async fn probe_provider_webrtc_datachannel_request_response_with_config(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    text_control_frame: Vec<u8>,
+    receipt_control_frame: Vec<u8>,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
     if text_control_frame.is_empty() {
         return Err(TransportError::Unavailable(
             "text/control proof frame must be non-empty opaque bytes".to_owned(),
@@ -674,7 +715,9 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
     }
     profile.validate()?;
     scope.validate()?;
-    ice_servers.validate_credentials_at(chrono::Utc::now())?;
+    negotiation_config
+        .ice_servers
+        .validate_credentials_at(chrono::Utc::now())?;
     let factory = SignalingAdapterFactory::for_kind(profile.kind);
     #[cfg(not(any(
         feature = "mqtt-adapter",
@@ -685,7 +728,7 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
     let _ = (
         bootstrap_secret,
         random_entropy,
-        &ice_servers,
+        &negotiation_config,
         &text_control_frame,
         &receipt_control_frame,
     );
@@ -695,7 +738,7 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
         scope,
         bootstrap_secret,
         random_entropy,
-        ice_servers,
+        negotiation_config,
         text_control_frame,
         receipt_control_frame,
     )
@@ -708,7 +751,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
     scope: ConversationScope,
     bootstrap_secret: &[u8],
     random_entropy: &[u8],
-    ice_servers: IceServerConfig,
+    negotiation_config: WebRtcNegotiationConfig,
     text_control_frame: Vec<u8>,
     receipt_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
@@ -723,7 +766,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
         scope,
         bootstrap_secret,
         random_entropy,
-        ice_servers,
+        negotiation_config,
         text_control_frame,
         receipt_control_frame,
     );
@@ -737,7 +780,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     scope,
                     bootstrap_secret,
                     random_entropy,
-                    ice_servers,
+                    negotiation_config,
                     text_control_frame,
                     receipt_control_frame,
                 )
@@ -757,7 +800,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     scope,
                     bootstrap_secret,
                     random_entropy,
-                    ice_servers,
+                    negotiation_config,
                     text_control_frame,
                     receipt_control_frame,
                 )
@@ -777,7 +820,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     scope,
                     bootstrap_secret,
                     random_entropy,
-                    ice_servers,
+                    negotiation_config,
                     text_control_frame,
                     receipt_control_frame,
                 )
@@ -797,7 +840,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     scope,
                     bootstrap_secret,
                     random_entropy,
-                    ice_servers,
+                    negotiation_config,
                     text_control_frame,
                     receipt_control_frame,
                 )
@@ -921,7 +964,7 @@ async fn probe_webrtc_with_adapter<A>(
     scope: ConversationScope,
     bootstrap_secret: &[u8],
     random_entropy: &[u8],
-    ice_servers: IceServerConfig,
+    negotiation_config: WebRtcNegotiationConfig,
     text_control_frame: Vec<u8>,
     receipt_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
@@ -956,10 +999,8 @@ where
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let mut alice_config = WebRtcNegotiationConfig::new(ice_servers.clone());
-    alice_config.udp_addrs = vec!["0.0.0.0:0".to_owned()];
-    let mut bob_config = WebRtcNegotiationConfig::new(ice_servers);
-    bob_config.udp_addrs = vec!["0.0.0.0:0".to_owned()];
+    let alice_config = negotiation_config.clone();
+    let bob_config = negotiation_config;
     let alice_webrtc = WebRtcNegotiator::new(alice_config).await?;
     let bob_webrtc = WebRtcNegotiator::new(bob_config).await?;
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
@@ -1101,6 +1142,14 @@ where
         rendezvous_topic,
         offerer_direct_path_ready: alice_direct.direct_path_ready,
         answerer_direct_path_ready: bob_direct.direct_path_ready,
+        offerer_turn_fallback_ready: alice_direct.turn_fallback_ready,
+        answerer_turn_fallback_ready: bob_direct.turn_fallback_ready,
+        offerer_configured_turn_servers: alice_direct.configured_turn_servers,
+        answerer_configured_turn_servers: bob_direct.configured_turn_servers,
+        offerer_local_relay_candidates_gathered: alice_direct.local_relay_candidates_gathered,
+        answerer_local_relay_candidates_gathered: bob_direct.local_relay_candidates_gathered,
+        offerer_remote_relay_candidates_applied: alice_direct.remote_relay_candidates_applied,
+        answerer_remote_relay_candidates_applied: bob_direct.remote_relay_candidates_applied,
         offerer_data_channel_open: offerer_data.open,
         answerer_data_channel_open: answerer_data.open,
         text_control_frame_roundtrip: frame_roundtrip,

@@ -19,8 +19,8 @@ use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit,
-    RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, RTCSdpType,
-    RTCSessionDescription, Registry,
+    RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
+    RTCPeerConnectionState, RTCSdpType, RTCSessionDescription, Registry,
 };
 
 /// SDP type carried through signaling.
@@ -631,6 +631,25 @@ impl DirectPathMetricsState {
     }
 }
 
+/// Candidate gathering policy used by production WebRTC probes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebRtcIceTransportPolicy {
+    /// Gather all candidate types allowed by the underlying WebRTC stack.
+    All,
+    /// Gather only relay/TURN candidates. This models hard-NAT release gates.
+    RelayOnly,
+}
+
+impl WebRtcIceTransportPolicy {
+    fn into_rtc(self) -> RTCIceTransportPolicy {
+        match self {
+            Self::All => RTCIceTransportPolicy::All,
+            Self::RelayOnly => RTCIceTransportPolicy::Relay,
+        }
+    }
+}
+
 /// Local WebRTC negotiation configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WebRtcNegotiationConfig {
@@ -640,6 +659,8 @@ pub struct WebRtcNegotiationConfig {
     pub udp_addrs: Vec<String>,
     /// DataChannel label used to ensure SDP negotiates an application m-line.
     pub data_channel_label: String,
+    /// ICE candidate gathering policy. Relay-only requires configured TURN.
+    pub ice_transport_policy: WebRtcIceTransportPolicy,
 }
 
 impl WebRtcNegotiationConfig {
@@ -653,6 +674,7 @@ impl WebRtcNegotiationConfig {
             ice_servers,
             udp_addrs: vec!["0.0.0.0:0".to_owned()],
             data_channel_label: "discrypt-control".to_owned(),
+            ice_transport_policy: WebRtcIceTransportPolicy::All,
         }
     }
 
@@ -666,6 +688,13 @@ impl WebRtcNegotiationConfig {
         if self.data_channel_label.trim().is_empty() {
             return Err(TransportError::Unavailable(
                 "data channel label is required for WebRTC negotiation".to_owned(),
+            ));
+        }
+        if self.ice_transport_policy == WebRtcIceTransportPolicy::RelayOnly
+            && self.ice_servers.turn_servers.is_empty()
+        {
+            return Err(TransportError::InvalidIcePolicy(
+                "relay-only WebRTC policy requires at least one configured TURN server".to_owned(),
             ));
         }
         Ok(())
@@ -714,6 +743,7 @@ impl WebRtcNegotiator {
             .with_configuration(
                 RTCConfigurationBuilder::new()
                     .with_ice_servers(to_rtc_ice_servers(&config.ice_servers))
+                    .with_ice_transport_policy(config.ice_transport_policy.into_rtc())
                     .build(),
             )
             .with_media_engine(media)
@@ -1388,6 +1418,18 @@ mod tests {
         assert!(negotiator.direct_path_metrics().await.turn_fallback_ready);
 
         negotiator.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_only_policy_rejects_missing_turn_configuration() -> Result<(), TransportError> {
+        let mut config = WebRtcNegotiationConfig::new(test_ice_config()?);
+        config.ice_transport_policy = WebRtcIceTransportPolicy::RelayOnly;
+
+        let Err(error) = WebRtcNegotiator::new(config).await else {
+            panic!("relay-only hard-NAT policy must not run without TURN");
+        };
+        assert!(format!("{error}").contains("relay-only WebRTC policy requires"));
         Ok(())
     }
 
