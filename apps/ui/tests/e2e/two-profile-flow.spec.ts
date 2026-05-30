@@ -63,6 +63,17 @@ async function openProfile(
 }
 
 
+
+async function readLatestInvite(page: Page) {
+  await expect(page.getByText(/discrypt:\/\/join\/v1\//).first()).toBeVisible();
+  const body = await page.locator("body").innerText();
+  const matches = [...body.matchAll(/discrypt:\/\/join\/v1\/\S+/g)].map(
+    (match) => match[0],
+  );
+  expect(matches.length).toBeGreaterThan(0);
+  return matches.at(-1) ?? "";
+}
+
 async function openDm(page: Page, contactName: string) {
   await page
     .getByRole("navigation", { name: /workspace sections/i })
@@ -99,13 +110,7 @@ async function createInvite(page: Page) {
   await page
     .getByRole("button", { name: /create invite for active group/i })
     .click();
-  const inviteText = await page
-    .getByText(/invite ready: discrypt:\/\/join\/v1/i)
-    .first()
-    .textContent();
-  const invite = inviteText?.match(/discrypt:\/\/join\/v1\/\S+/)?.[0];
-  expect(invite).toBeTruthy();
-  return invite ?? "";
+  return readLatestInvite(page);
 }
 
 async function joinInvite(page: Page, invite: string) {
@@ -114,9 +119,46 @@ async function joinInvite(page: Page, invite: string) {
     .getByRole("button", { name: "Invites", exact: true })
     .click();
   await page.getByLabel("Invite URL or code").fill(invite);
-  await page.getByLabel("Joined group label").fill("Two Profile Lab");
+  await page.getByLabel("Joined group/contact label").fill("Two Profile Lab");
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
+}
+
+async function createDmInviteForActiveContact(page: Page, contactName: string) {
+  await openDm(page, contactName);
+  await page
+    .getByRole("navigation", { name: /workspace sections/i })
+    .getByRole("button", { name: "Invites", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: /create dm invite for active dm/i })
+    .click();
+  return readLatestInvite(page);
+}
+
+async function acceptDmInvite(page: Page, invite: string, contactName: string) {
+  await page
+    .getByRole("navigation", { name: /workspace sections/i })
+    .getByRole("button", { name: "Invites", exact: true })
+    .click();
+  await page.getByLabel("Invite URL or code").fill(invite);
+  await page.getByLabel("Joined group/contact label").fill(contactName);
+  await page.getByRole("button", { name: /accept\/open dm invite/i }).click();
+  await expect(page.getByText(contactName).first()).toBeVisible();
+}
+
+async function sendGroupMessage(page: Page, body: string) {
+  await page
+    .getByRole("navigation", { name: /workspace sections/i })
+    .getByRole("button", { name: "Text", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message" }).fill(body);
+  await page.getByRole("button", { name: /^Send message$/i }).click();
+  await expect(page.getByText(body)).toBeVisible();
+  await expect(
+    page.getByText(/remote delivery\/read receipts not claimed/i).first(),
+  ).toBeVisible();
 }
 
 async function attemptVoice(page: Page) {
@@ -134,6 +176,12 @@ async function attemptVoice(page: Page) {
   await expect(
     page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
   ).toBeVisible();
+  await expect(page.getByRole("switch", { name: /mute my microphone/i })).toBeEnabled();
+  await page.getByRole("switch", { name: /mute my microphone/i }).click();
+  await expect(page.getByText(/muted/).first()).toBeVisible();
+  await expect(page.getByRole("slider").first()).toBeVisible();
+  await page.getByRole("button", { name: /leave call/i }).click();
+  await expect(page.getByText(/not joined/i).first()).toBeVisible();
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
 }
@@ -182,8 +230,26 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
       bob.page.getByText(/remote delivery\/read receipts not claimed/i).first(),
     ).toBeVisible();
 
+    const dmInvite = await createDmInviteForActiveContact(alice.page, "Bob");
+    await acceptDmInvite(bob.page, dmInvite, "Alice verified contact");
+    await sendDm(bob.page, "Alice verified contact", "bob accepted dm invite reply");
+    await expect(
+      bob.page.getByText("bob accepted dm invite reply"),
+    ).toBeVisible();
+    await expect(
+      alice.page.getByText("bob accepted dm invite reply"),
+    ).toHaveCount(0);
+
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
+    await sendGroupMessage(alice.page, "alice group channel command ping");
+    await sendGroupMessage(bob.page, "bob group channel command pong");
+    await expect(
+      alice.page.getByText("bob group channel command pong"),
+    ).toHaveCount(0);
+    await expect(
+      bob.page.getByText("alice group channel command ping"),
+    ).toHaveCount(0);
     await attemptVoice(alice.page);
     await attemptVoice(bob.page);
 

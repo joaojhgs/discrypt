@@ -28,8 +28,10 @@ import {
   createChannel as createChannelCommand,
   createGroup,
   createInvite,
+  createDmInvite,
   createUser,
   joinGroup,
+  acceptDmInvite,
   joinVoice,
   leaveVoice,
   loadAppState,
@@ -493,6 +495,35 @@ function App() {
     );
   }
 
+  function createCommandDmInvite() {
+    if (!activeDm) {
+      setCommandError("Start or select a DM before creating a contact invite.");
+      return;
+    }
+    void applyCommand(
+      createDmInvite({
+        dm_id: activeDm.dm_id,
+        expires: currentSnapshot.invite.expires,
+        max_use: currentSnapshot.invite.max_use,
+      }),
+      (state) => {
+        const invite = state.invites.at(-1);
+        if (invite) setDraftInvite(invite.code);
+        setWorkflow("join");
+      },
+    );
+  }
+
+  function acceptCommandDmInvite() {
+    void applyCommand(
+      acceptDmInvite({
+        invite_code: draftInvite,
+        display_name: draftJoinName || null,
+      }),
+      () => setWorkflow("dm"),
+    );
+  }
+
   function setVolume(id: string, value: number[]) {
     const sessionId = appState.voice_session?.session_id;
     if (!sessionId) {
@@ -703,8 +734,11 @@ function App() {
               latestInvite={appState.invites.at(-1) ?? null}
               joinProgress={appState.join_progress}
               onJoin={joinCommandGroup}
+              onAcceptDmInvite={acceptCommandDmInvite}
               onCreateInvite={createCommandInvite}
+              onCreateDmInvite={createCommandDmInvite}
               canCreateInvite={Boolean(activeGroup)}
+              canCreateDmInvite={Boolean(activeDm)}
             />
           ) : null}
           {workflow === "create-group" ? (
@@ -1828,8 +1862,11 @@ function JoinPanel({
   latestInvite,
   joinProgress,
   onJoin,
+  onAcceptDmInvite,
   onCreateInvite,
+  onCreateDmInvite,
   canCreateInvite,
+  canCreateDmInvite,
 }: {
   snapshot: AppSnapshot;
   inviteValue: string;
@@ -1839,8 +1876,11 @@ function JoinPanel({
   latestInvite: InviteView | null;
   joinProgress: JoinProgressStepView[];
   onJoin: () => void;
+  onAcceptDmInvite: () => void;
   onCreateInvite: () => void;
+  onCreateDmInvite: () => void;
   canCreateInvite: boolean;
+  canCreateDmInvite: boolean;
 }) {
   return (
     <div className="grid gap-4 py-5 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -1848,8 +1888,8 @@ function JoinPanel({
         <CardHeader>
           <CardTitle>Invites and joining</CardTitle>
           <CardDescription>
-            Create an invite for the active group or paste an invite to
-            join/open a group.
+            Create invites for active groups or DM contacts, then paste signed
+            invite descriptors to open the correct group or contact flow.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
@@ -1861,7 +1901,7 @@ function JoinPanel({
             />
           </Label>
           <Label className="grid gap-2">
-            Joined group label
+            Joined group/contact label
             <Input
               value={groupName}
               onChange={(event) => setGroupName(event.target.value)}
@@ -1869,6 +1909,9 @@ function JoinPanel({
           </Label>
           <div className="flex flex-wrap gap-2">
             <Button onClick={onJoin}>Join/open group</Button>
+            <Button variant="secondary" onClick={onAcceptDmInvite}>
+              Accept/open DM invite
+            </Button>
             <Button
               variant="outline"
               onClick={onCreateInvite}
@@ -1876,9 +1919,16 @@ function JoinPanel({
             >
               Create invite for active group
             </Button>
+            <Button
+              variant="outline"
+              onClick={onCreateDmInvite}
+              disabled={!canCreateDmInvite}
+            >
+              Create DM invite for active DM
+            </Button>
             {latestInvite ? (
               <Button
-                variant="secondary"
+                variant="ghost"
                 onClick={() => setInviteValue(latestInvite.code)}
               >
                 Use latest invite
