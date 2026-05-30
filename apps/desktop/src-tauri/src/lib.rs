@@ -7919,6 +7919,82 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn public_nostr_two_profile_receipt_crosses_provider_webrtc_when_enabled() -> Result<(), String>
+    {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_RECEIPT_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public Nostr two-profile receipt proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_RECEIPT_E2E=1 to run"
+            );
+            return Ok(());
+        }
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("public-nostr-two-profile-receipt-alice");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "provider nostr receipt proof".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let bob_path = fresh_state_path("public-nostr-two-profile-receipt-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let proof = guard
+            .state
+            .prove_text_delivery_receipt_over_data_channel_with_receiver(
+                &bob.state,
+                &message_id,
+                Some("nostr"),
+            )?;
+        assert_eq!(proof.kind, "nostr");
+        assert!(proof.text_control_frame_roundtrip);
+        assert!(proof.receipt_frame_roundtrip);
+        let view = guard.mutate(|_| {});
+        let message = view
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        assert!(message.peer_receipt.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn tampered_text_delivery_receipt_is_rejected() -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("tampered-text-receipt");
