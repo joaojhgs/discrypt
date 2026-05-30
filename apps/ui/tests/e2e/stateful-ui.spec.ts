@@ -311,7 +311,7 @@ test("transport and join progress stay evidence-based after invite creation", as
     page.getByText(/invite ready: discrypt:\/\/join\/v1/i),
   ).toBeVisible();
 
-  await expect(transportStrip.getByText(/signaling/i)).toBeVisible();
+  await expect(transportStrip.getByText(/^signaling$/)).toBeVisible();
   await expect(transportStrip.getByText(/signed-endpoint-ready/i)).toBeVisible();
   await expect(transportStrip.getByText(/no-direct-proof/i)).toBeVisible();
   await expect(transportStrip.getByText(/not-configured/i)).toBeVisible();
