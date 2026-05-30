@@ -187,6 +187,26 @@ export type TextDeliveryReceipt = {
   signature: number[];
 };
 
+export type TextRetentionMetadata = {
+  policy: string;
+  created_at_ms: number;
+  expires_at_ms: number | null;
+  delete_after_read: boolean;
+};
+
+export type TextMessageEnvelope = {
+  version: number;
+  group_id_commitment: number[];
+  epoch: number;
+  sender_leaf: number;
+  sender_device_id: string;
+  sequence: number;
+  message_id: string;
+  retention: TextRetentionMetadata;
+  content_ciphertext: number[];
+  signature: number[];
+};
+
 export type AppMessageView = {
   message_id: string;
   target: MessageTargetView;
@@ -558,6 +578,19 @@ export type ApplyTextDeliveryReceiptRequest = {
   message_id: string;
   receipt: TextDeliveryReceipt;
   recipient_verifying_key_hex: string;
+};
+
+export type ReceiveTextDeliveryEnvelopeRequest = {
+  target: MessageTargetView;
+  envelope: TextMessageEnvelope;
+  sender_verifying_key_hex: string;
+  recipient_leaf?: number | null;
+};
+
+export type ReceiveTextDeliveryEnvelopeResponse = {
+  state: AppState;
+  receipt: TextDeliveryReceipt | null;
+  recipient_verifying_key_hex: string | null;
 };
 
 export type JoinVoiceRequest = {
@@ -2777,7 +2810,7 @@ export async function sendMessage(
           ? "Transport proof unavailable"
           : "Sent locally",
         state_detail: request.transport_proof
-          ? "Fallback web runtime cannot run the Rust/Tauri provider-signaled WebRTC transport proof; native command path is required"
+          ? "Local fallback web runtime cannot run the Rust/Tauri provider-signaled WebRTC transport proof; native command path is required"
           : "Message is in the local encrypted author log; peer receipt requires backend-state proof",
         peer_receipt: null,
         sent_at: `local-${state.messages.length + 1}`,
@@ -2809,6 +2842,32 @@ export async function applyTextDeliveryReceipt(
           "Run the native app to verify peer receipt signatures",
         );
       }),
+  );
+}
+
+export async function receiveTextDeliveryEnvelope(
+  request: ReceiveTextDeliveryEnvelopeRequest,
+): Promise<ReceiveTextDeliveryEnvelopeResponse> {
+  return invokeOrFallback<ReceiveTextDeliveryEnvelopeResponse>(
+    "receive_text_delivery_envelope",
+    { request },
+    () => {
+      const state = mutateFallback((draft) => {
+        pushCommandError(
+          draft,
+          "message.envelope_rejected",
+          "receive_text_delivery_envelope",
+          "text_envelope_verification_unavailable",
+          "Local fallback web runtime cannot verify signed encrypted peer envelopes or generate receipts; native Rust/Tauri command path is required",
+          "Run the native app to verify peer envelopes and generate delivery receipts",
+        );
+      });
+      return {
+        state,
+        receipt: null,
+        recipient_verifying_key_hex: null,
+      };
+    },
   );
 }
 

@@ -122,10 +122,46 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "start_signaling_session",
+    exportName: "startSignalingSession",
+    args: ["scope_label", "adapter_probe", "data_channel_probe", "adapter_kind"],
+    returns: "AppState",
+  },
+  {
+    command: "stop_signaling_session",
+    exportName: "stopSignalingSession",
+    args: ["session_id"],
+    returns: "AppState",
+  },
+  {
+    command: "start_text_session",
+    exportName: "startTextSession",
+    args: ["scope_label"],
+    returns: "AppState",
+  },
+  {
+    command: "stop_text_session",
+    exportName: "stopTextSession",
+    args: ["session_id"],
+    returns: "AppState",
+  },
+  {
     command: "send_message",
     exportName: "sendMessage",
     args: ["target", "kind", "dm_id", "group_id", "channel_id", "body"],
     returns: "AppState",
+  },
+  {
+    command: "apply_text_delivery_receipt",
+    exportName: "applyTextDeliveryReceipt",
+    args: ["message_id", "receipt", "recipient_verifying_key_hex"],
+    returns: "AppState",
+  },
+  {
+    command: "receive_text_delivery_envelope",
+    exportName: "receiveTextDeliveryEnvelope",
+    args: ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"],
+    returns: "ReceiveTextDeliveryEnvelopeResponse",
   },
   {
     command: "join_voice",
@@ -276,7 +312,13 @@ const requestTypes = [
   ["CreateDmInviteRequest", ["dm_id", "expires", "max_use"]],
   ["AcceptDmInviteRequest", ["invite_code", "display_name"]],
   ["CreateChannelRequest", ["group_id", "name", "kind", "retention_status"]],
+  ["StartSignalingSessionRequest", ["scope_label", "adapter_probe", "data_channel_probe", "adapter_kind"]],
+  ["StopSignalingSessionRequest", ["session_id"]],
+  ["StartTextSessionRequest", ["scope_label"]],
+  ["StopTextSessionRequest", ["session_id"]],
   ["SendMessageRequest", ["target", "body"]],
+  ["ApplyTextDeliveryReceiptRequest", ["message_id", "receipt", "recipient_verifying_key_hex"]],
+  ["ReceiveTextDeliveryEnvelopeRequest", ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"]],
   ["MessageTargetView", ["kind", "dm_id", "group_id", "channel_id"]],
   ["JoinVoiceRequest", ["group_id", "channel_id"]],
   ["LeaveVoiceRequest", ["session_id"]],
@@ -393,6 +435,9 @@ const allowedProductionClaimContext = [
   "honest_copy_ready",
   "media-frame E2E",
   "socket/media adapter E2E",
+  "webrtc-datachannel-proofed",
+  "webrtc-datachannel-failed",
+  "webrtc-datachannel-not-run",
 ];
 
 function stringLiteralValues(source) {

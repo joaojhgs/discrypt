@@ -30,10 +30,9 @@ use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
 };
-#[cfg(test)]
-use discrypt_mls_delivery::TextDeliveryReceiptInput;
 use discrypt_mls_delivery::{
-    TextDeliveryReceipt, TextMessageEnvelope, TextMessageEnvelopeInput, TextRetentionMetadata,
+    TextDeliveryReceipt, TextDeliveryReceiptInput, TextMessageEnvelope, TextMessageEnvelopeInput,
+    TextRetentionMetadata,
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
@@ -888,6 +887,31 @@ pub struct ApplyTextDeliveryReceiptRequest {
     pub receipt: TextDeliveryReceipt,
     /// Hex-encoded recipient Ed25519 verifying key expected to validate the receipt.
     pub recipient_verifying_key_hex: String,
+}
+
+/// Request to accept a signed encrypted text envelope from a peer and produce a receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReceiveTextDeliveryEnvelopeRequest {
+    /// Conversation target that determines the expected delivery group binding.
+    pub target: MessageTargetView,
+    /// Signed encrypted text envelope received over text/control transport.
+    pub envelope: TextMessageEnvelope,
+    /// Hex-encoded sender Ed25519 verifying key expected to validate the envelope.
+    pub sender_verifying_key_hex: String,
+    /// Recipient MLS leaf/device slot that persisted the envelope.
+    #[serde(default)]
+    pub recipient_leaf: Option<u32>,
+}
+
+/// Result of accepting a peer text envelope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReceiveTextDeliveryEnvelopeResponse {
+    /// Updated application state after accepting or rejecting the envelope.
+    pub state: AppStateView,
+    /// Signed receipt to return to the sender when acceptance succeeded.
+    pub receipt: Option<TextDeliveryReceipt>,
+    /// Hex-encoded recipient verifying key for receipt verification by the sender.
+    pub recipient_verifying_key_hex: Option<String>,
 }
 
 /// Request to join a voice channel.
@@ -2424,6 +2448,26 @@ pub fn apply_text_delivery_receipt(request: ApplyTextDeliveryReceiptRequest) -> 
     })
 }
 
+/// Tauri command: accept a signed encrypted peer envelope and return a signed receipt.
+pub fn receive_text_delivery_envelope(
+    request: ReceiveTextDeliveryEnvelopeRequest,
+) -> ReceiveTextDeliveryEnvelopeResponse {
+    let (state, result) =
+        mutate_app_service_with_result(|state| state.receive_text_delivery_envelope(request));
+    match result {
+        Ok((receipt, recipient_verifying_key_hex)) => ReceiveTextDeliveryEnvelopeResponse {
+            state,
+            receipt: Some(receipt),
+            recipient_verifying_key_hex: Some(recipient_verifying_key_hex),
+        },
+        Err(_) => ReceiveTextDeliveryEnvelopeResponse {
+            state,
+            receipt: None,
+            recipient_verifying_key_hex: None,
+        },
+    }
+}
+
 /// Tauri command: join a voice channel.
 pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -2860,6 +2904,13 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn receive_text_delivery_envelope(
+        request: ReceiveTextDeliveryEnvelopeRequest,
+    ) -> ReceiveTextDeliveryEnvelopeResponse {
+        super::receive_text_delivery_envelope(request)
+    }
+
+    #[tauri::command]
     pub(super) fn join_voice(request: JoinVoiceRequest) -> AppStateView {
         super::join_voice(request)
     }
@@ -2933,6 +2984,7 @@ pub fn run() {
             ipc_commands::create_channel,
             ipc_commands::send_message,
             ipc_commands::apply_text_delivery_receipt,
+            ipc_commands::receive_text_delivery_envelope,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
@@ -3648,6 +3700,107 @@ impl PersistedAppState {
             format!("Verified signed peer receipt for {}", request.message_id),
         );
         Ok(())
+    }
+
+    fn receive_text_delivery_envelope(
+        &mut self,
+        request: ReceiveTextDeliveryEnvelopeRequest,
+    ) -> Result<(TextDeliveryReceipt, String), String> {
+        let sender_key = verifying_key_from_hex(&request.sender_verifying_key_hex)
+            .ok_or_else(|| "sender verifying key is invalid".to_owned());
+        let group_id = text_delivery_group_id(&request.target);
+        let result = sender_key
+            .and_then(|sender_key| {
+                let group_id = group_id?;
+                request
+                    .envelope
+                    .verify(&group_id, &sender_key)
+                    .map_err(|error| error.to_string())?;
+                Ok((group_id, sender_key))
+            })
+            .and_then(|(group_id, sender_key)| {
+                let recipient_leaf = request.recipient_leaf.unwrap_or(1);
+                let recipient_seed = self.identity_seed_bytes();
+                let recipient_signer = SigningKey::from_bytes(&recipient_seed);
+                let receipt = TextDeliveryReceipt::sign(
+                    &group_id,
+                    TextDeliveryReceiptInput {
+                        message_id: request.envelope.message_id.clone(),
+                        recipient_leaf,
+                        recipient_device_id: self.local_user_id(),
+                        received_at_ms: self.next_sequence.saturating_add(1),
+                        envelope_ciphertext_hash: request.envelope.ciphertext_hash(),
+                    },
+                    &recipient_signer,
+                )
+                .map_err(|error| error.to_string())?;
+                let recipient_verifying_key_hex =
+                    hex::encode(recipient_signer.verifying_key().as_bytes());
+                if !self
+                    .text_delivery_envelopes
+                    .iter()
+                    .any(|record| record.message_id == request.envelope.message_id)
+                {
+                    self.text_delivery_envelopes.push(TextDeliveryEnvelopeRecord {
+                        message_id: request.envelope.message_id.clone(),
+                        group_id: group_id.clone(),
+                        sender_verifying_key_hex: request.sender_verifying_key_hex.clone(),
+                        envelope: request.envelope.clone(),
+                    });
+                }
+                if !self
+                    .messages
+                    .iter()
+                    .any(|message| message.message_id == request.envelope.message_id)
+                {
+                    let sequence = self.next_sequence;
+                    self.next_sequence = self.next_sequence.saturating_add(1);
+                    self.messages.push(MessageView {
+                        message_id: request.envelope.message_id.clone(),
+                        target: request.target.clone(),
+                        author_id: request.envelope.sender_device_id.clone(),
+                        author: format!("Peer {}", key_fingerprint(&sender_key)),
+                        body: format!(
+                            "Encrypted message envelope received (ciphertext_hash={})",
+                            hex::encode(request.envelope.ciphertext_hash())
+                        ),
+                        status: "signed encrypted peer envelope verified and persisted; plaintext decrypt/render still requires the MLS receive loop".to_owned(),
+                        state_key: "received_envelope".to_owned(),
+                        state_label: "Envelope received".to_owned(),
+                        state_detail: format!(
+                            "Verified sender={} message={} group_binding={} and generated signed delivery receipt",
+                            key_fingerprint(&sender_key),
+                            request.envelope.message_id,
+                            group_id
+                        ),
+                        peer_receipt: None,
+                        sent_at: format!("remote-{sequence}"),
+                    });
+                }
+                self.text_delivery_receipts.push(TextDeliveryReceiptRecord {
+                    message_id: request.envelope.message_id.clone(),
+                    recipient_verifying_key_hex: recipient_verifying_key_hex.clone(),
+                    receipt: receipt.clone(),
+                });
+                self.push_event(
+                    "message.envelope_received",
+                    format!(
+                        "Verified encrypted peer envelope {} and generated signed receipt",
+                        request.envelope.message_id
+                    ),
+                );
+                Ok((receipt, recipient_verifying_key_hex))
+            });
+        if let Err(error) = &result {
+            self.push_command_error(
+                "message.envelope_rejected",
+                "receive_text_delivery_envelope",
+                "text_envelope_verification_failed",
+                error.clone(),
+                "Accept peer delivery only from an envelope whose sender signature and group binding verify",
+            );
+        }
+        result
     }
 
     fn active_connectivity_policy(
@@ -4649,6 +4802,20 @@ fn mutate_app_service(update: impl FnOnce(&mut PersistedAppState)) -> AppStateVi
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.mutate(update)
+}
+
+fn mutate_app_service_with_result<T>(
+    update: impl FnOnce(&mut PersistedAppState) -> T,
+) -> (AppStateView, T) {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    let result = update(&mut guard.state);
+    guard.persist();
+    let view = guard.state.to_view();
+    (view, result)
 }
 
 fn normalize_event_subscriptions(raw: &[String]) -> Vec<String> {
@@ -6757,6 +6924,7 @@ mod tests {
             vec![
                 "signaling",
                 "ICE",
+                "adapter",
                 "direct",
                 "overlay",
                 "TURN",
@@ -7042,6 +7210,160 @@ mod tests {
                 .map(|receipt| { receipt.recipient_key_fingerprint.as_str() }),
             Some(key_fingerprint(&bob_signer.verifying_key()).as_str())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_command_accepts_verified_envelope_and_returns_signed_receipt() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("receive-envelope-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_id),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "receiver command receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let persisted = load_state();
+        let envelope_record = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .cloned()
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+
+        let bob_path = fresh_state_path("receive-envelope-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let (receipt, recipient_key_hex) =
+            bob.state
+                .receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+                    target,
+                    envelope: envelope_record.envelope.clone(),
+                    sender_verifying_key_hex: envelope_record.sender_verifying_key_hex.clone(),
+                    recipient_leaf: Some(2),
+                })?;
+
+        assert!(bob.state.last_command_error.is_none());
+        assert!(bob
+            .state
+            .messages
+            .iter()
+            .any(|message| message.message_id == message_id
+                && message.state_key == "received_envelope"));
+        let recipient_key = verifying_key_from_hex(&recipient_key_hex)
+            .ok_or_else(|| "recipient key should decode".to_owned())?;
+        receipt
+            .verify(
+                &envelope_record.group_id,
+                &envelope_record.envelope,
+                &recipient_key,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: recipient_key_hex,
+        });
+        let message = receipted
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_command_rejects_tampered_envelope_without_receipt() -> Result<(), String> {
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("receive-envelope-tampered-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_id),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "tamper me".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let persisted = load_state();
+        let mut envelope_record = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .cloned()
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+        envelope_record.envelope.content_ciphertext.push(0x99);
+
+        let bob_path = fresh_state_path("receive-envelope-tampered-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let rejected =
+            bob.state
+                .receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+                    target,
+                    envelope: envelope_record.envelope,
+                    sender_verifying_key_hex: envelope_record.sender_verifying_key_hex,
+                    recipient_leaf: Some(2),
+                });
+
+        assert!(rejected.is_err());
+        assert_eq!(
+            bob.state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("text_envelope_verification_failed")
+        );
+        assert!(bob.state.messages.is_empty());
+        assert!(bob.state.text_delivery_receipts.is_empty());
         Ok(())
     }
 
