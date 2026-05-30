@@ -3876,24 +3876,18 @@ impl PersistedAppState {
         message_id: &str,
         requested_kind: Option<&str>,
     ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
-        let envelope_record = self
-            .text_delivery_envelopes
+        let outbox_frame = self
+            .text_control_outbox
             .iter()
-            .find(|record| record.message_id == message_id)
-            .cloned()
-            .ok_or_else(|| "no persisted text envelope for receipt message id".to_owned())?;
-        let target = self
-            .messages
-            .iter()
-            .find(|message| message.message_id == message_id)
-            .map(|message| message.target.clone())
-            .ok_or_else(|| "no message target for receipt message id".to_owned())?;
-        let envelope_frame = TextControlFrameView::Envelope {
-            target,
-            envelope: envelope_record.envelope,
-            sender_verifying_key_hex: envelope_record.sender_verifying_key_hex,
-            recipient_leaf: Some(2),
-        };
+            .find(|record| record.message_id == message_id && record.state_key == "pending")
+            .map(TextControlOutboxFrameView::from)
+            .ok_or_else(|| {
+                "no pending persisted text/control outbox frame for message id".to_owned()
+            })?;
+        let mut envelope_frame = outbox_frame.frame.clone();
+        if let TextControlFrameView::Envelope { recipient_leaf, .. } = &mut envelope_frame {
+            *recipient_leaf = Some(2);
+        }
         let mut receiver_state = receiver.clone();
         let receipt_frame = receiver_state
             .handle_text_control_frame(envelope_frame.clone())
@@ -3915,6 +3909,11 @@ impl PersistedAppState {
                     .to_owned(),
             );
         }
+        self.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+            message_id: message_id.to_owned(),
+            frame_sha256: outbox_frame.frame_sha256,
+            transport_session_id: Some(format!("{}:{}", probe.kind, probe.profile_id)),
+        })?;
         if self.handle_text_control_frame(receipt_frame).is_some() {
             return Err("receipt frame unexpectedly generated a response frame".to_owned());
         }
