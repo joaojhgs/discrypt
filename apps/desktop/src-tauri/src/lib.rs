@@ -1751,7 +1751,7 @@ impl TauriAppService {
                 label: "text/control runtime".to_owned(),
                 status: "not-attached".to_owned(),
                 detail: format!(
-                    "Text session {} is {}, but no app-service long-lived provider-backed transport runtime is attached; pending signed frames remain queued until a live runtime loop is implemented",
+                    "Text session {} is {}, but no app-service long-lived provider-backed transport runtime is attached; pending signed frames remain queued until a matching live runtime attaches",
                     session.session_id,
                     PersistedAppState::transport_state_label(session_state)
                 ),
@@ -2098,8 +2098,8 @@ pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
 }
 
 /// Tauri command: bind an app-service text/control runtime to the active text
-/// session. This is currently a fail-closed gate while the provider-negotiated
-/// long-lived attachment path is implemented.
+/// session. Role-split requests start a real provider-backed runtime; legacy
+/// no-role requests remain fail-closed rather than resuming stale probe SDP.
 pub fn attach_text_control_transport_runtime(
     request: AttachTextControlTransportRuntimeRequest,
 ) -> AppStateView {
@@ -10870,7 +10870,7 @@ mod tests {
         assert_eq!(text_control_status.status, "not-attached");
         assert!(
             text_control_status.detail.contains(
-                "pending signed frames remain queued until a live runtime loop is implemented"
+                "pending signed frames remain queued until a matching live runtime attaches"
             ),
             "status detail should expose the fail-closed queueing boundary"
         );
