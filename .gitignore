@@ -27,3 +27,6 @@
 /apps/ui/test-results/
 /playwright-report/
 /apps/ui/playwright-report/
+
+# External sibling repositories
+/discrypt-signaling/
