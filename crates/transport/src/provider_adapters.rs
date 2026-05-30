@@ -2225,6 +2225,23 @@ fn ipfs_validate_bootstrap_policy(addrs: &[libp2p::Multiaddr]) -> Result<(), Tra
                 "ipfs_pubsub duplicate bootstrap endpoint rejected by resource policy: {text}"
             )));
         }
+        if ipfs_contains_dns_component(addr) {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "ipfs_pubsub DNS bootstrap endpoint rejected while DNS discovery remains audit-blocked: {text}"
+            )));
+        }
+        if ipfs_should_dial(addr) {
+            if !ipfs_has_direct_ip_component(addr) {
+                return Err(TransportError::InvalidConnectivityPolicy(format!(
+                    "ipfs_pubsub dialable bootstrap endpoint must use explicit /ip4 or /ip6 addressing: {text}"
+                )));
+            }
+            if ipfs_peer_id_from_multiaddr(addr).is_none() {
+                return Err(TransportError::InvalidConnectivityPolicy(format!(
+                    "ipfs_pubsub dialable bootstrap endpoint must include /p2p/<peer-id> for a reachable Discrypt topic peer: {text}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2245,6 +2262,29 @@ pub fn ipfs_pubsub_default_bootstrap_addrs() -> Result<Vec<libp2p::Multiaddr>, T
 fn ipfs_should_dial(addr: &libp2p::Multiaddr) -> bool {
     let text = addr.to_string();
     !(text.contains("/tcp/0") || text.contains("/udp/0"))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_contains_dns_component(addr: &libp2p::Multiaddr) -> bool {
+    addr.iter().any(|protocol| {
+        matches!(
+            protocol,
+            libp2p::multiaddr::Protocol::Dns(_)
+                | libp2p::multiaddr::Protocol::Dns4(_)
+                | libp2p::multiaddr::Protocol::Dns6(_)
+                | libp2p::multiaddr::Protocol::Dnsaddr(_)
+        )
+    })
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_has_direct_ip_component(addr: &libp2p::Multiaddr) -> bool {
+    addr.iter().any(|protocol| {
+        matches!(
+            protocol,
+            libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_)
+        )
+    })
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -5135,9 +5175,10 @@ mod tests {
     #[test]
     #[cfg(feature = "ipfs-pubsub-adapter")]
     fn ipfs_pubsub_bootstrap_policy_rejects_duplicates_and_overflow() {
-        let duplicate = "/ip4/127.0.0.1/tcp/4001"
-            .parse::<libp2p::Multiaddr>()
-            .expect("multiaddr");
+        let duplicate =
+            "/ip4/127.0.0.1/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .parse::<libp2p::Multiaddr>()
+                .expect("multiaddr");
         let error = ipfs_validate_bootstrap_policy(&[duplicate.clone(), duplicate])
             .expect_err("duplicate bootstrap endpoint must be rejected");
         assert!(format!("{error}").contains("duplicate bootstrap endpoint"));
@@ -5145,14 +5186,46 @@ mod tests {
         let mut too_many = Vec::new();
         for port in 0..=IPFS_PUBSUB_MAX_BOOTSTRAP_ENDPOINTS {
             too_many.push(
-                format!("/ip4/127.0.0.1/tcp/{}", 4000 + port)
-                    .parse::<libp2p::Multiaddr>()
-                    .expect("multiaddr"),
+                format!(
+                    "/ip4/127.0.0.1/tcp/{}/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                    4000 + port
+                )
+                .parse::<libp2p::Multiaddr>()
+                .expect("multiaddr"),
             );
         }
         let error = ipfs_validate_bootstrap_policy(&too_many)
             .expect_err("too many bootstrap endpoints must be rejected");
         assert!(format!("{error}").contains("resource policy limit"));
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_bootstrap_policy_rejects_dns_or_non_topic_peer_endpoints() {
+        let dns_bootstrap: libp2p::Multiaddr =
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .parse()
+                .expect("dns multiaddr");
+        let dns_error = ipfs_validate_bootstrap_policy(&[dns_bootstrap])
+            .expect_err("DNS bootstrap remains audit-blocked");
+        assert!(format!("{dns_error}").contains("DNS bootstrap endpoint rejected"));
+
+        let missing_peer: libp2p::Multiaddr =
+            "/ip4/203.0.113.10/tcp/4001".parse().expect("ip4 multiaddr");
+        let peer_error = ipfs_validate_bootstrap_policy(&[missing_peer])
+            .expect_err("dialable public endpoint must identify the topic peer");
+        assert!(format!("{peer_error}").contains("/p2p/<peer-id>"));
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_bootstrap_policy_accepts_direct_topic_peer_multiaddrs() {
+        let direct_topic_peer: libp2p::Multiaddr =
+            "/ip4/203.0.113.10/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .parse()
+                .expect("direct topic peer multiaddr");
+        ipfs_validate_bootstrap_policy(&[direct_topic_peer])
+            .expect("explicit direct topic peer multiaddr should satisfy production policy");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5193,11 +5266,11 @@ mod tests {
             .join(scope.clone(), capability.clone(), alice.clone())
             .await?;
         let alice_addr = alice_room
-            .listen_addresses_for_tests()
+            .direct_topic_peer_multiaddrs_for_tests()
             .into_iter()
             .next()
             .ok_or_else(|| {
-                TransportError::SignalingAdapter("missing alice listen address".to_owned())
+                TransportError::SignalingAdapter("missing alice /p2p topic peer address".to_owned())
             })?;
         let bob_profile = SignalingAdapterProfile {
             profile_id: "ipfs-bob-local".to_owned(),
@@ -5372,7 +5445,9 @@ mod tests {
             profile_id: "ipfs-unreachable-bootstrap".to_owned(),
             kind: SignalingAdapterKind::IpfsPubsub,
             endpoints: vec![SignalingProviderEndpoint::new(
-                Endpoint::new("/ip4/127.0.0.1/tcp/9"),
+                Endpoint::new(
+                    "/ip4/127.0.0.1/tcp/9/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+                ),
                 SignalingEndpointSecurity::LocalDevLoopback,
             )],
             metadata_posture: ProviderMetadataPosture::HashedTopic,
