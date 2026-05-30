@@ -439,7 +439,8 @@ cargo test -q -p discrypt-transport live_provider_text_control_runtime_pair_carr
 - [x] Updated the frontend command type and command-coverage gate to include the new attach fields.
 - [x] UI now derives default runtime peer ids from active DM/group/invite state and lets the operator set reciprocal local/remote peer ids before starting answerer or offerer.
 - [x] Backend role-split attach now starts on a background thread and surfaces an `attaching` text/control runtime status row, so answerer/offerer startup no longer blocks the command/UI while it waits for the reciprocal peer.
-- [ ] UI still needs automatic invite/member-derived peer identity exchange; manual reciprocal peer id entry remains the current operator bridge.
+- [x] DM runtime peer defaults now use signed DM invite bootstrap commitments: the inviter side defaults to the inviter identity commitment and the accepted side defaults to the reply rendezvous commitment.
+- [ ] Group/member runtime peer identity exchange still needs signed member-device metadata; manual reciprocal peer id entry remains the operator bridge outside DM bootstrap flows.
 - [ ] Two installed app instances have not yet been run through the role-split attach command over public providers.
 
 Verification added/run:
@@ -459,7 +460,8 @@ npm --prefix apps/ui run typecheck
 - [x] Defaults are deterministically derived from active profile plus active DM/group/channel/invite state so the control is scoped to the current conversation context instead of global hard-coded peer ids.
 - [x] The UI calls the native `attach_text_control_transport_runtime` command with `runtime_role`, `local_peer_id`, and `remote_peer_id`; browser fallback remains honest through the existing command layer.
 - [x] Backend attach returns an honest `attaching` state immediately and completes/fails asynchronously through app events, avoiding a blocked UI while a peer is offline.
-- [ ] This is not yet the final production UX. A production flow still needs signed invite/member device metadata to exchange peer ids automatically and a two-installed-app UI E2E over public providers.
+- [x] DM defaults use signed invite bootstrap commitments for reciprocal inviter/reply peer roles where the app can infer the accepted-invite side.
+- [ ] This is not yet the final production UX. Group runtime attach still needs signed member-device metadata and a two-installed-app UI E2E over public providers.
 
 Verification added/run:
 

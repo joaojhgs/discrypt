@@ -105,6 +105,10 @@ function stableUiHash(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
+function runtimePeerIdFromCommitment(label: string, commitment: string): string {
+  return `peer-${stableUiHash(`${label}:${commitment}`)}`;
+}
+
 function textRuntimePeerDefaults(state: AppState): {
   local: string;
   remote: string;
@@ -118,9 +122,33 @@ function textRuntimePeerDefaults(state: AppState): {
   const activeDm = state.active_context?.dm_id
     ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
     : state.dms[0];
+  const activeInvite = state.active_context?.dm_id
+    ? state.invites
+        .slice()
+        .reverse()
+        .find((invite) => invite.dm_id === state.active_context?.dm_id)
+    : state.invites.at(-1);
+  const dmBootstrap =
+    activeDm?.connectivity?.dm_bootstrap ?? activeInvite?.dm_bootstrap ?? null;
+  if (dmBootstrap) {
+    const inviterPeer = runtimePeerIdFromCommitment(
+      "dm-inviter-runtime-peer",
+      dmBootstrap.inviter_identity_commitment,
+    );
+    const replyPeer = runtimePeerIdFromCommitment(
+      "dm-reply-runtime-peer",
+      dmBootstrap.reply_rendezvous_commitment,
+    );
+    const openedFromInvite = state.events.some(
+      (event) => event.kind === "dm.invite_accepted",
+    );
+    return openedFromInvite
+      ? { local: replyPeer, remote: inviterPeer }
+      : { local: inviterPeer, remote: replyPeer };
+  }
   const remoteSeed =
     activeDm?.participant_id ??
-    state.invites.at(-1)?.invite_key ??
+    activeInvite?.invite_key ??
     state.active_context?.group_id ??
     "remote-peer";
   return {
