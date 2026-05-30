@@ -45,3 +45,6 @@ tauri = { version = "2.11.2", optional = true, default-features = false , featur
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", optional = true , features = [] }
+
+[dev-dependencies]
+async-trait = { workspace = true }

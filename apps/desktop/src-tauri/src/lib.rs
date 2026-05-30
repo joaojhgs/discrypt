@@ -6587,6 +6587,7 @@ fn slugify(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::fs;
     use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6614,6 +6615,117 @@ mod tests {
         let _ = fs::remove_file(&path);
         reset_app_state();
         path
+    }
+
+    #[derive(Debug)]
+    struct ReceiverBackedTextControlTransport {
+        receiver: Mutex<TauriAppService>,
+        queued_responses: Mutex<VecDeque<Vec<u8>>>,
+        metrics: Mutex<discrypt_transport::WebRtcDataTransportMetrics>,
+    }
+
+    impl ReceiverBackedTextControlTransport {
+        fn new(receiver: TauriAppService) -> Self {
+            Self {
+                receiver: Mutex::new(receiver),
+                queued_responses: Mutex::new(VecDeque::new()),
+                metrics: Mutex::new(discrypt_transport::WebRtcDataTransportMetrics {
+                    schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+                    label: "test-text-control-datachannel".to_owned(),
+                    attached_channels: 1,
+                    open: true,
+                    frames_sent: 0,
+                    frames_received: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    last_state: "open".to_owned(),
+                }),
+            }
+        }
+
+        fn receiver_state_path(&self) -> Option<PathBuf> {
+            self.receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .state_path_override
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl discrypt_transport::TextControlDataTransport for ReceiverBackedTextControlTransport {
+        async fn send_text_control_frame(
+            &self,
+            frame: Vec<u8>,
+        ) -> Result<(), discrypt_transport::TransportError> {
+            {
+                let mut metrics = self
+                    .metrics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                metrics.frames_sent = metrics.frames_sent.saturating_add(1);
+                metrics.bytes_sent = metrics.bytes_sent.saturating_add(frame.len() as u64);
+                metrics.last_state = "sent".to_owned();
+            }
+            let frame_view: TextControlFrameView =
+                serde_json::from_slice(&frame).map_err(|error| {
+                    discrypt_transport::TransportError::Unavailable(format!(
+                        "decode text/control frame failed: {error}"
+                    ))
+                })?;
+            let mut receiver = self
+                .receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut response_frame = None;
+            receiver.mutate(|state| {
+                response_frame = state.handle_text_control_frame(frame_view);
+            });
+            if let Some(response_frame) = response_frame {
+                let response_bytes = serde_json::to_vec(&response_frame).map_err(|error| {
+                    discrypt_transport::TransportError::Unavailable(format!(
+                        "encode text/control response failed: {error}"
+                    ))
+                })?;
+                self.queued_responses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_back(response_bytes);
+            }
+            Ok(())
+        }
+
+        async fn recv_text_control_frame(
+            &self,
+        ) -> Result<Vec<u8>, discrypt_transport::TransportError> {
+            let response = self
+                .queued_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .ok_or_else(|| {
+                    discrypt_transport::TransportError::Unavailable(
+                        "no queued text/control response frame".to_owned(),
+                    )
+                })?;
+            let mut metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            metrics.frames_received = metrics.frames_received.saturating_add(1);
+            metrics.bytes_received = metrics.bytes_received.saturating_add(response.len() as u64);
+            metrics.last_state = "received".to_owned();
+            Ok(response)
+        }
+
+        async fn text_control_transport_metrics(
+            &self,
+        ) -> discrypt_transport::WebRtcDataTransportMetrics {
+            self.metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
     }
 
     #[test]
@@ -8235,6 +8347,130 @@ mod tests {
                 .map(|record| record.state_key.as_str()),
             Some("receipted")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_session_pump_uses_data_transport_trait_and_persists_receipt(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("text-control-transport-pump-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "transport trait session pump".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let outbox_frame = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: None,
+        })
+        .frames
+        .into_iter()
+        .find(|frame| frame.message_id == message_id)
+        .ok_or_else(|| "pending outbox frame missing".to_owned())?;
+        let outbound_bytes = serde_json::to_vec(&outbox_frame.frame)
+            .map_err(|error| format!("could not encode outbound text/control frame: {error}"))?;
+
+        let bob_path = fresh_state_path("text-control-transport-pump-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let transport = ReceiverBackedTextControlTransport::new(bob);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("could not start text/control pump runtime: {error}"))?;
+
+        runtime.block_on(async {
+            discrypt_transport::TextControlDataTransport::send_text_control_frame(
+                &transport,
+                outbound_bytes,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })?;
+        let marked = mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+            message_id: message_id.clone(),
+            frame_sha256: outbox_frame.frame_sha256,
+            transport_session_id: Some("text-control-transport-trait-test".to_owned()),
+        });
+        assert!(marked.last_command_error.is_none());
+
+        let receipt_bytes = runtime.block_on(async {
+            discrypt_transport::TextControlDataTransport::recv_text_control_frame(&transport)
+                .await
+                .map_err(|error| error.to_string())
+        })?;
+        let receipt_frame: TextControlFrameView = serde_json::from_slice(&receipt_bytes)
+            .map_err(|error| format!("could not decode receipt text/control frame: {error}"))?;
+        let handled = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: receipt_frame,
+        });
+        assert!(handled.state.last_command_error.is_none());
+        let receipted_message = handled
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "sender message row missing after transport pump".to_owned())?;
+        assert_eq!(receipted_message.state_key, "peer_receipt");
+
+        let metrics = runtime.block_on(async {
+            discrypt_transport::TextControlDataTransport::text_control_transport_metrics(&transport)
+                .await
+        });
+        assert!(metrics.open);
+        assert_eq!(metrics.frames_sent, 1);
+        assert_eq!(metrics.frames_received, 1);
+        assert!(metrics.bytes_sent > 0);
+        assert!(metrics.bytes_received > 0);
+
+        let mut alice_store = FileAppStore::new(&alice_path);
+        let alice_reloaded = load_state_from_store(&mut alice_store);
+        assert_eq!(
+            alice_reloaded
+                .text_control_outbox
+                .iter()
+                .find(|record| record.message_id == message_id)
+                .map(|record| record.state_key.as_str()),
+            Some("receipted")
+        );
+
+        let receiver_path = transport
+            .receiver_state_path()
+            .ok_or_else(|| "receiver state path missing".to_owned())?;
+        let mut bob_store = FileAppStore::new(&receiver_path);
+        let bob_reloaded = load_state_from_store(&mut bob_store);
+        assert!(bob_reloaded.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+        assert!(bob_reloaded
+            .text_delivery_receipts
+            .iter()
+            .any(|receipt| receipt.message_id == message_id));
         Ok(())
     }
 
