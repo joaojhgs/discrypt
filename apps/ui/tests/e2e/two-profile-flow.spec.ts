@@ -184,6 +184,13 @@ async function sendGroupMessage(page: Page, body: string) {
   ).toBeVisible();
 }
 
+async function expectMessageStaysLocal(page: Page, body: string) {
+  const bubble = page
+    .getByText(body)
+    .locator('xpath=ancestor::div[contains(@class,"rounded-2xl")][1]');
+  await expect(bubble.getByText("Sent locally", { exact: true })).toBeVisible();
+}
+
 async function attemptVoice(page: Page) {
   await page
     .getByRole("navigation", { name: /workspace sections/i })
@@ -275,6 +282,66 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     ).toHaveCount(0);
     await attemptVoice(alice.page);
     await attemptVoice(bob.page);
+
+    expect(alice.errors).toEqual([]);
+    expect(bob.errors).toEqual([]);
+  } finally {
+    await alice.context.close();
+    await bob.context.close();
+  }
+});
+
+test("two isolated profiles finish invite and channel text flows without claiming remote delivery", async ({
+  browser,
+}) => {
+  const alice = await openProfile(browser, "Alice", "Alice Desktop");
+  const bob = await openProfile(browser, "Bob", "Bob Laptop");
+  try {
+    await sendDm(alice.page, "Bob", "alice to bob local DM receipt proof");
+    await sendDm(bob.page, "Alice", "bob to alice local DM receipt proof");
+    await expectMessageStaysLocal(
+      alice.page,
+      "alice to bob local DM receipt proof",
+    );
+    await expectMessageStaysLocal(
+      bob.page,
+      "bob to alice local DM receipt proof",
+    );
+
+    await alice.page.reload();
+    await bob.page.reload();
+    await openDm(alice.page, "Bob");
+    await openDm(bob.page, "Alice");
+    await expectMessageStaysLocal(
+      alice.page,
+      "alice to bob local DM receipt proof",
+    );
+    await expectMessageStaysLocal(
+      bob.page,
+      "bob to alice local DM receipt proof",
+    );
+
+    const dmInvite = await createDmInviteForActiveContact(alice.page, "Bob");
+    await acceptDmInvite(bob.page, dmInvite, "Alice verified contact");
+    await sendDm(
+      bob.page,
+      "Alice verified contact",
+      "bob accepted dm invite reply",
+    );
+    await expectMessageStaysLocal(
+      bob.page,
+      "bob accepted dm invite reply",
+    );
+
+    const invite = await createInvite(alice.page);
+    await joinInvite(bob.page, invite);
+    await sendGroupMessage(alice.page, "alice group local text proof");
+    await sendGroupMessage(bob.page, "bob group local text proof");
+    await expectMessageStaysLocal(
+      alice.page,
+      "alice group local text proof",
+    );
+    await expectMessageStaysLocal(bob.page, "bob group local text proof");
 
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);
