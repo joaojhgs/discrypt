@@ -414,8 +414,8 @@ The test is intentionally environment-gated so normal unit tests do not depend o
   - `ProviderTextControlRuntime`, `ProviderTextControlRuntimePeerEvidence`, and `ProviderTextControlRuntimePeerRole`
 - [x] Proved the new runtime shape with two separately started local provider peers over the signaling adapter boundary. The answerer starts first, waits in the rendezvous scope, receives the sealed offer, answers, opens a real WebRTC DataChannel, receives an opaque frame, and returns an opaque receipt to the offerer.
 - [x] Kept provider-visible material opaque in the role-split test by scanning the local conformance bus for forbidden plaintext/SDP markers.
-- [ ] Wire the role-split runtime APIs into `attach_text_control_transport_runtime` and app state. The Tauri command still uses the fail-closed persisted probe resume path until the backend request carries role/local-peer/remote-peer configuration and stores a `ProviderTextControlRuntime` handle.
-- [ ] Wire the UI to start the answerer/offerer lifecycle from DM/group invite state. The current UI command layer has wrappers for attach/pump but does not yet drive the new role-split runtime lifecycle.
+- [x] Wire the role-split runtime APIs into `attach_text_control_transport_runtime` and app state. The Tauri command now accepts role/local-peer/remote-peer configuration and stores an owned `ProviderTextControlRuntime` handle for the active scope. Legacy no-role clients still use the fail-closed persisted probe resume path.
+- [x] Expose a UI role-split attach control surface that derives default peer ids from active DM/group/invite state and can call backend answerer/offerer runtime attach. This is an explicit manual runtime attach bridge, not final automatic invite/member orchestration.
 
 Verification added/run:
 
@@ -437,7 +437,8 @@ cargo test -q -p discrypt-transport live_provider_text_control_runtime_pair_carr
 - [x] Preserved backward compatibility: if no role is supplied, the command still uses the legacy fail-closed persisted-probe resume path and does not pretend stale probe SDP is a live runtime.
 - [x] When role and peer ids are supplied, the backend now builds active-scope signaling profile/scope/ICE material, starts the corresponding one-peer provider runtime, stores the owned runtime handle plus executor in app-service state, and exposes role/peer evidence in the text/control runtime status row.
 - [x] Updated the frontend command type and command-coverage gate to include the new attach fields.
-- [ ] UI still needs to derive/pass role/local-peer/remote-peer from DM/group invite state and orchestrate answerer-before-offerer startup across two app instances.
+- [x] UI now derives default runtime peer ids from active DM/group/invite state and lets the operator set reciprocal local/remote peer ids before starting answerer or offerer.
+- [ ] UI still needs automatic invite/member-derived peer identity exchange and background pending lifecycle so answerer startup does not behave like a blocking manual operation.
 - [ ] Two installed app instances have not yet been run through the role-split attach command over public providers.
 
 Verification added/run:
@@ -449,6 +450,20 @@ cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter
 cargo test -q -p discrypt-desktop attach_text_control_transport_runtime -- --nocapture
 npm --prefix apps/ui run test:command-coverage
 npm --prefix apps/ui run typecheck
+```
+
+### 2026-05-30 UI role-split runtime attach bridge
+
+- [x] Added manual UI controls to the transport status strip for `Local runtime peer`, `Remote runtime peer`, `Listen as answerer`, and `Connect as offerer`.
+- [x] Defaults are deterministically derived from active profile plus active DM/group/channel/invite state so the control is scoped to the current conversation context instead of global hard-coded peer ids.
+- [x] The UI calls the native `attach_text_control_transport_runtime` command with `runtime_role`, `local_peer_id`, and `remote_peer_id`; browser fallback remains honest through the existing command layer.
+- [ ] This is not yet the final production UX. A production flow still needs signed invite/member device metadata to exchange peer ids automatically, non-blocking/background answerer startup, and a two-installed-app UI E2E over public providers.
+
+Verification added/run:
+
+```bash
+npm --prefix apps/ui run typecheck
+npm --prefix apps/ui run test:command-coverage
 ```
 
 ### 2026-05-30 public role-split text runtime evidence

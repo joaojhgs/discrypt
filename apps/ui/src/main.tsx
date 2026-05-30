@@ -46,6 +46,7 @@ import {
   updateVoiceActivity,
   startSignalingSession,
   startTextSession,
+  attachTextControlTransportRuntime,
   startDm,
   verifySafetyNumber,
 } from "./commands";
@@ -93,6 +94,39 @@ function asTemplateId(value: string): TemplateId {
   return discryptUiConfig.templates.some((template) => template.id === value)
     ? (value as TemplateId)
     : discryptUiConfig.activeTemplate;
+}
+
+function stableUiHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (const char of input) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function textRuntimePeerDefaults(state: AppState): {
+  local: string;
+  remote: string;
+} {
+  const scope =
+    state.active_context?.dm_id ??
+    state.active_context?.group_id ??
+    state.active_context?.channel_id ??
+    state.invites.at(-1)?.invite_key ??
+    "active-scope";
+  const activeDm = state.active_context?.dm_id
+    ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
+    : state.dms[0];
+  const remoteSeed =
+    activeDm?.participant_id ??
+    state.invites.at(-1)?.invite_key ??
+    state.active_context?.group_id ??
+    "remote-peer";
+  return {
+    local: `peer-${stableUiHash(`local:${state.profile?.user_id ?? "local-profile-pending"}:${scope}`)}`,
+    remote: `peer-${stableUiHash(`remote:${remoteSeed}:${scope}`)}`,
+  };
 }
 
 function emptyVoiceDeviceAccess(
@@ -236,6 +270,8 @@ function App() {
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [messageTransportProof, setMessageTransportProof] = useState(false);
+  const [runtimeLocalPeerId, setRuntimeLocalPeerId] = useState("");
+  const [runtimeRemotePeerId, setRuntimeRemotePeerId] = useState("");
   const [eventCursor, setEventCursor] = useState(0);
 
   useEffect(() => {
@@ -354,6 +390,19 @@ function App() {
     );
   }
 
+  async function attachTextRuntime(role: "offerer" | "answerer") {
+    if (!commandState) return;
+    const defaults = textRuntimePeerDefaults(commandState);
+    await applyCommand(
+      attachTextControlTransportRuntime({
+        session_id: null,
+        runtime_role: role,
+        local_peer_id: runtimeLocalPeerId || defaults.local,
+        remote_peer_id: runtimeRemotePeerId || defaults.remote,
+      }),
+    );
+  }
+
   if (loadError) {
     return (
       <main className="grid min-h-dvh place-items-center bg-[hsl(var(--background))] p-6 text-red-200">
@@ -371,6 +420,7 @@ function App() {
 
   const appState = commandState;
   const currentSnapshot = appState.snapshot;
+  const runtimePeerDefaults = textRuntimePeerDefaults(appState);
   const activeGroup = getActiveGroup(appState);
   const activeTextChannel = getActiveTextChannel(appState, activeGroup);
   const activeVoiceChannel = getActiveVoiceChannel(appState, activeGroup);
@@ -811,9 +861,15 @@ function App() {
         <TransportStatusStrip
           statuses={appState.transport_status}
           diagnostics={appState.transport_diagnostics}
+          localPeerId={runtimeLocalPeerId || runtimePeerDefaults.local}
+          remotePeerId={runtimeRemotePeerId || runtimePeerDefaults.remote}
+          onLocalPeerIdChange={setRuntimeLocalPeerId}
+          onRemotePeerIdChange={setRuntimeRemotePeerId}
           onProbeAdapter={probeSelectedAdapter}
           onProbeDataChannel={probeSelectedDataChannel}
           onStartTextTransport={startTextTransportProof}
+          onAttachOfferer={() => attachTextRuntime("offerer")}
+          onAttachAnswerer={() => attachTextRuntime("answerer")}
         />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
@@ -1496,15 +1552,27 @@ function ConfigSelect({
 function TransportStatusStrip({
   statuses,
   diagnostics,
+  localPeerId,
+  remotePeerId,
+  onLocalPeerIdChange,
+  onRemotePeerIdChange,
   onProbeAdapter,
   onProbeDataChannel,
   onStartTextTransport,
+  onAttachOfferer,
+  onAttachAnswerer,
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
+  localPeerId: string;
+  remotePeerId: string;
+  onLocalPeerIdChange: (value: string) => void;
+  onRemotePeerIdChange: (value: string) => void;
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
   onStartTextTransport: () => void;
+  onAttachOfferer: () => void;
+  onAttachAnswerer: () => void;
 }) {
   const ordered = statuses.length
     ? statuses
@@ -1545,6 +1613,43 @@ function TransportStatusStrip({
           </Button>
           <Badge variant="outline">honest status</Badge>
         </div>
+      </div>
+      <div className="mb-3 grid gap-2 rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3 md:grid-cols-[1fr_1fr_auto]">
+        <div>
+          <Label className="text-xs" htmlFor="runtime-local-peer">
+            Local runtime peer
+          </Label>
+          <Input
+            id="runtime-local-peer"
+            value={localPeerId}
+            onChange={(event) => onLocalPeerIdChange(event.target.value)}
+            className="mt-1 h-9 font-mono text-xs"
+          />
+        </div>
+        <div>
+          <Label className="text-xs" htmlFor="runtime-remote-peer">
+            Remote runtime peer
+          </Label>
+          <Input
+            id="runtime-remote-peer"
+            value={remotePeerId}
+            onChange={(event) => onRemotePeerIdChange(event.target.value)}
+            className="mt-1 h-9 font-mono text-xs"
+          />
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <Button size="sm" variant="outline" onClick={onAttachAnswerer}>
+            Listen as answerer
+          </Button>
+          <Button size="sm" onClick={onAttachOfferer}>
+            Connect as offerer
+          </Button>
+        </div>
+        <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))] md:col-span-3">
+          Run the answerer on one profile first, then the offerer on the other
+          with reciprocal peer ids. The backend keeps claims silent unless a
+          real provider-signaled DataChannel attaches.
+        </p>
       </div>
       <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
         {ordered.map((item) => (
