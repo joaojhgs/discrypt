@@ -686,3 +686,61 @@ Verification run:
 Remaining gap: this closes backend/UI reciprocal peer derivation for basic DM
 invite attach setup, but it is still not an installed Tauri two-process public
 provider receipt proof and not real media/voice E2E.
+
+## 2026-05-30 update: live runtime-pair proofs now use signed invite peer rows
+
+The backend live runtime-pair pump no longer synthesizes offerer/answerer peer ids
+from local profile ids for the public MQTT/Nostr receipt proof path. It now:
+
+- derives the shared runtime bootstrap/entropy from the signed invite connectivity
+  metadata through the same role-split material path used by runtime attach
+- reads local/remote peer ids from persisted DM/group `runtime_peers`
+- fails closed when sender and receiver states do not contain reciprocal signed
+  bootstrap peer rows
+- updates the public MQTT/Nostr runtime-pair tests so Bob accepts Alice's real DM
+  invite before the pump attempts a peer receipt
+
+Verification added:
+
+- `live_runtime_peer_ids_are_signed_invite_reciprocals` proves Alice/Bob DM invite
+  states produce reciprocal signed runtime peer ids.
+- Public MQTT/Nostr runtime-pair tests compile and skip cleanly unless their
+  public-provider E2E env flags are explicitly enabled; their setup now uses the
+  real DM invite/accept flow.
+
+Verification run:
+
+- `cargo fmt --all --check`
+- `cargo check -q -p discrypt-desktop`
+- `cargo test -q -p discrypt-desktop live_runtime_peer_ids_are_signed_invite_reciprocals -- --nocapture`
+- `cargo test -q -p discrypt-desktop live_role_split_runtime_material_is_invite_shared_not_profile_local -- --nocapture`
+- `cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` (skipped because public E2E env flag was not set)
+- `cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` (skipped because public E2E env flag was not set)
+
+Remaining gap: this strengthens the real public-provider test harness and removes
+profile-local peer-id synthesis from that path, but the long-running public MQTT
+and Nostr receipt proof was not re-run in this slice because the explicit public
+E2E env flags were not set. IPFS direct topic-peer, deployed QUIC rendezvous,
+credentialed TURN relay-only, and real voice/audio capture/playback E2E remain
+open.
+
+## 2026-05-30 update: hardened public MQTT/Nostr receipt proofs passed
+
+After the runtime-pair hardening, the env-enabled public-provider receipt proofs
+were run against public endpoints with the real DM invite/accept setup:
+
+- MQTT: Alice creates a DM invite, Bob accepts it, both sides use reciprocal
+  signed `runtime_peers`, and the text/control envelope plus signed receipt cross
+  a provider-negotiated WebRTC DataChannel via `mqtts://broker.emqx.io:8883`.
+- Nostr: the same two-profile DM invite/accept receipt flow passes through
+  `wss://nos.lol`.
+
+Verification run:
+
+- `DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` — passed
+- `DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` — passed
+
+Remaining gap: MQTT and Nostr DM text/control receipt proof now has public-provider
+evidence through signed invite state, but IPFS direct topic-peer, deployed QUIC
+rendezvous, credentialed TURN relay-only, group public-provider receipt, installed
+GUI two-window E2E, and real voice/audio capture/playback E2E remain open.

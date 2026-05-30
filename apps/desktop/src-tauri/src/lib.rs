@@ -5113,34 +5113,33 @@ impl PersistedAppState {
             .map_err(|error| error.to_string())?;
         let ice_config =
             ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
-        let bootstrap_secret = self.probe_material(
-            "discrypt-live-runtime-pair-bootstrap-v1",
-            &connectivity.scope_id_commitment,
+        let bootstrap_secret = shared_runtime_material(
+            "discrypt-live-role-split-runtime-bootstrap-v1",
+            &connectivity,
             &profile.profile_id,
             32,
         );
-        let random_entropy = self.probe_material(
-            "discrypt-live-runtime-pair-entropy-v1",
-            &connectivity.scope_id_commitment,
+        let random_entropy = shared_runtime_material(
+            "discrypt-live-role-split-runtime-entropy-v1",
+            &connectivity,
             &profile.profile_id,
             16,
         );
         let mut sender_state = self.clone();
         let target = outbox_frame.target.clone();
         let transport_session_id = transport_session_id.into();
-        let sender_peer_id = SignalingPeerId::new(format!(
-            "offerer-{}",
-            &hash_commitment("discrypt-runtime-peer-id-v1", &[&self.local_user_id()])[..16]
-        ))
-        .map_err(|error| error.to_string())?;
-        let receiver_peer_id = SignalingPeerId::new(format!(
-            "answerer-{}",
-            &hash_commitment(
-                "discrypt-runtime-peer-id-v1",
-                &[&receiver.state.local_user_id()]
-            )[..16]
-        ))
-        .map_err(|error| error.to_string())?;
+        let (sender_peer_id, receiver_peer_id) = self.active_runtime_peer_ids_for_text_control()?;
+        let (receiver_local_peer_id, receiver_remote_peer_id) =
+            receiver.state.active_runtime_peer_ids_for_text_control()?;
+        if receiver_local_peer_id != receiver_peer_id || receiver_remote_peer_id != sender_peer_id {
+            return Err(format!(
+                "live runtime peer bootstrap mismatch: sender local={} remote={}, receiver local={} remote={}",
+                sender_peer_id.0,
+                receiver_peer_id.0,
+                receiver_local_peer_id.0,
+                receiver_remote_peer_id.0
+            ));
+        }
         let receiver_service = Arc::new(Mutex::new(receiver));
 
         let (updated_sender, receiver_state, evidence, report) = std::thread::spawn(move || {
@@ -5823,6 +5822,84 @@ impl PersistedAppState {
                     .and_then(|group| group.connectivity.clone())
                     .map(|connectivity| (ConnectivityScopeLevel::Group, connectivity))
             })
+    }
+
+    #[cfg(test)]
+    fn active_runtime_peer_ids_for_text_control(
+        &self,
+    ) -> Result<(SignalingPeerId, SignalingPeerId), String> {
+        let context = self.active_context.as_ref().ok_or_else(|| {
+            "No active DM/group context is available for text/control runtime peer attachment"
+                .to_owned()
+        })?;
+        if let Some(dm_id) = &context.dm_id {
+            let dm = self
+                .dms
+                .iter()
+                .find(|dm| &dm.dm_id == dm_id)
+                .ok_or_else(|| {
+                    format!("Active DM {dm_id} is missing for text/control runtime peer attachment")
+                })?;
+            let local = dm
+                .runtime_peers
+                .iter()
+                .find(|peer| peer.is_local)
+                .ok_or_else(|| {
+                    format!(
+                        "Active DM {dm_id} has no local runtime peer from signed bootstrap metadata"
+                    )
+                })?;
+            let remote = dm
+                .runtime_peers
+                .iter()
+                .find(|peer| !peer.is_local)
+                .ok_or_else(|| {
+                    format!(
+                        "Active DM {dm_id} has no remote runtime peer from signed bootstrap metadata"
+                    )
+                })?;
+            return Ok((
+                SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string())?,
+                SignalingPeerId::new(remote.peer_id.clone()).map_err(|error| error.to_string())?,
+            ));
+        }
+        if let Some(group_id) = &context.group_id {
+            let group = self
+                .groups
+                .iter()
+                .find(|group| &group.group_id == group_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Active group {group_id} is missing for text/control runtime peer attachment"
+                    )
+                })?;
+            let local = group
+                .runtime_peers
+                .iter()
+                .find(|peer| peer.is_local)
+                .ok_or_else(|| {
+                    format!(
+                        "Active group {group_id} has no local runtime peer from signed bootstrap metadata"
+                    )
+                })?;
+            let remote = group
+                .runtime_peers
+                .iter()
+                .find(|peer| !peer.is_local)
+                .ok_or_else(|| {
+                    format!(
+                        "Active group {group_id} has no remote runtime peer from signed bootstrap metadata"
+                    )
+                })?;
+            return Ok((
+                SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string())?,
+                SignalingPeerId::new(remote.peer_id.clone()).map_err(|error| error.to_string())?,
+            ));
+        }
+        Err(
+            "Active context is not a DM or group for text/control runtime peer attachment"
+                .to_owned(),
+        )
     }
 
     fn select_signaling_profile(
@@ -8384,6 +8461,43 @@ mod tests {
         let _ = fs::remove_file(&path);
         reset_app_state();
         path
+    }
+
+    fn reload_global_app_service_from_path(path: &std::path::Path) {
+        std::env::set_var("DISCRYPT_APP_STATE_PATH", path);
+        let mut store = FileAppStore::new(path);
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.state = load_state_from_store(&mut store);
+        guard.text_control_transport_runtime = None;
+        guard.pending_text_control_transport_runtime = None;
+    }
+
+    fn accept_dm_invite_as_test_profile(
+        profile_name: &str,
+        display_name: &str,
+        device_name: &str,
+        invite_code: String,
+        contact_label: &str,
+    ) -> Result<(PathBuf, TauriAppService), String> {
+        let path = reset_with_temp_state(profile_name);
+        create_user(CreateUserRequest {
+            display_name: display_name.to_owned(),
+            device_name: Some(device_name.to_owned()),
+        });
+        let accepted = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code,
+            display_name: Some(contact_label.to_owned()),
+        });
+        if accepted.last_command_error.is_some() {
+            return Err(format!(
+                "{display_name} could not accept DM invite: {:?}",
+                accepted.last_command_error
+            ));
+        }
+        Ok((path.clone(), TauriAppService::load_for_test_path(path)))
     }
 
     fn attach_text_control_transport_runtime_for_test(
@@ -11345,6 +11459,59 @@ mod tests {
     }
 
     #[test]
+    fn live_runtime_peer_ids_are_signed_invite_reciprocals() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("role-split-runtime-peers-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let active_dm_id = dm
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
+        let invite = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(active_dm_id),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(invite.last_command_error.is_none(), "{invite:?}");
+        let invite_code = invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "DM invite code missing".to_owned())?;
+        let alice_state = load_state();
+
+        let (_bob_path, bob_service) = accept_dm_invite_as_test_profile(
+            "role-split-runtime-peers-bob",
+            "Bob",
+            "Bob laptop",
+            invite_code,
+            "Alice",
+        )?;
+        reload_global_app_service_from_path(&alice_path);
+
+        let (alice_local, alice_remote) = alice_state.active_runtime_peer_ids_for_text_control()?;
+        let (bob_local, bob_remote) = bob_service
+            .state
+            .active_runtime_peer_ids_for_text_control()?;
+        assert_eq!(
+            alice_local, bob_remote,
+            "Bob must route to Alice's persisted signed bootstrap runtime peer"
+        );
+        assert_eq!(
+            alice_remote, bob_local,
+            "Alice must route to Bob's persisted signed bootstrap runtime peer"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn text_control_runtime_clears_when_text_session_stops() {
         let _guard = test_lock();
         reset_with_temp_state("text-control-runtime-clears-on-stop");
@@ -12148,9 +12315,25 @@ mod tests {
         let dm = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
         });
+        let active_dm_id = dm
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
+        let invite = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(active_dm_id.clone()),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(invite.last_command_error.is_none(), "{invite:?}");
+        let invite_code = invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "DM invite code missing".to_owned())?;
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm.dms[0].dm_id.clone()),
+            dm_id: Some(active_dm_id),
             group_id: None,
             channel_id: None,
         };
@@ -12162,18 +12345,14 @@ mod tests {
         });
         let message_id = sent.messages[0].message_id.clone();
 
-        let bob_path = fresh_state_path("desktop-public-mqtt-live-runtime-pair-bob");
-        let _ = fs::remove_file(&bob_path);
-        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
-        bob.mutate(|state| {
-            state.create_user(
-                CreateUserRequest {
-                    display_name: "Bob".to_owned(),
-                    device_name: Some("Bob laptop".to_owned()),
-                },
-                false,
-            );
-        });
+        let (_bob_path, bob) = accept_dm_invite_as_test_profile(
+            "desktop-public-mqtt-live-runtime-pair-bob",
+            "Bob",
+            "Bob laptop",
+            invite_code,
+            "Alice",
+        )?;
+        reload_global_app_service_from_path(&alice_path);
 
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("dm:bob".to_owned()),
@@ -12256,9 +12435,25 @@ mod tests {
         let dm = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
         });
+        let active_dm_id = dm
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
+        let invite = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(active_dm_id.clone()),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(invite.last_command_error.is_none(), "{invite:?}");
+        let invite_code = invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "DM invite code missing".to_owned())?;
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm.dms[0].dm_id.clone()),
+            dm_id: Some(active_dm_id),
             group_id: None,
             channel_id: None,
         };
@@ -12270,18 +12465,14 @@ mod tests {
         });
         let message_id = sent.messages[0].message_id.clone();
 
-        let bob_path = fresh_state_path("desktop-public-nostr-live-runtime-pair-bob");
-        let _ = fs::remove_file(&bob_path);
-        let mut bob = TauriAppService::load_for_test_path(bob_path);
-        bob.mutate(|state| {
-            state.create_user(
-                CreateUserRequest {
-                    display_name: "Bob".to_owned(),
-                    device_name: Some("Bob laptop".to_owned()),
-                },
-                false,
-            );
-        });
+        let (_bob_path, bob) = accept_dm_invite_as_test_profile(
+            "desktop-public-nostr-live-runtime-pair-bob",
+            "Bob",
+            "Bob laptop",
+            invite_code,
+            "Alice",
+        )?;
+        reload_global_app_service_from_path(&alice_path);
 
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("dm:bob".to_owned()),
