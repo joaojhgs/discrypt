@@ -789,6 +789,15 @@ pub struct CreateDmInviteRequest {
     pub max_use: String,
 }
 
+/// Request to accept/open a first-contact DM invite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceptDmInviteRequest {
+    /// DM contact invite code or paste payload.
+    pub invite_code: String,
+    /// Optional display label assigned to the contact.
+    pub display_name: Option<String>,
+}
+
 /// Request to create a channel in a group.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateChannelRequest {
@@ -1595,6 +1604,261 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
     })
 }
 
+/// Tauri command: create a first-contact invite for an existing DM contact.
+pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let Some(dm_id) = request
+            .dm_id
+            .or_else(|| {
+                state
+                    .active_context
+                    .as_ref()
+                    .and_then(|context| context.dm_id.clone())
+            })
+            .or_else(|| state.dms.first().map(|dm| dm.dm_id.clone()))
+        else {
+            state.push_command_error(
+                "invite.rejected",
+                "create_dm_invite",
+                "dm_not_found",
+                "No DM contact exists for invite creation",
+                "Start or select a DM before creating a contact invite",
+            );
+            return;
+        };
+        let Some(dm) = state.dms.iter().find(|dm| dm.dm_id == dm_id).cloned() else {
+            state.push_command_error(
+                "invite.rejected",
+                "create_dm_invite",
+                "dm_not_found",
+                "Requested DM contact does not exist",
+                "Pick a contact from the DM list before creating an invite",
+            );
+            return;
+        };
+        let abuse_key = format!("invite-dm:{}:{}", state.local_user_id(), dm.dm_id);
+        if !state.abuse.allow_invite_create(&abuse_key, Utc::now()) {
+            state.push_command_error(
+                "invite.rate_limited",
+                "create_dm_invite",
+                "invite_create_rate_limited",
+                "DM contact invite creation is rate-limited for this contact and issuer",
+                "Wait for the abuse-control window before issuing another DM invite",
+            );
+            return;
+        }
+        let connectivity = dm
+            .connectivity
+            .clone()
+            .unwrap_or_else(|| dm_connectivity_policy(&dm.dm_id, &dm.participant_id));
+        let bootstrap_metadata = match bootstrap_metadata_from_connectivity(&connectivity) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_dm_invite",
+                    "invite_bootstrap_invalid",
+                    error,
+                    "Recreate the DM connectivity policy before issuing an invite",
+                );
+                return;
+            }
+        };
+        let sequence = state.next_sequence;
+        let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
+        let max_use = normalize_label(&request.max_use, "Max-use is enforced before DM acceptance");
+        let expires_at = invite_expiration_horizon(&expires);
+        let descriptor_expires_at = Utc::now() + invite_expiration_duration(&expires);
+        let max_uses = parse_max_uses(&max_use);
+        let invite_key = Uuid::new_v4().to_string();
+        let room_secret = format!("dm-contact-secret:{}:{}:{}", dm.dm_id, invite_key, sequence);
+        let signaling_endpoint = default_signaling_endpoint();
+        let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
+        let signaling_metadata = InviteSignalingMetadata::new(
+            signaling_endpoint.clone(),
+            InviteEndpointPolicy::ProductionTls,
+            InviteTrustMetadata::new(
+                signaling_trust_fingerprint.clone(),
+                "signed endpoint fingerprint; verify before DM accept",
+            )
+            .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
+        )
+        .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
+        let mut invite_store = InviteStore::new();
+        let issuer = SigningKey::generate(&mut OsRng);
+        let descriptor = invite_store
+            .issue_invite_with_bootstrap_metadata(
+                room_secret.as_bytes(),
+                descriptor_expires_at,
+                max_uses,
+                signaling_metadata,
+                bootstrap_metadata,
+                &issuer,
+            )
+            .unwrap_or_else(|_| {
+                invite_store.issue_invite(
+                    room_secret.as_bytes(),
+                    descriptor_expires_at,
+                    max_uses,
+                    &issuer,
+                )
+            });
+        let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
+        let ice_config = descriptor.ice_server_config_at(None, Utc::now()).ok();
+        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
+            Ok(code) => code,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_dm_invite",
+                    "invite_link_invalid",
+                    error,
+                    "Regenerate the DM invite after validating signaling and ICE metadata",
+                );
+                return;
+            }
+        };
+        let invite = InviteView {
+            invite_id: format!("invite-{}", descriptor.invite_id),
+            invite_key: descriptor.invite_id.clone(),
+            group_id: String::new(),
+            dm_id: Some(dm.dm_id.clone()),
+            connectivity_schema_version: connectivity.connectivity_schema_version,
+            invite_kind: connectivity.invite_kind.clone(),
+            scope_id_commitment: connectivity.scope_id_commitment.clone(),
+            signaling_profiles: connectivity.signaling_profiles.clone(),
+            privacy_label: connectivity.privacy_label.clone(),
+            dm_bootstrap: connectivity.dm_bootstrap.clone(),
+            group_bootstrap: connectivity.group_bootstrap.clone(),
+            code: invite_code,
+            room_secret_hash,
+            signaling_endpoint,
+            signaling_trust_fingerprint,
+            signaling_trust_status: "signed endpoint fingerprint; verify before DM accept".to_owned(),
+            endpoint_policy: "production_tls".to_owned(),
+            ice_stun_servers: ice_config
+                .as_ref()
+                .map(ice_stun_server_views)
+                .unwrap_or_default(),
+            ice_turn_servers: ice_config
+                .as_ref()
+                .map(ice_turn_server_views)
+                .unwrap_or_default(),
+            expires,
+            expires_at,
+            max_use,
+            uses: 0,
+            revoked: false,
+            admission_copy: "Final DM acceptance still requires a sealed reply rendezvous and verified contact identity; the link alone is insufficient".to_owned(),
+        };
+        state.invites.push(invite);
+        state.push_event(
+            "invite.dm_created",
+            format!("DM contact invite created for {}", dm.display_name),
+        );
+    })
+}
+
+/// Tauri command: accept/open a first-contact DM invite.
+pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let invite_code = normalize_label(&request.invite_code, "manual DM invite");
+        let Some(parsed) = parse_invite_metadata(&invite_code) else {
+            state.push_command_error(
+                "invite.rejected",
+                "accept_dm_invite",
+                "invite_parse_failed",
+                "DM contact invite metadata could not be parsed",
+                "Paste a signed DM contact invite descriptor before accepting",
+            );
+            return;
+        };
+        if parsed.connectivity.invite_kind != InviteKind::DmContact.canonical_name() {
+            state.push_command_error(
+                "invite.rejected",
+                "accept_dm_invite",
+                "invite_kind_mismatch",
+                "Invite is not a DM contact invite",
+                "Use group join for group invites or request a DM contact invite",
+            );
+            return;
+        }
+        let display_name = request
+            .display_name
+            .map(|value| normalize_label(&value, "DM contact"))
+            .unwrap_or_else(|| "DM contact".to_owned());
+        let dm_id = stable_id("dm", &parsed.invite_key, state.next_sequence);
+        let participant_id = hash_commitment(
+            "discrypt-accepted-dm-participant-id-v1",
+            &[&parsed.connectivity.scope_id_commitment],
+        );
+        if !state.dms.iter().any(|dm| {
+            dm.connectivity
+                .as_ref()
+                .map(|policy| &policy.scope_id_commitment)
+                == Some(&parsed.connectivity.scope_id_commitment)
+        }) {
+            state.dms.push(DirectConversationView {
+                dm_id: dm_id.clone(),
+                participant_id,
+                display_name: display_name.clone(),
+                local_only_copy: "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt proof".to_owned(),
+                connectivity: Some(parsed.connectivity.clone()),
+            });
+        }
+        let active_dm_id = state
+            .dms
+            .iter()
+            .find(|dm| {
+                dm.connectivity
+                    .as_ref()
+                    .map(|policy| &policy.scope_id_commitment)
+                    == Some(&parsed.connectivity.scope_id_commitment)
+            })
+            .map(|dm| dm.dm_id.clone())
+            .unwrap_or(dm_id);
+        state.active_context = Some(ActiveContextView {
+            kind: "dm".to_owned(),
+            group_id: None,
+            channel_id: None,
+            dm_id: Some(active_dm_id.clone()),
+        });
+        state.invites.push(InviteView {
+            invite_id: format!("invite-{}", parsed.invite_key),
+            invite_key: parsed.invite_key,
+            group_id: String::new(),
+            dm_id: Some(active_dm_id),
+            connectivity_schema_version: parsed.connectivity.connectivity_schema_version,
+            invite_kind: parsed.connectivity.invite_kind.clone(),
+            scope_id_commitment: parsed.connectivity.scope_id_commitment.clone(),
+            signaling_profiles: parsed.connectivity.signaling_profiles.clone(),
+            privacy_label: parsed.connectivity.privacy_label.clone(),
+            dm_bootstrap: parsed.connectivity.dm_bootstrap.clone(),
+            group_bootstrap: parsed.connectivity.group_bootstrap.clone(),
+            code: invite_code.clone(),
+            room_secret_hash: parsed.room_secret_hash,
+            signaling_endpoint: parsed.signaling_endpoint,
+            signaling_trust_fingerprint: parsed.signaling_trust_fingerprint,
+            signaling_trust_status: parsed.signaling_trust_status,
+            endpoint_policy: parsed.endpoint_policy,
+            ice_stun_servers: parsed.ice_stun_servers,
+            ice_turn_servers: parsed.ice_turn_servers,
+            expires: "Invite expiry from signed descriptor".to_owned(),
+            expires_at: parsed.expires_at,
+            max_use: parsed.max_uses.to_string(),
+            uses: 1,
+            revoked: false,
+            admission_copy: "Parsed DM contact invite metadata; final acceptance still requires sealed reply rendezvous/contact verification".to_owned(),
+        });
+        state.push_event(
+            "dm.invite_accepted",
+            format!("Opened DM contact {display_name}"),
+        );
+    })
+}
+
 /// Tauri command: create a channel in a group.
 pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -2084,6 +2348,16 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
+        super::create_dm_invite(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
+        super::accept_dm_invite(request)
+    }
+
+    #[tauri::command]
     pub(super) fn create_channel(request: CreateChannelRequest) -> AppStateView {
         super::create_channel(request)
     }
@@ -2158,6 +2432,8 @@ pub fn run() {
             ipc_commands::set_active_group,
             ipc_commands::join_group,
             ipc_commands::create_invite,
+            ipc_commands::create_dm_invite,
+            ipc_commands::accept_dm_invite,
             ipc_commands::create_channel,
             ipc_commands::send_message,
             ipc_commands::join_voice,
@@ -3259,6 +3535,18 @@ fn default_signaling_endpoint() -> String {
             .is_ok()
         });
     configured.unwrap_or_else(|| InviteSignalingMetadata::default_production().signaling_endpoint)
+}
+
+fn default_ice_stun_servers() -> Vec<String> {
+    vec!["stun:default.discrypt.invalid:3478".to_owned()]
+}
+
+fn default_redacted_turn_servers() -> Vec<IceTurnServerView> {
+    vec![IceTurnServerView {
+        endpoint: "turns:default.discrypt.invalid:5349".to_owned(),
+        credential_declared: false,
+        credential_expires_at: None,
+    }]
 }
 
 fn hash_commitment(domain: &str, parts: &[&str]) -> String {

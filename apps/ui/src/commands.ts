@@ -138,6 +138,7 @@ export type DirectConversationView = {
   participant_id: string;
   display_name: string;
   local_only_copy: string;
+  connectivity?: ConnectivityPolicyView | null;
 };
 
 export type ChannelStateView = {
@@ -152,6 +153,7 @@ export type GroupView = {
   name: string;
   role: string;
   channels: ChannelStateView[];
+  connectivity?: ConnectivityPolicyView | null;
 };
 
 export type ActiveContextView = {
@@ -194,6 +196,43 @@ export type IceTurnServerView = {
   credential_expires_at: string | null;
 };
 
+
+export type SignalingProfileView = {
+  profile_id: string;
+  adapter_kind: string;
+  endpoints: string[];
+  room_topic_commitment: string;
+  trust_fingerprint: string;
+  ttl_seconds: number;
+  metadata_posture: string;
+  rate_limit_policy: string;
+  capabilities: string[];
+};
+
+export type DmInviteBootstrapView = {
+  inviter_identity_commitment: string;
+  contact_token_commitment: string;
+  reply_rendezvous_commitment: string;
+};
+
+export type GroupInviteBootstrapView = {
+  group_identity_commitment: string;
+  role_admission_policy_commitment: string;
+  channel_policy_commitment: string;
+};
+
+export type ConnectivityPolicyView = {
+  connectivity_schema_version: number;
+  invite_kind: string;
+  scope_id_commitment: string;
+  signaling_profiles: SignalingProfileView[];
+  ice_stun_servers: string[];
+  ice_turn_servers: IceTurnServerView[];
+  privacy_label: string;
+  dm_bootstrap: DmInviteBootstrapView | null;
+  group_bootstrap: GroupInviteBootstrapView | null;
+};
+
 export type TransportStatusView = {
   label: string;
   status: string;
@@ -233,6 +272,14 @@ export type InviteView = {
   invite_id: string;
   invite_key: string;
   group_id: string;
+  dm_id?: string | null;
+  connectivity_schema_version: number;
+  invite_kind: string;
+  scope_id_commitment: string;
+  signaling_profiles: SignalingProfileView[];
+  privacy_label: string;
+  dm_bootstrap: DmInviteBootstrapView | null;
+  group_bootstrap: GroupInviteBootstrapView | null;
   code: string;
   room_secret_hash: string;
   signaling_endpoint: string;
@@ -377,6 +424,17 @@ export type CreateInviteRequest = {
   group_id?: string | null;
   expires: string;
   max_use: string;
+};
+
+export type CreateDmInviteRequest = {
+  dm_id?: string | null;
+  expires: string;
+  max_use: string;
+};
+
+export type AcceptDmInviteRequest = {
+  invite_code: string;
+  display_name?: string | null;
 };
 
 export type CreateChannelRequest = {
@@ -1125,6 +1183,7 @@ type ParsedInviteMetadata = {
   endpointPolicy: string;
   iceStunServers: string[];
   iceTurnServers: IceTurnServerView[];
+  connectivity: ConnectivityPolicyView;
   expiresAt: string;
   maxUses: number;
 };
@@ -1147,6 +1206,99 @@ function defaultRedactedTurnServers(): IceTurnServerView[] {
   ];
 }
 
+
+function hashCommitment(domain: string, parts: string[]): string {
+  return stableHash(`${domain}:${parts.join(":")}`);
+}
+
+function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
+  const endpoints: Record<string, string> = {
+    mqtt: "wss://mqtt.discrypt.invalid/mqtt",
+    nostr: "wss://nostr.discrypt.invalid",
+    ipfs_pubsub: "https://ipfs.discrypt.invalid/bootstrap/pubsub",
+    discrypt_quic_rendezvous: "quic://signaling.discrypt.invalid:443/rendezvous",
+  };
+  return Object.entries(endpoints).map(([adapterKind, endpoint]) => ({
+    profile_id: `${adapterKind}-default`,
+    adapter_kind: adapterKind,
+    endpoints: [endpoint],
+    room_topic_commitment: hashCommitment(
+      "discrypt-rendezvous-topic-commitment-v1",
+      [scopeCommitment, adapterKind],
+    ),
+    trust_fingerprint: stableHash(
+      `external-signaling-endpoint-fingerprint-v1:${endpoint}`,
+    ),
+    ttl_seconds: 300,
+    metadata_posture: "hashed_topic",
+    rate_limit_policy: "bounded publish/take with provider backoff",
+    capabilities: [
+      "presence_ttl",
+      "trickle_ice",
+      "broadcast_control",
+      "health_telemetry",
+    ],
+  }));
+}
+
+function groupConnectivityPolicy(groupId: string): ConnectivityPolicyView {
+  const scope = hashCommitment("discrypt-group-scope-commitment-v1", [groupId]);
+  return {
+    connectivity_schema_version: 1,
+    invite_kind: "group_join",
+    scope_id_commitment: scope,
+    signaling_profiles: defaultSignalingProfiles(scope),
+    ice_stun_servers: defaultIceStunServers(),
+    ice_turn_servers: defaultRedactedTurnServers(),
+    privacy_label:
+      "Group invite topics are derived commitments; group names, channel names, and room secrets are not exposed",
+    dm_bootstrap: null,
+    group_bootstrap: {
+      group_identity_commitment: scope,
+      role_admission_policy_commitment: hashCommitment(
+        "discrypt-group-admission-policy-commitment-v1",
+        [groupId],
+      ),
+      channel_policy_commitment: hashCommitment(
+        "discrypt-channel-policy-commitment-v1",
+        [groupId],
+      ),
+    },
+  };
+}
+
+function dmConnectivityPolicy(
+  dmId: string,
+  participantId: string,
+): ConnectivityPolicyView {
+  const scope = hashCommitment("discrypt-dm-scope-commitment-v1", [dmId]);
+  return {
+    connectivity_schema_version: 1,
+    invite_kind: "dm_contact",
+    scope_id_commitment: scope,
+    signaling_profiles: defaultSignalingProfiles(scope),
+    ice_stun_servers: defaultIceStunServers(),
+    ice_turn_servers: defaultRedactedTurnServers(),
+    privacy_label:
+      "DM contact invite topics are derived commitments; aliases, safety numbers, and room secrets are not exposed",
+    dm_bootstrap: {
+      inviter_identity_commitment: hashCommitment(
+        "discrypt-dm-inviter-identity-commitment-v1",
+        [participantId],
+      ),
+      contact_token_commitment: hashCommitment(
+        "discrypt-dm-contact-token-commitment-v1",
+        [dmId, participantId],
+      ),
+      reply_rendezvous_commitment: hashCommitment(
+        "discrypt-dm-reply-rendezvous-commitment-v1",
+        [dmId],
+      ),
+    },
+    group_bootstrap: null,
+  };
+}
+
 function productionInviteLink(metadata: ParsedInviteMetadata): string {
   const query = new URLSearchParams({
     endpoint: metadata.signalingEndpoint,
@@ -1156,6 +1308,8 @@ function productionInviteLink(metadata: ParsedInviteMetadata): string {
     commitment: metadata.roomSecretHash,
     exp: metadata.expiresAt,
     max: String(metadata.maxUses),
+    kind: metadata.connectivity.invite_kind,
+    scope: metadata.connectivity.scope_id_commitment,
   });
   for (const endpoint of metadata.iceStunServers) {
     query.append("stun", endpoint);
@@ -1185,6 +1339,30 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
   ) {
     return null;
   }
+  const inviteKind = params.get("kind") === "dm_contact" ? "dm_contact" : "group_join";
+  const scope =
+    params.get("scope") ??
+    hashCommitment("discrypt-legacy-invite-scope-commitment-v1", [inviteKey]);
+  const iceStunServers = params.getAll("stun");
+  const iceTurnServers = params.getAll("turn").map((endpoint) => ({
+    endpoint,
+    credential_declared: true,
+    credential_expires_at: null,
+  }));
+  const connectivity =
+    inviteKind === "dm_contact"
+      ? {
+          ...dmConnectivityPolicy(`dm-${inviteKey}`, scope),
+          scope_id_commitment: scope,
+          ice_stun_servers: iceStunServers,
+          ice_turn_servers: iceTurnServers,
+        }
+      : {
+          ...groupConnectivityPolicy(`group-${inviteKey}`),
+          scope_id_commitment: scope,
+          ice_stun_servers: iceStunServers,
+          ice_turn_servers: iceTurnServers,
+        };
   return {
     inviteKey,
     roomSecretHash: params.get("commitment") ?? "",
@@ -1192,12 +1370,9 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
     signalingTrustFingerprint,
     signalingTrustStatus,
     endpointPolicy,
-    iceStunServers: params.getAll("stun"),
-    iceTurnServers: params.getAll("turn").map((endpoint) => ({
-      endpoint,
-      credential_declared: true,
-      credential_expires_at: null,
-    })),
+    iceStunServers,
+    iceTurnServers,
+    connectivity,
     expiresAt: params.get("exp") ?? "",
     maxUses: Number(params.get("max") ?? 1) || 1,
   };
