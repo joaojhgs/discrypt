@@ -14,7 +14,6 @@ const rustToolchain = read("rust-toolchain.toml");
 const nodeVersion = read(".node-version").trim();
 const packageJson = read("apps/ui/package.json");
 const releaseScript = read("scripts/release-linux.mjs");
-const nodeVersionFile = read(".node-version").trim();
 const releaseCheck = read("scripts/check-release-linux.mjs");
 const doc = read("docs/release/reproducible-release-g126.md");
 const adr = read("docs/adr/adr-008-supply-chain.md");
