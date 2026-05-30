@@ -365,10 +365,14 @@ pub struct ProviderWebRtcDataChannelProbe {
     pub offerer_data_channel_open: bool,
     /// Answer-side DataChannel opened.
     pub answerer_data_channel_open: bool,
-    /// Opaque text/control frame crossed the DataChannel.
+    /// Opaque text/control frame crossed the DataChannel from offerer to answerer.
     pub text_control_frame_roundtrip: bool,
     /// SHA-256 of the opaque text/control frame used for the proof.
     pub text_control_frame_sha256: String,
+    /// Opaque return receipt/control frame crossed the DataChannel from answerer to offerer.
+    pub receipt_frame_roundtrip: bool,
+    /// SHA-256 of the opaque return receipt/control frame used for the proof.
+    pub receipt_frame_sha256: String,
 }
 
 impl SignalingAdapterFallbackPlan {
@@ -540,7 +544,8 @@ pub async fn probe_provider_adapter_roundtrip(
 ///
 /// The probe uses the selected adapter as the encrypted rendezvous path for
 /// SDP offer/answer exchange, then requires a real WebRTC DataChannel to open
-/// and carry one opaque text/control frame. It deliberately uses a real network
+/// and carry one opaque text/control frame plus one opaque receipt/control
+/// frame back. It deliberately uses a real network
 /// UDP bind (`0.0.0.0:0`) so public STUN endpoints are not accidentally tested
 /// through loopback-only sockets.
 pub async fn probe_provider_webrtc_datachannel_roundtrip(
@@ -921,6 +926,26 @@ where
         })??;
     let frame_roundtrip = received == frame;
 
+    let receipt_frame =
+        format!("ciphertext:provider-webrtc-receipt:v1:{frame_sha256}").into_bytes();
+    let receipt_frame_sha256 = {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&receipt_frame);
+        hex::encode(hasher.finalize())
+    };
+    bob_webrtc
+        .send_text_control_frame(receipt_frame.clone())
+        .await?;
+    let received_receipt = timeout(
+        Duration::from_secs(5),
+        alice_webrtc.recv_text_control_frame(),
+    )
+    .await
+    .map_err(|_| {
+        TransportError::Unavailable("timed out receiving WebRTC receipt/control frame".to_owned())
+    })??;
+    let receipt_frame_roundtrip = received_receipt == receipt_frame;
+
     let alice_direct = alice_webrtc.direct_path_metrics().await;
     let bob_direct = bob_webrtc.direct_path_metrics().await;
     let offerer_data = alice_webrtc.text_control_transport_metrics().await;
@@ -945,6 +970,8 @@ where
         answerer_data_channel_open: answerer_data.open,
         text_control_frame_roundtrip: frame_roundtrip,
         text_control_frame_sha256: frame_sha256,
+        receipt_frame_roundtrip,
+        receipt_frame_sha256,
     })
 }
 

@@ -309,6 +309,8 @@ export type ProviderWebRtcDataChannelProbeView = {
   answerer_data_channel_open: boolean;
   text_control_frame_roundtrip: boolean;
   text_control_frame_sha256: string;
+  receipt_frame_roundtrip: boolean;
+  receipt_frame_sha256: string;
 };
 
 export type JoinProgressStepView = {

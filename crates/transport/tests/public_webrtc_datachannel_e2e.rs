@@ -76,6 +76,8 @@ async fn run_provider_signaled_webrtc_datachannel_roundtrip(
     assert!(probe.offerer_data_channel_open);
     assert!(probe.answerer_data_channel_open);
     assert!(probe.text_control_frame_roundtrip);
+    assert!(probe.receipt_frame_roundtrip);
+    assert_eq!(probe.receipt_frame_sha256.len(), 64);
     Ok(())
 }
 

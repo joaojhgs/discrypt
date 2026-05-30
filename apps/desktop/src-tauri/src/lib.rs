@@ -1108,11 +1108,17 @@ pub struct ProviderWebRtcDataChannelProbeView {
     pub offerer_data_channel_open: bool,
     /// Answerer DataChannel open state.
     pub answerer_data_channel_open: bool,
-    /// Opaque text/control frame crossed the DataChannel.
+    /// Opaque text/control frame crossed the DataChannel from offerer to answerer.
     pub text_control_frame_roundtrip: bool,
     /// SHA-256 of the opaque text/control frame used for the proof.
     #[serde(default)]
     pub text_control_frame_sha256: String,
+    /// Opaque return receipt/control frame crossed from answerer back to offerer.
+    #[serde(default)]
+    pub receipt_frame_roundtrip: bool,
+    /// SHA-256 of the opaque return receipt/control frame used for the proof.
+    #[serde(default)]
+    pub receipt_frame_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2353,11 +2359,12 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                     state_key = "transport_probe_verified".to_owned();
                     state_label = "Transport proofed".to_owned();
                     state_detail = format!(
-                        "Opaque text/control frame crossed adapter={} profile={} topic={} frame_sha256={}; this is not a signed peer receipt",
+                        "Opaque text/control frame crossed adapter={} profile={} topic={} frame_sha256={} receipt_return={}; this is not a signed peer receipt",
                         probe.kind,
                         probe.profile_id,
                         probe.rendezvous_topic,
-                        probe.text_control_frame_sha256
+                        probe.text_control_frame_sha256,
+                        probe.receipt_frame_roundtrip
                     );
                 }
                 Err(error) => {
@@ -3459,6 +3466,8 @@ impl PersistedAppState {
             answerer_data_channel_open: probe.answerer_data_channel_open,
             text_control_frame_roundtrip: probe.text_control_frame_roundtrip,
             text_control_frame_sha256: probe.text_control_frame_sha256,
+            receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
+            receipt_frame_sha256: probe.receipt_frame_sha256,
         };
         self.latest_data_channel_probe_error = None;
         self.latest_data_channel_probe = Some(view.clone());
@@ -7141,6 +7150,8 @@ mod tests {
         assert!(probe.offerer_data_channel_open);
         assert!(probe.answerer_data_channel_open);
         assert!(probe.text_control_frame_roundtrip);
+        assert!(probe.receipt_frame_roundtrip);
+        assert_eq!(probe.receipt_frame_sha256.len(), 64);
         assert!(state.voice_session.is_none());
     }
 
@@ -7232,13 +7243,18 @@ mod tests {
         assert_eq!(state.messages[0].state_key, "transport_probe_verified");
         assert_eq!(state.messages[0].state_label, "Transport proofed");
         assert!(state.messages[0].state_detail.contains("frame_sha256="));
+        assert!(state.messages[0]
+            .state_detail
+            .contains("receipt_return=true"));
         let proof = state
             .transport_diagnostics
             .data_channel_probe
             .expect("send transport proof should update diagnostics");
         assert_eq!(proof.kind, "mqtt");
         assert!(proof.text_control_frame_roundtrip);
+        assert!(proof.receipt_frame_roundtrip);
         assert_eq!(proof.text_control_frame_sha256.len(), 64);
+        assert_eq!(proof.receipt_frame_sha256.len(), 64);
     }
 
     #[test]
@@ -7290,7 +7306,9 @@ mod tests {
             .expect("send transport proof should update diagnostics");
         assert_eq!(proof.kind, "nostr");
         assert!(proof.text_control_frame_roundtrip);
+        assert!(proof.receipt_frame_roundtrip);
         assert_eq!(proof.text_control_frame_sha256.len(), 64);
+        assert_eq!(proof.receipt_frame_sha256.len(), 64);
     }
 
     #[test]
