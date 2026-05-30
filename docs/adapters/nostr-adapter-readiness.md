@@ -1,30 +1,38 @@
 # Nostr signaling adapter readiness note
 
-Status: groundwork only; not production-ready  
+Status: real provider client wired behind `nostr-adapter`; public relay E2E passed once against `wss://relay.damus.io`  
 Scope: Discrypt serverless signaling adapter `nostr` / Cargo feature `nostr-adapter`
 
 ## Current contract
 
-The `nostr` adapter is registered in the transport adapter registry and remains fail-closed until a real audited relay client is wired. Compiling with `nostr-adapter` currently changes the boundary from `feature_disabled` to `implementation_unavailable`; it must not make fallback selection treat Nostr as usable.
+The `nostr` adapter is registered in the transport adapter registry and is selectable when the `nostr-adapter` Cargo feature is compiled. It uses `nostr-sdk` to connect to configured `wss://` relay endpoints and publishes Discrypt-specific Nostr events containing only already-sealed Discrypt signaling envelopes.
 
 Verified guard:
 
 ```bash
 cargo test -q -p discrypt-transport --features nostr-adapter \
-  nostr_feature_gate_remains_fail_closed_until_real_relay_client_is_wired
+  nostr_adapter_feature_is_selectable_with_real_relay_client
 ```
 
-## Required production implementation checklist
+## Provider-visible shape
 
-- Choose and audit a Rust Nostr client/runtime dependency before adding it to default builds.
-- Connect only to configured `wss://` relay allowlists from app/DM/group/channel policy or signed invite bootstrap metadata.
-- Use a scoped relay identity for event signing; do not reuse the user's MLS/account identity key unless a future ADR explicitly approves it.
-- Derive random/hashed rendezvous tags from `RendezvousCapability`; never publish group names, channel names, display names, safety numbers, raw room seeds, raw SDP, ICE ufrag/passwords, TURN credentials, plaintext messages, or audio metadata.
-- Publish/subscribe the existing sealed provider payload types: presence, WebRTC offer/answer/candidate envelopes, and room control envelopes.
-- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values.
-- Add local relay integration tests plus opt-in public relay smoke/soak tests before enabling Nostr as a selectable default.
-- Add provider-visible capture scans for event tags/content/logs before any production-ready claim.
+- Event kind: Discrypt custom regular event kind `31733`.
+- Topic tag: `d=<RendezvousCapability.topic>` where the capability topic is already random/hashed policy metadata.
+- Event signer: scoped relay identity derived from the rendezvous topic and redacted local peer id, not the user's MLS/account identity key.
+- Event content: base64url/no-pad JSON envelope carrying only:
+  - encrypted presence bytes,
+  - `SealedWebRtcNegotiationPayload` offer/answer/candidate bytes,
+  - opaque room control bytes.
 
-## Why this is not using a fake adapter
+The relay must not receive group names, channel names, display names, safety numbers, raw room seeds, raw SDP, ICE ufrag/passwords, TURN credentials, plaintext messages, or audio metadata.
 
-The local conformance bus can prove the shared `SignalingAdapter` trait shape, but it is not a Nostr relay client. Production readiness requires real Nostr event signing, relay subscription filters, relay error mapping, and public/local relay E2E evidence.
+## Still required for production completion
+
+- Keep the opt-in public relay two-peer smoke test (`DISCRYPT_PUBLIC_NOSTR_E2E=1`) in release verification; latest pass used `wss://relay.damus.io`, while `wss://nostr.oxtr.dev` returned `blocked`.
+- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible.
+- Add provider-visible capture scans for event tags/content/logs before any release claim.
+- Wire this adapter through the Tauri runtime factory and UI selection path for actual app use, not only transport-level conformance.
+
+## Dependency note
+
+`nostr-sdk` 0.44.1 is MIT licensed and supports the client operations Discrypt needs: relay management, subscriptions, custom event builders, and notification handling. The crate is feature-gated and not part of default builds.

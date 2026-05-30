@@ -2,12 +2,12 @@
 //!
 //! Each required provider has a concrete adapter boundary that validates
 //! profiles, exposes redacted health, and fails closed unless an audited
-//! provider client is compiled behind its explicit Cargo feature. MQTT now has a
-//! real provider client behind `mqtt-adapter`; Nostr, IPFS/libp2p PubSub, and
-//! the Rust QUIC rendezvous adapter remain explicit fail-closed boundaries until
-//! their real clients land.
+//! provider client is compiled behind its explicit Cargo feature. MQTT and Nostr
+//! now have real provider clients behind `mqtt-adapter` and `nostr-adapter`;
+//! IPFS/libp2p PubSub and the Rust QUIC rendezvous adapter remain explicit
+//! fail-closed boundaries until their real clients land.
 
-#[cfg(feature = "mqtt-adapter")]
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 use crate::SignalingProviderEndpoint;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
@@ -18,11 +18,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "nostr-adapter")]
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "mqtt-adapter")]
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(feature = "mqtt-adapter")]
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 use tokio::time::{timeout, Duration, Instant};
 
 /// End-to-end readiness state used by registry and fallback planning.
@@ -124,7 +126,11 @@ pub enum SignalingAdapterFactory {
     /// MQTT fail-closed boundary when feature is disabled.
     #[cfg(not(feature = "mqtt-adapter"))]
     Mqtt(FeatureGatedProviderAdapter),
-    /// Nostr boundary until real client is wired.
+    /// Nostr real implementation when feature-gated client is enabled.
+    #[cfg(feature = "nostr-adapter")]
+    Nostr(NostrProviderAdapter),
+    /// Nostr fail-closed boundary when feature is disabled.
+    #[cfg(not(feature = "nostr-adapter"))]
     Nostr(FeatureGatedProviderAdapter),
     /// IPFS/libp2p PubSub boundary until real client is wired.
     IpfsPubsub(FeatureGatedProviderAdapter),
@@ -147,7 +153,16 @@ impl SignalingAdapterFactory {
                     Self::Mqtt(FeatureGatedProviderAdapter::new(kind))
                 }
             }
-            SignalingAdapterKind::Nostr => Self::Nostr(FeatureGatedProviderAdapter::new(kind)),
+            SignalingAdapterKind::Nostr => {
+                #[cfg(feature = "nostr-adapter")]
+                {
+                    Self::Nostr(NostrProviderAdapter)
+                }
+                #[cfg(not(feature = "nostr-adapter"))]
+                {
+                    Self::Nostr(FeatureGatedProviderAdapter::new(kind))
+                }
+            }
             SignalingAdapterKind::IpfsPubsub => {
                 Self::IpfsPubsub(FeatureGatedProviderAdapter::new(kind))
             }
@@ -165,6 +180,9 @@ impl SignalingAdapterFactory {
             Self::Mqtt(_) => adapter_boundary_for_kind(SignalingAdapterKind::Mqtt),
             #[cfg(not(feature = "mqtt-adapter"))]
             Self::Mqtt(adapter) => adapter.boundary(),
+            #[cfg(feature = "nostr-adapter")]
+            Self::Nostr(_) => adapter_boundary_for_kind(SignalingAdapterKind::Nostr),
+            #[cfg(not(feature = "nostr-adapter"))]
             Self::Nostr(adapter) => adapter.boundary(),
             Self::IpfsPubsub(adapter) => adapter.boundary(),
             Self::DiscryptQuicRendezvous(adapter) => adapter.boundary(),
@@ -409,7 +427,7 @@ pub const fn adapter_boundary_for_kind(kind: SignalingAdapterKind) -> ProviderAd
         SignalingAdapterKind::Nostr => ProviderAdapterBoundary {
             kind,
             cargo_feature: "nostr-adapter",
-            readiness: feature_readiness(cfg!(feature = "nostr-adapter")),
+            readiness: nostr_feature_readiness(),
         },
         SignalingAdapterKind::IpfsPubsub => ProviderAdapterBoundary {
             kind,
@@ -445,6 +463,14 @@ const fn feature_readiness(enabled: bool) -> ProviderAdapterReadiness {
 
 const fn mqtt_feature_readiness() -> ProviderAdapterReadiness {
     if cfg!(feature = "mqtt-adapter") {
+        ProviderAdapterReadiness::ImplementationAvailable
+    } else {
+        ProviderAdapterReadiness::FeatureDisabled
+    }
+}
+
+const fn nostr_feature_readiness() -> ProviderAdapterReadiness {
+    if cfg!(feature = "nostr-adapter") {
         ProviderAdapterReadiness::ImplementationAvailable
     } else {
         ProviderAdapterReadiness::FeatureDisabled
@@ -673,6 +699,72 @@ enum MqttWireEnvelope {
     },
 }
 
+#[cfg(feature = "nostr-adapter")]
+/// Real Nostr relay signaling adapter.
+///
+/// The relay receives NIP-01 events whose content is a Discrypt-specific JSON
+/// envelope containing only already-sealed presence, control, and WebRTC
+/// negotiation payload bytes. The public event kind is intentionally scoped to a
+/// random/hashed rendezvous topic (`d` tag); display names, room labels, raw SDP,
+/// ICE credentials, and invite secrets are not serialized into provider-visible
+/// fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NostrProviderAdapter;
+
+#[cfg(feature = "nostr-adapter")]
+#[derive(Clone, Debug)]
+pub struct NostrProviderSession {
+    profile: SignalingAdapterProfile,
+}
+
+#[cfg(feature = "nostr-adapter")]
+pub struct NostrProviderRoom {
+    local_peer_id: SignalingPeerId,
+    client: nostr_sdk::Client,
+    relay_url: String,
+    subscription_id: nostr_sdk::SubscriptionId,
+    topic: String,
+    notifications: AsyncMutex<tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>>,
+    inbox: AsyncMutex<NostrInbox>,
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[derive(Debug, Default)]
+struct NostrInbox {
+    presence: Vec<PresenceEvent>,
+    signals: Vec<PeerSignal>,
+    controls: Vec<ControlBroadcast>,
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NostrWireEnvelope {
+    Presence {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    },
+    Signal {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    },
+    Control {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+    },
+}
+
+#[cfg(feature = "nostr-adapter")]
+const NOSTR_DISCRYPT_EVENT_KIND: u16 = 31_733;
+
+#[cfg(feature = "nostr-adapter")]
+const NOSTR_EVENT_SCHEMA: u8 = 1;
+
 fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Ok(());
@@ -700,6 +792,59 @@ fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
 #[cfg(feature = "mqtt-adapter")]
 fn mqtt_err(context: &str, err: impl std::fmt::Display) -> TransportError {
     TransportError::SignalingAdapter(format!("mqtt {context} failed: {err}"))
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_err(context: &str, err: impl std::fmt::Display) -> TransportError {
+    TransportError::SignalingAdapter(format!("nostr {context} failed: {err}"))
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_endpoint_for_profile(
+    profile: &SignalingAdapterProfile,
+) -> Result<&SignalingProviderEndpoint, TransportError> {
+    profile.endpoints.first().ok_or_else(|| {
+        TransportError::InvalidConnectivityPolicy(
+            "nostr adapter profile must contain at least one relay endpoint".to_owned(),
+        )
+    })
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_client_secret(
+    topic: &str,
+    peer: &SignalingPeerId,
+) -> Result<nostr_sdk::Keys, TransportError> {
+    let mut material = Vec::new();
+    material.extend_from_slice(b"discrypt-nostr-signaling-v1");
+    material.extend_from_slice(topic.as_bytes());
+    material.extend_from_slice(peer.0.as_bytes());
+    let digest = sha2::Sha256::digest(&material);
+    let hex_secret = hex::encode(digest);
+    nostr_sdk::Keys::parse(&hex_secret).map_err(|err| nostr_err("client key derivation", err))
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_subscription_id(topic: &str, peer: &SignalingPeerId) -> nostr_sdk::SubscriptionId {
+    let mut material = Vec::new();
+    material.extend_from_slice(b"discrypt-nostr-subscription-v1");
+    material.extend_from_slice(topic.as_bytes());
+    material.extend_from_slice(peer.0.as_bytes());
+    let digest = sha2::Sha256::digest(&material);
+    nostr_sdk::SubscriptionId::new(format!("dc-{}", &hex::encode(digest)[..24]))
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_filter(topic: &str) -> nostr_sdk::Filter {
+    nostr_sdk::Filter::new()
+        .kind(nostr_sdk::Kind::Custom(NOSTR_DISCRYPT_EVENT_KIND))
+        .identifier(topic.to_owned())
+        .since(nostr_sdk::Timestamp::now())
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_discrypt_tag(topic: &str) -> Result<nostr_sdk::Tag, TransportError> {
+    nostr_sdk::Tag::parse(["d", topic]).map_err(|err| nostr_err("topic tag", err))
 }
 
 #[cfg(feature = "mqtt-adapter")]
@@ -755,6 +900,315 @@ fn mqtt_signal_topic(rendezvous_topic: &str, peer_id: &SignalingPeerId) -> Strin
         "discrypt/v1/rendezvous/{rendezvous_topic}/signal/{}",
         peer_id.0
     )
+}
+
+#[cfg(feature = "nostr-adapter")]
+impl NostrProviderRoom {
+    async fn publish_envelope(&self, envelope: NostrWireEnvelope) -> Result<(), TransportError> {
+        let bytes =
+            serde_json::to_vec(&envelope).map_err(|err| nostr_err("wire envelope encode", err))?;
+        reject_forbidden_plaintext(&bytes)?;
+        let content =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, bytes);
+        let builder = nostr_sdk::EventBuilder::new(
+            nostr_sdk::Kind::Custom(NOSTR_DISCRYPT_EVENT_KIND),
+            content,
+        )
+        .tag(nostr_discrypt_tag(&self.topic)?);
+        let output = self
+            .client
+            .send_event_builder_to([self.relay_url.as_str()], builder)
+            .await
+            .map_err(|err| nostr_err("publish", err))?;
+        if output.success.is_empty() {
+            return Err(TransportError::SignalingAdapter(format!(
+                "nostr publish failed on all relays: {:?}",
+                output.failed
+            )));
+        }
+        self.drain_network_for(Duration::from_secs(2)).await
+    }
+
+    async fn drain_network_for(&self, duration: Duration) -> Result<(), TransportError> {
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let notification = {
+                let mut notifications = self.notifications.lock().await;
+                timeout(remaining, notifications.recv()).await
+            };
+            match notification {
+                Ok(Ok(nostr_sdk::RelayPoolNotification::Event { event, .. })) => {
+                    self.record_event(&event).await?;
+                }
+                Ok(Ok(nostr_sdk::RelayPoolNotification::Message { message, .. })) => {
+                    if let nostr_sdk::RelayMessage::Event { event, .. } = message {
+                        self.record_event(&event).await?;
+                    }
+                }
+                Ok(Ok(nostr_sdk::RelayPoolNotification::Shutdown)) => {
+                    return Err(TransportError::SignalingAdapter(
+                        "nostr relay pool shut down".to_owned(),
+                    ));
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return Err(TransportError::SignalingAdapter(
+                        "nostr notification stream closed".to_owned(),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    async fn record_event(&self, event: &nostr_sdk::Event) -> Result<(), TransportError> {
+        if event.kind != nostr_sdk::Kind::Custom(NOSTR_DISCRYPT_EVENT_KIND) {
+            return Ok(());
+        }
+        let has_topic = event
+            .tags
+            .iter()
+            .any(|tag| tag.kind().to_string() == "d" && tag.content() == Some(self.topic.as_str()));
+        if !has_topic {
+            return Ok(());
+        }
+        reject_forbidden_plaintext(event.content.as_bytes())?;
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+            event.content.as_bytes(),
+        )
+        .map_err(|err| nostr_err("wire envelope base64 decode", err))?;
+        reject_forbidden_plaintext(&bytes)?;
+        let envelope: NostrWireEnvelope =
+            serde_json::from_slice(&bytes).map_err(|err| nostr_err("wire envelope decode", err))?;
+        let mut inbox = self.inbox.lock().await;
+        match envelope {
+            NostrWireEnvelope::Presence {
+                schema,
+                from_peer,
+                payload,
+                ttl_seconds,
+            } if schema == NOSTR_EVENT_SCHEMA && from_peer != self.local_peer_id => {
+                inbox.presence.push(PresenceEvent {
+                    peer_id: from_peer,
+                    encrypted_presence: payload,
+                    ttl_seconds,
+                });
+            }
+            NostrWireEnvelope::Signal {
+                schema,
+                from_peer,
+                to_peer,
+                payload,
+            } if schema == NOSTR_EVENT_SCHEMA && to_peer == self.local_peer_id => {
+                inbox.signals.push(PeerSignal {
+                    from_peer,
+                    to_peer,
+                    payload,
+                });
+            }
+            NostrWireEnvelope::Control {
+                schema,
+                from_peer,
+                payload,
+            } if schema == NOSTR_EVENT_SCHEMA && from_peer != self.local_peer_id => {
+                inbox.controls.push(ControlBroadcast { from_peer, payload });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[async_trait]
+impl SignalingAdapter for NostrProviderAdapter {
+    type Session = NostrProviderSession;
+
+    async fn connect(
+        &self,
+        profile: SignalingAdapterProfile,
+    ) -> Result<Self::Session, TransportError> {
+        profile.validate()?;
+        if profile.kind != SignalingAdapterKind::Nostr {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "adapter profile kind {} does not match nostr adapter",
+                profile.kind.canonical_name()
+            )));
+        }
+        Ok(NostrProviderSession { profile })
+    }
+
+    fn capabilities(&self) -> SignalingAdapterCapabilities {
+        SignalingAdapterCapabilities::production_required()
+    }
+
+    fn observability_redacted(&self) -> SignalingObservability {
+        SignalingObservability {
+            adapter_kind: SignalingAdapterKind::Nostr,
+            endpoint_label: "nostr#configured_profile".to_owned(),
+            health: SignalingHealthState::Healthy,
+            trust_label: AdapterTrustLabel {
+                label: "nostr".to_owned(),
+                posture: "real Nostr relay client; relay sees signed event metadata and opaque Discrypt envelopes".to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[async_trait]
+impl AdapterSession for NostrProviderSession {
+    type Room = NostrProviderRoom;
+
+    async fn join(
+        &self,
+        scope: ConversationScope,
+        rendezvous: RendezvousCapability,
+        local_peer_id: SignalingPeerId,
+    ) -> Result<Self::Room, TransportError> {
+        scope.validate()?;
+        if rendezvous.scope != scope {
+            return Err(TransportError::SignalingAdapter(
+                "rendezvous capability scope mismatch".to_owned(),
+            ));
+        }
+        if rendezvous.adapter_kind != SignalingAdapterKind::Nostr {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "rendezvous capability kind {} does not match nostr adapter",
+                rendezvous.adapter_kind.canonical_name()
+            )));
+        }
+        let endpoint = nostr_endpoint_for_profile(&self.profile)?;
+        let relay_url = endpoint.endpoint.0.clone();
+        let keys = nostr_client_secret(&rendezvous.topic, &local_peer_id)?;
+        let client = nostr_sdk::Client::new(keys);
+        client
+            .add_relay(relay_url.as_str())
+            .await
+            .map_err(|err| nostr_err("add relay", err))?;
+        client.connect().await;
+        let subscription_id = nostr_subscription_id(&rendezvous.topic, &local_peer_id);
+        let output = client
+            .subscribe_with_id_to(
+                [relay_url.as_str()],
+                subscription_id.clone(),
+                nostr_filter(&rendezvous.topic),
+                None,
+            )
+            .await
+            .map_err(|err| nostr_err("subscribe", err))?;
+        if output.success.is_empty() && !output.failed.is_empty() {
+            return Err(TransportError::SignalingAdapter(format!(
+                "nostr subscribe failed on all relays: {:?}",
+                output.failed
+            )));
+        }
+        let room = NostrProviderRoom {
+            local_peer_id,
+            client: client.clone(),
+            relay_url,
+            subscription_id,
+            topic: rendezvous.topic,
+            notifications: AsyncMutex::new(client.notifications()),
+            inbox: AsyncMutex::new(NostrInbox::default()),
+        };
+        room.drain_network_for(Duration::from_millis(700)).await?;
+        Ok(room)
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> SignalingHealth {
+        SignalingHealth {
+            adapter_kind: SignalingAdapterKind::Nostr,
+            state: SignalingHealthState::Healthy,
+            latency_bucket: "unknown".to_owned(),
+            failure_class: None,
+        }
+    }
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[async_trait]
+impl RendezvousRoom for NostrProviderRoom {
+    async fn publish_presence(
+        &self,
+        encrypted_presence: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        if ttl_seconds == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "presence ttl must be non-zero".to_owned(),
+            ));
+        }
+        reject_forbidden_plaintext(&encrypted_presence.bytes)?;
+        self.publish_envelope(NostrWireEnvelope::Presence {
+            schema: NOSTR_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            payload: encrypted_presence,
+            ttl_seconds,
+        })
+        .await
+    }
+
+    async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
+        self.drain_network_for(Duration::from_millis(500)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.presence))
+    }
+
+    async fn send_signal(
+        &self,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&payload.ciphertext)?;
+        self.publish_envelope(NostrWireEnvelope::Signal {
+            schema: NOSTR_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            to_peer,
+            payload,
+        })
+        .await
+    }
+
+    async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
+        self.drain_network_for(Duration::from_millis(500)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.signals))
+    }
+
+    async fn broadcast_control(
+        &self,
+        sealed_payload: OpaqueSignalingPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.publish_envelope(NostrWireEnvelope::Control {
+            schema: NOSTR_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            payload: sealed_payload,
+        })
+        .await
+    }
+
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        self.drain_network_for(Duration::from_millis(500)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.controls))
+    }
+
+    async fn leave(&self) -> Result<(), TransportError> {
+        self.client.unsubscribe(&self.subscription_id).await;
+        self.client.disconnect().await;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "mqtt-adapter")]
@@ -1468,7 +1922,11 @@ mod tests {
                 cfg!(feature = "discrypt-quic-rendezvous-adapter")
             }
         };
-        if boundary.kind == SignalingAdapterKind::Mqtt && feature_enabled {
+        if matches!(
+            boundary.kind,
+            SignalingAdapterKind::Mqtt | SignalingAdapterKind::Nostr
+        ) && feature_enabled
+        {
             ProviderAdapterReadiness::ImplementationAvailable
         } else if feature_enabled {
             ProviderAdapterReadiness::ImplementationUnavailable
@@ -1741,38 +2199,34 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "nostr-adapter")]
-    async fn nostr_feature_gate_remains_fail_closed_until_real_relay_client_is_wired(
+    async fn nostr_adapter_feature_is_selectable_with_real_relay_client(
     ) -> Result<(), TransportError> {
         let boundary = adapter_boundary_for_kind(SignalingAdapterKind::Nostr);
         assert_eq!(
             boundary.readiness,
-            ProviderAdapterReadiness::ImplementationUnavailable
+            ProviderAdapterReadiness::ImplementationAvailable
         );
-        assert_eq!(boundary.failure_class(), "implementation_unavailable");
-        assert!(!SignalingAdapterFactory::for_kind(SignalingAdapterKind::Nostr).selectable());
+        assert_eq!(boundary.failure_class(), "implementation_available");
+        assert!(SignalingAdapterFactory::for_kind(SignalingAdapterKind::Nostr).selectable());
 
         let plan = plan_signaling_adapter_fallback(
             &[SignalingAdapterKind::Nostr],
             AdapterFallbackBehavior::ManualOnly,
             Some(SignalingAdapterKind::Nostr),
         );
-        assert_eq!(plan.selected, None);
+        assert_eq!(plan.selected, Some(SignalingAdapterKind::Nostr));
         assert_eq!(plan.attempts.len(), 1);
-        assert_eq!(
-            plan.attempts[0].readiness,
-            AdapterReadinessState::ImplementationUnavailable
-        );
-        assert!(!plan.attempts[0].selected);
+        assert_eq!(plan.attempts[0].readiness, AdapterReadinessState::Available);
+        assert!(plan.attempts[0].selected);
 
-        let adapter = FeatureGatedProviderAdapter::new(SignalingAdapterKind::Nostr);
-        let error = adapter.connect(valid_profile(SignalingAdapterKind::Nostr)?).await;
-        assert!(matches!(error, Err(TransportError::SignalingAdapter(_))));
-        let message = error
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
-        assert!(message.contains("nostr"));
-        assert!(message.contains("no audited production provider client is wired"));
+        let adapter = NostrProviderAdapter;
+        let session = adapter
+            .connect(valid_profile(SignalingAdapterKind::Nostr)?)
+            .await?;
+        assert_eq!(session.health().await.state, SignalingHealthState::Healthy);
+        let observability = adapter.observability_redacted();
+        assert_eq!(observability.adapter_kind, SignalingAdapterKind::Nostr);
+        assert!(!observability.endpoint_label.contains("example.invalid"));
         Ok(())
     }
 
@@ -1825,8 +2279,10 @@ mod tests {
             ProviderAdapterReadiness::ImplementationUnavailable
         );
         assert_eq!(boundary.failure_class(), "implementation_unavailable");
-        assert!(!SignalingAdapterFactory::for_kind(SignalingAdapterKind::DiscryptQuicRendezvous)
-            .selectable());
+        assert!(
+            !SignalingAdapterFactory::for_kind(SignalingAdapterKind::DiscryptQuicRendezvous)
+                .selectable()
+        );
 
         let plan = plan_signaling_adapter_fallback(
             &[SignalingAdapterKind::DiscryptQuicRendezvous],

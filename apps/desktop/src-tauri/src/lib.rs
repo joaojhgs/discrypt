@@ -26,11 +26,6 @@ use discrypt_core::{
 use discrypt_media::{
     MicrophonePermissionState, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
 };
-use discrypt_transport::{
-    plan_signaling_adapter_fallback, required_provider_adapter_boundaries, AdapterFallbackBehavior,
-    FallbackLeg, SignalingAdapterKind, TransportRoute, TransportSession, TransportSessionSnapshot,
-    TransportSessionState,
-};
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
@@ -47,6 +42,11 @@ use discrypt_storage::{
 };
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{AppDbKeychain, AppStoreError};
+use discrypt_transport::{
+    plan_signaling_adapter_fallback, required_provider_adapter_boundaries, AdapterFallbackBehavior,
+    FallbackLeg, SignalingAdapterKind, TransportRoute, TransportSession, TransportSessionSnapshot,
+    TransportSessionState,
+};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -2778,7 +2778,8 @@ impl PersistedAppState {
         signaling.or(text).unwrap_or_else(|| {
             (
                 "route-proof-not-available".to_owned(),
-                "No connected signaling/text transport session exposes a verified route report".to_owned(),
+                "No connected signaling/text transport session exposes a verified route report"
+                    .to_owned(),
                 "not-proven".to_owned(),
             )
         })
@@ -2819,7 +2820,9 @@ impl PersistedAppState {
 
     fn adapter_readiness_label(readiness: discrypt_transport::AdapterReadinessState) -> String {
         match readiness {
-            discrypt_transport::AdapterReadinessState::FeatureDisabled => "feature_disabled".to_owned(),
+            discrypt_transport::AdapterReadinessState::FeatureDisabled => {
+                "feature_disabled".to_owned()
+            }
             discrypt_transport::AdapterReadinessState::ImplementationUnavailable => {
                 "implementation_unavailable".to_owned()
             }
@@ -2862,10 +2865,7 @@ impl PersistedAppState {
         }
     }
 
-    fn transport_session(
-        &self,
-        mode: BackendTransportMode,
-    ) -> Option<&TransportSessionRecord> {
+    fn transport_session(&self, mode: BackendTransportMode) -> Option<&TransportSessionRecord> {
         match mode {
             BackendTransportMode::Signaling => self.signaling_session.as_ref(),
             BackendTransportMode::Text => self.text_session.as_ref(),
@@ -2877,7 +2877,10 @@ impl PersistedAppState {
         mode: BackendTransportMode,
         scope_label: Option<String>,
     ) -> Result<String, String> {
-        let label = normalize_label(&scope_label.unwrap_or_else(|| "default".to_owned()), "default");
+        let label = normalize_label(
+            &scope_label.unwrap_or_else(|| "default".to_owned()),
+            "default",
+        );
         self.ensure_ready_profile();
 
         {
@@ -2928,11 +2931,7 @@ impl PersistedAppState {
         Ok(session_id)
     }
 
-    fn stop_transport_session(
-        &mut self,
-        mode: BackendTransportMode,
-        session_id: Option<String>,
-    ) {
+    fn stop_transport_session(&mut self, mode: BackendTransportMode, session_id: Option<String>) {
         let stopped_session_id = {
             let slot = self.transport_session_mut(mode);
             let Some(record) = slot.as_mut() else {
@@ -5879,18 +5878,14 @@ mod tests {
         });
         assert!(started.last_command_error.is_none());
         let diagnostics = started.transport_diagnostics;
-        assert!(
-            diagnostics
-                .adapter_boundaries
-                .iter()
-                .any(|boundary| boundary.kind == "mqtt")
-        );
-        assert!(
-            diagnostics
-                .adapter_fallback_attempts
-                .iter()
-                .any(|attempt| attempt.attempted)
-        );
+        assert!(diagnostics
+            .adapter_boundaries
+            .iter()
+            .any(|boundary| boundary.kind == "mqtt"));
+        assert!(diagnostics
+            .adapter_fallback_attempts
+            .iter()
+            .any(|attempt| attempt.attempted));
         assert_eq!(diagnostics.route_proof_status, "route-proof-not-available");
         assert!(started
             .transport_status

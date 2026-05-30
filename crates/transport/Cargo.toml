@@ -16,7 +16,7 @@ production-network = []
 production-media = []
 production-storage = []
 mqtt-adapter = ["production-network", "dep:rumqttc", "dep:hex"]
-nostr-adapter = ["production-network"]
+nostr-adapter = ["production-network", "dep:nostr-sdk", "dep:hex"]
 ipfs-pubsub-adapter = ["production-network"]
 discrypt-quic-rendezvous-adapter = ["production-network"]
 
@@ -37,5 +37,6 @@ sha2 = { workspace = true }
 base64 = "0.22"
 hex = { workspace = true, optional = true }
 rumqttc = { version = "0.25.1", features = ["url", "websocket"], optional = true }
+nostr-sdk = { version = "0.44.1", optional = true }
 
 [dev-dependencies]

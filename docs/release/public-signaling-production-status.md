@@ -7,7 +7,7 @@ _Last updated: 2026-05-30_
 Discrypt is **not production-complete** for the full serverless P2P encrypted app target yet. This update made the first real public-provider signaling path work at the Rust transport boundary:
 
 - **MQTT public signaling: implemented behind `mqtt-adapter` and verified against a real public broker.**
-- **Nostr signaling: fail-closed groundwork is locked by `nostr-adapter` feature tests; no real relay client is wired yet.**
+- **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
 - **IPFS/libp2p PubSub signaling: fail-closed groundwork is locked by `ipfs-pubsub-adapter` feature tests; no real pubsub client/runtime is wired yet.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
 - **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof is at the transport signaling adapter layer, not the complete UI/backend/media plane.
@@ -41,7 +41,7 @@ Behavior:
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
 - **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
 
-### Fail-closed adapter readiness groundwork
+### Nostr real adapter and remaining fail-closed adapter readiness groundwork
 
 Files:
 
@@ -53,14 +53,14 @@ Commands:
 
 ```bash
 cargo test -q -p discrypt-transport --features nostr-adapter \
-  nostr_feature_gate_remains_fail_closed_until_real_relay_client_is_wired
+  nostr_adapter_feature_is_selectable_with_real_relay_client
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_feature_gate_remains_fail_closed_until_real_pubsub_runtime_is_wired
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
   quic_rendezvous_feature_gate_remains_fail_closed_until_sibling_client_is_wired
 ```
 
-Result: all three pass and prove those adapters remain non-selectable until real provider clients are implemented and tested.
+Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p and QUIC still pass fail-closed guards proving those adapters remain non-selectable until real provider clients are implemented and tested.
 
 ### Public real-network test
 
@@ -91,14 +91,16 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 
 ### P0: adapter support gaps
 
-- [x] Lock Nostr feature-gate/fail-closed readiness and document production requirements.
-- [ ] Implement real Nostr adapter:
-  - connect to configured public `wss://` relays,
-  - sign Nostr events correctly,
-  - use hashed/random tags only,
-  - receive/filter by rendezvous topic,
+- [x] Lock Nostr feature-gate readiness and document production requirements.
+- [x] Implement real Nostr adapter boundary behind `nostr-adapter`:
+  - connects to configured `wss://` relays,
+  - signs Nostr events with scoped relay identities,
+  - uses hashed/random rendezvous tags only,
+  - receives/filters by rendezvous topic.
+- [ ] Complete Nostr production hardening:
   - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`,
-  - add real public relay E2E with two users.
+  - add multi-relay soak/fallback evidence beyond the single public relay smoke,
+  - add provider-visible capture scans.
 - [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
 - [ ] Implement real IPFS/libp2p PubSub adapter:
   - choose and audit Rust or JS/libp2p runtime,
@@ -162,11 +164,11 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 | STUN overlay ordering and TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
 | Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
 | Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Opaque transport behavior under a live broker when enabled |
-| Planned Nostr public-provider proof | `cargo test -p discrypt-transport public_nostr_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed once against `wss://relay.damus.io`; `wss://nostr.oxtr.dev` returned blocked |
 | Planned IPFS public-provider proof | `cargo test -p discrypt-transport public_ipfs_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
 | Planned QUIC public-provider proof | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
 
-- Real producer/adapter adapters still missing in this release gate: live Nostr/IPFS/QUIC public-provider route proofs and end-to-end mobile transport smoke (tracked separately).
+- Real producer/adapter route proofs still missing in this release gate: multi-relay Nostr soak plus live IPFS/QUIC public-provider route proofs and end-to-end mobile transport smoke (tracked separately).
 - Missing adapter check status is intentionally exposed as blockers instead of fake green signals in this phase.
 
 ## How to rerun the current real MQTT proof

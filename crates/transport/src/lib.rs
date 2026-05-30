@@ -33,6 +33,8 @@ pub use policy::{
 };
 #[cfg(feature = "mqtt-adapter")]
 pub use provider_adapters::MqttProviderAdapter;
+#[cfg(feature = "nostr-adapter")]
+pub use provider_adapters::NostrProviderAdapter;
 pub use provider_adapters::{
     adapter_boundary_for_kind, plan_signaling_adapter_fallback,
     required_provider_adapter_boundaries, required_provider_adapter_registry,
