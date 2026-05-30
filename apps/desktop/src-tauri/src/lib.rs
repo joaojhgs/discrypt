@@ -56,12 +56,18 @@ use discrypt_transport::{
     SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportRoute,
     TransportSession, TransportSessionSnapshot, TransportSessionState, TurnServerConfig,
 };
+#[cfg(test)]
+use discrypt_transport::{
+    probe_provider_webrtc_datachannel_request_response_with_config_and_answerer, TransportError,
+};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::Arc;
 use std::{
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -1310,6 +1316,37 @@ pub struct ProviderWebRtcDataChannelProbeView {
     /// SHA-256 of the opaque return receipt/control frame used for the proof.
     #[serde(default)]
     pub receipt_frame_sha256: String,
+}
+
+impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
+    for ProviderWebRtcDataChannelProbeView
+{
+    fn from(probe: discrypt_transport::ProviderWebRtcDataChannelProbe) -> Self {
+        Self {
+            kind: probe.kind.canonical_name().to_owned(),
+            profile_id: probe.profile_id,
+            endpoint_label: probe.endpoint_label,
+            rendezvous_topic: probe.rendezvous_topic,
+            offerer_direct_path_ready: probe.offerer_direct_path_ready,
+            answerer_direct_path_ready: probe.answerer_direct_path_ready,
+            offerer_turn_fallback_ready: probe.offerer_turn_fallback_ready,
+            answerer_turn_fallback_ready: probe.answerer_turn_fallback_ready,
+            offerer_configured_turn_servers: probe.offerer_configured_turn_servers,
+            answerer_configured_turn_servers: probe.answerer_configured_turn_servers,
+            offerer_local_relay_candidates_gathered: probe.offerer_local_relay_candidates_gathered,
+            answerer_local_relay_candidates_gathered: probe
+                .answerer_local_relay_candidates_gathered,
+            offerer_remote_relay_candidates_applied: probe.offerer_remote_relay_candidates_applied,
+            answerer_remote_relay_candidates_applied: probe
+                .answerer_remote_relay_candidates_applied,
+            offerer_data_channel_open: probe.offerer_data_channel_open,
+            answerer_data_channel_open: probe.answerer_data_channel_open,
+            text_control_frame_roundtrip: probe.text_control_frame_roundtrip,
+            text_control_frame_sha256: probe.text_control_frame_sha256,
+            receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
+            receipt_frame_sha256: probe.receipt_frame_sha256,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4097,20 +4134,65 @@ impl PersistedAppState {
         if let TextControlFrameView::Envelope { recipient_leaf, .. } = &mut envelope_frame {
             *recipient_leaf = Some(2);
         }
-        let mut receiver_state = receiver.clone();
-        let receipt_frame = receiver_state
-            .handle_text_control_frame(envelope_frame.clone())
-            .ok_or_else(|| {
-                "receiver did not accept envelope or generate receipt frame".to_owned()
-            })?;
         let envelope_frame_bytes = serde_json::to_vec(&envelope_frame)
             .map_err(|error| format!("could not encode text envelope frame: {error}"))?;
-        let receipt_frame_bytes = serde_json::to_vec(&receipt_frame)
-            .map_err(|error| format!("could not encode text receipt frame: {error}"))?;
-        let probe = self.probe_active_webrtc_data_channel_request_response(
-            requested_kind,
+        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
+            "No active DM/group/invite connectivity policy is available for WebRTC data-channel proof"
+                .to_owned()
+        })?;
+        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
+        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
+        else {
+            return Err(
+                "No signaling profile matches the requested adapter kind and build readiness"
+                    .to_owned(),
+            );
+        };
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let ice_config =
+            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
+        let bootstrap_secret = self.probe_material(
+            "discrypt-runtime-webrtc-probe-bootstrap-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = self.probe_material(
+            "discrypt-runtime-webrtc-probe-entropy-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            16,
+        );
+        let mut receiver_state = receiver.clone();
+        let receipt_slot = Arc::new(Mutex::new(None::<TextControlFrameView>));
+        let answerer_receipt_slot = receipt_slot.clone();
+        let probe = run_provider_webrtc_data_channel_request_response_probe_with_answerer(
+            profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            ice_config,
             envelope_frame_bytes,
-            Some(receipt_frame_bytes),
+            move |received| {
+                let received_frame: TextControlFrameView = serde_json::from_slice(&received)
+                    .map_err(|error| {
+                        format!("receiver could not decode delivered text/control frame: {error}")
+                    })?;
+                let receipt_frame = receiver_state
+                    .handle_text_control_frame(received_frame)
+                    .ok_or_else(|| {
+                        "receiver did not accept delivered envelope or generate receipt frame"
+                            .to_owned()
+                    })?;
+                *answerer_receipt_slot
+                    .lock()
+                    .map_err(|_| "receipt slot lock poisoned".to_owned())? =
+                    Some(receipt_frame.clone());
+                serde_json::to_vec(&receipt_frame)
+                    .map_err(|error| format!("could not encode text receipt frame: {error}"))
+            },
         )?;
         if !probe.text_control_frame_roundtrip || !probe.receipt_frame_roundtrip {
             return Err(
@@ -4118,15 +4200,24 @@ impl PersistedAppState {
                     .to_owned(),
             );
         }
+        let receipt_frame = receipt_slot
+            .lock()
+            .map_err(|_| "receipt slot lock poisoned".to_owned())?
+            .clone()
+            .ok_or_else(|| "receiver receipt frame was not produced after delivery".to_owned())?;
         self.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
             message_id: message_id.to_owned(),
             frame_sha256: outbox_frame.frame_sha256,
-            transport_session_id: Some(format!("{}:{}", probe.kind, probe.profile_id)),
+            transport_session_id: Some(format!(
+                "{}:{}",
+                probe.kind.canonical_name(),
+                probe.profile_id
+            )),
         })?;
         if self.handle_text_control_frame(receipt_frame).is_some() {
             return Err("receipt frame unexpectedly generated a response frame".to_owned());
         }
-        Ok(probe)
+        Ok(ProviderWebRtcDataChannelProbeView::from(probe))
     }
 
     fn text_delivery_envelope_record(
@@ -6250,6 +6341,47 @@ fn run_provider_webrtc_data_channel_request_response_probe(
     })
     .join()
     .map_err(|_| "Provider WebRTC data-channel request/response probe thread panicked".to_owned())?
+}
+
+#[cfg(test)]
+fn run_provider_webrtc_data_channel_request_response_probe_with_answerer<F>(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: Vec<u8>,
+    random_entropy: Vec<u8>,
+    ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
+    answerer: F,
+) -> Result<discrypt_transport::ProviderWebRtcDataChannelProbe, String>
+where
+    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, String> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                format!("Could not start WebRTC data-channel answerer probe runtime: {error}")
+            })?;
+        runtime
+            .block_on(
+                probe_provider_webrtc_datachannel_request_response_with_config_and_answerer(
+                    profile,
+                    scope,
+                    &bootstrap_secret,
+                    &random_entropy,
+                    discrypt_transport::WebRtcNegotiationConfig::new(ice_servers),
+                    text_control_frame,
+                    move |received| answerer(received).map_err(TransportError::SignalingAdapter),
+                ),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .map_err(|_| {
+        "Provider WebRTC data-channel answerer callback probe thread panicked".to_owned()
+    })?
 }
 
 fn ice_config_from_connectivity(

@@ -703,14 +703,39 @@ pub async fn probe_provider_webrtc_datachannel_request_response_with_config(
     text_control_frame: Vec<u8>,
     receipt_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    probe_provider_webrtc_datachannel_request_response_with_config_and_answerer(
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        negotiation_config,
+        text_control_frame,
+        move |_| Ok(receipt_control_frame),
+    )
+    .await
+}
+
+/// Run the provider-signaled WebRTC request/response proof with a live answerer callback.
+///
+/// The callback is invoked only after the answerer peer receives the opaque
+/// request frame over the DataChannel. This gives app-service harnesses a
+/// production-shaped hook for receiver-side frame verification/receipt
+/// generation without precomputing the response before transport delivery.
+pub async fn probe_provider_webrtc_datachannel_request_response_with_config_and_answerer<F>(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    text_control_frame: Vec<u8>,
+    answerer: F,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
+where
+    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send,
+{
     if text_control_frame.is_empty() {
         return Err(TransportError::Unavailable(
             "text/control proof frame must be non-empty opaque bytes".to_owned(),
-        ));
-    }
-    if receipt_control_frame.is_empty() {
-        return Err(TransportError::Unavailable(
-            "receipt/control proof frame must be non-empty opaque bytes".to_owned(),
         ));
     }
     profile.validate()?;
@@ -730,7 +755,6 @@ pub async fn probe_provider_webrtc_datachannel_request_response_with_config(
         random_entropy,
         &negotiation_config,
         &text_control_frame,
-        &receipt_control_frame,
     );
     probe_provider_webrtc_datachannel_request_response_with_factory(
         factory,
@@ -740,12 +764,12 @@ pub async fn probe_provider_webrtc_datachannel_request_response_with_config(
         random_entropy,
         negotiation_config,
         text_control_frame,
-        receipt_control_frame,
+        answerer,
     )
     .await
 }
 
-async fn probe_provider_webrtc_datachannel_request_response_with_factory(
+async fn probe_provider_webrtc_datachannel_request_response_with_factory<F>(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
     scope: ConversationScope,
@@ -753,8 +777,11 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
     random_entropy: &[u8],
     negotiation_config: WebRtcNegotiationConfig,
     text_control_frame: Vec<u8>,
-    receipt_control_frame: Vec<u8>,
-) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    answerer: F,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
+where
+    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send,
+{
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
@@ -768,13 +795,13 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
         random_entropy,
         negotiation_config,
         text_control_frame,
-        receipt_control_frame,
+        answerer,
     );
     match factory {
         SignalingAdapterFactory::Mqtt(adapter) => {
             #[cfg(feature = "mqtt-adapter")]
             {
-                probe_webrtc_with_adapter(
+                probe_webrtc_with_adapter_and_answerer(
                     adapter,
                     profile,
                     scope,
@@ -782,7 +809,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     random_entropy,
                     negotiation_config,
                     text_control_frame,
-                    receipt_control_frame,
+                    answerer,
                 )
                 .await
             }
@@ -794,7 +821,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
         SignalingAdapterFactory::Nostr(adapter) => {
             #[cfg(feature = "nostr-adapter")]
             {
-                probe_webrtc_with_adapter(
+                probe_webrtc_with_adapter_and_answerer(
                     adapter,
                     profile,
                     scope,
@@ -802,7 +829,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     random_entropy,
                     negotiation_config,
                     text_control_frame,
-                    receipt_control_frame,
+                    answerer,
                 )
                 .await
             }
@@ -814,7 +841,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
         SignalingAdapterFactory::IpfsPubsub(adapter) => {
             #[cfg(feature = "ipfs-pubsub-adapter")]
             {
-                probe_webrtc_with_adapter(
+                probe_webrtc_with_adapter_and_answerer(
                     adapter,
                     profile,
                     scope,
@@ -822,7 +849,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     random_entropy,
                     negotiation_config,
                     text_control_frame,
-                    receipt_control_frame,
+                    answerer,
                 )
                 .await
             }
@@ -834,7 +861,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
         SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
             #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
             {
-                probe_webrtc_with_adapter(
+                probe_webrtc_with_adapter_and_answerer(
                     adapter,
                     profile,
                     scope,
@@ -842,7 +869,7 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
                     random_entropy,
                     negotiation_config,
                     text_control_frame,
-                    receipt_control_frame,
+                    answerer,
                 )
                 .await
             }
@@ -958,7 +985,7 @@ where
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-async fn probe_webrtc_with_adapter<A>(
+async fn probe_webrtc_with_adapter_and_answerer<A, F>(
     adapter: A,
     profile: SignalingAdapterProfile,
     scope: ConversationScope,
@@ -966,10 +993,11 @@ async fn probe_webrtc_with_adapter<A>(
     random_entropy: &[u8],
     negotiation_config: WebRtcNegotiationConfig,
     text_control_frame: Vec<u8>,
-    receipt_control_frame: Vec<u8>,
+    answerer: F,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
 where
     A: SignalingAdapter,
+    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send,
 {
     let endpoint_label = profile
         .endpoints
@@ -1107,7 +1135,12 @@ where
         })??;
     let frame_roundtrip = received == frame;
 
-    let receipt_frame = receipt_control_frame;
+    let receipt_frame = answerer(received)?;
+    if receipt_frame.is_empty() {
+        return Err(TransportError::Unavailable(
+            "receipt/control proof frame must be non-empty opaque bytes".to_owned(),
+        ));
+    }
     let receipt_frame_sha256 = sha256_hex(&receipt_frame);
     bob_webrtc
         .send_text_control_frame(receipt_frame.clone())
