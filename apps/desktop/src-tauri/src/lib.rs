@@ -27,7 +27,9 @@ use discrypt_media::{
     MicrophonePermissionState, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
 };
 use discrypt_transport::{
-    TransportRoute, TransportSession, TransportSessionSnapshot, TransportSessionState,
+    plan_signaling_adapter_fallback, required_provider_adapter_boundaries, AdapterFallbackBehavior,
+    FallbackLeg, SignalingAdapterKind, TransportRoute, TransportSession, TransportSessionSnapshot,
+    TransportSessionState,
 };
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
@@ -645,6 +647,9 @@ pub struct AppStateView {
     /// Backend-derived transport/connectivity states for honest UI status surfaces.
     #[serde(default)]
     pub transport_status: Vec<TransportStatusView>,
+    /// Backend-derived transport diagnostics for adapter and route evidence.
+    #[serde(default)]
+    pub transport_diagnostics: TransportDiagnosticsView,
     /// Backend-derived invite/join progress states for the UI timeline.
     #[serde(default)]
     pub join_progress: Vec<JoinProgressStepView>,
@@ -947,6 +952,31 @@ pub struct SignalingAdapterBoundaryView {
 pub struct TransportDiagnosticsView {
     /// Required adapter boundaries and their readiness labels.
     pub adapter_boundaries: Vec<SignalingAdapterBoundaryView>,
+    /// Planned fallback attempts across required adapter boundaries.
+    pub adapter_fallback_attempts: Vec<SignalingAdapterFallbackAttemptView>,
+    /// Selected signaling adapter if one candidate is healthy.
+    pub selected_adapter: Option<String>,
+    /// Transport route-proof status from session evidence.
+    pub route_proof_status: String,
+    /// Route-proof details copied from the selected transport route report.
+    pub route_proof_detail: String,
+    /// TURN-required status derived from route evidence.
+    pub turn_required: String,
+}
+
+/// Readiness and selection metadata for a fallback signaling adapter attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingAdapterFallbackAttemptView {
+    /// Adapter canonical kind label.
+    pub kind: String,
+    /// Attempt readiness from adapter boundary inspection.
+    pub readiness: String,
+    /// Redacted failure class for UI and test assertions.
+    pub failure_class: String,
+    /// Attempt was executed under the active fallback policy.
+    pub attempted: bool,
+    /// This adapter won selection under the active fallback policy.
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2603,11 +2633,144 @@ impl PersistedAppState {
             event_cursor: self.latest_event_cursor(),
             last_command_error: self.last_command_error.clone(),
             transport_status: self.transport_status(),
+            transport_diagnostics: self.transport_diagnostics(),
             join_progress: self.join_progress(),
             text_state_legend: text_state_legend(),
             voice_states: self.voice_states(),
             runtime_mode: runtime_mode_view(),
             snapshot: self.to_snapshot(),
+        }
+    }
+
+    fn transport_diagnostics(&self) -> TransportDiagnosticsView {
+        let adapter_boundaries: Vec<_> = required_provider_adapter_boundaries()
+            .iter()
+            .map(|boundary| {
+                let readiness = boundary.readiness_state();
+                SignalingAdapterBoundaryView {
+                    kind: boundary.kind.canonical_name().to_owned(),
+                    cargo_feature: boundary.cargo_feature.to_owned(),
+                    readiness: Self::adapter_readiness_label(readiness),
+                    failure_class: readiness.failure_class().to_owned(),
+                }
+            })
+            .collect();
+        let requested = required_provider_adapter_boundaries()
+            .iter()
+            .map(|boundary| boundary.kind)
+            .collect::<Vec<SignalingAdapterKind>>();
+        let fallback_plan = plan_signaling_adapter_fallback(
+            requested.as_slice(),
+            AdapterFallbackBehavior::FirstHealthy,
+            None,
+        );
+        let adapter_fallback_attempts = fallback_plan
+            .attempts
+            .iter()
+            .map(|attempt| SignalingAdapterFallbackAttemptView {
+                kind: attempt.kind.canonical_name().to_owned(),
+                readiness: Self::adapter_readiness_label(attempt.readiness),
+                failure_class: attempt.readiness.failure_class().to_owned(),
+                attempted: attempt.attempted,
+                selected: attempt.selected,
+            })
+            .collect();
+        let selected_adapter = fallback_plan
+            .selected
+            .map(|kind| kind.canonical_name().to_owned());
+        let (route_proof_status, route_proof_detail, turn_required) =
+            self.route_proof_status(self.signaling_session.as_ref(), self.text_session.as_ref());
+        TransportDiagnosticsView {
+            adapter_boundaries,
+            adapter_fallback_attempts,
+            selected_adapter,
+            route_proof_status,
+            route_proof_detail,
+            turn_required,
+        }
+    }
+
+    fn route_proof_status(
+        &self,
+        signaling_session: Option<&TransportSessionRecord>,
+        text_session: Option<&TransportSessionRecord>,
+    ) -> (String, String, String) {
+        let signaling = signaling_session.and_then(Self::route_proof_status_for_session);
+        let text = text_session.and_then(Self::route_proof_status_for_session);
+        signaling.or(text).unwrap_or_else(|| {
+            (
+                "route-proof-not-available".to_owned(),
+                "No connected signaling/text transport session exposes a verified route report".to_owned(),
+                "not-proven".to_owned(),
+            )
+        })
+    }
+
+    fn route_proof_status_for_session(
+        session: &TransportSessionRecord,
+    ) -> Option<(String, String, String)> {
+        let snapshot = session.snapshot();
+        let report = snapshot.route?.route_report?;
+        let selected = Self::fallback_leg_label(report.selected);
+        let attempted = report
+            .attempted_legs
+            .into_iter()
+            .map(Self::fallback_leg_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let status = if snapshot.state.is_connected() {
+            "route-proofed"
+        } else {
+            "route-report-stored"
+        };
+        let detail = format!(
+            "session={} route_report: selected={} attempted=[{}] endpoint={} limitation={}",
+            session.mode.label(),
+            selected,
+            attempted,
+            report.endpoint.0,
+            report.limitation,
+        );
+        let turn_required = if selected == "turn" {
+            "turn-required"
+        } else {
+            "turn-not-required"
+        };
+        Some((status.to_owned(), detail, turn_required.to_owned()))
+    }
+
+    fn adapter_readiness_label(readiness: discrypt_transport::AdapterReadinessState) -> String {
+        match readiness {
+            discrypt_transport::AdapterReadinessState::FeatureDisabled => "feature_disabled".to_owned(),
+            discrypt_transport::AdapterReadinessState::ImplementationUnavailable => {
+                "implementation_unavailable".to_owned()
+            }
+            discrypt_transport::AdapterReadinessState::Available => "available".to_owned(),
+            discrypt_transport::AdapterReadinessState::ProviderUnhealthy => {
+                "provider_unhealthy".to_owned()
+            }
+            discrypt_transport::AdapterReadinessState::ProviderRateLimited => {
+                "provider_rate_limited".to_owned()
+            }
+            discrypt_transport::AdapterReadinessState::ProviderAuthRequired => {
+                "provider_auth_required".to_owned()
+            }
+            discrypt_transport::AdapterReadinessState::ProviderMessageTooLarge => {
+                "provider_message_too_large".to_owned()
+            }
+            discrypt_transport::AdapterReadinessState::TrustMismatch => "trust_mismatch".to_owned(),
+            discrypt_transport::AdapterReadinessState::IceFailedRequiresTurn => {
+                "ice_failed_requires_turn".to_owned()
+            }
+            discrypt_transport::AdapterReadinessState::Connected => "connected".to_owned(),
+        }
+    }
+
+    fn fallback_leg_label(leg: FallbackLeg) -> &'static str {
+        match leg {
+            FallbackLeg::Stun => "stun",
+            FallbackLeg::RelayOverlay => "overlay",
+            FallbackLeg::Turn => "turn",
         }
     }
 
