@@ -1584,6 +1584,8 @@ struct IpfsPubsubInbox {
     signals: Vec<PeerSignal>,
     controls: Vec<ControlBroadcast>,
     seen_messages: BTreeSet<String>,
+    duplicate_counts: BTreeMap<String, usize>,
+    health_faults: Vec<String>,
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -1887,6 +1889,9 @@ const IPFS_PUBSUB_MESH_N_HIGH: usize = 8;
 const IPFS_PUBSUB_DUPLICATE_CACHE_SECS: u64 = 60;
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_DUPLICATE_STORM_THRESHOLD: usize = 32;
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
 const IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS: u64 = 20;
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -2044,6 +2049,31 @@ fn ipfs_message_fingerprint(bytes: &[u8]) -> String {
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_duplicate_storm_error(fingerprint: &str, duplicate_count: usize) -> TransportError {
+    ipfs_typed_error(
+        "duplicate_storm",
+        AdapterReadinessState::ProviderUnhealthy,
+        format!(
+            "duplicate envelope fingerprint exceeded resource policy threshold: \
+             fingerprint={fingerprint} duplicates={duplicate_count} \
+             threshold={IPFS_PUBSUB_DUPLICATE_STORM_THRESHOLD}"
+        ),
+    )
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_swarm_provider_unhealthy_error(
+    context: &str,
+    details: impl std::fmt::Display,
+) -> TransportError {
+    ipfs_typed_error(
+        context,
+        AdapterReadinessState::ProviderUnhealthy,
+        format!("libp2p swarm reported provider/runtime failure: {details}"),
+    )
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
 fn ipfs_encode_envelope(envelope: &IpfsPubsubWireEnvelope) -> Result<Vec<u8>, TransportError> {
     let bytes =
         serde_json::to_vec(envelope).map_err(|err| ipfs_err("wire envelope encode", err))?;
@@ -2103,7 +2133,20 @@ impl IpfsPubsubProviderRoom {
         let envelope: IpfsPubsubWireEnvelope =
             serde_json::from_slice(&bytes).map_err(|err| ipfs_err("wire envelope decode", err))?;
         let mut inbox = inbox.lock().await;
-        if !inbox.seen_messages.insert(fingerprint) {
+        if !inbox.seen_messages.insert(fingerprint.clone()) {
+            let duplicate_count = {
+                let count = inbox
+                    .duplicate_counts
+                    .entry(fingerprint.clone())
+                    .or_insert(0);
+                *count += 1;
+                *count
+            };
+            if duplicate_count == IPFS_PUBSUB_DUPLICATE_STORM_THRESHOLD {
+                let error = ipfs_duplicate_storm_error(&fingerprint, duplicate_count);
+                inbox.health_faults.push(error.to_string());
+                return Err(error);
+            }
             return Ok(());
         }
         match envelope {
@@ -2141,6 +2184,19 @@ impl IpfsPubsubProviderRoom {
             _ => {}
         }
         Ok(())
+    }
+
+    async fn take_health_fault(&self) -> Result<(), TransportError> {
+        let mut inbox = self.inbox.lock().await;
+        if let Some(message) = inbox.health_faults.pop() {
+            return Err(TransportError::SignalingAdapter(message));
+        }
+        Ok(())
+    }
+
+    async fn record_health_fault(inbox: &Arc<AsyncMutex<IpfsPubsubInbox>>, error: TransportError) {
+        let mut inbox = inbox.lock().await;
+        inbox.health_faults.push(error.to_string());
     }
 }
 
@@ -2338,6 +2394,27 @@ async fn spawn_ipfs_pubsub_room(
                         libp2p::swarm::SwarmEvent::OutgoingConnectionError { .. } => {
                             task_failed_bootstrap_dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                        libp2p::swarm::SwarmEvent::ListenerError { error, .. } => {
+                            IpfsPubsubProviderRoom::record_health_fault(
+                                &task_inbox,
+                                ipfs_swarm_provider_unhealthy_error("listener_error", error),
+                            )
+                            .await;
+                        }
+                        libp2p::swarm::SwarmEvent::ListenerClosed {
+                            reason: Err(error),
+                            addresses,
+                            ..
+                        } => {
+                            IpfsPubsubProviderRoom::record_health_fault(
+                                &task_inbox,
+                                ipfs_swarm_provider_unhealthy_error(
+                                    "listener_closed",
+                                    format!("addresses={addresses:?} error={error}"),
+                                ),
+                            )
+                            .await;
+                        }
                         libp2p::swarm::SwarmEvent::Behaviour(IpfsPubsubBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. })) => {
                             let _ = IpfsPubsubProviderRoom::record_message(
                                 &task_inbox,
@@ -2528,6 +2605,7 @@ impl RendezvousRoom for IpfsPubsubProviderRoom {
 
     async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        self.take_health_fault().await?;
         let mut inbox = self.inbox.lock().await;
         Ok(std::mem::take(&mut inbox.presence))
     }
@@ -2549,6 +2627,7 @@ impl RendezvousRoom for IpfsPubsubProviderRoom {
 
     async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        self.take_health_fault().await?;
         let mut inbox = self.inbox.lock().await;
         Ok(std::mem::take(&mut inbox.signals))
     }
@@ -2568,6 +2647,7 @@ impl RendezvousRoom for IpfsPubsubProviderRoom {
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        self.take_health_fault().await?;
         let mut inbox = self.inbox.lock().await;
         Ok(std::mem::take(&mut inbox.controls))
     }
@@ -4342,6 +4422,68 @@ mod tests {
         assert!(message.contains("failure_class=provider_message_too_large"));
         assert!(message.contains("health_state=ProviderMessageTooLarge"));
         assert!(message.contains("max=65536"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_duplicate_storm_maps_to_typed_health() -> Result<(), TransportError> {
+        let local_peer_id = SignalingPeerId::new("bob-device")?;
+        let envelope = IpfsPubsubWireEnvelope::Signal {
+            schema: IPFS_PUBSUB_EVENT_SCHEMA,
+            from_peer: SignalingPeerId::new("alice-device")?,
+            to_peer: local_peer_id.clone(),
+            payload: SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [9; 12],
+                ciphertext: b"sealed-ipfs-duplicate-storm-offer".to_vec(),
+            },
+        };
+        let bytes = ipfs_encode_envelope(&envelope)?;
+        let inbox = Arc::new(AsyncMutex::new(IpfsPubsubInbox::default()));
+
+        IpfsPubsubProviderRoom::record_message(&inbox, &local_peer_id, bytes.clone()).await?;
+        {
+            let inbox = inbox.lock().await;
+            assert_eq!(inbox.signals.len(), 1);
+            assert!(inbox.health_faults.is_empty());
+        }
+
+        for _ in 1..IPFS_PUBSUB_DUPLICATE_STORM_THRESHOLD {
+            IpfsPubsubProviderRoom::record_message(&inbox, &local_peer_id, bytes.clone()).await?;
+        }
+
+        let error = IpfsPubsubProviderRoom::record_message(&inbox, &local_peer_id, bytes)
+            .await
+            .expect_err("duplicate storm must fail with typed provider health");
+        let TransportError::SignalingAdapter(message) = error else {
+            panic!("expected signaling adapter error");
+        };
+        assert!(message.contains("duplicate_storm"));
+        assert!(message.contains("failure_class=provider_unhealthy"));
+        assert!(message.contains("health_state=ProviderUnhealthy"));
+        assert!(message.contains(&format!(
+            "threshold={IPFS_PUBSUB_DUPLICATE_STORM_THRESHOLD}"
+        )));
+
+        let inbox = inbox.lock().await;
+        assert_eq!(inbox.signals.len(), 1, "duplicates must not redeliver");
+        assert_eq!(inbox.health_faults.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_swarm_runtime_errors_map_to_typed_health() {
+        let error =
+            ipfs_swarm_provider_unhealthy_error("listener_error", "permission denied on listener");
+        let TransportError::SignalingAdapter(message) = error else {
+            panic!("expected signaling adapter error");
+        };
+        assert!(message.contains("listener_error"));
+        assert!(message.contains("failure_class=provider_unhealthy"));
+        assert!(message.contains("health_state=ProviderUnhealthy"));
+        assert!(message.contains("libp2p swarm reported provider/runtime failure"));
     }
 
     #[tokio::test]
