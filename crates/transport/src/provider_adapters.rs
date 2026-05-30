@@ -108,14 +108,51 @@ impl AdapterReadinessState {
     pub const fn to_health_state(self) -> SignalingHealthState {
         match self {
             Self::Available | Self::Connected => SignalingHealthState::Healthy,
+            Self::ProviderRateLimited => SignalingHealthState::ProviderRateLimited,
+            Self::ProviderAuthRequired => SignalingHealthState::ProviderAuthRequired,
+            Self::ProviderMessageTooLarge => SignalingHealthState::ProviderMessageTooLarge,
+            Self::TrustMismatch => SignalingHealthState::TrustMismatch,
             Self::FeatureDisabled
             | Self::ImplementationUnavailable
             | Self::ProviderUnhealthy
-            | Self::ProviderRateLimited
-            | Self::ProviderAuthRequired
-            | Self::ProviderMessageTooLarge
-            | Self::TrustMismatch
             | Self::IceFailedRequiresTurn => SignalingHealthState::ProviderUnhealthy,
+        }
+    }
+
+    /// Classify common provider/relay failure strings into a redacted readiness state.
+    ///
+    /// Provider SDKs do not always expose a stable typed error for relay notices,
+    /// so this parser intentionally recognizes conservative public-relay wording
+    /// while falling back to `ProviderUnhealthy` for unknown failures.
+    #[must_use]
+    pub fn classify_provider_failure(message: &str) -> Self {
+        let normalized = message.to_ascii_lowercase();
+        if normalized.contains("rate-limit")
+            || normalized.contains("ratelimit")
+            || normalized.contains("too much")
+            || normalized.contains("slow down")
+        {
+            Self::ProviderRateLimited
+        } else if normalized.contains("auth")
+            || normalized.contains("unauthorized")
+            || normalized.contains("not authorized")
+            || normalized.contains("forbidden")
+            || normalized.contains("blocked")
+        {
+            Self::ProviderAuthRequired
+        } else if normalized.contains("too large")
+            || normalized.contains("message size")
+            || normalized.contains("payload size")
+            || normalized.contains("max message")
+        {
+            Self::ProviderMessageTooLarge
+        } else if normalized.contains("trust")
+            || normalized.contains("fingerprint")
+            || normalized.contains("certificate")
+        {
+            Self::TrustMismatch
+        } else {
+            Self::ProviderUnhealthy
         }
     }
 }
@@ -2303,9 +2340,12 @@ impl NostrProviderRoom {
             .await
             .map_err(|err| nostr_err("publish", err))?;
         if output.success.is_empty() {
+            let failed = format!("{:?}", output.failed);
+            let readiness = AdapterReadinessState::classify_provider_failure(&failed);
             return Err(TransportError::SignalingAdapter(format!(
-                "nostr publish failed on all relays: {:?}",
-                output.failed
+                "nostr publish failed on all relays: failure_class={} health_state={:?} details={failed}",
+                readiness.failure_class(),
+                readiness.to_health_state()
             )));
         }
         self.drain_network_for(Duration::from_secs(2)).await
@@ -2486,9 +2526,12 @@ impl AdapterSession for NostrProviderSession {
             .await
             .map_err(|err| nostr_err("subscribe", err))?;
         if output.success.is_empty() && !output.failed.is_empty() {
+            let failed = format!("{:?}", output.failed);
+            let readiness = AdapterReadinessState::classify_provider_failure(&failed);
             return Err(TransportError::SignalingAdapter(format!(
-                "nostr subscribe failed on all relays: {:?}",
-                output.failed
+                "nostr subscribe failed on all relays: failure_class={} health_state={:?} details={failed}",
+                readiness.failure_class(),
+                readiness.to_health_state()
             )));
         }
         let room = NostrProviderRoom {
@@ -3640,6 +3683,41 @@ mod tests {
             Err(TransportError::InvalidConnectivityPolicy(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn provider_failure_classes_map_to_typed_health_states() {
+        let cases = [
+            (
+                "rate-limited: you are noting too much",
+                AdapterReadinessState::ProviderRateLimited,
+                SignalingHealthState::ProviderRateLimited,
+            ),
+            (
+                "relay requires auth",
+                AdapterReadinessState::ProviderAuthRequired,
+                SignalingHealthState::ProviderAuthRequired,
+            ),
+            (
+                "max message size exceeded",
+                AdapterReadinessState::ProviderMessageTooLarge,
+                SignalingHealthState::ProviderMessageTooLarge,
+            ),
+            (
+                "certificate fingerprint mismatch",
+                AdapterReadinessState::TrustMismatch,
+                SignalingHealthState::TrustMismatch,
+            ),
+        ];
+        for (message, readiness, health) in cases {
+            let classified = AdapterReadinessState::classify_provider_failure(message);
+            assert_eq!(classified, readiness);
+            assert_eq!(classified.to_health_state(), health);
+        }
+        assert_eq!(
+            AdapterReadinessState::classify_provider_failure("connection closed"),
+            AdapterReadinessState::ProviderUnhealthy
+        );
     }
 
     #[tokio::test]

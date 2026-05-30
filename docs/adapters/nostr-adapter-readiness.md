@@ -14,6 +14,8 @@ cargo test -q -p discrypt-transport --features nostr-adapter \
   nostr_adapter_feature_is_selectable_with_real_relay_client
 cargo test -q -p discrypt-transport --features nostr-adapter \
   nostr_profile_preserves_all_configured_relays_for_room_join
+cargo test -q -p discrypt-transport \
+  provider_failure_classes_map_to_typed_health_states -- --nocapture
 DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol \
   cargo test -q -p discrypt-transport --features nostr-adapter \
   --test public_webrtc_datachannel_e2e \
@@ -36,7 +38,7 @@ The relay must not receive group names, channel names, display names, safety num
 
 - Keep the opt-in public relay two-peer smoke tests (`DISCRYPT_PUBLIC_NOSTR_E2E=1` and `DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1`) in release verification; latest WebRTC/DataChannel pass used `wss://nos.lol`, while an earlier relay tried at `wss://nostr.oxtr.dev` returned `blocked`.
 - Add public multi-relay soak/fallback evidence using at least two configured relays with one degraded/rate-limited relay; the code now preserves all configured relay endpoints, but release evidence still needs to prove failure handling under public provider conditions.
-- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible.
+- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible. Conservative string classification and all-relay Nostr publish/subscribe failure labeling are implemented; structured provider-specific error extraction still needs public degraded-relay evidence.
 - Add provider-visible capture scans for event tags/content/logs before any release claim.
 - Wire this adapter through the Tauri runtime factory and UI selection path for actual app use, not only transport-level conformance.
 

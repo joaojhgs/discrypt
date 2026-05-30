@@ -229,7 +229,7 @@ npm --prefix apps/ui run typecheck
   - uses hashed/random rendezvous tags only,
   - receives/filters by rendezvous topic.
 - [ ] Complete Nostr production hardening:
-  - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`,
+  - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`; conservative failure-class parsing now maps common rate-limit/auth/message-size/trust strings to typed health states and Nostr all-relay publish/subscribe failures include the redacted failure class, but provider-specific structured error extraction and public failure soaks remain open,
   - add multi-relay soak/fallback evidence beyond the single public relay smoke; profile-level multi-relay join/publish/subscribe wiring is implemented and unit-tested, but public multi-relay failure/fallback soak evidence is not complete,
   - add provider-visible capture scans.
 - [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
