@@ -6947,7 +6947,7 @@ fn text_state_legend() -> Vec<TextStateView> {
             key: "transport_probe_failed".to_owned(),
             label: "Transport proof failed".to_owned(),
             status: "available".to_owned(),
-            detail: "Requested provider-signaled WebRTC text/control proof failed; message remains local-only".to_owned(),
+            detail: "Requested provider-signaled WebRTC text/control proof failed; message remains without peer-delivery proof".to_owned(),
         },
         TextStateView {
             key: "peer_receipt".to_owned(),

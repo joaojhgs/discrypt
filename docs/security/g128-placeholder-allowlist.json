@@ -379,30 +379,6 @@
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
     },
     {
-      "path": "../discrypt-signaling/src/lib.rs",
-      "pattern": "local-dev",
-      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
-      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
-    },
-    {
-      "path": "../discrypt-signaling/src/production_status.rs",
-      "pattern": "local-dev",
-      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
-      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
-    },
-    {
-      "path": "../discrypt-signaling/src/production_status.rs",
-      "pattern": "local-dev",
-      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
-      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
-    },
-    {
-      "path": "../discrypt-signaling/src/production_status.rs",
-      "pattern": "local-dev",
-      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
-      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
-    },
-    {
       "path": "crates/storage/src/appdb.rs",
       "pattern": "local-dev",
       "expected": "\"Tests, harnesses, local-dev, and non-production builds may use MemoryAppDbKeychain only as a non-production boundary.\",",
@@ -515,6 +491,114 @@
       "pattern": "local-dev",
       "expected": "local_dev: cfg!(feature = \"local-dev\"),",
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/transport/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev gate is explicitly excluded from production builds and surfaced by production status checks."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/policy.rs",
+      "pattern": "local-dev",
+      "expected": "\"local-dev signaling endpoints must be loopback cleartext only\".to_owned(),",
+      "reason": "Policy validation rejects non-loopback cleartext local-dev endpoints, documenting a test-only boundary rather than production fallback."
+    },
+    {
+      "path": "crates/transport/src/provider_adapters.rs",
+      "pattern": "local-dev",
+      "expected": "\"local conformance adapters require local-dev loopback endpoints\".to_owned(),",
+      "reason": "Provider adapter validation rejects conformance endpoints unless they are loopback local-dev endpoints used for tests only."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
+    },
+    {
+      "path": "crates/transport/src/signaling.rs",
+      "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
     }
   ]
 }
