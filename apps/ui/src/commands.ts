@@ -582,6 +582,9 @@ export type StopTextSessionRequest = {
 
 export type AttachTextControlTransportRuntimeRequest = {
   session_id?: string | null;
+  runtime_role?: "offerer" | "answerer" | string | null;
+  local_peer_id?: string | null;
+  remote_peer_id?: string | null;
 };
 
 export type SendMessageRequest = {

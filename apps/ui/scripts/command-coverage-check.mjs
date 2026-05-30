@@ -352,7 +352,10 @@ const requestTypes = [
   ["StopSignalingSessionRequest", ["session_id"]],
   ["StartTextSessionRequest", ["scope_label", "data_channel_probe", "adapter_kind"]],
   ["StopTextSessionRequest", ["session_id"]],
-  ["AttachTextControlTransportRuntimeRequest", ["session_id"]],
+  [
+    "AttachTextControlTransportRuntimeRequest",
+    ["session_id", "runtime_role", "local_peer_id", "remote_peer_id"],
+  ],
   ["SendMessageRequest", ["target", "body"]],
   ["ApplyTextDeliveryReceiptRequest", ["message_id", "receipt", "recipient_verifying_key_hex"]],
   ["ReceiveTextDeliveryEnvelopeRequest", ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"]],

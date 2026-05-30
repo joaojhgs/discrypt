@@ -52,18 +52,19 @@ use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_
 #[cfg(test)]
 use discrypt_transport::start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer;
 #[cfg(test)]
-use discrypt_transport::SignalingPeerId;
-#[cfg(test)]
 use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
     probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
-    resume_text_control_runtime_from_probe, AdapterFallbackBehavior, AdapterTrustLabel,
+    resume_text_control_runtime_from_probe,
+    start_provider_webrtc_text_control_answer_runtime_with_answerer,
+    start_provider_webrtc_text_control_offer_runtime, AdapterFallbackBehavior, AdapterTrustLabel,
     ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel, ConversationScope, Endpoint,
     FallbackLeg, IceServerConfig, ProviderMetadataPosture, ProviderTextControlRuntimeAttachment,
-    ProviderTextControlRuntimeSpec, SignalingAdapterCapabilities, SignalingAdapterKind,
-    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+    ProviderTextControlRuntimePeerRole, ProviderTextControlRuntimeSpec,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
     TransportRoute, TransportSession, TransportSessionSnapshot, TransportSessionState,
     TurnServerConfig,
 };
@@ -1139,12 +1140,24 @@ pub struct StopTextSessionRequest {
 
 /// Request to attach a long-lived text/control transport runtime to the active
 /// text session.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AttachTextControlTransportRuntimeRequest {
     /// Optional expected session id for explicit attach scoping. If present and the
     /// active text session does not match, attach is rejected.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Optional runtime role for a real role-split attach (`offerer` or `answerer`).
+    ///
+    /// When omitted, the command preserves the legacy fail-closed probe-resume
+    /// behavior so older clients do not accidentally block waiting for a peer.
+    #[serde(default)]
+    pub runtime_role: Option<String>,
+    /// Stable, scoped local peer id for provider-visible routing.
+    #[serde(default)]
+    pub local_peer_id: Option<String>,
+    /// Stable, scoped remote peer id for provider-visible routing.
+    #[serde(default)]
+    pub remote_peer_id: Option<String>,
 }
 
 /// Request to set self mute state.
@@ -1488,7 +1501,20 @@ impl TransportSessionRecord {
 #[derive(Clone)]
 struct TextControlTransportRuntime {
     transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+    owned_runtime: Option<Arc<discrypt_transport::ProviderTextControlRuntime>>,
+    executor: Option<Arc<tokio::runtime::Runtime>>,
     session_id: String,
+    role: Option<ProviderTextControlRuntimePeerRole>,
+    local_peer_id: Option<String>,
+    remote_peer_id: Option<String>,
+}
+
+struct TextControlRuntimeAttachInputs {
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: Vec<u8>,
+    random_entropy: Vec<u8>,
+    ice_config: IceServerConfig,
 }
 
 impl fmt::Debug for TextControlTransportRuntime {
@@ -1496,6 +1522,11 @@ impl fmt::Debug for TextControlTransportRuntime {
         formatter
             .debug_struct("TextControlTransportRuntime")
             .field("session_id", &self.session_id)
+            .field("role", &self.role)
+            .field("local_peer_id", &self.local_peer_id)
+            .field("remote_peer_id", &self.remote_peer_id)
+            .field("owns_provider_runtime", &self.owned_runtime.is_some())
+            .field("owns_executor", &self.executor.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1673,8 +1704,11 @@ impl TauriAppService {
                 label: "text/control runtime".to_owned(),
                 status: "attached".to_owned(),
                 detail: format!(
-                    "App-service text/control pump owns runtime session {} and can drain signed pending frames",
-                    runtime.session_id
+                    "App-service text/control pump owns runtime session {} role={} local_peer={} remote_peer={} and can drain signed pending frames",
+                    runtime.session_id,
+                    runtime_role_label(runtime.role),
+                    runtime.local_peer_id.as_deref().unwrap_or("test-harness"),
+                    runtime.remote_peer_id.as_deref().unwrap_or("test-harness")
                 ),
             },
             (Some(runtime), true) => TransportStatusView {
@@ -1724,7 +1758,34 @@ impl TauriAppService {
     ) {
         self.text_control_transport_runtime = Some(TextControlTransportRuntime {
             transport,
+            owned_runtime: None,
+            executor: None,
             session_id: session_id.into(),
+            role: None,
+            local_peer_id: None,
+            remote_peer_id: None,
+        });
+    }
+
+    fn attach_owned_text_control_transport_runtime(
+        &mut self,
+        runtime: discrypt_transport::ProviderTextControlRuntime,
+        executor: Arc<tokio::runtime::Runtime>,
+        session_id: impl Into<String>,
+    ) {
+        let role = runtime.evidence().role;
+        let local_peer_id = runtime.evidence().local_peer_id.0.clone();
+        let remote_peer_id = runtime.evidence().remote_peer_id.0.clone();
+        let owned_runtime = Arc::new(runtime);
+        let transport = owned_runtime.transport();
+        self.text_control_transport_runtime = Some(TextControlTransportRuntime {
+            transport,
+            owned_runtime: Some(owned_runtime),
+            executor: Some(executor),
+            session_id: session_id.into(),
+            role: Some(role),
+            local_peer_id: Some(local_peer_id),
+            remote_peer_id: Some(remote_peer_id),
         });
     }
 
@@ -2024,7 +2085,7 @@ pub fn attach_text_control_transport_runtime(
     let active_session_id = session.session_id.clone();
     let active_session_state = session.state();
 
-    if let Some(expected_session_id) = request.session_id {
+    if let Some(expected_session_id) = request.session_id.as_deref() {
         if expected_session_id != active_session_id {
             guard.state.push_command_error(
                 "transport.text_runtime_attach_rejected",
@@ -2053,6 +2114,150 @@ pub fn attach_text_control_transport_runtime(
             ),
             "Complete a provider DataChannel proof and route transition before binding a runtime",
         );
+        guard.persist();
+        return guard.to_view();
+    }
+
+    if let Some(runtime_role) = request.runtime_role.as_deref() {
+        let role = match runtime_role {
+            "offerer" => ProviderTextControlRuntimePeerRole::Offerer,
+            "answerer" => ProviderTextControlRuntimePeerRole::Answerer,
+            other => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "attach_text_control_transport_runtime",
+                    "text_runtime_role_invalid",
+                    format!("Unsupported text/control runtime role {other}"),
+                    "Use runtime_role=offerer or runtime_role=answerer with scoped local/remote peer ids",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        };
+        let Some(local_peer_id) = request.local_peer_id.as_deref() else {
+            guard.state.push_command_error(
+                "transport.text_runtime_attach_rejected",
+                "attach_text_control_transport_runtime",
+                "text_runtime_local_peer_missing",
+                "Role-split runtime attach requires a local peer id",
+                "Pass a stable scoped local_peer_id derived from the local device/user for this DM or group",
+            );
+            guard.persist();
+            return guard.to_view();
+        };
+        let Some(remote_peer_id) = request.remote_peer_id.as_deref() else {
+            guard.state.push_command_error(
+                "transport.text_runtime_attach_rejected",
+                "attach_text_control_transport_runtime",
+                "text_runtime_remote_peer_missing",
+                "Role-split runtime attach requires a remote peer id",
+                "Pass a stable scoped remote_peer_id from the DM/group invite or membership state",
+            );
+            guard.persist();
+            return guard.to_view();
+        };
+        let local_peer_id = match SignalingPeerId::new(local_peer_id.to_owned()) {
+            Ok(peer_id) => peer_id,
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "attach_text_control_transport_runtime",
+                    "text_runtime_local_peer_invalid",
+                    error.to_string(),
+                    "Use a trimmed ASCII token for local_peer_id",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        };
+        let remote_peer_id = match SignalingPeerId::new(remote_peer_id.to_owned()) {
+            Ok(peer_id) => peer_id,
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "attach_text_control_transport_runtime",
+                    "text_runtime_remote_peer_invalid",
+                    error.to_string(),
+                    "Use a trimmed ASCII token for remote_peer_id",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        };
+        let runtime_inputs = match guard
+            .state
+            .text_control_runtime_inputs_for_active_scope(None)
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "attach_text_control_transport_runtime",
+                    "text_runtime_scope_unavailable",
+                    error,
+                    "Open a DM/group/invite context with a configured signaling profile before attaching runtime",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        };
+        let executor = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(executor) => Arc::new(executor),
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_unavailable",
+                    "attach_text_control_transport_runtime",
+                    "transport_runtime_executor_unavailable",
+                    format!("Could not start text/control runtime executor: {error}"),
+                    "Retry after the backend can construct a Tokio executor for the live provider runtime",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        };
+        drop(guard);
+
+        let runtime_result = start_role_split_text_control_runtime(
+            executor.clone(),
+            runtime_inputs,
+            role,
+            local_peer_id,
+            remote_peer_id,
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match runtime_result {
+            Ok(runtime) => {
+                guard.attach_owned_text_control_transport_runtime(
+                    runtime,
+                    executor,
+                    active_session_id.clone(),
+                );
+                guard.state.push_event(
+                    "transport.text_runtime_attached",
+                    format!(
+                        "Attached provider-backed text/control runtime session {} as {}",
+                        active_session_id,
+                        runtime_role_label(Some(role))
+                    ),
+                );
+            }
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_unavailable",
+                    "attach_text_control_transport_runtime",
+                    "transport_runtime_attach_failed",
+                    error,
+                    "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and STUN/TURN policy allows WebRTC",
+                );
+            }
+        }
         guard.persist();
         return guard.to_view();
     }
@@ -4602,6 +4807,48 @@ impl PersistedAppState {
         Ok(view)
     }
 
+    fn text_control_runtime_inputs_for_active_scope(
+        &self,
+        requested_kind: Option<&str>,
+    ) -> Result<TextControlRuntimeAttachInputs, String> {
+        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
+            "No active DM/group/invite connectivity policy is available for live text/control runtime"
+                .to_owned()
+        })?;
+        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
+        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
+        else {
+            return Err(
+                "No signaling profile matches the requested adapter kind and build readiness"
+                    .to_owned(),
+            );
+        };
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let ice_config =
+            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
+        let bootstrap_secret = self.probe_material(
+            "discrypt-live-role-split-runtime-bootstrap-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = self.probe_material(
+            "discrypt-live-role-split-runtime-entropy-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            16,
+        );
+        Ok(TextControlRuntimeAttachInputs {
+            profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            ice_config,
+        })
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     fn prove_text_delivery_receipt_over_data_channel_with_receiver(
@@ -6921,6 +7168,83 @@ fn provider_metadata_posture_from_name(value: &str) -> ProviderMetadataPosture {
         "epoch_rotating_topic" => ProviderMetadataPosture::EpochRotatingTopic,
         _ => ProviderMetadataPosture::HashedTopic,
     }
+}
+
+fn runtime_role_label(role: Option<ProviderTextControlRuntimePeerRole>) -> &'static str {
+    match role {
+        Some(ProviderTextControlRuntimePeerRole::Offerer) => "offerer",
+        Some(ProviderTextControlRuntimePeerRole::Answerer) => "answerer",
+        None => "test-harness",
+    }
+}
+
+fn start_role_split_text_control_runtime(
+    executor: Arc<tokio::runtime::Runtime>,
+    inputs: TextControlRuntimeAttachInputs,
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+) -> Result<discrypt_transport::ProviderTextControlRuntime, String> {
+    executor
+        .block_on(async move {
+            match role {
+                ProviderTextControlRuntimePeerRole::Offerer => {
+                    start_provider_webrtc_text_control_offer_runtime(
+                        inputs.profile,
+                        inputs.scope,
+                        &inputs.bootstrap_secret,
+                        &inputs.random_entropy,
+                        discrypt_transport::WebRtcNegotiationConfig::new(inputs.ice_config),
+                        local_peer_id,
+                        remote_peer_id,
+                    )
+                    .await
+                }
+                ProviderTextControlRuntimePeerRole::Answerer => {
+                    start_provider_webrtc_text_control_answer_runtime_with_answerer(
+                        inputs.profile,
+                        inputs.scope,
+                        &inputs.bootstrap_secret,
+                        &inputs.random_entropy,
+                        discrypt_transport::WebRtcNegotiationConfig::new(inputs.ice_config),
+                        local_peer_id,
+                        remote_peer_id,
+                        move |received| {
+                            let frame: TextControlFrameView =
+                                serde_json::from_slice(&received).map_err(|error| {
+                                    TransportError::Unavailable(format!(
+                                        "receiver could not decode live text/control frame: {error}"
+                                    ))
+                                })?;
+                            let mut response_frame = None;
+                            app_service()
+                                .lock()
+                                .map_err(|_| {
+                                    TransportError::Unavailable(
+                                        "live runtime app service lock poisoned".to_owned(),
+                                    )
+                                })?
+                                .mutate(|state| {
+                                    response_frame = state.handle_text_control_frame(frame);
+                                });
+                            let response_frame = response_frame.ok_or_else(|| {
+                                TransportError::Unavailable(
+                                    "receiver did not accept live text/control frame or generate receipt"
+                                        .to_owned(),
+                                )
+                            })?;
+                            serde_json::to_vec(&response_frame).map_err(|error| {
+                                TransportError::Unavailable(format!(
+                                    "could not encode live text/control response frame: {error}"
+                                ))
+                            })
+                        },
+                    )
+                    .await
+                }
+            }
+        })
+        .map_err(|error| error.to_string())
 }
 
 fn run_provider_adapter_probe(
@@ -10201,6 +10525,7 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: None,
+                ..Default::default()
             });
         let command_error = state
             .last_command_error
@@ -10241,6 +10566,7 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some("stale-text-session".to_owned()),
+                ..Default::default()
             });
         let command_error = state
             .last_command_error
@@ -10292,6 +10618,7 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(active_session_id),
+                ..Default::default()
             });
         let command_error = state
             .last_command_error
@@ -10362,6 +10689,7 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(session_id),
+                ..Default::default()
             });
         let command_error = state
             .last_command_error
@@ -10455,6 +10783,7 @@ mod tests {
         let attached =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(session_id.clone()),
+                ..Default::default()
             });
         let command_error = attached
             .last_command_error

@@ -427,3 +427,26 @@ cargo check -q -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-
 cargo test -q -p discrypt-transport live_provider_text_control_role_split_runtimes_connect_two_peers -- --nocapture
 cargo test -q -p discrypt-transport live_provider_text_control_runtime_pair_carries_multiple_opaque_frames -- --nocapture
 ```
+
+### 2026-05-30 Tauri role-split attach surface progress
+
+- [x] Extended the Tauri/backend `attach_text_control_transport_runtime` command with optional role-split fields:
+  - `runtime_role`: `offerer` or `answerer`
+  - `local_peer_id`
+  - `remote_peer_id`
+- [x] Preserved backward compatibility: if no role is supplied, the command still uses the legacy fail-closed persisted-probe resume path and does not pretend stale probe SDP is a live runtime.
+- [x] When role and peer ids are supplied, the backend now builds active-scope signaling profile/scope/ICE material, starts the corresponding one-peer provider runtime, stores the owned runtime handle plus executor in app-service state, and exposes role/peer evidence in the text/control runtime status row.
+- [x] Updated the frontend command type and command-coverage gate to include the new attach fields.
+- [ ] UI still needs to derive/pass role/local-peer/remote-peer from DM/group invite state and orchestrate answerer-before-offerer startup across two app instances.
+- [ ] Two installed app instances have not yet been run through the role-split attach command over public providers.
+
+Verification added/run:
+
+```bash
+cargo fmt --all --check
+cargo check -q -p discrypt-desktop
+cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter
+cargo test -q -p discrypt-desktop attach_text_control_transport_runtime -- --nocapture
+npm --prefix apps/ui run test:command-coverage
+npm --prefix apps/ui run typecheck
+```
