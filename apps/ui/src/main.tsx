@@ -172,6 +172,7 @@ function App() {
   const [draftDmName, setDraftDmName] = useState("New contact");
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [messageTransportProof, setMessageTransportProof] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -432,6 +433,8 @@ function App() {
           channel_id: activeTextChannel.channel_id,
         },
         body,
+        transport_proof: messageTransportProof,
+        adapter_kind: null,
       }),
       () => setDraftMessage(""),
     );
@@ -449,6 +452,8 @@ function App() {
           channel_id: null,
         },
         body,
+        transport_proof: messageTransportProof,
+        adapter_kind: null,
       }),
       () => setDraftMessage(""),
     );
@@ -668,6 +673,8 @@ function App() {
               setDraftMessage={setDraftMessage}
               onStartDm={startCommandDm}
               onSendDm={sendCommandDm}
+              transportProof={messageTransportProof}
+              setTransportProof={setMessageTransportProof}
             />
           ) : null}
           {workflow === "join" ? (
@@ -707,6 +714,8 @@ function App() {
               onCreateTextChannel={() => createCommandChannel("Text")}
               onCreateVoiceChannel={() => createCommandChannel("Voice")}
               onSendMessage={sendCommandMessage}
+              transportProof={messageTransportProof}
+              setTransportProof={setMessageTransportProof}
             />
           ) : null}
           {workflow === "voice" ? (
@@ -1729,6 +1738,8 @@ function DmPanel({
   setDraftMessage,
   onStartDm,
   onSendDm,
+  transportProof,
+  setTransportProof,
 }: {
   activeDm: DirectConversationView | null;
   messages: AppMessageView[];
@@ -1739,6 +1750,8 @@ function DmPanel({
   setDraftMessage: (value: string) => void;
   onStartDm: () => void;
   onSendDm: () => void;
+  transportProof: boolean;
+  setTransportProof: (value: boolean) => void;
 }) {
   const visibleMessages = activeDm
     ? messages.filter((message) => message.target.dm_id === activeDm.dm_id)
@@ -1776,6 +1789,8 @@ function DmPanel({
         sendLabel="Send DM message"
         onSend={onSendDm}
         disabled={!activeDm}
+        transportProof={transportProof}
+        setTransportProof={setTransportProof}
       />
     </div>
   );
@@ -2135,6 +2150,8 @@ function ChannelPanel({
   onCreateTextChannel,
   onCreateVoiceChannel,
   onSendMessage,
+  transportProof,
+  setTransportProof,
 }: {
   snapshot: AppSnapshot;
   group: GroupView | null;
@@ -2149,6 +2166,8 @@ function ChannelPanel({
   onCreateTextChannel: () => void;
   onCreateVoiceChannel: () => void;
   onSendMessage: () => void;
+  transportProof: boolean;
+  setTransportProof: (value: boolean) => void;
 }) {
   const visibleMessages = activeChannel
     ? messages.filter(
@@ -2171,6 +2190,8 @@ function ChannelPanel({
         sendLabel="Send message"
         onSend={onSendMessage}
         disabled={!activeChannel}
+        transportProof={transportProof}
+        setTransportProof={setTransportProof}
       />
       <Card className="h-fit">
         <CardHeader>
@@ -2238,6 +2259,8 @@ function Timeline({
   sendLabel,
   onSend,
   disabled,
+  transportProof,
+  setTransportProof,
 }: {
   title: string;
   description: string;
@@ -2248,6 +2271,8 @@ function Timeline({
   sendLabel: string;
   onSend: () => void;
   disabled?: boolean;
+  transportProof: boolean;
+  setTransportProof: (value: boolean) => void;
 }) {
   return (
     <Card className="flex min-h-[72dvh] flex-col overflow-hidden">
@@ -2281,11 +2306,21 @@ function Timeline({
             disabled={disabled}
           />
         </Label>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <p className="text-xs text-[hsl(var(--muted-foreground))]">
-            Local encrypted timeline; remote delivery/read receipts require
-            signed receipts and are not claimed here.
-          </p>
+        <div className="mt-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div className="space-y-2">
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              Local encrypted timeline; remote delivery/read receipts require
+              signed receipts and are not claimed here.
+            </p>
+            <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+              <Switch
+                checked={transportProof}
+                onCheckedChange={setTransportProof}
+                disabled={disabled}
+              />
+              Verify provider-signaled WebRTC transport for this send
+            </Label>
+          </div>
           <Button onClick={onSend} disabled={disabled || !draftMessage.trim()}>
             {sendLabel}
           </Button>
@@ -2324,9 +2359,9 @@ function TextStateLegend({ states }: { states: TextStateView[] }) {
 function messageStateBadgeVariant(
   stateKey: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if (["sent_local", "received"].includes(stateKey)) return "success";
-  if (["pending", "locked", "peer_receipt"].includes(stateKey)) return "warning";
-  if (["failed", "shredded"].includes(stateKey)) return "secondary";
+  if (["sent_local", "received", "transport_probe_verified"].includes(stateKey)) return "success";
+  if (["pending", "locked", "peer_receipt", "transport_probe_unavailable"].includes(stateKey)) return "warning";
+  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey)) return "secondary";
   return "outline";
 }
 

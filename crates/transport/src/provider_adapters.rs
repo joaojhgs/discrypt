@@ -32,7 +32,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "nostr-adapter", feature = "ipfs-pubsub-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
 use sha2::Digest;
 use std::collections::BTreeMap;
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -363,6 +367,8 @@ pub struct ProviderWebRtcDataChannelProbe {
     pub answerer_data_channel_open: bool,
     /// Opaque text/control frame crossed the DataChannel.
     pub text_control_frame_roundtrip: bool,
+    /// SHA-256 of the opaque text/control frame used for the proof.
+    pub text_control_frame_sha256: String,
 }
 
 impl SignalingAdapterFallbackPlan {
@@ -544,6 +550,36 @@ pub async fn probe_provider_webrtc_datachannel_roundtrip(
     random_entropy: &[u8],
     ice_servers: IceServerConfig,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    probe_provider_webrtc_datachannel_text_frame_roundtrip(
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        ice_servers,
+        b"ciphertext:public-provider-signaled-webrtc-text-frame:v1".to_vec(),
+    )
+    .await
+}
+
+/// Run a provider-signaled WebRTC DataChannel roundtrip with a caller-supplied opaque frame.
+///
+/// This is used by app-service tests and diagnostics to prove that the selected
+/// provider can negotiate WebRTC and carry an already-protected text/control
+/// frame derived from the actual command path. The frame must be non-empty and
+/// must already be ciphertext/opaque to this transport layer.
+pub async fn probe_provider_webrtc_datachannel_text_frame_roundtrip(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
+) -> Result<ProviderWebRtcDataChannelProbe, TransportError> {
+    if text_control_frame.is_empty() {
+        return Err(TransportError::Unavailable(
+            "text/control proof frame must be non-empty opaque bytes".to_owned(),
+        ));
+    }
     profile.validate()?;
     scope.validate()?;
     ice_servers.validate_credentials_at(chrono::Utc::now())?;
@@ -552,7 +588,12 @@ pub async fn probe_provider_webrtc_datachannel_roundtrip(
         feature = "nostr-adapter",
         feature = "ipfs-pubsub-adapter"
     )))]
-    let _ = (bootstrap_secret, random_entropy, ice_servers);
+    let _ = (
+        bootstrap_secret,
+        random_entropy,
+        ice_servers,
+        text_control_frame,
+    );
     let kind = profile.kind;
     match kind {
         SignalingAdapterKind::Mqtt => {
@@ -565,6 +606,7 @@ pub async fn probe_provider_webrtc_datachannel_roundtrip(
                     bootstrap_secret,
                     random_entropy,
                     ice_servers,
+                    text_control_frame,
                 )
                 .await;
             }
@@ -585,6 +627,7 @@ pub async fn probe_provider_webrtc_datachannel_roundtrip(
                     bootstrap_secret,
                     random_entropy,
                     ice_servers,
+                    text_control_frame,
                 )
                 .await;
             }
@@ -605,6 +648,7 @@ pub async fn probe_provider_webrtc_datachannel_roundtrip(
                     bootstrap_secret,
                     random_entropy,
                     ice_servers,
+                    text_control_frame,
                 )
                 .await;
             }
@@ -730,6 +774,7 @@ async fn probe_webrtc_with_adapter<A>(
     bootstrap_secret: &[u8],
     random_entropy: &[u8],
     ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
 ) -> Result<ProviderWebRtcDataChannelProbe, TransportError>
 where
     A: SignalingAdapter,
@@ -862,7 +907,12 @@ where
         )));
     }
 
-    let frame = b"ciphertext:public-provider-signaled-webrtc-text-frame:v1".to_vec();
+    let frame = text_control_frame;
+    let frame_sha256 = {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&frame);
+        hex::encode(hasher.finalize())
+    };
     alice_webrtc.send_text_control_frame(frame.clone()).await?;
     let received = timeout(Duration::from_secs(5), bob_webrtc.recv_text_control_frame())
         .await
@@ -894,6 +944,7 @@ where
         offerer_data_channel_open: offerer_data.open,
         answerer_data_channel_open: answerer_data.open,
         text_control_frame_roundtrip: frame_roundtrip,
+        text_control_frame_sha256: frame_sha256,
     })
 }
 

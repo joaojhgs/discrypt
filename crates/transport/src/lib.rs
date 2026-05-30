@@ -39,7 +39,8 @@ pub use provider_adapters::MqttProviderAdapter;
 pub use provider_adapters::NostrProviderAdapter;
 pub use provider_adapters::{
     adapter_boundary_for_kind, plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
-    probe_provider_webrtc_datachannel_roundtrip, required_provider_adapter_boundaries,
+    probe_provider_webrtc_datachannel_roundtrip,
+    probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     required_provider_adapter_registry, AdapterReadinessState, FeatureGatedProviderAdapter,
     LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,
     ProviderAdapterReadiness, ProviderAdapterRoundtripProbe, ProviderWebRtcDataChannelProbe,

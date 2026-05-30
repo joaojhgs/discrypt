@@ -44,7 +44,7 @@ use discrypt_storage::{
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
-    probe_provider_webrtc_datachannel_roundtrip, required_provider_adapter_boundaries,
+    probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityScopeLevel, ConversationScope,
     Endpoint, FallbackLeg, IceServerConfig, ProviderMetadataPosture, SignalingAdapterCapabilities,
     SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity,
@@ -846,6 +846,15 @@ pub struct SendMessageRequest {
     pub target: MessageTargetView,
     /// Message body.
     pub body: String,
+    /// When true, run a real provider-signaled WebRTC DataChannel proof for an
+    /// opaque frame derived from this message before marking transport proof.
+    /// This does not claim peer receipt.
+    #[serde(default)]
+    pub transport_proof: bool,
+    /// Optional adapter kind override for the text transport proof (`mqtt`,
+    /// `nostr`, `ipfs_pubsub`, or `discrypt_quic_rendezvous`).
+    #[serde(default)]
+    pub adapter_kind: Option<String>,
 }
 
 /// Request to join a voice channel.
@@ -1069,6 +1078,9 @@ pub struct ProviderWebRtcDataChannelProbeView {
     pub answerer_data_channel_open: bool,
     /// Opaque text/control frame crossed the DataChannel.
     pub text_control_frame_roundtrip: bool,
+    /// SHA-256 of the opaque text/control frame used for the proof.
+    #[serde(default)]
+    pub text_control_frame_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2250,16 +2262,59 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             .as_ref()
             .map(|profile| profile.display_name.clone())
             .unwrap_or_else(|| "Alice".to_owned());
+        let message_id = format!("msg-{sequence}");
+        let mut status = "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned();
+        let mut state_key = "sent_local".to_owned();
+        let mut state_label = "Sent locally".to_owned();
+        let mut state_detail = default_text_state_detail();
+        if request.transport_proof {
+            let frame = opaque_text_control_frame_for_message(
+                state,
+                &request.target,
+                &message_id,
+                body,
+                sequence,
+            );
+            match state
+                .probe_active_webrtc_data_channel_with_frame(request.adapter_kind.as_deref(), frame)
+            {
+                Ok(probe) => {
+                    status = "local encrypted author log plus provider-signaled WebRTC DataChannel transport proof; peer receipt still requires signed remote receipt".to_owned();
+                    state_key = "transport_probe_verified".to_owned();
+                    state_label = "Transport proofed".to_owned();
+                    state_detail = format!(
+                        "Opaque text/control frame crossed adapter={} profile={} topic={} frame_sha256={}; this is not a signed peer receipt",
+                        probe.kind,
+                        probe.profile_id,
+                        probe.rendezvous_topic,
+                        probe.text_control_frame_sha256
+                    );
+                }
+                Err(error) => {
+                    status = "local encrypted author log only; requested WebRTC DataChannel transport proof failed".to_owned();
+                    state_key = "transport_probe_failed".to_owned();
+                    state_label = "Transport proof failed".to_owned();
+                    state_detail = error.clone();
+                    state.push_command_error(
+                        "message.transport_proof_failed",
+                        "send_message",
+                        "text_transport_proof_failed",
+                        error,
+                        "Check provider reachability, STUN/ICE policy, active scope connectivity, and adapter feature flags before claiming remote delivery",
+                    );
+                }
+            }
+        }
         let message = MessageView {
-            message_id: format!("msg-{sequence}"),
+            message_id,
             target: request.target,
             author_id: state.local_user_id(),
             author,
             body: body.to_owned(),
-            status: "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned(),
-            state_key: "sent_local".to_owned(),
-            state_label: "Sent locally".to_owned(),
-            state_detail: default_text_state_detail(),
+            status,
+            state_key,
+            state_label,
+            state_detail,
             sent_at: format!("local-{sequence}"),
         };
         state.messages.push(message);
@@ -3231,7 +3286,18 @@ impl PersistedAppState {
     fn probe_active_webrtc_data_channel(
         &mut self,
         requested_kind: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
+        self.probe_active_webrtc_data_channel_with_frame(
+            requested_kind,
+            b"ciphertext:runtime-webrtc-datachannel-probe:v1".to_vec(),
+        )
+    }
+
+    fn probe_active_webrtc_data_channel_with_frame(
+        &mut self,
+        requested_kind: Option<&str>,
+        text_control_frame: Vec<u8>,
+    ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
         let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
             "No active DM/group/invite connectivity policy is available for WebRTC data-channel probe"
                 .to_owned()
@@ -3274,6 +3340,7 @@ impl PersistedAppState {
             bootstrap_secret,
             random_entropy,
             ice_config,
+            text_control_frame,
         )
         .map_err(|error| {
             self.latest_data_channel_probe = None;
@@ -3290,6 +3357,7 @@ impl PersistedAppState {
             offerer_data_channel_open: probe.offerer_data_channel_open,
             answerer_data_channel_open: probe.answerer_data_channel_open,
             text_control_frame_roundtrip: probe.text_control_frame_roundtrip,
+            text_control_frame_sha256: probe.text_control_frame_sha256,
         };
         self.latest_data_channel_probe_error = None;
         self.latest_data_channel_probe = Some(view.clone());
@@ -3300,7 +3368,7 @@ impl PersistedAppState {
                 view.kind, view.profile_id
             ),
         );
-        Ok(())
+        Ok(view)
     }
 
     fn active_connectivity_policy(
@@ -4147,6 +4215,38 @@ fn text_send_abuse_key(state: &PersistedAppState, target: &MessageTargetView) ->
     )
 }
 
+fn opaque_text_control_frame_for_message(
+    state: &PersistedAppState,
+    target: &MessageTargetView,
+    message_id: &str,
+    body: &str,
+    sequence: u64,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-opaque-text-control-frame-v1");
+    hasher.update([0]);
+    hasher.update(state.local_user_id().as_bytes());
+    hasher.update([0]);
+    hasher.update(target.kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(target.dm_id.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(target.group_id.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(target.channel_id.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(message_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(sequence.to_be_bytes());
+    hasher.update([0]);
+    hasher.update(body.as_bytes());
+    format!(
+        "ciphertext:discrypt-text-control-proof:v1:{}",
+        hex::encode(hasher.finalize())
+    )
+    .into_bytes()
+}
+
 #[cfg(test)]
 fn abuse_controls_contract_covers_g116() -> bool {
     let mut controls = AbuseControls::new(
@@ -4675,6 +4775,7 @@ fn run_provider_webrtc_data_channel_probe(
     bootstrap_secret: Vec<u8>,
     random_entropy: Vec<u8>,
     ice_servers: IceServerConfig,
+    text_control_frame: Vec<u8>,
 ) -> Result<discrypt_transport::ProviderWebRtcDataChannelProbe, String> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -4685,12 +4786,13 @@ fn run_provider_webrtc_data_channel_probe(
                 format!("Could not start WebRTC data-channel probe runtime: {error}")
             })?;
         runtime
-            .block_on(probe_provider_webrtc_datachannel_roundtrip(
+            .block_on(probe_provider_webrtc_datachannel_text_frame_roundtrip(
                 profile,
                 scope,
                 &bootstrap_secret,
                 &random_entropy,
                 ice_servers,
+                text_control_frame,
             ))
             .map_err(|error| error.to_string())
     })
@@ -5205,6 +5307,18 @@ fn text_state_legend() -> Vec<TextStateView> {
             detail: default_text_state_detail(),
         },
         TextStateView {
+            key: "transport_probe_verified".to_owned(),
+            label: "Transport proofed".to_owned(),
+            status: "available".to_owned(),
+            detail: "Opaque message-derived frame crossed a provider-signaled WebRTC DataChannel; signed peer receipt is still required".to_owned(),
+        },
+        TextStateView {
+            key: "transport_probe_failed".to_owned(),
+            label: "Transport proof failed".to_owned(),
+            status: "available".to_owned(),
+            detail: "Requested provider-signaled WebRTC text/control proof failed; message remains local-only".to_owned(),
+        },
+        TextStateView {
             key: "peer_receipt".to_owned(),
             label: "Peer receipt".to_owned(),
             status: "requires-signed-receipt".to_owned(),
@@ -5667,6 +5781,8 @@ mod tests {
                 channel_id: Some(channel_id),
             },
             body: "hello encrypted local shell".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         assert!(message_state
             .messages
@@ -5846,6 +5962,8 @@ mod tests {
                 channel_id: None,
             },
             body: "persist this dm".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         let loaded = load_state().to_view();
         assert!(loaded.dms.iter().any(|dm| dm.dm_id == dm_id));
@@ -6334,6 +6452,8 @@ mod tests {
                 channel_id: None,
             },
             body: "hello state".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         assert_eq!(state.messages[0].state_key, "sent_local");
         assert_eq!(state.messages[0].state_label, "Sent locally");
@@ -6347,6 +6467,8 @@ mod tests {
             vec![
                 "pending",
                 "sent_local",
+                "transport_probe_verified",
+                "transport_probe_failed",
                 "peer_receipt",
                 "received",
                 "failed",
@@ -6399,6 +6521,8 @@ mod tests {
                 channel_id: Some(channel_id),
             },
             body: "service-backed command path".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         assert!(messaged.last_command_error.is_none());
         assert_eq!(app_state().messages.len(), 1);
@@ -6620,6 +6744,103 @@ mod tests {
     }
 
     #[test]
+    fn text_transport_proof_failure_keeps_message_honest() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-transport-proof-fail");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm.dms[0].dm_id.clone();
+
+        let state = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "needs real transport proof".to_owned(),
+            transport_proof: true,
+            adapter_kind: Some("discrypt_quic_rendezvous".to_owned()),
+        });
+
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("fail-closed QUIC adapter should block text transport proof");
+        assert_eq!(error.code, "text_transport_proof_failed");
+        assert_eq!(state.messages[0].state_key, "transport_probe_failed");
+        assert_eq!(state.messages[0].state_label, "Transport proof failed");
+        assert!(
+            state.messages[0].state_detail.contains("unavailable")
+                || state.messages[0]
+                    .state_detail
+                    .contains("implementation_unavailable")
+                || state.messages[0].state_detail.contains("not enabled"),
+            "{}",
+            state.messages[0].state_detail
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mqtt-adapter")]
+    fn public_mqtt_message_send_proves_provider_webrtc_transport_when_enabled() {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_MESSAGE_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public MQTT message transport proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_MESSAGE_E2E=1 to run"
+            );
+            return;
+        }
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("desktop-public-mqtt-message-proof");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm.dms[0].dm_id.clone();
+
+        let state = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "transport proof message".to_owned(),
+            transport_proof: true,
+            adapter_kind: Some("mqtt".to_owned()),
+        });
+
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
+        );
+        assert_eq!(state.messages[0].state_key, "transport_probe_verified");
+        assert_eq!(state.messages[0].state_label, "Transport proofed");
+        assert!(state.messages[0].state_detail.contains("frame_sha256="));
+        let proof = state
+            .transport_diagnostics
+            .data_channel_probe
+            .expect("send transport proof should update diagnostics");
+        assert_eq!(proof.kind, "mqtt");
+        assert!(proof.text_control_frame_roundtrip);
+        assert_eq!(proof.text_control_frame_sha256.len(), 64);
+    }
+
+    #[test]
     #[cfg(feature = "mqtt-adapter")]
     fn mqtt_adapter_feature_reaches_app_state_diagnostics() {
         let _guard = test_lock();
@@ -6761,6 +6982,8 @@ mod tests {
                     channel_id: None,
                 },
                 body: format!("message {index}"),
+                transport_proof: false,
+                adapter_kind: None,
             });
             assert!(
                 sent.last_command_error.is_none(),
@@ -6775,6 +6998,8 @@ mod tests {
                 channel_id: None,
             },
             body: "limited".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         assert_eq!(
             limited_message
@@ -6856,6 +7081,8 @@ mod tests {
                 channel_id: None,
             },
             body: "   ".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         let error = empty_message
             .last_command_error
@@ -7032,6 +7259,8 @@ mod tests {
                 channel_id: Some(channel_id),
             },
             body: "cursor-backed state".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         cursor = assert_cursor_advanced(cursor, &message);
 
@@ -7043,6 +7272,8 @@ mod tests {
                 channel_id: None,
             },
             body: "cursor-backed dm".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         cursor = assert_cursor_advanced(cursor, &dm_message);
 
@@ -7147,6 +7378,8 @@ mod tests {
                 channel_id: Some(text_channel_id),
             },
             body: "stream me".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
         });
         let voice_channel = create_channel(CreateChannelRequest {
             group_id: group_id.clone(),

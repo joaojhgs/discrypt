@@ -290,6 +290,7 @@ export type ProviderWebRtcDataChannelProbeView = {
   offerer_data_channel_open: boolean;
   answerer_data_channel_open: boolean;
   text_control_frame_roundtrip: boolean;
+  text_control_frame_sha256: string;
 };
 
 export type JoinProgressStepView = {
@@ -529,6 +530,8 @@ export type StopTextSessionRequest = {
 export type SendMessageRequest = {
   target: MessageTargetView;
   body: string;
+  transport_proof?: boolean;
+  adapter_kind?: string | null;
 };
 
 export type JoinVoiceRequest = {
@@ -2717,10 +2720,15 @@ export async function sendMessage(
         body,
         status:
           "local encrypted author log; remote delivery/read receipts not claimed without signed receipt",
-        state_key: "sent_local",
-        state_label: "Sent locally",
-        state_detail:
-          "Message is in the local encrypted author log; peer receipt requires backend-state proof",
+        state_key: request.transport_proof
+          ? "transport_probe_unavailable"
+          : "sent_local",
+        state_label: request.transport_proof
+          ? "Transport proof unavailable"
+          : "Sent locally",
+        state_detail: request.transport_proof
+          ? "Fallback web runtime cannot run the Rust/Tauri provider-signaled WebRTC transport proof; native command path is required"
+          : "Message is in the local encrypted author log; peer receipt requires backend-state proof",
         sent_at: `local-${state.messages.length + 1}`,
       });
       pushEvent(
