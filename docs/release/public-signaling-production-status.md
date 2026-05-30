@@ -131,11 +131,16 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 
 ### G132 production evidence matrix
 
+#### Two-profile signaling verification matrix (required + planned)
+
 | Gate slice | Command | Evidence target |
 | --- | --- | --- |
 | STUN overlay ordering and TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
 | Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
 | Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Opaque transport behavior under a live broker when enabled |
+| Planned Nostr public-provider proof | `cargo test -p discrypt-transport public_nostr_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| Planned IPFS public-provider proof | `cargo test -p discrypt-transport public_ipfs_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| Planned QUIC public-provider proof | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
 
 - Real producer/adapter adapters still missing in this release gate: live Nostr/IPFS/QUIC public-provider route proofs and end-to-end mobile transport smoke (tracked separately).
 - Missing adapter check status is intentionally exposed as blockers instead of fake green signals in this phase.

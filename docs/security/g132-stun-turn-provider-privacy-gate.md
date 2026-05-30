@@ -27,3 +27,15 @@ This gate is intentionally narrow:
 
 - Local harness proof comes from `harness/multinode/src/lib.rs` (`ConnectivitySignalingPushSmoke`) and transport fallback policy tests in `crates/transport/tests/connectivity_flows.rs`.
 - Public-provider proof is intentionally opt-in to keep CI deterministic while preserving reproducible release evidence from real-broker smoke runs.
+
+## Real-provider verification matrix (two-profile)
+
+| Slice | Command | Status |
+| --- | --- | --- |
+| STUN direct path | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | Required local gate |
+| TURN relay path / fallback chain | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Required local gate |
+| Adapter fallback observability | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Required local gate |
+| Public MQTT two-profile signal/control | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Optional (real provider) |
+| Public Nostr two-profile signal/control | `cargo test -p discrypt-transport public_nostr_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| Public IPFS two-profile signal/control | `cargo test -p discrypt-transport public_ipfs_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| Public QUIC two-profile signal/control | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
