@@ -682,6 +682,7 @@ pub struct WebRtcNegotiator {
 impl WebRtcNegotiator {
     /// Create a WebRTC peer connection configured with validated ICE servers.
     pub async fn new(config: WebRtcNegotiationConfig) -> Result<Self, TransportError> {
+        ensure_rustls_crypto_provider_for_mqtt_feature();
         config.validate(Utc::now())?;
         let candidates = Arc::new(Mutex::new(Vec::new()));
         let metrics = Arc::new(Mutex::new(
@@ -892,6 +893,18 @@ impl WebRtcNegotiator {
             .map_err(|err| TransportError::Unavailable(format!("close WebRTC peer failed: {err}")))
     }
 }
+
+#[cfg(feature = "mqtt-adapter")]
+fn ensure_rustls_crypto_provider_for_mqtt_feature() {
+    // Enabling `rumqttc`'s TLS support can bring both rustls crypto provider
+    // backends into the unified dependency graph. The WebRTC stack also touches
+    // rustls, so install one deterministic provider before either stack asks
+    // rustls for its process-wide default.
+    let _ = rumqttc::tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+#[cfg(not(feature = "mqtt-adapter"))]
+fn ensure_rustls_crypto_provider_for_mqtt_feature() {}
 
 #[async_trait]
 impl TextControlDataTransport for WebRtcNegotiator {

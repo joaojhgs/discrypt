@@ -15,7 +15,7 @@ local-dev = []
 production-network = []
 production-media = []
 production-storage = []
-mqtt-adapter = ["production-network"]
+mqtt-adapter = ["production-network", "dep:rumqttc", "dep:hex"]
 nostr-adapter = ["production-network"]
 ipfs-pubsub-adapter = ["production-network"]
 discrypt-quic-rendezvous-adapter = ["production-network"]
@@ -35,5 +35,7 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = { workspace = true }
 base64 = "0.22"
+hex = { workspace = true, optional = true }
+rumqttc = { version = "0.25.1", features = ["url", "websocket"], optional = true }
 
 [dev-dependencies]

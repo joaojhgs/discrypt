@@ -31,6 +31,8 @@ pub use policy::{
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingProviderEndpoint,
 };
+#[cfg(feature = "mqtt-adapter")]
+pub use provider_adapters::MqttProviderAdapter;
 pub use provider_adapters::{
     adapter_boundary_for_kind, required_provider_adapter_boundaries, FeatureGatedProviderAdapter,
     LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,

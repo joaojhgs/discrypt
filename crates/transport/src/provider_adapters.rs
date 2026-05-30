@@ -1,11 +1,14 @@
 //! Feature-gated production boundaries for required signaling providers.
 //!
-//! The real MQTT, Nostr, IPFS/libp2p PubSub, and Rust QUIC provider clients are
-//! intentionally not emulated here. This module gives each required provider a
-//! concrete adapter boundary that validates profiles, exposes redacted health,
-//! and fails closed unless a future production implementation replaces the
-//! boundary behind its explicit Cargo feature.
+//! Each required provider has a concrete adapter boundary that validates
+//! profiles, exposes redacted health, and fails closed unless an audited
+//! provider client is compiled behind its explicit Cargo feature. MQTT now has a
+//! real provider client behind `mqtt-adapter`; Nostr, IPFS/libp2p PubSub, and
+//! the Rust QUIC rendezvous adapter remain explicit fail-closed boundaries until
+//! their real clients land.
 
+#[cfg(feature = "mqtt-adapter")]
+use crate::SignalingProviderEndpoint;
 use crate::{
     AdapterSession, AdapterTrustLabel, ControlBroadcast, ConversationScope, OpaqueSignalingPayload,
     PeerSignal, PresenceEvent, RendezvousCapability, RendezvousRoom,
@@ -17,6 +20,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "mqtt-adapter")]
+use tokio::sync::Mutex as AsyncMutex;
+#[cfg(feature = "mqtt-adapter")]
+use tokio::time::{timeout, Duration, Instant};
 
 /// Production readiness for a provider adapter boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -26,6 +33,8 @@ pub enum ProviderAdapterReadiness {
     FeatureDisabled,
     /// The Cargo feature is enabled but no audited provider client is wired yet.
     ImplementationUnavailable,
+    /// A real provider client is wired behind the Cargo feature in this build.
+    ImplementationAvailable,
 }
 
 /// Static production boundary metadata for one required signaling adapter.
@@ -43,7 +52,10 @@ impl ProviderAdapterBoundary {
     /// True when a real provider client is available in this build.
     #[must_use]
     pub const fn implementation_available(self) -> bool {
-        false
+        matches!(
+            self.readiness,
+            ProviderAdapterReadiness::ImplementationAvailable
+        )
     }
 
     /// Redacted failure label for health/observability.
@@ -52,6 +64,7 @@ impl ProviderAdapterBoundary {
         match self.readiness {
             ProviderAdapterReadiness::FeatureDisabled => "feature_disabled",
             ProviderAdapterReadiness::ImplementationUnavailable => "implementation_unavailable",
+            ProviderAdapterReadiness::ImplementationAvailable => "implementation_available",
         }
     }
 
@@ -67,6 +80,11 @@ impl ProviderAdapterBoundary {
                 self.kind.canonical_name(),
                 self.cargo_feature
             )),
+            ProviderAdapterReadiness::ImplementationAvailable => TransportError::SignalingAdapter(format!(
+                "{} adapter feature {} is available; use its concrete production adapter instead of the fail-closed boundary",
+                self.kind.canonical_name(),
+                self.cargo_feature
+            )),
         }
     }
 }
@@ -78,7 +96,7 @@ pub const fn adapter_boundary_for_kind(kind: SignalingAdapterKind) -> ProviderAd
         SignalingAdapterKind::Mqtt => ProviderAdapterBoundary {
             kind,
             cargo_feature: "mqtt-adapter",
-            readiness: feature_readiness(cfg!(feature = "mqtt-adapter")),
+            readiness: mqtt_feature_readiness(),
         },
         SignalingAdapterKind::Nostr => ProviderAdapterBoundary {
             kind,
@@ -112,6 +130,14 @@ pub const fn required_provider_adapter_boundaries() -> [ProviderAdapterBoundary;
 const fn feature_readiness(enabled: bool) -> ProviderAdapterReadiness {
     if enabled {
         ProviderAdapterReadiness::ImplementationUnavailable
+    } else {
+        ProviderAdapterReadiness::FeatureDisabled
+    }
+}
+
+const fn mqtt_feature_readiness() -> ProviderAdapterReadiness {
+    if cfg!(feature = "mqtt-adapter") {
+        ProviderAdapterReadiness::ImplementationAvailable
     } else {
         ProviderAdapterReadiness::FeatureDisabled
     }
@@ -269,6 +295,76 @@ pub struct LocalConformanceProviderRoom {
     local_peer_id: SignalingPeerId,
 }
 
+#[cfg(feature = "mqtt-adapter")]
+/// Real MQTT signaling adapter.
+///
+/// This adapter publishes only already-sealed Discrypt signaling envelopes to
+/// broker topics derived from [`RendezvousCapability`]. It does not receive raw
+/// SDP, ICE credentials, group names, display names, invite secrets, or message
+/// plaintext. Public production profiles must use `mqtts://` or `wss://`;
+/// `mqtt://` is accepted only when the profile itself validates as loopback
+/// local development.
+#[derive(Clone, Debug, Default)]
+pub struct MqttProviderAdapter;
+
+#[cfg(feature = "mqtt-adapter")]
+#[derive(Clone, Debug)]
+pub struct MqttProviderSession {
+    profile: SignalingAdapterProfile,
+}
+
+#[cfg(feature = "mqtt-adapter")]
+pub struct MqttProviderRoom {
+    local_peer_id: SignalingPeerId,
+    client: rumqttc::AsyncClient,
+    events: AsyncMutex<MqttEventReceiver>,
+    rendezvous_topic: String,
+    topics: MqttTopics,
+    inbox: AsyncMutex<MqttInbox>,
+}
+
+#[cfg(feature = "mqtt-adapter")]
+type MqttEventReceiver = tokio::sync::mpsc::Receiver<Result<(String, Vec<u8>), String>>;
+
+#[cfg(feature = "mqtt-adapter")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MqttTopics {
+    presence: String,
+    control: String,
+    signal_for_local_peer: String,
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[derive(Debug, Default)]
+struct MqttInbox {
+    presence: Vec<PresenceEvent>,
+    signals: Vec<PeerSignal>,
+    controls: Vec<ControlBroadcast>,
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MqttWireEnvelope {
+    Presence {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    },
+    Signal {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    },
+    Control {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+    },
+}
+
 fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Ok(());
@@ -291,6 +387,374 @@ fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
         return Err(TransportError::PlaintextLeak);
     }
     Ok(())
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_err(context: &str, err: impl std::fmt::Display) -> TransportError {
+    TransportError::SignalingAdapter(format!("mqtt {context} failed: {err}"))
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_endpoint_for_profile(
+    profile: &SignalingAdapterProfile,
+) -> Result<&SignalingProviderEndpoint, TransportError> {
+    profile.endpoints.first().ok_or_else(|| {
+        TransportError::InvalidConnectivityPolicy(
+            "mqtt adapter profile must contain at least one endpoint".to_owned(),
+        )
+    })
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_client_id(topic: &str, _peer: &SignalingPeerId) -> String {
+    let mut random = [0_u8; 8];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut random);
+    let suffix = topic.rsplit('-').next().unwrap_or(topic);
+    let topic_suffix = &suffix[..suffix.len().min(8)];
+    format!("dc{topic_suffix}{}", hex::encode(random))
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_options_from_endpoint(
+    endpoint: &str,
+    client_id: &str,
+) -> Result<rumqttc::MqttOptions, TransportError> {
+    let _ = rumqttc::tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let separator = if endpoint.contains('?') { '&' } else { '?' };
+    let url = format!("{endpoint}{separator}client_id={client_id}");
+    let mut options =
+        rumqttc::MqttOptions::parse_url(url).map_err(|err| mqtt_err("endpoint parse", err))?;
+    options.set_keep_alive(std::time::Duration::from_secs(10));
+    options.set_clean_session(true);
+    options.set_max_packet_size(64 * 1024, 64 * 1024);
+    Ok(options)
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_topics(rendezvous: &RendezvousCapability, local_peer_id: &SignalingPeerId) -> MqttTopics {
+    let base = format!("discrypt/v1/rendezvous/{}", rendezvous.topic);
+    MqttTopics {
+        presence: format!("{base}/presence"),
+        control: format!("{base}/control"),
+        signal_for_local_peer: format!("{base}/signal/{}", local_peer_id.0),
+    }
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_signal_topic(rendezvous_topic: &str, peer_id: &SignalingPeerId) -> String {
+    format!(
+        "discrypt/v1/rendezvous/{rendezvous_topic}/signal/{}",
+        peer_id.0
+    )
+}
+
+#[cfg(feature = "mqtt-adapter")]
+impl MqttProviderRoom {
+    async fn publish_envelope(
+        &self,
+        topic: String,
+        envelope: MqttWireEnvelope,
+    ) -> Result<(), TransportError> {
+        let bytes =
+            serde_json::to_vec(&envelope).map_err(|err| mqtt_err("wire envelope encode", err))?;
+        reject_forbidden_plaintext(&bytes)?;
+        self.client
+            .publish(topic, rumqttc::QoS::AtLeastOnce, false, bytes)
+            .await
+            .map_err(|err| mqtt_err("publish", err))?;
+        self.drain_network_for(Duration::from_secs(1)).await
+    }
+
+    async fn drain_network_for(&self, duration: Duration) -> Result<(), TransportError> {
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let event = {
+                let mut events = self.events.lock().await;
+                timeout(remaining, events.recv()).await
+            };
+            match event {
+                Ok(Some(Ok((topic, payload)))) => {
+                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                        eprintln!("mqtt incoming publish {topic}");
+                    }
+                    self.record_publish(topic, payload).await?;
+                }
+                Ok(Some(Err(err))) => {
+                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                        eprintln!("mqtt event error {err}");
+                    }
+                    return Err(mqtt_err("event loop", err));
+                }
+                Ok(None) => {
+                    return Err(TransportError::SignalingAdapter(
+                        "mqtt event loop stopped".to_owned(),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    async fn record_publish(&self, _topic: String, bytes: Vec<u8>) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&bytes)?;
+        let envelope: MqttWireEnvelope =
+            serde_json::from_slice(&bytes).map_err(|err| mqtt_err("wire envelope decode", err))?;
+        let mut inbox = self.inbox.lock().await;
+        match envelope {
+            MqttWireEnvelope::Presence {
+                schema,
+                from_peer,
+                payload,
+                ttl_seconds,
+            } if schema == 1 && from_peer != self.local_peer_id => {
+                inbox.presence.push(PresenceEvent {
+                    peer_id: from_peer,
+                    encrypted_presence: payload,
+                    ttl_seconds,
+                });
+            }
+            MqttWireEnvelope::Signal {
+                schema,
+                from_peer,
+                to_peer,
+                payload,
+            } if schema == 1 && to_peer == self.local_peer_id => {
+                inbox.signals.push(PeerSignal {
+                    from_peer,
+                    to_peer,
+                    payload,
+                });
+            }
+            MqttWireEnvelope::Control {
+                schema,
+                from_peer,
+                payload,
+            } if schema == 1 && from_peer != self.local_peer_id => {
+                inbox.controls.push(ControlBroadcast { from_peer, payload });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[async_trait]
+impl SignalingAdapter for MqttProviderAdapter {
+    type Session = MqttProviderSession;
+
+    async fn connect(
+        &self,
+        profile: SignalingAdapterProfile,
+    ) -> Result<Self::Session, TransportError> {
+        profile.validate()?;
+        if profile.kind != SignalingAdapterKind::Mqtt {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "adapter profile kind {} does not match mqtt adapter",
+                profile.kind.canonical_name()
+            )));
+        }
+        Ok(MqttProviderSession { profile })
+    }
+
+    fn capabilities(&self) -> SignalingAdapterCapabilities {
+        SignalingAdapterCapabilities::production_required()
+    }
+
+    fn observability_redacted(&self) -> SignalingObservability {
+        SignalingObservability {
+            adapter_kind: SignalingAdapterKind::Mqtt,
+            endpoint_label: "mqtt#configured_profile".to_owned(),
+            health: SignalingHealthState::Healthy,
+            trust_label: AdapterTrustLabel {
+                label: "mqtt".to_owned(),
+                posture: "real provider client; broker sees hashed topic and opaque envelopes"
+                    .to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[async_trait]
+impl AdapterSession for MqttProviderSession {
+    type Room = MqttProviderRoom;
+
+    async fn join(
+        &self,
+        scope: ConversationScope,
+        rendezvous: RendezvousCapability,
+        local_peer_id: SignalingPeerId,
+    ) -> Result<Self::Room, TransportError> {
+        scope.validate()?;
+        if rendezvous.scope != scope {
+            return Err(TransportError::SignalingAdapter(
+                "rendezvous capability scope mismatch".to_owned(),
+            ));
+        }
+        if rendezvous.adapter_kind != SignalingAdapterKind::Mqtt {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "rendezvous capability kind {} does not match mqtt adapter",
+                rendezvous.adapter_kind.canonical_name()
+            )));
+        }
+        let endpoint = mqtt_endpoint_for_profile(&self.profile)?;
+        let client_id = mqtt_client_id(&rendezvous.topic, &local_peer_id);
+        let options = mqtt_options_from_endpoint(&endpoint.endpoint.0, &client_id)?;
+        let topics = mqtt_topics(&rendezvous, &local_peer_id);
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 64);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
+        tokio::spawn(async move {
+            loop {
+                match eventloop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                        if event_tx
+                            .send(Ok((publish.topic, publish.payload.to_vec())))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = event_tx.send(Err(err.to_string())).await;
+                        break;
+                    }
+                }
+            }
+        });
+        client
+            .subscribe(topics.presence.clone(), rumqttc::QoS::AtLeastOnce)
+            .await
+            .map_err(|err| mqtt_err("subscribe presence", err))?;
+        client
+            .subscribe(topics.control.clone(), rumqttc::QoS::AtLeastOnce)
+            .await
+            .map_err(|err| mqtt_err("subscribe control", err))?;
+        client
+            .subscribe(
+                topics.signal_for_local_peer.clone(),
+                rumqttc::QoS::AtLeastOnce,
+            )
+            .await
+            .map_err(|err| mqtt_err("subscribe peer signal", err))?;
+        let room = MqttProviderRoom {
+            local_peer_id,
+            client,
+            events: AsyncMutex::new(event_rx),
+            rendezvous_topic: rendezvous.topic,
+            topics,
+            inbox: AsyncMutex::new(MqttInbox::default()),
+        };
+        room.drain_network_for(Duration::from_millis(500)).await?;
+        Ok(room)
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> SignalingHealth {
+        SignalingHealth {
+            adapter_kind: SignalingAdapterKind::Mqtt,
+            state: SignalingHealthState::Healthy,
+            latency_bucket: "unknown".to_owned(),
+            failure_class: None,
+        }
+    }
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[async_trait]
+impl RendezvousRoom for MqttProviderRoom {
+    async fn publish_presence(
+        &self,
+        encrypted_presence: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        if ttl_seconds == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "presence ttl must be non-zero".to_owned(),
+            ));
+        }
+        reject_forbidden_plaintext(&encrypted_presence.bytes)?;
+        self.publish_envelope(
+            self.topics.presence.clone(),
+            MqttWireEnvelope::Presence {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                payload: encrypted_presence,
+                ttl_seconds,
+            },
+        )
+        .await
+    }
+
+    async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
+        self.drain_network_for(Duration::from_millis(300)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.presence))
+    }
+
+    async fn send_signal(
+        &self,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&payload.ciphertext)?;
+        let topic = mqtt_signal_topic(&self.rendezvous_topic, &to_peer);
+        self.publish_envelope(
+            topic,
+            MqttWireEnvelope::Signal {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                to_peer,
+                payload,
+            },
+        )
+        .await
+    }
+
+    async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
+        self.drain_network_for(Duration::from_millis(300)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.signals))
+    }
+
+    async fn broadcast_control(
+        &self,
+        sealed_payload: OpaqueSignalingPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.publish_envelope(
+            self.topics.control.clone(),
+            MqttWireEnvelope::Control {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                payload: sealed_payload,
+            },
+        )
+        .await
+    }
+
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        self.drain_network_for(Duration::from_millis(300)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.controls))
+    }
+
+    async fn leave(&self) -> Result<(), TransportError> {
+        self.client
+            .disconnect()
+            .await
+            .map_err(|err| mqtt_err("disconnect", err))
+    }
 }
 
 #[async_trait]
@@ -696,7 +1160,9 @@ mod tests {
                 cfg!(feature = "discrypt-quic-rendezvous-adapter")
             }
         };
-        if feature_enabled {
+        if boundary.kind == SignalingAdapterKind::Mqtt && feature_enabled {
+            ProviderAdapterReadiness::ImplementationAvailable
+        } else if feature_enabled {
             ProviderAdapterReadiness::ImplementationUnavailable
         } else {
             ProviderAdapterReadiness::FeatureDisabled
@@ -718,13 +1184,17 @@ mod tests {
 
         for boundary in boundaries {
             assert_eq!(boundary.readiness, expected_readiness(boundary));
-            assert!(!boundary.implementation_available());
+            assert_eq!(
+                boundary.implementation_available(),
+                boundary.readiness == ProviderAdapterReadiness::ImplementationAvailable
+            );
             assert_eq!(
                 boundary.failure_class(),
                 match boundary.readiness {
                     ProviderAdapterReadiness::FeatureDisabled => "feature_disabled",
                     ProviderAdapterReadiness::ImplementationUnavailable =>
                         "implementation_unavailable",
+                    ProviderAdapterReadiness::ImplementationAvailable => "implementation_available",
                 }
             );
             let adapter = FeatureGatedProviderAdapter::new(boundary.kind);
