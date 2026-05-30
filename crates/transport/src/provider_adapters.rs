@@ -258,7 +258,8 @@ impl RendezvousRoom for FeatureGatedProviderRoom {
 mod tests {
     use super::*;
     use crate::{
-        Endpoint, ProviderMetadataPosture, SignalingEndpointSecurity, SignalingProviderEndpoint,
+        derive_scope_commitment, ConnectivityScopeLevel, Endpoint, ProviderMetadataPosture,
+        SignalingEndpointSecurity, SignalingProviderEndpoint, WebRtcNegotiationPayloadKind,
     };
 
     fn valid_endpoint(kind: SignalingAdapterKind) -> &'static str {
@@ -288,6 +289,22 @@ mod tests {
         })
     }
 
+    fn expected_readiness(boundary: ProviderAdapterBoundary) -> ProviderAdapterReadiness {
+        let feature_enabled = match boundary.kind {
+            SignalingAdapterKind::Mqtt => cfg!(feature = "mqtt-adapter"),
+            SignalingAdapterKind::Nostr => cfg!(feature = "nostr-adapter"),
+            SignalingAdapterKind::IpfsPubsub => cfg!(feature = "ipfs-pubsub-adapter"),
+            SignalingAdapterKind::DiscryptQuicRendezvous => {
+                cfg!(feature = "discrypt-quic-rendezvous-adapter")
+            }
+        };
+        if feature_enabled {
+            ProviderAdapterReadiness::ImplementationUnavailable
+        } else {
+            ProviderAdapterReadiness::FeatureDisabled
+        }
+    }
+
     #[tokio::test]
     async fn all_required_provider_boundaries_fail_closed_without_real_clients(
     ) -> Result<(), TransportError> {
@@ -302,7 +319,16 @@ mod tests {
         );
 
         for boundary in boundaries {
+            assert_eq!(boundary.readiness, expected_readiness(boundary));
             assert!(!boundary.implementation_available());
+            assert_eq!(
+                boundary.failure_class(),
+                match boundary.readiness {
+                    ProviderAdapterReadiness::FeatureDisabled => "feature_disabled",
+                    ProviderAdapterReadiness::ImplementationUnavailable =>
+                        "implementation_unavailable",
+                }
+            );
             let adapter = FeatureGatedProviderAdapter::new(boundary.kind);
             assert_eq!(adapter.boundary().cargo_feature, boundary.cargo_feature);
             assert!(adapter.capabilities().satisfies_production_contract());
@@ -334,6 +360,73 @@ mod tests {
         assert!(matches!(
             adapter.connect(wrong_profile).await,
             Err(TransportError::InvalidConnectivityPolicy(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_gated_session_and_room_methods_fail_closed() -> Result<(), TransportError> {
+        let boundary = adapter_boundary_for_kind(SignalingAdapterKind::Mqtt);
+        let session = FeatureGatedProviderSession { boundary };
+        let room = FeatureGatedProviderRoom { boundary };
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(ConnectivityScopeLevel::Dm, b"feature gated dm", "test"),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Mqtt,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "redacted")?,
+        )?;
+        let peer = SignalingPeerId::new("alice-device")?;
+
+        assert!(matches!(
+            session.join(scope, capability, peer.clone()).await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert_eq!(
+            session.health().await.failure_class,
+            Some(boundary.failure_class().to_owned())
+        );
+        session.close().await?;
+
+        let opaque = OpaqueSignalingPayload::new(b"opaque sealed payload".to_vec())?;
+        assert!(matches!(
+            room.publish_presence(opaque.clone(), 120).await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert!(matches!(
+            room.subscribe_presence().await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert!(matches!(
+            room.send_signal(
+                peer,
+                SealedWebRtcNegotiationPayload {
+                    version: 1,
+                    kind: WebRtcNegotiationPayloadKind::Offer,
+                    nonce: [9; 12],
+                    ciphertext: b"ciphertext".to_vec(),
+                },
+            )
+            .await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert!(matches!(
+            room.take_signals().await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert!(matches!(
+            room.broadcast_control(opaque).await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert!(matches!(
+            room.leave().await,
+            Err(TransportError::SignalingAdapter(_))
         ));
         Ok(())
     }
