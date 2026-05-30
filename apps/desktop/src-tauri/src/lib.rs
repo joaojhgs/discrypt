@@ -3651,28 +3651,30 @@ impl PersistedAppState {
             .find(|record| record.message_id == message_id)
             .cloned()
             .ok_or_else(|| "no persisted text envelope for receipt message id".to_owned())?;
+        let target = self
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .map(|message| message.target.clone())
+            .ok_or_else(|| "no message target for receipt message id".to_owned())?;
+        let envelope_frame = TextControlFrameView::Envelope {
+            target,
+            envelope: envelope_record.envelope,
+            sender_verifying_key_hex: envelope_record.sender_verifying_key_hex,
+            recipient_leaf: Some(2),
+        };
         let mut receiver_state = receiver.clone();
-        let receiver_signer = SigningKey::from_bytes(&receiver_state.identity_seed_bytes());
-        let receipt = TextDeliveryReceipt::sign(
-            &envelope_record.group_id,
-            TextDeliveryReceiptInput {
-                message_id: message_id.to_owned(),
-                recipient_leaf: 2,
-                recipient_device_id: receiver.local_user_id(),
-                received_at_ms: self.next_sequence.saturating_add(42_000),
-                envelope_ciphertext_hash: envelope_record.envelope.ciphertext_hash(),
-            },
-            &receiver_signer,
-        )
-        .map_err(|error| error.to_string())?;
-        let envelope_frame = serde_json::to_vec(&envelope_record.envelope)
+        let receipt_frame = receiver_state
+            .handle_text_control_frame(envelope_frame.clone())
+            .ok_or_else(|| "receiver did not accept envelope or generate receipt frame".to_owned())?;
+        let envelope_frame_bytes = serde_json::to_vec(&envelope_frame)
             .map_err(|error| format!("could not encode text envelope frame: {error}"))?;
-        let receipt_frame = serde_json::to_vec(&receipt)
+        let receipt_frame_bytes = serde_json::to_vec(&receipt_frame)
             .map_err(|error| format!("could not encode text receipt frame: {error}"))?;
         let probe = self.probe_active_webrtc_data_channel_request_response(
             requested_kind,
-            envelope_frame,
-            Some(receipt_frame),
+            envelope_frame_bytes,
+            Some(receipt_frame_bytes),
         )?;
         if !probe.text_control_frame_roundtrip || !probe.receipt_frame_roundtrip {
             return Err(
@@ -3680,11 +3682,9 @@ impl PersistedAppState {
                     .to_owned(),
             );
         }
-        self.apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.to_owned(),
-            receipt,
-            recipient_verifying_key_hex: hex::encode(receiver_signer.verifying_key().as_bytes()),
-        })?;
+        if self.handle_text_control_frame(receipt_frame).is_some() {
+            return Err("receipt frame unexpectedly generated a response frame".to_owned());
+        }
         Ok(probe)
     }
 
