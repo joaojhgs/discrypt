@@ -1889,6 +1889,9 @@ const IPFS_PUBSUB_DUPLICATE_CACHE_SECS: u64 = 60;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 const IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS: u64 = 20;
 
+#[cfg(feature = "ipfs-pubsub-adapter")]
+const IPFS_PUBSUB_BOOTSTRAP_CONNECT_TIMEOUT_SECS: u64 = 5;
+
 /// Versioned public bootstrap policy for explicit IPFS/libp2p adapter profiles.
 ///
 /// DNS bootstrap is intentionally disabled while the libp2p DNS stack is
@@ -2240,6 +2243,14 @@ async fn spawn_ipfs_pubsub_room(
     let task_inbox = inbox.clone();
     let listen_addresses = Arc::new(AsyncMutex::new(Vec::<String>::new()));
     let task_listen_addresses = listen_addresses.clone();
+    let connected_peers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failed_bootstrap_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_connected_peers = connected_peers.clone();
+    let task_failed_bootstrap_dials = failed_bootstrap_dials.clone();
+    let bootstrap_dial_count = bootstrap_addrs
+        .iter()
+        .filter(|addr| ipfs_should_dial(addr))
+        .count();
     let task_local_peer_id = local_peer_id.clone();
     let mut listen_tx = Some(listen_tx);
     let task_topic = topic.clone();
@@ -2309,6 +2320,7 @@ async fn spawn_ipfs_pubsub_room(
                             }
                         }
                         libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            task_connected_peers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             let _ = swarm
                                 .behaviour_mut()
@@ -2316,7 +2328,15 @@ async fn spawn_ipfs_pubsub_room(
                                 .get_providers(task_provider_key.clone());
                         }
                         libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            task_connected_peers.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |count| Some(count.saturating_sub(1)),
+                            ).ok();
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        }
+                        libp2p::swarm::SwarmEvent::OutgoingConnectionError { .. } => {
+                            task_failed_bootstrap_dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         libp2p::swarm::SwarmEvent::Behaviour(IpfsPubsubBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. })) => {
                             let _ = IpfsPubsubProviderRoom::record_message(
@@ -2364,6 +2384,37 @@ async fn spawn_ipfs_pubsub_room(
         .map_err(|_| {
             TransportError::SignalingAdapter("ipfs_pubsub listen address dropped".to_owned())
         })?;
+
+    if bootstrap_dial_count > 0 {
+        let deadline =
+            Instant::now() + Duration::from_secs(IPFS_PUBSUB_BOOTSTRAP_CONNECT_TIMEOUT_SECS);
+        loop {
+            if connected_peers.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                break;
+            }
+            if failed_bootstrap_dials.load(std::sync::atomic::Ordering::Relaxed)
+                >= bootstrap_dial_count
+            {
+                return Err(ipfs_typed_error(
+                    "bootstrap_connect",
+                    AdapterReadinessState::ProviderUnhealthy,
+                    format!(
+                        "all configured bootstrap dials failed before a libp2p peer connection was established (bootstrap_dials={bootstrap_dial_count})"
+                    ),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(ipfs_typed_error(
+                    "bootstrap_connect",
+                    AdapterReadinessState::ProviderUnhealthy,
+                    format!(
+                        "timed out waiting for a reachable Discrypt/IPFS pubsub peer (bootstrap_dials={bootstrap_dial_count})"
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
     Ok(IpfsPubsubProviderRoom {
         local_peer_id,
@@ -4196,6 +4247,59 @@ mod tests {
 
         alice_room.leave().await?;
         bob_room.leave().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_unreachable_bootstrap_maps_to_typed_health() -> Result<(), TransportError>
+    {
+        let adapter = IpfsPubsubProviderAdapter;
+        let peer = SignalingPeerId::new("alice-device")?;
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"ipfs unreachable bootstrap",
+                "test",
+            ),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::IpfsPubsub,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("ipfs_pubsub", "unreachable bootstrap test")?,
+        )?;
+        let profile = SignalingAdapterProfile {
+            profile_id: "ipfs-unreachable-bootstrap".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("/ip4/127.0.0.1/tcp/9"),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "unreachable bootstrap test")?,
+        };
+
+        let error = match adapter
+            .connect(profile)
+            .await?
+            .join(scope, capability, peer)
+            .await
+        {
+            Ok(_) => panic!("unreachable bootstrap must fail with typed health"),
+            Err(error) => error,
+        };
+        let TransportError::SignalingAdapter(message) = error else {
+            panic!("expected signaling adapter error");
+        };
+        assert!(message.contains("bootstrap_connect"));
+        assert!(message.contains("failure_class=provider_unhealthy"));
+        assert!(message.contains("health_state=ProviderUnhealthy"));
         Ok(())
     }
 
