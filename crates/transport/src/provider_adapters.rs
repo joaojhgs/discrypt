@@ -1777,6 +1777,86 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_feature_gate_remains_fail_closed_until_real_pubsub_runtime_is_wired(
+    ) -> Result<(), TransportError> {
+        let boundary = adapter_boundary_for_kind(SignalingAdapterKind::IpfsPubsub);
+        assert_eq!(
+            boundary.readiness,
+            ProviderAdapterReadiness::ImplementationUnavailable
+        );
+        assert_eq!(boundary.failure_class(), "implementation_unavailable");
+        assert!(!SignalingAdapterFactory::for_kind(SignalingAdapterKind::IpfsPubsub).selectable());
+
+        let plan = plan_signaling_adapter_fallback(
+            &[SignalingAdapterKind::IpfsPubsub],
+            AdapterFallbackBehavior::ManualOnly,
+            Some(SignalingAdapterKind::IpfsPubsub),
+        );
+        assert_eq!(plan.selected, None);
+        assert_eq!(plan.attempts.len(), 1);
+        assert_eq!(
+            plan.attempts[0].readiness,
+            AdapterReadinessState::ImplementationUnavailable
+        );
+        assert!(!plan.attempts[0].selected);
+
+        let adapter = FeatureGatedProviderAdapter::new(SignalingAdapterKind::IpfsPubsub);
+        let error = adapter
+            .connect(valid_profile(SignalingAdapterKind::IpfsPubsub)?)
+            .await;
+        assert!(matches!(error, Err(TransportError::SignalingAdapter(_))));
+        let message = error
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("ipfs_pubsub"));
+        assert!(message.contains("no audited production provider client is wired"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn quic_rendezvous_feature_gate_remains_fail_closed_until_sibling_client_is_wired(
+    ) -> Result<(), TransportError> {
+        let boundary = adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous);
+        assert_eq!(
+            boundary.readiness,
+            ProviderAdapterReadiness::ImplementationUnavailable
+        );
+        assert_eq!(boundary.failure_class(), "implementation_unavailable");
+        assert!(!SignalingAdapterFactory::for_kind(SignalingAdapterKind::DiscryptQuicRendezvous)
+            .selectable());
+
+        let plan = plan_signaling_adapter_fallback(
+            &[SignalingAdapterKind::DiscryptQuicRendezvous],
+            AdapterFallbackBehavior::ManualOnly,
+            Some(SignalingAdapterKind::DiscryptQuicRendezvous),
+        );
+        assert_eq!(plan.selected, None);
+        assert_eq!(plan.attempts.len(), 1);
+        assert_eq!(
+            plan.attempts[0].readiness,
+            AdapterReadinessState::ImplementationUnavailable
+        );
+        assert!(!plan.attempts[0].selected);
+
+        let adapter =
+            FeatureGatedProviderAdapter::new(SignalingAdapterKind::DiscryptQuicRendezvous);
+        let error = adapter
+            .connect(valid_profile(SignalingAdapterKind::DiscryptQuicRendezvous)?)
+            .await;
+        assert!(matches!(error, Err(TransportError::SignalingAdapter(_))));
+        let message = error
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("discrypt_quic_rendezvous"));
+        assert!(message.contains("no audited production provider client is wired"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_gated_session_and_room_methods_fail_closed() -> Result<(), TransportError> {
         let boundary = adapter_boundary_for_kind(SignalingAdapterKind::Mqtt);
         let session = FeatureGatedProviderSession { boundary };

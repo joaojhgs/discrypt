@@ -7,9 +7,9 @@ _Last updated: 2026-05-30_
 Discrypt is **not production-complete** for the full serverless P2P encrypted app target yet. This update made the first real public-provider signaling path work at the Rust transport boundary:
 
 - **MQTT public signaling: implemented behind `mqtt-adapter` and verified against a real public broker.**
-- **Nostr signaling: still fail-closed; no real relay client is wired yet.**
-- **IPFS/libp2p PubSub signaling: still fail-closed; no real pubsub client/runtime is wired yet.**
-- **Separate Rust QUIC rendezvous adapter: still fail-closed in this repo; intended to point at the sibling service once the external adapter client is wired.**
+- **Nostr signaling: fail-closed groundwork is locked by `nostr-adapter` feature tests; no real relay client is wired yet.**
+- **IPFS/libp2p PubSub signaling: fail-closed groundwork is locked by `ipfs-pubsub-adapter` feature tests; no real pubsub client/runtime is wired yet.**
+- **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
 - **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof is at the transport signaling adapter layer, not the complete UI/backend/media plane.
 
 ## What was implemented now
@@ -41,6 +41,27 @@ Behavior:
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
 - **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
 
+### Fail-closed adapter readiness groundwork
+
+Files:
+
+- `docs/adapters/nostr-adapter-readiness.md`
+- `docs/adapters/ipfs-pubsub-adapter-readiness.md`
+- `docs/adapters/quic-rendezvous-adapter-readiness.md`
+
+Commands:
+
+```bash
+cargo test -q -p discrypt-transport --features nostr-adapter \
+  nostr_feature_gate_remains_fail_closed_until_real_relay_client_is_wired
+cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
+  ipfs_pubsub_feature_gate_remains_fail_closed_until_real_pubsub_runtime_is_wired
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
+  quic_rendezvous_feature_gate_remains_fail_closed_until_sibling_client_is_wired
+```
+
+Result: all three pass and prove those adapters remain non-selectable until real provider clients are implemented and tested.
+
 ### Public real-network test
 
 File:
@@ -70,6 +91,7 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 
 ### P0: adapter support gaps
 
+- [x] Lock Nostr feature-gate/fail-closed readiness and document production requirements.
 - [ ] Implement real Nostr adapter:
   - connect to configured public `wss://` relays,
   - sign Nostr events correctly,
@@ -77,12 +99,14 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
   - receive/filter by rendezvous topic,
   - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`,
   - add real public relay E2E with two users.
+- [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
 - [ ] Implement real IPFS/libp2p PubSub adapter:
   - choose and audit Rust or JS/libp2p runtime,
   - configure bootstrap peers/resource limits,
   - support topic cleanup and duplicate suppression,
   - define what “public default IPFS” means without requiring a user-hosted Kubo API,
   - add realistic multi-node or public-swarm E2E.
+- [x] Lock separate Rust QUIC rendezvous feature-gate/fail-closed readiness and document production requirements.
 - [ ] Wire separate Rust QUIC rendezvous adapter:
   - use the sibling signaling service as an explicit/self-hosted adapter,
   - validate QUIC endpoint identity/fingerprint from policy/invite,
