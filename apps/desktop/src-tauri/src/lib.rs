@@ -1578,7 +1578,68 @@ impl TauriAppService {
         self.state.last_command_error = None;
         update(&mut self.state);
         self.persist();
-        self.state.to_view()
+        self.to_view()
+    }
+
+    fn to_view(&self) -> AppStateView {
+        let mut view = self.state.to_view();
+        view.transport_status
+            .push(self.text_control_runtime_status_row());
+        view
+    }
+
+    fn text_control_runtime_status_row(&self) -> TransportStatusView {
+        let Some(session) = &self.state.text_session else {
+            return TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "idle".to_owned(),
+                detail: "No text transport session is active; the signed text/control outbox pump stays idle".to_owned(),
+            };
+        };
+        let session_state = session.state();
+        let session_active = !matches!(
+            session_state,
+            TransportSessionState::Idle
+                | TransportSessionState::Disconnected
+                | TransportSessionState::Failed
+                | TransportSessionState::Cancelled
+        );
+        match (&self.text_control_transport_runtime, session_active) {
+            (Some(runtime), true) if runtime.session_id == session.session_id => TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "attached".to_owned(),
+                detail: format!(
+                    "App-service text/control pump owns runtime session {} and can drain signed pending frames",
+                    runtime.session_id
+                ),
+            },
+            (Some(runtime), true) => TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "stale-runtime".to_owned(),
+                detail: format!(
+                    "Attached runtime session {} does not match active text session {}; restart text transport before claiming delivery",
+                    runtime.session_id, session.session_id
+                ),
+            },
+            (None, true) => TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "not-attached".to_owned(),
+                detail: format!(
+                    "Text session {} is {}, but no app-service transport runtime is attached; pending frames remain queued until a live runtime is bound",
+                    session.session_id,
+                    PersistedAppState::transport_state_label(session_state)
+                ),
+            },
+            (_, false) => TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "inactive".to_owned(),
+                detail: format!(
+                    "Text session {} is {}; the pump will not send frames from an inactive session",
+                    session.session_id,
+                    PersistedAppState::transport_state_label(session_state)
+                ),
+            },
+        }
     }
 
     fn persist(&self) {
@@ -1722,7 +1783,11 @@ pub fn app_snapshot() -> AppSnapshot {
 
 /// Tauri command: return the full command-backed app state for the React shell.
 pub fn app_state() -> AppStateView {
-    with_state(|state| state.to_view())
+    let service = app_service();
+    let guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.to_view()
 }
 
 /// Tauri command: start the backend signaling control-plane transport session.
@@ -5882,7 +5947,7 @@ fn mutate_app_service_with_result<T>(
     guard.state.last_command_error = None;
     let result = update(&mut guard.state);
     guard.persist();
-    let view = guard.state.to_view();
+    let view = guard.to_view();
     (view, result)
 }
 
@@ -8454,7 +8519,8 @@ mod tests {
                 "TURN",
                 "degraded",
                 "reconnecting",
-                "failed"
+                "failed",
+                "text/control runtime"
             ]
         );
         assert!(state
