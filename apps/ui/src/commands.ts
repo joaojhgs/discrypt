@@ -1292,6 +1292,99 @@ function dmConnectivityPolicy(
   };
 }
 
+
+function hashCommitment(domain: string, parts: string[]): string {
+  return stableHash(`${domain}:${parts.join(":")}`);
+}
+
+function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
+  const endpoints: Record<string, string> = {
+    mqtt: "wss://mqtt.discrypt.invalid/mqtt",
+    nostr: "wss://nostr.discrypt.invalid",
+    ipfs_pubsub: "https://ipfs.discrypt.invalid/bootstrap/pubsub",
+    discrypt_quic_rendezvous: "quic://signaling.discrypt.invalid:443/rendezvous",
+  };
+  return Object.entries(endpoints).map(([adapterKind, endpoint]) => ({
+    profile_id: `${adapterKind}-default`,
+    adapter_kind: adapterKind,
+    endpoints: [endpoint],
+    room_topic_commitment: hashCommitment(
+      "discrypt-rendezvous-topic-commitment-v1",
+      [scopeCommitment, adapterKind],
+    ),
+    trust_fingerprint: stableHash(
+      `external-signaling-endpoint-fingerprint-v1:${endpoint}`,
+    ),
+    ttl_seconds: 300,
+    metadata_posture: "hashed_topic",
+    rate_limit_policy: "bounded publish/take with provider backoff",
+    capabilities: [
+      "presence_ttl",
+      "trickle_ice",
+      "broadcast_control",
+      "health_telemetry",
+    ],
+  }));
+}
+
+function groupConnectivityPolicy(groupId: string): ConnectivityPolicyView {
+  const scope = hashCommitment("discrypt-group-scope-commitment-v1", [groupId]);
+  return {
+    connectivity_schema_version: 1,
+    invite_kind: "group_join",
+    scope_id_commitment: scope,
+    signaling_profiles: defaultSignalingProfiles(scope),
+    ice_stun_servers: defaultIceStunServers(),
+    ice_turn_servers: defaultRedactedTurnServers(),
+    privacy_label:
+      "Group invite topics are derived commitments; group names, channel names, and room secrets are not exposed",
+    dm_bootstrap: null,
+    group_bootstrap: {
+      group_identity_commitment: scope,
+      role_admission_policy_commitment: hashCommitment(
+        "discrypt-group-admission-policy-commitment-v1",
+        [groupId],
+      ),
+      channel_policy_commitment: hashCommitment(
+        "discrypt-channel-policy-commitment-v1",
+        [groupId],
+      ),
+    },
+  };
+}
+
+function dmConnectivityPolicy(
+  dmId: string,
+  participantId: string,
+): ConnectivityPolicyView {
+  const scope = hashCommitment("discrypt-dm-scope-commitment-v1", [dmId]);
+  return {
+    connectivity_schema_version: 1,
+    invite_kind: "dm_contact",
+    scope_id_commitment: scope,
+    signaling_profiles: defaultSignalingProfiles(scope),
+    ice_stun_servers: defaultIceStunServers(),
+    ice_turn_servers: defaultRedactedTurnServers(),
+    privacy_label:
+      "DM contact invite topics are derived commitments; aliases, safety numbers, and room secrets are not exposed",
+    dm_bootstrap: {
+      inviter_identity_commitment: hashCommitment(
+        "discrypt-dm-inviter-identity-commitment-v1",
+        [participantId],
+      ),
+      contact_token_commitment: hashCommitment(
+        "discrypt-dm-contact-token-commitment-v1",
+        [dmId, participantId],
+      ),
+      reply_rendezvous_commitment: hashCommitment(
+        "discrypt-dm-reply-rendezvous-commitment-v1",
+        [dmId],
+      ),
+    },
+    group_bootstrap: null,
+  };
+}
+
 function productionInviteLink(metadata: ParsedInviteMetadata): string {
   const query = new URLSearchParams({
     endpoint: metadata.signalingEndpoint,

@@ -3537,6 +3537,18 @@ fn default_signaling_endpoint() -> String {
     configured.unwrap_or_else(|| InviteSignalingMetadata::default_production().signaling_endpoint)
 }
 
+fn default_ice_stun_servers() -> Vec<String> {
+    vec!["stun:default.discrypt.invalid:3478".to_owned()]
+}
+
+fn default_redacted_turn_servers() -> Vec<IceTurnServerView> {
+    vec![IceTurnServerView {
+        endpoint: "turns:default.discrypt.invalid:5349".to_owned(),
+        credential_declared: false,
+        credential_expires_at: None,
+    }]
+}
+
 fn hash_commitment(domain: &str, parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
