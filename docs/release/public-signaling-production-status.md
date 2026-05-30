@@ -836,3 +836,23 @@ staged/deployed HTTPS/WSS rendezvous service proof with external TLS
 certificate/public-key pinning and capture evidence. Native `quic://` transport
 remains reserved; this adapter is still the sibling service API rendezvous path
 for sealed signaling, not a replacement for WebRTC data/audio.
+
+## 2026-05-30 update: public MQTT/Nostr role-split text runtime proofs passed
+
+The public MQTT and Nostr adapters now have env-enabled role-split runtime
+evidence at the transport boundary. In these gates the answerer runtime starts
+first, the offerer runtime starts separately with reciprocal peer ids, the
+selected public provider carries only sealed WebRTC negotiation payloads, a real
+DataChannel opens, the offerer sends an opaque text/control frame through its
+`TextControlDataTransport`, and the answerer returns an opaque receipt over the
+same runtime.
+
+Verification run:
+
+- `DISCRYPT_PUBLIC_MQTT_ROLE_SPLIT_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_role_split_text_runtime_roundtrip -- --nocapture` — passed
+- `DISCRYPT_PUBLIC_NOSTR_ROLE_SPLIT_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-transport --features nostr-adapter --test public_webrtc_datachannel_e2e public_nostr_role_split_text_runtime_roundtrip -- --nocapture` — passed
+
+Remaining gap: this is transport-boundary role-split runtime evidence, not a
+two-installed-Tauri-process GUI test and not remote voice/audio. IPFS public
+topic-peer, deployed Discrypt rendezvous, credentialed TURN relay-only, installed
+GUI two-window E2E, and real voice/audio capture/playback E2E remain open.
