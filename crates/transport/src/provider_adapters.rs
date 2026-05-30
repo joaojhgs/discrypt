@@ -10,8 +10,8 @@
 #[cfg(feature = "mqtt-adapter")]
 use crate::SignalingProviderEndpoint;
 use crate::{
-    AdapterSession, AdapterTrustLabel, ControlBroadcast, ConversationScope, OpaqueSignalingPayload,
-    PeerSignal, PresenceEvent, RendezvousCapability, RendezvousRoom,
+    AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast, ConversationScope,
+    OpaqueSignalingPayload, PeerSignal, PresenceEvent, RendezvousCapability, RendezvousRoom,
     SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingAdapterCapabilities,
     SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity, SignalingHealth,
     SignalingHealthState, SignalingObservability, SignalingPeerId, TransportError,
@@ -24,6 +24,289 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(feature = "mqtt-adapter")]
 use tokio::time::{timeout, Duration, Instant};
+
+/// End-to-end readiness state used by registry and fallback planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterReadinessState {
+    /// Adapter feature is not enabled in this build.
+    FeatureDisabled,
+    /// Feature is enabled but no audited provider client is wired yet.
+    ImplementationUnavailable,
+    /// The implementation is present and selectable for attempts.
+    Available,
+    /// Adapter health check or connect attempt failed.
+    ProviderUnhealthy,
+    /// Adapter is currently rate limited.
+    ProviderRateLimited,
+    /// Adapter requires authentication to continue.
+    ProviderAuthRequired,
+    /// Provider rejected payload because it exceeds limits.
+    ProviderMessageTooLarge,
+    /// Adapter trust posture check failed.
+    TrustMismatch,
+    /// ICE fallback contract indicates relay path is required now.
+    IceFailedRequiresTurn,
+    /// Adapter returned a connected/healthy state.
+    Connected,
+}
+
+impl AdapterReadinessState {
+    /// Return true when the adapter can be selected.
+    #[must_use]
+    pub const fn selectable(self) -> bool {
+        matches!(self, Self::Available | Self::Connected)
+    }
+
+    /// Redacted failure class for diagnostics and persistence.
+    #[must_use]
+    pub const fn failure_class(self) -> &'static str {
+        match self {
+            Self::FeatureDisabled => "feature_disabled",
+            Self::ImplementationUnavailable => "implementation_unavailable",
+            Self::Available => "available",
+            Self::ProviderUnhealthy => "provider_unhealthy",
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderAuthRequired => "provider_auth_required",
+            Self::ProviderMessageTooLarge => "provider_message_too_large",
+            Self::TrustMismatch => "trust_mismatch",
+            Self::IceFailedRequiresTurn => "ice_failed_requires_turn",
+            Self::Connected => "connected",
+        }
+    }
+
+    /// Convert a readiness state into redacted health.
+    #[must_use]
+    pub const fn to_health_state(self) -> SignalingHealthState {
+        match self {
+            Self::Available | Self::Connected => SignalingHealthState::Healthy,
+            Self::FeatureDisabled
+            | Self::ImplementationUnavailable
+            | Self::ProviderUnhealthy
+            | Self::ProviderRateLimited
+            | Self::ProviderAuthRequired
+            | Self::ProviderMessageTooLarge
+            | Self::TrustMismatch
+            | Self::IceFailedRequiresTurn => SignalingHealthState::ProviderUnhealthy,
+        }
+    }
+}
+
+/// One required adapter in the ordered registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingAdapterRegistryEntry {
+    /// Adapter kind in the registry.
+    pub kind: SignalingAdapterKind,
+    /// Static feature/build boundary.
+    pub boundary: ProviderAdapterBoundary,
+}
+
+impl SignalingAdapterRegistryEntry {
+    /// Static readiness projected into runtime planning state.
+    #[must_use]
+    pub const fn readiness_state(self) -> AdapterReadinessState {
+        match self.boundary.readiness {
+            ProviderAdapterReadiness::FeatureDisabled => AdapterReadinessState::FeatureDisabled,
+            ProviderAdapterReadiness::ImplementationUnavailable => {
+                AdapterReadinessState::ImplementationUnavailable
+            }
+            ProviderAdapterReadiness::ImplementationAvailable => AdapterReadinessState::Available,
+        }
+    }
+}
+
+/// Registry-backed factory for required adapter kinds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SignalingAdapterFactory {
+    /// MQTT real implementation when feature-gated client is enabled.
+    #[cfg(feature = "mqtt-adapter")]
+    Mqtt(MqttProviderAdapter),
+    /// MQTT fail-closed boundary when feature is disabled.
+    #[cfg(not(feature = "mqtt-adapter"))]
+    Mqtt(FeatureGatedProviderAdapter),
+    /// Nostr boundary until real client is wired.
+    Nostr(FeatureGatedProviderAdapter),
+    /// IPFS/libp2p PubSub boundary until real client is wired.
+    IpfsPubsub(FeatureGatedProviderAdapter),
+    /// Rust QUIC rendezvous boundary until real client is wired.
+    DiscryptQuicRendezvous(FeatureGatedProviderAdapter),
+}
+
+impl SignalingAdapterFactory {
+    /// Build a concrete adapter entry for one required kind.
+    #[must_use]
+    pub const fn for_kind(kind: SignalingAdapterKind) -> Self {
+        match kind {
+            SignalingAdapterKind::Mqtt => {
+                #[cfg(feature = "mqtt-adapter")]
+                {
+                    Self::Mqtt(MqttProviderAdapter)
+                }
+                #[cfg(not(feature = "mqtt-adapter"))]
+                {
+                    Self::Mqtt(FeatureGatedProviderAdapter::new(kind))
+                }
+            }
+            SignalingAdapterKind::Nostr => Self::Nostr(FeatureGatedProviderAdapter::new(kind)),
+            SignalingAdapterKind::IpfsPubsub => {
+                Self::IpfsPubsub(FeatureGatedProviderAdapter::new(kind))
+            }
+            SignalingAdapterKind::DiscryptQuicRendezvous => {
+                Self::DiscryptQuicRendezvous(FeatureGatedProviderAdapter::new(kind))
+            }
+        }
+    }
+
+    /// Registry boundary for this entry.
+    #[must_use]
+    pub const fn boundary(self) -> ProviderAdapterBoundary {
+        match self {
+            #[cfg(feature = "mqtt-adapter")]
+            Self::Mqtt(_) => adapter_boundary_for_kind(SignalingAdapterKind::Mqtt),
+            #[cfg(not(feature = "mqtt-adapter"))]
+            Self::Mqtt(adapter) => adapter.boundary(),
+            Self::Nostr(adapter) => adapter.boundary(),
+            Self::IpfsPubsub(adapter) => adapter.boundary(),
+            Self::DiscryptQuicRendezvous(adapter) => adapter.boundary(),
+        }
+    }
+
+    /// Adapter kind for this factory entry.
+    #[must_use]
+    pub const fn kind(self) -> SignalingAdapterKind {
+        self.boundary().kind
+    }
+
+    /// Readiness for this entry in fallback planning.
+    #[must_use]
+    pub const fn readiness_state(self) -> AdapterReadinessState {
+        self.boundary().readiness_state()
+    }
+
+    /// True when this entry can be selected for attempts.
+    #[must_use]
+    pub const fn selectable(self) -> bool {
+        self.readiness_state().selectable()
+    }
+}
+
+/// Ordered registry of all required adapter boundaries.
+#[must_use]
+pub const fn required_provider_adapter_registry() -> [SignalingAdapterRegistryEntry; 4] {
+    [
+        SignalingAdapterRegistryEntry {
+            kind: SignalingAdapterKind::Mqtt,
+            boundary: adapter_boundary_for_kind(SignalingAdapterKind::Mqtt),
+        },
+        SignalingAdapterRegistryEntry {
+            kind: SignalingAdapterKind::Nostr,
+            boundary: adapter_boundary_for_kind(SignalingAdapterKind::Nostr),
+        },
+        SignalingAdapterRegistryEntry {
+            kind: SignalingAdapterKind::IpfsPubsub,
+            boundary: adapter_boundary_for_kind(SignalingAdapterKind::IpfsPubsub),
+        },
+        SignalingAdapterRegistryEntry {
+            kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+            boundary: adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous),
+        },
+    ]
+}
+
+/// One fallback attempt record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingAdapterFallbackAttempt {
+    /// Candidate adapter kind.
+    pub kind: SignalingAdapterKind,
+    /// Planned readiness state for this attempt.
+    pub readiness: AdapterReadinessState,
+    /// Adapter was attempted under the selected behavior.
+    pub attempted: bool,
+    /// Adapter won selection under the active behavior.
+    pub selected: bool,
+}
+
+/// Deterministic adapter fallback contract output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingAdapterFallbackPlan {
+    /// Requested fallback behavior.
+    pub behavior: AdapterFallbackBehavior,
+    /// Ordered candidate attempts.
+    pub attempts: Vec<SignalingAdapterKind>,
+    /// Selected adapter kind, if any.
+    pub selected: Option<SignalingAdapterKind>,
+}
+
+impl SignalingAdapterFallbackPlan {
+    /// True when at least one candidate was selected.
+    #[must_use]
+    pub fn has_selected(&self) -> bool {
+        self.selected.is_some()
+    }
+
+    /// True when every candidate was non-selectable.
+    #[must_use]
+    pub fn all_unavailable(&self) -> bool {
+        !self.has_selected()
+    }
+}
+
+/// Build a deterministic fallback plan from requested candidates and policy.
+#[must_use]
+pub fn plan_signaling_adapter_fallback(
+    requested: &[SignalingAdapterKind],
+    behavior: AdapterFallbackBehavior,
+    manual: Option<SignalingAdapterKind>,
+) -> SignalingAdapterFallbackPlan {
+    let mut requested_unique = Vec::new();
+    for kind in requested {
+        if !requested_unique.contains(kind) {
+            requested_unique.push(*kind);
+        }
+    }
+
+    let ordered = if matches!(behavior, AdapterFallbackBehavior::ManualOnly) {
+        manual.into_iter().collect::<Vec<_>>()
+    } else {
+        requested_unique
+    };
+
+    let mut selected = None;
+    let mut attempts = Vec::new();
+    for kind in ordered {
+        let readiness = SignalingAdapterFactory::for_kind(kind).readiness_state();
+        let is_selected = match behavior {
+            AdapterFallbackBehavior::TryAll => selected.is_none() && readiness.selectable(),
+            AdapterFallbackBehavior::FirstHealthy => selected.is_none() && readiness.selectable(),
+            AdapterFallbackBehavior::ManualOnly => readiness.selectable(),
+        };
+        if is_selected {
+            selected = Some(kind);
+        }
+
+        let attempted = match behavior {
+            AdapterFallbackBehavior::TryAll => true,
+            AdapterFallbackBehavior::FirstHealthy => selected.is_none() || is_selected,
+            AdapterFallbackBehavior::ManualOnly => is_selected,
+        };
+
+        attempts.push(kind);
+
+        if matches!(behavior, AdapterFallbackBehavior::FirstHealthy | AdapterFallbackBehavior::ManualOnly)
+            && is_selected
+        {
+            break;
+        }
+    }
+
+    // The contract currently records only selection and ordering in this layer.
+    // Attempts carry full readiness through typed telemetry attached by callers.
+    SignalingAdapterFallbackPlan {
+        behavior,
+        attempts,
+        selected,
+    }
+}
 
 /// Production readiness for a provider adapter boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
