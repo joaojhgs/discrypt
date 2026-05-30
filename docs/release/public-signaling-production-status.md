@@ -405,3 +405,25 @@ DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 \
 ```
 
 The test is intentionally environment-gated so normal unit tests do not depend on public network availability.
+
+### 2026-05-30 role-split runtime progress
+
+- [x] Added transport-level role-split provider WebRTC text/control runtime APIs:
+  - `start_provider_webrtc_text_control_offer_runtime(...)`
+  - `start_provider_webrtc_text_control_answer_runtime_with_answerer(...)`
+  - `ProviderTextControlRuntime`, `ProviderTextControlRuntimePeerEvidence`, and `ProviderTextControlRuntimePeerRole`
+- [x] Proved the new runtime shape with two separately started local provider peers over the signaling adapter boundary. The answerer starts first, waits in the rendezvous scope, receives the sealed offer, answers, opens a real WebRTC DataChannel, receives an opaque frame, and returns an opaque receipt to the offerer.
+- [x] Kept provider-visible material opaque in the role-split test by scanning the local conformance bus for forbidden plaintext/SDP markers.
+- [ ] Wire the role-split runtime APIs into `attach_text_control_transport_runtime` and app state. The Tauri command still uses the fail-closed persisted probe resume path until the backend request carries role/local-peer/remote-peer configuration and stores a `ProviderTextControlRuntime` handle.
+- [ ] Wire the UI to start the answerer/offerer lifecycle from DM/group invite state. The current UI command layer has wrappers for attach/pump but does not yet drive the new role-split runtime lifecycle.
+
+Verification added/run:
+
+```bash
+cargo fmt --all --check
+cargo check -q -p discrypt-transport
+cargo check -q -p discrypt-transport --features mqtt-adapter,nostr-adapter
+cargo check -q -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter
+cargo test -q -p discrypt-transport live_provider_text_control_role_split_runtimes_connect_two_peers -- --nocapture
+cargo test -q -p discrypt-transport live_provider_text_control_runtime_pair_carries_multiple_opaque_frames -- --nocapture
+```

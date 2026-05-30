@@ -538,6 +538,93 @@ impl Drop for ProviderTextControlRuntimePair {
     }
 }
 
+/// Role of one installed app instance in a provider-backed WebRTC text/control runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTextControlRuntimePeerRole {
+    /// Peer that creates the WebRTC offer and owns the initiating DataChannel.
+    Offerer,
+    /// Peer that waits for the offer, answers it, and may run a receive/respond loop.
+    Answerer,
+}
+
+/// Evidence returned when one installed app instance attaches one side of a live runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTextControlRuntimePeerEvidence {
+    /// Adapter that opened the runtime.
+    pub kind: SignalingAdapterKind,
+    /// Profile id supplied by app/runtime policy.
+    pub profile_id: String,
+    /// Redacted provider endpoint label used by the profile.
+    pub endpoint_label: String,
+    /// Committed scope used to derive the rendezvous topic.
+    pub scope_commitment: String,
+    /// Provider-visible derived rendezvous topic/tag.
+    pub rendezvous_topic: String,
+    /// Stable, scoped local peer id used only for provider routing.
+    pub local_peer_id: SignalingPeerId,
+    /// Stable, scoped remote peer id used only for provider routing.
+    pub remote_peer_id: SignalingPeerId,
+    /// Offerer/answerer role for this installed app instance.
+    pub role: ProviderTextControlRuntimePeerRole,
+    /// This peer reached WebRTC connected/completed state.
+    pub direct_path_ready: bool,
+    /// This peer's DataChannel opened.
+    pub data_channel_open: bool,
+    /// Versioned serialized runtime handoff material captured during attach.
+    pub runtime_spec: ProviderTextControlRuntimeSpec,
+}
+
+/// One installed app's live provider-backed text/control runtime.
+///
+/// Unlike [`ProviderTextControlRuntimePair`], this handle owns only one side of
+/// the WebRTC session. It is the transport-layer primitive needed by two
+/// separate Tauri app instances: one side waits as answerer, the other side
+/// initiates as offerer, and both exchange only sealed negotiation payloads over
+/// the selected adapter.
+pub struct ProviderTextControlRuntime {
+    evidence: ProviderTextControlRuntimePeerEvidence,
+    peer: Option<Arc<WebRtcNegotiator>>,
+    receiver_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ProviderTextControlRuntime {
+    /// Runtime attach evidence safe to surface to the app/UI.
+    #[must_use]
+    pub const fn evidence(&self) -> &ProviderTextControlRuntimePeerEvidence {
+        &self.evidence
+    }
+
+    /// App-facing text/control DataChannel transport for this installed peer.
+    #[must_use]
+    pub fn transport(&self) -> Arc<dyn TextControlDataTransport> {
+        self.peer
+            .as_ref()
+            .expect("provider runtime transport is present until close")
+            .clone()
+    }
+
+    /// Abort any receive/respond loop and close this peer connection.
+    pub async fn close(mut self) -> Result<(), TransportError> {
+        if let Some(task) = self.receiver_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(peer) = self.peer.take() {
+            peer.tear_down().await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProviderTextControlRuntime {
+    fn drop(&mut self) {
+        if let Some(task) = self.receiver_task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Inputs required to resume a provider-backed WebRTC text/control runtime from a
 /// previously proven peer rendezvous path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1160,6 +1247,103 @@ where
     .await
 }
 
+/// Start the offerer side of a provider-backed WebRTC text/control runtime.
+///
+/// The matching answerer must be running in the same scope with the same
+/// profile/bootstrap material and the reciprocal peer ids. This function is
+/// production-shaped for installed app instances: it does not create the remote
+/// peer in-process and it fails if signaling/WebRTC cannot establish a real
+/// DataChannel.
+pub async fn start_provider_webrtc_text_control_offer_runtime(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+) -> Result<ProviderTextControlRuntime, TransportError> {
+    validate_runtime_peer_inputs(
+        &profile,
+        &scope,
+        &negotiation_config,
+        &local_peer_id,
+        &remote_peer_id,
+    )?;
+    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    start_provider_webrtc_text_control_offer_runtime_with_factory(
+        factory,
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        negotiation_config,
+        local_peer_id,
+        remote_peer_id,
+    )
+    .await
+}
+
+/// Start the answerer side of a provider-backed WebRTC text/control runtime.
+///
+/// The returned handle owns only this peer's WebRTC connection. The optional
+/// receive/respond loop invokes `answerer` for each opaque inbound frame and
+/// sends any non-empty opaque response back over the same DataChannel.
+pub async fn start_provider_webrtc_text_control_answer_runtime_with_answerer<F>(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+    answerer: F,
+) -> Result<ProviderTextControlRuntime, TransportError>
+where
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    validate_runtime_peer_inputs(
+        &profile,
+        &scope,
+        &negotiation_config,
+        &local_peer_id,
+        &remote_peer_id,
+    )?;
+    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    start_provider_webrtc_text_control_answer_runtime_with_factory(
+        factory,
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        negotiation_config,
+        local_peer_id,
+        remote_peer_id,
+        answerer,
+    )
+    .await
+}
+
+fn validate_runtime_peer_inputs(
+    profile: &SignalingAdapterProfile,
+    scope: &ConversationScope,
+    negotiation_config: &WebRtcNegotiationConfig,
+    local_peer_id: &SignalingPeerId,
+    remote_peer_id: &SignalingPeerId,
+) -> Result<(), TransportError> {
+    profile.validate()?;
+    scope.validate()?;
+    negotiation_config
+        .ice_servers
+        .validate_credentials_at(chrono::Utc::now())?;
+    if local_peer_id == remote_peer_id {
+        return Err(TransportError::InvalidConnectivityPolicy(
+            "text/control runtime peer ids must be distinct".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn start_provider_webrtc_text_control_runtime_pair_with_factory<F>(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
@@ -1294,6 +1478,278 @@ where
                     negotiation_config,
                     offerer_peer_id,
                     answerer_peer_id,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+    }
+}
+
+async fn start_provider_webrtc_text_control_offer_runtime_with_factory(
+    factory: SignalingAdapterFactory,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+) -> Result<ProviderTextControlRuntime, TransportError> {
+    match factory {
+        SignalingAdapterFactory::Mqtt(adapter) => {
+            #[cfg(feature = "mqtt-adapter")]
+            {
+                start_provider_webrtc_text_control_offer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "mqtt-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::Nostr(adapter) => {
+            #[cfg(feature = "nostr-adapter")]
+            {
+                start_provider_webrtc_text_control_offer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "nostr-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::IpfsPubsub(adapter) => {
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            {
+                start_provider_webrtc_text_control_offer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            {
+                start_provider_webrtc_text_control_offer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+    }
+}
+
+async fn start_provider_webrtc_text_control_answer_runtime_with_factory<F>(
+    factory: SignalingAdapterFactory,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+    answerer: F,
+) -> Result<ProviderTextControlRuntime, TransportError>
+where
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    match factory {
+        SignalingAdapterFactory::Mqtt(adapter) => {
+            #[cfg(feature = "mqtt-adapter")]
+            {
+                start_provider_webrtc_text_control_answer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "mqtt-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::Nostr(adapter) => {
+            #[cfg(feature = "nostr-adapter")]
+            {
+                start_provider_webrtc_text_control_answer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "nostr-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::IpfsPubsub(adapter) => {
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            {
+                start_provider_webrtc_text_control_answer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            {
+                start_provider_webrtc_text_control_answer_runtime_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    local_peer_id,
+                    remote_peer_id,
                     answerer,
                 );
                 Err(adapter.boundary().unavailable_error())
@@ -1734,6 +2190,332 @@ where
         answerer: Some(bob_webrtc),
         answerer_task: Some(answerer_task),
     })
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+async fn start_provider_webrtc_text_control_offer_runtime_with_adapter<A>(
+    adapter: A,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+) -> Result<ProviderTextControlRuntime, TransportError>
+where
+    A: SignalingAdapter,
+{
+    let endpoint_label = profile
+        .endpoints
+        .first()
+        .map(|endpoint| redacted_endpoint_label(&endpoint.endpoint.0))
+        .unwrap_or_else(|| "endpoint#missing".to_owned());
+    let capability = RendezvousCapability::derive(
+        scope.clone(),
+        profile.kind,
+        bootstrap_secret,
+        random_entropy,
+        120,
+        profile.metadata_posture,
+        profile.trust_label.clone(),
+    )?;
+    let rendezvous_topic = capability.topic.clone();
+    let session = adapter.connect(profile.clone()).await?;
+    let room = session
+        .join(scope.clone(), capability, local_peer_id.clone())
+        .await?;
+
+    let webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
+    let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
+    let sealed_offer = sealer.seal_description(&webrtc.create_offer().await?)?;
+    let opaque_offer = sealed_offer.to_opaque_bytes()?;
+    if opaque_offer.windows(3).any(|window| window == b"v=0") {
+        return Err(TransportError::PlaintextLeak);
+    }
+    room.send_signal(remote_peer_id.clone(), sealed_offer.clone())
+        .await?;
+
+    let mut captured_sealed_answer = None;
+    let mut sealed_ice_candidates = Vec::new();
+    let mut answer_applied = false;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        for candidate in webrtc.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            sealed_ice_candidates.push(sealed_candidate.clone());
+            room.send_signal(remote_peer_id.clone(), sealed_candidate)
+                .await?;
+        }
+
+        for signal in room.take_signals().await? {
+            if signal.from_peer != remote_peer_id || signal.to_peer != local_peer_id {
+                continue;
+            }
+            match signal.payload.kind {
+                WebRtcNegotiationPayloadKind::Answer if !answer_applied => {
+                    captured_sealed_answer = Some(signal.payload.clone());
+                    webrtc
+                        .accept_answer(sealer.open_description(&signal.payload)?)
+                        .await?;
+                    answer_applied = true;
+                }
+                WebRtcNegotiationPayloadKind::Candidate => {
+                    sealed_ice_candidates.push(signal.payload.clone());
+                    webrtc
+                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Offer | WebRtcNegotiationPayloadKind::Answer => {}
+            }
+        }
+
+        if answer_applied && webrtc.direct_path_metrics().await.direct_path_ready {
+            webrtc
+                .wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let data_metrics = webrtc.text_control_transport_metrics().await;
+    if !data_metrics.open {
+        return Err(TransportError::Unavailable(format!(
+            "provider-signaled offerer WebRTC runtime data channel did not open: {:?}",
+            webrtc.direct_path_metrics().await
+        )));
+    }
+    let direct_metrics = webrtc.direct_path_metrics().await;
+    let runtime_spec = provider_runtime_spec_from_live_material(
+        &profile,
+        &scope,
+        endpoint_label.clone(),
+        rendezvous_topic.clone(),
+        Some(sealed_offer),
+        captured_sealed_answer,
+        sealed_ice_candidates,
+    );
+    let evidence = ProviderTextControlRuntimePeerEvidence {
+        kind: profile.kind,
+        profile_id: profile.profile_id,
+        endpoint_label,
+        scope_commitment: scope.scope_id_commitment,
+        rendezvous_topic,
+        local_peer_id,
+        remote_peer_id,
+        role: ProviderTextControlRuntimePeerRole::Offerer,
+        direct_path_ready: direct_metrics.direct_path_ready,
+        data_channel_open: data_metrics.open,
+        runtime_spec,
+    };
+
+    room.leave().await?;
+    session.close().await?;
+    Ok(ProviderTextControlRuntime {
+        evidence,
+        peer: Some(webrtc),
+        receiver_task: None,
+    })
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+async fn start_provider_webrtc_text_control_answer_runtime_with_adapter<A, F>(
+    adapter: A,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+    answerer: F,
+) -> Result<ProviderTextControlRuntime, TransportError>
+where
+    A: SignalingAdapter,
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    let endpoint_label = profile
+        .endpoints
+        .first()
+        .map(|endpoint| redacted_endpoint_label(&endpoint.endpoint.0))
+        .unwrap_or_else(|| "endpoint#missing".to_owned());
+    let capability = RendezvousCapability::derive(
+        scope.clone(),
+        profile.kind,
+        bootstrap_secret,
+        random_entropy,
+        120,
+        profile.metadata_posture,
+        profile.trust_label.clone(),
+    )?;
+    let rendezvous_topic = capability.topic.clone();
+    let session = adapter.connect(profile.clone()).await?;
+    let room = session
+        .join(scope.clone(), capability, local_peer_id.clone())
+        .await?;
+
+    let webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
+    let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
+    let mut captured_sealed_offer = None;
+    let mut captured_sealed_answer = None;
+    let mut sealed_ice_candidates = Vec::new();
+    let mut answer_sent = false;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        for signal in room.take_signals().await? {
+            if signal.from_peer != remote_peer_id || signal.to_peer != local_peer_id {
+                continue;
+            }
+            match signal.payload.kind {
+                WebRtcNegotiationPayloadKind::Offer if !answer_sent => {
+                    captured_sealed_offer = Some(signal.payload.clone());
+                    let offer = sealer.open_description(&signal.payload)?;
+                    let answer = webrtc.create_answer(offer).await?;
+                    let sealed_answer = sealer.seal_description(&answer)?;
+                    captured_sealed_answer = Some(sealed_answer.clone());
+                    room.send_signal(remote_peer_id.clone(), sealed_answer)
+                        .await?;
+                    answer_sent = true;
+                }
+                WebRtcNegotiationPayloadKind::Candidate => {
+                    sealed_ice_candidates.push(signal.payload.clone());
+                    webrtc
+                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Offer | WebRtcNegotiationPayloadKind::Answer => {}
+            }
+        }
+
+        for candidate in webrtc.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            sealed_ice_candidates.push(sealed_candidate.clone());
+            room.send_signal(remote_peer_id.clone(), sealed_candidate)
+                .await?;
+        }
+
+        if answer_sent && webrtc.direct_path_metrics().await.direct_path_ready {
+            webrtc
+                .wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let data_metrics = webrtc.text_control_transport_metrics().await;
+    if !data_metrics.open {
+        return Err(TransportError::Unavailable(format!(
+            "provider-signaled answerer WebRTC runtime data channel did not open: {:?}",
+            webrtc.direct_path_metrics().await
+        )));
+    }
+    let direct_metrics = webrtc.direct_path_metrics().await;
+    let runtime_spec = provider_runtime_spec_from_live_material(
+        &profile,
+        &scope,
+        endpoint_label.clone(),
+        rendezvous_topic.clone(),
+        captured_sealed_offer,
+        captured_sealed_answer,
+        sealed_ice_candidates,
+    );
+    let evidence = ProviderTextControlRuntimePeerEvidence {
+        kind: profile.kind,
+        profile_id: profile.profile_id,
+        endpoint_label,
+        scope_commitment: scope.scope_id_commitment,
+        rendezvous_topic,
+        local_peer_id,
+        remote_peer_id,
+        role: ProviderTextControlRuntimePeerRole::Answerer,
+        direct_path_ready: direct_metrics.direct_path_ready,
+        data_channel_open: data_metrics.open,
+        runtime_spec,
+    };
+
+    room.leave().await?;
+    session.close().await?;
+
+    let answerer_webrtc = webrtc.clone();
+    let answerer = Arc::new(answerer);
+    let receiver_task = tokio::spawn(async move {
+        loop {
+            let received = match answerer_webrtc.recv_text_control_frame().await {
+                Ok(received) => received,
+                Err(_) => break,
+            };
+            let response = match answerer(received) {
+                Ok(response) => response,
+                Err(_) => break,
+            };
+            if response.is_empty() {
+                continue;
+            }
+            if answerer_webrtc
+                .send_text_control_frame(response)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    Ok(ProviderTextControlRuntime {
+        evidence,
+        peer: Some(webrtc),
+        receiver_task: Some(receiver_task),
+    })
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn provider_runtime_spec_from_live_material(
+    profile: &SignalingAdapterProfile,
+    scope: &ConversationScope,
+    endpoint_label: String,
+    rendezvous_topic: String,
+    sealed_offer: Option<SealedWebRtcNegotiationPayload>,
+    sealed_answer: Option<SealedWebRtcNegotiationPayload>,
+    sealed_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
+) -> ProviderTextControlRuntimeSpec {
+    let now_unix_seconds = Utc::now().timestamp();
+    ProviderTextControlRuntimeSpec {
+        schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+        attachment: ProviderTextControlRuntimeAttachment {
+            adapter_kind: profile.kind.canonical_name().to_owned(),
+            profile_id: profile.profile_id.clone(),
+            endpoint_label,
+            rendezvous_topic,
+            scope_commitment: scope.scope_id_commitment.clone(),
+            runtime_spec: None,
+        },
+        created_at_unix_seconds: now_unix_seconds,
+        expires_at_unix_seconds: now_unix_seconds.saturating_add(60 * 60),
+        sealed_offer,
+        sealed_answer,
+        sealed_ice_candidates,
+        missing_material: Vec::new(),
+    }
 }
 
 #[cfg(any(
@@ -7404,6 +8186,141 @@ mod tests {
         }
 
         runtime.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_provider_text_control_role_split_runtimes_connect_two_peers(
+    ) -> Result<(), TransportError> {
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus.clone());
+        let profile = local_profile(SignalingAdapterKind::Mqtt)?;
+        let scope = ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"alice bob split live runtime",
+                "runtime split",
+            ),
+        )?;
+        let bootstrap_secret = b"runtime split bootstrap secret with thirty two bytes";
+        let random_entropy = b"runtime split entropy";
+        let ice_config = WebRtcNegotiationConfig::new(IceServerConfig::new(
+            vec![Endpoint::new("stun:127.0.0.1:3478")],
+            vec![],
+        )?);
+        let alice = SignalingPeerId::new("alice-installed-device")?;
+        let bob = SignalingPeerId::new("bob-installed-device")?;
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let answerer_received = received.clone();
+
+        let answerer_task = tokio::spawn(
+            start_provider_webrtc_text_control_answer_runtime_with_adapter(
+                adapter.clone(),
+                profile.clone(),
+                scope.clone(),
+                bootstrap_secret,
+                random_entropy,
+                ice_config.clone(),
+                bob.clone(),
+                alice.clone(),
+                move |frame| {
+                    answerer_received
+                        .lock()
+                        .map_err(|_| {
+                            TransportError::Unavailable(
+                                "role-split answerer receipt lock poisoned".to_owned(),
+                            )
+                        })?
+                        .push(frame.clone());
+                    Ok(
+                        format!("ciphertext:role-split-receipt:{}", sha256_hex(&frame))
+                            .into_bytes(),
+                    )
+                },
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let offerer = start_provider_webrtc_text_control_offer_runtime_with_adapter(
+            adapter,
+            profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            ice_config,
+            alice.clone(),
+            bob.clone(),
+        )
+        .await?;
+        let answerer = timeout(Duration::from_secs(10), answerer_task)
+            .await
+            .map_err(|_| {
+                TransportError::Unavailable(
+                    "timed out waiting for role-split answerer runtime".to_owned(),
+                )
+            })?
+            .map_err(|error| {
+                TransportError::Unavailable(format!(
+                    "role-split answerer runtime task join failed: {error}"
+                ))
+            })??;
+
+        assert_eq!(
+            offerer.evidence().role,
+            ProviderTextControlRuntimePeerRole::Offerer
+        );
+        assert_eq!(
+            answerer.evidence().role,
+            ProviderTextControlRuntimePeerRole::Answerer
+        );
+        assert_eq!(offerer.evidence().local_peer_id, alice);
+        assert_eq!(offerer.evidence().remote_peer_id, bob);
+        assert_eq!(answerer.evidence().local_peer_id, bob);
+        assert_eq!(answerer.evidence().remote_peer_id, alice);
+        assert!(offerer.evidence().direct_path_ready);
+        assert!(answerer.evidence().direct_path_ready);
+        assert!(offerer.evidence().data_channel_open);
+        assert!(answerer.evidence().data_channel_open);
+        offerer
+            .evidence()
+            .runtime_spec
+            .validate_for_runtime_attach(
+                Utc::now().timestamp(),
+                &offerer.evidence().runtime_spec.attachment,
+            )?;
+        answerer
+            .evidence()
+            .runtime_spec
+            .validate_for_runtime_attach(
+                Utc::now().timestamp(),
+                &answerer.evidence().runtime_spec.attachment,
+            )?;
+
+        let transport = offerer.transport();
+        let frame = b"ciphertext:role-split-frame:0".to_vec();
+        let expected_receipt =
+            format!("ciphertext:role-split-receipt:{}", sha256_hex(&frame)).into_bytes();
+        transport.send_text_control_frame(frame.clone()).await?;
+        let receipt = timeout(Duration::from_secs(5), transport.recv_text_control_frame())
+            .await
+            .map_err(|_| {
+                TransportError::Unavailable(
+                    "timed out receiving role-split runtime receipt".to_owned(),
+                )
+            })??;
+        assert_eq!(receipt, expected_receipt);
+        assert_eq!(
+            received
+                .lock()
+                .map_err(|_| TransportError::Unavailable("receipt lock poisoned".to_owned()))?
+                .as_slice(),
+            &[frame]
+        );
+        assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
+
+        offerer.close().await?;
+        answerer.close().await?;
         Ok(())
     }
 
