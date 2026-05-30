@@ -7022,6 +7022,106 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_direct_topic_peer_webrtc_text_control_roundtrip(
+    ) -> Result<(), TransportError> {
+        let adapter = IpfsPubsubProviderAdapter;
+        let topic_peer = SignalingPeerId::new("topic-peer-device")?;
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"ipfs direct topic peer webrtc text control",
+                "runtime split",
+            ),
+        )?;
+        let bootstrap_secret = b"ipfs direct topic peer bootstrap secret with thirty two bytes";
+        let random_entropy = b"ipfs direct topic peer entropy";
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::IpfsPubsub,
+            bootstrap_secret,
+            random_entropy,
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new(
+                "ipfs_pubsub",
+                "direct topic-peer WebRTC text/control rust-libp2p gossipsub",
+            )?,
+        )?;
+
+        let topic_peer_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-topic-peer-webrtc-text-control".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("/ip4/127.0.0.1/tcp/0"),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "local topic-peer listener")?,
+        };
+        let topic_peer_room = adapter
+            .connect(topic_peer_profile)
+            .await?
+            .join(scope.clone(), capability, topic_peer)
+            .await?;
+        let topic_peer_addr = topic_peer_room
+            .direct_topic_peer_multiaddrs_for_tests()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                TransportError::SignalingAdapter(
+                    "missing IPFS /p2p direct topic-peer multiaddr for WebRTC text/control proof"
+                        .to_owned(),
+                )
+            })?;
+
+        let runtime_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-direct-topic-peer-webrtc-text-control".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new(topic_peer_addr),
+                SignalingEndpointSecurity::SelfHostedExplicit,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "explicit direct topic peer")?,
+        };
+        let probe = probe_webrtc_with_adapter_and_answerer(
+            adapter,
+            runtime_profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            WebRtcNegotiationConfig::new(IceServerConfig::new(
+                vec![Endpoint::new("stun:stun.l.google.com:19302")],
+                vec![],
+            )?),
+            b"ciphertext:ipfs-direct-topic-peer-text-control-frame".to_vec(),
+            |frame| {
+                Ok(format!(
+                    "ciphertext:ipfs-direct-topic-peer-receipt:{}",
+                    sha256_hex(&frame)
+                )
+                .into_bytes())
+            },
+        )
+        .await?;
+
+        assert_eq!(probe.kind, SignalingAdapterKind::IpfsPubsub);
+        assert!(probe.offerer_direct_path_ready);
+        assert!(probe.answerer_direct_path_ready);
+        assert!(probe.offerer_data_channel_open);
+        assert!(probe.answerer_data_channel_open);
+        assert!(probe.text_control_frame_roundtrip);
+        assert!(probe.receipt_frame_roundtrip);
+
+        topic_peer_room.leave().await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "ipfs-pubsub-adapter")]
     async fn ipfs_pubsub_unreachable_bootstrap_maps_to_typed_health() -> Result<(), TransportError>

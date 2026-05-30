@@ -762,3 +762,27 @@ Remaining gap: MQTT/Nostr now have public-provider DM and group text/control
 receipt evidence through Tauri backend state, but IPFS direct topic-peer, deployed
 QUIC rendezvous, credentialed TURN relay-only, installed GUI two-window E2E, and
 real voice/audio capture/playback E2E remain open.
+
+## 2026-05-30 update: IPFS direct topic-peer WebRTC text/control proof passed
+
+The IPFS/libp2p adapter now has a self-hosted/direct topic-peer WebRTC
+text/control gate. The test starts a rust-libp2p gossipsub topic-peer listener
+on loopback, extracts its explicit `/p2p/<peer-id>` multiaddr, configures the
+runtime profile with that direct topic-peer endpoint, negotiates a WebRTC
+DataChannel through the IPFS provider adapter, sends an opaque ciphertext-shaped
+text/control frame, and receives a receipt frame back over the same negotiated
+DataChannel.
+
+Verification run:
+
+- `cargo fmt --all --check` — passed
+- `cargo check -q -p discrypt-transport --features ipfs-pubsub-adapter` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_direct_topic_peer_webrtc_text_control_roundtrip -- --nocapture` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_direct_topic_peer_multiaddr_roundtrip -- --nocapture` — passed
+
+Remaining gap: this closes the local/self-hosted direct IPFS topic-peer WebRTC
+text/control proof, but it is not a public Internet IPFS topic-peer run, not a
+long-lived role-split Tauri text runtime, not installed GUI two-window E2E, and
+not real voice/audio capture/playback. Public IPFS still requires an explicit
+reachable Discrypt topic-peer multiaddr until public discovery/rendezvous is
+implemented and audited.
