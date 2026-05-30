@@ -1579,6 +1579,16 @@ struct DiscryptRendezvousHealthResponse {
     rate_limit_window_seconds: Option<u64>,
     #[serde(default)]
     rate_limit_max_requests: Option<u32>,
+    #[serde(default)]
+    service_identity_fingerprint: Option<String>,
+    #[serde(default)]
+    tls_alpn_protocols: Vec<String>,
+    #[serde(default)]
+    service_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    rotation_policy: Option<String>,
+    #[serde(default)]
+    endpoint_allowlist_commitment: Option<String>,
     at_rest_records: usize,
 }
 
@@ -2076,6 +2086,9 @@ const DISCRYPT_RENDEZVOUS_MIN_MAX_BODY_BYTES: usize = 4096;
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 const DISCRYPT_RENDEZVOUS_MAX_MAX_BODY_BYTES: usize = 1024 * 1024;
 
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+const DISCRYPT_RENDEZVOUS_ACCEPTED_ALPN: &[&str] = &["h2", "http/1.1"];
+
 /// Versioned public bootstrap policy for explicit IPFS/libp2p adapter profiles.
 ///
 /// DNS bootstrap is intentionally disabled while the libp2p DNS stack is
@@ -2449,9 +2462,15 @@ fn discrypt_rendezvous_validate_profile_trust(
 }
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 fn discrypt_rendezvous_validate_health(
     endpoint_base: &str,
     endpoint_security: SignalingEndpointSecurity,
+    endpoint_trust_fingerprint: Option<&str>,
     health: &DiscryptRendezvousHealthResponse,
 ) -> Result<(), TransportError> {
     if health.status != "ok" {
@@ -2512,6 +2531,65 @@ fn discrypt_rendezvous_validate_health(
         if health.rate_limit_max_requests.unwrap_or(0) == 0 {
             return Err(TransportError::SignalingAdapter(
                 "discrypt rendezvous service health is missing rate_limit_max_requests".to_owned(),
+            ));
+        }
+        let expected_identity = endpoint_trust_fingerprint.ok_or_else(|| {
+            TransportError::SignalingAdapter(
+                "discrypt rendezvous production endpoint is missing signed identity fingerprint"
+                    .to_owned(),
+            )
+        })?;
+        let service_identity = health
+            .service_identity_fingerprint
+            .as_deref()
+            .ok_or_else(|| {
+                TransportError::SignalingAdapter(
+                    "discrypt rendezvous service health is missing service_identity_fingerprint"
+                        .to_owned(),
+                )
+            })?;
+        if !discrypt_rendezvous_is_sha256_hex(service_identity)
+            || !service_identity.eq_ignore_ascii_case(expected_identity)
+        {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service identity fingerprint does not match signed endpoint trust".to_owned(),
+            ));
+        }
+        if !health.tls_alpn_protocols.iter().any(|protocol| {
+            DISCRYPT_RENDEZVOUS_ACCEPTED_ALPN
+                .iter()
+                .any(|accepted| protocol == accepted)
+        }) {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing accepted TLS ALPN evidence"
+                    .to_owned(),
+            ));
+        }
+        let expires_at = health.service_expires_at.ok_or_else(|| {
+            TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing service_expires_at".to_owned(),
+            )
+        })?;
+        if expires_at <= chrono::Utc::now() {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service identity/allowlist proof is expired".to_owned(),
+            ));
+        }
+        let rotation_policy = health.rotation_policy.as_deref().unwrap_or_default();
+        if !(rotation_policy.contains("rotate") && rotation_policy.contains("expires")) {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing endpoint rotation policy".to_owned(),
+            ));
+        }
+        let Some(allowlist_commitment) = health.endpoint_allowlist_commitment.as_deref() else {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing endpoint allowlist commitment"
+                    .to_owned(),
+            ));
+        };
+        if !allowlist_commitment.eq_ignore_ascii_case(expected_identity) {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service endpoint allowlist proof does not match signed endpoint trust".to_owned(),
             ));
         }
     }
@@ -3639,15 +3717,13 @@ impl SignalingAdapter for DiscryptQuicRendezvousProviderAdapter {
         }
         let endpoint_base = discrypt_rendezvous_endpoint_base(&profile)?;
         discrypt_rendezvous_validate_profile_trust(&profile)?;
-        let endpoint_security = profile
-            .endpoints
-            .first()
-            .map(|endpoint| endpoint.security)
-            .ok_or_else(|| {
-                TransportError::InvalidConnectivityPolicy(
-                    "discrypt rendezvous profile requires one endpoint".to_owned(),
-                )
-            })?;
+        let endpoint = profile.endpoints.first().ok_or_else(|| {
+            TransportError::InvalidConnectivityPolicy(
+                "discrypt rendezvous profile requires one endpoint".to_owned(),
+            )
+        })?;
+        let endpoint_security = endpoint.security;
+        let endpoint_trust_fingerprint = endpoint.trust_fingerprint.as_deref();
         let health_url = format!("{endpoint_base}/healthz");
         let health = tokio::task::spawn_blocking(move || {
             let mut response = ureq::get(&health_url).call().map_err(|error| {
@@ -3670,7 +3746,12 @@ impl SignalingAdapter for DiscryptQuicRendezvousProviderAdapter {
                 "discrypt rendezvous health task failed: {error}"
             ))
         })??;
-        discrypt_rendezvous_validate_health(&endpoint_base, endpoint_security, &health)?;
+        discrypt_rendezvous_validate_health(
+            &endpoint_base,
+            endpoint_security,
+            endpoint_trust_fingerprint,
+            &health,
+        )?;
         Ok(Self::Session {
             profile,
             endpoint_base,
@@ -5442,6 +5523,9 @@ mod tests {
     #[test]
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_requires_matching_public_base_for_production() {
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(
+            "https://rendezvous.example.invalid",
+        );
         let health = DiscryptRendezvousHealthResponse {
             schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
             protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
@@ -5451,15 +5535,51 @@ mod tests {
             max_body_bytes: Some(64 * 1024),
             rate_limit_window_seconds: Some(60),
             rate_limit_max_requests: Some(120),
+            service_identity_fingerprint: Some(trust_fingerprint.clone()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            rotation_policy: Some("rotate before service_expires_at".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
             at_rest_records: 0,
         };
         let error = discrypt_rendezvous_validate_health(
             "https://rendezvous.example.invalid",
             SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
             &health,
         )
         .expect_err("production health must match selected endpoint");
         assert!(error.to_string().contains("public_base_url mismatch"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_accepts_signed_identity_and_rotation_metadata(
+    ) -> Result<(), TransportError> {
+        let endpoint = "https://rendezvous.example.invalid";
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint);
+        let health = DiscryptRendezvousHealthResponse {
+            schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
+            protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: endpoint.to_owned(),
+            max_body_bytes: Some(64 * 1024),
+            rate_limit_window_seconds: Some(60),
+            rate_limit_max_requests: Some(120),
+            service_identity_fingerprint: Some(trust_fingerprint.clone()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            rotation_policy: Some("rotate before service_expires_at".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
+            at_rest_records: 0,
+        };
+        discrypt_rendezvous_validate_health(
+            endpoint,
+            SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
+            &health,
+        )
     }
 
     #[test]
@@ -5475,11 +5595,17 @@ mod tests {
             max_body_bytes: None,
             rate_limit_window_seconds: None,
             rate_limit_max_requests: None,
+            service_identity_fingerprint: None,
+            tls_alpn_protocols: Vec::new(),
+            service_expires_at: None,
+            rotation_policy: None,
+            endpoint_allowlist_commitment: None,
             at_rest_records: 0,
         };
         discrypt_rendezvous_validate_health(
             "http://127.0.0.1:18787",
             SignalingEndpointSecurity::LocalDevLoopback,
+            None,
             &health,
         )
     }
@@ -5487,6 +5613,9 @@ mod tests {
     #[test]
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_rejects_non_ok_status() {
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(
+            "https://rendezvous.example.invalid",
+        );
         let health = DiscryptRendezvousHealthResponse {
             schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
             protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
@@ -5496,11 +5625,17 @@ mod tests {
             max_body_bytes: Some(64 * 1024),
             rate_limit_window_seconds: Some(60),
             rate_limit_max_requests: Some(120),
+            service_identity_fingerprint: Some(trust_fingerprint.clone()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            rotation_policy: Some("rotate before service_expires_at".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
             at_rest_records: 0,
         };
         let error = discrypt_rendezvous_validate_health(
             "https://rendezvous.example.invalid",
             SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
             &health,
         )
         .expect_err("non-ok health must fail");
@@ -5510,6 +5645,9 @@ mod tests {
     #[test]
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_requires_production_protocol_metadata() {
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(
+            "https://rendezvous.example.invalid",
+        );
         let health = DiscryptRendezvousHealthResponse {
             schema_version: None,
             protocol_version: None,
@@ -5519,11 +5657,17 @@ mod tests {
             max_body_bytes: None,
             rate_limit_window_seconds: None,
             rate_limit_max_requests: None,
+            service_identity_fingerprint: Some(trust_fingerprint.clone()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            rotation_policy: Some("rotate before service_expires_at".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
             at_rest_records: 0,
         };
         let error = discrypt_rendezvous_validate_health(
             "https://rendezvous.example.invalid",
             SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
             &health,
         )
         .expect_err("production health must include schema metadata");
@@ -5533,6 +5677,9 @@ mod tests {
     #[test]
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_rejects_unsafe_max_body_policy() {
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(
+            "https://rendezvous.example.invalid",
+        );
         let health = DiscryptRendezvousHealthResponse {
             schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
             protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
@@ -5542,11 +5689,17 @@ mod tests {
             max_body_bytes: Some(DISCRYPT_RENDEZVOUS_MAX_MAX_BODY_BYTES + 1),
             rate_limit_window_seconds: Some(60),
             rate_limit_max_requests: Some(120),
+            service_identity_fingerprint: Some(trust_fingerprint.clone()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            rotation_policy: Some("rotate before service_expires_at".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
             at_rest_records: 0,
         };
         let error = discrypt_rendezvous_validate_health(
             "https://rendezvous.example.invalid",
             SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
             &health,
         )
         .expect_err("production health must keep max body bounded");
