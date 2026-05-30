@@ -5541,7 +5541,7 @@ fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, Str
     Ok(hex::encode(hasher.finalize()))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn pump_text_control_transport_once<T>(
     state: &mut PersistedAppState,
     transport: &T,
