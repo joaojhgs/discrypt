@@ -6,7 +6,11 @@
 //! IPFS/libp2p PubSub, and the separate Discrypt rendezvous service have real
 //! provider clients behind explicit adapter features.
 
-#[cfg(any(feature = "mqtt-adapter", feature = "ipfs-pubsub-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 use crate::SignalingProviderEndpoint;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
@@ -2375,6 +2379,45 @@ fn discrypt_rendezvous_endpoint_base(
 }
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"external-signaling-endpoint-fingerprint-v1");
+    hasher.update(endpoint.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_validate_endpoint_trust(
+    endpoint: &SignalingProviderEndpoint,
+) -> Result<(), TransportError> {
+    let expected = discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint.endpoint.0.as_str());
+    match (&endpoint.trust_fingerprint, endpoint.security) {
+        (Some(actual), _) if actual.eq_ignore_ascii_case(&expected) => Ok(()),
+        (Some(_), _) => Err(TransportError::SignalingAdapter(
+            "discrypt rendezvous endpoint trust fingerprint mismatch".to_owned(),
+        )),
+        (None, SignalingEndpointSecurity::LocalDevLoopback) => Ok(()),
+        (None, _) => Err(TransportError::SignalingAdapter(
+            "discrypt rendezvous production/self-hosted endpoint requires signed endpoint trust fingerprint"
+                .to_owned(),
+        )),
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_validate_profile_trust(
+    profile: &SignalingAdapterProfile,
+) -> Result<(), TransportError> {
+    let endpoint = profile.endpoints.first().ok_or_else(|| {
+        TransportError::InvalidConnectivityPolicy(
+            "discrypt rendezvous profile requires one endpoint".to_owned(),
+        )
+    })?;
+    discrypt_rendezvous_validate_endpoint_trust(endpoint)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 fn discrypt_rendezvous_key(topic: &str, label: &str, peer: Option<&SignalingPeerId>) -> Vec<u8> {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
@@ -3493,6 +3536,7 @@ impl SignalingAdapter for DiscryptQuicRendezvousProviderAdapter {
             )));
         }
         let endpoint_base = discrypt_rendezvous_endpoint_base(&profile)?;
+        discrypt_rendezvous_validate_profile_trust(&profile)?;
         let health_url = format!("{endpoint_base}/healthz");
         let health = tokio::task::spawn_blocking(move || ureq::get(&health_url).call())
             .await
@@ -5206,6 +5250,71 @@ mod tests {
         assert!(error
             .to_string()
             .contains("native quic:// transport remains reserved"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn quic_rendezvous_rejects_https_endpoint_without_signed_trust_fingerprint(
+    ) -> Result<(), TransportError> {
+        let adapter = DiscryptQuicRendezvousProviderAdapter;
+        let profile = SignalingAdapterProfile {
+            profile_id: "production-rendezvous-no-trust".to_owned(),
+            kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("https://rendezvous.example.invalid"),
+                SignalingEndpointSecurity::ProductionTls,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new(
+                "discrypt_quic_rendezvous",
+                "production service without signed trust",
+            )?,
+        };
+
+        let error = adapter
+            .connect(profile)
+            .await
+            .expect_err("production rendezvous endpoint must require signed trust");
+        assert!(error
+            .to_string()
+            .contains("requires signed endpoint trust fingerprint"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn quic_rendezvous_rejects_mismatched_signed_trust_fingerprint(
+    ) -> Result<(), TransportError> {
+        let adapter = DiscryptQuicRendezvousProviderAdapter;
+        let endpoint = "https://rendezvous.example.invalid";
+        let mut provider_endpoint = SignalingProviderEndpoint::new(
+            Endpoint::new(endpoint),
+            SignalingEndpointSecurity::ProductionTls,
+        );
+        provider_endpoint.trust_fingerprint = Some(
+            discrypt_rendezvous_trust_fingerprint_for_endpoint("https://evil.example.invalid"),
+        );
+        let profile = SignalingAdapterProfile {
+            profile_id: "production-rendezvous-wrong-trust".to_owned(),
+            kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+            endpoints: vec![provider_endpoint],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new(
+                "discrypt_quic_rendezvous",
+                "production service with mismatched trust",
+            )?,
+        };
+
+        let error = adapter
+            .connect(profile)
+            .await
+            .expect_err("mismatched rendezvous trust must fail before health probe");
+        assert!(error
+            .to_string()
+            .contains("endpoint trust fingerprint mismatch"));
         Ok(())
     }
 

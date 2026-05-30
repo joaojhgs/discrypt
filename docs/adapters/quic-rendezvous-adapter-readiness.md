@@ -1,6 +1,6 @@
 # Separate Rust QUIC rendezvous adapter readiness note
 
-Status: sibling-service HTTP API client wired; native `quic://` transport still reserved; not production-ready  
+Status: sibling-service HTTP API client wired with signed endpoint-fingerprint enforcement; native `quic://` transport still reserved; not production-ready  
 Scope: Discrypt self-hosted signaling adapter `discrypt_quic_rendezvous` / Cargo feature `discrypt-quic-rendezvous-adapter`
 
 ## Current contract
@@ -17,13 +17,20 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
   discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available -- --nocapture
+
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
+  quic_rendezvous_rejects_https_endpoint_without_signed_trust_fingerprint -- --nocapture
+
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
+  quic_rendezvous_rejects_mismatched_signed_trust_fingerprint -- --nocapture
 ```
 
 ## Required production implementation checklist
 
 - Keep the signaling service in the sibling repository and depend only on the audited content-blind `/v1/signals/*` client protocol/API from Discrypt.
 - Accept only signed `https://` endpoint descriptors from app/DM/group/channel policy or signed invite bootstrap metadata for production; `quic://` remains reserved until native QUIC client support lands.
-- Validate service identity/trust fingerprint, ALPN, protocol version, expiry, max payload, abuse/rate-limit policy, and endpoint allowlist before use.
+- Require the signed endpoint trust fingerprint from app/DM/group/channel policy or invite bootstrap metadata before any production/self-hosted endpoint is used, and reject mismatched fingerprints before health probes.
+- Still add TLS certificate/public-key pin validation, ALPN, protocol version, expiry, max payload, abuse/rate-limit policy, and endpoint allowlist proof before production release.
 - Transport only sealed rendezvous, WebRTC offer/answer/candidate, and control envelopes. QUIC rendezvous does not replace WebRTC data/audio.
 - Map trust mismatch, version mismatch, rate-limit, payload-too-large, outage, and provider-unhealthy states to typed health/readiness.
 - Extend the local sibling-service harness into staged/deployed service E2E with TLS-edge identity/fingerprint checks.
@@ -31,4 +38,4 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 
 ## Why this is not using a fake adapter
 
-A loopback or in-memory conformance adapter cannot prove service identity, future QUIC ALPN/version negotiation, sibling service trust, deployment health, or outage fallback. The current adapter uses the real sibling service API when the external binary is available; production readiness still requires staged service evidence, TLS/fingerprint enforcement, and native QUIC proof if `quic://` endpoints are enabled.
+A loopback or in-memory conformance adapter cannot prove TLS certificate identity, future QUIC ALPN/version negotiation, sibling service trust, deployment health, or outage fallback. The current adapter uses the real sibling service API when the external binary is available and enforces the signed endpoint fingerprint carried by policy/invites; production readiness still requires staged service evidence, TLS certificate/public-key pinning, and native QUIC proof if `quic://` endpoints are enabled.
