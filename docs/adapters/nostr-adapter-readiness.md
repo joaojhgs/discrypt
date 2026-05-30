@@ -1,6 +1,6 @@
 # Nostr signaling adapter readiness note
 
-Status: real provider client wired behind `nostr-adapter`; public relay WebRTC/DataChannel E2E passed against `wss://nos.lol`; profile-level multi-relay wiring is implemented but public multi-relay soak/fallback evidence is still required.
+Status: real provider client wired behind `nostr-adapter`; public relay WebRTC/DataChannel E2E passed against `wss://nos.lol`; profile-level multi-relay wiring is implemented and a degraded multi-relay public fallback soak passed with two public relays plus one intentionally invalid relay.
 Scope: Discrypt serverless signaling adapter `nostr` / Cargo feature `nostr-adapter`
 
 ## Current contract
@@ -14,6 +14,8 @@ cargo test -q -p discrypt-transport --features nostr-adapter \
   nostr_adapter_feature_is_selectable_with_real_relay_client
 cargo test -q -p discrypt-transport --features nostr-adapter \
   nostr_profile_preserves_all_configured_relays_for_room_join
+DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport \
+  --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture
 cargo test -q -p discrypt-transport \
   provider_failure_classes_map_to_typed_health_states -- --nocapture
 DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol \
@@ -37,9 +39,9 @@ The relay must not receive group names, channel names, display names, safety num
 ## Still required for production completion
 
 - Keep the opt-in public relay two-peer smoke tests (`DISCRYPT_PUBLIC_NOSTR_E2E=1` and `DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1`) in release verification; latest WebRTC/DataChannel pass used `wss://nos.lol`, while an earlier relay tried at `wss://nostr.oxtr.dev` returned `blocked`.
-- Add public multi-relay soak/fallback evidence using at least two configured relays with one degraded/rate-limited relay; the code now preserves all configured relay endpoints, but release evidence still needs to prove failure handling under public provider conditions.
-- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible. Conservative string classification and all-relay Nostr publish/subscribe failure labeling are implemented; structured provider-specific error extraction still needs public degraded-relay evidence.
-- Add provider-visible capture scans for event tags/content/logs before any release claim.
+- Public multi-relay fallback evidence now exists: `DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture` passed on 2026-05-30 with the default relay set `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`, proving a configured degraded relay does not prevent two peers from exchanging sealed presence, signaling, and control messages via the healthy relay set.
+- Map relay auth, rate-limit, message-too-large, unhealthy relay, and trust mismatch failures to typed `SignalingHealthState`/`AdapterReadinessState` values instead of a generic signaling error where possible. Conservative string classification and all-relay Nostr publish/subscribe failure labeling are implemented; still needed for full release hardening: structured provider-specific error extraction from relay notices and explicit public rate-limit/auth relay evidence.
+- Provider-visible capture scans are covered by G133 (`npm --prefix apps/ui run test:provider-metadata-capture-g133`) for event tags/content/log-adjacent adapter captures. External host packet capture remains a separate release-run artifact.
 - Wire this adapter through the Tauri runtime factory and UI selection path for actual app use, not only transport-level conformance.
 
 ## Dependency note

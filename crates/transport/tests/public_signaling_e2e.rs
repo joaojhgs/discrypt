@@ -37,18 +37,37 @@ fn public_mqtt_profile(endpoint: String) -> Result<SignalingAdapterProfile, Tran
 }
 
 #[cfg(feature = "nostr-adapter")]
-fn public_nostr_profile(endpoint: String) -> Result<SignalingAdapterProfile, TransportError> {
+fn public_nostr_profile(
+    endpoints: Vec<String>,
+    profile_id: &str,
+    trust_posture: &str,
+) -> Result<SignalingAdapterProfile, TransportError> {
     Ok(SignalingAdapterProfile {
-        profile_id: "public-nostr-e2e".to_owned(),
+        profile_id: profile_id.to_owned(),
         kind: SignalingAdapterKind::Nostr,
-        endpoints: vec![SignalingProviderEndpoint::new(
-            Endpoint::new(endpoint),
-            SignalingEndpointSecurity::ProductionTls,
-        )],
+        endpoints: endpoints
+            .into_iter()
+            .map(|endpoint| {
+                SignalingProviderEndpoint::new(
+                    Endpoint::new(endpoint),
+                    SignalingEndpointSecurity::ProductionTls,
+                )
+            })
+            .collect(),
         metadata_posture: ProviderMetadataPosture::HashedTopic,
         capabilities: SignalingAdapterCapabilities::production_required(),
-        trust_label: AdapterTrustLabel::new("public nostr", "public relay; opaque envelopes only")?,
+        trust_label: AdapterTrustLabel::new("public nostr", trust_posture)?,
     })
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn comma_separated_endpoints(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -189,17 +208,11 @@ async fn public_mqtt_two_peer_presence_signal_and_control_roundtrip() -> Result<
 }
 
 #[cfg(feature = "nostr-adapter")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result<(), TransportError>
-{
-    if std::env::var("DISCRYPT_PUBLIC_NOSTR_E2E").as_deref() != Ok("1") {
-        eprintln!("skipping public Nostr E2E; set DISCRYPT_PUBLIC_NOSTR_E2E=1 to run");
-        return Ok(());
-    }
-
-    let endpoint = std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
-        .unwrap_or_else(|_| "wss://relay.damus.io".to_owned());
-    let profile = public_nostr_profile(endpoint)?;
+async fn run_public_nostr_two_peer_roundtrip(
+    profile: SignalingAdapterProfile,
+    scope_label: &str,
+    trust_posture: &str,
+) -> Result<(), TransportError> {
     let adapter = NostrProviderAdapter;
     let alice_session = adapter.connect(profile.clone()).await?;
     let bob_session = adapter.connect(profile).await?;
@@ -207,11 +220,7 @@ async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result
     let scope_secret = random_bytes::<32>();
     let scope = ConversationScope::new(
         ConnectivityScopeLevel::Dm,
-        derive_scope_commitment(
-            ConnectivityScopeLevel::Dm,
-            &scope_secret,
-            "public-nostr-e2e",
-        ),
+        derive_scope_commitment(ConnectivityScopeLevel::Dm, &scope_secret, scope_label),
     )?;
     let capability = RendezvousCapability::derive(
         scope.clone(),
@@ -220,7 +229,7 @@ async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result
         &random_bytes::<16>(),
         120,
         ProviderMetadataPosture::HashedTopic,
-        AdapterTrustLabel::new("public nostr", "hashed topic and opaque payloads")?,
+        AdapterTrustLabel::new("public nostr", trust_posture)?,
     )?;
 
     let alice = SignalingPeerId::new("alice-device")?;
@@ -280,6 +289,69 @@ async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result
     alice_session.close().await?;
     bob_session.close().await?;
     Ok(())
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result<(), TransportError>
+{
+    if std::env::var("DISCRYPT_PUBLIC_NOSTR_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Nostr E2E; set DISCRYPT_PUBLIC_NOSTR_E2E=1 to run");
+        return Ok(());
+    }
+
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+        .unwrap_or_else(|_| "wss://relay.damus.io".to_owned());
+    let profile = public_nostr_profile(
+        vec![endpoint],
+        "public-nostr-e2e",
+        "public relay; opaque envelopes only",
+    )?;
+    run_public_nostr_two_peer_roundtrip(
+        profile,
+        "public-nostr-e2e",
+        "hashed topic and opaque payloads",
+    )
+    .await
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_nostr_multi_relay_degraded_fallback_soak() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Nostr multi-relay soak; set DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 to run");
+        return Ok(());
+    }
+
+    let endpoints = std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINTS")
+        .map(|value| comma_separated_endpoints(&value))
+        .unwrap_or_else(|_| {
+            comma_separated_endpoints(
+                "wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid",
+            )
+        });
+    if endpoints.len() < 2 {
+        return Err(TransportError::SignalingAdapter(
+            "public Nostr multi-relay soak requires at least two relay endpoints".to_owned(),
+        ));
+    }
+    assert!(
+        endpoints.iter().any(|endpoint| endpoint.contains("invalid"))
+            || std::env::var("DISCRYPT_PUBLIC_NOSTR_ALLOW_ALL_HEALTHY").as_deref() == Ok("1"),
+        "include one intentionally degraded relay endpoint, or set DISCRYPT_PUBLIC_NOSTR_ALLOW_ALL_HEALTHY=1 for a pure relay-set soak"
+    );
+
+    let profile = public_nostr_profile(
+        endpoints,
+        "public-nostr-multi-relay-soak",
+        "public multi-relay set with degraded fallback; opaque envelopes only",
+    )?;
+    run_public_nostr_two_peer_roundtrip(
+        profile,
+        "public-nostr-multi-relay-soak",
+        "hashed topic and opaque payloads across fallback relay set",
+    )
+    .await
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
