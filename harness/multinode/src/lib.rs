@@ -352,6 +352,23 @@ pub struct UxE2eHardeningSmoke {
     pub all_phase_smokes_ready: bool,
 }
 
+/// Deterministic two-profile DM, voice/media, and UI verification result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwoProfileP2pDmVoiceUiSmoke {
+    /// Alice and Bob are independently generated profiles with distinct identity keys.
+    pub independent_profiles_created: bool,
+    /// Both profiles derive the same out-of-band DM safety number.
+    pub pairwise_safety_numbers_match: bool,
+    /// The direct app-text route protects, delivers, and decrypts one DM payload.
+    pub p2p_dm_message_e2e: bool,
+    /// The voice/media harness covers direct, overlay, and TURN attempts without plaintext exposure.
+    pub voice_media_attempt_covered: bool,
+    /// UI/command hardening gates are ready for browser-visible setup, DM, invite, text, and voice checks.
+    pub frontend_ui_checks_ready: bool,
+    /// The command/UI voice roster is state-backed and does not fabricate friend/relay participants.
+    pub no_fake_voice_members: bool,
+}
+
 impl MediaSecuritySmoke {
     /// True when every Phase-1 security invariant is satisfied.
     #[must_use]
@@ -599,6 +616,19 @@ impl UxE2eHardeningSmoke {
             && self.invite_retention_deletion_ready
             && self.connectivity_copy_ready
             && self.all_phase_smokes_ready
+    }
+}
+
+impl TwoProfileP2pDmVoiceUiSmoke {
+    /// True when every two-profile/browser-facing invariant is satisfied.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.independent_profiles_created
+            && self.pairwise_safety_numbers_match
+            && self.p2p_dm_message_e2e
+            && self.voice_media_attempt_covered
+            && self.frontend_ui_checks_ready
+            && self.no_fake_voice_members
     }
 }
 
