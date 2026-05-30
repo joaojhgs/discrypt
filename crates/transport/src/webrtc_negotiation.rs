@@ -643,12 +643,15 @@ pub struct WebRtcNegotiationConfig {
 }
 
 impl WebRtcNegotiationConfig {
-    /// Build a config with a safe loopback bind default for tests/local embedded use.
+    /// Build a config with a real network UDP bind default for production peer discovery.
+    ///
+    /// Tests that require strict loopback-only behavior should override `udp_addrs`
+    /// to `127.0.0.1:0` explicitly.
     #[must_use]
     pub fn new(ice_servers: IceServerConfig) -> Self {
         Self {
             ice_servers,
-            udp_addrs: vec!["127.0.0.1:0".to_owned()],
+            udp_addrs: vec!["0.0.0.0:0".to_owned()],
             data_channel_label: "discrypt-control".to_owned(),
         }
     }
@@ -674,6 +677,7 @@ pub struct WebRtcNegotiator {
     peer_connection: Box<dyn PeerConnection>,
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
+    ice_gathering_complete: Arc<Notify>,
     data_channels: DataChannelHub,
     data_channel_label: String,
     turn_endpoints: Vec<Endpoint>,
@@ -685,6 +689,7 @@ impl WebRtcNegotiator {
         ensure_rustls_crypto_provider_for_mqtt_feature();
         config.validate(Utc::now())?;
         let candidates = Arc::new(Mutex::new(Vec::new()));
+        let ice_gathering_complete = Arc::new(Notify::new());
         let metrics = Arc::new(Mutex::new(
             DirectPathMetricsState::with_configured_turn_servers(
                 config.ice_servers.turn_servers.len() as u64,
@@ -694,6 +699,7 @@ impl WebRtcNegotiator {
         let handler = Arc::new(CandidateCollector {
             candidates: Arc::clone(&candidates),
             metrics: Arc::clone(&metrics),
+            ice_gathering_complete: Arc::clone(&ice_gathering_complete),
             data_channels: data_channels.clone(),
         });
         let mut media = MediaEngine::default();
@@ -723,6 +729,7 @@ impl WebRtcNegotiator {
             peer_connection: Box::new(peer_connection),
             candidates,
             metrics,
+            ice_gathering_complete,
             data_channels,
             data_channel_label: config.data_channel_label,
             turn_endpoints: config
@@ -765,6 +772,20 @@ impl WebRtcNegotiator {
         WebRtcSessionDescription::from_rtc(local)
     }
 
+    /// Create a local SDP offer and wait until ICE gathering completes before returning it.
+    ///
+    /// This produces a provider-latency-tolerant non-trickle SDP envelope for public
+    /// rendezvous adapters where the peer may not receive follow-up candidate messages
+    /// quickly enough for the WebRTC stack's initial answer window.
+    pub async fn create_complete_offer(
+        &self,
+        duration: Duration,
+    ) -> Result<WebRtcSessionDescription, TransportError> {
+        let _initial_offer = self.create_offer().await?;
+        self.wait_ice_gathering_complete(duration).await?;
+        self.local_description().await
+    }
+
     /// Apply a remote offer, then create and set a local SDP answer.
     pub async fn create_answer(
         &self,
@@ -797,6 +818,17 @@ impl WebRtcNegotiator {
                 TransportError::Unavailable("WebRTC local answer was not recorded".to_owned())
             })?;
         WebRtcSessionDescription::from_rtc(local)
+    }
+
+    /// Apply a remote offer, create a local answer, and wait until ICE gathering completes.
+    pub async fn create_complete_answer(
+        &self,
+        remote_offer: WebRtcSessionDescription,
+        duration: Duration,
+    ) -> Result<WebRtcSessionDescription, TransportError> {
+        let _initial_answer = self.create_answer(remote_offer).await?;
+        self.wait_ice_gathering_complete(duration).await?;
+        self.local_description().await
     }
 
     /// Apply a remote answer to an offer-side peer connection.
@@ -834,9 +866,45 @@ impl WebRtcNegotiator {
         std::mem::take(&mut *candidates)
     }
 
+    /// Wait for local ICE candidate gathering to reach `Complete`.
+    pub async fn wait_ice_gathering_complete(
+        &self,
+        duration: Duration,
+    ) -> Result<(), TransportError> {
+        if self.metrics.lock().await.ice_gathering_state == RTCIceGatheringState::Complete {
+            return Ok(());
+        }
+        timeout(duration, self.ice_gathering_complete.notified())
+            .await
+            .map_err(|_| {
+                TransportError::Unavailable(format!(
+                    "ICE gathering did not complete within {} ms",
+                    duration.as_millis()
+                ))
+            })?;
+        if self.metrics.lock().await.ice_gathering_state == RTCIceGatheringState::Complete {
+            Ok(())
+        } else {
+            Err(TransportError::Unavailable(
+                "ICE gathering completion notification arrived before metrics updated".to_owned(),
+            ))
+        }
+    }
+
     /// Current direct ICE/WebRTC metrics for app-service/Tauri state surfaces.
     pub async fn direct_path_metrics(&self) -> WebRtcDirectPathMetrics {
         self.metrics.lock().await.snapshot()
+    }
+
+    async fn local_description(&self) -> Result<WebRtcSessionDescription, TransportError> {
+        let local = self
+            .peer_connection
+            .local_description()
+            .await
+            .ok_or_else(|| {
+                TransportError::Unavailable("WebRTC local description was not recorded".to_owned())
+            })?;
+        WebRtcSessionDescription::from_rtc(local)
     }
 
     /// Select a direct route in a transport session only after WebRTC reports readiness.
@@ -964,6 +1032,7 @@ impl WebRtcIceCandidate {
 struct CandidateCollector {
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
+    ice_gathering_complete: Arc<Notify>,
     data_channels: DataChannelHub,
 }
 
@@ -975,6 +1044,9 @@ impl PeerConnectionEventHandler for CandidateCollector {
 
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         self.metrics.lock().await.ice_gathering_state = state;
+        if state == RTCIceGatheringState::Complete {
+            self.ice_gathering_complete.notify_waiters();
+        }
     }
 
     async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {

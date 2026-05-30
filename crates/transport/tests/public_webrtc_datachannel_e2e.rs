@@ -99,11 +99,17 @@ where
     sleep(Duration::from_secs(1)).await;
 
     let ice = IceServerConfig::new(vec![Endpoint::new("stun:stun.l.google.com:19302")], vec![])?;
-    let alice_webrtc = WebRtcNegotiator::new(WebRtcNegotiationConfig::new(ice.clone())).await?;
-    let bob_webrtc = WebRtcNegotiator::new(WebRtcNegotiationConfig::new(ice)).await?;
+    let mut alice_config = WebRtcNegotiationConfig::new(ice.clone());
+    alice_config.udp_addrs = vec!["0.0.0.0:0".to_owned()];
+    let mut bob_config = WebRtcNegotiationConfig::new(ice);
+    bob_config.udp_addrs = vec!["0.0.0.0:0".to_owned()];
+    let alice_webrtc = WebRtcNegotiator::new(alice_config).await?;
+    let bob_webrtc = WebRtcNegotiator::new(bob_config).await?;
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
 
-    let offer = alice_webrtc.create_offer().await?;
+    let offer = alice_webrtc
+        .create_complete_offer(Duration::from_secs(45))
+        .await?;
     let sealed_offer = sealer.seal_description(&offer)?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
@@ -121,7 +127,9 @@ where
             match signal.payload.kind {
                 WebRtcNegotiationPayloadKind::Offer => {
                     let offer = sealer.open_description(&signal.payload)?;
-                    let answer = bob_webrtc.create_answer(offer).await?;
+                    let answer = bob_webrtc
+                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .await?;
                     bob_room
                         .send_signal(alice.clone(), sealer.seal_description(&answer)?)
                         .await?;
