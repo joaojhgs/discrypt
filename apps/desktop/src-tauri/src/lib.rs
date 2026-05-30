@@ -50,7 +50,9 @@ use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
 #[cfg(test)]
-use discrypt_transport::start_provider_webrtc_text_control_runtime_pair_with_answerer;
+use discrypt_transport::start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer;
+#[cfg(test)]
+use discrypt_transport::SignalingPeerId;
 #[cfg(test)]
 use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
@@ -4764,6 +4766,19 @@ impl PersistedAppState {
         let mut sender_state = self.clone();
         let target = outbox_frame.target.clone();
         let transport_session_id = transport_session_id.into();
+        let sender_peer_id = SignalingPeerId::new(format!(
+            "offerer-{}",
+            &hash_commitment("discrypt-runtime-peer-id-v1", &[&self.local_user_id()])[..16]
+        ))
+        .map_err(|error| error.to_string())?;
+        let receiver_peer_id = SignalingPeerId::new(format!(
+            "answerer-{}",
+            &hash_commitment(
+                "discrypt-runtime-peer-id-v1",
+                &[&receiver.state.local_user_id()]
+            )[..16]
+        ))
+        .map_err(|error| error.to_string())?;
         let receiver_service = Arc::new(Mutex::new(receiver));
 
         let (updated_sender, receiver_state, evidence, report) = std::thread::spawn(move || {
@@ -4777,12 +4792,14 @@ impl PersistedAppState {
             runtime.block_on(async move {
                 let answerer_service = receiver_service.clone();
                 let receiver_after = receiver_service.clone();
-                let pair = start_provider_webrtc_text_control_runtime_pair_with_answerer(
+                let pair = start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
                     profile,
                     scope,
                     &bootstrap_secret,
                     &random_entropy,
                     discrypt_transport::WebRtcNegotiationConfig::new(ice_config),
+                    sender_peer_id,
+                    receiver_peer_id,
                     move |received| {
                         let frame: TextControlFrameView =
                             serde_json::from_slice(&received).map_err(|error| {
