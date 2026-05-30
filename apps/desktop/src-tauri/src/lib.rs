@@ -1017,6 +1017,23 @@ pub struct HandleTextControlFrameResponse {
     pub response_frame: Option<TextControlFrameView>,
 }
 
+/// One-shot text/control transport pump report for a session-loop iteration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextControlTransportPumpReportView {
+    /// Pending frames selected before the pump attempted transport.
+    pub pending_before: usize,
+    /// Frames handed to the app-facing data transport.
+    pub frames_sent: usize,
+    /// Response frames received from the transport.
+    pub response_frames_received: usize,
+    /// Signed peer receipts applied to local message state.
+    pub receipts_applied: usize,
+    /// Frames that failed send/receive/decode/apply.
+    pub failures: Vec<String>,
+    /// DataChannel/text-control transport metrics after the pump iteration.
+    pub metrics: discrypt_transport::WebRtcDataTransportMetrics,
+}
+
 /// Request to join a voice channel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JoinVoiceRequest {
@@ -5330,6 +5347,120 @@ fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, Str
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[allow(dead_code)]
+async fn pump_text_control_transport_once<T>(
+    state: &mut PersistedAppState,
+    transport: &T,
+    request: ListPendingTextControlFramesRequest,
+    transport_session_id: impl Into<String>,
+) -> TextControlTransportPumpReportView
+where
+    T: discrypt_transport::TextControlDataTransport,
+{
+    let transport_session_id = transport_session_id.into();
+    let pending = state.list_pending_text_control_frames(&request);
+    let mut frames_sent = 0_usize;
+    let mut response_frames_received = 0_usize;
+    let mut receipts_applied = 0_usize;
+    let mut failures = Vec::new();
+
+    for frame in &pending {
+        let outbound = match serde_json::to_vec(&frame.frame) {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                failures.push(format!(
+                    "{}: encode text/control frame failed: {error}",
+                    frame.message_id
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = transport.send_text_control_frame(outbound).await {
+            failures.push(format!(
+                "{}: send text/control frame failed: {error}",
+                frame.message_id
+            ));
+            continue;
+        }
+        frames_sent += 1;
+        if let Err(error) = state.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+            message_id: frame.message_id.clone(),
+            frame_sha256: frame.frame_sha256.clone(),
+            transport_session_id: Some(transport_session_id.clone()),
+        }) {
+            failures.push(format!(
+                "{}: mark text/control frame sent failed: {error}",
+                frame.message_id
+            ));
+            continue;
+        }
+        let inbound = match transport.recv_text_control_frame().await {
+            Ok(inbound) => inbound,
+            Err(error) => {
+                failures.push(format!(
+                    "{}: receive text/control response failed: {error}",
+                    frame.message_id
+                ));
+                continue;
+            }
+        };
+        response_frames_received += 1;
+        let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&inbound) {
+            Ok(inbound_frame) => inbound_frame,
+            Err(error) => {
+                failures.push(format!(
+                    "{}: decode text/control response failed: {error}",
+                    frame.message_id
+                ));
+                continue;
+            }
+        };
+        let receipt_response = matches!(inbound_frame, TextControlFrameView::Receipt { .. });
+        if state.handle_text_control_frame(inbound_frame).is_some() {
+            failures.push(format!(
+                "{}: response frame unexpectedly generated another response",
+                frame.message_id
+            ));
+            continue;
+        }
+        if state.last_command_error.as_ref().is_some_and(|error| {
+            matches!(
+                error.command.as_str(),
+                "handle_text_control_frame" | "apply_text_delivery_receipt"
+            )
+        }) {
+            failures.push(format!(
+                "{}: text/control response verification failed",
+                frame.message_id
+            ));
+            continue;
+        }
+        if receipt_response {
+            receipts_applied += 1;
+        }
+    }
+
+    let metrics = transport.text_control_transport_metrics().await;
+    state.push_event(
+        "message.transport_pump",
+        format!(
+            "Text/control transport pump sent {} frame(s), received {} response frame(s), applied {} receipt(s), failures={}",
+            frames_sent,
+            response_frames_received,
+            receipts_applied,
+            failures.len()
+        ),
+    );
+    TextControlTransportPumpReportView {
+        pending_before: pending.len(),
+        frames_sent,
+        response_frames_received,
+        receipts_applied,
+        failures,
+        metrics,
+    }
+}
+
 fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> {
     match target.kind.as_str() {
         "dm" => target
@@ -8493,16 +8624,6 @@ mod tests {
             adapter_kind: None,
         });
         let message_id = sent.messages[0].message_id.clone();
-        let outbox_frame = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
-            target: Some(target),
-            limit: None,
-        })
-        .frames
-        .into_iter()
-        .find(|frame| frame.message_id == message_id)
-        .ok_or_else(|| "pending outbox frame missing".to_owned())?;
-        let outbound_bytes = serde_json::to_vec(&outbox_frame.frame)
-            .map_err(|error| format!("could not encode outbound text/control frame: {error}"))?;
 
         let bob_path = fresh_state_path("text-control-transport-pump-bob");
         let _ = fs::remove_file(&bob_path);
@@ -8522,49 +8643,39 @@ mod tests {
             .build()
             .map_err(|error| format!("could not start text/control pump runtime: {error}"))?;
 
-        runtime.block_on(async {
-            discrypt_transport::TextControlDataTransport::send_text_control_frame(
+        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
+        let report = runtime.block_on(async {
+            pump_text_control_transport_once(
+                &mut alice.state,
                 &transport,
-                outbound_bytes,
+                ListPendingTextControlFramesRequest {
+                    target: Some(target),
+                    limit: None,
+                },
+                "text-control-transport-trait-test",
             )
             .await
-            .map_err(|error| error.to_string())
-        })?;
-        let marked = mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
-            message_id: message_id.clone(),
-            frame_sha256: outbox_frame.frame_sha256,
-            transport_session_id: Some("text-control-transport-trait-test".to_owned()),
         });
-        assert!(marked.last_command_error.is_none());
+        alice.persist();
 
-        let receipt_bytes = runtime.block_on(async {
-            discrypt_transport::TextControlDataTransport::recv_text_control_frame(&transport)
-                .await
-                .map_err(|error| error.to_string())
-        })?;
-        let receipt_frame: TextControlFrameView = serde_json::from_slice(&receipt_bytes)
-            .map_err(|error| format!("could not decode receipt text/control frame: {error}"))?;
-        let handled = handle_text_control_frame(HandleTextControlFrameRequest {
-            frame: receipt_frame,
-        });
-        assert!(handled.state.last_command_error.is_none());
-        let receipted_message = handled
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 1);
+        assert_eq!(report.receipts_applied, 1);
+        assert!(report.metrics.open);
+        assert_eq!(report.metrics.frames_sent, 1);
+        assert_eq!(report.metrics.frames_received, 1);
+        assert!(report.metrics.bytes_sent > 0);
+        assert!(report.metrics.bytes_received > 0);
+
+        let receipted_message = alice
             .state
             .messages
             .iter()
             .find(|message| message.message_id == message_id)
             .ok_or_else(|| "sender message row missing after transport pump".to_owned())?;
         assert_eq!(receipted_message.state_key, "peer_receipt");
-
-        let metrics = runtime.block_on(async {
-            discrypt_transport::TextControlDataTransport::text_control_transport_metrics(&transport)
-                .await
-        });
-        assert!(metrics.open);
-        assert_eq!(metrics.frames_sent, 1);
-        assert_eq!(metrics.frames_received, 1);
-        assert!(metrics.bytes_sent > 0);
-        assert!(metrics.bytes_received > 0);
 
         let mut alice_store = FileAppStore::new(&alice_path);
         let alice_reloaded = load_state_from_store(&mut alice_store);
