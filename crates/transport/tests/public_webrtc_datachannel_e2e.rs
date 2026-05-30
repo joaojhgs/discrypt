@@ -111,6 +111,7 @@ fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportErr
     Ok(config)
 }
 
+#[cfg(feature = "mqtt-adapter")]
 fn media_frame_probe_payload() -> Vec<u8> {
     let mut frame = Vec::with_capacity(320);
     frame.extend_from_slice(b"media-frame-ciphertext:v1:");
@@ -119,6 +120,7 @@ fn media_frame_probe_payload() -> Vec<u8> {
     frame
 }
 
+#[cfg(feature = "mqtt-adapter")]
 fn media_frame_receipt_probe_payload(request: &[u8]) -> Vec<u8> {
     let mut receipt = Vec::with_capacity(request.len() + 48);
     receipt.extend_from_slice(b"media-receipt-v1:");

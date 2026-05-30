@@ -12,6 +12,7 @@
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
 use crate::SignalingProviderEndpoint;
+use crate::WebRtcNegotiator;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
     ConversationScope, IceServerConfig, OpaqueSignalingPayload, PeerSignal, PresenceEvent,
@@ -21,12 +22,13 @@ use crate::{
     SignalingPeerId, TextControlDataTransport, TransportError, WebRtcNegotiationConfig,
 };
 #[cfg(any(
+    test,
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-use crate::{WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator};
+use crate::{WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -43,19 +45,21 @@ use std::sync::{Arc, Mutex};
 ))]
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(any(
+    test,
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-use tokio::time::Instant;
+use tokio::time::timeout;
 #[cfg(any(
+    test,
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, Instant};
 
 /// End-to-end readiness state used by registry and fallback planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -439,6 +443,99 @@ pub struct ProviderWebRtcDataChannelProbe {
     /// Versioned serialized runtime handoff material captured during the probe.
     #[serde(default)]
     pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
+}
+
+/// Evidence returned when a live provider-signaled text/control runtime is attached.
+///
+/// This proves that the selected provider carried sealed WebRTC negotiation far
+/// enough to open a real DataChannel and return an app-facing transport handle.
+/// It intentionally does not claim message delivery; delivery is only proven by
+/// signed app-level receipts after the runtime is used.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTextControlRuntimeEvidence {
+    /// Adapter that opened the runtime.
+    pub kind: SignalingAdapterKind,
+    /// Profile id supplied by app/runtime policy.
+    pub profile_id: String,
+    /// Redacted provider endpoint label used by the profile.
+    pub endpoint_label: String,
+    /// Committed scope used to derive the rendezvous topic.
+    pub scope_commitment: String,
+    /// Provider-visible derived rendezvous topic/tag.
+    pub rendezvous_topic: String,
+    /// Offer-side direct path reached connected/completed state.
+    pub offerer_direct_path_ready: bool,
+    /// Answer-side direct path reached connected/completed state.
+    pub answerer_direct_path_ready: bool,
+    /// Offer-side DataChannel opened.
+    pub offerer_data_channel_open: bool,
+    /// Answer-side DataChannel opened.
+    pub answerer_data_channel_open: bool,
+    /// Versioned serialized runtime handoff material captured during attach.
+    pub runtime_spec: ProviderTextControlRuntimeSpec,
+}
+
+/// Live app-facing provider-backed text/control runtime pair.
+///
+/// The offerer side is returned as the sender's app-facing transport. The
+/// answerer side is kept alive by this handle and runs a receiver loop that
+/// turns incoming opaque frames into opaque responses. Dropping the handle aborts
+/// that receiver loop; call [`ProviderTextControlRuntimePair::close`] in tests or
+/// owned runtimes for deterministic teardown.
+pub struct ProviderTextControlRuntimePair {
+    evidence: ProviderTextControlRuntimeEvidence,
+    offerer: Option<Arc<WebRtcNegotiator>>,
+    answerer: Option<Arc<WebRtcNegotiator>>,
+    answerer_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ProviderTextControlRuntimePair {
+    /// Runtime attach evidence safe to surface to the app/UI.
+    #[must_use]
+    pub const fn evidence(&self) -> &ProviderTextControlRuntimeEvidence {
+        &self.evidence
+    }
+
+    /// Offerer-side app-facing text/control DataChannel transport.
+    #[must_use]
+    pub fn transport(&self) -> Arc<dyn TextControlDataTransport> {
+        self.offerer
+            .as_ref()
+            .expect("provider runtime transport is present until close")
+            .clone()
+    }
+
+    /// Abort the receiver loop and close both WebRTC peer connections.
+    pub async fn close(mut self) -> Result<(), TransportError> {
+        if let Some(task) = self.answerer_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+
+        let mut first_error = None;
+        if let Some(offerer) = self.offerer.take() {
+            if let Err(error) = offerer.tear_down().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(answerer) = self.answerer.take() {
+            if let Err(error) = answerer.tear_down().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ProviderTextControlRuntimePair {
+    fn drop(&mut self) {
+        if let Some(task) = self.answerer_task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Inputs required to resume a provider-backed WebRTC text/control runtime from a
@@ -989,6 +1086,165 @@ where
     .await
 }
 
+/// Start a live provider-signaled WebRTC text/control runtime pair.
+///
+/// The selected adapter carries only sealed SDP/candidate negotiation payloads.
+/// The returned offerer transport is a real WebRTC DataChannel transport, while
+/// the answerer loop invokes `answerer` for each received opaque frame and sends
+/// any non-empty opaque response back over the same DataChannel.
+pub async fn start_provider_webrtc_text_control_runtime_pair_with_answerer<F>(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    answerer: F,
+) -> Result<ProviderTextControlRuntimePair, TransportError>
+where
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    profile.validate()?;
+    scope.validate()?;
+    negotiation_config
+        .ice_servers
+        .validate_credentials_at(chrono::Utc::now())?;
+    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    start_provider_webrtc_text_control_runtime_pair_with_factory(
+        factory,
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        negotiation_config,
+        answerer,
+    )
+    .await
+}
+
+async fn start_provider_webrtc_text_control_runtime_pair_with_factory<F>(
+    factory: SignalingAdapterFactory,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    answerer: F,
+) -> Result<ProviderTextControlRuntimePair, TransportError>
+where
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    match factory {
+        SignalingAdapterFactory::Mqtt(adapter) => {
+            #[cfg(feature = "mqtt-adapter")]
+            {
+                start_provider_webrtc_text_control_runtime_pair_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "mqtt-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::Nostr(adapter) => {
+            #[cfg(feature = "nostr-adapter")]
+            {
+                start_provider_webrtc_text_control_runtime_pair_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "nostr-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::IpfsPubsub(adapter) => {
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            {
+                start_provider_webrtc_text_control_runtime_pair_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            {
+                start_provider_webrtc_text_control_runtime_pair_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                )
+                .await
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+            {
+                let _ = (
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    negotiation_config,
+                    answerer,
+                );
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+    }
+}
+
 async fn probe_provider_webrtc_datachannel_request_response_with_factory<F>(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
@@ -1200,6 +1456,228 @@ where
 }
 
 #[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+async fn start_provider_webrtc_text_control_runtime_pair_with_adapter<A, F>(
+    adapter: A,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    answerer: F,
+) -> Result<ProviderTextControlRuntimePair, TransportError>
+where
+    A: SignalingAdapter,
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    let endpoint_label = profile
+        .endpoints
+        .first()
+        .map(|endpoint| redacted_endpoint_label(&endpoint.endpoint.0))
+        .unwrap_or_else(|| "endpoint#missing".to_owned());
+    let capability = RendezvousCapability::derive(
+        scope.clone(),
+        profile.kind,
+        bootstrap_secret,
+        random_entropy,
+        120,
+        profile.metadata_posture,
+        profile.trust_label.clone(),
+    )?;
+    let rendezvous_topic = capability.topic.clone();
+    let alice = SignalingPeerId::new("runtime-webrtc-live-alice")?;
+    let bob = SignalingPeerId::new("runtime-webrtc-live-bob")?;
+    let alice_session = adapter.connect(profile.clone()).await?;
+    let bob_session = adapter.connect(profile.clone()).await?;
+    let alice_room = alice_session
+        .join(scope.clone(), capability.clone(), alice.clone())
+        .await?;
+    let bob_room = bob_session
+        .join(scope.clone(), capability, bob.clone())
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let alice_webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?);
+    let bob_webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
+    let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
+
+    let offer = alice_webrtc.create_offer().await?;
+    let sealed_offer = sealer.seal_description(&offer)?;
+    let opaque_offer = sealed_offer.to_opaque_bytes()?;
+    if opaque_offer.windows(3).any(|window| window == b"v=0") {
+        return Err(TransportError::PlaintextLeak);
+    }
+    let captured_sealed_offer = Some(sealed_offer.clone());
+    let mut captured_sealed_answer = None;
+    let mut offerer_ice_candidates = Vec::new();
+    let mut answerer_ice_candidates = Vec::new();
+    alice_room.send_signal(bob.clone(), sealed_offer).await?;
+
+    let mut answer_applied = false;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        for signal in bob_room.take_signals().await? {
+            if signal.from_peer != alice || signal.to_peer != bob {
+                continue;
+            }
+            match signal.payload.kind {
+                WebRtcNegotiationPayloadKind::Offer => {
+                    let offer = sealer.open_description(&signal.payload)?;
+                    let answer = bob_webrtc.create_answer(offer).await?;
+                    let sealed_answer = sealer.seal_description(&answer)?;
+                    captured_sealed_answer = Some(sealed_answer.clone());
+                    bob_room.send_signal(alice.clone(), sealed_answer).await?;
+                }
+                WebRtcNegotiationPayloadKind::Candidate => {
+                    bob_webrtc
+                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Answer => {}
+            }
+        }
+
+        for signal in alice_room.take_signals().await? {
+            if signal.from_peer != bob || signal.to_peer != alice {
+                continue;
+            }
+            match signal.payload.kind {
+                WebRtcNegotiationPayloadKind::Answer if !answer_applied => {
+                    alice_webrtc
+                        .accept_answer(sealer.open_description(&signal.payload)?)
+                        .await?;
+                    answer_applied = true;
+                }
+                WebRtcNegotiationPayloadKind::Candidate => {
+                    alice_webrtc
+                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                        .await?;
+                }
+                WebRtcNegotiationPayloadKind::Offer | WebRtcNegotiationPayloadKind::Answer => {}
+            }
+        }
+
+        for candidate in alice_webrtc.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            offerer_ice_candidates.push(sealed_candidate.clone());
+            alice_room
+                .send_signal(bob.clone(), sealed_candidate)
+                .await?;
+        }
+        for candidate in bob_webrtc.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            answerer_ice_candidates.push(sealed_candidate.clone());
+            bob_room
+                .send_signal(alice.clone(), sealed_candidate)
+                .await?;
+        }
+
+        if answer_applied
+            && alice_webrtc.direct_path_metrics().await.direct_path_ready
+            && bob_webrtc.direct_path_metrics().await.direct_path_ready
+        {
+            alice_webrtc
+                .wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            bob_webrtc
+                .wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let offerer_data = alice_webrtc.text_control_transport_metrics().await;
+    let answerer_data = bob_webrtc.text_control_transport_metrics().await;
+    if !offerer_data.open || !answerer_data.open {
+        return Err(TransportError::Unavailable(format!(
+            "provider-signaled WebRTC runtime data channel did not open: alice={:?} bob={:?}",
+            alice_webrtc.direct_path_metrics().await,
+            bob_webrtc.direct_path_metrics().await
+        )));
+    }
+
+    let alice_direct = alice_webrtc.direct_path_metrics().await;
+    let bob_direct = bob_webrtc.direct_path_metrics().await;
+    let now_unix_seconds = Utc::now().timestamp();
+    let mut runtime_ice_candidates = Vec::new();
+    runtime_ice_candidates.extend(offerer_ice_candidates);
+    runtime_ice_candidates.extend(answerer_ice_candidates);
+    let runtime_spec = ProviderTextControlRuntimeSpec {
+        schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+        attachment: ProviderTextControlRuntimeAttachment {
+            adapter_kind: profile.kind.canonical_name().to_owned(),
+            profile_id: profile.profile_id.clone(),
+            endpoint_label: endpoint_label.clone(),
+            rendezvous_topic: rendezvous_topic.clone(),
+            scope_commitment: scope.scope_id_commitment.clone(),
+            runtime_spec: None,
+        },
+        created_at_unix_seconds: now_unix_seconds,
+        expires_at_unix_seconds: now_unix_seconds.saturating_add(60 * 60),
+        sealed_offer: captured_sealed_offer,
+        sealed_answer: captured_sealed_answer,
+        sealed_ice_candidates: runtime_ice_candidates,
+        missing_material: Vec::new(),
+    };
+    let evidence = ProviderTextControlRuntimeEvidence {
+        kind: profile.kind,
+        profile_id: profile.profile_id,
+        endpoint_label,
+        scope_commitment: scope.scope_id_commitment,
+        rendezvous_topic,
+        offerer_direct_path_ready: alice_direct.direct_path_ready,
+        answerer_direct_path_ready: bob_direct.direct_path_ready,
+        offerer_data_channel_open: offerer_data.open,
+        answerer_data_channel_open: answerer_data.open,
+        runtime_spec,
+    };
+
+    alice_room.leave().await?;
+    bob_room.leave().await?;
+    alice_session.close().await?;
+    bob_session.close().await?;
+
+    let answerer_webrtc = bob_webrtc.clone();
+    let answerer = Arc::new(answerer);
+    let answerer_task = tokio::spawn(async move {
+        loop {
+            let received = match answerer_webrtc.recv_text_control_frame().await {
+                Ok(received) => received,
+                Err(_) => break,
+            };
+            let response = match answerer(received) {
+                Ok(response) => response,
+                Err(_) => break,
+            };
+            if response.is_empty() {
+                continue;
+            }
+            if answerer_webrtc
+                .send_text_control_frame(response)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    Ok(ProviderTextControlRuntimePair {
+        evidence,
+        offerer: Some(alice_webrtc),
+        answerer: Some(bob_webrtc),
+        answerer_task: Some(answerer_task),
+    })
+}
+
+#[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -1261,7 +1739,7 @@ where
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
     }
-    let mut captured_sealed_offer = Some(sealed_offer.clone());
+    let captured_sealed_offer = Some(sealed_offer.clone());
     let mut captured_sealed_answer = None;
     let mut offerer_ice_candidates = Vec::new();
     let mut answerer_ice_candidates = Vec::new();
@@ -1482,6 +1960,7 @@ where
 }
 
 #[cfg(any(
+    test,
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -6775,6 +7254,95 @@ mod tests {
                 .await,
             Err(TransportError::PlaintextLeak)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_provider_text_control_runtime_pair_carries_multiple_opaque_frames(
+    ) -> Result<(), TransportError> {
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus.clone());
+        let scope = ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"alice bob live runtime pair",
+                "runtime pair",
+            ),
+        )?;
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let answerer_received = received.clone();
+        let runtime = start_provider_webrtc_text_control_runtime_pair_with_adapter(
+            adapter,
+            local_profile(SignalingAdapterKind::Mqtt)?,
+            scope,
+            b"runtime pair bootstrap secret with thirty two bytes",
+            b"runtime pair entropy",
+            WebRtcNegotiationConfig::new(IceServerConfig::new(
+                vec![Endpoint::new("stun:127.0.0.1:3478")],
+                vec![],
+            )?),
+            move |frame| {
+                answerer_received
+                    .lock()
+                    .map_err(|_| {
+                        TransportError::Unavailable(
+                            "runtime pair answerer receipt lock poisoned".to_owned(),
+                        )
+                    })?
+                    .push(frame.clone());
+                Ok(format!("ciphertext:runtime-pair-receipt:{}", sha256_hex(&frame)).into_bytes())
+            },
+        )
+        .await?;
+
+        assert!(runtime.evidence().offerer_direct_path_ready);
+        assert!(runtime.evidence().answerer_direct_path_ready);
+        assert!(runtime.evidence().offerer_data_channel_open);
+        assert!(runtime.evidence().answerer_data_channel_open);
+        runtime
+            .evidence()
+            .runtime_spec
+            .validate_for_runtime_attach(
+                Utc::now().timestamp(),
+                &runtime.evidence().runtime_spec.attachment,
+            )?;
+
+        let transport = runtime.transport();
+        for index in 0..2 {
+            let frame = format!("ciphertext:runtime-pair-frame:{index}").into_bytes();
+            let expected_receipt =
+                format!("ciphertext:runtime-pair-receipt:{}", sha256_hex(&frame)).into_bytes();
+            transport.send_text_control_frame(frame).await?;
+            let receipt = timeout(Duration::from_secs(5), transport.recv_text_control_frame())
+                .await
+                .map_err(|_| {
+                    TransportError::Unavailable(
+                        "timed out receiving runtime pair receipt".to_owned(),
+                    )
+                })??;
+            assert_eq!(receipt, expected_receipt);
+        }
+
+        let metrics = transport.text_control_transport_metrics().await;
+        assert!(metrics.open);
+        assert_eq!(metrics.frames_sent, 2);
+        assert_eq!(metrics.frames_received, 2);
+        assert_eq!(
+            received
+                .lock()
+                .map_err(|_| TransportError::Unavailable("receipt lock poisoned".to_owned()))?
+                .len(),
+            2
+        );
+        for material in bus.relay_visible_material_for_tests() {
+            assert!(!material.windows(3).any(|window| window == b"v=0"));
+            assert!(!material
+                .windows(b"runtime-pair-frame".len())
+                .any(|window| window == b"runtime-pair-frame"));
+        }
+
+        runtime.close().await?;
         Ok(())
     }
 
