@@ -328,6 +328,14 @@ export type ProviderWebRtcDataChannelProbeView = {
   rendezvous_topic: string;
   offerer_direct_path_ready: boolean;
   answerer_direct_path_ready: boolean;
+  offerer_turn_fallback_ready: boolean;
+  answerer_turn_fallback_ready: boolean;
+  offerer_configured_turn_servers: number;
+  answerer_configured_turn_servers: number;
+  offerer_local_relay_candidates_gathered: number;
+  answerer_local_relay_candidates_gathered: number;
+  offerer_remote_relay_candidates_applied: number;
+  answerer_remote_relay_candidates_applied: number;
   offerer_data_channel_open: boolean;
   answerer_data_channel_open: boolean;
   text_control_frame_roundtrip: boolean;

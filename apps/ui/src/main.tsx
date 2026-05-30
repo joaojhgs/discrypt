@@ -1526,6 +1526,64 @@ function TransportStatusStrip({
               <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
                 {diagnostics.data_channel_probe_detail}
               </p>
+              {diagnostics.data_channel_probe ? (
+                <div className="mt-2 grid gap-1 text-xs text-[hsl(var(--muted-foreground))] sm:grid-cols-2">
+                  <span>
+                    Direct: offerer{" "}
+                    {diagnostics.data_channel_probe.offerer_direct_path_ready
+                      ? "ready"
+                      : "not ready"}{" "}
+                    / answerer{" "}
+                    {diagnostics.data_channel_probe.answerer_direct_path_ready
+                      ? "ready"
+                      : "not ready"}
+                  </span>
+                  <span>
+                    TURN: offerer{" "}
+                    {diagnostics.data_channel_probe.offerer_turn_fallback_ready
+                      ? "ready"
+                      : "not ready"}{" "}
+                    / answerer{" "}
+                    {diagnostics.data_channel_probe.answerer_turn_fallback_ready
+                      ? "ready"
+                      : "not ready"}
+                  </span>
+                  <span>
+                    TURN servers:{" "}
+                    {
+                      diagnostics.data_channel_probe
+                        .offerer_configured_turn_servers
+                    }
+                    /
+                    {
+                      diagnostics.data_channel_probe
+                        .answerer_configured_turn_servers
+                    }
+                  </span>
+                  <span>
+                    Relay candidates: local{" "}
+                    {
+                      diagnostics.data_channel_probe
+                        .offerer_local_relay_candidates_gathered
+                    }
+                    /
+                    {
+                      diagnostics.data_channel_probe
+                        .answerer_local_relay_candidates_gathered
+                    }{" "}
+                    remote{" "}
+                    {
+                      diagnostics.data_channel_probe
+                        .offerer_remote_relay_candidates_applied
+                    }
+                    /
+                    {
+                      diagnostics.data_channel_probe
+                        .answerer_remote_relay_candidates_applied
+                    }
+                  </span>
+                </div>
+              ) : null}
             </div>
             {diagnostics.adapter_fallback_attempts.length ? (
               <div className="mt-3 space-y-1">

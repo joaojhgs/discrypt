@@ -54,7 +54,7 @@ use discrypt_transport::{
     ConnectivityScopeLevel, ConversationScope, Endpoint, FallbackLeg, IceServerConfig,
     ProviderMetadataPosture, SignalingAdapterCapabilities, SignalingAdapterKind,
     SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportRoute,
-    TransportSession, TransportSessionSnapshot, TransportSessionState,
+    TransportSession, TransportSessionSnapshot, TransportSessionState, TurnServerConfig,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -1241,6 +1241,30 @@ pub struct ProviderWebRtcDataChannelProbeView {
     pub offerer_direct_path_ready: bool,
     /// Answerer WebRTC direct path readiness.
     pub answerer_direct_path_ready: bool,
+    /// Offerer TURN fallback readiness from configured relay candidate evidence.
+    #[serde(default)]
+    pub offerer_turn_fallback_ready: bool,
+    /// Answerer TURN fallback readiness from configured relay candidate evidence.
+    #[serde(default)]
+    pub answerer_turn_fallback_ready: bool,
+    /// Number of TURN servers configured for the offerer probe.
+    #[serde(default)]
+    pub offerer_configured_turn_servers: u64,
+    /// Number of TURN servers configured for the answerer probe.
+    #[serde(default)]
+    pub answerer_configured_turn_servers: u64,
+    /// Local relay candidates gathered by the offerer probe.
+    #[serde(default)]
+    pub offerer_local_relay_candidates_gathered: u64,
+    /// Local relay candidates gathered by the answerer probe.
+    #[serde(default)]
+    pub answerer_local_relay_candidates_gathered: u64,
+    /// Remote relay candidates applied by the offerer probe.
+    #[serde(default)]
+    pub offerer_remote_relay_candidates_applied: u64,
+    /// Remote relay candidates applied by the answerer probe.
+    #[serde(default)]
+    pub answerer_remote_relay_candidates_applied: u64,
     /// Offerer DataChannel open state.
     pub offerer_data_channel_open: bool,
     /// Answerer DataChannel open state.
@@ -3381,13 +3405,21 @@ impl PersistedAppState {
             return (
                 "webrtc-datachannel-proofed".to_owned(),
                 format!(
-                    "adapter={} profile={} endpoint={} topic={} offerer_direct={} answerer_direct={} offerer_open={} answerer_open={} frame={}",
+                    "adapter={} profile={} endpoint={} topic={} offerer_direct={} answerer_direct={} offerer_turn={} answerer_turn={} turn_servers={}/{} relay_local={}/{} relay_remote={}/{} offerer_open={} answerer_open={} frame={}",
                     probe.kind,
                     probe.profile_id,
                     probe.endpoint_label,
                     probe.rendezvous_topic,
                     probe.offerer_direct_path_ready,
                     probe.answerer_direct_path_ready,
+                    probe.offerer_turn_fallback_ready,
+                    probe.answerer_turn_fallback_ready,
+                    probe.offerer_configured_turn_servers,
+                    probe.answerer_configured_turn_servers,
+                    probe.offerer_local_relay_candidates_gathered,
+                    probe.answerer_local_relay_candidates_gathered,
+                    probe.offerer_remote_relay_candidates_applied,
+                    probe.answerer_remote_relay_candidates_applied,
                     probe.offerer_data_channel_open,
                     probe.answerer_data_channel_open,
                     probe.text_control_frame_roundtrip
@@ -3679,27 +3711,78 @@ impl PersistedAppState {
             );
             return;
         }
-        if !(probe.offerer_direct_path_ready && probe.answerer_direct_path_ready) {
+        let (selected_leg, endpoint) =
+            if probe.offerer_direct_path_ready && probe.answerer_direct_path_ready {
+                let endpoint = self
+                    .active_connectivity_policy()
+                    .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
+                    .map(Endpoint::new)
+                    .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
+                (FallbackLeg::Stun, endpoint)
+            } else if probe.offerer_turn_fallback_ready && probe.answerer_turn_fallback_ready {
+                let endpoint = self
+                    .active_connectivity_policy()
+                    .and_then(|(_, connectivity)| {
+                        connectivity
+                            .ice_turn_servers
+                            .first()
+                            .map(|server| server.endpoint.clone())
+                    })
+                    .map(Endpoint::new)
+                    .unwrap_or_else(|| Endpoint::new("turn:provider-relay.proofed"));
+                (FallbackLeg::Turn, endpoint)
+            } else {
+                (FallbackLeg::RelayOverlay, Endpoint::new("overlay:pending"))
+            };
+        if matches!(selected_leg, FallbackLeg::RelayOverlay) {
             self.push_event(
                 "transport.text_route_pending",
                 "DataChannel opened, but direct STUN route readiness was not proven; route state left unconnected until TURN/overlay proof is available".to_owned(),
             );
             return;
-        }
-        let endpoint = self
-            .active_connectivity_policy()
-            .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
-            .map(Endpoint::new)
-            .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
-        let plan = ConnectivityPlan {
-            attempts: vec![ConnectionAttempt {
-                leg: FallbackLeg::Stun,
+        };
+        let attempts = if matches!(selected_leg, FallbackLeg::Turn) {
+            vec![
+                ConnectionAttempt {
+                    leg: FallbackLeg::Stun,
+                    endpoint: self
+                        .active_connectivity_policy()
+                        .and_then(|(_, connectivity)| {
+                            connectivity.ice_stun_servers.first().cloned()
+                        })
+                        .map(Endpoint::new)
+                        .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302")),
+                    carries_content: false,
+                    ciphertext_only: false,
+                    succeeded: false,
+                },
+                ConnectionAttempt {
+                    leg: FallbackLeg::RelayOverlay,
+                    endpoint: Endpoint::new("overlay:not-proofed"),
+                    carries_content: false,
+                    ciphertext_only: true,
+                    succeeded: false,
+                },
+                ConnectionAttempt {
+                    leg: FallbackLeg::Turn,
+                    endpoint: endpoint.clone(),
+                    carries_content: false,
+                    ciphertext_only: true,
+                    succeeded: true,
+                },
+            ]
+        } else {
+            vec![ConnectionAttempt {
+                leg: selected_leg,
                 endpoint: endpoint.clone(),
                 carries_content: false,
                 ciphertext_only: false,
                 succeeded: true,
-            }],
-            selected: FallbackLeg::Stun,
+            }]
+        };
+        let plan = ConnectivityPlan {
+            attempts,
+            selected: selected_leg,
             endpoint,
         };
         let selected_session = self.transport_session_mut(BackendTransportMode::Text);
@@ -3736,8 +3819,10 @@ impl PersistedAppState {
             Ok(()) => self.push_event(
                 "transport.text_route_proofed",
                 format!(
-                    "Text session route proofed by provider-signaled WebRTC DataChannel using {} profile {}",
-                    probe.kind, probe.profile_id
+                    "Text session route proofed by provider-signaled WebRTC DataChannel using {} profile {} over {}",
+                    probe.kind,
+                    probe.profile_id,
+                    Self::fallback_leg_label(selected_leg)
                 ),
             ),
             Err(error) => self.push_command_error(
@@ -3795,16 +3880,8 @@ impl PersistedAppState {
         let profile = transport_profile_from_view(&profile_view)?;
         let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
             .map_err(|error| error.to_string())?;
-        let ice_config = IceServerConfig::new(
-            connectivity
-                .ice_stun_servers
-                .iter()
-                .cloned()
-                .map(Endpoint::new)
-                .collect(),
-            Vec::new(),
-        )
-        .map_err(|error| error.to_string())?;
+        let ice_config =
+            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
         let bootstrap_secret = self.probe_material(
             "discrypt-runtime-webrtc-probe-bootstrap-v1",
             &connectivity.scope_id_commitment,
@@ -3849,6 +3926,16 @@ impl PersistedAppState {
             rendezvous_topic: probe.rendezvous_topic,
             offerer_direct_path_ready: probe.offerer_direct_path_ready,
             answerer_direct_path_ready: probe.answerer_direct_path_ready,
+            offerer_turn_fallback_ready: probe.offerer_turn_fallback_ready,
+            answerer_turn_fallback_ready: probe.answerer_turn_fallback_ready,
+            offerer_configured_turn_servers: probe.offerer_configured_turn_servers,
+            answerer_configured_turn_servers: probe.answerer_configured_turn_servers,
+            offerer_local_relay_candidates_gathered: probe.offerer_local_relay_candidates_gathered,
+            answerer_local_relay_candidates_gathered: probe
+                .answerer_local_relay_candidates_gathered,
+            offerer_remote_relay_candidates_applied: probe.offerer_remote_relay_candidates_applied,
+            answerer_remote_relay_candidates_applied: probe
+                .answerer_remote_relay_candidates_applied,
             offerer_data_channel_open: probe.offerer_data_channel_open,
             answerer_data_channel_open: probe.answerer_data_channel_open,
             text_control_frame_roundtrip: probe.text_control_frame_roundtrip,
@@ -5927,6 +6014,37 @@ fn run_provider_webrtc_data_channel_request_response_probe(
     })
     .join()
     .map_err(|_| "Provider WebRTC data-channel request/response probe thread panicked".to_owned())?
+}
+
+fn ice_config_from_connectivity(
+    connectivity: &ConnectivityPolicyView,
+) -> Result<IceServerConfig, discrypt_transport::TransportError> {
+    let stun_servers = connectivity
+        .ice_stun_servers
+        .iter()
+        .cloned()
+        .map(Endpoint::new)
+        .collect();
+    let mut turn_servers = connectivity
+        .ice_turn_servers
+        .iter()
+        .filter(|server| !server.credential_declared)
+        .map(|server| {
+            TurnServerConfig::new(Endpoint::new(server.endpoint.clone()), None, None, None)
+        })
+        .collect::<Vec<_>>();
+    if let Ok(endpoint) = std::env::var("DISCRYPT_PUBLIC_TURN_ENDPOINT") {
+        let endpoint = endpoint.trim();
+        if !endpoint.is_empty() {
+            turn_servers.push(TurnServerConfig::new(
+                Endpoint::new(endpoint.to_owned()),
+                std::env::var("DISCRYPT_PUBLIC_TURN_USERNAME").ok(),
+                std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL").ok(),
+                std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL_EXPIRES_AT").ok(),
+            ));
+        }
+    }
+    IceServerConfig::new(stun_servers, turn_servers)
 }
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> Option<String> {
@@ -8975,6 +9093,76 @@ mod tests {
             .transport_status
             .iter()
             .any(|status| { status.label == "text session" && status.status == "signaling" }));
+    }
+
+    #[test]
+    fn text_session_turn_probe_marks_turn_route_and_diagnostics() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-session-turn-route-proof");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none());
+
+        let turn_probe = ProviderWebRtcDataChannelProbeView {
+            kind: "mqtt".to_owned(),
+            profile_id: "mqtt-default".to_owned(),
+            endpoint_label: "mqtts://broker.example".to_owned(),
+            rendezvous_topic: "topic-commitment".to_owned(),
+            offerer_direct_path_ready: false,
+            answerer_direct_path_ready: false,
+            offerer_turn_fallback_ready: true,
+            answerer_turn_fallback_ready: true,
+            offerer_configured_turn_servers: 1,
+            answerer_configured_turn_servers: 1,
+            offerer_local_relay_candidates_gathered: 1,
+            answerer_local_relay_candidates_gathered: 1,
+            offerer_remote_relay_candidates_applied: 1,
+            answerer_remote_relay_candidates_applied: 1,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "b".repeat(64),
+        };
+
+        let state = mutate_app_service(|state| {
+            state.latest_data_channel_probe = Some(turn_probe.clone());
+            state.mark_text_session_data_channel_route_proof(&turn_probe);
+        });
+
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-proofed"
+        );
+        assert!(state
+            .transport_diagnostics
+            .data_channel_probe_detail
+            .contains("offerer_turn=true"));
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-proofed"
+        );
+        assert_eq!(state.transport_diagnostics.turn_required, "turn-required");
+        assert!(state
+            .transport_diagnostics
+            .route_proof_detail
+            .contains("selected=turn"));
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| status.label == "text session" && status.status == "turn_relay"));
     }
 
     #[test]
