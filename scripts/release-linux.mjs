@@ -29,6 +29,12 @@ function fail(message) {
   process.exit(1);
 }
 
+function capture(command, args) {
+  const result = spawnSync(command, args, { cwd: repoRoot, encoding: "utf8" });
+  if (result.status !== 0) fail(`${[command, ...args].join(" ")} failed with status ${result.status ?? "unknown"}`);
+  return result.stdout.trim();
+}
+
 function run(command, args, options = {}) {
   const rendered = [command, ...args].join(" ");
   if (dryRun) return { command, args, rendered, skipped: true };
@@ -72,6 +78,8 @@ if (!releaseFeatures.includes("tauri-runtime")) {
   fail("DISCRYPT_RELEASE_FEATURES must include tauri-runtime for desktop packaging");
 }
 
+const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH ?? capture("git", ["log", "-1", "--format=%ct"]);
+const releaseEnv = { ...process.env, SOURCE_DATE_EPOCH: sourceDateEpoch };
 const steps = [];
 steps.push(
   run("npm", ["--prefix", "apps/ui", "ci"]),
@@ -89,13 +97,18 @@ steps.push(
     bundles.join(","),
     "--features",
     releaseFeatures.join(","),
-  ]),
+  ], { env: releaseEnv }),
   run(process.execPath, [
     "scripts/generate-sbom-g124.mjs",
     "--out-dir",
     "target/sbom",
     "--require-packaged-artifacts",
   ]),
+  run(process.execPath, [
+    "scripts/reproducible-release-evidence-g126.mjs",
+    "--out",
+    "target/release/reproducibility-g126.json",
+  ], { env: releaseEnv }),
 );
 
 const plan = {
@@ -107,6 +120,7 @@ const plan = {
   tauriConfigPath,
   targetDir,
   dryRun,
+  sourceDateEpoch,
   steps,
 };
 

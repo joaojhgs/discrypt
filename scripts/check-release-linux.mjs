@@ -38,12 +38,14 @@ for (const token of [
   "npx --yes @tauri-apps/cli@2.11.2 build",
   "--bundles deb,rpm,appimage",
   "node scripts/generate-sbom-g124.mjs --out-dir target/sbom --require-packaged-artifacts",
+  "node scripts/reproducible-release-evidence-g126.mjs --out target/release/reproducibility-g126.json",
 ]) {
   if (!rendered.includes(token)) failures.push(`release plan missing command token: ${token}`);
 }
 if (!String(plan.tauriConfigPath).endsWith("apps/desktop/src-tauri/tauri.conf.json")) {
   failures.push("release plan must use the desktop Tauri config");
 }
+if (!plan.sourceDateEpoch) failures.push("release plan missing SOURCE_DATE_EPOCH");
 if (failures.length > 0) {
   console.error("release-linux dry-run check failed:");
   for (const failure of failures) console.error(`- ${failure}`);

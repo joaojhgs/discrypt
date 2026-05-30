@@ -126,7 +126,7 @@ Required gates for this decision:
    set matches the current dependency graph.
 9. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
    policy is configured, with duplicate versions still warnings.
-11. Full `cargo audit and advisory-deny clean runs remain release-blocking gates
+10. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
    handled by the later advisory/reproducibility stories.
 
 ## Consequences
