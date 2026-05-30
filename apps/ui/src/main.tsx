@@ -122,12 +122,20 @@ function textRuntimePeerDefaults(state: AppState): {
   const activeDm = state.active_context?.dm_id
     ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
     : state.dms[0];
+  const activeGroup = state.active_context?.group_id
+    ? state.groups.find((group) => group.group_id === state.active_context?.group_id)
+    : state.groups[0];
   const activeInvite = state.active_context?.dm_id
     ? state.invites
         .slice()
         .reverse()
         .find((invite) => invite.dm_id === state.active_context?.dm_id)
-    : state.invites.at(-1);
+    : state.active_context?.group_id
+      ? state.invites
+          .slice()
+          .reverse()
+          .find((invite) => invite.group_id === state.active_context?.group_id)
+      : state.invites.at(-1);
   const dmBootstrap =
     activeDm?.connectivity?.dm_bootstrap ?? activeInvite?.dm_bootstrap ?? null;
   if (dmBootstrap) {
@@ -145,6 +153,24 @@ function textRuntimePeerDefaults(state: AppState): {
     return openedFromInvite
       ? { local: replyPeer, remote: inviterPeer }
       : { local: inviterPeer, remote: replyPeer };
+  }
+  const groupBootstrap =
+    activeGroup?.connectivity?.group_bootstrap ?? activeInvite?.group_bootstrap ?? null;
+  if (groupBootstrap) {
+    const ownerPeer = runtimePeerIdFromCommitment(
+      "group-owner-runtime-peer",
+      groupBootstrap.group_identity_commitment,
+    );
+    const memberPeer = runtimePeerIdFromCommitment(
+      "group-member-runtime-peer",
+      `${groupBootstrap.role_admission_policy_commitment}:${groupBootstrap.channel_policy_commitment}`,
+    );
+    const joinedFromInvite =
+      activeGroup?.role !== "owner" ||
+      state.events.some((event) => event.kind === "group.joined");
+    return joinedFromInvite
+      ? { local: memberPeer, remote: ownerPeer }
+      : { local: ownerPeer, remote: memberPeer };
   }
   const remoteSeed =
     activeDm?.participant_id ??

@@ -559,3 +559,24 @@ Public evidence rerun:
 
 Remaining gap: this is now a stronger two-role persisted-state backend proof, but
 still not a two-window installed GUI Playwright/Tauri UI flow.
+
+## 2026-05-30 update: group invite-derived runtime peer defaults
+
+The React runtime attach controls now derive group owner/member peer defaults
+from signed group bootstrap commitments instead of falling through to local UI
+hash seeds. For an owner/admin profile, the default local peer is derived from
+`group_identity_commitment` and the remote member peer is derived from the signed
+role-admission/channel-policy commitments. For a joined member profile, the
+mapping is reversed. Users can still override the fields manually, but the normal
+group path no longer starts from ad-hoc profile-local defaults when signed group
+metadata is present.
+
+Verification run:
+
+- `npm --prefix apps/ui run typecheck`
+- `npm --prefix apps/ui run test:command-coverage`
+- `npm --prefix apps/ui run build`
+
+Remaining gap: this improves UI/runtime attach defaults for group flows, but does
+not yet provide a full signed member-device directory or two-window group text
+and voice E2E proof.
