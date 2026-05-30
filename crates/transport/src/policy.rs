@@ -238,15 +238,7 @@ impl SignalingProviderEndpoint {
                         value.starts_with("mqtts://") || value.starts_with("wss://")
                     }
                     SignalingAdapterKind::Nostr => value.starts_with("wss://"),
-                    SignalingAdapterKind::IpfsPubsub => {
-                        value.starts_with("/dnsaddr/")
-                            || value.starts_with("/dns/")
-                            || value.starts_with("/dns4/")
-                            || value.starts_with("/dns6/")
-                            || value.starts_with("/ip4/")
-                            || value.starts_with("/ip6/")
-                            || value.starts_with("libp2p://")
-                    }
+                    SignalingAdapterKind::IpfsPubsub => is_ipfs_public_direct_peer_multiaddr(value),
                     SignalingAdapterKind::DiscryptQuicRendezvous => {
                         value.starts_with("quic://")
                             || value.starts_with("https://")
@@ -272,10 +264,7 @@ impl SignalingProviderEndpoint {
                     || value.starts_with("wss://")
                     || value.starts_with("quic://")
                     || value.starts_with("https://")
-                    || value.starts_with("/dnsaddr/")
-                    || value.starts_with("/dns/")
-                    || value.starts_with("/ip4/")
-                    || value.starts_with("/ip6/");
+                    || is_ipfs_public_direct_peer_multiaddr(value);
                 if !valid {
                     return Err(TransportError::InvalidConnectivityPolicy(
                         "self-hosted signaling endpoint must still use an explicit supported scheme"
@@ -733,6 +722,13 @@ fn is_loopback_cleartext(value: &str) -> bool {
         || value.starts_with("/ip6/::1/")
 }
 
+fn is_ipfs_public_direct_peer_multiaddr(value: &str) -> bool {
+    let value = value.strip_prefix("libp2p://").unwrap_or(value);
+    (value.starts_with("/ip4/") || value.starts_with("/ip6/"))
+        && value.contains("/tcp/")
+        && value.contains("/p2p/")
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -938,13 +934,28 @@ mod tests {
     }
 
     #[test]
-    fn ipfs_profile_accepts_dnsaddr_bootstrap_multiaddr() -> Result<(), TransportError> {
+    fn ipfs_profile_accepts_direct_topic_peer_multiaddr() -> Result<(), TransportError> {
+        let profile = adapter(
+            SignalingAdapterKind::IpfsPubsub,
+            "/ip4/203.0.113.10/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+        )?;
+
+        assert!(profile.validate().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn ipfs_profile_rejects_dns_bootstrap_until_topic_peer_discovery_is_audited(
+    ) -> Result<(), TransportError> {
         let profile = adapter(
             SignalingAdapterKind::IpfsPubsub,
             "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
         )?;
 
-        assert!(profile.validate().is_ok());
+        let error = profile
+            .validate()
+            .expect_err("DNS bootstrap is not an accepted production IPFS default");
+        assert!(format!("{error}").contains("production endpoint scheme is invalid"));
         Ok(())
     }
 

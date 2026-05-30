@@ -4546,7 +4546,9 @@ mod tests {
         match kind {
             SignalingAdapterKind::Mqtt => "wss://mqtt.example.invalid",
             SignalingAdapterKind::Nostr => "wss://nostr.example.invalid",
-            SignalingAdapterKind::IpfsPubsub => "/dns/bootstrap.example.invalid/tcp/4001",
+            SignalingAdapterKind::IpfsPubsub => {
+                "/ip4/203.0.113.10/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+            }
             SignalingAdapterKind::DiscryptQuicRendezvous => "quic://signal.example.invalid",
         }
     }
