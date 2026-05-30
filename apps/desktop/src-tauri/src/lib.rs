@@ -4901,15 +4901,15 @@ impl PersistedAppState {
             .map_err(|error| error.to_string())?;
         let ice_config =
             ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
-        let bootstrap_secret = self.probe_material(
+        let bootstrap_secret = shared_runtime_material(
             "discrypt-live-role-split-runtime-bootstrap-v1",
-            &connectivity.scope_id_commitment,
+            &connectivity,
             &profile.profile_id,
             32,
         );
-        let random_entropy = self.probe_material(
+        let random_entropy = shared_runtime_material(
             "discrypt-live-role-split-runtime-entropy-v1",
-            &connectivity.scope_id_commitment,
+            &connectivity,
             &profile.profile_id,
             16,
         );
@@ -5690,6 +5690,18 @@ impl PersistedAppState {
     ) -> Option<(ConnectivityScopeLevel, ConnectivityPolicyView)> {
         if let Some(context) = &self.active_context {
             if let Some(dm_id) = &context.dm_id {
+                if let Some(connectivity) = self
+                    .invites
+                    .iter()
+                    .rev()
+                    .find(|invite| {
+                        invite.invite_kind == InviteKind::DmContact.canonical_name()
+                            && invite.dm_id.as_ref() == Some(dm_id)
+                    })
+                    .map(InviteView::connectivity_policy)
+                {
+                    return Some((ConnectivityScopeLevel::Dm, connectivity));
+                }
                 if let Some(connectivity) = self
                     .dms
                     .iter()
@@ -7108,6 +7120,49 @@ fn hash_commitment(domain: &str, parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     hex::encode(hasher.finalize())
+}
+
+fn shared_runtime_material(
+    domain: &str,
+    connectivity: &ConnectivityPolicyView,
+    profile_id: &str,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut counter = 0_u8;
+    while out.len() < len {
+        let mut hasher = Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update([0]);
+        hasher.update(connectivity.connectivity_schema_version.to_be_bytes());
+        hasher.update([0]);
+        hasher.update(connectivity.invite_kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(connectivity.scope_id_commitment.as_bytes());
+        hasher.update([0]);
+        hasher.update(profile_id.as_bytes());
+        if let Some(dm) = &connectivity.dm_bootstrap {
+            hasher.update([0]);
+            hasher.update(dm.inviter_identity_commitment.as_bytes());
+            hasher.update([0]);
+            hasher.update(dm.contact_token_commitment.as_bytes());
+            hasher.update([0]);
+            hasher.update(dm.reply_rendezvous_commitment.as_bytes());
+        }
+        if let Some(group) = &connectivity.group_bootstrap {
+            hasher.update([0]);
+            hasher.update(group.group_identity_commitment.as_bytes());
+            hasher.update([0]);
+            hasher.update(group.role_admission_policy_commitment.as_bytes());
+            hasher.update([0]);
+            hasher.update(group.channel_policy_commitment.as_bytes());
+        }
+        hasher.update([0, counter]);
+        out.extend_from_slice(&hasher.finalize());
+        counter = counter.wrapping_add(1);
+    }
+    out.truncate(len);
+    out
 }
 
 fn profile_kind_name(kind: &InviteSignalingAdapterKind) -> String {
@@ -10893,6 +10948,72 @@ mod tests {
             active_session_id, session_id,
             "attach attempt should not mutate active session identity"
         );
+    }
+
+    #[test]
+    fn live_role_split_runtime_material_is_invite_shared_not_profile_local() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("role-split-shared-material-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let active_dm_id = dm
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
+        let invite = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(active_dm_id),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(invite.last_command_error.is_none(), "{invite:?}");
+        let invite_code = invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "DM invite code missing".to_owned())?;
+        let alice_state = load_state();
+        let alice_inputs =
+            alice_state.text_control_runtime_inputs_for_active_scope(Some("mqtt"))?;
+
+        reset_with_temp_state("role-split-shared-material-bob");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let accepted = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code,
+            display_name: Some("Alice".to_owned()),
+        });
+        assert!(accepted.last_command_error.is_none(), "{accepted:?}");
+        let bob_state = load_state();
+        assert_ne!(
+            alice_state.local_user_id(),
+            bob_state.local_user_id(),
+            "test must compare two distinct local profiles"
+        );
+        let bob_inputs = bob_state.text_control_runtime_inputs_for_active_scope(Some("mqtt"))?;
+
+        assert_eq!(
+            alice_inputs.profile.profile_id,
+            bob_inputs.profile.profile_id
+        );
+        assert_eq!(alice_inputs.scope, bob_inputs.scope);
+        assert_eq!(alice_inputs.ice_config, bob_inputs.ice_config);
+        assert_eq!(
+            alice_inputs.bootstrap_secret, bob_inputs.bootstrap_secret,
+            "role-split peers must derive the same provider rendezvous bootstrap from signed invite/connectivity metadata, not local profile identity"
+        );
+        assert_eq!(
+            alice_inputs.random_entropy, bob_inputs.random_entropy,
+            "role-split peers must derive the same provider rendezvous entropy from signed invite/connectivity metadata, not local profile identity"
+        );
+        Ok(())
     }
 
     #[test]

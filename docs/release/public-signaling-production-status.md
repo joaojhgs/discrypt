@@ -510,3 +510,35 @@ DISCRYPT_PUBLIC_NOSTR_ROLE_SPLIT_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter --test public_webrtc_datachannel_e2e public_ipfs_role_split_text_runtime_roundtrip -- --nocapture
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter --test public_webrtc_datachannel_e2e public_quic_rendezvous_role_split_text_runtime_roundtrip -- --nocapture
 ```
+
+## 2026-05-30 update: invite-shared role-split runtime material
+
+Role-split text/control runtime attach now derives its WebRTC rendezvous bootstrap
+and entropy from signed connectivity metadata (`connectivity_schema_version`,
+invite kind, scope commitment, selected profile id, and DM/group bootstrap
+commitments) instead of the local profile identity seed. This is required for two
+separately installed app profiles to compute the same provider rendezvous topic
+after one user creates a DM invite and the other accepts it.
+
+The active-DM connectivity resolver also prefers the matching signed DM invite
+snapshot for that DM before falling back to the local-only DM default, so the
+inviter and invitee attach against the same DM scope when a contact invite is
+present.
+
+Verification added:
+
+- `live_role_split_runtime_material_is_invite_shared_not_profile_local` proves
+  Alice and Bob have distinct local profile identities but resolve identical
+  role-split runtime profile, scope, ICE config, bootstrap secret, and entropy
+  after create/accept DM invite.
+
+Verification run:
+
+- `cargo fmt --all --check`
+- `cargo check -q -p discrypt-desktop`
+- `cargo test -q -p discrypt-desktop attach_text_control_transport_runtime -- --nocapture`
+- `cargo test -q -p discrypt-desktop live_role_split_runtime_material_is_invite_shared_not_profile_local -- --nocapture`
+
+Remaining gap: this removes a real two-profile attach precondition, but does not
+by itself prove two installed GUI processes completed a public-provider attach
+and sent/received text from the UI.
