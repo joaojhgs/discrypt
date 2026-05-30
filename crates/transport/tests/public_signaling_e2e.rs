@@ -5,6 +5,8 @@
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
 
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+use discrypt_transport::probe_provider_adapter_roundtrip;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 use discrypt_transport::IpfsPubsubProviderAdapter;
 #[cfg(feature = "mqtt-adapter")]
@@ -12,10 +14,9 @@ use discrypt_transport::MqttProviderAdapter;
 #[cfg(feature = "nostr-adapter")]
 use discrypt_transport::NostrProviderAdapter;
 use discrypt_transport::{
-    derive_scope_commitment, probe_provider_adapter_roundtrip, AdapterTrustLabel,
-    ConnectivityScopeLevel, ConversationScope, Endpoint, ProviderMetadataPosture,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+    derive_scope_commitment, AdapterTrustLabel, ConnectivityScopeLevel, ConversationScope,
+    Endpoint, ProviderMetadataPosture, SignalingAdapterCapabilities, SignalingAdapterKind,
+    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
 };
 #[cfg(any(
     feature = "mqtt-adapter",

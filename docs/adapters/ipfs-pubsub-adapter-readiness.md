@@ -46,11 +46,11 @@ The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` a
 
 - Public/default bootstrap peer policy is now versioned and parse-tested, but public defaults are intentionally empty while the libp2p/Hickory DNS stack remains audit-blocked. Explicit direct bootstrap multiaddrs are still capped by the resource policy. Rotation plus topic-peer discovery remains a release-management task before IPFS becomes a default route.
 - Resource-limit configuration is implemented for the current adapter boundary: bounded bootstrap endpoint count, duplicate rejection, 64 KiB transmit/envelope limit, bounded command queue, strict gossipsub validation, flood-publish disabled, and bounded mesh/history/duplicate-cache settings. Full peer-score tuning remains future hardening before default enablement.
-- Typed health mapping now covers oversized envelopes (`provider_message_too_large`) and topic mesh unavailability (`provider_unhealthy`) with redacted `failure_class`/`health_state` details. Remaining typed-health hardening: bootstrap connection failures, resource exhaustion beyond local policy rejection, duplicate storms, and provider-unhealthy swarm events.
-- Add provider-visible metadata capture scans for gossipsub topics and payloads.
-- Add public/realistic direct-bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1` and explicit topic-peer/rendezvous multiaddrs; keep IPFS non-default until this passes without DNS bootstrap.
-- Wire this adapter through the Tauri app runtime path and two-profile app E2E; current proof is at the transport adapter boundary.
+- Typed health mapping covers oversized envelopes (`provider_message_too_large`), topic mesh unavailability, unreachable bootstrap connection, duplicate-envelope storms, and libp2p listener/runtime failures as redacted `failure_class`/`health_state` details.
+- Provider-visible metadata capture is covered by G133 (`npm --prefix apps/ui run test:provider-metadata-capture-g133`) for MQTT, Nostr, IPFS/libp2p, and QUIC adapter boundaries. External host packet captures remain a release-run artifact.
+- Remaining production blocker: add public/realistic direct-bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1` and explicit topic-peer/rendezvous multiaddrs; keep IPFS non-default until this passes without DNS bootstrap.
+- Tauri runtime can select the adapter through the shared adapter factory when compiled with `ipfs-pubsub-adapter` and given explicit IPFS endpoints, but the remaining app proof is two-profile installed-app E2E over a real public/topic-peer IPFS route.
 
 ## Why this is no longer a fake adapter
 
-The old fail-closed guard has been replaced by a real rust-libp2p gossipsub client, a local two-node roundtrip, an opt-in public bootstrap smoke, and bounded bootstrap/resource policy tests. The remaining blockers are topic-peer public-swarm evidence, full provider health mapping, app/runtime integration, and full two-installed-app E2E.
+The old fail-closed guard has been replaced by a real rust-libp2p gossipsub client, a local two-node roundtrip, an opt-in public bootstrap smoke, bounded bootstrap/resource policy tests, typed provider-health failure coverage, and deterministic G133 metadata capture. The remaining blockers are accepted public-default semantics, topic-peer public-swarm evidence, and full two-installed-app E2E over that route.
