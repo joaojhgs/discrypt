@@ -5930,6 +5930,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        feature = "ipfs-pubsub-adapter",
+        not(feature = "mqtt-adapter"),
+        not(feature = "nostr-adapter")
+    ))]
+    fn ipfs_pubsub_adapter_feature_reaches_app_state_diagnostics() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("ipfs-pubsub-adapter-diagnostics");
+        let state = app_state();
+        assert_eq!(
+            state.transport_diagnostics.selected_adapter.as_deref(),
+            Some("ipfs_pubsub")
+        );
+        let ipfs = state
+            .transport_diagnostics
+            .adapter_boundaries
+            .iter()
+            .find(|boundary| boundary.kind == "ipfs_pubsub")
+            .expect("ipfs_pubsub boundary is surfaced");
+        assert_eq!(ipfs.readiness, "available");
+        assert_eq!(ipfs.failure_class, "available");
+    }
+
+    #[test]
     fn abuse_rate_limits_invite_consume_helper_and_text_send_commands() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("abuse-command-rate-limits");
