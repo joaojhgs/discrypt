@@ -1727,6 +1727,62 @@ fn nostr_discrypt_tag(topic: &str) -> Result<nostr_sdk::Tag, TransportError> {
     nostr_sdk::Tag::parse(["d", topic]).map_err(|err| nostr_err("topic tag", err))
 }
 
+#[cfg(feature = "nostr-adapter")]
+fn nostr_notice_text_is_failure(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "auth",
+        "blocked",
+        "closed",
+        "error",
+        "failed",
+        "forbidden",
+        "limit",
+        "pow",
+        "rate",
+        "reject",
+        "restricted",
+        "too large",
+        "unauthorized",
+        "unsupported",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_relay_message_failure(
+    message: &nostr_sdk::RelayMessage<'_>,
+) -> Option<AdapterReadinessState> {
+    match message {
+        nostr_sdk::RelayMessage::Notice(notice) if nostr_notice_text_is_failure(notice) => {
+            Some(AdapterReadinessState::classify_provider_failure(notice))
+        }
+        nostr_sdk::RelayMessage::Closed { message, .. } => {
+            Some(AdapterReadinessState::classify_provider_failure(message))
+        }
+        nostr_sdk::RelayMessage::Ok {
+            status: false,
+            message,
+            ..
+        } => Some(AdapterReadinessState::classify_provider_failure(message)),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_relay_message_error(
+    relay_url: &nostr_sdk::RelayUrl,
+    message: &nostr_sdk::RelayMessage<'_>,
+) -> Option<TransportError> {
+    let readiness = nostr_relay_message_failure(message)?;
+    Some(TransportError::SignalingAdapter(format!(
+        "nostr relay message failed: relay={relay_url} failure_class={} health_state={:?}",
+        readiness.failure_class(),
+        readiness.to_health_state()
+    )))
+}
+
 #[cfg(feature = "mqtt-adapter")]
 fn mqtt_endpoint_for_profile(
     profile: &SignalingAdapterProfile,
@@ -2393,7 +2449,10 @@ impl NostrProviderRoom {
                 Ok(Ok(nostr_sdk::RelayPoolNotification::Event { event, .. })) => {
                     self.record_event(&event).await?;
                 }
-                Ok(Ok(nostr_sdk::RelayPoolNotification::Message { message, .. })) => {
+                Ok(Ok(nostr_sdk::RelayPoolNotification::Message { relay_url, message })) => {
+                    if let Some(error) = nostr_relay_message_error(&relay_url, &message) {
+                        return Err(error);
+                    }
                     if let nostr_sdk::RelayMessage::Event { event, .. } = message {
                         self.record_event(&event).await?;
                     }
@@ -3710,6 +3769,32 @@ mod tests {
             Err(TransportError::InvalidConnectivityPolicy(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn nostr_structured_relay_messages_map_to_typed_failures() {
+        use std::borrow::Cow;
+
+        let rate_limited = nostr_sdk::RelayMessage::Notice(Cow::Borrowed(
+            "rate-limited: slow down before publishing more events",
+        ));
+        assert_eq!(
+            nostr_relay_message_failure(&rate_limited),
+            Some(AdapterReadinessState::ProviderRateLimited)
+        );
+
+        let auth_required = nostr_sdk::RelayMessage::Closed {
+            subscription_id: Cow::Owned(nostr_sdk::SubscriptionId::new("dc-test")),
+            message: Cow::Borrowed("auth-required: restricted relay"),
+        };
+        assert_eq!(
+            nostr_relay_message_failure(&auth_required),
+            Some(AdapterReadinessState::ProviderAuthRequired)
+        );
+
+        let benign_notice = nostr_sdk::RelayMessage::Notice(Cow::Borrowed("welcome"));
+        assert_eq!(nostr_relay_message_failure(&benign_notice), None);
     }
 
     #[test]

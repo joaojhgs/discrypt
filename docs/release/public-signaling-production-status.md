@@ -66,7 +66,7 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 
 Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; QUIC still passes fail-closed guards proving it remains non-selectable until the sibling-service client is implemented and tested.
 
-- Nostr profile handling now preserves every configured relay endpoint when joining a room and publishes/subscribes against the configured relay set instead of silently collapsing a profile to the first relay. The latest single-relay public WebRTC smoke still passes against `wss://nos.lol`; production still needs a multi-relay public soak that proves fallback behavior under relay rate-limit/failure.
+- Nostr profile handling now preserves every configured relay endpoint when joining a room and publishes/subscribes against the configured relay set instead of silently collapsing a profile to the first relay. The latest single-relay public WebRTC smoke still passes against `wss://nos.lol`; a degraded multi-relay public soak now proves fallback behavior with one intentionally invalid relay, while explicit public auth/rate-limit relay evidence remains open.
 
 
 ### Tauri runtime adapter probe
@@ -235,8 +235,8 @@ npm --prefix apps/ui run test:command-coverage
   - uses hashed/random rendezvous tags only,
   - receives/filters by rendezvous topic.
 - [ ] Complete Nostr production hardening:
-  - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`; conservative failure-class parsing now maps common rate-limit/auth/message-size/trust strings to typed health states and Nostr all-relay publish/subscribe failures include the redacted failure class, but provider-specific structured error extraction and public failure soaks remain open,
-  - public multi-relay fallback soak passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`, proving sealed presence/signal/control delivery survives one degraded configured relay; remaining Nostr hardening is explicit public auth/rate-limit failure evidence and structured relay notice extraction,
+  - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`; conservative failure-class parsing and structured `NOTICE`/`CLOSED`/negative `OK` relay-message extraction now map common rate-limit/auth/message-size/trust strings to typed health states, and Nostr all-relay publish/subscribe failures include the redacted failure class; explicit public rate-limit/auth relay evidence remains open,
+  - public multi-relay fallback soak passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`, proving sealed presence/signal/control delivery survives one degraded configured relay; remaining Nostr hardening is explicit public auth/rate-limit relay evidence,
   - provider-visible capture scans are covered by G133; external host packet capture remains a separate release-run artifact.
 - [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
 - [x] Implement real IPFS/libp2p PubSub adapter with rust-libp2p gossipsub, derived topics, opaque envelopes, unsubscribe, duplicate suppression, and local two-node transport E2E.
