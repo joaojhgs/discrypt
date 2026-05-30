@@ -99,3 +99,5 @@ jobs:
         working-directory: apps/ui
       - run: npm run test:ui-integration-g130
         working-directory: apps/ui
+      - run: npm run test:final-e2e-g131
+        working-directory: apps/ui

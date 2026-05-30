@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test:command-coverage": "node scripts/command-coverage-check.mjs",
     "test:production-copy": "node scripts/command-coverage-check.mjs",
-    "test:e2e": "VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 vite build && playwright test",
+    "test:e2e": "VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 vite build && playwright test --workers=1",
     "test:honesty": "node scripts/honesty-gates.mjs",
     "release:linux": "node ../../scripts/release-linux.mjs",
     "release:linux:dry-run": "node ../../scripts/release-linux.mjs --dry-run",
@@ -62,7 +62,8 @@
     "test:no-placeholders-g127": "node ../../scripts/check-no-placeholders-g127.mjs",
     "test:placeholder-allowlist-g128": "node ../../scripts/check-placeholder-allowlist-g128.mjs",
     "test:release-no-fallback-g129": "node ../../scripts/check-release-no-fallback-g129.mjs",
-    "test:ui-integration-g130": "node ../../scripts/check-ui-integration-g130.mjs"
+    "test:ui-integration-g130": "node ../../scripts/check-ui-integration-g130.mjs",
+    "test:final-e2e-g131": "node ../../scripts/check-final-e2e-g131.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
