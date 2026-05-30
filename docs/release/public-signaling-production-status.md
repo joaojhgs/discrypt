@@ -251,7 +251,7 @@ npm --prefix apps/ui run typecheck
 
 - [ ] Add an adapter registry/factory used by Tauri/backend runtime, not only transport tests.
 - [x] Make per-DM/per-group/per-channel connectivity policy select from configured real adapter profiles and exclude unconfigured IPFS/QUIC placeholder endpoints from default app/invite profiles.
-- [ ] Carry selected adapter state into UI status honestly: selected provider, health, fallback state, and failure class.
+- [x] Carry selected adapter state into UI status honestly: backend `transport_status` now includes an `adapter` row with the selected provider plus readiness/fallback attempts, and transport diagnostics continue to expose selected provider, readiness, fallback state, and failure class for UI rendering without claiming a route/media connection.
 - [ ] Run two actual app profiles/instances through:
   - setup/recovery,
   - DM invite generation/acceptance,

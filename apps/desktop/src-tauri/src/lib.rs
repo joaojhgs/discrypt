@@ -3861,6 +3861,7 @@ impl PersistedAppState {
                     })
                     .unwrap_or_else(|| "No ICE server metadata is available until an invite descriptor is present".to_owned()),
             },
+            self.adapter_selection_status_row(),
             TransportStatusView {
                 label: "direct".to_owned(),
                 status: if route_connected {
@@ -3927,6 +3928,72 @@ impl PersistedAppState {
             rows.push(Self::transport_session_status_row(session));
         }
         rows
+    }
+
+    fn adapter_selection_status_row(&self) -> TransportStatusView {
+        let requested = self
+            .active_connectivity_policy()
+            .map(|(_, connectivity)| {
+                connectivity
+                    .signaling_profiles
+                    .iter()
+                    .filter_map(|profile| transport_adapter_kind_from_name(&profile.adapter_kind))
+                    .collect::<Vec<SignalingAdapterKind>>()
+            })
+            .filter(|profiles| !profiles.is_empty())
+            .unwrap_or_else(|| {
+                required_provider_adapter_boundaries()
+                    .iter()
+                    .map(|boundary| boundary.kind)
+                    .collect::<Vec<SignalingAdapterKind>>()
+            });
+        let fallback_plan = plan_signaling_adapter_fallback(
+            requested.as_slice(),
+            AdapterFallbackBehavior::FirstHealthy,
+            None,
+        );
+        let selected = fallback_plan
+            .selected
+            .map(|kind| kind.canonical_name().to_owned());
+        let attempts = fallback_plan
+            .attempts
+            .iter()
+            .map(|attempt| {
+                let marker = if attempt.selected {
+                    "selected"
+                } else if attempt.attempted {
+                    "attempted"
+                } else {
+                    "skipped"
+                };
+                format!(
+                    "{}:{}:{}",
+                    attempt.kind.canonical_name(),
+                    Self::adapter_readiness_label(attempt.readiness),
+                    marker
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        TransportStatusView {
+            label: "adapter".to_owned(),
+            status: selected
+                .as_ref()
+                .map(|_| "selected")
+                .unwrap_or("no-healthy-adapter")
+                .to_owned(),
+            detail: selected
+                .map(|selected| {
+                    format!(
+                        "Selected provider {selected} via first-healthy fallback; readiness/fallback attempts: {attempts}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "No healthy provider adapter selected; readiness/fallback attempts: {attempts}"
+                    )
+                }),
+        }
     }
 
     fn transport_session_status_row(session: &TransportSessionRecord) -> TransportStatusView {
@@ -7639,6 +7706,14 @@ mod tests {
             state.transport_diagnostics.selected_adapter.as_deref(),
             Some("nostr")
         );
+        let adapter_status = state
+            .transport_status
+            .iter()
+            .find(|status| status.label == "adapter")
+            .expect("adapter status row is surfaced");
+        assert_eq!(adapter_status.status, "selected");
+        assert!(adapter_status.detail.contains("Selected provider nostr"));
+        assert!(adapter_status.detail.contains("nostr:available:selected"));
         let first_attempt = state
             .transport_diagnostics
             .adapter_fallback_attempts

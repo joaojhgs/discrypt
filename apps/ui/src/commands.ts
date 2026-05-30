@@ -1054,6 +1054,23 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
   const hasStun = Boolean(latestInvite?.ice_stun_servers.length);
   const hasTurn = Boolean(latestInvite?.ice_turn_servers.length);
   const lastError = state.last_command_error;
+  const selectedAdapter = state.transport_diagnostics?.selected_adapter ?? null;
+  const fallbackAttempts =
+    state.transport_diagnostics?.adapter_fallback_attempts ?? [];
+  const fallbackAttemptCopy = fallbackAttempts.length
+    ? fallbackAttempts
+        .map(
+          (attempt) =>
+            `${attempt.kind}:${attempt.readiness}:${
+              attempt.selected
+                ? "selected"
+                : attempt.attempted
+                  ? "attempted"
+                  : "skipped"
+            }`,
+        )
+        .join(", ")
+    : "no backend fallback attempts available";
   return [
     {
       label: "signaling",
@@ -1061,6 +1078,13 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
       detail: latestInvite
         ? `Signed endpoint ${latestInvite.signaling_endpoint} with trust fingerprint ${latestInvite.signaling_trust_fingerprint}; no identity-room topology is stored by the signaling service`
         : "Create or paste an invite before signaling can be used",
+    },
+    {
+      label: "adapter",
+      status: selectedAdapter ? "selected" : "no-healthy-adapter",
+      detail: selectedAdapter
+        ? `Selected provider ${selectedAdapter} from backend fallback diagnostics; readiness/fallback attempts: ${fallbackAttemptCopy}`
+        : `No backend-selected provider adapter is available; readiness/fallback attempts: ${fallbackAttemptCopy}`,
     },
     {
       label: "ICE",

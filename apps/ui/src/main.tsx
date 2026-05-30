@@ -1500,6 +1500,7 @@ function transportBadgeVariant(
     "signed-endpoint-ready",
     "clear",
     "available",
+    "selected",
     "route-proofed",
     "provider-roundtrip-proofed",
     "webrtc-datachannel-proofed",
@@ -1512,6 +1513,7 @@ function transportBadgeVariant(
     "media-gated",
     "provider-roundtrip-failed",
     "webrtc-datachannel-failed",
+    "no-healthy-adapter",
   ].includes(status)) {
     return "warning";
   }
