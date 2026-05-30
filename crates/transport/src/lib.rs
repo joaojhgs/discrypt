@@ -14,6 +14,7 @@
 pub mod ice;
 pub mod production_status;
 pub mod session;
+pub mod signaling;
 pub mod webrtc_negotiation;
 
 use async_trait::async_trait;
@@ -26,6 +27,12 @@ pub use session::{
     ReconnectBackoffPolicy, ReconnectDecision, TransportRoute, TransportRouteStatus,
     TransportSession, TransportSessionError, TransportSessionEvent, TransportSessionSnapshot,
     TransportSessionState,
+};
+pub use signaling::{
+    AdapterConformanceReport, AdapterFailure, AdapterHealth, AdapterMessage, AdapterScope,
+    AdapterSelection, AdapterSelectionError, ConnectivityPolicy, IceProfile,
+    InMemorySignalingAdapter, RendezvousCapability, SignalingAdapter, SignalingAdapterKind,
+    SignalingAdapterProfile, SignalingProviderEndpoint,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -176,8 +183,8 @@ pub struct ConnectivityConfig {
 impl Default for ConnectivityConfig {
     fn default() -> Self {
         Self {
-            default_stun: Endpoint::new("stun:default.discrypt.invalid:3478"),
-            default_turn: Endpoint::new("turns:default.discrypt.invalid:5349"),
+            default_stun: Endpoint::new("stun:stun.l.google.com:19302"),
+            default_turn: Endpoint::new("turn:unconfigured.discrypt.invalid"),
             overrides: EndpointOverrides::new(None, None),
         }
     }

@@ -219,7 +219,6 @@ impl InviteTrustMetadata {
     }
 }
 
-
 /// Signed invite bootstrap descriptor schema version for connectivity policy metadata.
 pub const INVITE_CONNECTIVITY_SCHEMA_VERSION: u32 = 1;
 

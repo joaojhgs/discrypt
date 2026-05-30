@@ -36,10 +36,14 @@ impl TurnStunCredentialDecision {
     #[must_use]
     pub fn covers_adr_004(&self) -> bool {
         self.default_stun_endpoint.contains("stun:")
-            && self.default_turn_endpoint.contains("turns:")
+            && self
+                .default_turn_endpoint
+                .contains("TURN requires configured credentials")
             && self.group_override_rule.contains("group")
             && self.group_override_rule.contains("invite")
-            && self.ephemeral_credential_service.contains("TURN service REST")
+            && self
+                .ephemeral_credential_service
+                .contains("TURN service REST")
             && self.ephemeral_credential_service.contains("HMAC-SHA1")
             && self
                 .invite_descriptor_reference
@@ -57,8 +61,8 @@ impl TurnStunCredentialDecision {
 #[must_use]
 pub fn turn_stun_credential_decision() -> TurnStunCredentialDecision {
     TurnStunCredentialDecision {
-        default_stun_endpoint: "stun:default.discrypt.invalid:3478",
-        default_turn_endpoint: "turns:default.discrypt.invalid:5349",
+        default_stun_endpoint: "stun:stun.l.google.com:19302",
+        default_turn_endpoint: "none by default; TURN requires configured credentials",
         group_override_rule: "non-empty group IceEndpointPolicy stun_servers/turn_servers override signed invite policy by endpoint kind; otherwise invite policy falls back to defaults",
         ephemeral_credential_service: "TURN service REST auth credentials: username is unix-expiry:subject, credential is base64(HMAC-SHA1(static_auth_secret, username)), carried only as ephemeral TurnServerConfig material",
         invite_descriptor_reference: "InviteSignalingMetadata signs ice_endpoint_policy into StoredInvite signing bytes so invite descriptors reference signaling, STUN, TURN, expiry, and trust metadata together",
@@ -89,13 +93,8 @@ impl IceEndpointPolicy {
     #[must_use]
     pub fn default_production() -> Self {
         Self {
-            stun_servers: vec![Endpoint::new("stun:default.discrypt.invalid:3478")],
-            turn_servers: vec![TurnServerConfig::new(
-                Endpoint::new("turns:default.discrypt.invalid:5349"),
-                None,
-                None,
-                None,
-            )],
+            stun_servers: vec![Endpoint::new("stun:stun.l.google.com:19302")],
+            turn_servers: Vec::new(),
         }
     }
 
@@ -116,7 +115,7 @@ impl IceEndpointPolicy {
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.stun_servers.is_empty() && self.turn_servers.is_empty() {
             return Err(TransportError::InvalidIcePolicy(
-                "at least one STUN or TURN server is required".to_owned(),
+                "at least one STUN server or configured TURN server is required".to_owned(),
             ));
         }
         for endpoint in &self.stun_servers {
@@ -835,7 +834,9 @@ mod tests {
 
         assert!(decision.covers_adr_004());
         assert!(decision.default_stun_endpoint.starts_with("stun:"));
-        assert!(decision.default_turn_endpoint.starts_with("turns:"));
+        assert!(decision
+            .default_turn_endpoint
+            .contains("TURN requires configured credentials"));
         assert!(decision
             .ephemeral_credential_service
             .contains("base64(HMAC-SHA1"));

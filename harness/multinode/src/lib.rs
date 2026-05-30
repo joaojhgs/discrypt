@@ -913,10 +913,10 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
         SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
         VoiceCaptureSendOutcome, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
     };
-    use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
     use discrypt_transport::{
         ConnectivityConfig, FallbackLeg, LocalProcessSocketAdapter, SimulatedNat,
     };
+    use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
 
     #[derive(Default)]
     struct HarnessMediaSink {
@@ -2019,11 +2019,11 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         VolunteerRelaySettings,
     };
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
-    use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
     use discrypt_transport::{
         ConnectivityConfig, FallbackLeg, LocalProcessSocketAdapter, SimulatedNat,
     };
+    use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
     use std::collections::BTreeSet;
 
     fn protected_text_payload(
@@ -3419,8 +3419,8 @@ pub fn abuse_e2e_smoke() -> Result<AbuseE2eSmoke, anyhow::Error> {
     use discrypt_abuse::AbuseControls;
     use discrypt_admission::{InviteError, OnlineAdmissionHelper};
     use discrypt_relay_overlay::{OverlayManager, OverlayManagerError, RelayRuntimeObservation};
-    use external_signaling::server::{handle_http_request, ServerConfig, SharedSignalingService};
     use ed25519_dalek::SigningKey;
+    use external_signaling::server::{handle_http_request, ServerConfig, SharedSignalingService};
     use rand::rngs::OsRng;
 
     fn http_request(method: &str, path: &str, body: &str) -> String {
@@ -3574,13 +3574,13 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
     use discrypt_push::{
         contains_content, contains_forbidden_token, AndroidWakeService, WakePayload, WakeReason,
     };
-    use external_signaling::{
-        AuditFixture, ContentExposure, InfrastructureComponent, MetadataMatrix, PcapEvent,
-        ReferenceSignalingServer, RendezvousBlob, RendezvousKey,
-    };
     use discrypt_transport::{
         ConnectivityConfig, ConnectivityPlanner, Endpoint, EndpointOverrides, FallbackLeg,
         LocalProcessSocketAdapter, SimulatedNat,
+    };
+    use external_signaling::{
+        AuditFixture, ContentExposure, InfrastructureComponent, MetadataMatrix, PcapEvent,
+        ReferenceSignalingServer, RendezvousBlob, RendezvousKey,
     };
 
     let now = Utc::now();
