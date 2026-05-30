@@ -5852,8 +5852,6 @@ dependencies = [
 [[package]]
 name = "rtc-mdns"
 version = "0.20.0-alpha.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57deeaa15ece574bf4b6ecd697e4b036aff0bc042e56fb811921eef063a2fdd5"
 dependencies = [
  "bytes",
  "log",
