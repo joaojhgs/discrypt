@@ -8324,6 +8324,67 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn public_nostr_text_session_probe_marks_text_route_when_enabled() {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_TEXT_SESSION_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public Nostr text session route proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_TEXT_SESSION_E2E=1 to run"
+            );
+            return;
+        }
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("desktop-public-nostr-text-session");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: true,
+            adapter_kind: Some("nostr".to_owned()),
+        });
+
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
+        );
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-proofed"
+        );
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-proofed"
+        );
+        assert_eq!(
+            state.transport_diagnostics.turn_required,
+            "turn-not-required"
+        );
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| { status.label == "text session" && status.status == "direct" }));
+        let proof = state
+            .transport_diagnostics
+            .data_channel_probe
+            .expect("text session should retain Nostr DataChannel proof");
+        assert_eq!(proof.kind, "nostr");
+        assert!(proof.text_control_frame_roundtrip);
+        assert!(proof.receipt_frame_roundtrip);
+        assert!(state.voice_session.is_none());
+    }
+
+    #[test]
     #[cfg(feature = "mqtt-adapter")]
     fn public_mqtt_data_channel_probe_reaches_tauri_diagnostics_when_enabled() {
         if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_WEBRTC_E2E").as_deref() != Ok("1") {
