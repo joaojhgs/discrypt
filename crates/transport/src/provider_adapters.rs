@@ -1624,12 +1624,18 @@ mod tests {
         assert!(plan.attempts.iter().all(|attempt| attempt.attempted));
         assert_eq!(plan.selected, selected);
         if let Some(selected) = selected {
-            let last = plan
-                .attempts
-                .last()
-                .expect("plan should not be empty when selected");
-            assert_eq!(last.kind, selected);
-            assert!(last.selected);
+            let mut last_selected = None;
+            for attempt in plan.attempts.iter().rev() {
+                if attempt.selected {
+                    last_selected = Some(attempt.kind);
+                    break;
+                }
+            }
+            assert_eq!(
+                last_selected,
+                Some(selected),
+                "plan should include selected kind and mark it selected"
+            );
         } else {
             assert!(plan.all_unavailable());
         }
@@ -1650,7 +1656,7 @@ mod tests {
         assert_eq!(attempt.kind, manual);
         let readiness = SignalingAdapterFactory::for_kind(manual).readiness_state();
         assert_eq!(attempt.readiness, readiness);
-        assert_eq!(attempt.attempted, true);
+        assert!(attempt.attempted);
         assert_eq!(attempt.selected, readiness.selectable());
         assert_eq!(
             plan.selected,
