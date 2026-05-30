@@ -8,7 +8,7 @@ Discrypt is **not production-complete** for the full serverless P2P encrypted ap
 
 - **MQTT public signaling: implemented behind `mqtt-adapter` and latest reruns passed against a real public broker after the adapter began waiting for broker subscription acknowledgements before publishing.**
 - **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
-- **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; public bootstrap smoke exists but still requires configured bootstrap multiaddrs.**
+- **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; `/dnsaddr` bootstrap multiaddrs are accepted, but the latest public bootstrap smoke failed with `InsufficientPeers` because public IPFS bootstrap peers are not enough by themselves to form a topic mesh.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
 - **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof is at the transport signaling adapter layer plus a Tauri command/UI-triggered provider-adapter roundtrip probe; it is still not the complete UI/backend/media plane.
 
@@ -81,7 +81,7 @@ Behavior:
 - Extends `start_signaling_session` with `adapter_probe=true` and optional `adapter_kind` so the Tauri backend can run the selected DM/group/invite signaling profile instead of only showing static readiness.
 - Persists structured `adapter_probe_status`, `adapter_probe_detail`, and redacted probe evidence into transport diagnostics.
 - Adds a UI "Probe adapter" action in the transport status panel.
-- Uses public Nostr (`wss://relay.damus.io`) first and public MQTT (`mqtts://broker.emqx.io:8883`) second as zero-config default endpoint candidates when no `DISCRYPT_DEFAULT_*`/`VITE_DISCRYPT_DEFAULT_*` override is supplied; IPFS and QUIC still require explicit endpoint configuration because no production default bootstrap/self-hosted endpoint has been accepted yet.
+- Uses public Nostr (`wss://relay.damus.io`) first and public MQTT (`mqtts://broker.emqx.io:8883`) second as zero-config default endpoint candidates when no `DISCRYPT_DEFAULT_*`/`VITE_DISCRYPT_DEFAULT_*` override is supplied; IPFS and QUIC still require explicit endpoint configuration because no production default pubsub rendezvous mesh or self-hosted endpoint has been accepted yet.
 - Keeps route/media claims separate: a successful adapter probe proves provider rendezvous only; it does not mark ICE, data-channel, or voice media as connected.
 
 Verification:
@@ -152,7 +152,8 @@ These are real public signaling proofs at the provider adapter boundary, but the
   - configure public/default bootstrap peer policy and resource limits,
   - map libp2p bootstrap/resource/message failures to typed health,
   - define what “public default IPFS” means without requiring a user-hosted Kubo API,
-  - run public-swarm E2E with configured bootstrap multiaddrs,
+  - add topic-peer discovery/rendezvous instead of relying on generic IPFS bootstrap peers as topic mesh members,
+  - run public-swarm E2E with configured bootstrap/rendezvous multiaddrs,
   - add provider-visible metadata capture scans.
 - [x] Lock separate Rust QUIC rendezvous feature-gate/fail-closed readiness and document production requirements.
 - [ ] Wire separate Rust QUIC rendezvous adapter:
@@ -212,10 +213,10 @@ These are real public signaling proofs at the provider adapter boundary, but the
 | Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Latest reruns passed against `mqtts://broker.emqx.io:8883` after broker `SUBACK` readiness was enforced; `test.mosquitto.org` certificate incompatibility and `broker.hivemq.com` network timeout remain provider-specific caveats. |
 | Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Latest rerun passed against `wss://relay.damus.io`; `wss://nostr.oxtr.dev` returned blocked |
 | IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal/control only |
-| IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Test exists; public bootstrap run still missing until bootstrap endpoints are selected/configured |
+| IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Latest `/dnsaddr/bootstrap.libp2p.io/...` attempt reaches validation but fails at publish with `InsufficientPeers`; needs topic-peer discovery/rendezvous, not generic bootstrap-only wiring. |
 | Planned QUIC public-provider proof | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
 
-- Real producer/adapter route proofs still missing in this release gate: multi-relay Nostr soak, live IPFS public-bootstrap proof, live QUIC public-provider proof, and end-to-end mobile/installed-app transport smoke (tracked separately).
+- Real producer/adapter route proofs still missing in this release gate: multi-relay Nostr soak, live IPFS public-bootstrap/topic-discovery proof, live QUIC public-provider proof, and end-to-end mobile/installed-app transport smoke (tracked separately).
 - Missing adapter check status is intentionally exposed as blockers instead of fake green signals in this phase.
 
 ## How to rerun the current real MQTT proof

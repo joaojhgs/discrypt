@@ -239,7 +239,8 @@ impl SignalingProviderEndpoint {
                     }
                     SignalingAdapterKind::Nostr => value.starts_with("wss://"),
                     SignalingAdapterKind::IpfsPubsub => {
-                        value.starts_with("/dns/")
+                        value.starts_with("/dnsaddr/")
+                            || value.starts_with("/dns/")
                             || value.starts_with("/dns4/")
                             || value.starts_with("/dns6/")
                             || value.starts_with("/ip4/")
@@ -269,6 +270,7 @@ impl SignalingProviderEndpoint {
                     || value.starts_with("wss://")
                     || value.starts_with("quic://")
                     || value.starts_with("https://")
+                    || value.starts_with("/dnsaddr/")
                     || value.starts_with("/dns/")
                     || value.starts_with("/ip4/")
                     || value.starts_with("/ip6/");
@@ -930,6 +932,17 @@ mod tests {
             trust("nostr")?,
         )?;
         assert_ne!(capability.topic, nostr.topic);
+        Ok(())
+    }
+
+    #[test]
+    fn ipfs_profile_accepts_dnsaddr_bootstrap_multiaddr() -> Result<(), TransportError> {
+        let profile = adapter(
+            SignalingAdapterKind::IpfsPubsub,
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+        )?;
+
+        assert!(profile.validate().is_ok());
         Ok(())
     }
 
