@@ -7860,6 +7860,135 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn discrypt_rendezvous_sibling_service_runtime_pair_text_control_when_binary_is_available(
+    ) -> Result<(), TransportError> {
+        let server_bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("discrypt-signaling/target/debug/discrypt-signaling-server");
+        if !server_bin.exists() {
+            eprintln!(
+                "skipping sibling service runtime-pair roundtrip: {} is not built",
+                server_bin.display()
+            );
+            return Ok(());
+        }
+        let probe_socket = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| TransportError::Io(error.to_string()))?;
+        let port = probe_socket
+            .local_addr()
+            .map_err(|error| TransportError::Io(error.to_string()))?
+            .port();
+        drop(probe_socket);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut child = std::process::Command::new(&server_bin)
+            .args([
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--public-base-url",
+                "https://127.0.0.1/rendezvous-runtime-test",
+                "--name",
+                "discrypt-rendezvous-runtime-test",
+            ])
+            .spawn()
+            .map_err(|error| TransportError::Io(error.to_string()))?;
+
+        let health_url = format!("{endpoint}/healthz");
+        let mut healthy = false;
+        for _ in 0..30 {
+            if ureq::get(&health_url).call().is_ok() {
+                healthy = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let result = async {
+            if !healthy {
+                return Err(TransportError::SignalingAdapter(
+                    "sibling signaling service did not become healthy".to_owned(),
+                ));
+            }
+            let scope = crate::ConversationScope::new(
+                ConnectivityScopeLevel::Dm,
+                derive_scope_commitment(
+                    ConnectivityScopeLevel::Dm,
+                    b"quic sibling service runtime dm",
+                    "runtime test",
+                ),
+            )?;
+            let profile = SignalingAdapterProfile {
+                profile_id: "local-discrypt-rendezvous-runtime-service".to_owned(),
+                kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+                endpoints: vec![SignalingProviderEndpoint::new(
+                    Endpoint::new(endpoint.clone()),
+                    SignalingEndpointSecurity::LocalDevLoopback,
+                )],
+                metadata_posture: ProviderMetadataPosture::HashedTopic,
+                capabilities: SignalingAdapterCapabilities::production_required(),
+                trust_label: AdapterTrustLabel::new(
+                    "discrypt_quic_rendezvous",
+                    "local sibling service runtime pair",
+                )?,
+            };
+            let runtime =
+                start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
+                    profile,
+                    scope,
+                    b"quic sibling runtime bootstrap secret with thirty two bytes",
+                    b"quic sibling runtime entropy",
+                    WebRtcNegotiationConfig::new(IceServerConfig::new(
+                        vec![Endpoint::new("stun:stun.l.google.com:19302")],
+                        vec![],
+                    )?),
+                    SignalingPeerId::new("quic-sibling-runtime-alice")?,
+                    SignalingPeerId::new("quic-sibling-runtime-bob")?,
+                    |frame| {
+                        Ok(format!(
+                            "ciphertext:quic-sibling-runtime-receipt:{}",
+                            sha256_hex(&frame)
+                        )
+                        .into_bytes())
+                    },
+                )
+                .await?;
+
+            assert_eq!(
+                runtime.evidence().kind,
+                SignalingAdapterKind::DiscryptQuicRendezvous
+            );
+            assert!(runtime.evidence().offerer_direct_path_ready);
+            assert!(runtime.evidence().answerer_direct_path_ready);
+            assert!(runtime.evidence().offerer_data_channel_open);
+            assert!(runtime.evidence().answerer_data_channel_open);
+
+            let frame = b"ciphertext:quic-sibling-runtime-frame".to_vec();
+            let expected_receipt = format!(
+                "ciphertext:quic-sibling-runtime-receipt:{}",
+                sha256_hex(&frame)
+            )
+            .into_bytes();
+            let transport = runtime.transport();
+            transport.send_text_control_frame(frame).await?;
+            let received = timeout(Duration::from_secs(10), transport.recv_text_control_frame())
+                .await
+                .map_err(|_| {
+                    TransportError::Unavailable(
+                        "timed out receiving sibling runtime receipt".to_owned(),
+                    )
+                })??;
+            assert_eq!(received, expected_receipt);
+
+            runtime.close().await
+        }
+        .await;
+
+        let _ = child.kill();
+        let _ = child.wait();
+        result
+    }
+
     #[tokio::test]
     async fn feature_gated_session_and_room_methods_fail_closed() -> Result<(), TransportError> {
         let boundary = adapter_boundary_for_kind(SignalingAdapterKind::Mqtt);

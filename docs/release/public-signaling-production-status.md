@@ -812,3 +812,27 @@ runtime-pair text/control proof. It is still not a public Internet IPFS
 topic-peer proof, not a two-installed-Tauri-process runtime ownership proof, not
 deployed QUIC rendezvous, not credentialed TURN relay-only, and not real
 voice/audio capture/playback E2E.
+
+## 2026-05-30 update: sibling Discrypt rendezvous runtime-pair proof passed
+
+The separate sibling `discrypt-signaling` service path now has a local
+runtime-pair text/control proof in addition to the existing presence/signal/control
+roundtrip. When `../discrypt-signaling/target/debug/discrypt-signaling-server`
+is built, the test starts that external binary on a random loopback port,
+validates health, opens a `discrypt_quic_rendezvous` adapter profile against the
+service API, negotiates a real WebRTC DataChannel, sends an opaque text/control
+frame through `TextControlDataTransport`, and receives an opaque receipt frame
+from the answerer runtime.
+
+Verification run:
+
+- `cargo fmt --all --check` — passed
+- `cargo check -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter discrypt_rendezvous_sibling_service_runtime_pair_text_control_when_binary_is_available -- --nocapture` — passed
+- `timeout 180s cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available -- --nocapture` — passed
+
+Remaining gap: this is still loopback/local sibling-service evidence, not a
+staged/deployed HTTPS/WSS rendezvous service proof with external TLS
+certificate/public-key pinning and capture evidence. Native `quic://` transport
+remains reserved; this adapter is still the sibling service API rendezvous path
+for sealed signaling, not a replacement for WebRTC data/audio.
