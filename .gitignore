@@ -21,3 +21,9 @@
 .omc/state/
 .omc/.omc/
 .omc/drafts/
+
+# Test artifacts
+/test-results/
+/apps/ui/test-results/
+/playwright-report/
+/apps/ui/playwright-report/
