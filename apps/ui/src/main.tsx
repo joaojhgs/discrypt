@@ -35,9 +35,7 @@ import {
   joinVoice,
   leaveVoice,
   loadAppState,
-  listPendingTextControlFrames,
   pollAppEvents,
-  pumpTextControlTransportOnce,
   recoverUser,
   resetAppState,
   savePreferences,
@@ -238,7 +236,6 @@ function App() {
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [messageTransportProof, setMessageTransportProof] = useState(false);
-  const [textTransportPumpSummary, setTextTransportPumpSummary] = useState<string | null>(null);
   const [eventCursor, setEventCursor] = useState(0);
 
   useEffect(() => {
@@ -259,60 +256,6 @@ function App() {
     };
   }, []);
 
-
-  useEffect(() => {
-    if (!commandState || commandState.runtime_mode.mode !== "native") {
-      return;
-    }
-
-    let cancelled = false;
-    let pumpInFlight = false;
-    const nativePump = window.setInterval(() => {
-      if (pumpInFlight) {
-        return;
-      }
-      pumpInFlight = true;
-      void (async () => {
-        try {
-          const listed = await listPendingTextControlFrames({ limit: 8 });
-          if (cancelled) {
-            return;
-          }
-          setCommandState(listed.state);
-          if (listed.frames.length === 0) {
-            setTextTransportPumpSummary(null);
-            return;
-          }
-          const report = await pumpTextControlTransportOnce({ limit: 8 });
-          if (cancelled) {
-            return;
-          }
-          setTextTransportPumpSummary(
-            report.failures.length
-              ? report.failures.join("; ")
-              : `text/control pump sent ${report.frames_sent}, received ${report.response_frames_received}, receipts ${report.receipts_applied}`,
-          );
-          const refreshed = await loadAppState();
-          if (!cancelled) {
-            setCommandState(refreshed);
-          }
-        } catch (error: unknown) {
-          if (!cancelled) {
-            setTextTransportPumpSummary(
-              error instanceof Error ? error.message : "Text/control pump failed",
-            );
-          }
-        } finally {
-          pumpInFlight = false;
-        }
-      })();
-    }, 2500);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(nativePump);
-    };
-  }, [commandState?.runtime_mode.mode]);
 
   useEffect(() => {
     if (!commandState || commandState.runtime_mode.mode !== "native") {
@@ -866,7 +809,6 @@ function App() {
           onProbeAdapter={probeSelectedAdapter}
           onProbeDataChannel={probeSelectedDataChannel}
           onStartTextTransport={startTextTransportProof}
-          textPumpSummary={textTransportPumpSummary}
         />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
@@ -1552,14 +1494,12 @@ function TransportStatusStrip({
   onProbeAdapter,
   onProbeDataChannel,
   onStartTextTransport,
-  textPumpSummary,
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
   onStartTextTransport: () => void;
-  textPumpSummary?: string | null;
 }) {
   const ordered = statuses.length
     ? statuses
@@ -1601,11 +1541,6 @@ function TransportStatusStrip({
           <Badge variant="outline">honest status</Badge>
         </div>
       </div>
-      {textPumpSummary ? (
-        <p className="mb-2 rounded-xl border border-[hsl(var(--border))] bg-black/15 p-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-          Text/control pump: {textPumpSummary}
-        </p>
-      ) : null}
       <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
         {ordered.map((item) => (
           <div

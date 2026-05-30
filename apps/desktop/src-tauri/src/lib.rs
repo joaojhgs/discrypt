@@ -1541,6 +1541,9 @@ struct PersistedAppState {
 
 static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 
+#[cfg(feature = "tauri-runtime")]
+static TEXT_CONTROL_RUNTIME_PUMP_STARTED: OnceLock<()> = OnceLock::new();
+
 /// Shared command-facing app service used by Tauri IPC wrappers.
 #[derive(Debug)]
 struct TauriAppService {
@@ -1586,6 +1589,35 @@ impl TauriAppService {
         view.transport_status
             .push(self.text_control_runtime_status_row());
         view
+    }
+
+    #[cfg(feature = "tauri-runtime")]
+    fn should_run_text_control_transport_pump(
+        &self,
+        request: &ListPendingTextControlFramesRequest,
+    ) -> bool {
+        let Some(runtime) = &self.text_control_transport_runtime else {
+            return false;
+        };
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            return false;
+        };
+        if runtime.session_id != session.session_id {
+            return false;
+        }
+        if matches!(
+            session.state(),
+            TransportSessionState::Idle
+                | TransportSessionState::Disconnected
+                | TransportSessionState::Failed
+                | TransportSessionState::Cancelled
+        ) {
+            return false;
+        }
+        !self
+            .state
+            .list_pending_text_control_frames(request)
+            .is_empty()
     }
 
     fn text_control_runtime_status_row(&self) -> TransportStatusView {
@@ -1931,6 +1963,32 @@ pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
     }
     guard.persist();
     guard.to_view()
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn start_text_control_transport_runtime_pump() {
+    if TEXT_CONTROL_RUNTIME_PUMP_STARTED.set(()).is_err() {
+        return;
+    }
+
+    let service = app_service();
+    std::thread::spawn(move || {
+        let request = ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(16),
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1_250));
+
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.should_run_text_control_transport_pump(&request) {
+                continue;
+            }
+            let _ = guard.pump_text_control_transport_once(request.clone());
+        }
+    });
 }
 
 /// Tauri command: create a new local user and unlock the shell.
@@ -3632,6 +3690,9 @@ mod ipc_commands {
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(feature = "tauri-runtime")]
+    start_text_control_transport_runtime_pump();
+
     tauri::Builder::<tauri::Wry>::default()
         .invoke_handler(tauri::generate_handler![
             ipc_commands::app_snapshot,
