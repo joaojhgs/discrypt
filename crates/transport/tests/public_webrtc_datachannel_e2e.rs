@@ -1,5 +1,7 @@
 #![cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+use discrypt_transport::probe_provider_webrtc_datachannel_request_response_roundtrip;
 use discrypt_transport::{
     derive_scope_commitment, probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel,
     ConnectivityScopeLevel, ConversationScope, Endpoint, IceServerConfig,
@@ -8,7 +10,6 @@ use discrypt_transport::{
 };
 #[cfg(feature = "mqtt-adapter")]
 use discrypt_transport::{
-    probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_request_response_with_config, TurnServerConfig,
     WebRtcIceTransportPolicy, WebRtcNegotiationConfig,
 };
@@ -111,7 +112,7 @@ fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportErr
     Ok(config)
 }
 
-#[cfg(feature = "mqtt-adapter")]
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 fn media_frame_probe_payload() -> Vec<u8> {
     let mut frame = Vec::with_capacity(320);
     frame.extend_from_slice(b"media-frame-ciphertext:v1:");
@@ -120,7 +121,7 @@ fn media_frame_probe_payload() -> Vec<u8> {
     frame
 }
 
-#[cfg(feature = "mqtt-adapter")]
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 fn media_frame_receipt_probe_payload(request: &[u8]) -> Vec<u8> {
     let mut receipt = Vec::with_capacity(request.len() + 48);
     receipt.extend_from_slice(b"media-receipt-v1:");
@@ -128,7 +129,7 @@ fn media_frame_receipt_probe_payload(request: &[u8]) -> Vec<u8> {
     receipt
 }
 
-#[cfg(feature = "mqtt-adapter")]
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 async fn run_provider_signaled_webrtc_media_frame_roundtrip(
     profile: SignalingAdapterProfile,
 ) -> Result<(), TransportError> {
@@ -201,6 +202,20 @@ async fn public_mqtt_signals_real_webrtc_media_frame_roundtrip() -> Result<(), T
     let endpoint = std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
         .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned());
     run_provider_signaled_webrtc_media_frame_roundtrip(public_mqtt_profile(endpoint)?).await
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_nostr_signals_real_webrtc_media_frame_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_NOSTR_MEDIA_WEBRTC_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping public Nostr media-frame transport gate; set DISCRYPT_PUBLIC_NOSTR_MEDIA_WEBRTC_E2E=1 to run"
+        );
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+        .unwrap_or_else(|_| "wss://nos.lol".to_owned());
+    run_provider_signaled_webrtc_media_frame_roundtrip(public_nostr_profile(endpoint)?).await
 }
 
 #[cfg(feature = "mqtt-adapter")]
