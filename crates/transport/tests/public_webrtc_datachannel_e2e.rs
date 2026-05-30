@@ -1,6 +1,16 @@
-#![cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#![cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_roundtrip;
 use discrypt_transport::{
     derive_scope_commitment, probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel,
@@ -53,6 +63,90 @@ fn public_nostr_profile(endpoint: String) -> Result<SignalingAdapterProfile, Tra
         trust_label: AdapterTrustLabel::new(
             "public nostr",
             "public relay; opaque WebRTC negotiation envelopes only",
+        )?,
+    })
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn public_ipfs_profile(endpoints: Vec<String>) -> Result<SignalingAdapterProfile, TransportError> {
+    Ok(SignalingAdapterProfile {
+        profile_id: "public-ipfs-webrtc-datachannel-e2e".to_owned(),
+        kind: SignalingAdapterKind::IpfsPubsub,
+        endpoints: endpoints
+            .into_iter()
+            .map(|endpoint| {
+                SignalingProviderEndpoint::new(
+                    Endpoint::new(endpoint),
+                    SignalingEndpointSecurity::ProductionTls,
+                )
+            })
+            .collect(),
+        metadata_posture: discrypt_transport::ProviderMetadataPosture::HashedTopic,
+        capabilities: SignalingAdapterCapabilities::production_required(),
+        trust_label: AdapterTrustLabel::new(
+            "public ipfs_pubsub",
+            "explicit libp2p direct topic peers; opaque WebRTC negotiation envelopes only",
+        )?,
+    })
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn public_ipfs_direct_topic_peer_endpoints() -> Result<Vec<String>, TransportError> {
+    let endpoints = std::env::var("DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS")
+        .map_err(|_| {
+            TransportError::SignalingAdapter(
+                "DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS is required for public IPFS WebRTC E2E"
+                    .to_owned(),
+            )
+        })?
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() || endpoints.iter().any(|endpoint| !endpoint.contains("/p2p/")) {
+        return Err(TransportError::InvalidConnectivityPolicy(
+            "public IPFS WebRTC E2E requires explicit direct topic-peer multiaddrs with /p2p/<peer-id>"
+                .to_owned(),
+        ));
+    }
+    Ok(endpoints)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"external-signaling-endpoint-fingerprint-v1");
+    hasher.update(endpoint.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn public_discrypt_rendezvous_profile(
+    endpoint: String,
+) -> Result<SignalingAdapterProfile, TransportError> {
+    let mut provider_endpoint = SignalingProviderEndpoint::new(
+        Endpoint::new(endpoint.clone()),
+        SignalingEndpointSecurity::ProductionTls,
+    );
+    provider_endpoint.trust_fingerprint =
+        std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_TRUST_FINGERPRINT")
+            .ok()
+            .or_else(|| {
+                Some(discrypt_rendezvous_trust_fingerprint_for_endpoint(
+                    &endpoint,
+                ))
+            });
+    Ok(SignalingAdapterProfile {
+        profile_id: "public-discrypt-rendezvous-webrtc-datachannel-e2e".to_owned(),
+        kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+        endpoints: vec![provider_endpoint],
+        metadata_posture: discrypt_transport::ProviderMetadataPosture::HashedTopic,
+        capabilities: SignalingAdapterCapabilities::production_required(),
+        trust_label: AdapterTrustLabel::new(
+            "public discrypt rendezvous",
+            "explicit self-hosted rendezvous service; opaque WebRTC negotiation envelopes only",
         )?,
     })
 }
@@ -112,7 +206,12 @@ fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportErr
     Ok(config)
 }
 
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn media_frame_probe_payload() -> Vec<u8> {
     let mut frame = Vec::with_capacity(320);
     frame.extend_from_slice(b"media-frame-ciphertext:v1:");
@@ -121,7 +220,12 @@ fn media_frame_probe_payload() -> Vec<u8> {
     frame
 }
 
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn media_frame_receipt_probe_payload(request: &[u8]) -> Vec<u8> {
     let mut receipt = Vec::with_capacity(request.len() + 48);
     receipt.extend_from_slice(b"media-receipt-v1:");
@@ -129,7 +233,12 @@ fn media_frame_receipt_probe_payload(request: &[u8]) -> Vec<u8> {
     receipt
 }
 
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 async fn run_provider_signaled_webrtc_media_frame_roundtrip(
     profile: SignalingAdapterProfile,
 ) -> Result<(), TransportError> {
@@ -178,6 +287,37 @@ async fn public_nostr_signals_real_webrtc_datachannel_roundtrip() -> Result<(), 
     run_provider_signaled_webrtc_datachannel_roundtrip(public_nostr_profile(endpoint)?).await
 }
 
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_ipfs_signals_real_webrtc_datachannel_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_IPFS_WEBRTC_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public IPFS/libp2p WebRTC E2E; set DISCRYPT_PUBLIC_IPFS_WEBRTC_E2E=1 and DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS to comma-separated direct topic-peer multiaddrs to run");
+        return Ok(());
+    }
+    let endpoints = public_ipfs_direct_topic_peer_endpoints()?;
+    run_provider_signaled_webrtc_datachannel_roundtrip(public_ipfs_profile(endpoints)?).await
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_quic_rendezvous_signals_real_webrtc_datachannel_roundtrip(
+) -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_WEBRTC_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Discrypt rendezvous WebRTC E2E; set DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_WEBRTC_E2E=1 and DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... to run");
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT").map_err(|_| {
+        TransportError::SignalingAdapter(
+            "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT is required for deployed Discrypt rendezvous WebRTC E2E"
+                .to_owned(),
+        )
+    })?;
+    run_provider_signaled_webrtc_datachannel_roundtrip(public_discrypt_rendezvous_profile(
+        endpoint,
+    )?)
+    .await
+}
+
 #[cfg(feature = "mqtt-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_mqtt_signals_real_webrtc_datachannel_roundtrip() -> Result<(), TransportError> {
@@ -216,6 +356,37 @@ async fn public_nostr_signals_real_webrtc_media_frame_roundtrip() -> Result<(), 
     let endpoint = std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
         .unwrap_or_else(|_| "wss://nos.lol".to_owned());
     run_provider_signaled_webrtc_media_frame_roundtrip(public_nostr_profile(endpoint)?).await
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_ipfs_signals_real_webrtc_media_frame_roundtrip() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_IPFS_MEDIA_WEBRTC_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public IPFS/libp2p media-frame WebRTC E2E; set DISCRYPT_PUBLIC_IPFS_MEDIA_WEBRTC_E2E=1 and DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS to comma-separated direct topic-peer multiaddrs to run");
+        return Ok(());
+    }
+    let endpoints = public_ipfs_direct_topic_peer_endpoints()?;
+    run_provider_signaled_webrtc_media_frame_roundtrip(public_ipfs_profile(endpoints)?).await
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_quic_rendezvous_signals_real_webrtc_media_frame_roundtrip(
+) -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_MEDIA_WEBRTC_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public Discrypt rendezvous media-frame WebRTC E2E; set DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_MEDIA_WEBRTC_E2E=1 and DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... to run");
+        return Ok(());
+    }
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT").map_err(|_| {
+        TransportError::SignalingAdapter(
+            "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT is required for deployed Discrypt rendezvous media-frame E2E"
+                .to_owned(),
+        )
+    })?;
+    run_provider_signaled_webrtc_media_frame_roundtrip(public_discrypt_rendezvous_profile(
+        endpoint,
+    )?)
+    .await
 }
 
 #[cfg(feature = "mqtt-adapter")]
