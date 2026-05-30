@@ -12,8 +12,10 @@ use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
 use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
-    signaling_fingerprint_for_endpoint, InviteEndpointPolicy, InviteSignalingMetadata, InviteStore,
-    InviteTrustMetadata,
+    signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
+    InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind, InviteSignalingAdapterKind,
+    InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
+    INVITE_CONNECTIVITY_SCHEMA_VERSION,
 };
 use discrypt_core::{
     app_snapshot as core_app_snapshot, identity_recovery_verification_smoke,
@@ -147,6 +149,9 @@ pub struct DirectConversationView {
     pub display_name: String,
     /// Honest local/harness capability copy.
     pub local_only_copy: String,
+    /// Persisted DM connectivity policy from the contact invite/acceptance flow.
+    #[serde(default)]
+    pub connectivity: Option<ConnectivityPolicyView>,
 }
 
 /// Channel row with stable identifiers for app-state consumers.
@@ -173,6 +178,9 @@ pub struct GroupView {
     pub role: String,
     /// Channels in this group.
     pub channels: Vec<ChannelStateView>,
+    /// Persisted group connectivity policy inherited by channel sessions unless overridden.
+    #[serde(default)]
+    pub connectivity: Option<ConnectivityPolicyView>,
 }
 
 /// Current routed context for the shell.
@@ -267,6 +275,84 @@ pub struct IceTurnServerView {
     pub credential_expires_at: Option<String>,
 }
 
+/// UI/persistence view of one signed signaling adapter profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingProfileView {
+    /// Stable profile id, unique inside the descriptor.
+    pub profile_id: String,
+    /// Adapter kind: mqtt, nostr, ipfs_pubsub, or discrypt_quic_rendezvous.
+    pub adapter_kind: String,
+    /// Broker/relay/bootstrap/QUIC endpoint URLs for this adapter.
+    pub endpoints: Vec<String>,
+    /// Provider-visible room namespace commitment, never a display name.
+    pub room_topic_commitment: String,
+    /// Endpoint/service/relay trust fingerprint or public-key commitment.
+    pub trust_fingerprint: String,
+    /// Publish/subscribe TTL in seconds.
+    pub ttl_seconds: u32,
+    /// Public provider metadata posture.
+    pub metadata_posture: String,
+    /// Abuse/rate-limit policy hint surfaced to UI/backend.
+    pub rate_limit_policy: String,
+    /// Adapter capabilities asserted by this profile.
+    pub capabilities: Vec<String>,
+}
+
+/// DM-specific bootstrap metadata persisted after first-contact invite parsing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmInviteBootstrapView {
+    /// Commitment to inviter identity, not the display alias.
+    pub inviter_identity_commitment: String,
+    /// Bounded-use contact token commitment.
+    pub contact_token_commitment: String,
+    /// Reply rendezvous capability commitment.
+    pub reply_rendezvous_commitment: String,
+}
+
+/// Group-specific bootstrap metadata persisted after invite parsing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupInviteBootstrapView {
+    /// Commitment to group identity/scope, not the group display name.
+    pub group_identity_commitment: String,
+    /// Commitment to role/admission policy.
+    pub role_admission_policy_commitment: String,
+    /// Commitment to the channel policy inheritance snapshot.
+    pub channel_policy_commitment: String,
+}
+
+/// Persisted connectivity bootstrap policy for a DM or group scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectivityPolicyView {
+    /// Connectivity schema version for forward-compatible parsers.
+    pub connectivity_schema_version: u32,
+    /// Scope kind: group_join or dm_contact.
+    pub invite_kind: String,
+    /// Commitment to the group or DM scope; never the display name.
+    pub scope_id_commitment: String,
+    /// Ordered signaling profiles allowed for this scope.
+    pub signaling_profiles: Vec<SignalingProfileView>,
+    /// STUN endpoints selected for this scope.
+    pub ice_stun_servers: Vec<String>,
+    /// Redacted TURN endpoints selected for this scope.
+    pub ice_turn_servers: Vec<IceTurnServerView>,
+    /// UI privacy label explaining provider-visible metadata.
+    pub privacy_label: String,
+    /// Optional DM contact bootstrap.
+    #[serde(default)]
+    pub dm_bootstrap: Option<DmInviteBootstrapView>,
+    /// Optional group admission bootstrap.
+    #[serde(default)]
+    pub group_bootstrap: Option<GroupInviteBootstrapView>,
+}
+
+fn default_connectivity_schema_version() -> u32 {
+    INVITE_CONNECTIVITY_SCHEMA_VERSION
+}
+
+fn default_invite_kind_group() -> String {
+    InviteKind::GroupJoin.canonical_name().to_owned()
+}
+
 /// Command-backed invite row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteView {
@@ -275,8 +361,32 @@ pub struct InviteView {
     /// Opaque invite key embedded in the link.
     #[serde(default)]
     pub invite_key: String,
-    /// Group id this invite targets.
+    /// Group id this invite targets; empty for DM contact invites.
     pub group_id: String,
+    /// DM id this invite targets for first-contact DM invites.
+    #[serde(default)]
+    pub dm_id: Option<String>,
+    /// Connectivity schema version for this invite descriptor.
+    #[serde(default = "default_connectivity_schema_version")]
+    pub connectivity_schema_version: u32,
+    /// Invite kind: group_join or dm_contact.
+    #[serde(default = "default_invite_kind_group")]
+    pub invite_kind: String,
+    /// Commitment to group/DM scope; never the display name.
+    #[serde(default)]
+    pub scope_id_commitment: String,
+    /// Ordered signed signaling adapter profiles.
+    #[serde(default)]
+    pub signaling_profiles: Vec<SignalingProfileView>,
+    /// UI privacy label explaining provider-visible metadata.
+    #[serde(default)]
+    pub privacy_label: String,
+    /// Optional DM contact bootstrap.
+    #[serde(default)]
+    pub dm_bootstrap: Option<DmInviteBootstrapView>,
+    /// Optional group admission bootstrap.
+    #[serde(default)]
+    pub group_bootstrap: Option<GroupInviteBootstrapView>,
     /// User-pastable invite code/URL.
     pub code: String,
     /// Hash of the room secret; the plan requires secret-derived admission, not incremental ids.
@@ -665,6 +775,17 @@ pub struct CreateInviteRequest {
     /// Expiry label selected by the user/admin.
     pub expires: String,
     /// Maximum-use label selected by the user/admin.
+    pub max_use: String,
+}
+
+/// Request to create a first-contact DM invite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateDmInviteRequest {
+    /// Optional DM id; active DM is used when absent.
+    pub dm_id: Option<String>,
+    /// Expiry label selected by the user.
+    pub expires: String,
+    /// Maximum-use label selected by the user.
     pub max_use: String,
 }
 
@@ -1093,12 +1214,14 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
             normalize_label(&request.display_name, &core_app_snapshot().friend.alias);
         let dm_id = stable_id("dm", &display_name, state.next_sequence);
         if !state.dms.iter().any(|dm| dm.display_name == display_name) {
+            let participant_id = stable_id("participant", &display_name, state.next_sequence);
             state.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
-                participant_id: stable_id("participant", &display_name, state.next_sequence),
+                participant_id: participant_id.clone(),
                 display_name: display_name.clone(),
                 local_only_copy: "Local harness-backed DM; no remote delivery is claimed"
                     .to_owned(),
+                connectivity: Some(dm_connectivity_policy(&dm_id, &participant_id)),
             });
         }
         let active_dm_id = state
@@ -1129,6 +1252,7 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
                 name: name.clone(),
                 role: "owner".to_owned(),
                 channels: default_group_channels(state.next_sequence),
+                connectivity: Some(group_connectivity_policy(&group_id)),
             });
         }
         let active_group_id = state
@@ -1248,6 +1372,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 name: name.clone(),
                 role: "member".to_owned(),
                 channels: default_group_channels(state.next_sequence),
+                connectivity: Some(group_connectivity_policy(&group_id)),
             });
         }
         let active_group_id = state
@@ -2452,11 +2577,13 @@ impl PersistedAppState {
         if self.dms.is_empty() {
             let friend = core_app_snapshot().friend;
             let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);
+            let participant_id = participant_id_from_friend_code(&friend.friend_code);
             self.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
-                participant_id: participant_id_from_friend_code(&friend.friend_code),
+                participant_id: participant_id.clone(),
                 display_name: friend.alias,
                 local_only_copy: "Local DM seeded from a generated friend-code/QR payload; no remote delivery is claimed".to_owned(),
+                connectivity: Some(dm_connectivity_policy(&dm_id, &participant_id)),
             });
             self.active_context = Some(ActiveContextView {
                 kind: "dm".to_owned(),
@@ -2590,10 +2717,11 @@ impl PersistedAppState {
             }
             let group_id = stable_id("group", &room_name, self.next_sequence);
             self.groups.push(GroupView {
-                group_id,
+                group_id: group_id.clone(),
                 name: room_name,
                 role: "member".to_owned(),
                 channels: default_group_channels(self.next_sequence),
+                connectivity: Some(group_connectivity_policy(&group_id)),
             });
         }
     }
@@ -3099,6 +3227,249 @@ fn default_signaling_endpoint() -> String {
     configured.unwrap_or_else(|| InviteSignalingMetadata::default_production().signaling_endpoint)
 }
 
+fn hash_commitment(domain: &str, parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    for part in parts {
+        hasher.update([0]);
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn profile_kind_name(kind: &InviteSignalingAdapterKind) -> String {
+    kind.canonical_name().to_owned()
+}
+
+fn profile_kind_from_name(value: &str) -> InviteSignalingAdapterKind {
+    match value {
+        "nostr" => InviteSignalingAdapterKind::Nostr,
+        "ipfs_pubsub" => InviteSignalingAdapterKind::IpfsPubsub,
+        "discrypt_quic_rendezvous" => InviteSignalingAdapterKind::DiscryptQuicRendezvous,
+        _ => InviteSignalingAdapterKind::Mqtt,
+    }
+}
+
+fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
+    match kind {
+        InviteSignalingAdapterKind::Mqtt => "wss://mqtt.discrypt.invalid/mqtt".to_owned(),
+        InviteSignalingAdapterKind::Nostr => "wss://nostr.discrypt.invalid".to_owned(),
+        InviteSignalingAdapterKind::IpfsPubsub => {
+            "https://ipfs.discrypt.invalid/bootstrap/pubsub".to_owned()
+        }
+        InviteSignalingAdapterKind::DiscryptQuicRendezvous => {
+            "quic://signaling.discrypt.invalid:443/rendezvous".to_owned()
+        }
+    }
+}
+
+fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileView> {
+    [
+        InviteSignalingAdapterKind::Mqtt,
+        InviteSignalingAdapterKind::Nostr,
+        InviteSignalingAdapterKind::IpfsPubsub,
+        InviteSignalingAdapterKind::DiscryptQuicRendezvous,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let adapter_kind = profile_kind_name(&kind);
+        let endpoint = default_adapter_endpoint(&kind);
+        SignalingProfileView {
+            profile_id: format!("{adapter_kind}-default"),
+            adapter_kind: adapter_kind.clone(),
+            endpoints: vec![endpoint.clone()],
+            room_topic_commitment: hash_commitment(
+                "discrypt-rendezvous-topic-commitment-v1",
+                &[scope_commitment, &adapter_kind],
+            ),
+            trust_fingerprint: signaling_fingerprint_for_endpoint(&endpoint),
+            ttl_seconds: 300,
+            metadata_posture: "hashed_topic".to_owned(),
+            rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
+            capabilities: vec![
+                "presence_ttl".to_owned(),
+                "trickle_ice".to_owned(),
+                "broadcast_control".to_owned(),
+                "health_telemetry".to_owned(),
+            ],
+        }
+    })
+    .collect()
+}
+
+fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
+    let scope_id_commitment = hash_commitment("discrypt-group-scope-commitment-v1", &[group_id]);
+    ConnectivityPolicyView {
+        connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
+        invite_kind: InviteKind::GroupJoin.canonical_name().to_owned(),
+        scope_id_commitment: scope_id_commitment.clone(),
+        signaling_profiles: default_signaling_profiles(&scope_id_commitment),
+        ice_stun_servers: default_ice_stun_servers(),
+        ice_turn_servers: default_redacted_turn_servers(),
+        privacy_label: "Group invite topics are derived commitments; group names, channel names, and room secrets are not exposed".to_owned(),
+        dm_bootstrap: None,
+        group_bootstrap: Some(GroupInviteBootstrapView {
+            group_identity_commitment: scope_id_commitment.clone(),
+            role_admission_policy_commitment: hash_commitment(
+                "discrypt-group-admission-policy-commitment-v1",
+                &[group_id],
+            ),
+            channel_policy_commitment: hash_commitment(
+                "discrypt-channel-policy-commitment-v1",
+                &[group_id],
+            ),
+        }),
+    }
+}
+
+fn dm_connectivity_policy(dm_id: &str, participant_id: &str) -> ConnectivityPolicyView {
+    let scope_id_commitment = hash_commitment("discrypt-dm-scope-commitment-v1", &[dm_id]);
+    ConnectivityPolicyView {
+        connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
+        invite_kind: InviteKind::DmContact.canonical_name().to_owned(),
+        scope_id_commitment: scope_id_commitment.clone(),
+        signaling_profiles: default_signaling_profiles(&scope_id_commitment),
+        ice_stun_servers: default_ice_stun_servers(),
+        ice_turn_servers: default_redacted_turn_servers(),
+        privacy_label: "DM contact invite topics are derived commitments; aliases, safety numbers, and room secrets are not exposed".to_owned(),
+        dm_bootstrap: Some(DmInviteBootstrapView {
+            inviter_identity_commitment: hash_commitment(
+                "discrypt-dm-inviter-identity-commitment-v1",
+                &[participant_id],
+            ),
+            contact_token_commitment: hash_commitment(
+                "discrypt-dm-contact-token-commitment-v1",
+                &[dm_id, participant_id],
+            ),
+            reply_rendezvous_commitment: hash_commitment(
+                "discrypt-dm-reply-rendezvous-commitment-v1",
+                &[dm_id],
+            ),
+        }),
+        group_bootstrap: None,
+    }
+}
+
+fn profile_to_admission(profile: &SignalingProfileView) -> InviteSignalingProfile {
+    InviteSignalingProfile {
+        profile_id: profile.profile_id.clone(),
+        adapter_kind: profile_kind_from_name(&profile.adapter_kind),
+        endpoints: profile.endpoints.clone(),
+        room_topic_commitment: profile.room_topic_commitment.clone(),
+        trust_fingerprint: profile.trust_fingerprint.clone(),
+        ttl_seconds: profile.ttl_seconds,
+        metadata_posture: profile.metadata_posture.clone(),
+        rate_limit_policy: profile.rate_limit_policy.clone(),
+        capabilities: profile.capabilities.clone(),
+    }
+}
+
+fn profile_from_admission(profile: &InviteSignalingProfile) -> SignalingProfileView {
+    SignalingProfileView {
+        profile_id: profile.profile_id.clone(),
+        adapter_kind: profile_kind_name(&profile.adapter_kind),
+        endpoints: profile.endpoints.clone(),
+        room_topic_commitment: profile.room_topic_commitment.clone(),
+        trust_fingerprint: profile.trust_fingerprint.clone(),
+        ttl_seconds: profile.ttl_seconds,
+        metadata_posture: profile.metadata_posture.clone(),
+        rate_limit_policy: profile.rate_limit_policy.clone(),
+        capabilities: profile.capabilities.clone(),
+    }
+}
+
+fn bootstrap_metadata_from_connectivity(
+    connectivity: &ConnectivityPolicyView,
+) -> Result<InviteBootstrapMetadata, String> {
+    let profiles = connectivity
+        .signaling_profiles
+        .iter()
+        .map(profile_to_admission)
+        .collect::<Vec<_>>();
+    match connectivity.invite_kind.as_str() {
+        "dm_contact" => InviteBootstrapMetadata::dm_contact(
+            connectivity.scope_id_commitment.clone(),
+            profiles,
+            DmInviteBootstrap {
+                inviter_identity_commitment: connectivity
+                    .dm_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.inviter_identity_commitment.clone())
+                    .ok_or_else(|| "DM invite bootstrap metadata is missing".to_owned())?,
+                contact_token_commitment: connectivity
+                    .dm_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.contact_token_commitment.clone())
+                    .ok_or_else(|| "DM contact token metadata is missing".to_owned())?,
+                reply_rendezvous_commitment: connectivity
+                    .dm_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.reply_rendezvous_commitment.clone())
+                    .ok_or_else(|| "DM reply rendezvous metadata is missing".to_owned())?,
+            },
+        )
+        .map_err(|err| err.to_string()),
+        _ => InviteBootstrapMetadata::group_join(
+            connectivity.scope_id_commitment.clone(),
+            profiles,
+            GroupInviteBootstrap {
+                group_identity_commitment: connectivity
+                    .group_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.group_identity_commitment.clone())
+                    .ok_or_else(|| "Group invite bootstrap metadata is missing".to_owned())?,
+                role_admission_policy_commitment: connectivity
+                    .group_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.role_admission_policy_commitment.clone())
+                    .ok_or_else(|| "Group admission policy metadata is missing".to_owned())?,
+                channel_policy_commitment: connectivity
+                    .group_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.channel_policy_commitment.clone())
+                    .ok_or_else(|| "Group channel policy metadata is missing".to_owned())?,
+            },
+        )
+        .map_err(|err| err.to_string()),
+    }
+}
+
+fn connectivity_from_bootstrap(
+    bootstrap: &InviteBootstrapMetadata,
+    ice_stun_servers: Vec<String>,
+    ice_turn_servers: Vec<IceTurnServerView>,
+) -> ConnectivityPolicyView {
+    ConnectivityPolicyView {
+        connectivity_schema_version: bootstrap.connectivity_schema_version,
+        invite_kind: bootstrap.invite_kind.canonical_name().to_owned(),
+        scope_id_commitment: bootstrap.scope_id_commitment.clone(),
+        signaling_profiles: bootstrap
+            .signaling_profiles
+            .iter()
+            .map(profile_from_admission)
+            .collect(),
+        ice_stun_servers,
+        ice_turn_servers,
+        privacy_label: bootstrap.privacy_label.clone(),
+        dm_bootstrap: bootstrap
+            .dm_bootstrap
+            .as_ref()
+            .map(|dm| DmInviteBootstrapView {
+                inviter_identity_commitment: dm.inviter_identity_commitment.clone(),
+                contact_token_commitment: dm.contact_token_commitment.clone(),
+                reply_rendezvous_commitment: dm.reply_rendezvous_commitment.clone(),
+            }),
+        group_bootstrap: bootstrap
+            .group_bootstrap
+            .as_ref()
+            .map(|group| GroupInviteBootstrapView {
+                group_identity_commitment: group.group_identity_commitment.clone(),
+                role_admission_policy_commitment: group.role_admission_policy_commitment.clone(),
+                channel_policy_commitment: group.channel_policy_commitment.clone(),
+            }),
+    }
+}
+
 fn production_invite_link(
     descriptor: &discrypt_admission::StoredInvite,
     expires_at: &str,
@@ -3147,6 +3518,7 @@ struct ParsedInviteMetadata {
     endpoint_policy: String,
     ice_stun_servers: Vec<String>,
     ice_turn_servers: Vec<IceTurnServerView>,
+    connectivity: ConnectivityPolicyView,
     expires_at: String,
     max_uses: u32,
 }
@@ -3166,6 +3538,19 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             InviteEndpointPolicy::LocalDevLoopback => "local_dev_loopback",
         }
         .to_owned();
+        let ice_stun_servers = ice_stun_server_views(&ice_config);
+        let ice_turn_servers = ice_turn_server_views(&ice_config);
+        let connectivity = descriptor
+            .bootstrap_metadata
+            .as_ref()
+            .map(|bootstrap| {
+                connectivity_from_bootstrap(
+                    bootstrap,
+                    ice_stun_servers.clone(),
+                    ice_turn_servers.clone(),
+                )
+            })
+            .unwrap_or_else(|| group_connectivity_policy(&descriptor.invite_id));
         return Some(ParsedInviteMetadata {
             invite_key: descriptor.invite_id,
             room_secret_hash: hex::encode(descriptor.room_secret_commitment),
@@ -3173,8 +3558,9 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             signaling_trust_fingerprint: descriptor.signaling_metadata.trust.signaling_fingerprint,
             signaling_trust_status: descriptor.signaling_metadata.trust.trust_status,
             endpoint_policy,
-            ice_stun_servers: ice_stun_server_views(&ice_config),
-            ice_turn_servers: ice_turn_server_views(&ice_config),
+            ice_stun_servers,
+            ice_turn_servers,
+            connectivity,
             expires_at: descriptor.expires_at.to_rfc3339(),
             max_uses: descriptor.max_uses,
         });
@@ -3201,6 +3587,8 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(1);
+    let legacy_scope =
+        hash_commitment("discrypt-legacy-invite-scope-commitment-v1", &[&invite_key]);
     Some(ParsedInviteMetadata {
         invite_key,
         room_secret_hash,
@@ -3210,6 +3598,21 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         endpoint_policy,
         ice_stun_servers: Vec::new(),
         ice_turn_servers: Vec::new(),
+        connectivity: ConnectivityPolicyView {
+            connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
+            invite_kind: InviteKind::GroupJoin.canonical_name().to_owned(),
+            scope_id_commitment: legacy_scope.clone(),
+            signaling_profiles: default_signaling_profiles(&legacy_scope),
+            ice_stun_servers: Vec::new(),
+            ice_turn_servers: Vec::new(),
+            privacy_label: "Compatibility invite parsed without signed bootstrap policy; group/contact names are not used as provider topics".to_owned(),
+            dm_bootstrap: None,
+            group_bootstrap: Some(GroupInviteBootstrapView {
+                group_identity_commitment: legacy_scope.clone(),
+                role_admission_policy_commitment: hash_commitment("discrypt-legacy-admission-policy-v1", &[&invite_key]),
+                channel_policy_commitment: hash_commitment("discrypt-legacy-channel-policy-v1", &[&invite_key]),
+            }),
+        },
         expires_at,
         max_uses,
     })

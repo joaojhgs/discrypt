@@ -552,6 +552,9 @@ pub struct StoredInvite {
     pub issuer_signature: Vec<u8>,
     /// Signed signaling endpoint and trust metadata for joiner rendezvous.
     pub signaling_metadata: InviteSignalingMetadata,
+    /// Optional signed bootstrap metadata for group joins, first-contact DMs, and device pairing.
+    #[serde(default)]
+    pub bootstrap_metadata: Option<InviteBootstrapMetadata>,
     /// Expiry timestamp.
     pub expires_at: DateTime<Utc>,
     /// Maximum accepted uses.
@@ -566,6 +569,9 @@ impl StoredInvite {
     /// Verify the issuer signature on this invite descriptor.
     pub fn verify_issuer_signature(&self) -> Result<(), InviteError> {
         self.signaling_metadata.validate()?;
+        if let Some(bootstrap_metadata) = &self.bootstrap_metadata {
+            bootstrap_metadata.validate()?;
+        }
         let verifying_key = VerifyingKey::from_bytes(
             &self
                 .issuer_public_key
@@ -621,6 +627,7 @@ impl StoredInvite {
         expires_at: DateTime<Utc>,
         max_uses: u32,
         signaling_metadata: InviteSignalingMetadata,
+        bootstrap_metadata: Option<InviteBootstrapMetadata>,
         issuer: &SigningKey,
     ) -> Self {
         let issuer_public_key = issuer.verifying_key().to_bytes().to_vec();
@@ -630,6 +637,7 @@ impl StoredInvite {
             issuer_public_key,
             issuer_signature: Vec::new(),
             signaling_metadata,
+            bootstrap_metadata,
             expires_at,
             max_uses,
             consumed_uses: 0,
@@ -645,6 +653,7 @@ impl StoredInvite {
             &self.room_secret_commitment,
             &self.issuer_public_key,
             &self.signaling_metadata,
+            self.bootstrap_metadata.as_ref(),
             self.expires_at,
             self.max_uses,
         )
@@ -679,6 +688,7 @@ impl InviteStore {
             expires_at,
             max_uses.max(1),
             InviteSignalingMetadata::default_production(),
+            None,
             issuer,
         );
         self.invites
@@ -702,6 +712,33 @@ impl InviteStore {
             expires_at,
             max_uses.max(1),
             signaling_metadata,
+            None,
+            issuer,
+        );
+        self.invites
+            .insert(invite.invite_id.clone(), invite.clone());
+        Ok(invite)
+    }
+
+    /// Issue and persist a signed invite descriptor with explicit signaling and bootstrap metadata.
+    pub fn issue_invite_with_bootstrap_metadata(
+        &mut self,
+        room_secret: &[u8],
+        expires_at: DateTime<Utc>,
+        max_uses: u32,
+        signaling_metadata: InviteSignalingMetadata,
+        bootstrap_metadata: InviteBootstrapMetadata,
+        issuer: &SigningKey,
+    ) -> Result<StoredInvite, InviteError> {
+        signaling_metadata.validate()?;
+        bootstrap_metadata.validate()?;
+        let invite = StoredInvite::sign(
+            opaque_invite_id(),
+            room_secret_commitment(room_secret),
+            expires_at,
+            max_uses.max(1),
+            signaling_metadata,
+            Some(bootstrap_metadata),
             issuer,
         );
         self.invites
@@ -783,6 +820,7 @@ fn canonical_invite_signing_bytes(
     room_secret_commitment: &[u8; 32],
     issuer_public_key: &[u8],
     signaling_metadata: &InviteSignalingMetadata,
+    bootstrap_metadata: Option<&InviteBootstrapMetadata>,
     expires_at: DateTime<Utc>,
     max_uses: u32,
 ) -> Vec<u8> {
@@ -807,9 +845,67 @@ fn canonical_invite_signing_bytes(
     let ice_policy = signaling_metadata.ice_endpoint_policy.signing_bytes();
     bytes.extend_from_slice(&(ice_policy.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&ice_policy);
+    if let Some(bootstrap) = bootstrap_metadata {
+        bytes.push(1);
+        let bootstrap_bytes = bootstrap.signing_bytes();
+        bytes.extend_from_slice(&(bootstrap_bytes.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&bootstrap_bytes);
+    } else {
+        bytes.push(0);
+    }
     bytes.extend_from_slice(&expires_at.timestamp_millis().to_le_bytes());
     bytes.extend_from_slice(&max_uses.to_le_bytes());
     bytes
+}
+
+impl InviteBootstrapMetadata {
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = b"discrypt-invite-bootstrap".to_vec();
+        bytes.extend_from_slice(&self.connectivity_schema_version.to_le_bytes());
+        append_signed_str(&mut bytes, self.invite_kind.canonical_name());
+        append_signed_str(&mut bytes, &self.scope_id_commitment);
+        append_signed_str(&mut bytes, &self.privacy_label);
+        bytes.extend_from_slice(&(self.signaling_profiles.len() as u64).to_le_bytes());
+        for profile in &self.signaling_profiles {
+            append_signed_str(&mut bytes, &profile.profile_id);
+            append_signed_str(&mut bytes, profile.adapter_kind.canonical_name());
+            bytes.extend_from_slice(&(profile.endpoints.len() as u64).to_le_bytes());
+            for endpoint in &profile.endpoints {
+                append_signed_str(&mut bytes, endpoint);
+            }
+            append_signed_str(&mut bytes, &profile.room_topic_commitment);
+            append_signed_str(&mut bytes, &profile.trust_fingerprint);
+            bytes.extend_from_slice(&profile.ttl_seconds.to_le_bytes());
+            append_signed_str(&mut bytes, &profile.metadata_posture);
+            append_signed_str(&mut bytes, &profile.rate_limit_policy);
+            bytes.extend_from_slice(&(profile.capabilities.len() as u64).to_le_bytes());
+            for capability in &profile.capabilities {
+                append_signed_str(&mut bytes, capability);
+            }
+        }
+        if let Some(dm) = &self.dm_bootstrap {
+            bytes.push(1);
+            append_signed_str(&mut bytes, &dm.inviter_identity_commitment);
+            append_signed_str(&mut bytes, &dm.contact_token_commitment);
+            append_signed_str(&mut bytes, &dm.reply_rendezvous_commitment);
+        } else {
+            bytes.push(0);
+        }
+        if let Some(group) = &self.group_bootstrap {
+            bytes.push(1);
+            append_signed_str(&mut bytes, &group.group_identity_commitment);
+            append_signed_str(&mut bytes, &group.role_admission_policy_commitment);
+            append_signed_str(&mut bytes, &group.channel_policy_commitment);
+        } else {
+            bytes.push(0);
+        }
+        bytes
+    }
+}
+
+fn append_signed_str(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
 }
 
 impl Invite {
