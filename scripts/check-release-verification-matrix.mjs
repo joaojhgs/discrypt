@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,20 @@ const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const docs = read("docs/release/release-verification-matrix.md");
 const packageJson = JSON.parse(read("apps/ui/package.json"));
 const failures = [];
+
+function resolveSiblingRepoRoot(repoName) {
+  const envValue = process.env[`${repoName.toUpperCase().replace(/-/g, "_")}_REPO_ROOT`];
+  if (envValue && existsSync(envValue)) return envValue;
+
+  let cursor = repoRoot;
+  for (let i = 0; i < 8; i += 1) {
+    const candidate = resolve(cursor, "..", repoName);
+    if (existsSync(candidate)) return candidate;
+    cursor = resolve(cursor, "..");
+  }
+
+  throw new Error(`unable to locate sibling repo ${repoName} from ${repoRoot}`);
+}
 
 for (const token of [
   "# Release verification matrix",
@@ -94,13 +108,14 @@ async function waitForHealth(port) {
 }
 
 if (failures.length === 0) {
+  const signalingRepoRoot = resolveSiblingRepoRoot("discrypt-signaling");
   const run = spawnSync("cargo", [
     "test",
     "--manifest-path", "../discrypt-signaling/Cargo.toml",
     "-p", "discrypt-signaling",
     "config_parses_cli_values",
     "--quiet",
-  ], { cwd: repoRoot, encoding: "utf8" });
+  ], { cwd: signalingRepoRoot, encoding: "utf8" });
   if (run.status !== 0) {
     failures.push(`external signaling config smoke failed:
 ${run.stdout}
