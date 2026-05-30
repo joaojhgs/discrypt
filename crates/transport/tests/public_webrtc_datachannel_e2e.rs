@@ -98,7 +98,7 @@ where
 
     sleep(Duration::from_secs(1)).await;
 
-    let ice = IceServerConfig::new(vec![Endpoint::new("stun:127.0.0.1:3478")], vec![])?;
+    let ice = IceServerConfig::new(vec![Endpoint::new("stun:stun.l.google.com:19302")], vec![])?;
     let alice_webrtc = WebRtcNegotiator::new(WebRtcNegotiationConfig::new(ice.clone())).await?;
     let bob_webrtc = WebRtcNegotiator::new(WebRtcNegotiationConfig::new(ice)).await?;
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
