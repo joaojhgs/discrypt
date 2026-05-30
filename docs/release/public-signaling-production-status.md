@@ -66,6 +66,8 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 
 Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; QUIC still passes fail-closed guards proving it remains non-selectable until the sibling-service client is implemented and tested.
 
+- Nostr profile handling now preserves every configured relay endpoint when joining a room and publishes/subscribes against the configured relay set instead of silently collapsing a profile to the first relay. The latest single-relay public WebRTC smoke still passes against `wss://nos.lol`; production still needs a multi-relay public soak that proves fallback behavior under relay rate-limit/failure.
+
 
 ### Tauri runtime adapter probe
 
@@ -228,7 +230,7 @@ npm --prefix apps/ui run typecheck
   - receives/filters by rendezvous topic.
 - [ ] Complete Nostr production hardening:
   - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`,
-  - add multi-relay soak/fallback evidence beyond the single public relay smoke,
+  - add multi-relay soak/fallback evidence beyond the single public relay smoke; profile-level multi-relay join/publish/subscribe wiring is implemented and unit-tested, but public multi-relay failure/fallback soak evidence is not complete,
   - add provider-visible capture scans.
 - [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
 - [x] Implement real IPFS/libp2p PubSub adapter with rust-libp2p gossipsub, derived topics, opaque envelopes, unsubscribe, duplicate suppression, and local two-node transport E2E.

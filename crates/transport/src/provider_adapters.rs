@@ -7,11 +7,7 @@
 //! adapter features; the Rust QUIC rendezvous adapter remains an explicit
 //! fail-closed boundary until its sibling-service client lands.
 
-#[cfg(any(
-    feature = "mqtt-adapter",
-    feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
-))]
+#[cfg(any(feature = "mqtt-adapter", feature = "ipfs-pubsub-adapter"))]
 use crate::SignalingProviderEndpoint;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
@@ -1455,7 +1451,7 @@ pub struct NostrProviderSession {
 pub struct NostrProviderRoom {
     local_peer_id: SignalingPeerId,
     client: nostr_sdk::Client,
-    relay_url: String,
+    relay_urls: Vec<String>,
     subscription_id: nostr_sdk::SubscriptionId,
     topic: String,
     notifications: AsyncMutex<tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>>,
@@ -1613,14 +1609,19 @@ fn nostr_err(context: &str, err: impl std::fmt::Display) -> TransportError {
 }
 
 #[cfg(feature = "nostr-adapter")]
-fn nostr_endpoint_for_profile(
+fn nostr_endpoints_for_profile(
     profile: &SignalingAdapterProfile,
-) -> Result<&SignalingProviderEndpoint, TransportError> {
-    profile.endpoints.first().ok_or_else(|| {
-        TransportError::InvalidConnectivityPolicy(
+) -> Result<Vec<String>, TransportError> {
+    if profile.endpoints.is_empty() {
+        return Err(TransportError::InvalidConnectivityPolicy(
             "nostr adapter profile must contain at least one relay endpoint".to_owned(),
-        )
-    })
+        ));
+    }
+    Ok(profile
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.endpoint.0.clone())
+        .collect())
 }
 
 #[cfg(feature = "nostr-adapter")]
@@ -2298,7 +2299,7 @@ impl NostrProviderRoom {
         .tag(nostr_discrypt_tag(&self.topic)?);
         let output = self
             .client
-            .send_event_builder_to([self.relay_url.as_str()], builder)
+            .send_event_builder_to(self.relay_urls.iter().map(String::as_str), builder)
             .await
             .map_err(|err| nostr_err("publish", err))?;
         if output.success.is_empty() {
@@ -2464,19 +2465,20 @@ impl AdapterSession for NostrProviderSession {
                 rendezvous.adapter_kind.canonical_name()
             )));
         }
-        let endpoint = nostr_endpoint_for_profile(&self.profile)?;
-        let relay_url = endpoint.endpoint.0.clone();
+        let relay_urls = nostr_endpoints_for_profile(&self.profile)?;
         let keys = nostr_client_secret(&rendezvous.topic, &local_peer_id)?;
         let client = nostr_sdk::Client::new(keys);
-        client
-            .add_relay(relay_url.as_str())
-            .await
-            .map_err(|err| nostr_err("add relay", err))?;
+        for relay_url in &relay_urls {
+            client
+                .add_relay(relay_url.as_str())
+                .await
+                .map_err(|err| nostr_err("add relay", err))?;
+        }
         client.connect().await;
         let subscription_id = nostr_subscription_id(&rendezvous.topic, &local_peer_id);
         let output = client
             .subscribe_with_id_to(
-                [relay_url.as_str()],
+                relay_urls.iter().map(String::as_str),
                 subscription_id.clone(),
                 nostr_filter(&rendezvous.topic),
                 None,
@@ -2492,7 +2494,7 @@ impl AdapterSession for NostrProviderSession {
         let room = NostrProviderRoom {
             local_peer_id,
             client: client.clone(),
-            relay_url,
+            relay_urls,
             subscription_id,
             topic: rendezvous.topic,
             notifications: AsyncMutex::new(client.notifications()),
@@ -3670,6 +3672,26 @@ mod tests {
         let observability = adapter.observability_redacted();
         assert_eq!(observability.adapter_kind, SignalingAdapterKind::Nostr);
         assert!(!observability.endpoint_label.contains("example.invalid"));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn nostr_profile_preserves_all_configured_relays_for_room_join() -> Result<(), TransportError> {
+        let mut profile = valid_profile(SignalingAdapterKind::Nostr)?;
+        profile.endpoints.push(SignalingProviderEndpoint::new(
+            Endpoint::new("wss://nostr-backup.example.invalid"),
+            SignalingEndpointSecurity::ProductionTls,
+        ));
+
+        let relays = nostr_endpoints_for_profile(&profile)?;
+        assert_eq!(
+            relays,
+            vec![
+                "wss://nostr.example.invalid".to_owned(),
+                "wss://nostr-backup.example.invalid".to_owned(),
+            ]
+        );
         Ok(())
     }
 
