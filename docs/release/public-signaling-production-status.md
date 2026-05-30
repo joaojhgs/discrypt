@@ -856,3 +856,20 @@ Remaining gap: this is transport-boundary role-split runtime evidence, not a
 two-installed-Tauri-process GUI test and not remote voice/audio. IPFS public
 topic-peer, deployed Discrypt rendezvous, credentialed TURN relay-only, installed
 GUI two-window E2E, and real voice/audio capture/playback E2E remain open.
+
+## 2026-05-30 update: public MQTT/Nostr encrypted media-frame gates passed
+
+The public MQTT and Nostr adapters were also re-run through their encrypted
+media-shaped WebRTC DataChannel gates. These tests prove provider-signaled
+DataChannel delivery for codec-like opaque media frames plus receipts over public
+rendezvous providers. They do **not** prove microphone capture, decoded remote
+audio playback, jitter buffering, echo cancellation, or end-user voice-call UX.
+
+Verification run:
+
+- `DISCRYPT_PUBLIC_MQTT_MEDIA_WEBRTC_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_media_frame_roundtrip -- --nocapture` — passed
+- `DISCRYPT_PUBLIC_NOSTR_MEDIA_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-transport --features nostr-adapter --test public_webrtc_datachannel_e2e public_nostr_signals_real_webrtc_media_frame_roundtrip -- --nocapture` — passed
+
+Remaining gap: this is still media-frame transport evidence only. Real voice/audio
+capture/playback E2E, TURN relay-only, installed GUI two-window E2E, public IPFS
+topic-peer, and deployed Discrypt rendezvous remain open.
