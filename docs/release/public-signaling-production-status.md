@@ -744,3 +744,21 @@ Remaining gap: MQTT and Nostr DM text/control receipt proof now has public-provi
 evidence through signed invite state, but IPFS direct topic-peer, deployed QUIC
 rendezvous, credentialed TURN relay-only, group public-provider receipt, installed
 GUI two-window E2E, and real voice/audio capture/playback E2E remain open.
+
+## 2026-05-30 update: public MQTT/Nostr group channel receipt proofs passed
+
+The backend now has opt-in public-provider group-channel receipt gates mirroring
+the DM receipt proof. Each test creates a group, issues a signed group invite,
+has Bob join through that invite, sends a channel message from Alice, and pumps
+the persisted text/control outbox through the provider-signaled WebRTC runtime
+using reciprocal group `runtime_peers` from signed bootstrap metadata.
+
+Verification run:
+
+- `DISCRYPT_DESKTOP_PUBLIC_MQTT_GROUP_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` — passed
+- `DISCRYPT_DESKTOP_PUBLIC_NOSTR_GROUP_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` — passed
+
+Remaining gap: MQTT/Nostr now have public-provider DM and group text/control
+receipt evidence through Tauri backend state, but IPFS direct topic-peer, deployed
+QUIC rendezvous, credentialed TURN relay-only, installed GUI two-window E2E, and
+real voice/audio capture/playback E2E remain open.

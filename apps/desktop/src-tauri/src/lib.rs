@@ -8500,6 +8500,31 @@ mod tests {
         Ok((path.clone(), TauriAppService::load_for_test_path(path)))
     }
 
+    fn join_group_invite_as_test_profile(
+        profile_name: &str,
+        display_name: &str,
+        device_name: &str,
+        invite_code: String,
+        group_name: &str,
+    ) -> Result<(PathBuf, TauriAppService), String> {
+        let path = reset_with_temp_state(profile_name);
+        create_user(CreateUserRequest {
+            display_name: display_name.to_owned(),
+            device_name: Some(device_name.to_owned()),
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: Some(group_name.to_owned()),
+        });
+        if joined.last_command_error.is_some() {
+            return Err(format!(
+                "{display_name} could not join group invite: {:?}",
+                joined.last_command_error
+            ));
+        }
+        Ok((path.clone(), TauriAppService::load_for_test_path(path)))
+    }
+
     fn attach_text_control_transport_runtime_for_test(
         transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
         session_id: impl Into<String>,
@@ -12412,6 +12437,131 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mqtt-adapter")]
+    fn public_mqtt_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled(
+    ) -> Result<(), String> {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_GROUP_RUNTIME_PAIR_E2E").as_deref()
+            != Ok("1")
+        {
+            eprintln!(
+                "skipping desktop public MQTT group live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_GROUP_RUNTIME_PAIR_E2E=1 to run"
+            );
+            return Ok(());
+        }
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("desktop-public-mqtt-group-runtime-pair-alice");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "7 days".to_owned(),
+        });
+        let group_id = group
+            .active_context
+            .as_ref()
+            .and_then(|context| context.group_id.clone())
+            .ok_or_else(|| "active group id missing after create_group".to_owned())?;
+        let channel_id = group
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Text)
+                    .map(|channel| channel.channel_id.clone())
+            })
+            .ok_or_else(|| "group text channel missing after create_group".to_owned())?;
+        let invite = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(invite.last_command_error.is_none(), "{invite:?}");
+        let invite_code = invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "group invite code missing".to_owned())?;
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: Some(channel_id),
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "mqtt group live runtime pair receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let (_bob_path, bob) = join_group_invite_as_test_profile(
+            "desktop-public-mqtt-group-runtime-pair-bob",
+            "Bob",
+            "Bob laptop",
+            invite_code,
+            "Private Lab",
+        )?;
+        reload_global_app_service_from_path(&alice_path);
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("group:private-lab".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: Some("mqtt".to_owned()),
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session_id = guard
+            .state
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active group text session missing".to_owned())?;
+        let (evidence, report, bob_state) = guard
+            .state
+            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
+                bob,
+                &message_id,
+                Some("mqtt"),
+                session_id,
+            )?;
+        guard.persist();
+
+        assert_eq!(evidence.kind.canonical_name(), "mqtt");
+        assert!(evidence.offerer_direct_path_ready);
+        assert!(evidence.answerer_direct_path_ready);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 1);
+        assert_eq!(report.receipts_applied, 1);
+        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert!(
+            alice_reloaded
+                .messages
+                .iter()
+                .any(|message| message.message_id == message_id
+                    && message.state_key == "peer_receipt")
+        );
+        assert!(bob_state.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+        Ok(())
+    }
+
+    #[test]
     #[cfg(feature = "nostr-adapter")]
     fn public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled() -> Result<(), String>
     {
@@ -12528,6 +12678,131 @@ mod tests {
             .text_delivery_receipts
             .iter()
             .any(|receipt| receipt.message_id == message_id));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn public_nostr_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled(
+    ) -> Result<(), String> {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_GROUP_RUNTIME_PAIR_E2E").as_deref()
+            != Ok("1")
+        {
+            eprintln!(
+                "skipping desktop public Nostr group live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_GROUP_RUNTIME_PAIR_E2E=1 to run"
+            );
+            return Ok(());
+        }
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("desktop-public-nostr-group-runtime-pair-alice");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "7 days".to_owned(),
+        });
+        let group_id = group
+            .active_context
+            .as_ref()
+            .and_then(|context| context.group_id.clone())
+            .ok_or_else(|| "active group id missing after create_group".to_owned())?;
+        let channel_id = group
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Text)
+                    .map(|channel| channel.channel_id.clone())
+            })
+            .ok_or_else(|| "group text channel missing after create_group".to_owned())?;
+        let invite = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(invite.last_command_error.is_none(), "{invite:?}");
+        let invite_code = invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "group invite code missing".to_owned())?;
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: Some(channel_id),
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "nostr group live runtime pair receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let (_bob_path, bob) = join_group_invite_as_test_profile(
+            "desktop-public-nostr-group-runtime-pair-bob",
+            "Bob",
+            "Bob laptop",
+            invite_code,
+            "Private Lab",
+        )?;
+        reload_global_app_service_from_path(&alice_path);
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("group:private-lab".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: Some("nostr".to_owned()),
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session_id = guard
+            .state
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active group text session missing".to_owned())?;
+        let (evidence, report, bob_state) = guard
+            .state
+            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
+                bob,
+                &message_id,
+                Some("nostr"),
+                session_id,
+            )?;
+        guard.persist();
+
+        assert_eq!(evidence.kind.canonical_name(), "nostr");
+        assert!(evidence.offerer_direct_path_ready);
+        assert!(evidence.answerer_direct_path_ready);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 1);
+        assert_eq!(report.receipts_applied, 1);
+        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert!(
+            alice_reloaded
+                .messages
+                .iter()
+                .any(|message| message.message_id == message_id
+                    && message.state_key == "peer_receipt")
+        );
+        assert!(bob_state.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
         Ok(())
     }
 
