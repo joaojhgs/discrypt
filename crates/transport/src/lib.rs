@@ -34,11 +34,11 @@ pub use policy::{
 #[cfg(feature = "mqtt-adapter")]
 pub use provider_adapters::MqttProviderAdapter;
 pub use provider_adapters::{
-    adapter_boundary_for_kind, required_provider_adapter_boundaries,
-    required_provider_adapter_registry, plan_signaling_adapter_fallback,
+    adapter_boundary_for_kind, plan_signaling_adapter_fallback,
+    required_provider_adapter_boundaries, required_provider_adapter_registry,
     AdapterReadinessState, FeatureGatedProviderAdapter, LocalConformanceProviderAdapter,
     LocalConformanceProviderBus, ProviderAdapterBoundary, ProviderAdapterReadiness,
-    SignalingAdapterFallbackAttempt, SignalingAdapterFallbackPlan, SignalingAdapterFactory,
+    SignalingAdapterFactory, SignalingAdapterFallbackAttempt, SignalingAdapterFallbackPlan,
     SignalingAdapterRegistryEntry,
 };
 use serde::{Deserialize, Serialize};

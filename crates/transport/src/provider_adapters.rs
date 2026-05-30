@@ -10,9 +10,9 @@
 #[cfg(feature = "mqtt-adapter")]
 use crate::SignalingProviderEndpoint;
 use crate::{
-    AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast, ConversationScope,
-    OpaqueSignalingPayload, PeerSignal, PresenceEvent, RendezvousCapability, RendezvousRoom,
-    SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingAdapterCapabilities,
+    AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
+    ConversationScope, OpaqueSignalingPayload, PeerSignal, PresenceEvent, RendezvousCapability,
+    RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingAdapterCapabilities,
     SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity, SignalingHealth,
     SignalingHealthState, SignalingObservability, SignalingPeerId, TransportError,
 };
@@ -297,8 +297,10 @@ pub fn plan_signaling_adapter_fallback(
             selected = Some(kind);
         }
 
-        if matches!(behavior, AdapterFallbackBehavior::FirstHealthy | AdapterFallbackBehavior::ManualOnly)
-            && is_selected
+        if matches!(
+            behavior,
+            AdapterFallbackBehavior::FirstHealthy | AdapterFallbackBehavior::ManualOnly
+        ) && is_selected
         {
             break;
         }
@@ -1491,8 +1493,7 @@ mod tests {
             let boundary = adapter_boundary_for_kind(entry.kind);
             assert_eq!(entry.boundary, boundary);
             assert_eq!(
-                entry.kind,
-                boundary.kind,
+                entry.kind, boundary.kind,
                 "kind and boundary kind must remain aligned"
             );
             let factory = SignalingAdapterFactory::for_kind(entry.kind);
@@ -1518,11 +1519,8 @@ mod tests {
     fn plan_signaling_adapter_fallback_try_all_deduplicates_and_marks_selected() {
         let requested = dedup_requested_kinds();
         let registry = required_provider_adapter_boundaries();
-        let plan = plan_signaling_adapter_fallback(
-            &requested,
-            AdapterFallbackBehavior::TryAll,
-            None,
-        );
+        let plan =
+            plan_signaling_adapter_fallback(&requested, AdapterFallbackBehavior::TryAll, None);
 
         assert_eq!(plan.behavior, AdapterFallbackBehavior::TryAll);
         let mut expected = Vec::new();
@@ -1532,19 +1530,29 @@ mod tests {
             }
         }
         assert_eq!(
-            plan.attempts.iter().map(|attempt| attempt.kind).collect::<Vec<_>>(),
+            plan.attempts
+                .iter()
+                .map(|attempt| attempt.kind)
+                .collect::<Vec<_>>(),
             expected
         );
         assert!(plan.attempts.iter().all(|attempt| attempt.attempted));
 
         let first_selectable = expected
             .iter()
-            .find(|kind| SignalingAdapterFactory::for_kind(**kind).readiness_state().selectable())
+            .find(|kind| {
+                SignalingAdapterFactory::for_kind(**kind)
+                    .readiness_state()
+                    .selectable()
+            })
             .copied();
         assert_eq!(plan.selected, first_selectable);
 
         if let Some(selected) = first_selectable {
-            assert_eq!(plan.attempts.last().map(|attempt| attempt.selected), Some(true));
+            assert_eq!(
+                plan.attempts.last().map(|attempt| attempt.selected),
+                Some(true)
+            );
             assert_eq!(
                 plan.attempts
                     .iter()
@@ -1579,7 +1587,11 @@ mod tests {
         };
         let selected = expected_dedup
             .iter()
-            .find(|kind| SignalingAdapterFactory::for_kind(**kind).readiness_state().selectable())
+            .find(|kind| {
+                SignalingAdapterFactory::for_kind(**kind)
+                    .readiness_state()
+                    .selectable()
+            })
             .copied();
         let expected_attempts = match selected {
             Some(_) => plan
@@ -1594,7 +1606,10 @@ mod tests {
         assert!(plan.attempts.iter().all(|attempt| attempt.attempted));
         assert_eq!(plan.selected, selected);
         if let Some(selected) = selected {
-            let last = plan.attempts.last().expect("plan should not be empty when selected");
+            let last = plan
+                .attempts
+                .last()
+                .expect("plan should not be empty when selected");
             assert_eq!(last.kind, selected);
             assert!(last.selected);
         } else {
@@ -1619,13 +1634,17 @@ mod tests {
         assert_eq!(attempt.readiness, readiness);
         assert_eq!(attempt.attempted, true);
         assert_eq!(attempt.selected, readiness.selectable());
-        assert_eq!(plan.selected, if readiness.selectable() { Some(manual) } else { None });
-
-        let absent = plan_signaling_adapter_fallback(
-            &requested,
-            AdapterFallbackBehavior::ManualOnly,
-            None,
+        assert_eq!(
+            plan.selected,
+            if readiness.selectable() {
+                Some(manual)
+            } else {
+                None
+            }
         );
+
+        let absent =
+            plan_signaling_adapter_fallback(&requested, AdapterFallbackBehavior::ManualOnly, None);
         assert!(absent.attempts.is_empty());
         assert_eq!(absent.selected, None);
     }
