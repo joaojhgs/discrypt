@@ -12,26 +12,6 @@ const adr = read("docs/adr/adr-008-supply-chain.md");
 const packageJson = read("apps/ui/package.json");
 const failures = [];
 
-const allowedVulnerabilityWaivers = new Map([
-  [
-    "RUSTSEC-2026-0124",
-    {
-      package: "libcrux-chacha20poly1305",
-      tokens: [
-        "RUSTSEC-2026-0124",
-        "libcrux-chacha20poly1305",
-        "Owner: supply-chain release owner",
-        "Release disposition: non-release waiver only",
-        "Reason:",
-        "Mitigation:",
-        "Upgrade path:",
-        "Expiry: 2026-07-31",
-        "cargo tree --workspace --target all --locked -i\n  libcrux-chacha20poly1305",
-      ],
-    },
-  ],
-]);
-
 const requiredWarningIds = [
   "RUSTSEC-2024-0413",
   "RUSTSEC-2024-0416",
@@ -41,6 +21,8 @@ const requiredWarningIds = [
   "RUSTSEC-2024-0415",
   "RUSTSEC-2024-0420",
   "RUSTSEC-2024-0419",
+  "RUSTSEC-2024-0384",
+  "RUSTSEC-2024-0436",
   "RUSTSEC-2024-0370",
   "RUSTSEC-2025-0081",
   "RUSTSEC-2025-0075",
@@ -54,15 +36,11 @@ function requireText(name, text, token) {
   if (!text.includes(token)) failures.push(`${name} missing token: ${token}`);
 }
 
-for (const [id, waiver] of allowedVulnerabilityWaivers) {
-  for (const token of waiver.tokens) requireText(waiverDocPath, waiverDoc, token);
-  requireText(waiverDocPath, waiverDoc, id);
-}
 for (const id of requiredWarningIds) requireText(waiverDocPath, waiverDoc, id);
 for (const token of [
   "test:cargo-audit-g122",
   "cargo audit",
-  "documented non-release waivers",
+  "permits no vulnerability waivers",
 ]) requireText("ADR-008", adr, token);
 requireText("package.json", packageJson, "test:cargo-audit-g122");
 
@@ -81,42 +59,40 @@ try {
 if (auditJson) {
   const vulnerabilities = auditJson.vulnerabilities?.list ?? [];
   for (const vulnerability of vulnerabilities) {
-    const id = vulnerability.advisory?.id;
-    const packageName = vulnerability.package?.name;
-    const waiver = allowedVulnerabilityWaivers.get(id);
-    if (!waiver) {
-      failures.push(`unwaived cargo audit vulnerability ${id ?? "<unknown>"} in ${packageName ?? "<unknown package>"}`);
-      continue;
-    }
-    if (packageName !== waiver.package) {
-      failures.push(`waiver ${id} expected package ${waiver.package}, saw ${packageName}`);
+    const id = vulnerability.advisory?.id ?? "<unknown>";
+    const packageName = vulnerability.package?.name ?? "<unknown package>";
+    failures.push(
+      `cargo audit vulnerability ${id} in ${packageName}; production gate allows no vulnerability waivers`,
+    );
+  }
+
+  const warningIds = Object.values(auditJson.warnings ?? {})
+    .flat()
+    .map((warning) => warning.advisory?.id)
+    .filter(Boolean)
+    .sort();
+  const required = [...requiredWarningIds].sort();
+  for (const id of required) {
+    if (!warningIds.includes(id)) {
+      failures.push(`documented warning ${id} not present in cargo audit JSON; update ${waiverDocPath}`);
     }
   }
-  for (const id of requiredWarningIds) {
-    const found = Object.values(auditJson.warnings ?? {})
-      .flat()
-      .some((warning) => warning.advisory?.id === id);
-    if (!found) failures.push(`documented warning ${id} not present in cargo audit JSON; update ${waiverDocPath}`);
+  for (const id of warningIds) {
+    if (!required.includes(id)) {
+      failures.push(`cargo audit warning ${id} is not documented in ${waiverDocPath}`);
+    }
   }
 }
 
-const activeTree = spawnSync(
-  "cargo",
-  ["tree", "--workspace", "--target", "all", "--locked", "-i", "libcrux-chacha20poly1305"],
-  { cwd: repoRoot, encoding: "utf8" },
-);
-const activeTreeOutput = `${activeTree.stdout}\n${activeTree.stderr}`;
-if (activeTreeOutput.includes("libcrux-chacha20poly1305 v")) {
-  failures.push(`RUSTSEC-2026-0124 waiver is no longer non-release; active cargo tree contains libcrux-chacha20poly1305:\n${activeTreeOutput}`.trim());
-}
-
-const auditWithWaivers = spawnSync("cargo", ["audit", "--ignore", "RUSTSEC-2026-0124"], {
+const auditStrict = spawnSync("cargo", ["audit"], {
   cwd: repoRoot,
   encoding: "utf8",
   maxBuffer: 1024 * 1024 * 16,
 });
-if (auditWithWaivers.status !== 0) {
-  failures.push(`cargo audit with documented waiver failed:\n${auditWithWaivers.stdout}\n${auditWithWaivers.stderr}`.trim());
+if (auditStrict.status !== 0) {
+  failures.push(`cargo audit failed without waivers:
+${auditStrict.stdout}
+${auditStrict.stderr}`.trim());
 }
 
 if (failures.length > 0) {
@@ -125,4 +101,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log("G122 cargo-audit gate passed with enforced non-release waiver for RUSTSEC-2026-0124");
+console.log("G122 cargo-audit gate passed with zero vulnerabilities and documented warning watchlist");

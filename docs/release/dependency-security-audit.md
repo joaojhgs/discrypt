@@ -8,7 +8,7 @@ Latest command run:
 cargo audit --json > /tmp/discrypt-cargo-audit-libp2p-patched.json
 ```
 
-Result: **vulnerability-clean but not release-clean**. After the libp2p 0.56, MQTT client, direct-IPFS, MLS/libcrux, and libp2p umbrella metadata remediation slices, `cargo audit` exits zero with **0 vulnerability hits**. It still reports unmaintained and unsound warnings that require release triage.
+Result: **vulnerability-clean but not release-complete**. After the libp2p 0.56, MQTT client, direct-IPFS, MLS/libcrux, and libp2p umbrella metadata remediation slices, `cargo audit` exits zero with **0 vulnerability hits**. G122 now enforces a zero-vulnerability policy and an exact warning watchlist in `docs/security/g122-rust-advisory-waivers.md`; the remaining production release work is replacing or target-scoping those unmaintained/unsound warnings plus closing the broader app/device/media E2E gaps.
 
 ## What improved in these slices
 
@@ -46,15 +46,15 @@ Cargo rejected that direct update because `libp2p-mdns 0.48.0` required `hickory
 
 ## Warning blockers
 
-`cargo audit` also reports unmaintained/unsound packages, including GTK3-era Tauri stack packages (`atk`, `gdk`, `gtk`, `gtk-sys`, etc.), `instant`, `paste`, `proc-macro-error`, `rustls-pemfile`, `unic-*`, `glib`, and `lru`. These must be triaged before production packaging; if they are build-only or platform-only, the release matrix needs explicit target-scoped acceptance or replacement evidence.
+`cargo audit` also reports unmaintained/unsound packages, including GTK3-era Tauri stack packages (`atk`, `gdk`, `gtk`, `gtk-sys`, etc.), `instant`, `paste`, `proc-macro-error`, `unic-*`, and `glib`. G122 now requires every current warning ID to appear in the warning watchlist with owner, expiry, disposition, and upgrade path. Production packaging still needs replacement evidence or target-scoped acceptance for the retained warning set.
 
 ## Required completion steps
 
 - Replace the local `libp2p` metadata patch with direct subcrate dependencies or an upstream libp2p release that no longer locks vulnerable DNS/mDNS packages; keep `dns`/`mdns` disabled in Discrypt production until that migration is audited.
 - Keep IPFS public defaults disabled until DNS/topic-peer discovery is remediated; only explicit direct-address profiles should be accepted in production builds while Hickory remains unresolved.
 - Replace the local `hpke-rs-libcrux` patch with an upstream patched release as soon as one exists and passes the same MLS verification gates.
-- Triage every remaining unmaintained/unsound warning into replaced, target-scoped accepted, or release-blocking.
-- Re-run `cargo audit`; keep the production dependency/security gate open until vulnerability output remains zero and every warning has a documented, target-scoped, security-reviewed triage decision.
+- Replace or target-scope every retained unmaintained/unsound warning before a production release candidate.
+- Re-run `cargo audit`; keep the production dependency/security gate open until vulnerability output remains zero and the warning watchlist is current, owner-assigned, and release-reviewed.
 
 ## Verification evidence for the dependency remediation slices
 
@@ -70,4 +70,4 @@ cargo tree --workspace --all-features --target all -i hickory-proto@0.25.2
 cargo audit --json > /tmp/discrypt-cargo-audit-libp2p-patched.json
 ```
 
-Latest audit result after these slices: **0 vulnerability hits remain**. `cargo audit` exits zero, while 16 unmaintained warnings and 1 unsound warning still require release triage.
+Latest audit result after these slices: **0 vulnerability hits remain**. `npm --prefix apps/ui run test:cargo-audit-g122` now passes only when strict `cargo audit` exits zero and the 16 unmaintained warnings plus 1 unsound warning exactly match the documented watchlist.

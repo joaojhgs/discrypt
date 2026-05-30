@@ -100,9 +100,9 @@ Required gates for this decision:
 0. `npm --prefix apps/ui run test:cargo-deny-g121` runs the full
    `cargo deny check --hide-inclusion-graph` policy and fails on advisory,
    license, wildcard, unknown-registry, or unknown-git violations.
-1. `npm --prefix apps/ui run test:cargo-audit-g122` runs `cargo audit`,
-   permits only documented non-release waivers, and fails if a waived
-   vulnerability becomes reachable in the active workspace cargo tree.
+1. `npm --prefix apps/ui run test:cargo-audit-g122` runs strict `cargo audit`,
+   permits no vulnerability waivers, and fails if the current warning watchlist
+   diverges from the documented owner/expiry/disposition table.
 2. `npm --prefix apps/ui run test:npm-audit-g123` runs production and full UI
    `npm audit --audit-level=high` checks and permits only a documented
    non-release waiver.
