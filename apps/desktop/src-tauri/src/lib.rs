@@ -5915,6 +5915,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mqtt-adapter")]
+    fn mqtt_adapter_feature_reaches_app_state_diagnostics() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("mqtt-adapter-diagnostics");
+        let state = app_state();
+        assert_eq!(
+            state.transport_diagnostics.selected_adapter.as_deref(),
+            Some("mqtt")
+        );
+        let mqtt = state
+            .transport_diagnostics
+            .adapter_boundaries
+            .iter()
+            .find(|boundary| boundary.kind == "mqtt")
+            .expect("mqtt boundary is surfaced");
+        assert_eq!(mqtt.readiness, "available");
+        assert_eq!(mqtt.failure_class, "available");
+    }
+
+    #[test]
     fn abuse_rate_limits_invite_consume_helper_and_text_send_commands() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("abuse-command-rate-limits");
