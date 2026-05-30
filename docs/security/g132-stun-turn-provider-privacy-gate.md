@@ -46,3 +46,10 @@ This gate is intentionally narrow:
 | Public IPFS two-profile signal/control | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-topic-peer-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Optional but still blocked until a reachable Discrypt topic-peer/rendezvous multiaddr is supplied |
 | Public QUIC two-profile signal/control | `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=<https://...> cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter public_quic_two_peer_signaling_smoke -- --nocapture` | Optional but still blocked until a staged deployed service endpoint is supplied |
 | Public MQTT relay-only TURN WebRTC DataChannel | `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<turns://...> DISCRYPT_PUBLIC_TURN_USERNAME=<user> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<secret> cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture` | Optional; requires real TURN credentials and asserts relay candidate evidence |
+
+## Deferred lower-value hardening (not blocking current gate)
+
+- Add public NAT-composition proof beyond relay-only TURN (for example, constrained-NAT two-device STUN/overlay assertions) before claiming broad STUN hardening completion.
+- Add staged/deployed QUIC rendezvous evidence with provider-visible capture and explicit TLS certificate/public-key pin checks before accepting the rendezvous adapter as generally production-usable.
+- Add sustained public IPFS rendezvous/mesh evidence for explicit topic-peer sets and publish/subscribe health over realistic cross-device path, then align allowlist/capture requirements with release evidence.
+- Document remaining TURN-provider operational hardening (endpoint rotation evidence, endpoint allowlist diff-reporting, and multi-provider failure-class harmonization) alongside this gate before merging into broader production release narratives.

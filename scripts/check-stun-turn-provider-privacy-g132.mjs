@@ -12,6 +12,7 @@ const packageJson = JSON.parse(read("apps/ui/package.json"));
 const harness = read("harness/multinode/src/lib.rs");
 const transportTests = read("crates/transport/tests/connectivity_flows.rs");
 const publicWebrtcTests = read("crates/transport/tests/public_webrtc_datachannel_e2e.rs");
+const transportPublicSignalingTests = read("crates/transport/tests/public_signaling_e2e.rs");
 const failures = [];
 
 function requireText(name, text, token) {
@@ -60,6 +61,15 @@ for (const token of [
   "offerer_turn_fallback_ready",
 ]) {
   requireText("public-webrtc-tests", publicWebrtcTests, token);
+}
+
+for (const token of [
+  "public_ipfs_two_peer_signaling_smoke",
+  "DISCRYPT_PUBLIC_IPFS_E2E",
+  "public_quic_two_peer_signaling_smoke",
+  "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E",
+]) {
+  requireText("public-signaling-e2e-tests", transportPublicSignalingTests, token);
 }
 
 if (!packageJson.scripts?.["test:stun-turn-provider-privacy-g132"]) {
@@ -142,6 +152,66 @@ if (process.env.DISCRYPT_PUBLIC_TURN_E2E === "1") {
     ],
     { env: { ...process.env, DISCRYPT_PUBLIC_TURN_E2E: "1" } }
   );
+}
+
+if (process.env.DISCRYPT_PUBLIC_IPFS_E2E === "1") {
+  if (!process.env.DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS) {
+    failures.push(
+      "Public IPFS proof requested without DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS; set to comma-separated direct topic-peer multiaddrs"
+    );
+  } else {
+    run(
+      "Public IPFS topic-peer smoke (opt-in)",
+      "cargo",
+      [
+        "test",
+        "-q",
+        "-p",
+        "discrypt-transport",
+        "--features",
+        "ipfs-pubsub-adapter",
+        "public_ipfs_two_peer_signaling_smoke",
+        "--",
+        "--nocapture",
+      ],
+      {
+        env: {
+          ...process.env,
+          DISCRYPT_PUBLIC_IPFS_E2E: "1",
+        },
+      }
+    );
+  }
+}
+
+if (process.env.DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E === "1") {
+  if (!process.env.DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT) {
+    failures.push(
+      "Public QUIC rendezvous proof requested without DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT; set the deployed HTTPS/WSS endpoint"
+    );
+  } else {
+    run(
+      "Deployed QUIC rendezvous smoke (opt-in)",
+      "cargo",
+      [
+        "test",
+        "-q",
+        "-p",
+        "discrypt-transport",
+        "--features",
+        "discrypt-quic-rendezvous-adapter",
+        "public_quic_two_peer_signaling_smoke",
+        "--",
+        "--nocapture",
+      ],
+      {
+        env: {
+          ...process.env,
+          DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E: "1",
+        },
+      }
+    );
+  }
 }
 
 if (existsSync(resolve(repoRoot, "docs/release/public-signaling-production-status.md"))) {
