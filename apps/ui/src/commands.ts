@@ -1193,19 +1193,12 @@ function defaultSignalingEndpoint(): string {
 }
 
 function defaultIceStunServers(): string[] {
-  return ["stun:default.discrypt.invalid:3478"];
+  return ["stun:stun.l.google.com:19302"];
 }
 
 function defaultRedactedTurnServers(): IceTurnServerView[] {
-  return [
-    {
-      endpoint: "turns:default.discrypt.invalid:5349",
-      credential_declared: false,
-      credential_expires_at: null,
-    },
-  ];
+  return [];
 }
-
 
 function hashCommitment(domain: string, parts: string[]): string {
   return stableHash(`${domain}:${parts.join(":")}`);
@@ -1889,6 +1882,13 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
           invite_id: `invite-${parsedInvite.inviteKey}`,
           invite_key: parsedInvite.inviteKey,
           group_id: groupId,
+          connectivity_schema_version: parsedInvite.connectivity.connectivity_schema_version,
+          invite_kind: parsedInvite.connectivity.invite_kind,
+          scope_id_commitment: parsedInvite.connectivity.scope_id_commitment,
+          signaling_profiles: parsedInvite.connectivity.signaling_profiles,
+          privacy_label: parsedInvite.connectivity.privacy_label,
+          dm_bootstrap: parsedInvite.connectivity.dm_bootstrap,
+          group_bootstrap: parsedInvite.connectivity.group_bootstrap,
           code: inviteCode,
           room_secret_hash: parsedInvite.roomSecretHash,
           signaling_endpoint: parsedInvite.signalingEndpoint,
@@ -1983,22 +1983,32 @@ export async function createInvite(
       const endpointPolicy = "production_tls";
       const trustStatus =
         "signed endpoint fingerprint; verify before MLS Welcome";
+      const connectivity = groupConnectivityPolicy(groupId);
+      const inviteMetadata: ParsedInviteMetadata = {
+        inviteKey,
+        signalingEndpoint,
+        endpointPolicy,
+        signalingTrustFingerprint,
+        signalingTrustStatus: trustStatus,
+        iceStunServers: defaultIceStunServers(),
+        iceTurnServers: defaultRedactedTurnServers(),
+        roomSecretHash,
+        connectivity,
+        expiresAt,
+        maxUses: parseMaxUses(maxUse),
+      };
       state.invites.push({
         invite_id: `invite-${inviteKey}`,
         invite_key: inviteKey,
         group_id: groupId,
-        code: productionInviteLink({
-          inviteKey,
-          signalingEndpoint,
-          endpointPolicy,
-          signalingTrustFingerprint,
-          signalingTrustStatus: trustStatus,
-          iceStunServers: defaultIceStunServers(),
-          iceTurnServers: defaultRedactedTurnServers(),
-          roomSecretHash,
-          expiresAt,
-          maxUses: parseMaxUses(maxUse),
-        }),
+        connectivity_schema_version: connectivity.connectivity_schema_version,
+        invite_kind: connectivity.invite_kind,
+        scope_id_commitment: connectivity.scope_id_commitment,
+        signaling_profiles: connectivity.signaling_profiles,
+        privacy_label: connectivity.privacy_label,
+        dm_bootstrap: connectivity.dm_bootstrap,
+        group_bootstrap: connectivity.group_bootstrap,
+        code: productionInviteLink(inviteMetadata),
         room_secret_hash: roomSecretHash,
         signaling_endpoint: signalingEndpoint,
         signaling_trust_fingerprint: signalingTrustFingerprint,
