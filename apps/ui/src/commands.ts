@@ -622,6 +622,32 @@ export type HandleTextControlFrameResponse = {
   response_frame: TextControlFrameView | null;
 };
 
+export type TextControlOutboxFrameView = {
+  message_id: string;
+  target: MessageTargetView;
+  frame: TextControlFrameView;
+  state_key: string;
+  attempts: number;
+  last_transport_session_id: string | null;
+  frame_sha256: string;
+};
+
+export type ListPendingTextControlFramesRequest = {
+  target?: MessageTargetView | null;
+  limit?: number | null;
+};
+
+export type ListPendingTextControlFramesResponse = {
+  state: AppState;
+  frames: TextControlOutboxFrameView[];
+};
+
+export type MarkTextControlFrameSentRequest = {
+  message_id: string;
+  frame_sha256: string;
+  transport_session_id?: string | null;
+};
+
 export type JoinVoiceRequest = {
   group_id: string;
   channel_id: string;
@@ -2906,6 +2932,48 @@ export async function receiveTextDeliveryEnvelope(
         recipient_verifying_key_hex: null,
       };
     },
+  );
+}
+
+export async function listPendingTextControlFrames(
+  request: ListPendingTextControlFramesRequest = {},
+): Promise<ListPendingTextControlFramesResponse> {
+  return invokeOrFallback<ListPendingTextControlFramesResponse>(
+    "list_pending_text_control_frames",
+    { request },
+    () => {
+      const state = mutateFallback((draft) => {
+        pushCommandError(
+          draft,
+          "message.outbox_unavailable",
+          "list_pending_text_control_frames",
+          "text_control_outbox_unavailable",
+          "Local fallback web runtime cannot expose persisted signed text/control frames; native Rust/Tauri command path is required",
+          "Run the native app to drive the transport session loop",
+        );
+      });
+      return { state, frames: [] };
+    },
+  );
+}
+
+export async function markTextControlFrameSent(
+  request: MarkTextControlFrameSentRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "mark_text_control_frame_sent",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "message.outbox_mark_rejected",
+          "mark_text_control_frame_sent",
+          "text_control_outbox_unavailable",
+          "Local fallback web runtime cannot mark persisted text/control frames sent; native Rust/Tauri command path is required",
+          "Run the native app so transport-session send state is persisted by the backend",
+        );
+      }),
   );
 }
 

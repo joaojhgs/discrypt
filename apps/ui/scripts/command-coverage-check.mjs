@@ -164,6 +164,18 @@ const expectedCommands = [
     returns: "ReceiveTextDeliveryEnvelopeResponse",
   },
   {
+    command: "list_pending_text_control_frames",
+    exportName: "listPendingTextControlFrames",
+    args: ["target", "limit"],
+    returns: "ListPendingTextControlFramesResponse",
+  },
+  {
+    command: "mark_text_control_frame_sent",
+    exportName: "markTextControlFrameSent",
+    args: ["message_id", "frame_sha256", "transport_session_id"],
+    returns: "AppState",
+  },
+  {
     command: "handle_text_control_frame",
     exportName: "handleTextControlFrame",
     args: ["frame"],
@@ -325,6 +337,8 @@ const requestTypes = [
   ["SendMessageRequest", ["target", "body"]],
   ["ApplyTextDeliveryReceiptRequest", ["message_id", "receipt", "recipient_verifying_key_hex"]],
   ["ReceiveTextDeliveryEnvelopeRequest", ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"]],
+  ["ListPendingTextControlFramesRequest", ["target", "limit"]],
+  ["MarkTextControlFrameSentRequest", ["message_id", "frame_sha256", "transport_session_id"]],
   ["HandleTextControlFrameRequest", ["frame"]],
   ["MessageTargetView", ["kind", "dm_id", "group_id", "channel_id"]],
   ["JoinVoiceRequest", ["group_id", "channel_id"]],

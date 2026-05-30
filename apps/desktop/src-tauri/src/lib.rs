@@ -950,6 +950,57 @@ pub enum TextControlFrameView {
     },
 }
 
+/// Persisted outbound text/control frame ready for a transport session loop.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextControlOutboxFrameView {
+    /// Message id associated with this frame.
+    pub message_id: String,
+    /// Conversation target that determines transport scope.
+    pub target: MessageTargetView,
+    /// Signed frame to put on the text/control DataChannel.
+    pub frame: TextControlFrameView,
+    /// Durable outbox state (`pending`, `sent`, or `receipted`).
+    pub state_key: String,
+    /// Number of transport send attempts recorded by the app session loop.
+    pub attempts: u32,
+    /// Last transport session id that claimed to send this frame.
+    pub last_transport_session_id: Option<String>,
+    /// Stable SHA-256 over the serialized frame, used as an idempotency guard.
+    pub frame_sha256: String,
+}
+
+/// Request to list pending text/control frames for a session loop.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListPendingTextControlFramesRequest {
+    /// Optional target filter for the active DM/channel session.
+    #[serde(default)]
+    pub target: Option<MessageTargetView>,
+    /// Optional result cap. Defaults to 50 and is clamped to 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Response containing state plus outbound frames still needing transport work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListPendingTextControlFramesResponse {
+    /// Updated/snapshot application state.
+    pub state: AppStateView,
+    /// Pending outbound text/control frames.
+    pub frames: Vec<TextControlOutboxFrameView>,
+}
+
+/// Request to mark a text/control frame as handed to a transport session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MarkTextControlFrameSentRequest {
+    /// Message id associated with this frame.
+    pub message_id: String,
+    /// Expected frame hash from the pending outbox view.
+    pub frame_sha256: String,
+    /// Optional session id that sent the frame.
+    #[serde(default)]
+    pub transport_session_id: Option<String>,
+}
+
 /// Request to handle a peer text/control frame from a DataChannel/session loop.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HandleTextControlFrameRequest {
@@ -1325,6 +1376,17 @@ struct TextDeliveryReceiptRecord {
     receipt: TextDeliveryReceipt,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct TextControlOutboxRecord {
+    message_id: String,
+    target: MessageTargetView,
+    frame: TextControlFrameView,
+    frame_sha256: String,
+    attempts: u32,
+    state_key: String,
+    last_transport_session_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -1339,6 +1401,8 @@ struct PersistedAppState {
     text_delivery_envelopes: Vec<TextDeliveryEnvelopeRecord>,
     #[serde(default)]
     text_delivery_receipts: Vec<TextDeliveryReceiptRecord>,
+    #[serde(default)]
+    text_control_outbox: Vec<TextControlOutboxRecord>,
     voice_session: Option<VoiceSessionView>,
     invites: Vec<InviteView>,
     devices: Vec<DeviceView>,
@@ -2481,10 +2545,25 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                 }
             }
         }
+        let mut outbox_error = None;
         if let Ok(envelope_record) =
             state.text_delivery_envelope_record(&request.target, &message_id, body, sequence)
         {
-            state.text_delivery_envelopes.push(envelope_record);
+            state.text_delivery_envelopes.push(envelope_record.clone());
+            if let Err(error) =
+                state.enqueue_text_control_outbox(&request.target, &message_id, &envelope_record)
+            {
+                outbox_error = Some(error);
+            }
+        }
+        if let Some(error) = outbox_error {
+            state.push_command_error(
+                "message.outbox_rejected",
+                "send_message",
+                "text_control_outbox_enqueue_failed",
+                error,
+                "The message was stored locally, but the transport session loop cannot send it until its signed frame can be persisted",
+            );
         }
         let message = MessageView {
             message_id,
@@ -2540,6 +2619,31 @@ pub fn receive_text_delivery_envelope(
             recipient_verifying_key_hex: None,
         },
     }
+}
+
+/// Tauri command: list persisted outbound text/control frames for the session loop.
+pub fn list_pending_text_control_frames(
+    request: ListPendingTextControlFramesRequest,
+) -> ListPendingTextControlFramesResponse {
+    with_state(|state| ListPendingTextControlFramesResponse {
+        state: state.to_view(),
+        frames: state.list_pending_text_control_frames(&request),
+    })
+}
+
+/// Tauri command: mark an outbound text/control frame as handed to transport.
+pub fn mark_text_control_frame_sent(request: MarkTextControlFrameSentRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        if let Err(error) = state.mark_text_control_frame_sent(request) {
+            state.push_command_error(
+                "message.outbox_mark_rejected",
+                "mark_text_control_frame_sent",
+                "text_control_outbox_mark_failed",
+                error,
+                "Only mark an outbound frame sent when the message id and frame hash match the persisted outbox item",
+            );
+        }
+    })
 }
 
 /// Tauri command: handle one peer text/control frame and return an optional response frame.
@@ -2997,6 +3101,20 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn list_pending_text_control_frames(
+        request: ListPendingTextControlFramesRequest,
+    ) -> ListPendingTextControlFramesResponse {
+        super::list_pending_text_control_frames(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn mark_text_control_frame_sent(
+        request: MarkTextControlFrameSentRequest,
+    ) -> AppStateView {
+        super::mark_text_control_frame_sent(request)
+    }
+
+    #[tauri::command]
     pub(super) fn handle_text_control_frame(
         request: HandleTextControlFrameRequest,
     ) -> HandleTextControlFrameResponse {
@@ -3078,6 +3196,8 @@ pub fn run() {
             ipc_commands::send_message,
             ipc_commands::apply_text_delivery_receipt,
             ipc_commands::receive_text_delivery_envelope,
+            ipc_commands::list_pending_text_control_frames,
+            ipc_commands::mark_text_control_frame_sent,
             ipc_commands::handle_text_control_frame,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
@@ -3110,6 +3230,7 @@ impl PersistedAppState {
             messages: Vec::new(),
             text_delivery_envelopes: Vec::new(),
             text_delivery_receipts: Vec::new(),
+            text_control_outbox: Vec::new(),
             voice_session: None,
             invites: Vec::new(),
             devices: Vec::new(),
@@ -3839,6 +3960,111 @@ impl PersistedAppState {
         })
     }
 
+    fn enqueue_text_control_outbox(
+        &mut self,
+        target: &MessageTargetView,
+        message_id: &str,
+        envelope_record: &TextDeliveryEnvelopeRecord,
+    ) -> Result<(), String> {
+        let frame = TextControlFrameView::Envelope {
+            target: target.clone(),
+            envelope: envelope_record.envelope.clone(),
+            sender_verifying_key_hex: envelope_record.sender_verifying_key_hex.clone(),
+            recipient_leaf: None,
+        };
+        let frame_sha256 = text_control_frame_sha256(&frame)?;
+        if let Some(existing) = self
+            .text_control_outbox
+            .iter_mut()
+            .find(|record| record.message_id == message_id)
+        {
+            existing.target = target.clone();
+            existing.frame = frame;
+            existing.frame_sha256 = frame_sha256;
+            existing.state_key = "pending".to_owned();
+            return Ok(());
+        }
+        self.text_control_outbox.push(TextControlOutboxRecord {
+            message_id: message_id.to_owned(),
+            target: target.clone(),
+            frame,
+            frame_sha256,
+            attempts: 0,
+            state_key: "pending".to_owned(),
+            last_transport_session_id: None,
+        });
+        self.push_event(
+            "message.outbox_queued",
+            format!("Queued signed text/control frame for {message_id}"),
+        );
+        Ok(())
+    }
+
+    fn list_pending_text_control_frames(
+        &self,
+        request: &ListPendingTextControlFramesRequest,
+    ) -> Vec<TextControlOutboxFrameView> {
+        let limit = request.limit.unwrap_or(50).clamp(1, 200);
+        self.text_control_outbox
+            .iter()
+            .filter(|record| record.state_key == "pending")
+            .filter(|record| {
+                request
+                    .target
+                    .as_ref()
+                    .map_or(true, |target| &record.target == target)
+            })
+            .take(limit)
+            .map(TextControlOutboxFrameView::from)
+            .collect()
+    }
+
+    fn mark_text_control_frame_sent(
+        &mut self,
+        request: MarkTextControlFrameSentRequest,
+    ) -> Result<(), String> {
+        let frame_sha256 = {
+            let outbox = self
+                .text_control_outbox
+                .iter_mut()
+                .find(|record| record.message_id == request.message_id)
+                .ok_or_else(|| "no persisted outbox frame for message id".to_owned())?;
+            if outbox.frame_sha256 != request.frame_sha256 {
+                return Err("outbox frame hash mismatch".to_owned());
+            }
+            outbox.attempts = outbox.attempts.saturating_add(1);
+            outbox.state_key = "sent".to_owned();
+            outbox.last_transport_session_id = request.transport_session_id.clone();
+            outbox.frame_sha256.clone()
+        };
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.message_id == request.message_id)
+            .filter(|message| message.state_key != "peer_receipt")
+        {
+            message.status = "signed text/control frame handed to transport session; peer delivery still requires signed receipt".to_owned();
+            message.state_key = "transport_frame_sent".to_owned();
+            message.state_label = "Awaiting peer receipt".to_owned();
+            message.state_detail = format!(
+                "frame_sha256={} session_id={}",
+                frame_sha256,
+                request
+                    .transport_session_id
+                    .as_deref()
+                    .unwrap_or("unreported")
+            );
+        }
+        self.push_event(
+            "message.outbox_sent",
+            format!(
+                "Marked text/control frame {} sent to transport",
+                request.message_id
+            ),
+        );
+        Ok(())
+    }
+
     fn apply_text_delivery_receipt(
         &mut self,
         request: ApplyTextDeliveryReceiptRequest,
@@ -3880,6 +4106,13 @@ impl PersistedAppState {
             receipt_view.envelope_ciphertext_hash
         );
         message.peer_receipt = Some(receipt_view);
+        if let Some(outbox) = self
+            .text_control_outbox
+            .iter_mut()
+            .find(|record| record.message_id == request.message_id)
+        {
+            outbox.state_key = "receipted".to_owned();
+        }
         self.text_delivery_receipts.push(TextDeliveryReceiptRecord {
             message_id: request.message_id.clone(),
             recipient_verifying_key_hex: request.recipient_verifying_key_hex,
@@ -4987,6 +5220,28 @@ fn opaque_text_control_frame_for_message(
         hex::encode(hasher.finalize())
     )
     .into_bytes()
+}
+
+impl From<&TextControlOutboxRecord> for TextControlOutboxFrameView {
+    fn from(record: &TextControlOutboxRecord) -> Self {
+        Self {
+            message_id: record.message_id.clone(),
+            target: record.target.clone(),
+            frame: record.frame.clone(),
+            state_key: record.state_key.clone(),
+            attempts: record.attempts,
+            last_transport_session_id: record.last_transport_session_id.clone(),
+            frame_sha256: record.frame_sha256.clone(),
+        }
+    }
+}
+
+fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, String> {
+    let encoded = serde_json::to_vec(frame)
+        .map_err(|error| format!("could not encode text/control frame: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> {
@@ -7839,6 +8094,148 @@ mod tests {
             .ok_or_else(|| "alice message row missing after reload".to_owned())?;
         assert_eq!(message.state_key, "peer_receipt");
         assert!(message.peer_receipt.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_outbox_persists_pending_frame_across_reload() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-control-outbox-pending");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "queued outbox frame".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let listed = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: None,
+        });
+        assert!(listed.state.last_command_error.is_none());
+        assert_eq!(listed.frames.len(), 1);
+        assert_eq!(listed.frames[0].message_id, message_id);
+        assert_eq!(listed.frames[0].state_key, "pending");
+        assert_eq!(
+            listed.frames[0].frame_sha256,
+            text_control_frame_sha256(&listed.frames[0].frame)?
+        );
+
+        let reloaded = load_state();
+        let pending_after_reload =
+            reloaded.list_pending_text_control_frames(&ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(10),
+            });
+        assert_eq!(pending_after_reload.len(), 1);
+        assert_eq!(pending_after_reload[0].message_id, message_id);
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_outbox_marks_sent_then_receipted() -> Result<(), String> {
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("text-control-outbox-receipted-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target,
+            body: "outbox sent then receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let listed = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: None,
+        });
+        let outbox_frame = listed
+            .frames
+            .into_iter()
+            .find(|frame| frame.message_id == message_id)
+            .ok_or_else(|| "pending outbox frame missing".to_owned())?;
+
+        let marked = mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+            message_id: message_id.clone(),
+            frame_sha256: outbox_frame.frame_sha256.clone(),
+            transport_session_id: Some("text-session-test".to_owned()),
+        });
+        assert!(marked.last_command_error.is_none());
+        let marked_message = marked
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "marked message row missing".to_owned())?;
+        assert_eq!(marked_message.state_key, "transport_frame_sent");
+        assert!(
+            list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+                target: None,
+                limit: None,
+            })
+            .frames
+            .is_empty()
+        );
+
+        let bob_path = fresh_state_path("text-control-outbox-receipted-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let receipt_frame = bob
+            .state
+            .handle_text_control_frame(outbox_frame.frame)
+            .ok_or_else(|| "receiver should return receipt frame".to_owned())?;
+        let handled = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: receipt_frame,
+        });
+        assert!(handled.state.last_command_error.is_none());
+        let receipted_message = handled
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "receipted message row missing".to_owned())?;
+        assert_eq!(receipted_message.state_key, "peer_receipt");
+        assert_eq!(
+            load_state()
+                .text_control_outbox
+                .iter()
+                .find(|record| record.message_id == message_id)
+                .map(|record| record.state_key.as_str()),
+            Some("receipted")
+        );
         Ok(())
     }
 

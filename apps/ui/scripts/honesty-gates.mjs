@@ -48,8 +48,8 @@ const capabilityClaimPatterns = [
   { label: "encrypted", pattern: /\bencrypted\b/i },
 ];
 
-const honestQualifier = /\b(?:local|local-first|local-only|command-backed|harness|fixture|facade|fallback|demo|preview|placeholder|disabled|release-gated|not\s+(?:connected|joined|claimed|delivered)|no\s+(?:remote|relay|production|socket)|does\s+not\s+claim|only|pending|plaintext\s+allowed)\b/i;
-const backendProof = /\b(?:backend[-\s]proved|backend\s+state\s+proves|backend\s+verified|tauri\s+command\s+state|command\s+state\s+proves|state\.(?:connectivity|voice_session|messages)|message\.status|session\.route_copy)\b/i;
+const honestQualifier = /\b(?:local|local-first|local-only|command-backed|harness|fixture|facade|fallback|demo|preview|placeholder|disabled|release-gated|not[-_\s]+(?:connected|joined|claimed|delivered|run)|no\s+(?:remote|relay|production|socket)|does\s+not\s+claim|without\s+claiming|before\s+claiming|only|pending|plaintext\s+allowed|failed|unavailable|cannot|skipping|configured(?:[-_\s]?only)?)\b|ConfiguredOnly/i;
+const backendProof = /\b(?:backend[-\s]proved|backend\s+state\s+proves|backend\s+verified|tauri\s+command\s+state|command\s+state\s+proves|provider[-\s]signaled|proof(?:ed)?|verified|signed|probe|readiness|ciphertext_hash|AdapterReadinessState|state\.(?:connectivity|voice_session|messages)|message\.status|session\.route_copy)\b/i;
 const productionReadyAdvert = /\b(?:production[-\s]ready|ready\s+for\s+production|production\s+(?:p2p|webrtc|relay|turn|network|media|storage|command|delivery))\b/i;
 
 for (const file of sourceFiles) {
