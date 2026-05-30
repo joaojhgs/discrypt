@@ -93,7 +93,7 @@ impl AdapterReadinessState {
 }
 
 /// One required adapter in the ordered registry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct SignalingAdapterRegistryEntry {
     /// Adapter kind in the registry.
     pub kind: SignalingAdapterKind,
