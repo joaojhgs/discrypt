@@ -62,24 +62,82 @@ const matrixCommands = [
   },
   {
     required: false,
-    label: "Planned Nostr public-provider matrix",
+    label: "Public Nostr smoke (opt-in real provider)",
     command: "cargo",
-    args: ["test", "-p", "discrypt-transport", "public_nostr_two_peer_signaling_smoke", "--quiet"],
-    skipReason: "Command not yet implemented in this branch.",
+    args: [
+      "test",
+      "-q",
+      "-p",
+      "discrypt-transport",
+      "--features",
+      "nostr-adapter",
+      "public_nostr_two_peer_presence_signal_and_control_roundtrip",
+      "--",
+      "--nocapture",
+    ],
+    env: {
+      DISCRYPT_PUBLIC_NOSTR_E2E: "1",
+      DISCRYPT_PUBLIC_NOSTR_ENDPOINT: process.env.DISCRYPT_PUBLIC_NOSTR_ENDPOINT || "wss://nos.lol",
+    },
+    enabledByEnv: "DISCRYPT_PUBLIC_NOSTR_E2E",
+    skipReason:
+      "Set DISCRYPT_PUBLIC_NOSTR_E2E=1 to run this real-provider verification.",
   },
   {
     required: false,
-    label: "Planned IPFS public-provider matrix",
+    label: "Public IPFS explicit-topic-peer smoke (opt-in real provider)",
     command: "cargo",
-    args: ["test", "-p", "discrypt-transport", "public_ipfs_two_peer_signaling_smoke", "--quiet"],
-    skipReason: "Command not yet implemented in this branch.",
+    args: [
+      "test",
+      "-q",
+      "-p",
+      "discrypt-transport",
+      "--features",
+      "ipfs-pubsub-adapter",
+      "public_ipfs_two_peer_signaling_smoke",
+      "--",
+      "--nocapture",
+    ],
+    env: {
+      DISCRYPT_PUBLIC_IPFS_E2E: "1",
+      ...(process.env.DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS
+        ? { DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS: process.env.DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS }
+        : {}),
+    },
+    enabledByEnv: "DISCRYPT_PUBLIC_IPFS_E2E",
+    skipReason:
+      "Set DISCRYPT_PUBLIC_IPFS_E2E=1 and DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct topic-peer multiaddr,...> to run this proof.",
   },
   {
     required: false,
-    label: "Planned QUIC public-provider matrix",
+    label: "Deployed Discrypt rendezvous smoke (opt-in real provider)",
     command: "cargo",
-    args: ["test", "-p", "discrypt-transport", "public_quic_two_peer_signaling_smoke", "--quiet"],
-    skipReason: "Command not yet implemented in this branch.",
+    args: [
+      "test",
+      "-q",
+      "-p",
+      "discrypt-transport",
+      "--features",
+      "discrypt-quic-rendezvous-adapter",
+      "public_quic_two_peer_signaling_smoke",
+      "--",
+      "--nocapture",
+    ],
+    env: {
+      DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E: "1",
+      ...(process.env.DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT
+        ? { DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT: process.env.DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT }
+        : {}),
+      ...(process.env.DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_TRUST_FINGERPRINT
+        ? {
+            DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_TRUST_FINGERPRINT:
+              process.env.DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_TRUST_FINGERPRINT,
+          }
+        : {}),
+    },
+    enabledByEnv: "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E",
+    skipReason:
+      "Set DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 and DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... to run this deployed-service proof.",
   },
   {
     required: false,

@@ -1,7 +1,8 @@
 #![cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -11,14 +12,27 @@ use discrypt_transport::MqttProviderAdapter;
 #[cfg(feature = "nostr-adapter")]
 use discrypt_transport::NostrProviderAdapter;
 use discrypt_transport::{
-    derive_scope_commitment, AdapterSession, AdapterTrustLabel, ConnectivityScopeLevel,
-    ConversationScope, Endpoint, OpaqueSignalingPayload, ProviderMetadataPosture,
-    RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
+    derive_scope_commitment, probe_provider_adapter_roundtrip, AdapterTrustLabel,
+    ConnectivityScopeLevel, ConversationScope, Endpoint, ProviderMetadataPosture,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
+    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+};
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+use discrypt_transport::{
+    AdapterSession, OpaqueSignalingPayload, RendezvousCapability, RendezvousRoom,
+    SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingPeerId,
     WebRtcNegotiationPayloadKind,
 };
 use rand::RngCore;
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
 use tokio::time::{sleep, Duration, Instant};
 
 #[cfg(feature = "mqtt-adapter")]
@@ -70,6 +84,44 @@ fn comma_separated_endpoints(value: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"external-signaling-endpoint-fingerprint-v1");
+    hasher.update(endpoint.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn public_discrypt_rendezvous_profile(
+    endpoint: String,
+) -> Result<SignalingAdapterProfile, TransportError> {
+    let mut provider_endpoint = SignalingProviderEndpoint::new(
+        Endpoint::new(endpoint.clone()),
+        SignalingEndpointSecurity::ProductionTls,
+    );
+    provider_endpoint.trust_fingerprint =
+        std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_TRUST_FINGERPRINT")
+            .ok()
+            .or_else(|| {
+                Some(discrypt_rendezvous_trust_fingerprint_for_endpoint(
+                    &endpoint,
+                ))
+            });
+    Ok(SignalingAdapterProfile {
+        profile_id: "public-discrypt-rendezvous-e2e".to_owned(),
+        kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+        endpoints: vec![provider_endpoint],
+        metadata_posture: ProviderMetadataPosture::HashedTopic,
+        capabilities: SignalingAdapterCapabilities::production_required(),
+        trust_label: AdapterTrustLabel::new(
+            "public discrypt rendezvous",
+            "explicit self-hosted rendezvous service; opaque envelopes only",
+        )?,
+    })
+}
+
 #[cfg(feature = "ipfs-pubsub-adapter")]
 fn public_ipfs_profile(endpoints: Vec<String>) -> Result<SignalingAdapterProfile, TransportError> {
     Ok(SignalingAdapterProfile {
@@ -99,6 +151,11 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
 async fn wait_for<T, Fut>(mut poll: impl FnMut() -> Fut) -> Result<T, TransportError>
 where
     Fut: std::future::Future<Output = Result<Option<T>, TransportError>>,
@@ -494,5 +551,45 @@ async fn public_ipfs_two_peer_signaling_smoke() -> Result<(), TransportError> {
     bob_room.leave().await?;
     alice_session.close().await?;
     bob_session.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_quic_two_peer_signaling_smoke() -> Result<(), TransportError> {
+    if std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping public Discrypt rendezvous E2E; set DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 and DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... to run"
+        );
+        return Ok(());
+    }
+
+    let endpoint = std::env::var("DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT").map_err(|_| {
+        TransportError::SignalingAdapter(
+            "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT is required for deployed Discrypt rendezvous E2E"
+                .to_owned(),
+        )
+    })?;
+    let profile = public_discrypt_rendezvous_profile(endpoint)?;
+    let scope_secret = random_bytes::<32>();
+    let scope = ConversationScope::new(
+        ConnectivityScopeLevel::Dm,
+        derive_scope_commitment(
+            ConnectivityScopeLevel::Dm,
+            &scope_secret,
+            "public-discrypt-rendezvous-e2e",
+        ),
+    )?;
+
+    let probe = probe_provider_adapter_roundtrip(
+        profile,
+        scope,
+        &random_bytes::<32>(),
+        &random_bytes::<16>(),
+    )
+    .await?;
+    assert!(probe.presence_roundtrip);
+    assert!(probe.signal_roundtrip);
+    assert!(probe.control_roundtrip);
     Ok(())
 }
