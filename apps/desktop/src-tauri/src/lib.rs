@@ -1372,7 +1372,10 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 name: name.clone(),
                 role: "member".to_owned(),
                 channels: default_group_channels(state.next_sequence),
-                connectivity: Some(group_connectivity_policy(&group_id)),
+                connectivity: parsed_invite
+                    .as_ref()
+                    .map(|parsed| parsed.connectivity.clone())
+                    .or_else(|| Some(group_connectivity_policy(&group_id))),
             });
         }
         let active_group_id = state
@@ -1396,6 +1399,14 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                     .as_ref()
                     .and_then(|context| context.group_id.clone())
                     .unwrap_or_default(),
+                dm_id: None,
+                connectivity_schema_version: parsed.connectivity.connectivity_schema_version,
+                invite_kind: parsed.connectivity.invite_kind.clone(),
+                scope_id_commitment: parsed.connectivity.scope_id_commitment.clone(),
+                signaling_profiles: parsed.connectivity.signaling_profiles.clone(),
+                privacy_label: parsed.connectivity.privacy_label.clone(),
+                dm_bootstrap: parsed.connectivity.dm_bootstrap.clone(),
+                group_bootstrap: parsed.connectivity.group_bootstrap.clone(),
                 code: invite_code.clone(),
                 room_secret_hash: parsed.room_secret_hash,
                 signaling_endpoint: parsed.signaling_endpoint,
@@ -1453,12 +1464,26 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             return;
         }
         let sequence = state.next_sequence;
-        let group_name = state
-            .groups
-            .iter()
-            .find(|group| group.group_id == group_id)
+        let group = state.groups.iter().find(|group| group.group_id == group_id);
+        let group_name = group
             .map(|group| group.name.clone())
             .unwrap_or_else(|| "group".to_owned());
+        let connectivity = group
+            .and_then(|group| group.connectivity.clone())
+            .unwrap_or_else(|| group_connectivity_policy(&group_id));
+        let bootstrap_metadata = match bootstrap_metadata_from_connectivity(&connectivity) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_bootstrap_invalid",
+                    error,
+                    "Recreate the group connectivity policy before issuing an invite",
+                );
+                return;
+            }
+        };
         let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
         let max_use = normalize_label(&request.max_use, "Max-use is enforced before MLS admission");
         let expires_at = invite_expiration_horizon(&expires);
@@ -1481,11 +1506,12 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = invite_store
-            .issue_invite_with_metadata(
+            .issue_invite_with_bootstrap_metadata(
                 room_secret.as_bytes(),
                 descriptor_expires_at,
                 max_uses,
                 signaling_metadata.clone(),
+                bootstrap_metadata,
                 &issuer,
             )
             .unwrap_or_else(|_| {
@@ -1515,6 +1541,14 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             invite_id: format!("invite-{}", descriptor.invite_id),
             invite_key: descriptor.invite_id.clone(),
             group_id: group_id.clone(),
+            dm_id: None,
+            connectivity_schema_version: connectivity.connectivity_schema_version,
+            invite_kind: connectivity.invite_kind.clone(),
+            scope_id_commitment: connectivity.scope_id_commitment.clone(),
+            signaling_profiles: connectivity.signaling_profiles.clone(),
+            privacy_label: connectivity.privacy_label.clone(),
+            dm_bootstrap: connectivity.dm_bootstrap.clone(),
+            group_bootstrap: connectivity.group_bootstrap.clone(),
             code: invite_code,
             room_secret_hash,
             signaling_endpoint,
