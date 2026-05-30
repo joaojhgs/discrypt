@@ -580,3 +580,41 @@ Verification run:
 Remaining gap: this improves UI/runtime attach defaults for group flows, but does
 not yet provide a full signed member-device directory or two-window group text
 and voice E2E proof.
+
+## 2026-05-30 update: backend group runtime peers are persisted and returned
+
+Group creation, invite join, and account-recovery room hydration now persist a
+backend-owned `runtime_peers` list on each `GroupView`. The peer ids are derived
+from signed group bootstrap commitments with the same domain separation used by
+the UI/runtime attach path:
+
+- owner peer: signed `group_identity_commitment`
+- member peer: signed `role_admission_policy_commitment` + `channel_policy_commitment`
+- `is_local` marks owner-local on created groups and member-local on joined or
+  recovered groups
+- `source=signed_group_bootstrap_v1` documents that these are not ad-hoc UI-only
+  hashes
+
+The React runtime attach controls now prefer backend-returned group runtime peers
+before falling back to local bootstrap derivation, so the normal group attach path
+is driven by persisted Tauri state.
+
+Verification added:
+
+- `group_invite_join_persists_signed_runtime_peers` proves Alice-created owner
+  peers and Bob-joined member peers are reciprocal, derived from the signed group
+  invite bootstrap, and survive reload.
+
+Verification run:
+
+- `cargo fmt --all --check`
+- `cargo check -q -p discrypt-desktop`
+- `cargo test -q -p discrypt-desktop group_invite_join_persists_signed_runtime_peers -- --nocapture`
+- `npm --prefix apps/ui run typecheck`
+- `npm --prefix apps/ui run test:command-coverage`
+- `npm --prefix apps/ui run build`
+
+Remaining gap: this closes the UI-only group peer defaulting gap for two-sided
+owner/member invite bootstrap, but it is not a full multi-member signed device
+directory, not dynamic peer selection for large groups, and not yet a two-window
+installed GUI proof of group text or voice over public providers.

@@ -196,6 +196,19 @@ pub struct ChannelStateView {
     pub retention_status: String,
 }
 
+/// Signed runtime peer row for group text/control attachment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupRuntimePeerView {
+    /// Stable provider peer id derived from signed group bootstrap metadata.
+    pub peer_id: String,
+    /// Role this peer represents for the current two-sided invite bootstrap.
+    pub role: String,
+    /// Whether this peer is the local device/profile role in this installed state.
+    pub is_local: bool,
+    /// Backend evidence source for this peer id.
+    pub source: String,
+}
+
 /// Group/server row with stable identifiers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GroupView {
@@ -207,6 +220,9 @@ pub struct GroupView {
     pub role: String,
     /// Channels in this group.
     pub channels: Vec<ChannelStateView>,
+    /// Backend-returned local/remote runtime peers for attaching text/control DataChannels.
+    #[serde(default)]
+    pub runtime_peers: Vec<GroupRuntimePeerView>,
     /// Persisted group connectivity policy inherited by channel sessions unless overridden.
     #[serde(default)]
     pub connectivity: Option<ConnectivityPolicyView>,
@@ -2638,12 +2654,15 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
         let name = normalize_label(&request.name, "private lab");
         let group_id = stable_id("group", &name, state.next_sequence);
         if !state.groups.iter().any(|group| group.name == name) {
+            let connectivity = group_connectivity_policy(&group_id);
+            let runtime_peers = group_runtime_peers(Some(&connectivity), "owner");
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "owner".to_owned(),
                 channels: default_group_channels(state.next_sequence),
-                connectivity: Some(group_connectivity_policy(&group_id)),
+                runtime_peers,
+                connectivity: Some(connectivity),
             });
         }
         let active_group_id = state
@@ -2758,15 +2777,18 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             .unwrap_or_else(|| parse_invite_group_name(&invite_code));
         let group_id = stable_id("group", &name, state.next_sequence);
         if !state.groups.iter().any(|group| group.name == name) {
+            let connectivity = parsed_invite
+                .as_ref()
+                .map(|parsed| parsed.connectivity.clone())
+                .unwrap_or_else(|| group_connectivity_policy(&group_id));
+            let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "member".to_owned(),
                 channels: default_group_channels(state.next_sequence),
-                connectivity: parsed_invite
-                    .as_ref()
-                    .map(|parsed| parsed.connectivity.clone())
-                    .or_else(|| Some(group_connectivity_policy(&group_id))),
+                runtime_peers,
+                connectivity: Some(connectivity),
             });
         }
         let active_group_id = state
@@ -6536,12 +6558,15 @@ impl PersistedAppState {
                 continue;
             }
             let group_id = stable_id("group", &room_name, self.next_sequence);
+            let connectivity = group_connectivity_policy(&group_id);
+            let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
             self.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: room_name,
                 role: "member".to_owned(),
                 channels: default_group_channels(self.next_sequence),
-                connectivity: Some(group_connectivity_policy(&group_id)),
+                runtime_peers,
+                connectivity: Some(connectivity),
             });
         }
     }
@@ -7651,6 +7676,47 @@ fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileVie
         })
     })
     .collect()
+}
+
+fn runtime_peer_id_from_commitment(label: &str, commitment: &str) -> String {
+    let digest = hash_commitment("discrypt-runtime-peer-id-v1", &[label, commitment]);
+    let short = digest.get(..16).unwrap_or(digest.as_str());
+    format!("peer-{short}")
+}
+
+fn group_runtime_peers(
+    connectivity: Option<&ConnectivityPolicyView>,
+    local_role: &str,
+) -> Vec<GroupRuntimePeerView> {
+    let Some(group_bootstrap) = connectivity.and_then(|policy| policy.group_bootstrap.as_ref())
+    else {
+        return Vec::new();
+    };
+    let owner_peer_id = runtime_peer_id_from_commitment(
+        "group-owner-runtime-peer",
+        &group_bootstrap.group_identity_commitment,
+    );
+    let member_commitment = format!(
+        "{}:{}",
+        group_bootstrap.role_admission_policy_commitment, group_bootstrap.channel_policy_commitment
+    );
+    let member_peer_id =
+        runtime_peer_id_from_commitment("group-member-runtime-peer", &member_commitment);
+    let local_is_owner = local_role == "owner";
+    vec![
+        GroupRuntimePeerView {
+            peer_id: owner_peer_id,
+            role: "owner".to_owned(),
+            is_local: local_is_owner,
+            source: "signed_group_bootstrap_v1".to_owned(),
+        },
+        GroupRuntimePeerView {
+            peer_id: member_peer_id,
+            role: "member".to_owned(),
+            is_local: !local_is_owner,
+            source: "signed_group_bootstrap_v1".to_owned(),
+        },
+    ]
 }
 
 fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
@@ -9129,6 +9195,89 @@ mod tests {
             .as_ref()
             .map(|policy| policy.invite_kind.as_str())
             == Some("dm_contact")));
+    }
+
+    #[test]
+    fn group_invite_join_persists_signed_runtime_peers() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("group-runtime-peers-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let owner_group = created
+            .groups
+            .first()
+            .ok_or_else(|| "owner group missing".to_owned())?;
+        assert_eq!(owner_group.runtime_peers.len(), 2);
+        let owner_local_peer = owner_group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "owner local runtime peer missing".to_owned())?;
+        assert_eq!(owner_local_peer.role, "owner");
+        assert_eq!(owner_local_peer.source, "signed_group_bootstrap_v1");
+        let owner_remote_peer = owner_group
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "owner remote runtime peer missing".to_owned())?;
+        assert_eq!(owner_remote_peer.role, "member");
+
+        let invited = create_invite(CreateInviteRequest {
+            group_id: Some(owner_group.group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+        });
+        assert!(invited.last_command_error.is_none(), "{invited:?}");
+        let invite_code = invited
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "group invite code missing".to_owned())?;
+
+        reset_with_temp_state("group-runtime-peers-bob");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: Some("Private Lab".to_owned()),
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let member_group = joined
+            .groups
+            .first()
+            .ok_or_else(|| "member group missing".to_owned())?;
+        assert_eq!(member_group.runtime_peers.len(), 2);
+        let member_local_peer = member_group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "member local runtime peer missing".to_owned())?;
+        assert_eq!(member_local_peer.role, "member");
+        assert_eq!(member_local_peer.peer_id, owner_remote_peer.peer_id);
+        let member_remote_peer = member_group
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "member remote runtime peer missing".to_owned())?;
+        assert_eq!(member_remote_peer.role, "owner");
+        assert_eq!(member_remote_peer.peer_id, owner_local_peer.peer_id);
+
+        let reloaded = load_state().to_view();
+        let persisted_group = reloaded
+            .groups
+            .first()
+            .ok_or_else(|| "persisted member group missing".to_owned())?;
+        assert_eq!(persisted_group.runtime_peers, member_group.runtime_peers);
+        Ok(())
     }
 
     #[test]

@@ -136,6 +136,16 @@ function textRuntimePeerDefaults(state: AppState): {
           .reverse()
           .find((invite) => invite.group_id === state.active_context?.group_id)
       : state.invites.at(-1);
+  const groupRuntimePeers = activeGroup?.runtime_peers ?? [];
+  const backendLocalGroupPeer = groupRuntimePeers.find((peer) => peer.is_local);
+  const backendRemoteGroupPeer = groupRuntimePeers.find((peer) => !peer.is_local);
+  if (backendLocalGroupPeer && backendRemoteGroupPeer) {
+    return {
+      local: backendLocalGroupPeer.peer_id,
+      remote: backendRemoteGroupPeer.peer_id,
+    };
+  }
+
   const dmBootstrap =
     activeDm?.connectivity?.dm_bootstrap ?? activeInvite?.dm_bootstrap ?? null;
   if (dmBootstrap) {

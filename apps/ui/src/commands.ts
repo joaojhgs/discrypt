@@ -148,11 +148,19 @@ export type ChannelStateView = {
   retention_status: string;
 };
 
+export type GroupRuntimePeerView = {
+  peer_id: string;
+  role: string;
+  is_local: boolean;
+  source: string;
+};
+
 export type GroupView = {
   group_id: string;
   name: string;
   role: string;
   channels: ChannelStateView[];
+  runtime_peers?: GroupRuntimePeerView[];
   connectivity?: ConnectivityPolicyView | null;
 };
 
@@ -1597,6 +1605,41 @@ function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView
   }));
 }
 
+function runtimePeerIdFromCommitment(label: string, commitment: string): string {
+  return `peer-${hashCommitment("discrypt-runtime-peer-id-v1", [label, commitment]).slice(0, 16)}`;
+}
+
+function groupRuntimePeers(
+  connectivity: ConnectivityPolicyView | null | undefined,
+  localRole: "owner" | "member" | string,
+): GroupRuntimePeerView[] {
+  const bootstrap = connectivity?.group_bootstrap;
+  if (!bootstrap) return [];
+  const ownerPeerId = runtimePeerIdFromCommitment(
+    "group-owner-runtime-peer",
+    bootstrap.group_identity_commitment,
+  );
+  const memberPeerId = runtimePeerIdFromCommitment(
+    "group-member-runtime-peer",
+    `${bootstrap.role_admission_policy_commitment}:${bootstrap.channel_policy_commitment}`,
+  );
+  const localIsOwner = localRole === "owner";
+  return [
+    {
+      peer_id: ownerPeerId,
+      role: "owner",
+      is_local: localIsOwner,
+      source: "signed_group_bootstrap_v1",
+    },
+    {
+      peer_id: memberPeerId,
+      role: "member",
+      is_local: !localIsOwner,
+      source: "signed_group_bootstrap_v1",
+    },
+  ];
+}
+
 function groupConnectivityPolicy(groupId: string): ConnectivityPolicyView {
   const scope = hashCommitment("discrypt-group-scope-commitment-v1", [groupId]);
   return {
@@ -1886,6 +1929,7 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
   for (const room of rooms) {
     if (fallbackState.groups.some((group) => group.name === room)) continue;
     const groupId = `group-${slugify(room)}`;
+    const connectivity = groupConnectivityPolicy(groupId);
     fallbackState.groups.push({
       group_id: groupId,
       name: room,
@@ -1904,7 +1948,8 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
           retention_status: "session",
         },
       ],
-      connectivity: groupConnectivityPolicy(groupId),
+      runtime_peers: groupRuntimePeers(connectivity, "member"),
+      connectivity,
     });
   }
 }
@@ -2051,12 +2096,14 @@ export async function recoverUser(
         if (!name) continue;
         const groupId = `group-${slugify(name)}`;
         if (!state.groups.some((group) => group.group_id === groupId)) {
+          const connectivity = groupConnectivityPolicy(groupId);
           state.groups.push({
             group_id: groupId,
             name,
             role: "member",
             channels: defaultGroupChannels(),
-            connectivity: groupConnectivityPolicy(groupId),
+            runtime_peers: groupRuntimePeers(connectivity, "member"),
+            connectivity,
           });
         }
       }
@@ -2268,12 +2315,14 @@ export async function createGroup(
       const name = request.name.trim() || "private lab";
       const groupId = `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
+        const connectivity = groupConnectivityPolicy(groupId);
         state.groups.push({
           group_id: groupId,
           name,
           role: "owner",
           channels: defaultGroupChannels(),
-          connectivity: groupConnectivityPolicy(groupId),
+          runtime_peers: groupRuntimePeers(connectivity, "owner"),
+          connectivity,
         });
       }
       state.active_context = {
@@ -2314,12 +2363,15 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         request.group_name?.trim() || parseInviteGroupName(request.invite_code);
       const groupId = `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
+        const connectivity =
+          parsedInvite?.connectivity ?? groupConnectivityPolicy(groupId);
         state.groups.push({
           group_id: groupId,
           name,
           role: "member",
           channels: defaultGroupChannels(),
-          connectivity: parsedInvite?.connectivity ?? groupConnectivityPolicy(groupId),
+          runtime_peers: groupRuntimePeers(connectivity, "member"),
+          connectivity,
         });
       }
       state.active_context = {
