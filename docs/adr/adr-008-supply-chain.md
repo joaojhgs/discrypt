@@ -132,7 +132,10 @@ Required gates for this decision:
 11. `npm --prefix apps/ui run test:placeholder-allowlist-g128` proves every
     remaining review-pattern occurrence has an explicit path and release-review
     rationale.
-12. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
+12. `npm --prefix apps/ui run test:release-no-fallback-g129` proves Linux
+    release builds exclude `harness`/`local-dev`, strip local fallback env flags,
+    and do not render fallback-only UI copy.
+13. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
     handled by the later advisory/reproducibility stories.
 
 ## Consequences

@@ -33,6 +33,7 @@ for (const token of [
   "npm --prefix apps/ui ci",
   "npm --prefix apps/ui run test:honesty",
   "npm --prefix apps/ui run test:command-coverage",
+  "npm --prefix apps/ui run test:release-no-fallback-g129",
   "npm --prefix apps/ui run build",
   "cargo test -p discrypt-desktop --features",
   "npx --yes @tauri-apps/cli@2.11.2 build",
@@ -46,6 +47,10 @@ if (!String(plan.tauriConfigPath).endsWith("apps/desktop/src-tauri/tauri.conf.js
   failures.push("release plan must use the desktop Tauri config");
 }
 if (!plan.sourceDateEpoch) failures.push("release plan missing SOURCE_DATE_EPOCH");
+for (const feature of ["harness", "local-dev"]) {
+  if (plan.releaseFeatures.includes(feature)) failures.push(`release plan must exclude harness/local-dev feature: ${feature}`);
+}
+
 if (failures.length > 0) {
   console.error("release-linux dry-run check failed:");
   for (const failure of failures) console.error(`- ${failure}`);

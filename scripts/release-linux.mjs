@@ -23,6 +23,7 @@ const bundles = (process.env.DISCRYPT_LINUX_BUNDLES ?? "deb,rpm,appimage")
 const dryRun =
   process.argv.includes("--dry-run") ||
   process.env.DISCRYPT_RELEASE_DRY_RUN === "1";
+const forbiddenReleaseFeatures = releaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
 
 function fail(message) {
   console.error(`release-linux: ${message}`);
@@ -74,17 +75,22 @@ if (!targetSupported) {
     `Tauri bundle.targets must be "all" or include every requested Linux bundle (${bundles.join(",")})`,
   );
 }
+if (forbiddenReleaseFeatures.length > 0) {
+  fail(`release builds must not include non-production features: ${forbiddenReleaseFeatures.join(",")}`);
+}
 if (!releaseFeatures.includes("tauri-runtime")) {
   fail("DISCRYPT_RELEASE_FEATURES must include tauri-runtime for desktop packaging");
 }
-
 const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH ?? capture("git", ["log", "-1", "--format=%ct"]);
 const releaseEnv = { ...process.env, SOURCE_DATE_EPOCH: sourceDateEpoch };
+delete releaseEnv.VITE_DISCRYPT_LOCAL_DEV_FALLBACK;
+delete releaseEnv.DISCRYPT_LOCAL_DEV_FALLBACK;
 const steps = [];
 steps.push(
   run("npm", ["--prefix", "apps/ui", "ci"]),
   run("npm", ["--prefix", "apps/ui", "run", "test:honesty"]),
   run("npm", ["--prefix", "apps/ui", "run", "test:command-coverage"]),
+  run("npm", ["--prefix", "apps/ui", "run", "test:release-no-fallback-g129"]),
   run("npm", ["--prefix", "apps/ui", "run", "build"]),
   run("cargo", ["test", "-p", "discrypt-desktop", "--features", releaseFeatures.join(",")]),
   run("npx", [
