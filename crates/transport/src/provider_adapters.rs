@@ -1995,7 +1995,10 @@ fn ipfs_pubsub_no_topic_mesh_error(
     subscribed_peers: usize,
     mesh_peers: usize,
 ) -> TransportError {
-    if matches!(error, libp2p::gossipsub::PublishError::InsufficientPeers) {
+    if matches!(
+        error,
+        libp2p::gossipsub::PublishError::NoPeersSubscribedToTopic
+    ) {
         ipfs_typed_error(
             "topic_mesh_unavailable",
             AdapterReadinessState::ProviderUnhealthy,
@@ -2264,12 +2267,18 @@ async fn spawn_ipfs_pubsub_room(
                             let _ = result.send(outcome);
                         }
                         IpfsPubsubCommand::Leave { result } => {
-                            let outcome = swarm
+                            let outcome = if swarm
                                 .behaviour_mut()
                                 .gossipsub
                                 .unsubscribe(&task_topic)
-                                .map(|_| ())
-                                .map_err(|err| ipfs_err("unsubscribe", err));
+                            {
+                                Ok(())
+                            } else {
+                                Err(ipfs_err(
+                                    "unsubscribe",
+                                    "topic was not subscribed by this adapter session",
+                                ))
+                            };
                             let _ = result.send(outcome);
                             break;
                         }
@@ -4183,7 +4192,7 @@ mod tests {
     #[cfg(feature = "ipfs-pubsub-adapter")]
     fn ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error() {
         let error = ipfs_pubsub_no_topic_mesh_error(
-            libp2p::gossipsub::PublishError::InsufficientPeers,
+            libp2p::gossipsub::PublishError::NoPeersSubscribedToTopic,
             1,
             0,
             0,

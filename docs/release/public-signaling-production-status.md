@@ -280,7 +280,7 @@ npm --prefix apps/ui run test:command-coverage
 
 ### P0: security/release gaps
 
-- [ ] Dependency/security audit for `rumqttc` and any Nostr/IPFS/libp2p dependencies. Latest `cargo audit` is documented in `docs/release/dependency-security-audit.md` and remains release-blocking due vulnerable `hickory-proto`, `libcrux-chacha20poly1305`, `ring 0.16`, and old `rustls-webpki` edges.
+- [ ] Dependency/security audit for `rumqttc` and any Nostr/IPFS/libp2p dependencies. Latest `cargo audit` is documented in `docs/release/dependency-security-audit.md` and remains release-blocking: the libp2p 0.56 slice removed the old `ring 0.16` and `rustls-webpki 0.101.7` findings, but vulnerable `hickory-proto 0.25.2`, `libcrux-chacha20poly1305 0.0.7`, and `rumqttc`'s `rustls-webpki 0.102.8` edge remain.
 - [x] Public provider allowlist/versioning and rotation policy. Signed invite/app signaling profiles now carry `provider_policy_version`, endpoint allowlist commitments, and provider rotation policy text; Tauri validates endpoint commitments before converting profiles into transport probes, and invite bootstrap validation rejects empty/malformed provider-policy metadata.
 - [x] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
   for deterministic harness evidence and optional public-provider MQTT validation. `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132` passed and runs both local cargo gates by default; real distinct-machine STUN/TURN release evidence remains tracked separately above.
