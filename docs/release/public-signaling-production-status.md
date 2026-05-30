@@ -97,6 +97,10 @@ cargo test -q -p discrypt-desktop signaling_adapter_probe_surfaces_runtime_block
 npm --prefix apps/ui run typecheck
 cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter
 cargo test -q -p discrypt-desktop probe -- --nocapture
+DISCRYPT_DESKTOP_PUBLIC_MQTT_WEBRTC_E2E=1 \
+DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 \
+  cargo test -q -p discrypt-desktop --features mqtt-adapter \
+  public_mqtt_data_channel_probe_reaches_tauri_diagnostics_when_enabled -- --nocapture
 npm --prefix apps/ui run typecheck
 ```
 

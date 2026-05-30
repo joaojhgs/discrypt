@@ -6568,6 +6568,59 @@ mod tests {
 
     #[test]
     #[cfg(feature = "mqtt-adapter")]
+    fn public_mqtt_data_channel_probe_reaches_tauri_diagnostics_when_enabled() {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_WEBRTC_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public MQTT WebRTC probe; set DISCRYPT_DESKTOP_PUBLIC_MQTT_WEBRTC_E2E=1 to run"
+            );
+            return;
+        }
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("desktop-public-mqtt-datachannel");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = start_signaling_session(StartSignalingSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            adapter_probe: false,
+            data_channel_probe: true,
+            adapter_kind: Some("mqtt".to_owned()),
+        });
+
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
+        );
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-proofed"
+        );
+        let probe = state
+            .transport_diagnostics
+            .data_channel_probe
+            .expect("desktop diagnostics should include DataChannel proof");
+        assert_eq!(probe.kind, "mqtt");
+        assert!(probe.offerer_direct_path_ready);
+        assert!(probe.answerer_direct_path_ready);
+        assert!(probe.offerer_data_channel_open);
+        assert!(probe.answerer_data_channel_open);
+        assert!(probe.text_control_frame_roundtrip);
+        assert!(state.voice_session.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "mqtt-adapter")]
     fn mqtt_adapter_feature_reaches_app_state_diagnostics() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("mqtt-adapter-diagnostics");
