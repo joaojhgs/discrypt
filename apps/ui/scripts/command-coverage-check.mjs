@@ -164,6 +164,12 @@ const expectedCommands = [
     returns: "ReceiveTextDeliveryEnvelopeResponse",
   },
   {
+    command: "handle_text_control_frame",
+    exportName: "handleTextControlFrame",
+    args: ["frame"],
+    returns: "HandleTextControlFrameResponse",
+  },
+  {
     command: "join_voice",
     exportName: "joinVoice",
     args: ["group_id", "channel_id"],
@@ -319,6 +325,7 @@ const requestTypes = [
   ["SendMessageRequest", ["target", "body"]],
   ["ApplyTextDeliveryReceiptRequest", ["message_id", "receipt", "recipient_verifying_key_hex"]],
   ["ReceiveTextDeliveryEnvelopeRequest", ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"]],
+  ["HandleTextControlFrameRequest", ["frame"]],
   ["MessageTargetView", ["kind", "dm_id", "group_id", "channel_id"]],
   ["JoinVoiceRequest", ["group_id", "channel_id"]],
   ["LeaveVoiceRequest", ["session_id"]],

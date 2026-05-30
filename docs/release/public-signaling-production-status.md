@@ -200,9 +200,10 @@ Behavior:
 
 - `send_message` now stores a signed `TextMessageEnvelope` record for the opaque encrypted text/control frame that would be delivered to a peer.
 - The Tauri command `receive_text_delivery_envelope` accepts a peer `TextMessageEnvelope`, verifies the sender signature and DM/group/channel delivery binding, persists a received-envelope timeline row, and returns a locally signed `TextDeliveryReceipt` plus recipient verifying key for transport back to the sender. Tampered envelopes are rejected without receipt generation.
+- The Tauri command `handle_text_control_frame` accepts a typed text/control frame from a future DataChannel/session loop. Envelope frames are verified through `receive_text_delivery_envelope` and return a receipt response frame; receipt frames are verified through `apply_text_delivery_receipt` and update the sender timeline. This is the command boundary the persistent receiver loop should call, not a full loop by itself.
 - The Tauri command `apply_text_delivery_receipt` accepts a `TextDeliveryReceipt`, verifies it with `discrypt-mls-delivery` against the stored envelope, message id, group/DM/channel delivery group id, recipient verifying key, and envelope ciphertext hash, then marks the message as `peer_receipt` only after verification succeeds.
 - Tampered receipts are rejected with `receipt_verification_failed` and do not upgrade the message state.
-- The UI command surface has typed envelope/receipt/receipt-view models plus native-only `receiveTextDeliveryEnvelope(...)` and `applyTextDeliveryReceipt(...)` bindings; browser fallback stays honest and reports that signed envelope/receipt verification requires the Rust/Tauri backend.
+- The UI command surface has typed envelope/receipt/text-control-frame/receipt-view models plus native-only `receiveTextDeliveryEnvelope(...)`, `handleTextControlFrame(...)`, and `applyTextDeliveryReceipt(...)` bindings; browser fallback stays honest and reports that signed envelope/receipt verification requires the Rust/Tauri backend.
 - This is the signed state-transition boundary needed for remote delivery honesty. A two-profile backend test proves a distinct Bob profile identity can verify Alice's envelope, persist a received-envelope row, sign a receipt, and return it for Alice to verify; an env-gated public MQTT DataChannel test carries Alice's serialized encrypted text envelope to the Bob-side transport peer and returns Bob's signed receipt frame before Alice applies `peer_receipt`. This is **not yet** a full production peer-delivery flow because the persistent installed-app session still has to call the receive command from a live receiver event loop and transport the generated receipt back automatically.
 
 Verification:
@@ -213,6 +214,7 @@ cargo test -q -p discrypt-desktop tampered_text_delivery_receipt_is_rejected -- 
 cargo test -q -p discrypt-desktop two_profile_receiver_identity_can_sign_delivery_receipt -- --nocapture
 cargo test -q -p discrypt-desktop receiver_command_accepts_verified_envelope_and_returns_signed_receipt -- --nocapture
 cargo test -q -p discrypt-desktop receiver_command_rejects_tampered_envelope_without_receipt -- --nocapture
+cargo test -q -p discrypt-desktop text_control_frame_handler_bridges_envelope_to_receipt -- --nocapture
 DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E=1 \
 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 \
   cargo test -q -p discrypt-desktop --features mqtt-adapter \
@@ -270,7 +272,7 @@ npm --prefix apps/ui run test:command-coverage
 - [x] Establish data channel for opaque text/control delivery across two independent Rust transport peers over public MQTT and Nostr rendezvous.
 - [x] Expose a UI/Tauri opt-in message-send transport proof that sends an opaque message-derived frame through the provider-signaled WebRTC DataChannel diagnostic.
 - [x] Add a same-process Tauri service harness that can load and persist two isolated app profiles from distinct state files, removing the prior global-state-only blocker for two-profile command E2E tests.
-- [ ] Establish persistent send/receive over the same data-channel path across two real Tauri app profiles/devices from UI-driven DM/group state, with signed peer receipts. The signed receipt verification/apply boundary and receiver-side envelope acceptance/receipt-generation command are implemented and tested, and an env-gated same-process two-profile MQTT proof now carries an encrypted envelope and signed receipt over a real provider-signaled DataChannel; production runtime session ownership, receiver event loop invocation, UI-driven DM/group plumbing, and installed-device persistence remain open.
+- [ ] Establish persistent send/receive over the same data-channel path across two real Tauri app profiles/devices from UI-driven DM/group state, with signed peer receipts. The signed receipt verification/apply boundary, receiver-side envelope acceptance/receipt-generation command, and text-control-frame handler are implemented and tested, and an env-gated same-process two-profile MQTT proof now carries an encrypted envelope and signed receipt over a real provider-signaled DataChannel; production runtime session ownership, receiver event loop invocation, UI-driven DM/group plumbing, and installed-device persistence remain open.
 - [ ] Establish audio media path and prove speaking/mute/volume UI state reflects real media state.
 - [x] Prove public STUN participates in provider-signaled WebRTC data-channel setup in the live same-host Rust transport harness with real network UDP bind.
 - [ ] Prove STUN works across distinct machines and normal NAT scenarios.

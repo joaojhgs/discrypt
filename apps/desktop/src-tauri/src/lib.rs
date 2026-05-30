@@ -914,6 +914,49 @@ pub struct ReceiveTextDeliveryEnvelopeResponse {
     pub recipient_verifying_key_hex: Option<String>,
 }
 
+/// Text/control frame carried by the peer DataChannel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextControlFrameView {
+    /// Signed encrypted text envelope from a peer.
+    Envelope {
+        /// Conversation target that determines expected group binding.
+        target: MessageTargetView,
+        /// Signed encrypted message envelope.
+        envelope: TextMessageEnvelope,
+        /// Hex-encoded sender verifying key.
+        sender_verifying_key_hex: String,
+        /// Recipient leaf/device slot that persisted the envelope.
+        #[serde(default)]
+        recipient_leaf: Option<u32>,
+    },
+    /// Signed delivery receipt returning to an envelope sender.
+    Receipt {
+        /// Message id being acknowledged.
+        message_id: String,
+        /// Signed receipt payload.
+        receipt: TextDeliveryReceipt,
+        /// Hex-encoded recipient verifying key.
+        recipient_verifying_key_hex: String,
+    },
+}
+
+/// Request to handle a peer text/control frame from a DataChannel/session loop.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HandleTextControlFrameRequest {
+    /// Incoming frame to verify/apply.
+    pub frame: TextControlFrameView,
+}
+
+/// Result of handling a text/control frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HandleTextControlFrameResponse {
+    /// Updated application state after handling the frame.
+    pub state: AppStateView,
+    /// Optional response frame to send back over the same text/control transport.
+    pub response_frame: Option<TextControlFrameView>,
+}
+
 /// Request to join a voice channel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JoinVoiceRequest {
@@ -2468,6 +2511,18 @@ pub fn receive_text_delivery_envelope(
     }
 }
 
+/// Tauri command: handle one peer text/control frame and return an optional response frame.
+pub fn handle_text_control_frame(
+    request: HandleTextControlFrameRequest,
+) -> HandleTextControlFrameResponse {
+    let (state, response_frame) =
+        mutate_app_service_with_result(|state| state.handle_text_control_frame(request.frame));
+    HandleTextControlFrameResponse {
+        state,
+        response_frame,
+    }
+}
+
 /// Tauri command: join a voice channel.
 pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -2911,6 +2966,13 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn handle_text_control_frame(
+        request: HandleTextControlFrameRequest,
+    ) -> HandleTextControlFrameResponse {
+        super::handle_text_control_frame(request)
+    }
+
+    #[tauri::command]
     pub(super) fn join_voice(request: JoinVoiceRequest) -> AppStateView {
         super::join_voice(request)
     }
@@ -2985,6 +3047,7 @@ pub fn run() {
             ipc_commands::send_message,
             ipc_commands::apply_text_delivery_receipt,
             ipc_commands::receive_text_delivery_envelope,
+            ipc_commands::handle_text_control_frame,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
@@ -3801,6 +3864,59 @@ impl PersistedAppState {
             );
         }
         result
+    }
+
+    fn handle_text_control_frame(
+        &mut self,
+        frame: TextControlFrameView,
+    ) -> Option<TextControlFrameView> {
+        match frame {
+            TextControlFrameView::Envelope {
+                target,
+                envelope,
+                sender_verifying_key_hex,
+                recipient_leaf,
+            } => {
+                let message_id = envelope.message_id.clone();
+                match self.receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+                    target,
+                    envelope,
+                    sender_verifying_key_hex,
+                    recipient_leaf,
+                }) {
+                    Ok((receipt, recipient_verifying_key_hex)) => {
+                        Some(TextControlFrameView::Receipt {
+                            message_id,
+                            receipt,
+                            recipient_verifying_key_hex,
+                        })
+                    }
+                    Err(_) => None,
+                }
+            }
+            TextControlFrameView::Receipt {
+                message_id,
+                receipt,
+                recipient_verifying_key_hex,
+            } => {
+                if let Err(error) =
+                    self.apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+                        message_id,
+                        receipt,
+                        recipient_verifying_key_hex,
+                    })
+                {
+                    self.push_command_error(
+                        "message.receipt_frame_rejected",
+                        "handle_text_control_frame",
+                        "receipt_frame_verification_failed",
+                        error,
+                        "Accept peer delivery only from a receipt frame whose signature, message id, group binding, and ciphertext hash verify",
+                    );
+                }
+                None
+            }
+        }
     }
 
     fn active_connectivity_policy(
@@ -7364,6 +7480,94 @@ mod tests {
         );
         assert!(bob.state.messages.is_empty());
         assert!(bob.state.text_delivery_receipts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_frame_handler_bridges_envelope_to_receipt() -> Result<(), String> {
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("text-control-frame-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_id),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "frame handler receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let persisted = load_state();
+        let envelope_record = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .cloned()
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+
+        let bob_path = fresh_state_path("text-control-frame-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+
+        let response = bob
+            .state
+            .handle_text_control_frame(TextControlFrameView::Envelope {
+                target,
+                envelope: envelope_record.envelope,
+                sender_verifying_key_hex: envelope_record.sender_verifying_key_hex,
+                recipient_leaf: Some(2),
+            })
+            .ok_or_else(|| "receiver should return receipt frame".to_owned())?;
+
+        let TextControlFrameView::Receipt {
+            message_id: receipt_message_id,
+            receipt,
+            recipient_verifying_key_hex,
+        } = response
+        else {
+            return Err("expected receipt response frame".to_owned());
+        };
+        assert_eq!(receipt_message_id, message_id);
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let response = guard
+            .state
+            .handle_text_control_frame(TextControlFrameView::Receipt {
+                message_id: receipt_message_id,
+                receipt,
+                recipient_verifying_key_hex,
+            });
+        assert!(response.is_none());
+        let alice_view = guard.state.to_view();
+        let message = alice_view
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
         Ok(())
     }
 

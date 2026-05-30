@@ -593,6 +593,30 @@ export type ReceiveTextDeliveryEnvelopeResponse = {
   recipient_verifying_key_hex: string | null;
 };
 
+export type TextControlFrameView =
+  | {
+      kind: "envelope";
+      target: MessageTargetView;
+      envelope: TextMessageEnvelope;
+      sender_verifying_key_hex: string;
+      recipient_leaf?: number | null;
+    }
+  | {
+      kind: "receipt";
+      message_id: string;
+      receipt: TextDeliveryReceipt;
+      recipient_verifying_key_hex: string;
+    };
+
+export type HandleTextControlFrameRequest = {
+  frame: TextControlFrameView;
+};
+
+export type HandleTextControlFrameResponse = {
+  state: AppState;
+  response_frame: TextControlFrameView | null;
+};
+
 export type JoinVoiceRequest = {
   group_id: string;
   channel_id: string;
@@ -2866,6 +2890,31 @@ export async function receiveTextDeliveryEnvelope(
         state,
         receipt: null,
         recipient_verifying_key_hex: null,
+      };
+    },
+  );
+}
+
+export async function handleTextControlFrame(
+  request: HandleTextControlFrameRequest,
+): Promise<HandleTextControlFrameResponse> {
+  return invokeOrFallback<HandleTextControlFrameResponse>(
+    "handle_text_control_frame",
+    { request },
+    () => {
+      const state = mutateFallback((draft) => {
+        pushCommandError(
+          draft,
+          "message.control_frame_rejected",
+          "handle_text_control_frame",
+          "text_control_frame_unavailable",
+          "Local fallback web runtime cannot verify signed text/control frames or generate receipt response frames; native Rust/Tauri command path is required",
+          "Run the native app to process peer text/control frames",
+        );
+      });
+      return {
+        state,
+        response_frame: null,
       };
     },
   );
