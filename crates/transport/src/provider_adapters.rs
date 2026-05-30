@@ -612,7 +612,7 @@ pub struct LocalConformanceProviderRoom {
 /// plaintext. Public production profiles must use `mqtts://` or `wss://`;
 /// `mqtt://` is accepted only when the profile itself validates as loopback
 /// local development.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MqttProviderAdapter;
 
 #[cfg(feature = "mqtt-adapter")]
@@ -1568,7 +1568,10 @@ mod tests {
 
         if let Some(selected) = first_selectable {
             assert_eq!(
-                plan.attempts.last().map(|attempt| attempt.selected),
+                plan.attempts
+                    .iter()
+                    .find(|attempt| attempt.kind == selected)
+                    .map(|attempt| attempt.selected),
                 Some(true)
             );
             assert_eq!(
