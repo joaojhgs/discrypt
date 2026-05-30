@@ -1,0 +1,520 @@
+{
+  "schema": "discrypt.g128.placeholder-allowlist.v1",
+  "scope": [
+    "crates/*/src",
+    "apps/desktop/src-tauri/src",
+    "apps/ui/src",
+    ".github/workflows"
+  ],
+  "reviewPatterns": [
+    "shim",
+    "emulat",
+    "facade",
+    "skeleton",
+    "fixture",
+    "local-only",
+    "local dev",
+    "local-dev",
+    "mock"
+  ],
+  "entries": [
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "- docs/release/android-build-emulator-gate.md",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "- uses: reactivecircus/android-emulator-runner@v2",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "\"emulator\" \\",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "android-emulator-voice-path:",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "description: Build the Android APK and run the voice media path on an Android emulator runner",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_android_emulator }}",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "name: Android emulator voice path",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "name: discrypt-android-emulator-voice-path",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
+      "expected": "run_android_emulator:",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "\"local-dev / harness mode\".to_owned()",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "\"local-dev-harness\"",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "/// Visible badge/copy for local-dev or harness mode.",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "assert_eq!(runtime.mode, \"local-dev-harness\");",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "cfg!(any(test, feature = \"harness\", feature = \"local-dev\"))",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "// Local-dev fallback persistence is best-effort; Tauri IPC-backed builds use",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "`Tauri IPC unavailable for ${command}; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev/test harness`,",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "const FALLBACK_STORAGE_KEY = \"discrypt.local-dev.app-state.v1\";",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "harness_badge: \"local-dev / harness mode\",",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "mode: \"local-dev-harness\",",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "safetyNumber: groupSafetyHash(`local-dev-fallback:${publicKey}`),",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "crates/abuse/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/abuse/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/abuse/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/abuse/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/admission/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/admission/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/admission/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/admission/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/content-keys/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/content-keys/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/content-keys/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/content-keys/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/core/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/core/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/core/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/media/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/media/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/media/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/media/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/mls-core/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/mls-core/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/mls-core/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/mls-core/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/mls-delivery/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/mls-delivery/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/mls-delivery/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/mls-delivery/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/push/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/push/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/push/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/push/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/relay-overlay/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/relay-overlay/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/relay-overlay/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/relay-overlay/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "external/signaling-repository/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "external/signaling-repository/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "external/signaling-repository/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "external/signaling-repository/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "\"Tests, harnesses, local-dev, and non-production builds may use MemoryAppDbKeychain only as a non-production boundary.\",",
+      "reason": "Storage documentation states local-dev keychain use is non-production and release-gated."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "assert_eq!(keychain.load_wrapping_key(\"local-dev-key\")?, None);",
+      "reason": "Unit-test key label inside the storage test module; not used by release runtime code."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "assert_eq!(keychain.load_wrapping_key(\"local-dev-key\")?, Some([3; 32]));",
+      "reason": "Unit-test key label inside the storage test module; not used by release runtime code."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "feature = \"local-dev\",",
+      "reason": "Compile-time local-dev keychain boundary is feature-gated and rejected by production status gates."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "feature = \"local-dev\",",
+      "reason": "Compile-time local-dev keychain boundary is feature-gated and rejected by production status gates."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "feature = \"local-dev\",",
+      "reason": "Compile-time local-dev keychain boundary is feature-gated and rejected by production status gates."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "feature = \"local-dev\",",
+      "reason": "Compile-time local-dev keychain boundary is feature-gated and rejected by production status gates."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "feature = \"local-dev\",",
+      "reason": "Compile-time local-dev keychain boundary is feature-gated and rejected by production status gates."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "keychain.delete_wrapping_key(\"local-dev-key\")?;",
+      "reason": "Unit-test key label inside the storage test module; not used by release runtime code."
+    },
+    {
+      "path": "crates/storage/src/appdb.rs",
+      "pattern": "local-dev",
+      "expected": "keychain.store_wrapping_key(\"local-dev-key\", [3; 32])?;",
+      "reason": "Unit-test key label inside the storage test module; not used by release runtime code."
+    },
+    {
+      "path": "crates/storage/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/storage/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "feature = \"local-dev\",",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/storage/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/storage/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/storage/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/transport/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
+      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/transport/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/transport/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    },
+    {
+      "path": "crates/transport/src/production_status.rs",
+      "pattern": "local-dev",
+      "expected": "local_dev: cfg!(feature = \"local-dev\"),",
+      "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
+    }
+  ]
+}

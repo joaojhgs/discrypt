@@ -67,12 +67,14 @@ for (const token of [
   'actions/upload-artifact@v4',
   'discrypt-sbom',
   'target/sbom',
+  'test:no-placeholders-g127',
+  'test:placeholder-allowlist-g128',
 ]) requireText('ci', token);
 
 for (const token of ['license = "AGPL-3.0-or-later"', '[workspace.dependencies]']) requireText('cargoToml', token);
 for (const token of ['openmls', 'webrtc', 'aes-gcm']) requireText('cargoLock', token);
 for (const token of ['"lockfileVersion"', '"packages"']) requireText('packageLock', token);
-for (const token of ['test:adr-008-supply-chain', 'test:sbom-g124']) requireText('packageJson', token);
+for (const token of ['test:adr-008-supply-chain', 'test:sbom-g124', 'test:no-placeholders-g127', 'test:placeholder-allowlist-g128']) requireText('packageJson', token);
 for (const token of ['SBOMs, lockfile hashes, and git commit', 'reproducibility evidence archived']) requireText('releasePolicy', token);
 
 if (/TODO|FIXME|unimplemented!|todo!/i.test(files.adr)) failures.push('ADR-008 contains unfinished-work marker');

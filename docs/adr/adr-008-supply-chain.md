@@ -129,8 +129,11 @@ Required gates for this decision:
 10. `npm --prefix apps/ui run test:no-placeholders-g127` proves CI scans
     production-gated modules for blocking placeholder markers and inventories
     shim/emulation/facade/skeleton/fixture/local-only wording for G128 review.
-11. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
-   handled by the later advisory/reproducibility stories.
+11. `npm --prefix apps/ui run test:placeholder-allowlist-g128` proves every
+    remaining review-pattern occurrence has an explicit path and release-review
+    rationale.
+12. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
+    handled by the later advisory/reproducibility stories.
 
 ## Consequences
 

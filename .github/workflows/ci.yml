@@ -93,3 +93,5 @@ jobs:
         working-directory: apps/ui
       - run: npm run test:no-placeholders-g127
         working-directory: apps/ui
+      - run: npm run test:placeholder-allowlist-g128
+        working-directory: apps/ui
