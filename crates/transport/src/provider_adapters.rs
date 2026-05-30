@@ -1889,6 +1889,19 @@ fn ipfs_err(context: &str, err: impl std::fmt::Display) -> TransportError {
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_typed_error(
+    context: &str,
+    readiness: AdapterReadinessState,
+    details: impl std::fmt::Display,
+) -> TransportError {
+    TransportError::SignalingAdapter(format!(
+        "ipfs_pubsub {context} failed: failure_class={} health_state={:?} details={details}",
+        readiness.failure_class(),
+        readiness.to_health_state()
+    ))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
 fn ipfs_topic(rendezvous: &RendezvousCapability) -> libp2p::gossipsub::IdentTopic {
     libp2p::gossipsub::IdentTopic::new(format!("discrypt/v1/rendezvous/{}", rendezvous.topic))
 }
@@ -1983,14 +1996,18 @@ fn ipfs_pubsub_no_topic_mesh_error(
     mesh_peers: usize,
 ) -> TransportError {
     if matches!(error, libp2p::gossipsub::PublishError::InsufficientPeers) {
-        TransportError::SignalingAdapter(format!(
-            "ipfs_pubsub topic_mesh_unavailable: publish has insufficient topic peers \
-             (connected_peers={connected_peers}, subscribed_topic_peers={subscribed_peers}, \
-             mesh_peers={mesh_peers}); generic libp2p bootstrap peers do not relay arbitrary \
-             gossipsub topics. Configure at least one reachable Discrypt/IPFS pubsub peer for \
-             this rendezvous topic, or a public DHT/rendezvous path where participants can \
-             advertise and discover the same topic provider record before publishing"
-        ))
+        ipfs_typed_error(
+            "topic_mesh_unavailable",
+            AdapterReadinessState::ProviderUnhealthy,
+            format!(
+                "publish has insufficient topic peers (connected_peers={connected_peers}, \
+                 subscribed_topic_peers={subscribed_peers}, mesh_peers={mesh_peers}); generic \
+                 libp2p bootstrap peers do not relay arbitrary gossipsub topics. Configure at \
+                 least one reachable Discrypt/IPFS pubsub peer for this rendezvous topic, or a \
+                 public DHT/rendezvous path where participants can advertise and discover the \
+                 same topic provider record before publishing"
+            ),
+        )
     } else {
         ipfs_err("publish", error)
     }
@@ -2008,8 +2025,14 @@ fn ipfs_encode_envelope(envelope: &IpfsPubsubWireEnvelope) -> Result<Vec<u8>, Tr
     let bytes =
         serde_json::to_vec(envelope).map_err(|err| ipfs_err("wire envelope encode", err))?;
     if bytes.len() > IPFS_PUBSUB_MAX_MESSAGE_BYTES {
-        return Err(TransportError::SignalingAdapter(
-            "ipfs_pubsub envelope exceeds max message size".to_owned(),
+        return Err(ipfs_typed_error(
+            "envelope_size",
+            AdapterReadinessState::ProviderMessageTooLarge,
+            format!(
+                "envelope exceeds max message size: bytes={} max={}",
+                bytes.len(),
+                IPFS_PUBSUB_MAX_MESSAGE_BYTES
+            ),
         ));
     }
     reject_forbidden_plaintext(&bytes)?;
@@ -4170,10 +4193,31 @@ mod tests {
             panic!("expected signaling adapter error");
         };
         assert!(message.contains("topic_mesh_unavailable"));
+        assert!(message.contains("failure_class=provider_unhealthy"));
+        assert!(message.contains("health_state=ProviderUnhealthy"));
         assert!(message.contains("connected_peers=1"));
         assert!(message.contains("subscribed_topic_peers=0"));
         assert!(message.contains("generic libp2p bootstrap peers do not relay"));
         assert!(message.contains("reachable Discrypt/IPFS pubsub peer"));
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_oversized_envelope_maps_to_typed_health() {
+        let envelope = IpfsPubsubWireEnvelope::Control {
+            schema: IPFS_PUBSUB_EVENT_SCHEMA,
+            from_peer: SignalingPeerId::new("alice-device").expect("peer id"),
+            payload: OpaqueSignalingPayload::new(vec![b'x'; IPFS_PUBSUB_MAX_MESSAGE_BYTES + 1])
+                .expect("opaque payload"),
+        };
+        let error = ipfs_encode_envelope(&envelope).expect_err("oversized envelope must fail");
+        let TransportError::SignalingAdapter(message) = error else {
+            panic!("expected signaling adapter error");
+        };
+        assert!(message.contains("envelope_size"));
+        assert!(message.contains("failure_class=provider_message_too_large"));
+        assert!(message.contains("health_state=ProviderMessageTooLarge"));
+        assert!(message.contains("max=65536"));
     }
 
     #[tokio::test]

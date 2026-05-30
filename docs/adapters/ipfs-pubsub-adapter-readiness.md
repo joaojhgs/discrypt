@@ -34,6 +34,10 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_resource_policy_is_bounded_and_default_bootstrap_is_parseable -- --nocapture
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_bootstrap_policy_rejects_duplicates_and_overflow -- --nocapture
+cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
+  ipfs_pubsub_oversized_envelope_maps_to_typed_health -- --nocapture
+cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
+  ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error -- --nocapture
 ```
 
 The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` and `DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS` contains comma-separated bootstrap multiaddrs.
@@ -42,7 +46,7 @@ The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` a
 
 - Public/default bootstrap peer policy is now versioned and parse-tested, with generic `bootstrap.libp2p.io` seed(s) documented as discovery-only and capped by a resource policy. Rotation remains a release-management task before IPFS becomes a default route.
 - Resource-limit configuration is implemented for the current adapter boundary: bounded bootstrap endpoint count, duplicate rejection, 64 KiB transmit/envelope limit, bounded command queue, strict gossipsub validation, flood-publish disabled, and bounded mesh/history/duplicate-cache settings. Full peer-score tuning remains future hardening before default enablement.
-- Add typed health mapping for remaining bootstrap failures, resource exhaustion beyond local policy rejection, duplicate storms, and provider-unhealthy states.
+- Typed health mapping now covers oversized envelopes (`provider_message_too_large`) and topic mesh unavailability (`provider_unhealthy`) with redacted `failure_class`/`health_state` details. Remaining typed-health hardening: bootstrap connection failures, resource exhaustion beyond local policy rejection, duplicate storms, and provider-unhealthy swarm events.
 - Add provider-visible metadata capture scans for gossipsub topics and payloads.
 - Add public/realistic bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1`; if public peers are unreliable, keep IPFS non-default and require explicit group/DM configuration.
 - Wire this adapter through the Tauri app runtime path and two-profile app E2E; current proof is at the transport adapter boundary.
