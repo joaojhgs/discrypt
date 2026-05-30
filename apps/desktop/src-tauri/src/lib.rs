@@ -3666,7 +3666,9 @@ impl PersistedAppState {
         let mut receiver_state = receiver.clone();
         let receipt_frame = receiver_state
             .handle_text_control_frame(envelope_frame.clone())
-            .ok_or_else(|| "receiver did not accept envelope or generate receipt frame".to_owned())?;
+            .ok_or_else(|| {
+                "receiver did not accept envelope or generate receipt frame".to_owned()
+            })?;
         let envelope_frame_bytes = serde_json::to_vec(&envelope_frame)
             .map_err(|error| format!("could not encode text envelope frame: {error}"))?;
         let receipt_frame_bytes = serde_json::to_vec(&receipt_frame)
@@ -7644,6 +7646,89 @@ mod tests {
             .find(|message| message.message_id == message_id)
             .ok_or_else(|| "message row missing".to_owned())?;
         assert_eq!(message.state_key, "peer_receipt");
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_frame_roundtrip_persists_across_two_profile_state_files() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("text-control-frame-persist-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_id),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "persistent frame receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let envelope_record = load_state()
+            .text_delivery_envelopes
+            .into_iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+
+        let bob_path = fresh_state_path("text-control-frame-persist-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let mut receipt_frame = None;
+        bob.mutate(|state| {
+            receipt_frame = state.handle_text_control_frame(TextControlFrameView::Envelope {
+                target,
+                envelope: envelope_record.envelope,
+                sender_verifying_key_hex: envelope_record.sender_verifying_key_hex,
+                recipient_leaf: Some(2),
+            });
+        });
+        let receipt_frame =
+            receipt_frame.ok_or_else(|| "receiver should return receipt frame".to_owned())?;
+
+        let bob_reloaded = TauriAppService::load_for_test_path(bob_path);
+        let bob_view = bob_reloaded.state.to_view();
+        assert!(bob_view.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+        assert!(bob_reloaded
+            .state
+            .text_delivery_receipts
+            .iter()
+            .any(|receipt| receipt.message_id == message_id));
+
+        let (_alice_view, response) =
+            mutate_app_service_with_result(|state| state.handle_text_control_frame(receipt_frame));
+        assert!(response.is_none());
+
+        let mut alice_store = FileAppStore::new(&alice_path);
+        let alice_reloaded = load_state_from_store(&mut alice_store);
+        let message = alice_reloaded
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "alice message row missing after reload".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        assert!(message.peer_receipt.is_some());
         Ok(())
     }
 
