@@ -284,7 +284,7 @@ npm --prefix apps/ui run test:command-coverage
 - [x] Public provider allowlist/versioning and rotation policy. Signed invite/app signaling profiles now carry `provider_policy_version`, endpoint allowlist commitments, and provider rotation policy text; Tauri validates endpoint commitments before converting profiles into transport probes, and invite bootstrap validation rejects empty/malformed provider-policy metadata.
 - [x] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
   for deterministic harness evidence and optional public-provider MQTT validation. `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132` passed and runs both local cargo gates by default; real distinct-machine STUN/TURN release evidence remains tracked separately above.
-- [ ] Provider-visible metadata capture/PCAP tests for MQTT, Nostr, IPFS, and QUIC.
+- [x] Provider-visible metadata capture/PCAP tests for MQTT, Nostr, IPFS, and QUIC. `npm --prefix apps/ui run test:provider-metadata-capture-g133` now runs deterministic provider-visible conformance capture plus plaintext-rejection tests across all four adapter boundaries; external host packet captures remain a release-run artifact, not a local CI claim.
 - [ ] Abuse/rate-limit handling against public relays/brokers.
 - [ ] Full release matrix across Linux desktop package and Android once mobile exists.
 
