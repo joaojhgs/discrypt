@@ -18,7 +18,7 @@ use crate::{
     RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
-    SignalingPeerId, TransportError, WebRtcNegotiationConfig,
+    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcNegotiationConfig,
 };
 #[cfg(any(
     feature = "mqtt-adapter",
@@ -26,10 +26,7 @@ use crate::{
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-use crate::{
-    TextControlDataTransport, WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer,
-    WebRtcNegotiator,
-};
+use crate::{WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -438,6 +435,43 @@ pub struct ProviderWebRtcDataChannelProbe {
     pub receipt_frame_roundtrip: bool,
     /// SHA-256 of the opaque return receipt/control frame used for the proof.
     pub receipt_frame_sha256: String,
+}
+
+/// Inputs required to resume a provider-backed WebRTC text/control runtime from a
+/// previously proven peer rendezvous path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTextControlRuntimeAttachment {
+    /// Canonical adapter kind label (for example, `mqtt`, `nostr`, `ipfs_pubsub`).
+    pub adapter_kind: String,
+    /// Signaling profile identifier used by the proven peer contract.
+    pub profile_id: String,
+    /// Redacted profile endpoint label from probe evidence.
+    pub endpoint_label: String,
+    /// Rendezvous topic that the peer proof already established.
+    pub rendezvous_topic: String,
+}
+
+/// Explicitly exposed transport-blocker message for provider-backed long-lived
+/// text/control runtime attachment.
+pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
+    "provider-backed text/control runtime attachment is not implemented in this build";
+/// Recovery guidance for the missing long-lived runtime constructor path.
+pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
+    "Persisted provider offer/answer/ICE handoff and a long-lived receiver loop are still required before runtime attachment can be established";
+
+/// Build a live provider-backed text/control transport runtime from prior peer
+/// proof material.
+///
+/// This seam is intentionally currently unavailable while the transport backend
+/// grows the long-lived attachment contract. It is explicitly fail-closed to
+/// avoid silently pretending that short-lived test probes imply a production
+/// long-lived runtime.
+pub fn resume_text_control_runtime_from_probe(
+    _attachment: ProviderTextControlRuntimeAttachment,
+) -> Result<std::sync::Arc<dyn TextControlDataTransport>, TransportError> {
+    Err(TransportError::Unavailable(
+        TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE.to_owned(),
+    ))
 }
 
 impl SignalingAdapterFallbackPlan {
@@ -6142,6 +6176,27 @@ mod tests {
             Err(TransportError::SignalingAdapter(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn text_control_runtime_attachment_seam_reports_missing_implementation() {
+        let attach_request = ProviderTextControlRuntimeAttachment {
+            adapter_kind: "mqtt".to_owned(),
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "unit-test-endpoint".to_owned(),
+            rendezvous_topic: "unit-test-topic".to_owned(),
+        };
+        let error = match resume_text_control_runtime_from_probe(attach_request) {
+            Ok(_) => panic!("runtime attachment path must remain unimplemented"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("unavailable: {TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE}")
+        );
+        assert!(error
+            .to_string()
+            .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));
     }
 
     #[tokio::test]

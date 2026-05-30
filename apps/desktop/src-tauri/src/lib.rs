@@ -47,19 +47,20 @@ use discrypt_storage::{
 };
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{AppDbKeychain, AppStoreError};
+#[cfg(test)]
+use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
+#[cfg(test)]
+use discrypt_transport::TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE;
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
     probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
-    AdapterFallbackBehavior, AdapterTrustLabel, ConnectionAttempt, ConnectivityPlan,
-    ConnectivityScopeLevel, ConversationScope, Endpoint, FallbackLeg, IceServerConfig,
-    ProviderMetadataPosture, SignalingAdapterCapabilities, SignalingAdapterKind,
-    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportRoute,
+    resume_text_control_runtime_from_probe, AdapterFallbackBehavior, AdapterTrustLabel,
+    ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel, ConversationScope, Endpoint,
+    FallbackLeg, IceServerConfig, ProviderMetadataPosture, ProviderTextControlRuntimeAttachment,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError, TransportRoute,
     TransportSession, TransportSessionSnapshot, TransportSessionState, TurnServerConfig,
-};
-#[cfg(test)]
-use discrypt_transport::{
-    probe_provider_webrtc_datachannel_request_response_with_config_and_answerer, TransportError,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -86,8 +87,6 @@ const TEXT_SEND_LIMIT: u32 = 20;
 const ADMISSION_HELPER_ATTEMPT_LIMIT: u32 = 5;
 const SIGNALING_ACTION_LIMIT: u32 = 60;
 const ABUSE_WINDOW_SECONDS: i64 = 60;
-const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
-    "provider-backed text/control runtime attachment is not implemented in this build";
 const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
     "Provider-backed long-lived attachment is intentionally disabled while this app-service only owns short-lived transport probes; add persisted negotiated offer/answer/ICE bootstrap handoff and a persistent installed-app receiver loop for peer routing before attaching";
 
@@ -2039,12 +2038,36 @@ pub fn attach_text_control_transport_runtime(
         return guard.to_view();
     }
 
+    let attachment = guard.state.latest_data_channel_probe.as_ref().map_or_else(
+        || ProviderTextControlRuntimeAttachment {
+            adapter_kind: "unknown".to_owned(),
+            profile_id: String::new(),
+            endpoint_label: "unknown-endpoint".to_owned(),
+            rendezvous_topic: "unknown-topic".to_owned(),
+        },
+        |probe| ProviderTextControlRuntimeAttachment {
+            adapter_kind: probe.kind.clone(),
+            profile_id: probe.profile_id.clone(),
+            endpoint_label: probe.endpoint_label.clone(),
+            rendezvous_topic: probe.rendezvous_topic.clone(),
+        },
+    );
+    let reason = match resume_text_control_runtime_from_probe(attachment) {
+        Ok(_) => unreachable!("text-control runtime seam should remain unavailable in this slice"),
+        Err(TransportError::Unavailable(message)) => {
+            (message, TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT)
+        }
+        Err(error) => (
+            error.to_string(),
+            TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
+        ),
+    };
     guard.state.push_command_error(
         "transport.text_runtime_attach_unavailable",
         "attach_text_control_transport_runtime",
         "transport_runtime_not_supported",
-        TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE,
-        TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
+        &reason.0,
+        reason.1,
     );
     guard.persist();
     guard.to_view()

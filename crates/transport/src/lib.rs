@@ -44,11 +44,14 @@ pub use provider_adapters::{
     probe_provider_webrtc_datachannel_request_response_with_config_and_answerer,
     probe_provider_webrtc_datachannel_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
-    required_provider_adapter_registry, AdapterReadinessState, FeatureGatedProviderAdapter,
-    LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,
-    ProviderAdapterReadiness, ProviderAdapterRoundtripProbe, ProviderWebRtcDataChannelProbe,
-    SignalingAdapterFactory, SignalingAdapterFallbackAttempt, SignalingAdapterFallbackPlan,
-    SignalingAdapterRegistryEntry,
+    required_provider_adapter_registry, resume_text_control_runtime_from_probe,
+    AdapterReadinessState, FeatureGatedProviderAdapter, LocalConformanceProviderAdapter,
+    LocalConformanceProviderBus, ProviderAdapterBoundary, ProviderAdapterReadiness,
+    ProviderAdapterRoundtripProbe, ProviderTextControlRuntimeAttachment,
+    ProviderWebRtcDataChannelProbe, SignalingAdapterFactory, SignalingAdapterFallbackAttempt,
+    SignalingAdapterFallbackPlan, SignalingAdapterRegistryEntry,
+    TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE,
+    TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
 };
 use serde::{Deserialize, Serialize};
 pub use session::{
