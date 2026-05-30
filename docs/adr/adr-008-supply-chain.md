@@ -92,6 +92,9 @@ user profile state.
 
 ## Verification
 
+Release build can be reproduced from lockfiles and documented toolchain versions.
+
+
 Required gates for this decision:
 
 0. `npm --prefix apps/ui run test:cargo-deny-g121` runs the full
@@ -110,16 +113,20 @@ Required gates for this decision:
 4. `npm --prefix apps/ui run test:crypto-sensitive-g125` proves
    Crypto-sensitive dependencies are pinned or vendored according to ADR-008 by
    validating direct dependency specs, lockfile checksums, and vendoring policy.
-5. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
+5. `npm --prefix apps/ui run test:repro-g126` proves Release build can be
+   reproduced from lockfiles and documented toolchain versions by checking
+   lockfile resolution, release dry-run, SBOM generation, and concrete tool
+   version commands.
+6. `npm --prefix apps/ui run test:adr-008-supply-chain` proves ADR/CI/config
    wiring for cargo-audit, cargo-deny, npm audit, SBOM generation, license policy,
    source policy, lockfiles, and reproducibility assumptions.
-6. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
+7. `cargo metadata --locked --format-version 1 --no-deps` proves Rust metadata is
    resolvable from `Cargo.lock` without lockfile mutation.
-7. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
+8. `cargo deny check licenses --hide-inclusion-graph` proves the accepted license
    set matches the current dependency graph.
-8. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
+9. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
    policy is configured, with duplicate versions still warnings.
-9. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
+11. Full `cargo audit and advisory-deny clean runs remain release-blocking gates
    handled by the later advisory/reproducibility stories.
 
 ## Consequences
