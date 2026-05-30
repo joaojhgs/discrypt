@@ -232,7 +232,7 @@ pub struct SignalingAdapterFallbackPlan {
     /// Requested fallback behavior.
     pub behavior: AdapterFallbackBehavior,
     /// Ordered candidate attempts.
-    pub attempts: Vec<SignalingAdapterKind>,
+    pub attempts: Vec<SignalingAdapterFallbackAttempt>,
     /// Selected adapter kind, if any.
     pub selected: Option<SignalingAdapterKind>,
 }
@@ -280,17 +280,22 @@ pub fn plan_signaling_adapter_fallback(
             AdapterFallbackBehavior::FirstHealthy => selected.is_none() && readiness.selectable(),
             AdapterFallbackBehavior::ManualOnly => readiness.selectable(),
         };
-        if is_selected {
-            selected = Some(kind);
-        }
-
         let attempted = match behavior {
             AdapterFallbackBehavior::TryAll => true,
-            AdapterFallbackBehavior::FirstHealthy => selected.is_none() || is_selected,
+            AdapterFallbackBehavior::FirstHealthy => selected.is_none(),
             AdapterFallbackBehavior::ManualOnly => is_selected,
         };
 
-        attempts.push(kind);
+        attempts.push(SignalingAdapterFallbackAttempt {
+            kind,
+            readiness,
+            attempted,
+            selected: is_selected,
+        });
+
+        if is_selected {
+            selected = Some(kind);
+        }
 
         if matches!(behavior, AdapterFallbackBehavior::FirstHealthy | AdapterFallbackBehavior::ManualOnly)
             && is_selected
@@ -1450,6 +1455,179 @@ mod tests {
         } else {
             ProviderAdapterReadiness::FeatureDisabled
         }
+    }
+
+    fn expected_adapter_readiness_state(
+        readiness: ProviderAdapterReadiness,
+    ) -> AdapterReadinessState {
+        match readiness {
+            ProviderAdapterReadiness::FeatureDisabled => AdapterReadinessState::FeatureDisabled,
+            ProviderAdapterReadiness::ImplementationUnavailable => {
+                AdapterReadinessState::ImplementationUnavailable
+            }
+            ProviderAdapterReadiness::ImplementationAvailable => AdapterReadinessState::Available,
+        }
+    }
+
+    fn dedup_requested_kinds() -> [SignalingAdapterKind; 7] {
+        [
+            SignalingAdapterKind::Nostr,
+            SignalingAdapterKind::Mqtt,
+            SignalingAdapterKind::Nostr,
+            SignalingAdapterKind::IpfsPubsub,
+            SignalingAdapterKind::DiscryptQuicRendezvous,
+            SignalingAdapterKind::IpfsPubsub,
+            SignalingAdapterKind::Mqtt,
+        ]
+    }
+
+    #[test]
+    fn required_provider_adapter_registry_is_stable_and_matches_boundaries_and_factory() {
+        let registry = required_provider_adapter_registry();
+        let boundaries = required_provider_adapter_boundaries();
+        assert_eq!(registry.len(), boundaries.len());
+
+        for entry in registry {
+            let boundary = adapter_boundary_for_kind(entry.kind);
+            assert_eq!(entry.boundary, boundary);
+            assert_eq!(
+                entry.kind,
+                boundary.kind,
+                "kind and boundary kind must remain aligned"
+            );
+            let factory = SignalingAdapterFactory::for_kind(entry.kind);
+            assert_eq!(factory.boundary(), boundary);
+        }
+    }
+
+    #[test]
+    fn signaling_adapter_registry_readiness_is_consistent_with_boundary_definition() {
+        let registry = required_provider_adapter_registry();
+        let expected = required_provider_adapter_boundaries();
+
+        for (entry, expected_boundary) in registry.iter().zip(expected.iter()) {
+            assert_eq!(entry.boundary, *expected_boundary);
+            assert_eq!(
+                entry.readiness_state(),
+                expected_adapter_readiness_state(expected_boundary.readiness)
+            );
+        }
+    }
+
+    #[test]
+    fn plan_signaling_adapter_fallback_try_all_deduplicates_and_marks_selected() {
+        let requested = dedup_requested_kinds();
+        let registry = required_provider_adapter_boundaries();
+        let plan = plan_signaling_adapter_fallback(
+            &requested,
+            AdapterFallbackBehavior::TryAll,
+            None,
+        );
+
+        assert_eq!(plan.behavior, AdapterFallbackBehavior::TryAll);
+        let mut expected = Vec::new();
+        for kind in requested {
+            if !expected.contains(&kind) {
+                expected.push(kind);
+            }
+        }
+        assert_eq!(
+            plan.attempts.iter().map(|attempt| attempt.kind).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(plan.attempts.iter().all(|attempt| attempt.attempted));
+
+        let first_selectable = expected
+            .iter()
+            .find(|kind| SignalingAdapterFactory::for_kind(**kind).readiness_state().selectable())
+            .copied();
+        assert_eq!(plan.selected, first_selectable);
+
+        if let Some(selected) = first_selectable {
+            assert_eq!(plan.attempts.last().map(|attempt| attempt.selected), Some(true));
+            assert_eq!(
+                plan.attempts
+                    .iter()
+                    .filter(|attempt| attempt.selected && attempt.kind == selected)
+                    .count(),
+                1
+            );
+        } else {
+            assert_eq!(plan.selected, None);
+            assert!(plan.all_unavailable());
+            assert!(plan.attempts.iter().all(|attempt| !attempt.selected));
+        }
+    }
+
+    #[test]
+    fn plan_signaling_adapter_fallback_first_healthy_stops_after_selected() {
+        let requested = dedup_requested_kinds();
+        let plan = plan_signaling_adapter_fallback(
+            &requested,
+            AdapterFallbackBehavior::FirstHealthy,
+            None,
+        );
+
+        let expected_dedup: Vec<_> = {
+            let mut kinds = Vec::new();
+            for kind in requested {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            kinds
+        };
+        let selected = expected_dedup
+            .iter()
+            .find(|kind| SignalingAdapterFactory::for_kind(**kind).readiness_state().selectable())
+            .copied();
+        let expected_attempts = match selected {
+            Some(_) => plan
+                .selected
+                .as_ref()
+                .and_then(|selected| expected_dedup.iter().position(|kind| kind == selected))
+                .map(|index| index + 1)
+                .unwrap_or(expected_dedup.len()),
+            None => expected_dedup.len(),
+        };
+        assert_eq!(plan.attempts.len(), expected_attempts);
+        assert!(plan.attempts.iter().all(|attempt| attempt.attempted));
+        assert_eq!(plan.selected, selected);
+        if let Some(selected) = selected {
+            let last = plan.attempts.last().expect("plan should not be empty when selected");
+            assert_eq!(last.kind, selected);
+            assert!(last.selected);
+        } else {
+            assert!(plan.all_unavailable());
+        }
+    }
+
+    #[test]
+    fn plan_signaling_adapter_fallback_manual_only_uses_only_requested_manual_adapter() {
+        let requested = dedup_requested_kinds();
+        let manual = SignalingAdapterKind::IpfsPubsub;
+        let plan = plan_signaling_adapter_fallback(
+            &requested,
+            AdapterFallbackBehavior::ManualOnly,
+            Some(manual),
+        );
+        assert_eq!(plan.behavior, AdapterFallbackBehavior::ManualOnly);
+        assert_eq!(plan.attempts.len(), 1);
+        let attempt = &plan.attempts[0];
+        assert_eq!(attempt.kind, manual);
+        let readiness = SignalingAdapterFactory::for_kind(manual).readiness_state();
+        assert_eq!(attempt.readiness, readiness);
+        assert_eq!(attempt.attempted, true);
+        assert_eq!(attempt.selected, readiness.selectable());
+        assert_eq!(plan.selected, if readiness.selectable() { Some(manual) } else { None });
+
+        let absent = plan_signaling_adapter_fallback(
+            &requested,
+            AdapterFallbackBehavior::ManualOnly,
+            None,
+        );
+        assert!(absent.attempts.is_empty());
+        assert_eq!(absent.selected, None);
     }
 
     #[tokio::test]
