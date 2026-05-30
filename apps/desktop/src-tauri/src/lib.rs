@@ -4364,6 +4364,120 @@ impl PersistedAppState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn pump_text_control_transport_once<T>(
+        &mut self,
+        transport: &T,
+        request: ListPendingTextControlFramesRequest,
+        transport_session_id: impl Into<String>,
+    ) -> TextControlTransportPumpReportView
+    where
+        T: discrypt_transport::TextControlDataTransport,
+    {
+        let transport_session_id = transport_session_id.into();
+        let pending = self.list_pending_text_control_frames(&request);
+        let mut frames_sent = 0_usize;
+        let mut response_frames_received = 0_usize;
+        let mut receipts_applied = 0_usize;
+        let mut failures = Vec::new();
+
+        for frame in &pending {
+            let outbound = match serde_json::to_vec(&frame.frame) {
+                Ok(outbound) => outbound,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: encode text/control frame failed: {error}",
+                        frame.message_id
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = transport.send_text_control_frame(outbound).await {
+                failures.push(format!(
+                    "{}: send text/control frame failed: {error}",
+                    frame.message_id
+                ));
+                continue;
+            }
+            frames_sent += 1;
+            if let Err(error) = self.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+                message_id: frame.message_id.clone(),
+                frame_sha256: frame.frame_sha256.clone(),
+                transport_session_id: Some(transport_session_id.clone()),
+            }) {
+                failures.push(format!(
+                    "{}: mark text/control frame sent failed: {error}",
+                    frame.message_id
+                ));
+                continue;
+            }
+            let inbound = match transport.recv_text_control_frame().await {
+                Ok(inbound) => inbound,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: receive text/control response failed: {error}",
+                        frame.message_id
+                    ));
+                    continue;
+                }
+            };
+            response_frames_received += 1;
+            let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&inbound) {
+                Ok(inbound_frame) => inbound_frame,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: decode text/control response failed: {error}",
+                        frame.message_id
+                    ));
+                    continue;
+                }
+            };
+            let receipt_response = matches!(inbound_frame, TextControlFrameView::Receipt { .. });
+            if self.handle_text_control_frame(inbound_frame).is_some() {
+                failures.push(format!(
+                    "{}: response frame unexpectedly generated another response",
+                    frame.message_id
+                ));
+                continue;
+            }
+            if self.last_command_error.as_ref().is_some_and(|error| {
+                matches!(
+                    error.command.as_str(),
+                    "handle_text_control_frame" | "apply_text_delivery_receipt"
+                )
+            }) {
+                failures.push(format!(
+                    "{}: text/control response verification failed",
+                    frame.message_id
+                ));
+                continue;
+            }
+            if receipt_response {
+                receipts_applied += 1;
+            }
+        }
+
+        let metrics = transport.text_control_transport_metrics().await;
+        self.push_event(
+            "message.transport_pump",
+            format!(
+                "Text/control transport pump sent {} frame(s), received {} response frame(s), applied {} receipt(s), failures={}",
+                frames_sent,
+                response_frames_received,
+                receipts_applied,
+                failures.len()
+            ),
+        );
+        TextControlTransportPumpReportView {
+            pending_before: pending.len(),
+            frames_sent,
+            response_frames_received,
+            receipts_applied,
+            failures,
+            metrics,
+        }
+    }
+
     fn apply_text_delivery_receipt(
         &mut self,
         request: ApplyTextDeliveryReceiptRequest,
@@ -5539,120 +5653,6 @@ fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, Str
     let mut hasher = Sha256::new();
     hasher.update(encoded);
     Ok(hex::encode(hasher.finalize()))
-}
-
-#[cfg(test)]
-async fn pump_text_control_transport_once<T>(
-    state: &mut PersistedAppState,
-    transport: &T,
-    request: ListPendingTextControlFramesRequest,
-    transport_session_id: impl Into<String>,
-) -> TextControlTransportPumpReportView
-where
-    T: discrypt_transport::TextControlDataTransport,
-{
-    let transport_session_id = transport_session_id.into();
-    let pending = state.list_pending_text_control_frames(&request);
-    let mut frames_sent = 0_usize;
-    let mut response_frames_received = 0_usize;
-    let mut receipts_applied = 0_usize;
-    let mut failures = Vec::new();
-
-    for frame in &pending {
-        let outbound = match serde_json::to_vec(&frame.frame) {
-            Ok(outbound) => outbound,
-            Err(error) => {
-                failures.push(format!(
-                    "{}: encode text/control frame failed: {error}",
-                    frame.message_id
-                ));
-                continue;
-            }
-        };
-        if let Err(error) = transport.send_text_control_frame(outbound).await {
-            failures.push(format!(
-                "{}: send text/control frame failed: {error}",
-                frame.message_id
-            ));
-            continue;
-        }
-        frames_sent += 1;
-        if let Err(error) = state.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
-            message_id: frame.message_id.clone(),
-            frame_sha256: frame.frame_sha256.clone(),
-            transport_session_id: Some(transport_session_id.clone()),
-        }) {
-            failures.push(format!(
-                "{}: mark text/control frame sent failed: {error}",
-                frame.message_id
-            ));
-            continue;
-        }
-        let inbound = match transport.recv_text_control_frame().await {
-            Ok(inbound) => inbound,
-            Err(error) => {
-                failures.push(format!(
-                    "{}: receive text/control response failed: {error}",
-                    frame.message_id
-                ));
-                continue;
-            }
-        };
-        response_frames_received += 1;
-        let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&inbound) {
-            Ok(inbound_frame) => inbound_frame,
-            Err(error) => {
-                failures.push(format!(
-                    "{}: decode text/control response failed: {error}",
-                    frame.message_id
-                ));
-                continue;
-            }
-        };
-        let receipt_response = matches!(inbound_frame, TextControlFrameView::Receipt { .. });
-        if state.handle_text_control_frame(inbound_frame).is_some() {
-            failures.push(format!(
-                "{}: response frame unexpectedly generated another response",
-                frame.message_id
-            ));
-            continue;
-        }
-        if state.last_command_error.as_ref().is_some_and(|error| {
-            matches!(
-                error.command.as_str(),
-                "handle_text_control_frame" | "apply_text_delivery_receipt"
-            )
-        }) {
-            failures.push(format!(
-                "{}: text/control response verification failed",
-                frame.message_id
-            ));
-            continue;
-        }
-        if receipt_response {
-            receipts_applied += 1;
-        }
-    }
-
-    let metrics = transport.text_control_transport_metrics().await;
-    state.push_event(
-        "message.transport_pump",
-        format!(
-            "Text/control transport pump sent {} frame(s), received {} response frame(s), applied {} receipt(s), failures={}",
-            frames_sent,
-            response_frames_received,
-            receipts_applied,
-            failures.len()
-        ),
-    );
-    TextControlTransportPumpReportView {
-        pending_before: pending.len(),
-        frames_sent,
-        response_frames_received,
-        receipts_applied,
-        failures,
-        metrics,
-    }
 }
 
 fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> {
@@ -8914,16 +8914,17 @@ mod tests {
 
         let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
         let report = runtime.block_on(async {
-            pump_text_control_transport_once(
-                &mut alice.state,
-                &transport,
-                ListPendingTextControlFramesRequest {
-                    target: Some(target),
-                    limit: None,
-                },
-                "text-control-transport-trait-test",
-            )
-            .await
+            alice
+                .state
+                .pump_text_control_transport_once(
+                    &transport,
+                    ListPendingTextControlFramesRequest {
+                        target: Some(target),
+                        limit: None,
+                    },
+                    "text-control-transport-trait-test",
+                )
+                .await
         });
         alice.persist();
 
