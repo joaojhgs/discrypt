@@ -6,7 +6,7 @@ _Last updated: 2026-05-30_
 
 Discrypt is **not production-complete** for the full serverless P2P encrypted app target yet. This update has real MQTT, Nostr, and IPFS/libp2p signaling paths at the Rust transport boundary, but it is still not a complete installed-app proof:
 
-- **MQTT public signaling: implemented behind `mqtt-adapter`; previous public broker proof existed, but the latest rerun against public brokers failed/timed out and is no longer treated as green.**
+- **MQTT public signaling: implemented behind `mqtt-adapter` and latest reruns passed against a real public broker after the adapter began waiting for broker subscription acknowledgements before publishing.**
 - **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
 - **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; public bootstrap smoke exists but still requires configured bootstrap multiaddrs.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
@@ -109,8 +109,8 @@ DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
 
 MQTT status:
 
-- A previous run passed against default public broker `mqtts://broker.emqx.io:8883`, but latest reruns are no longer green and MQTT must remain an open production blocker.
-- Latest `broker.emqx.io`, `test.mosquitto.org`, and `broker.hivemq.com` reruns failed respectively with peer-delivery timeout, TLS certificate incompatibility, and network timeout.
+- Latest reruns passed against default public broker `mqtts://broker.emqx.io:8883` after the adapter started waiting for all broker `SUBACK`s before treating a joined room as ready.
+- Prior failures on `broker.emqx.io` timed out waiting for peer delivery and are treated as a subscription-readiness race that this fix targets; `test.mosquitto.org` still has TLS certificate incompatibility and `broker.hivemq.com` still hit network timeout in this environment.
 
 Nostr command:
 
@@ -199,7 +199,7 @@ These are real public signaling proofs at the provider adapter boundary, but the
 - Added release gate script:
   - `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132`
 - Public-provider smoke remains optional to keep default CI deterministic:
-  - set `DISCRYPT_PUBLIC_SIGNALING_E2E=1` for MQTT reruns and `DISCRYPT_PUBLIC_NOSTR_E2E=1` for Nostr reruns; MQTT is currently blocked by public-broker failures while Nostr is the latest green public proof.
+  - set `DISCRYPT_PUBLIC_SIGNALING_E2E=1` for MQTT reruns and `DISCRYPT_PUBLIC_NOSTR_E2E=1` for Nostr reruns; latest MQTT and Nostr public adapter-boundary proofs are green against their configured default public providers.
 
 ### G132 production evidence matrix
 
@@ -209,7 +209,7 @@ These are real public signaling proofs at the provider adapter boundary, but the
 | --- | --- | --- |
 | STUN overlay ordering and TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
 | Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
-| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | **Latest reruns failed**: `mqtts://broker.emqx.io:8883` timed out waiting for peer delivery, `mqtts://test.mosquitto.org:8883` had certificate incompatibility, and `mqtts://broker.hivemq.com:8883` hit network timeout. Keep as open blocker. |
+| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Latest reruns passed against `mqtts://broker.emqx.io:8883` after broker `SUBACK` readiness was enforced; `test.mosquitto.org` certificate incompatibility and `broker.hivemq.com` network timeout remain provider-specific caveats. |
 | Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Latest rerun passed against `wss://relay.damus.io`; `wss://nostr.oxtr.dev` returned blocked |
 | IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal/control only |
 | IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Test exists; public bootstrap run still missing until bootstrap endpoints are selected/configured |

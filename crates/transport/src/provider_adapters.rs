@@ -956,7 +956,15 @@ pub struct MqttProviderRoom {
 }
 
 #[cfg(feature = "mqtt-adapter")]
-type MqttEventReceiver = tokio::sync::mpsc::Receiver<Result<(String, Vec<u8>), String>>;
+type MqttEventReceiver = tokio::sync::mpsc::Receiver<MqttProviderEvent>;
+
+#[cfg(feature = "mqtt-adapter")]
+#[derive(Debug)]
+enum MqttProviderEvent {
+    Publish { topic: String, payload: Vec<u8> },
+    SubAck,
+    Error(String),
+}
 
 #[cfg(feature = "mqtt-adapter")]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2028,6 +2036,51 @@ impl MqttProviderRoom {
         self.drain_network_for(Duration::from_secs(1)).await
     }
 
+    async fn wait_for_subscription_acks(
+        &self,
+        expected: usize,
+        duration: Duration,
+    ) -> Result<(), TransportError> {
+        let deadline = Instant::now() + duration;
+        let mut acked = 0;
+        while acked < expected {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TransportError::SignalingAdapter(format!(
+                    "mqtt subscribe ack timeout: observed {acked}/{expected}"
+                )));
+            }
+            let event = {
+                let mut events = self.events.lock().await;
+                timeout(remaining, events.recv()).await
+            };
+            match event {
+                Ok(Some(MqttProviderEvent::SubAck)) => {
+                    acked += 1;
+                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                        eprintln!("mqtt subscribe ack {acked}/{expected}");
+                    }
+                }
+                Ok(Some(MqttProviderEvent::Publish { topic, payload })) => {
+                    self.record_publish(topic, payload).await?;
+                }
+                Ok(Some(MqttProviderEvent::Error(err))) => {
+                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                        eprintln!("mqtt event error {err}");
+                    }
+                    return Err(mqtt_err("event loop", err));
+                }
+                Ok(None) => {
+                    return Err(TransportError::SignalingAdapter(
+                        "mqtt event loop stopped".to_owned(),
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(())
+    }
+
     async fn drain_network_for(&self, duration: Duration) -> Result<(), TransportError> {
         let deadline = Instant::now() + duration;
         loop {
@@ -2040,13 +2093,18 @@ impl MqttProviderRoom {
                 timeout(remaining, events.recv()).await
             };
             match event {
-                Ok(Some(Ok((topic, payload)))) => {
+                Ok(Some(MqttProviderEvent::Publish { topic, payload })) => {
                     if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
                         eprintln!("mqtt incoming publish {topic}");
                     }
                     self.record_publish(topic, payload).await?;
                 }
-                Ok(Some(Err(err))) => {
+                Ok(Some(MqttProviderEvent::SubAck)) => {
+                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                        eprintln!("mqtt late subscribe ack");
+                    }
+                }
+                Ok(Some(MqttProviderEvent::Error(err))) => {
                     if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
                         eprintln!("mqtt event error {err}");
                     }
@@ -2176,16 +2234,26 @@ impl AdapterSession for MqttProviderSession {
                 match eventloop.poll().await {
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
                         if event_tx
-                            .send(Ok((publish.topic, publish.payload.to_vec())))
+                            .send(MqttProviderEvent::Publish {
+                                topic: publish.topic,
+                                payload: publish.payload.to_vec(),
+                            })
                             .await
                             .is_err()
                         {
                             break;
                         }
                     }
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_))) => {
+                        if event_tx.send(MqttProviderEvent::SubAck).await.is_err() {
+                            break;
+                        }
+                    }
                     Ok(_) => {}
                     Err(err) => {
-                        let _ = event_tx.send(Err(err.to_string())).await;
+                        let _ = event_tx
+                            .send(MqttProviderEvent::Error(err.to_string()))
+                            .await;
                         break;
                     }
                 }
@@ -2214,6 +2282,8 @@ impl AdapterSession for MqttProviderSession {
             topics,
             inbox: AsyncMutex::new(MqttInbox::default()),
         };
+        room.wait_for_subscription_acks(3, Duration::from_secs(5))
+            .await?;
         room.drain_network_for(Duration::from_millis(500)).await?;
         Ok(room)
     }
