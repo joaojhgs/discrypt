@@ -194,13 +194,14 @@ Behavior:
 - The Tauri command `apply_text_delivery_receipt` accepts a `TextDeliveryReceipt`, verifies it with `discrypt-mls-delivery` against the stored envelope, message id, group/DM/channel delivery group id, recipient verifying key, and envelope ciphertext hash, then marks the message as `peer_receipt` only after verification succeeds.
 - Tampered receipts are rejected with `receipt_verification_failed` and do not upgrade the message state.
 - The UI command surface has typed receipt/receipt-view models and a native-only `applyTextDeliveryReceipt(...)` binding; browser fallback stays honest and reports that signed receipts require the Rust/Tauri backend.
-- This is the signed state-transition boundary needed for remote delivery honesty, but it is **not yet** a full production peer-delivery flow because the receiving peer still has to generate the receipt and carry it back over a persistent two-profile DataChannel session.
+- This is the signed state-transition boundary needed for remote delivery honesty. A two-profile backend test now proves a distinct Bob profile identity can sign a receipt that Alice verifies, but this is **not yet** a full production peer-delivery flow because the receiving app still has to generate the receipt from a received frame and carry it back over a persistent two-profile DataChannel session.
 
 Verification:
 
 ```bash
 cargo test -q -p discrypt-desktop signed_text_delivery_receipt_updates_message_state -- --nocapture
 cargo test -q -p discrypt-desktop tampered_text_delivery_receipt_is_rejected -- --nocapture
+cargo test -q -p discrypt-desktop two_profile_receiver_identity_can_sign_delivery_receipt -- --nocapture
 cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter
 npm --prefix apps/ui run typecheck
 ```

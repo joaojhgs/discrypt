@@ -6783,6 +6783,86 @@ mod tests {
     }
 
     #[test]
+    fn two_profile_receiver_identity_can_sign_delivery_receipt() -> Result<(), String> {
+        let _guard = test_lock();
+        let _alice_path = reset_with_temp_state("two-profile-text-receipt-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "two profile receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let persisted = load_state();
+        let envelope = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+
+        let bob_path = fresh_state_path("two-profile-text-receipt-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let bob_signer = SigningKey::from_bytes(&bob.state.identity_seed_bytes());
+        let receipt = TextDeliveryReceipt::sign(
+            &envelope.group_id,
+            TextDeliveryReceiptInput {
+                message_id: message_id.clone(),
+                recipient_leaf: 2,
+                recipient_device_id: bob.state.local_user_id(),
+                received_at_ms: 42_100,
+                envelope_ciphertext_hash: envelope.envelope.ciphertext_hash(),
+            },
+            &bob_signer,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: hex::encode(bob_signer.verifying_key().as_bytes()),
+        });
+
+        assert!(receipted.last_command_error.is_none());
+        let message = receipted
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        assert_eq!(
+            message
+                .peer_receipt
+                .as_ref()
+                .map(|receipt| { receipt.recipient_key_fingerprint.as_str() }),
+            Some(key_fingerprint(&bob_signer.verifying_key()).as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tampered_text_delivery_receipt_is_rejected() -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("tampered-text-receipt");
