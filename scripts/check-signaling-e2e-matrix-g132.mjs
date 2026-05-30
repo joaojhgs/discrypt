@@ -122,11 +122,15 @@ for (const check of matrixCommands) {
   });
 
   if (result.status !== 0) {
+    const detail = (result.stdout || result.stderr || "").trim();
     if (check.required) {
-      const detail = (result.stdout || result.stderr || "").trim();
       failures.push(`${check.label} failed${detail ? `: ${detail.slice(0, 240)}` : ""}`);
     } else {
-      skips.push(`${check.label} unavailable: ${check.skipReason || check.label}`);
+      skips.push(
+        `${check.label} unavailable: ${check.skipReason || check.label}${
+          detail ? ` (${detail.slice(0, 240)})` : ""
+        }`,
+      );
     }
   }
 }
