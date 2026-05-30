@@ -93,7 +93,7 @@ impl AdapterReadinessState {
 }
 
 /// One required adapter in the ordered registry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct SignalingAdapterRegistryEntry {
     /// Adapter kind in the registry.
     pub kind: SignalingAdapterKind,
@@ -339,6 +339,18 @@ pub struct ProviderAdapterBoundary {
 }
 
 impl ProviderAdapterBoundary {
+    /// Static readiness projected into runtime planning state.
+    #[must_use]
+    pub const fn readiness_state(self) -> AdapterReadinessState {
+        match self.readiness {
+            ProviderAdapterReadiness::FeatureDisabled => AdapterReadinessState::FeatureDisabled,
+            ProviderAdapterReadiness::ImplementationUnavailable => {
+                AdapterReadinessState::ImplementationUnavailable
+            }
+            ProviderAdapterReadiness::ImplementationAvailable => AdapterReadinessState::Available,
+        }
+    }
+
     /// True when a real provider client is available in this build.
     #[must_use]
     pub const fn implementation_available(self) -> bool {
@@ -1518,7 +1530,6 @@ mod tests {
     #[test]
     fn plan_signaling_adapter_fallback_try_all_deduplicates_and_marks_selected() {
         let requested = dedup_requested_kinds();
-        let registry = required_provider_adapter_boundaries();
         let plan =
             plan_signaling_adapter_fallback(&requested, AdapterFallbackBehavior::TryAll, None);
 
