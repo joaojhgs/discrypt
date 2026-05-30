@@ -86,6 +86,10 @@ const TEXT_SEND_LIMIT: u32 = 20;
 const ADMISSION_HELPER_ATTEMPT_LIMIT: u32 = 5;
 const SIGNALING_ACTION_LIMIT: u32 = 60;
 const ABUSE_WINDOW_SECONDS: i64 = 60;
+const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
+    "provider-backed text/control runtime attachment is not implemented in this build";
+const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
+    "Provider-backed long-lived attachment is intentionally disabled while this app-service only owns short-lived transport probes; add persisted negotiated offer/answer/ICE bootstrap handoff and a persistent installed-app receiver loop for peer routing before attaching";
 
 /// Desktop/Tauri wrapper around the Rust signaling protocol client.
 pub struct DesktopSignalingClient<T> {
@@ -1667,7 +1671,7 @@ impl TauriAppService {
                 label: "text/control runtime".to_owned(),
                 status: "not-attached".to_owned(),
                 detail: format!(
-                    "Text session {} is {}, but no app-service transport runtime is attached; pending frames remain queued until a live runtime is bound",
+                    "Text session {} is {}, but no app-service long-lived provider-backed transport runtime is attached; pending signed frames remain queued until a live runtime loop is implemented",
                     session.session_id,
                     PersistedAppState::transport_state_label(session_state)
                 ),
@@ -2039,8 +2043,8 @@ pub fn attach_text_control_transport_runtime(
         "transport.text_runtime_attach_unavailable",
         "attach_text_control_transport_runtime",
         "transport_runtime_not_supported",
-        "provider-backed text/control runtime attachment is not implemented in this build",
-        "Use pump_text_control_transport_once with an explicitly injected transport runtime during internal tests until long-lived attachment is wired",
+        TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE,
+        TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
     );
     guard.persist();
     guard.to_view()
@@ -9886,6 +9890,41 @@ mod tests {
     }
 
     #[test]
+    fn attach_text_control_transport_runtime_rejects_when_text_session_not_connected() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-not-connected");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("attach-not-connected".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+
+        let state =
+            attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
+                session_id: Some(active_session_id),
+            });
+        let command_error = state
+            .last_command_error
+            .expect("attach should fail while text session is not connected");
+        assert_eq!(command_error.code, "text_session_not_connected");
+    }
+
+    #[test]
     fn attach_text_control_transport_runtime_exposes_missing_provider_implementation() {
         let _guard = test_lock();
         reset_with_temp_state("attach-text-control-runtime-missing-implementation");
@@ -9955,6 +9994,13 @@ mod tests {
             "attach_text_control_transport_runtime"
         );
         assert_eq!(command_error.code, "transport_runtime_not_supported");
+        assert!(command_error
+            .recovery_hint
+            .contains("persisted negotiated offer/answer/ICE bootstrap handoff"));
+        assert_eq!(
+            command_error.message,
+            TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE
+        );
         let service = app_service();
         let guard = service
             .lock()
@@ -9962,6 +10008,109 @@ mod tests {
         assert!(
             guard.text_control_transport_runtime.is_none(),
             "unsupported attach path must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn text_control_runtime_status_remains_not_attached_after_missing_implementation() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-runtime-status-not-attached");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("attach-status-not-attached".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let synthetic_probe = ProviderWebRtcDataChannelProbeView {
+            kind: "unit-test".to_owned(),
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "unit-test-endpoint".to_owned(),
+            rendezvous_topic: "unit-test-topic".to_owned(),
+            offerer_direct_path_ready: true,
+            answerer_direct_path_ready: true,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "b".repeat(64),
+        };
+        let session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active");
+        assert!(
+            session_id.starts_with("text-session-"),
+            "expected a generated session id before proving route"
+        );
+        let route_marked = mutate_app_service(|state| {
+            state.latest_data_channel_probe = Some(synthetic_probe);
+            let proof = state
+                .latest_data_channel_probe
+                .as_ref()
+                .expect("probe should be set")
+                .clone();
+            state.mark_text_session_data_channel_route_proof(&proof)
+        });
+        assert!(
+            route_marked.last_command_error.is_none(),
+            "route proof should not fail"
+        );
+
+        let attached =
+            attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
+                session_id: Some(session_id.clone()),
+            });
+        let command_error = attached
+            .last_command_error
+            .expect("attach should fail until provider runtime path is wired");
+        assert_eq!(command_error.code, "transport_runtime_not_supported");
+        let text_control_status = attached
+            .transport_status
+            .into_iter()
+            .find(|status| status.label == "text/control runtime")
+            .expect("text/control runtime status should be present");
+        assert_eq!(text_control_status.status, "not-attached");
+        assert!(
+            text_control_status.detail.contains(
+                "pending signed frames remain queued until a live runtime loop is implemented"
+            ),
+            "status detail should expose the fail-closed queueing boundary"
+        );
+
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.text_control_transport_runtime.is_none(),
+            "missing provider implementation must not attach runtime state"
+        );
+        let active_session_id = guard
+            .state
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("active text session should still exist");
+        assert_eq!(
+            active_session_id, session_id,
+            "attach attempt should not mutate active session identity"
         );
     }
 
