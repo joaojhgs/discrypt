@@ -1711,6 +1711,18 @@ function productionInviteLink(metadata: ParsedInviteMetadata): string {
     kind: metadata.connectivity.invite_kind,
     scope: metadata.connectivity.scope_id_commitment,
   });
+  const groupBootstrap = metadata.connectivity.group_bootstrap;
+  if (groupBootstrap) {
+    query.set("group_identity", groupBootstrap.group_identity_commitment);
+    query.set("role_policy", groupBootstrap.role_admission_policy_commitment);
+    query.set("channel_policy", groupBootstrap.channel_policy_commitment);
+  }
+  const dmBootstrap = metadata.connectivity.dm_bootstrap;
+  if (dmBootstrap) {
+    query.set("dm_inviter", dmBootstrap.inviter_identity_commitment);
+    query.set("dm_contact", dmBootstrap.contact_token_commitment);
+    query.set("dm_reply", dmBootstrap.reply_rendezvous_commitment);
+  }
   for (const endpoint of metadata.iceStunServers) {
     query.append("stun", endpoint);
   }
@@ -1756,12 +1768,30 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
           scope_id_commitment: scope,
           ice_stun_servers: iceStunServers,
           ice_turn_servers: iceTurnServers,
+          dm_bootstrap:
+            params.get("dm_inviter") && params.get("dm_contact") && params.get("dm_reply")
+              ? {
+                  inviter_identity_commitment: params.get("dm_inviter") ?? "",
+                  contact_token_commitment: params.get("dm_contact") ?? "",
+                  reply_rendezvous_commitment: params.get("dm_reply") ?? "",
+                }
+              : dmConnectivityPolicy(`dm-${inviteKey}`, scope).dm_bootstrap,
         }
       : {
           ...groupConnectivityPolicy(`group-${inviteKey}`),
           scope_id_commitment: scope,
           ice_stun_servers: iceStunServers,
           ice_turn_servers: iceTurnServers,
+          group_bootstrap:
+            params.get("group_identity") &&
+            params.get("role_policy") &&
+            params.get("channel_policy")
+              ? {
+                  group_identity_commitment: params.get("group_identity") ?? "",
+                  role_admission_policy_commitment: params.get("role_policy") ?? "",
+                  channel_policy_commitment: params.get("channel_policy") ?? "",
+                }
+              : groupConnectivityPolicy(`group-${inviteKey}`).group_bootstrap,
         };
   return {
     inviteKey,

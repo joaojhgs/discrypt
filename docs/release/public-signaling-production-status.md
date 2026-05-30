@@ -618,3 +618,33 @@ Remaining gap: this closes the UI-only group peer defaulting gap for two-sided
 owner/member invite bootstrap, but it is not a full multi-member signed device
 directory, not dynamic peer selection for large groups, and not yet a two-window
 installed GUI proof of group text or voice over public providers.
+
+## 2026-05-30 update: UI fallback invites carry bootstrap commitments and E2E asserts reciprocal peers
+
+The browser/local-dev fallback invite format now carries the same bootstrap
+commitments needed by two independent UI profiles to derive reciprocal runtime
+peers from an invite:
+
+- group invites include `group_identity`, `role_policy`, and `channel_policy`
+  commitment query fields
+- DM invites include `dm_inviter`, `dm_contact`, and `dm_reply` commitment query
+  fields
+- parsing preserves these commitments instead of rebuilding bootstrap metadata
+  from invite-key-local fallbacks
+
+The two-profile Playwright flow now asserts that after Alice creates a group
+invite and Bob joins it, the displayed local/remote runtime peer ids are
+reciprocal (`Alice.local == Bob.remote` and `Alice.remote == Bob.local`) before
+sending group messages. This does not claim remote delivery; it verifies the UI
+state needed before role-split attach is no longer divergent.
+
+Verification run:
+
+- `npm --prefix apps/ui run typecheck`
+- `VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npm --prefix apps/ui run build`
+- `cd apps/ui && CI=1 VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npx playwright test tests/e2e/two-profile-flow.spec.ts --workers=1`
+- `npm --prefix apps/ui run test:command-coverage`
+
+Remaining gap: this is browser fallback E2E for invite/bootstrap state and UI
+reciprocal runtime peer fields, not an installed Tauri two-process public-provider
+DataChannel receipt proof.

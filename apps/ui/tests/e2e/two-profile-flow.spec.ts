@@ -147,6 +147,24 @@ async function joinInvite(page: Page, invite: string) {
   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
 }
 
+async function readRuntimePeers(page: Page) {
+  await expect(page.locator("#runtime-local-peer")).toBeVisible();
+  await expect(page.locator("#runtime-remote-peer")).toBeVisible();
+  return {
+    local: await page.locator("#runtime-local-peer").inputValue(),
+    remote: await page.locator("#runtime-remote-peer").inputValue(),
+  };
+}
+
+async function expectReciprocalGroupRuntimePeers(owner: Page, member: Page) {
+  const ownerPeers = await readRuntimePeers(owner);
+  const memberPeers = await readRuntimePeers(member);
+  expect(ownerPeers.local).toMatch(/^peer-[a-f0-9]{16}$/);
+  expect(ownerPeers.remote).toMatch(/^peer-[a-f0-9]{16}$/);
+  expect(memberPeers.local).toBe(ownerPeers.remote);
+  expect(memberPeers.remote).toBe(ownerPeers.local);
+}
+
 async function createDmInviteForActiveContact(page: Page, contactName: string) {
   await openDm(page, contactName);
   await page
@@ -272,6 +290,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
+    await expectReciprocalGroupRuntimePeers(alice.page, bob.page);
     await sendGroupMessage(alice.page, "alice group channel command ping");
     await sendGroupMessage(bob.page, "bob group channel command pong");
     await expect(
@@ -335,6 +354,7 @@ test("two isolated profiles finish invite and channel text flows without claimin
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
+    await expectReciprocalGroupRuntimePeers(alice.page, bob.page);
     await sendGroupMessage(alice.page, "alice group local text proof");
     await sendGroupMessage(bob.page, "bob group local text proof");
     await expectMessageStaysLocal(
