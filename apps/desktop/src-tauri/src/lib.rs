@@ -3297,6 +3297,14 @@ fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
     }
 }
 
+fn default_ice_stun_servers() -> Vec<String> {
+    vec!["stun:stun.l.google.com:19302".to_owned()]
+}
+
+fn default_redacted_turn_servers() -> Vec<IceTurnServerView> {
+    Vec::new()
+}
+
 fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileView> {
     [
         InviteSignalingAdapterKind::Mqtt,
@@ -3624,7 +3632,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
     let legacy_scope =
         hash_commitment("discrypt-legacy-invite-scope-commitment-v1", &[&invite_key]);
     Some(ParsedInviteMetadata {
-        invite_key,
+        invite_key: invite_key.clone(),
         room_secret_hash,
         signaling_endpoint: endpoint,
         signaling_trust_fingerprint,
@@ -4215,14 +4223,9 @@ mod tests {
         assert!(!invite_state.invites[0].room_secret_hash.is_empty());
         assert_eq!(
             invite_state.invites[0].ice_stun_servers,
-            vec!["stun:default.discrypt.invalid:3478".to_owned()]
+            vec!["stun:stun.l.google.com:19302".to_owned()]
         );
-        assert_eq!(invite_state.invites[0].ice_turn_servers.len(), 1);
-        assert_eq!(
-            invite_state.invites[0].ice_turn_servers[0].endpoint,
-            "turns:default.discrypt.invalid:5349".to_owned()
-        );
-        assert!(!invite_state.invites[0].ice_turn_servers[0].credential_declared);
+        assert!(invite_state.invites[0].ice_turn_servers.is_empty());
         let channel_state = create_channel(CreateChannelRequest {
             group_id: group_id.clone(),
             name: "ops".to_owned(),
@@ -4294,14 +4297,9 @@ mod tests {
 
         assert_eq!(
             parsed.ice_stun_servers,
-            vec!["stun:default.discrypt.invalid:3478".to_owned()]
+            vec!["stun:stun.l.google.com:19302".to_owned()]
         );
-        assert_eq!(parsed.ice_turn_servers.len(), 1);
-        assert_eq!(
-            parsed.ice_turn_servers[0].endpoint,
-            "turns:default.discrypt.invalid:5349".to_owned()
-        );
-        assert!(!parsed.ice_turn_servers[0].credential_declared);
+        assert!(parsed.ice_turn_servers.is_empty());
         assert!(!format!("{parsed:?}").contains("raw-turn-secret"));
     }
 
