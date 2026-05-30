@@ -14,6 +14,7 @@
 pub mod ice;
 pub mod policy;
 pub mod production_status;
+pub mod provider_adapters;
 pub mod session;
 pub mod signaling;
 pub mod webrtc_negotiation;
@@ -29,6 +30,10 @@ pub use policy::{
     EffectiveConnectivityPolicy, IceProfile, ProviderMetadataPosture, RendezvousCapability,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingProviderEndpoint,
+};
+pub use provider_adapters::{
+    adapter_boundary_for_kind, required_provider_adapter_boundaries, FeatureGatedProviderAdapter,
+    ProviderAdapterBoundary, ProviderAdapterReadiness,
 };
 use serde::{Deserialize, Serialize};
 pub use session::{
