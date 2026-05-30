@@ -6,8 +6,6 @@ _Last updated: 2026-05-30T20:45Z_
 
 ### What passed in this session
 
-All the following tests were run and passed during this session:
-
 **Tauri dev build fix:**
 - `tauri.conf.json` `build.features` now includes `tauri-runtime`; `cargo tauri dev` DevCommand is `cargo run --no-default-features --features tauri-runtime`
 - `cargo check -p discrypt-desktop --features tauri-runtime` — passed
