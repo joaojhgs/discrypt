@@ -1,0 +1,131 @@
+{
+  "schema_version": "discrypt.g131.final_e2e_quality_gate.v1",
+  "generated_at": "2026-05-30T00:47:58.231Z",
+  "status": "readiness-gate-passed",
+  "gate": "G131-full-production-e2e-verification-acr",
+  "serialized_playwright_e2e": true,
+  "required_command_evidence": [
+    "cargo fmt --all --check",
+    "npm --prefix apps/ui run test:final-e2e-g131",
+    "npm --prefix apps/ui run test:e2e",
+    "npm --prefix apps/ui run test:ui-integration-g130",
+    "npm --prefix apps/ui run test:release-no-fallback-g129",
+    "npm --prefix apps/ui run test:placeholder-allowlist-g128",
+    "npm --prefix apps/ui run test:no-placeholders-g127",
+    "npm --prefix apps/ui run test:release-linux",
+    "npm --prefix apps/ui run test:linux-package-smoke",
+    "npm --prefix apps/ui run test:desktop-package-ci",
+    "npm --prefix apps/ui run test:android-gate",
+    "npm --prefix apps/ui run test:signaling-relay-ops",
+    "npm --prefix apps/ui run test:release-governance",
+    "npm --prefix apps/ui run test:release-verification-matrix",
+    "npm --prefix apps/ui run test:ac-dashboard-g101",
+    "npm --prefix apps/ui run test:pcap-suite-g096",
+    "npm --prefix apps/ui run test:malicious-relay-g097",
+    "npm --prefix apps/ui run test:malicious-member-g098",
+    "npm --prefix apps/ui run test:retention-shred-g099",
+    "npm --prefix apps/ui run test:performance-soak-g100",
+    "npm --prefix apps/ui run test:presence-g115",
+    "npm --prefix apps/ui run test:abuse-g120",
+    "npm --prefix apps/ui run test:cargo-deny-g121",
+    "npm --prefix apps/ui run test:cargo-audit-g122",
+    "npm --prefix apps/ui run test:npm-audit-g123",
+    "npm --prefix apps/ui run test:sbom-g124",
+    "npm --prefix apps/ui run test:crypto-sensitive-g125",
+    "npm --prefix apps/ui run test:repro-g126",
+    "npm --prefix apps/ui run test:honesty",
+    "npm --prefix apps/ui run test:command-coverage",
+    "npm --prefix apps/ui run build",
+    "cargo check --workspace --quiet",
+    "cargo test --workspace --quiet",
+    "cargo clippy --workspace --all-targets --quiet -- -D warnings",
+    "git diff --check"
+  ],
+  "readiness_inputs": {
+    "ci_workflow": ".github/workflows/ci.yml",
+    "release_matrix": "docs/release/release-verification-matrix.md",
+    "ac_dashboard": ".omx/artifacts/production-readiness/ac-dashboard.json",
+    "package_scripts": "apps/ui/package.json"
+  },
+  "note": "This JSON records the static readiness gate. The final checkpoint evidence must also cite a fresh successful run of every required command in required_command_evidence plus final ai-slop-cleaner and code-review evidence.",
+  "aiSlopCleaner": {
+    "status": "passed",
+    "evidence": "ai-slop-cleaner pass scoped to G131/G132 final-gate files found no fallback-like slop, no dead-code deletion opportunity, no unsafe duplicate removal, and no stale UI/theming cleanup in this final blocker slice; behavior was locked by test:final-e2e-g131, serial Playwright E2E, and git diff --check.",
+    "scope": "G131/G132 final gate files only",
+    "behaviorLock": [
+      "npm --prefix apps/ui run test:final-e2e-g131",
+      "npm --prefix apps/ui run test:e2e (8 Chromium tests, --workers=1)",
+      "git diff --check"
+    ],
+    "cleanupPlan": [
+      "Scope final gate files only",
+      "Check fallback-like wording/branches",
+      "Check duplicated evidence lists",
+      "Check stale docs and weak error evidence"
+    ],
+    "fallbackFindings": [],
+    "uiDesignFindings": [],
+    "passesCompleted": [
+      "Fallback-like code resolution gate: no masking fallback slop found",
+      "Dead code deletion: no safe deletion required",
+      "Duplicate removal: no safe duplicate removal required",
+      "Naming/error handling cleanup: no issue found",
+      "Test reinforcement: final-e2e and Playwright rerun passed"
+    ],
+    "qualityGates": {
+      "regressionTests": "PASS",
+      "lintStatic": "PASS",
+      "typecheckBuild": "PASS",
+      "tests": "PASS",
+      "staticSecurityScan": "PASS"
+    },
+    "changedFiles": [
+      "scripts/check-final-e2e-g131.mjs",
+      "docs/release/g131-final-e2e-verification.md",
+      "apps/ui/package.json",
+      ".github/workflows/ci.yml"
+    ],
+    "remainingRisks": []
+  },
+  "verification": {
+    "status": "passed",
+    "commands": [
+      "npm --prefix apps/ui run test:final-e2e-g131",
+      "npm --prefix apps/ui run test:e2e",
+      "git diff --check"
+    ],
+    "evidence": "Post-cleaner blocker-resolution verification passed; full G131 fail-fast verification evidence is recorded in docs/release/g131-final-e2e-verification.md and the final quality-gate artifact."
+  },
+  "codeReview": {
+    "recommendation": "APPROVE",
+    "architectStatus": "CLEAR",
+    "evidence": "Independent final reviews found no remaining blockers after G132 blocker-resolution work.",
+    "independentReview": {
+      "codeReviewer": {
+        "agentRole": "code-reviewer",
+        "decision": "APPROVE",
+        "blockers": [],
+        "evidence": "code-reviewer subagent approved G132 with no blockers after verifying CI/package wiring, Playwright pass state, final-e2e evidence, and git diff hygiene."
+      },
+      "architect": {
+        "agentRole": "architect",
+        "status": "CLEAR",
+        "blockers": [],
+        "evidence": "architect subagent cleared G132 with no blockers after verifying previous review blockers were resolved by maintained final gate wiring and serial Playwright evidence."
+      }
+    }
+  },
+  "verification_evidence": {
+    "ai_slop_cleaner": {
+      "status": "passed",
+      "evidence": "ai-slop-cleaner pass scoped to G131/G132 final-gate files found no fallback-like slop, no dead-code deletion opportunity, no unsafe duplicate removal, and no stale UI/theming cleanup in this final blocker slice; behavior was locked by test:final-e2e-g131, serial Playwright E2E, and git diff --check.",
+      "scope": "G131/G132 final gate files only",
+      "fallback_findings": [],
+      "quality_gates": [
+        "npm --prefix apps/ui run test:final-e2e-g131",
+        "npm --prefix apps/ui run test:e2e (8 Chromium tests, --workers=1)",
+        "git diff --check"
+      ]
+    }
+  }
+}
