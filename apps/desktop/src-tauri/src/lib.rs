@@ -7263,6 +7263,164 @@ mod tests {
     }
 
     #[test]
+    fn two_profile_app_ui_flow_mixes_invites_and_persists_channel_receipt() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("two-profile-app-ui-flow");
+
+        let alice_user = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        assert_eq!(
+            alice_user.lifecycle,
+            AppLifecycle::Ready,
+            "alice profile should reach ready state"
+        );
+
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let dm_invite_state = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(dm_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "3".to_owned(),
+        });
+        let dm_invite = dm_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.dm_id.as_deref() == Some(dm_id.as_str()))
+            .ok_or_else(|| "dm invite should be persisted".to_owned())?;
+
+        let group_state = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group = group_state
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "alice should have a created group".to_owned())?;
+        let group_id = group.group_id.clone();
+        let group_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "group should include a text channel".to_owned())?;
+        let group_invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "4".to_owned(),
+        });
+        let group_invite = group_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.group_id == group_id)
+            .ok_or_else(|| "group invite should be persisted".to_owned())?;
+
+        let bob_path = fresh_state_path("two-profile-app-ui-flow-bob");
+        let _ = fs::remove_file(&bob_path);
+        std::env::set_var("DISCRYPT_APP_STATE_PATH", &bob_path);
+        reset_app_state();
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let bob_dm_state = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code: dm_invite.code.clone(),
+            display_name: Some("Alice contact".to_owned()),
+        });
+        assert!(bob_dm_state.last_command_error.is_none());
+        let bob_group_state = join_group(JoinGroupRequest {
+            invite_code: group_invite.code.clone(),
+            group_name: Some("Private Lab".to_owned()),
+        });
+        std::env::set_var("DISCRYPT_APP_STATE_PATH", &alice_path);
+        reset_app_state();
+
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        assert!(bob_dm_state.last_command_error.is_none());
+        assert!(bob_group_state.last_command_error.is_none());
+        assert!(bob.state.dms.iter().any(|dm| {
+            dm.connectivity
+                .as_ref()
+                .is_some_and(|policy| policy.scope_id_commitment == dm_invite.scope_id_commitment)
+        }));
+        assert!(bob
+            .state
+            .groups
+            .iter()
+            .any(|group| group.name == "Private Lab"));
+
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: Some(group_channel_id.clone()),
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "channel hello from alice".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let envelope_record = load_state()
+            .text_delivery_envelopes
+            .into_iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "persisted envelope missing for group message".to_owned())?;
+        let (receipt, recipient_key_hex) =
+            bob.state
+                .receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+                    target: target.clone(),
+                    envelope: envelope_record.envelope.clone(),
+                    sender_verifying_key_hex: envelope_record.sender_verifying_key_hex,
+                    recipient_leaf: Some(2),
+                })?;
+        assert!(bob.state.last_command_error.is_none());
+        assert!(bob.state.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: recipient_key_hex.clone(),
+        });
+        let message = receipted
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing after receipt".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+
+        let alice_view = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let persisted_message = alice_view
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message missing after reload".to_owned())?;
+        let bob_key = verifying_key_from_hex(&recipient_key_hex)
+            .ok_or_else(|| "recipient key should decode from envelope response".to_owned())?;
+        assert_eq!(
+            persisted_message.state_key, "peer_receipt",
+            "peer receipt should persist after reload"
+        );
+        assert!(persisted_message.peer_receipt.is_some());
+        assert_eq!(
+            persisted_message
+                .peer_receipt
+                .as_ref()
+                .map(|receipt| receipt.recipient_key_fingerprint.as_str()),
+            Some(key_fingerprint(&bob_key).as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fresh_state_starts_first_run() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("fresh");
