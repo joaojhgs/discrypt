@@ -26,6 +26,10 @@ use discrypt_core::{
 use discrypt_media::{
     MicrophonePermissionState, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
 };
+use discrypt_transport::{
+    required_provider_adapter_boundaries, TransportRoute, TransportSession, TransportSessionSnapshot,
+    TransportSessionState,
+};
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
@@ -898,6 +902,26 @@ pub struct CommandHealth {
     pub honest_copy_ready: bool,
 }
 
+/// Readiness for one required signaling adapter boundary used by diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingAdapterBoundaryView {
+    /// Adapter canonical kind label.
+    pub kind: String,
+    /// Cargo feature required by this adapter boundary.
+    pub cargo_feature: String,
+    /// Readiness state from build-time boundary inspection.
+    pub readiness: String,
+    /// Redacted failure class for UI and test assertions.
+    pub failure_class: String,
+}
+
+/// Transport-session and adapter readines diagnostics surfaced to trusted tooling.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransportDiagnosticsView {
+    /// Required adapter boundaries and their readiness labels.
+    pub adapter_boundaries: Vec<SignalingAdapterBoundaryView>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct AbuseBucketView {
     key: String,
@@ -950,6 +974,31 @@ impl PersistedAbuseState {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BackendTransportMode {
+    Signaling,
+    Text,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct TransportSessionRecord {
+    session_id: String,
+    scope_label: String,
+    mode: BackendTransportMode,
+    session: TransportSession,
+}
+
+impl TransportSessionRecord {
+    fn snapshot(&self) -> TransportSessionSnapshot {
+        self.session.snapshot()
+    }
+
+    fn state(&self) -> TransportSessionState {
+        self.snapshot().state
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -971,6 +1020,10 @@ struct PersistedAppState {
     events: Vec<AppEventView>,
     #[serde(default)]
     last_command_error: Option<CommandErrorView>,
+    #[serde(default)]
+    signaling_session: Option<TransportSessionRecord>,
+    #[serde(default)]
+    text_session: Option<TransportSessionRecord>,
     #[serde(default)]
     abuse: PersistedAbuseState,
     friend_verified: bool,
@@ -2477,6 +2530,8 @@ impl PersistedAppState {
                 summary: "No local profile exists; setup/recovery is required".to_owned(),
             }],
             last_command_error: None,
+            signaling_session: None,
+            text_session: None,
             abuse: PersistedAbuseState::default(),
             friend_verified: false,
             next_sequence: 2,
