@@ -1,12 +1,15 @@
 #![cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
 
 use discrypt_transport::{
-    derive_scope_commitment, probe_provider_webrtc_datachannel_request_response_with_config,
-    probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel, ConnectivityScopeLevel,
-    ConversationScope, Endpoint, IceServerConfig, SignalingAdapterCapabilities,
-    SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity,
-    SignalingProviderEndpoint, TransportError, TurnServerConfig, WebRtcIceTransportPolicy,
-    WebRtcNegotiationConfig,
+    derive_scope_commitment, probe_provider_webrtc_datachannel_roundtrip, AdapterTrustLabel,
+    ConnectivityScopeLevel, ConversationScope, Endpoint, IceServerConfig,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+};
+#[cfg(feature = "mqtt-adapter")]
+use discrypt_transport::{
+    probe_provider_webrtc_datachannel_request_response_with_config, TurnServerConfig,
+    WebRtcIceTransportPolicy, WebRtcNegotiationConfig,
 };
 use rand::RngCore;
 
