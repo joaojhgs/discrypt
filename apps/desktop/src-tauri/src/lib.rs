@@ -855,6 +855,34 @@ pub struct LeaveVoiceRequest {
     pub session_id: String,
 }
 
+/// Request to start a backend transport session for signaling control plane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartSignalingSessionRequest {
+    /// Optional stable label for observability and command dedupe.
+    pub scope_label: Option<String>,
+}
+
+/// Request to stop a backend signaling transport session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StopSignalingSessionRequest {
+    /// Optional active session id to target; omitted id stops the current session.
+    pub session_id: Option<String>,
+}
+
+/// Request to start a backend transport session for text/control channels.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartTextSessionRequest {
+    /// Optional stable label for observability and command dedupe.
+    pub scope_label: Option<String>,
+}
+
+/// Request to stop a backend text/control transport session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StopTextSessionRequest {
+    /// Optional active session id to target; omitted id stops the current session.
+    pub session_id: Option<String>,
+}
+
 /// Request to set self mute state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SetSelfMuteRequest {
