@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "identifier": "chat.discrypt.desktop",
   "build": {
+    "features": ["tauri-runtime"],
     "beforeDevCommand": "cd ../ui && npm run dev -- --host 127.0.0.1 --port 1420 --strictPort",
     "beforeBuildCommand": "cd ../ui && npm run build",
     "devUrl": "http://127.0.0.1:1420",
