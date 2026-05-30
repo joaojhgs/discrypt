@@ -1,4 +1,4 @@
-//! Local-only storage facades for author logs, recipient caches, and sealed backup.
+//! Local-device storage boundaries for author logs, recipient caches, and sealed backup.
 //!
 //! ## ProductionStatus
 //! See [`production_status`] for this crate's build-time gate status. Default
@@ -59,7 +59,7 @@ pub enum AppStoreError {
 /// Byte-oriented local app-state store used by the core AppService.
 ///
 /// The core crate owns the typed schema; storage owns durable byte persistence so
-/// migrations can be tested without coupling UI state to React fixtures.
+/// migrations can be tested without coupling UI state to React state samples.
 pub trait AppStore: Clone + Send + Sync + 'static {
     /// Load the serialized app state, if initialized.
     fn load_app_state(&mut self) -> Result<Option<Vec<u8>>, AppStoreError>;
@@ -419,7 +419,7 @@ pub struct AppGroupState {
     pub name: String,
     /// Local user's role label.
     pub role: String,
-    /// Current MLS epoch facade.
+    /// Current MLS epoch summary.
     pub epoch: u64,
     /// Channels belonging to this group.
     pub channels: Vec<AppChannelState>,

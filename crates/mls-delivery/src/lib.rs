@@ -1,4 +1,4 @@
-//! Delivery, ordering, fork detection, Welcome/catch-up, and repair facades around MLS state.
+//! Delivery, ordering, fork detection, Welcome/catch-up, and repair boundaries around MLS state.
 //!
 //! This crate deliberately models the service layer around MLS rather than a
 //! replacement for MLS cryptography: it orders application events, detects
@@ -1558,7 +1558,7 @@ pub struct ApplicationEvent {
 }
 
 impl ApplicationEvent {
-    /// Create an event for deterministic tests and facades.
+    /// Create an event for deterministic tests and service boundaries.
     #[must_use]
     pub fn new(epoch: u64, leaf_index: u32, event_id: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {
@@ -1638,7 +1638,7 @@ impl CommitEnvelope {
     }
 }
 
-/// Deterministic delivery state for tests and higher-level facades.
+/// Deterministic delivery state for tests and higher-level service boundaries.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeliveryState {
     summary: EpochSummary,

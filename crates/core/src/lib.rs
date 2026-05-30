@@ -1,4 +1,4 @@
-//! Domain orchestration facade for Tauri commands and headless E2E tests.
+//! Domain orchestration boundary for Tauri commands and headless E2E tests.
 //!
 //! ## ProductionStatus
 //! See [`production_status`] for this crate's build-time gate status. Default
@@ -20,9 +20,9 @@ use thiserror::Error;
 pub struct RoomSummary {
     /// Stable room identifier.
     pub room_id: String,
-    /// Current MLS epoch facade.
+    /// Current MLS epoch summary.
     pub epoch: u64,
-    /// Current member count facade.
+    /// Current member count summary.
     pub members: usize,
 }
 
@@ -633,7 +633,7 @@ impl<S: AppStore> AppService<S> {
         Ok(self.snapshot())
     }
 
-    /// Persist a local-first encrypted text facade message.
+    /// Persist a local-first encrypted text boundary message.
     pub fn send_message(
         &mut self,
         request: SendMessageRequest,
@@ -678,7 +678,7 @@ impl<S: AppStore> AppService<S> {
     }
 }
 
-/// Create a deterministic DM facade and safety number.
+/// Create a deterministic DM boundary and safety number.
 #[must_use]
 pub fn create_dm(alice: &Identity, bob: &Identity) -> (GroupState, String) {
     let group = GroupState::new(format!(
@@ -821,7 +821,7 @@ pub fn snapshot_safety_number_matches_identity_keys(snapshot: &AppSnapshot) -> b
         == snapshot.friend.safety_number
 }
 
-/// Build an in-memory app service seeded with the deterministic fixture.
+/// Build an in-memory app service seeded with the deterministic seed data.
 pub fn in_memory_app_service() -> Result<AppService<MemoryAppStore>, AppServiceError> {
     AppService::load_or_seed(MemoryAppStore::default())
 }

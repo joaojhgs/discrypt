@@ -1,4 +1,4 @@
-//! Media encryption, transform bridge, and sender-binding facade.
+//! Media encryption, transform bridge, and sender-binding boundary.
 //!
 //! The media crate is the Phase-1 boundary between MLS exporter state and the
 //! WebRTC frame path. Rust owns SFrame-like keys; callers only exchange KIDs,

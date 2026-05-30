@@ -61,7 +61,7 @@ pub enum GovernanceError {
 ///
 /// The signature covers a domain-separated canonical payload containing the epoch,
 /// committer leaf, signer device public key, and action. The signature bytes are no
-/// longer a deterministic content-hash facade; tampering with any signed field or
+/// longer a deterministic content-hash substitute; tampering with any signed field or
 /// swapping the signer key invalidates the event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GovernanceEvent {

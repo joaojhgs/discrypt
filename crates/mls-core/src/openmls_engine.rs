@@ -4,7 +4,7 @@
 //! upstream OpenMLS group APIs with the RustCrypto provider and the OpenMLS
 //! SQLite storage provider, so group state, epochs, queued proposals, pending
 //! commits, epoch secrets, and confirmation tags are written through OpenMLS'
-//! `StorageProvider` instead of the legacy deterministic facade.
+//! `StorageProvider` instead of the legacy deterministic boundary.
 
 use openmls::prelude::{
     tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait},

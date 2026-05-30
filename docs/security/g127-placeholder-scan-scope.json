@@ -1,0 +1,17 @@
+{
+  "schema": "discrypt.g127.placeholder-scan-scope.v1",
+  "blockPatterns": ["TODO", "FIXME", "todo!", "unimplemented!", "panic!(\\\"not implemented\\\")"],
+  "reviewPatterns": ["shim", "emulat", "facade", "skeleton", "fixture", "local-only", "local dev", "local-dev", "mock"],
+  "scopes": [
+    "crates/*/src",
+    "apps/desktop/src-tauri/src",
+    "apps/ui/src",
+    ".github/workflows"
+  ],
+  "excludedPathFragments": [
+    "/target/",
+    "/node_modules/",
+    "/dist/"
+  ],
+  "g128": "Review-pattern findings are inventoried by this scan and must be explicitly allowlisted or removed by G128."
+}

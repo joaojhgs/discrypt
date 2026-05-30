@@ -1,4 +1,4 @@
-//! Minimal group state facade. Later phases replace internals with OpenMLS.
+//! Minimal group state boundary backed by OpenMLS-oriented state.
 
 use crate::{derive_epoch_secret, DeviceLeaf, ExportLabel};
 use serde::{Deserialize, Serialize};
@@ -212,7 +212,7 @@ mod tests {
                 "primary",
                 idx,
             );
-            // Phase-0 group facade models the group-assigned leaf index explicitly.
+            // Phase-0 group boundary models the group-assigned leaf index explicitly.
             leaf.leaf_index = idx as u32;
             assert_eq!(group.add_leaf(leaf.clone()), Ok(()));
             leaves.push(leaf);

@@ -66,9 +66,9 @@ pub enum KeyState {
     Unavailable,
 }
 
-/// Deterministic content-key derivation for tests/facade.
+/// Deterministic content-key derivation for tests/boundary.
 ///
-/// Content keys are derived through the MLS exporter facade using the
+/// Content keys are derived through the MLS exporter boundary using the
 /// content-key service label. Raw exporter bytes stay inside Rust-owned
 /// content-key logic rather than crossing command/UI boundaries.
 #[must_use]
@@ -472,7 +472,7 @@ pub struct LiveKeyOracle {
 impl LiveKeyOracle {
     /// Create an oracle from repaired local MLS group state plus resolved governance state.
     ///
-    /// This is intentionally local-only: membership is derived from the current local
+    /// This is intentionally local-device: membership is derived from the current local
     /// OpenMLS/group view intersected with the resolved governance roles and bans. It
     /// registers verifier keys from active MLS device leaves and performs no online
     /// lookup that could leak live presence.

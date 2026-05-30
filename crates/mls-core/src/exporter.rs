@@ -1,4 +1,4 @@
-//! Exporter derivation facade used by Rust text/media/content-key service layers.
+//! Exporter derivation boundary used by Rust text/media/content-key service layers.
 
 use sha2::{Digest, Sha256};
 

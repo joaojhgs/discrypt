@@ -1,4 +1,4 @@
-//! Encrypted local application database facade.
+//! Encrypted local application database boundary.
 //!
 //! The app DB stores an encrypted envelope on disk and keeps the wrapping key
 //! behind a keychain trait. The persisted file contains only a wrapped data key,
@@ -116,7 +116,7 @@ pub const fn storage_keychain_decision() -> StorageKeychainDecision {
 /// Local keychain boundary used by the encrypted app DB.
 ///
 /// Implementations should store the wrapping key in an OS/platform keychain or
-/// equivalent local-only secret store. The app DB persists only the data key
+/// equivalent local-device secret store. The app DB persists only the data key
 /// wrapped by this key.
 pub trait AppDbKeychain: Clone + Send + Sync + 'static {
     /// Load a wrapping key by stable key id.

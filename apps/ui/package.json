@@ -58,7 +58,8 @@
     "test:crypto-sensitive-g125": "node ../../scripts/check-crypto-sensitive-deps-g125.mjs",
     "test:repro-g126": "node ../../scripts/check-reproducible-release-g126.mjs",
     "repro:g126": "node ../../scripts/reproducible-release-evidence-g126.mjs --out ../../target/release/reproducibility-g126.json",
-    "test:reproducible-g126": "node ../../scripts/check-reproducible-release-g126.mjs"
+    "test:reproducible-g126": "node ../../scripts/check-reproducible-release-g126.mjs",
+    "test:no-placeholders-g127": "node ../../scripts/check-no-placeholders-g127.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

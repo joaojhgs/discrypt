@@ -126,7 +126,10 @@ Required gates for this decision:
    set matches the current dependency graph.
 9. `cargo deny check bans sources --hide-inclusion-graph` proves wildcard/source
    policy is configured, with duplicate versions still warnings.
-10. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
+10. `npm --prefix apps/ui run test:no-placeholders-g127` proves CI scans
+    production-gated modules for blocking placeholder markers and inventories
+    shim/emulation/facade/skeleton/fixture/local-only wording for G128 review.
+11. Full `cargo audit` and advisory-deny clean runs remain release-blocking gates
    handled by the later advisory/reproducibility stories.
 
 ## Consequences

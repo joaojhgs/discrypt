@@ -132,7 +132,7 @@ pub struct UserProfileView {
     pub display_name: String,
     /// Local device name.
     pub device_name: String,
-    /// Honest local-only recovery posture.
+    /// Honest local-device recovery posture.
     pub recovery_status: String,
 }
 

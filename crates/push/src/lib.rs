@@ -63,7 +63,7 @@ pub struct PushEnvelope {
 }
 
 impl PushEnvelope {
-    /// Return all provider-visible bytes as a deterministic audit fixture.
+    /// Return all provider-visible bytes as a deterministic audit sample.
     #[must_use]
     pub fn provider_visible_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -90,7 +90,7 @@ pub enum PushError {
     ContainsContent,
 }
 
-/// Android wake sender facade.
+/// Android wake sender boundary.
 pub struct AndroidWakeService {
     provider: PushProvider,
 }

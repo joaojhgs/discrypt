@@ -268,7 +268,7 @@ impl SFrameKey {
     }
 }
 
-/// Convenience helper preserving the Phase-0 facade name.
+/// Convenience helper preserving the Phase-0 API name.
 pub fn derive_media_key(
     epoch_secret: &[u8],
     binding: &SenderBinding,
@@ -276,7 +276,7 @@ pub fn derive_media_key(
     SFrameKey::derive(epoch_secret, binding)
 }
 
-/// Convenience helper preserving the Phase-0 facade name while adding AEAD auth.
+/// Convenience helper preserving the Phase-0 API name while adding AEAD auth.
 pub fn protect_frame(
     key: &SFrameKey,
     binding: &SenderBinding,
@@ -565,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_replay_and_roundtrips_facade_ciphertext() -> Result<(), MediaError> {
+    fn rejects_replay_and_roundtrips_boundary_ciphertext() -> Result<(), MediaError> {
         let b = binding(&[1; 32], 1, 1, "alice-laptop")?;
         let mut sender = SFrameSender::new(&[1; 32], b.clone())?;
         let mut registry = MediaKeyRegistry::new();

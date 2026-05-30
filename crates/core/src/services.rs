@@ -44,7 +44,7 @@ pub struct RelayId(pub String);
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
-/// Keychain slot name for sealed local-only secrets.
+/// Keychain slot name for sealed local-device secrets.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SecretName(pub String);
 
@@ -265,7 +265,7 @@ pub struct AdmissionTicket {
 pub struct TextHistoryPage {
     /// Channel being read.
     pub channel_id: ChannelId,
-    /// Ordered encrypted/plaintext-facade message ids for the current adapter.
+    /// Ordered encrypted/plaintext-boundary message ids for the current adapter.
     pub message_ids: Vec<MessageId>,
     /// Cursor for the next page, if any.
     pub next_cursor: Option<String>,
@@ -744,13 +744,13 @@ pub trait AppStateStoreService {
 
 /// Platform/local keychain boundary for sealed secrets.
 pub trait KeychainService {
-    /// Seal a secret into a named local-only keychain slot.
+    /// Seal a secret into a named local-device keychain slot.
     fn seal_secret(&mut self, name: SecretName, plaintext: OpaqueBytes) -> ServiceResult<()>;
 
-    /// Open a named local-only keychain slot.
+    /// Open a named local-device keychain slot.
     fn open_secret(&self, name: &SecretName) -> ServiceResult<Option<OpaqueBytes>>;
 
-    /// Delete a named local-only keychain slot.
+    /// Delete a named local-device keychain slot.
     fn delete_secret(&mut self, name: &SecretName) -> ServiceResult<()>;
 }
 

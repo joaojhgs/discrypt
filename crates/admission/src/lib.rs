@@ -957,7 +957,7 @@ impl AdmissionController {
         }
     }
 
-    /// Attempt password admission. The facade treats `proof_ok` as PAKE/helper result.
+    /// Attempt password admission. The boundary treats `proof_ok` as PAKE/helper result.
     pub fn attempt_password(
         &mut self,
         subject: impl Into<String>,

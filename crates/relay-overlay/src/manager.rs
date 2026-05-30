@@ -2,7 +2,7 @@
 //!
 //! The deterministic topology, ranking, and failover modules remain pure, but
 //! production callers need a stateful owner that ingests measured peer health and
-//! route observations instead of relying on static test fixtures. This module is
+//! route observations instead of relying on static test observations. This module is
 //! that boundary: it accepts runtime metrics from transport/media/text services,
 //! updates the content-blind relay topology, and returns auditable route/failover
 //! decisions without inspecting application plaintext.
