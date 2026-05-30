@@ -26,7 +26,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{timeout, Duration, Instant};
 
 /// End-to-end readiness state used by registry and fallback planning.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterReadinessState {
     /// Adapter feature is not enabled in this build.
