@@ -62,7 +62,7 @@ async function openProfile(
   displayName: string,
   deviceName: string,
 ) {
-  const context = await browser.newContext();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
   const page = await context.newPage();
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -79,7 +79,7 @@ async function openProfile(
   await page.getByLabel("Device name").fill(deviceName);
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("navigation", { name: /workspace sections/i }),
+    page.getByRole("heading", { name: /finish the local trust setup/i }),
   ).toBeVisible();
   await expect(page.getByText(deviceName).first()).toHaveCount(0);
   return { context, page, errors };
@@ -98,10 +98,7 @@ async function readLatestInvite(page: Page) {
 }
 
 async function openDm(page: Page, contactName: string) {
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "DMs", exact: true })
-    .click();
+  await page.getByRole("button", { name: "New message" }).click();
   await page.getByLabel("Contact name").fill(contactName);
   await page.getByRole("button", { name: /start\/open dm/i }).click();
 }
@@ -117,30 +114,18 @@ async function sendDm(page: Page, contactName: string, body: string) {
 }
 
 async function createInvite(page: Page) {
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Groups", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Create group" }).first().click();
   await page.getByLabel("Group name").fill("Two Profile Lab");
   await page
     .getByRole("button", { name: /^Create group$/ })
     .last()
     .click();
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Invites", exact: true })
-    .click();
-  await page
-    .getByRole("button", { name: /create invite for active group/i })
-    .click();
+  await page.getByRole("button", { name: "Create invite" }).click();
   return readLatestInvite(page);
 }
 
 async function joinInvite(page: Page, invite: string) {
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Invites", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Join group" }).click();
   await page.getByLabel("Invite URL or code").fill(invite);
   await page.getByLabel("Joined group/contact label").fill("Two Profile Lab");
   await page.getByRole("button", { name: /join\/open group/i }).click();
@@ -148,10 +133,15 @@ async function joinInvite(page: Page, invite: string) {
 }
 
 async function readRuntimePeers(page: Page) {
-  await expect(page.locator("#runtime-local-peer")).toBeVisible();
+  const localInput = page.locator("#runtime-local-peer");
+  const isVisible = await localInput.isVisible();
+  if (!isVisible) {
+    await page.getByRole("button", { name: "Inspector" }).click();
+  }
+  await expect(localInput).toBeVisible();
   await expect(page.locator("#runtime-remote-peer")).toBeVisible();
   return {
-    local: await page.locator("#runtime-local-peer").inputValue(),
+    local: await localInput.inputValue(),
     remote: await page.locator("#runtime-remote-peer").inputValue(),
   };
 }
@@ -167,10 +157,7 @@ async function expectReciprocalRuntimePeers(owner: Page, member: Page) {
 
 async function createDmInviteForActiveContact(page: Page, contactName: string) {
   await openDm(page, contactName);
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Invites", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Join group" }).click();
   await page
     .getByRole("button", { name: /create dm invite for active dm/i })
     .click();
@@ -178,10 +165,7 @@ async function createDmInviteForActiveContact(page: Page, contactName: string) {
 }
 
 async function acceptDmInvite(page: Page, invite: string, contactName: string) {
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Invites", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Join group" }).click();
   await page.getByLabel("Invite URL or code").fill(invite);
   await page.getByLabel("Joined group/contact label").fill(contactName);
   await page.getByRole("button", { name: /accept\/open dm invite/i }).click();
@@ -189,10 +173,7 @@ async function acceptDmInvite(page: Page, invite: string, contactName: string) {
 }
 
 async function sendGroupMessage(page: Page, body: string) {
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Text", exact: true })
-    .click();
+  await page.getByRole("button", { name: /\#general/ }).click();
   await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
   await page.getByRole("textbox", { name: "Message" }).fill(body);
   await page.getByRole("button", { name: /^Send message$/i }).click();
@@ -210,10 +191,7 @@ async function expectMessageStaysLocal(page: Page, body: string) {
 }
 
 async function attemptVoice(page: Page) {
-  await page
-    .getByRole("navigation", { name: /workspace sections/i })
-    .getByRole("button", { name: "Voice", exact: true })
-    .click();
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
   await expect(
@@ -252,10 +230,10 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     await alice.page.reload();
     await bob.page.reload();
     await expect(
-      alice.page.getByRole("navigation", { name: /workspace sections/i }),
+      alice.page.getByRole("heading", { name: /finish the local trust setup/i }),
     ).toBeVisible();
     await expect(
-      bob.page.getByRole("navigation", { name: /workspace sections/i }),
+      bob.page.getByRole("heading", { name: /finish the local trust setup/i }),
     ).toBeVisible();
     await openDm(alice.page, "Bob");
     await openDm(bob.page, "Alice");

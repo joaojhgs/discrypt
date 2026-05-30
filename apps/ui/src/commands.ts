@@ -542,6 +542,15 @@ export type SetActiveGroupRequest = {
   group_id: string;
 };
 
+export type SetActiveChannelRequest = {
+  group_id: string;
+  channel_id: string;
+};
+
+export type SetActiveDmRequest = {
+  dm_id: string;
+};
+
 export type CreateInviteRequest = {
   group_id?: string | null;
   expires: string;
@@ -2518,6 +2527,68 @@ export async function setActiveGroup(
         dm_id: null,
       };
       pushEvent(state, "group.focused", `Focused group ${group.name}`);
+    }),
+  );
+}
+
+export async function setActiveChannel(
+  request: SetActiveChannelRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_active_channel", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const group = state.groups.find((g) => g.group_id === request.group_id);
+      const channel = group?.channels.find(
+        (c) => c.channel_id === request.channel_id,
+      );
+      if (!channel) {
+        pushCommandError(
+          state,
+          "channel.focus_missing",
+          "set_active_channel",
+          "channel_not_found",
+          "Requested channel does not exist in the group",
+          "Select a channel that belongs to the active group",
+        );
+        return;
+      }
+      const kind = channel.kind === "Voice" ? "voice_channel" : "text_channel";
+      state.active_context = {
+        kind,
+        group_id: request.group_id,
+        channel_id: request.channel_id,
+        dm_id: null,
+      };
+      pushEvent(state, "channel.focused", `Focused channel ${channel.name}`);
+    }),
+  );
+}
+
+export async function setActiveDm(
+  request: SetActiveDmRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_active_dm", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      const dm = state.dms.find((d) => d.dm_id === request.dm_id);
+      if (!dm) {
+        pushCommandError(
+          state,
+          "dm.focus_missing",
+          "set_active_dm",
+          "dm_not_found",
+          "Requested DM does not exist",
+          "Select a DM that already exists",
+        );
+        return;
+      }
+      state.active_context = {
+        kind: "dm",
+        group_id: null,
+        channel_id: null,
+        dm_id: request.dm_id,
+      };
+      pushEvent(state, "dm.focused", `Focused DM ${request.dm_id}`);
     }),
   );
 }
