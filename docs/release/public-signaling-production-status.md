@@ -264,9 +264,10 @@ npm --prefix apps/ui run test:command-coverage
   - public/default bootstrap peer policy and local resource limits are now configured and tested: default public bootstrap is intentionally empty while the libp2p/Hickory DNS stack remains audit-blocked, explicit direct bootstrap endpoints remain capped at 16 with duplicate rejection, 64 KiB envelope/transmit limit, bounded command queue, strict gossipsub validation, flood-publish disabled, and bounded mesh/history/duplicate-cache settings,
   - typed IPFS health covers `topic_mesh_unavailable`, unreachable `bootstrap_connect`, duplicate-envelope storms, and libp2p listener runtime errors as `provider_unhealthy` plus oversized envelopes as `provider_message_too_large`, while invalid/duplicate/overflow profile rejection remains policy-level,
   - provider-visible metadata capture is covered by G133 for the IPFS/libp2p boundary; external host packet capture remains a release-run artifact,
-  - remaining hardening gaps are topic-peer discovery/rendezvous and public-swarm E2E,
+  - remaining hardening gaps are public topic-peer discovery/rendezvous and public-swarm E2E,
   - [x] define the current safe “public IPFS” profile as no built-in DNS bootstrap/default Kubo dependency; production/self-hosted IPFS profiles must provide explicit direct `/ip4` or `/ip6` TCP multiaddrs with `/p2p/<peer-id>` for reachable Discrypt topic peers,
-  - add topic-peer discovery/rendezvous instead of relying on generic IPFS bootstrap peers as topic mesh members,
+  - [x] expose deterministic direct topic-peer multiaddrs from the rust-libp2p adapter and prove a self-hosted/direct `/p2p/<peer-id>` topic-peer roundtrip for presence and sealed WebRTC signaling without relying on generic IPFS bootstrap peers,
+  - add public topic-peer discovery/rendezvous instead of relying on generic IPFS bootstrap peers as topic mesh members,
   - run public-swarm E2E with configured direct bootstrap/rendezvous multiaddrs.
 - [x] Lock separate Rust QUIC rendezvous feature-gate/fail-closed readiness and document production requirements.
 - [ ] Harden separate Rust rendezvous service adapter:

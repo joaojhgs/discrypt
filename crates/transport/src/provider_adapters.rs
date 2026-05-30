@@ -1798,6 +1798,7 @@ pub struct IpfsPubsubProviderSession {
 #[cfg(feature = "ipfs-pubsub-adapter")]
 pub struct IpfsPubsubProviderRoom {
     local_peer_id: SignalingPeerId,
+    local_libp2p_peer_id: libp2p::PeerId,
     commands: tokio::sync::mpsc::Sender<IpfsPubsubCommand>,
     inbox: Arc<AsyncMutex<IpfsPubsubInbox>>,
     listen_addresses: Arc<AsyncMutex<Vec<String>>>,
@@ -2364,6 +2365,26 @@ impl IpfsPubsubProviderRoom {
             .unwrap_or_default()
     }
 
+    /// Return direct peer multiaddrs suitable for explicit topic-peer bootstrap profiles.
+    ///
+    /// Production/self-hosted IPFS profiles require an explicit `/p2p/<peer-id>`
+    /// suffix so peers dial a Discrypt topic peer rather than an arbitrary generic
+    /// IPFS bootstrap node. This helper exposes that exact shape for diagnostics
+    /// and deterministic E2E tests.
+    #[must_use]
+    pub fn direct_topic_peer_multiaddrs_for_tests(&self) -> Vec<String> {
+        self.listen_addresses
+            .try_lock()
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .filter(|address| !address.contains("/p2p/"))
+                    .map(|address| format!("{address}/p2p/{}", self.local_libp2p_peer_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn record_message(
         inbox: &Arc<AsyncMutex<IpfsPubsubInbox>>,
         local_peer_id: &SignalingPeerId,
@@ -2912,6 +2933,7 @@ async fn spawn_ipfs_pubsub_room(
         .kademlia
         .get_providers(provider_key.clone());
 
+    let local_libp2p_peer_id = *swarm.local_peer_id();
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(IPFS_PUBSUB_COMMAND_QUEUE_DEPTH);
     let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
     let inbox = Arc::new(AsyncMutex::new(IpfsPubsubInbox::default()));
@@ -3114,6 +3136,7 @@ async fn spawn_ipfs_pubsub_room(
 
     Ok(IpfsPubsubProviderRoom {
         local_peer_id,
+        local_libp2p_peer_id,
         commands: command_tx,
         inbox,
         listen_addresses,
@@ -5220,6 +5243,102 @@ mod tests {
         assert!(alice_controls
             .iter()
             .any(|control| control.from_peer == bob));
+
+        alice_room.leave().await?;
+        bob_room.leave().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    async fn ipfs_pubsub_direct_topic_peer_multiaddr_roundtrip() -> Result<(), TransportError> {
+        let adapter = IpfsPubsubProviderAdapter;
+        let alice = SignalingPeerId::new("alice-device")?;
+        let bob = SignalingPeerId::new("bob-device")?;
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Group,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Group,
+                b"ipfs direct topic peer",
+                "test",
+            ),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::IpfsPubsub,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("ipfs_pubsub", "direct topic-peer rust-libp2p gossipsub")?,
+        )?;
+
+        let alice_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-alice-direct-topic-peer".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("/ip4/127.0.0.1/tcp/0"),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new(
+                "ipfs_pubsub",
+                "local listener for direct topic peer",
+            )?,
+        };
+        let alice_room = adapter
+            .connect(alice_profile)
+            .await?
+            .join(scope.clone(), capability.clone(), alice.clone())
+            .await?;
+        let alice_topic_peer = alice_room
+            .direct_topic_peer_multiaddrs_for_tests()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                TransportError::SignalingAdapter(
+                    "missing alice /p2p topic peer multiaddr".to_owned(),
+                )
+            })?;
+        assert!(alice_topic_peer.contains("/p2p/"));
+
+        let bob_profile = SignalingAdapterProfile {
+            profile_id: "ipfs-bob-direct-topic-peer".to_owned(),
+            kind: SignalingAdapterKind::IpfsPubsub,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new(alice_topic_peer),
+                SignalingEndpointSecurity::SelfHostedExplicit,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("ipfs_pubsub", "explicit direct topic peer")?,
+        };
+        let bob_room = adapter
+            .connect(bob_profile)
+            .await?
+            .join(scope, capability, bob.clone())
+            .await?;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        bob_room
+            .publish_presence(
+                OpaqueSignalingPayload::new(b"sealed-presence-bob-direct-topic-peer".to_vec())?,
+                120,
+            )
+            .await?;
+        let alice_presence = alice_room.subscribe_presence().await?;
+        assert!(alice_presence.iter().any(|event| event.peer_id == bob));
+
+        let offer = SealedWebRtcNegotiationPayload {
+            version: 1,
+            kind: WebRtcNegotiationPayloadKind::Offer,
+            nonce: [3; 12],
+            ciphertext: b"sealed-ipfs-direct-topic-peer-offer".to_vec(),
+        };
+        alice_room.send_signal(bob.clone(), offer.clone()).await?;
+        let bob_signals = bob_room.take_signals().await?;
+        assert!(bob_signals.iter().any(|signal| signal.payload == offer));
 
         alice_room.leave().await?;
         bob_room.leave().await?;
