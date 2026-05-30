@@ -41,6 +41,8 @@ pub use signaling::{
     SignalingAdapter, SignalingHealth, SignalingHealthState, SignalingObservability,
     SignalingPeerId,
 };
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+pub use signaling::{LocalConformanceSignalingAdapter, LocalConformanceSignalingBus};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;

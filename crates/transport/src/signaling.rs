@@ -11,7 +11,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+use std::collections::HashMap;
 use std::fmt;
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+use std::sync::{Arc, Mutex};
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+use std::time::{Duration, Instant};
 
 /// Opaque peer/device identifier safe for adapter routing.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -205,6 +211,278 @@ pub trait SignalingAdapter: Send + Sync {
 
     /// Redacted observability safe for logs/UI.
     fn observability_redacted(&self) -> SignalingObservability;
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[derive(Clone, Default)]
+pub struct LocalConformanceSignalingBus {
+    state: Arc<Mutex<LocalConformanceBusState>>,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[derive(Default)]
+struct LocalConformanceBusState {
+    rooms: HashMap<String, LocalConformanceRoomState>,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[derive(Default)]
+struct LocalConformanceRoomState {
+    presence: Vec<LocalConformancePresenceRecord>,
+    signals: Vec<PeerSignal>,
+    controls: Vec<OpaqueSignalingPayload>,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[derive(Clone)]
+struct LocalConformancePresenceRecord {
+    event: PresenceEvent,
+    expires_at: Instant,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[derive(Clone)]
+pub struct LocalConformanceSignalingAdapter {
+    kind: SignalingAdapterKind,
+    bus: LocalConformanceSignalingBus,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+impl LocalConformanceSignalingAdapter {
+    pub fn new(kind: SignalingAdapterKind, bus: LocalConformanceSignalingBus) -> Self {
+        Self { kind, bus }
+    }
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+pub struct LocalConformanceSignalingSession {
+    kind: SignalingAdapterKind,
+    bus: LocalConformanceSignalingBus,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+pub struct LocalConformanceRendezvousRoom {
+    key: String,
+    local_peer_id: SignalingPeerId,
+    bus: LocalConformanceSignalingBus,
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[async_trait]
+impl SignalingAdapter for LocalConformanceSignalingAdapter {
+    type Session = LocalConformanceSignalingSession;
+
+    async fn connect(
+        &self,
+        profile: SignalingAdapterProfile,
+    ) -> Result<Self::Session, TransportError> {
+        profile.validate()?;
+        if profile.kind != self.kind {
+            return Err(TransportError::SignalingAdapter(format!(
+                "profile kind {} does not match local conformance adapter {}",
+                profile.kind.canonical_name(),
+                self.kind.canonical_name()
+            )));
+        }
+        Ok(LocalConformanceSignalingSession {
+            kind: self.kind,
+            bus: self.bus.clone(),
+        })
+    }
+
+    fn capabilities(&self) -> SignalingAdapterCapabilities {
+        SignalingAdapterCapabilities::production_required()
+    }
+
+    fn observability_redacted(&self) -> SignalingObservability {
+        SignalingObservability {
+            adapter_kind: self.kind,
+            endpoint_label: format!("local-conformance#{}", self.kind.canonical_name()),
+            health: SignalingHealthState::Healthy,
+            trust_label: AdapterTrustLabel {
+                label: format!("{} local conformance", self.kind.canonical_name()),
+                posture: "deterministic harness; not a public provider".to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[async_trait]
+impl AdapterSession for LocalConformanceSignalingSession {
+    type Room = LocalConformanceRendezvousRoom;
+
+    async fn join(
+        &self,
+        scope: ConversationScope,
+        rendezvous: RendezvousCapability,
+        local_peer_id: SignalingPeerId,
+    ) -> Result<Self::Room, TransportError> {
+        scope.validate()?;
+        if rendezvous.scope != scope {
+            return Err(TransportError::SignalingAdapter(
+                "rendezvous capability scope mismatch".to_owned(),
+            ));
+        }
+        if rendezvous.adapter_kind != self.kind {
+            return Err(TransportError::SignalingAdapter(format!(
+                "rendezvous capability kind {} does not match adapter {}",
+                rendezvous.adapter_kind.canonical_name(),
+                self.kind.canonical_name()
+            )));
+        }
+        let key = room_key(self.kind, &rendezvous.topic);
+        self.bus
+            .state
+            .lock()
+            .map_err(|_| TransportError::SignalingAdapter("local bus lock poisoned".to_owned()))?
+            .rooms
+            .entry(key.clone())
+            .or_default();
+        Ok(LocalConformanceRendezvousRoom {
+            key,
+            local_peer_id,
+            bus: self.bus.clone(),
+        })
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> SignalingHealth {
+        SignalingHealth {
+            adapter_kind: self.kind,
+            state: SignalingHealthState::Healthy,
+            latency_bucket: "local".to_owned(),
+            failure_class: None,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[async_trait]
+impl RendezvousRoom for LocalConformanceRendezvousRoom {
+    async fn publish_presence(
+        &self,
+        encrypted_presence: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        if ttl_seconds == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "presence ttl must be non-zero".to_owned(),
+            ));
+        }
+        let mut state =
+            self.bus.state.lock().map_err(|_| {
+                TransportError::SignalingAdapter("local bus lock poisoned".to_owned())
+            })?;
+        let room = state.rooms.entry(self.key.clone()).or_default();
+        room.presence
+            .retain(|record| record.expires_at > Instant::now());
+        room.presence.push(LocalConformancePresenceRecord {
+            event: PresenceEvent {
+                peer_id: self.local_peer_id.clone(),
+                encrypted_presence,
+                ttl_seconds,
+            },
+            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_seconds)),
+        });
+        Ok(())
+    }
+
+    async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
+        let mut state =
+            self.bus.state.lock().map_err(|_| {
+                TransportError::SignalingAdapter("local bus lock poisoned".to_owned())
+            })?;
+        let room = state.rooms.entry(self.key.clone()).or_default();
+        room.presence
+            .retain(|record| record.expires_at > Instant::now());
+        Ok(room
+            .presence
+            .iter()
+            .map(|record| record.event.clone())
+            .collect())
+    }
+
+    async fn send_signal(
+        &self,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    ) -> Result<(), TransportError> {
+        if payload.ciphertext.is_empty() {
+            return Err(TransportError::SignalingAdapter(
+                "sealed signaling payload must not be empty".to_owned(),
+            ));
+        }
+        self.bus
+            .state
+            .lock()
+            .map_err(|_| TransportError::SignalingAdapter("local bus lock poisoned".to_owned()))?
+            .rooms
+            .entry(self.key.clone())
+            .or_default()
+            .signals
+            .push(PeerSignal {
+                from_peer: self.local_peer_id.clone(),
+                to_peer,
+                payload,
+            });
+        Ok(())
+    }
+
+    async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
+        let mut state =
+            self.bus.state.lock().map_err(|_| {
+                TransportError::SignalingAdapter("local bus lock poisoned".to_owned())
+            })?;
+        let room = state.rooms.entry(self.key.clone()).or_default();
+        let mut mine = Vec::new();
+        let mut remaining = Vec::new();
+        for signal in room.signals.drain(..) {
+            if signal.to_peer == self.local_peer_id {
+                mine.push(signal);
+            } else {
+                remaining.push(signal);
+            }
+        }
+        room.signals = remaining;
+        Ok(mine)
+    }
+
+    async fn broadcast_control(
+        &self,
+        sealed_payload: OpaqueSignalingPayload,
+    ) -> Result<(), TransportError> {
+        self.bus
+            .state
+            .lock()
+            .map_err(|_| TransportError::SignalingAdapter("local bus lock poisoned".to_owned()))?
+            .rooms
+            .entry(self.key.clone())
+            .or_default()
+            .controls
+            .push(sealed_payload);
+        Ok(())
+    }
+
+    async fn leave(&self) -> Result<(), TransportError> {
+        let mut state =
+            self.bus.state.lock().map_err(|_| {
+                TransportError::SignalingAdapter("local bus lock poisoned".to_owned())
+            })?;
+        if let Some(room) = state.rooms.get_mut(&self.key) {
+            room.presence
+                .retain(|record| record.event.peer_id != self.local_peer_id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+fn room_key(kind: SignalingAdapterKind, topic: &str) -> String {
+    format!("{}:{topic}", kind.canonical_name())
 }
 
 #[cfg(test)]
@@ -404,6 +682,28 @@ mod tests {
         })
     }
 
+    fn local_profile(
+        kind: SignalingAdapterKind,
+    ) -> Result<crate::SignalingAdapterProfile, TransportError> {
+        let endpoint = match kind {
+            SignalingAdapterKind::Mqtt => "mqtt://127.0.0.1:1883",
+            SignalingAdapterKind::Nostr => "ws://127.0.0.1:7777",
+            SignalingAdapterKind::IpfsPubsub => "ws://127.0.0.1:7788",
+            SignalingAdapterKind::DiscryptQuicRendezvous => "http://127.0.0.1:7799",
+        };
+        Ok(crate::SignalingAdapterProfile {
+            profile_id: format!("{}-local-conformance", kind.canonical_name()),
+            kind,
+            endpoints: vec![crate::SignalingProviderEndpoint::new(
+                crate::Endpoint::new(endpoint),
+                crate::SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new(kind.canonical_name(), "local conformance")?,
+        })
+    }
+
     #[tokio::test]
     async fn adapter_contract_uses_prederived_capability_and_sealed_payloads(
     ) -> Result<(), TransportError> {
@@ -448,6 +748,85 @@ mod tests {
 
         room.leave().await?;
         assert!(room.subscribe_presence().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_conformance_adapters_exchange_sealed_dm_signals_for_every_required_kind(
+    ) -> Result<(), TransportError> {
+        let kinds = [
+            SignalingAdapterKind::Mqtt,
+            SignalingAdapterKind::Nostr,
+            SignalingAdapterKind::IpfsPubsub,
+            SignalingAdapterKind::DiscryptQuicRendezvous,
+        ];
+        for kind in kinds {
+            let bus = LocalConformanceSignalingBus::default();
+            let adapter = LocalConformanceSignalingAdapter::new(kind, bus);
+            let scope = crate::ConversationScope::new(
+                ConnectivityScopeLevel::Dm,
+                crate::derive_scope_commitment(
+                    ConnectivityScopeLevel::Dm,
+                    format!("alice-bob-{}", kind.canonical_name()).as_bytes(),
+                    "local-conformance",
+                ),
+            )?;
+            let capability = RendezvousCapability::derive(
+                scope.clone(),
+                kind,
+                b"bootstrap secret with enough bytes for all local adapters",
+                format!("local-conformance-random-entropy-{}", kind.canonical_name()).as_bytes(),
+                120,
+                ProviderMetadataPosture::HashedTopic,
+                AdapterTrustLabel::new(kind.canonical_name(), "local conformance")?,
+            )?;
+            assert!(!capability.topic.contains("alice"));
+            assert!(!capability.topic.contains("bob"));
+
+            let alice = adapter.connect(local_profile(kind)?).await?;
+            let bob = adapter.connect(local_profile(kind)?).await?;
+            let alice_room = alice
+                .join(
+                    scope.clone(),
+                    capability.clone(),
+                    SignalingPeerId::new("alice-device")?,
+                )
+                .await?;
+            let bob_room = bob
+                .join(scope, capability, SignalingPeerId::new("bob-device")?)
+                .await?;
+
+            alice_room
+                .publish_presence(OpaqueSignalingPayload::new(b"sealed-alice-presence")?, 120)
+                .await?;
+            let bob_presence = bob_room.subscribe_presence().await?;
+            assert_eq!(bob_presence.len(), 1);
+            assert_eq!(
+                bob_presence[0].peer_id,
+                SignalingPeerId::new("alice-device")?
+            );
+
+            let sealed_dm_offer = SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [kind as u8; 12],
+                ciphertext: format!("sealed-dm-offer-{}", kind.canonical_name()).into_bytes(),
+            };
+            alice_room
+                .send_signal(SignalingPeerId::new("bob-device")?, sealed_dm_offer.clone())
+                .await?;
+            let bob_signals = bob_room.take_signals().await?;
+            assert_eq!(bob_signals.len(), 1);
+            assert_eq!(
+                bob_signals[0].from_peer,
+                SignalingPeerId::new("alice-device")?
+            );
+            assert_eq!(bob_signals[0].payload, sealed_dm_offer);
+            assert!(alice_room.take_signals().await?.is_empty());
+
+            bob_room.leave().await?;
+            alice_room.leave().await?;
+        }
         Ok(())
     }
 }
