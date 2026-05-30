@@ -1379,6 +1379,7 @@ dependencies = [
  "discrypt-core",
  "discrypt-media",
  "discrypt-mls-core",
+ "discrypt-mls-delivery",
  "discrypt-signaling",
  "discrypt-storage",
  "discrypt-transport",

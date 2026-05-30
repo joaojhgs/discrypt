@@ -170,6 +170,23 @@ export type MessageTargetView = {
   channel_id: string | null;
 };
 
+export type TextDeliveryReceiptView = {
+  recipient_device_id: string;
+  received_at_ms: number;
+  envelope_ciphertext_hash: string;
+  recipient_key_fingerprint: string;
+};
+
+export type TextDeliveryReceipt = {
+  group_id_commitment: number[];
+  message_id: string;
+  recipient_leaf: number;
+  recipient_device_id: string;
+  received_at_ms: number;
+  envelope_ciphertext_hash: number[];
+  signature: number[];
+};
+
 export type AppMessageView = {
   message_id: string;
   target: MessageTargetView;
@@ -180,6 +197,7 @@ export type AppMessageView = {
   state_key: string;
   state_label: string;
   state_detail: string;
+  peer_receipt: TextDeliveryReceiptView | null;
   sent_at: string;
 };
 
@@ -532,6 +550,12 @@ export type SendMessageRequest = {
   body: string;
   transport_proof?: boolean;
   adapter_kind?: string | null;
+};
+
+export type ApplyTextDeliveryReceiptRequest = {
+  message_id: string;
+  receipt: TextDeliveryReceipt;
+  recipient_verifying_key_hex: string;
 };
 
 export type JoinVoiceRequest = {
@@ -2729,6 +2753,7 @@ export async function sendMessage(
         state_detail: request.transport_proof
           ? "Fallback web runtime cannot run the Rust/Tauri provider-signaled WebRTC transport proof; native command path is required"
           : "Message is in the local encrypted author log; peer receipt requires backend-state proof",
+        peer_receipt: null,
         sent_at: `local-${state.messages.length + 1}`,
       });
       pushEvent(
@@ -2737,6 +2762,27 @@ export async function sendMessage(
         "Message appended to local encrypted timeline; remote delivery/read receipts are not claimed",
       );
     }),
+  );
+}
+
+
+export async function applyTextDeliveryReceipt(
+  request: ApplyTextDeliveryReceiptRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "apply_text_delivery_receipt",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "message.receipt_rejected",
+          "apply_text_delivery_receipt",
+          "receipt_verification_unavailable",
+          "Fallback web runtime cannot verify signed peer receipts; native Rust/Tauri command path is required",
+          "Run the native app to verify peer receipt signatures",
+        );
+      }),
   );
 }
 

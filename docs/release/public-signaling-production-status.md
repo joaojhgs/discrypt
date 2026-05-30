@@ -11,7 +11,7 @@ Discrypt is **not production-complete** for the full serverless P2P encrypted ap
 - **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; `/dnsaddr` bootstrap multiaddrs are accepted, but the latest public bootstrap smoke failed with `InsufficientPeers` because public IPFS bootstrap peers are not enough by themselves to form a topic mesh.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
 - **Provider-signaled WebRTC data-channel proof: MQTT and Nostr are now green in live public-provider tests when using public STUN and a real network UDP bind.**
-- **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof reaches the Rust transport signaling adapter layer, sealed WebRTC offer/answer exchange, a real WebRTC DataChannel frame over public MQTT/Nostr rendezvous, and an opt-in Tauri `send_message(..., transport_proof=true)` path that sends an opaque message-derived frame through public MQTT and Nostr WebRTC diagnostics; it is still not the complete two-installed-profile peer receipt or voice/media-plane proof.
+- **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof reaches the Rust transport signaling adapter layer, sealed WebRTC offer/answer exchange, a real WebRTC DataChannel frame over public MQTT/Nostr rendezvous, an opt-in Tauri `send_message(..., transport_proof=true)` path that sends an opaque message-derived frame through public MQTT and Nostr WebRTC diagnostics, and a Tauri command path that verifies signed peer delivery receipts against stored encrypted message envelopes; it is still not the complete two-installed-profile peer receipt transport or voice/media-plane proof.
 
 ## What was implemented now
 
@@ -179,6 +179,32 @@ Public provider-signaled WebRTC data-channel status:
 - The same transport proof is exposed to Tauri as an explicit `data_channel_probe` diagnostic. It is not run automatically because public providers can rate-limit and the probe is network-dependent.
 - The message composer can now opt into the same backend proof per send. Latest live Tauri MQTT message-proof run passed with `DISCRYPT_DESKTOP_PUBLIC_MQTT_MESSAGE_E2E=1` against `mqtts://broker.emqx.io:8883`; latest live Tauri Nostr message-proof run passed with `DISCRYPT_DESKTOP_PUBLIC_NOSTR_MESSAGE_E2E=1` against `wss://nos.lol`. Both set `transport_probe_verified` and record a frame SHA-256 in diagnostics. This is a command/backend transport proof, not a signed remote peer receipt.
 
+
+### Signed text delivery receipt boundary
+
+Files:
+
+- `crates/mls-delivery/src/lib.rs`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/ui/src/commands.ts`
+
+Behavior:
+
+- `send_message` now stores a signed `TextMessageEnvelope` record for the opaque encrypted text/control frame that would be delivered to a peer.
+- The Tauri command `apply_text_delivery_receipt` accepts a `TextDeliveryReceipt`, verifies it with `discrypt-mls-delivery` against the stored envelope, message id, group/DM/channel delivery group id, recipient verifying key, and envelope ciphertext hash, then marks the message as `peer_receipt` only after verification succeeds.
+- Tampered receipts are rejected with `receipt_verification_failed` and do not upgrade the message state.
+- The UI command surface has typed receipt/receipt-view models and a native-only `applyTextDeliveryReceipt(...)` binding; browser fallback stays honest and reports that signed receipts require the Rust/Tauri backend.
+- This is the signed state-transition boundary needed for remote delivery honesty, but it is **not yet** a full production peer-delivery flow because the receiving peer still has to generate the receipt and carry it back over a persistent two-profile DataChannel session.
+
+Verification:
+
+```bash
+cargo test -q -p discrypt-desktop signed_text_delivery_receipt_updates_message_state -- --nocapture
+cargo test -q -p discrypt-desktop tampered_text_delivery_receipt_is_rejected -- --nocapture
+cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter
+npm --prefix apps/ui run typecheck
+```
+
 ## What remains open before production
 
 ### P0: adapter support gaps
@@ -227,7 +253,7 @@ Public provider-signaled WebRTC data-channel status:
 - [x] Establish data channel for opaque text/control delivery across two independent Rust transport peers over public MQTT and Nostr rendezvous.
 - [x] Expose a UI/Tauri opt-in message-send transport proof that sends an opaque message-derived frame through the provider-signaled WebRTC DataChannel diagnostic.
 - [x] Add a same-process Tauri service harness that can load and persist two isolated app profiles from distinct state files, removing the prior global-state-only blocker for two-profile command E2E tests.
-- [ ] Establish persistent send/receive over the same data-channel path across two real Tauri app profiles/devices from UI-driven DM/group state, with signed peer receipts.
+- [ ] Establish persistent send/receive over the same data-channel path across two real Tauri app profiles/devices from UI-driven DM/group state, with signed peer receipts. The signed receipt verification/apply boundary is implemented and tested; receipt generation/transport across the persistent peer session remains open.
 - [ ] Establish audio media path and prove speaking/mute/volume UI state reflects real media state.
 - [x] Prove public STUN participates in provider-signaled WebRTC data-channel setup in the live same-host Rust transport harness with real network UDP bind.
 - [ ] Prove STUN works across distinct machines and normal NAT scenarios.

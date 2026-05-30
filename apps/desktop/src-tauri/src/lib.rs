@@ -30,6 +30,11 @@ use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
     Identity, SafetyNumber,
 };
+#[cfg(test)]
+use discrypt_mls_delivery::TextDeliveryReceiptInput;
+use discrypt_mls_delivery::{
+    TextDeliveryReceipt, TextMessageEnvelope, TextMessageEnvelopeInput, TextRetentionMetadata,
+};
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
 #[cfg(not(all(target_os = "linux", feature = "production-storage")))]
@@ -218,6 +223,19 @@ pub struct MessageTargetView {
     pub channel_id: Option<String>,
 }
 
+/// Verified signed peer delivery receipt metadata for a message row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextDeliveryReceiptView {
+    /// Recipient device id that signed the delivery receipt.
+    pub recipient_device_id: String,
+    /// Receipt timestamp in milliseconds.
+    pub received_at_ms: u64,
+    /// Hash of the ciphertext envelope authenticated by the receipt.
+    pub envelope_ciphertext_hash: String,
+    /// Recipient verifying key fingerprint used for receipt verification.
+    pub recipient_key_fingerprint: String,
+}
+
 /// Command-backed local text message row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessageView {
@@ -242,6 +260,9 @@ pub struct MessageView {
     /// Evidence/caveat for the message state.
     #[serde(default = "default_text_state_detail")]
     pub state_detail: String,
+    /// Verified signed peer receipt metadata when available.
+    #[serde(default)]
+    pub peer_receipt: Option<TextDeliveryReceiptView>,
     /// Deterministic local timestamp/counter label.
     pub sent_at: String,
 }
@@ -857,6 +878,17 @@ pub struct SendMessageRequest {
     pub adapter_kind: Option<String>,
 }
 
+/// Request to apply a signed peer delivery receipt to a persisted message.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplyTextDeliveryReceiptRequest {
+    /// Message id being acknowledged.
+    pub message_id: String,
+    /// Signed delivery receipt received from a peer device over text/control transport.
+    pub receipt: TextDeliveryReceipt,
+    /// Hex-encoded recipient Ed25519 verifying key expected to validate the receipt.
+    pub recipient_verifying_key_hex: String,
+}
+
 /// Request to join a voice channel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JoinVoiceRequest {
@@ -1186,6 +1218,21 @@ impl TransportSessionRecord {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct TextDeliveryEnvelopeRecord {
+    message_id: String,
+    group_id: String,
+    sender_verifying_key_hex: String,
+    envelope: TextMessageEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct TextDeliveryReceiptRecord {
+    message_id: String,
+    recipient_verifying_key_hex: String,
+    receipt: TextDeliveryReceipt,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -1196,6 +1243,10 @@ struct PersistedAppState {
     groups: Vec<GroupView>,
     active_context: Option<ActiveContextView>,
     messages: Vec<MessageView>,
+    #[serde(default)]
+    text_delivery_envelopes: Vec<TextDeliveryEnvelopeRecord>,
+    #[serde(default)]
+    text_delivery_receipts: Vec<TextDeliveryReceiptRecord>,
     voice_session: Option<VoiceSessionView>,
     invites: Vec<InviteView>,
     devices: Vec<DeviceView>,
@@ -2324,6 +2375,11 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                 }
             }
         }
+        if let Ok(envelope_record) =
+            state.text_delivery_envelope_record(&request.target, &message_id, body, sequence)
+        {
+            state.text_delivery_envelopes.push(envelope_record);
+        }
         let message = MessageView {
             message_id,
             target: request.target,
@@ -2334,6 +2390,7 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             state_key,
             state_label,
             state_detail,
+            peer_receipt: None,
             sent_at: format!("local-{sequence}"),
         };
         state.messages.push(message);
@@ -2341,6 +2398,21 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             "message.sent",
             "Message appended to local encrypted timeline; remote delivery/read receipts are not claimed",
         );
+    })
+}
+
+/// Tauri command: apply a signed peer delivery receipt to a persisted message.
+pub fn apply_text_delivery_receipt(request: ApplyTextDeliveryReceiptRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        if let Err(error) = state.apply_text_delivery_receipt(request) {
+            state.push_command_error(
+                "message.receipt_rejected",
+                "apply_text_delivery_receipt",
+                "receipt_verification_failed",
+                error,
+                "Accept peer delivery only from a receipt whose signature, message id, group binding, and ciphertext hash verify",
+            );
+        }
     })
 }
 
@@ -2773,6 +2845,13 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn apply_text_delivery_receipt(
+        request: ApplyTextDeliveryReceiptRequest,
+    ) -> AppStateView {
+        super::apply_text_delivery_receipt(request)
+    }
+
+    #[tauri::command]
     pub(super) fn join_voice(request: JoinVoiceRequest) -> AppStateView {
         super::join_voice(request)
     }
@@ -2845,6 +2924,7 @@ pub fn run() {
             ipc_commands::accept_dm_invite,
             ipc_commands::create_channel,
             ipc_commands::send_message,
+            ipc_commands::apply_text_delivery_receipt,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
@@ -2874,6 +2954,8 @@ impl PersistedAppState {
             groups: Vec::new(),
             active_context: None,
             messages: Vec::new(),
+            text_delivery_envelopes: Vec::new(),
+            text_delivery_receipts: Vec::new(),
             voice_session: None,
             invites: Vec::new(),
             devices: Vec::new(),
@@ -3388,6 +3470,98 @@ impl PersistedAppState {
             ),
         );
         Ok(view)
+    }
+
+    fn text_delivery_envelope_record(
+        &mut self,
+        target: &MessageTargetView,
+        message_id: &str,
+        body: &str,
+        sequence: u64,
+    ) -> Result<TextDeliveryEnvelopeRecord, String> {
+        let group_id = text_delivery_group_id(target)?;
+        let seed = self.identity_seed_bytes();
+        let signing_key = SigningKey::from_bytes(&seed);
+        let ciphertext =
+            opaque_text_control_frame_for_message(self, target, message_id, body, sequence);
+        let envelope = TextMessageEnvelope::sign(
+            &group_id,
+            TextMessageEnvelopeInput {
+                epoch: 1,
+                sender_leaf: 1,
+                sender_device_id: self.local_user_id(),
+                sequence,
+                message_id: message_id.to_owned(),
+                retention: TextRetentionMetadata {
+                    policy: "app-default".to_owned(),
+                    created_at_ms: sequence,
+                    expires_at_ms: None,
+                    delete_after_read: false,
+                },
+                content_ciphertext: ciphertext,
+            },
+            &signing_key,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(TextDeliveryEnvelopeRecord {
+            message_id: message_id.to_owned(),
+            group_id,
+            sender_verifying_key_hex: hex::encode(signing_key.verifying_key().as_bytes()),
+            envelope,
+        })
+    }
+
+    fn apply_text_delivery_receipt(
+        &mut self,
+        request: ApplyTextDeliveryReceiptRequest,
+    ) -> Result<(), String> {
+        let recipient_key = verifying_key_from_hex(&request.recipient_verifying_key_hex)
+            .ok_or_else(|| "recipient verifying key is invalid".to_owned())?;
+        let envelope_record = self
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == request.message_id)
+            .ok_or_else(|| "no persisted text envelope for receipt message id".to_owned())?;
+        request
+            .receipt
+            .verify(
+                &envelope_record.group_id,
+                &envelope_record.envelope,
+                &recipient_key,
+            )
+            .map_err(|error| error.to_string())?;
+        let receipt_view = TextDeliveryReceiptView {
+            recipient_device_id: request.receipt.recipient_device_id.clone(),
+            received_at_ms: request.receipt.received_at_ms,
+            envelope_ciphertext_hash: hex::encode(request.receipt.envelope_ciphertext_hash),
+            recipient_key_fingerprint: key_fingerprint(&recipient_key),
+        };
+        let message = self
+            .messages
+            .iter_mut()
+            .find(|message| message.message_id == request.message_id)
+            .ok_or_else(|| "no message row for receipt message id".to_owned())?;
+        message.status =
+            "signed peer delivery receipt verified for this encrypted envelope".to_owned();
+        message.state_key = "peer_receipt".to_owned();
+        message.state_label = "Peer receipt".to_owned();
+        message.state_detail = format!(
+            "Signed receipt verified from {} at {} for envelope_ciphertext_hash={}",
+            receipt_view.recipient_device_id,
+            receipt_view.received_at_ms,
+            receipt_view.envelope_ciphertext_hash
+        );
+        message.peer_receipt = Some(receipt_view);
+        self.text_delivery_receipts.push(TextDeliveryReceiptRecord {
+            message_id: request.message_id.clone(),
+            recipient_verifying_key_hex: request.recipient_verifying_key_hex,
+            receipt: request.receipt,
+        });
+        self.push_event(
+            "message.receipt_verified",
+            format!("Verified signed peer receipt for {}", request.message_id),
+        );
+        Ok(())
     }
 
     fn active_connectivity_policy(
@@ -4264,6 +4438,33 @@ fn opaque_text_control_frame_for_message(
         hex::encode(hasher.finalize())
     )
     .into_bytes()
+}
+
+fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> {
+    match target.kind.as_str() {
+        "dm" => target
+            .dm_id
+            .as_ref()
+            .map(|dm_id| format!("dm:{dm_id}"))
+            .ok_or_else(|| "DM delivery receipt target requires dm_id".to_owned()),
+        "channel" => Ok(format!(
+            "group:{}:channel:{}",
+            target
+                .group_id
+                .as_deref()
+                .ok_or_else(|| "channel delivery receipt target requires group_id".to_owned())?,
+            target
+                .channel_id
+                .as_deref()
+                .ok_or_else(|| "channel delivery receipt target requires channel_id".to_owned())?
+        )),
+        other => Err(format!("unsupported delivery receipt target kind {other}")),
+    }
+}
+
+fn key_fingerprint(key: &VerifyingKey) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    hex::encode(&digest[..10])
 }
 
 #[cfg(test)]
@@ -6507,6 +6708,129 @@ mod tests {
             .voice_states
             .iter()
             .any(|entry| entry.key == "joining" && entry.status == "joined"));
+    }
+
+    #[test]
+    fn signed_text_delivery_receipt_updates_message_state() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("signed-text-receipt");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "receipt-bound message".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let persisted = load_state();
+        let envelope = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+        let recipient_signer = SigningKey::generate(&mut OsRng);
+        let receipt = TextDeliveryReceipt::sign(
+            &envelope.group_id,
+            TextDeliveryReceiptInput {
+                message_id: message_id.clone(),
+                recipient_leaf: 2,
+                recipient_device_id: "bob-desktop".to_owned(),
+                received_at_ms: 42_000,
+                envelope_ciphertext_hash: envelope.envelope.ciphertext_hash(),
+            },
+            &recipient_signer,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: hex::encode(recipient_signer.verifying_key().as_bytes()),
+        });
+
+        assert!(receipted.last_command_error.is_none());
+        let message = receipted
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message row missing".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        assert_eq!(message.state_label, "Peer receipt");
+        assert!(message.peer_receipt.is_some());
+        assert!(message.state_detail.contains("bob-desktop"));
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_text_delivery_receipt_is_rejected() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("tampered-text-receipt");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "tamper receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let persisted = load_state();
+        let envelope = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "persisted text envelope missing".to_owned())?;
+        let recipient_signer = SigningKey::generate(&mut OsRng);
+        let mut receipt = TextDeliveryReceipt::sign(
+            &envelope.group_id,
+            TextDeliveryReceiptInput {
+                message_id: message_id.clone(),
+                recipient_leaf: 2,
+                recipient_device_id: "bob-desktop".to_owned(),
+                received_at_ms: 42_000,
+                envelope_ciphertext_hash: envelope.envelope.ciphertext_hash(),
+            },
+            &recipient_signer,
+        )
+        .map_err(|error| error.to_string())?;
+        receipt.message_id = "different-message".to_owned();
+
+        let rejected = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: hex::encode(recipient_signer.verifying_key().as_bytes()),
+        });
+
+        let error = rejected
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "tampered receipt should be rejected".to_owned())?;
+        assert_eq!(error.code, "receipt_verification_failed");
+        assert_eq!(rejected.messages[0].state_key, "sent_local");
+        Ok(())
     }
 
     #[test]
