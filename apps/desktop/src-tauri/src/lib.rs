@@ -50,6 +50,8 @@ use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
 #[cfg(test)]
+use discrypt_transport::start_provider_webrtc_text_control_runtime_pair_with_answerer;
+#[cfg(test)]
 use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
@@ -4704,6 +4706,142 @@ impl PersistedAppState {
             return Err("receipt frame unexpectedly generated a response frame".to_owned());
         }
         Ok(ProviderWebRtcDataChannelProbeView::from(probe))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
+        &mut self,
+        receiver: TauriAppService,
+        message_id: &str,
+        requested_kind: Option<&str>,
+        transport_session_id: impl Into<String>,
+    ) -> Result<
+        (
+            discrypt_transport::ProviderTextControlRuntimeEvidence,
+            TextControlTransportPumpReportView,
+            PersistedAppState,
+        ),
+        String,
+    > {
+        let outbox_frame = self
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id && record.state_key == "pending")
+            .map(TextControlOutboxFrameView::from)
+            .ok_or_else(|| {
+                "no pending persisted text/control outbox frame for live runtime pump".to_owned()
+            })?;
+        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
+            "No active DM/group/invite connectivity policy is available for live text/control runtime"
+                .to_owned()
+        })?;
+        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
+        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
+        else {
+            return Err(
+                "No signaling profile matches the requested adapter kind and build readiness"
+                    .to_owned(),
+            );
+        };
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let ice_config =
+            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
+        let bootstrap_secret = self.probe_material(
+            "discrypt-live-runtime-pair-bootstrap-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = self.probe_material(
+            "discrypt-live-runtime-pair-entropy-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            16,
+        );
+        let mut sender_state = self.clone();
+        let target = outbox_frame.target.clone();
+        let transport_session_id = transport_session_id.into();
+        let receiver_service = Arc::new(Mutex::new(receiver));
+
+        let (updated_sender, receiver_state, evidence, report) = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    format!("Could not start live text/control runtime-pair pump: {error}")
+                })?;
+            runtime.block_on(async move {
+                let answerer_service = receiver_service.clone();
+                let receiver_after = receiver_service.clone();
+                let pair = start_provider_webrtc_text_control_runtime_pair_with_answerer(
+                    profile,
+                    scope,
+                    &bootstrap_secret,
+                    &random_entropy,
+                    discrypt_transport::WebRtcNegotiationConfig::new(ice_config),
+                    move |received| {
+                        let frame: TextControlFrameView =
+                            serde_json::from_slice(&received).map_err(|error| {
+                                TransportError::Unavailable(format!(
+                                    "receiver could not decode live text/control frame: {error}"
+                                ))
+                            })?;
+                        let mut response_frame = None;
+                        answerer_service
+                            .lock()
+                            .map_err(|_| {
+                                TransportError::Unavailable(
+                                    "live runtime receiver service lock poisoned".to_owned(),
+                                )
+                            })?
+                            .mutate(|state| {
+                                response_frame = state.handle_text_control_frame(frame);
+                            });
+                        let response_frame = response_frame.ok_or_else(|| {
+                            TransportError::Unavailable(
+                                "receiver did not accept live text/control frame or generate receipt"
+                                    .to_owned(),
+                            )
+                        })?;
+                        serde_json::to_vec(&response_frame).map_err(|error| {
+                            TransportError::Unavailable(format!(
+                                "could not encode live text/control response frame: {error}"
+                            ))
+                        })
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let evidence = pair.evidence().clone();
+                let report = sender_state
+                    .pump_text_control_transport_once(
+                        pair.transport().as_ref(),
+                        ListPendingTextControlFramesRequest {
+                            target: Some(target),
+                            limit: Some(1),
+                            operation_timeout_ms: Some(10_000),
+                        },
+                        transport_session_id,
+                    )
+                    .await;
+                pair.close().await.map_err(|error| error.to_string())?;
+                let receiver_state = receiver_after
+                    .lock()
+                    .map_err(|_| "live runtime receiver service lock poisoned".to_owned())?
+                    .state
+                    .clone();
+                Ok::<_, String>((sender_state, receiver_state, evidence, report))
+            })
+        })
+        .join()
+        .map_err(|_| "live text/control runtime-pair pump thread panicked".to_owned())??;
+
+        *self = updated_sender;
+        Ok((evidence, report, receiver_state))
     }
 
     fn text_delivery_envelope_record(
@@ -11116,6 +11254,222 @@ mod tests {
         assert!(proof.text_control_frame_roundtrip);
         assert!(proof.receipt_frame_roundtrip);
         assert!(state.voice_session.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "mqtt-adapter")]
+    fn public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled() -> Result<(), String>
+    {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public MQTT live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E=1 to run"
+            );
+            return Ok(());
+        }
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("desktop-public-mqtt-live-runtime-pair-alice");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "mqtt live runtime pair receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let bob_path = fresh_state_path("desktop-public-mqtt-live-runtime-pair-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: Some("mqtt".to_owned()),
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        assert_eq!(
+            started.transport_diagnostics.route_proof_status,
+            "route-proof-not-available"
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session_id = guard
+            .state
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        let (evidence, report, bob_state) = guard
+            .state
+            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
+                bob,
+                &message_id,
+                Some("mqtt"),
+                session_id,
+            )?;
+        guard.persist();
+
+        assert_eq!(evidence.kind.canonical_name(), "mqtt");
+        assert!(evidence.offerer_direct_path_ready);
+        assert!(evidence.answerer_direct_path_ready);
+        assert!(evidence.offerer_data_channel_open);
+        assert!(evidence.answerer_data_channel_open);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 1);
+        assert_eq!(report.receipts_applied, 1);
+        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert!(
+            alice_reloaded
+                .messages
+                .iter()
+                .any(|message| message.message_id == message_id
+                    && message.state_key == "peer_receipt")
+        );
+        assert!(bob_state.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+        assert!(bob_state
+            .text_delivery_receipts
+            .iter()
+            .any(|receipt| receipt.message_id == message_id));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled() -> Result<(), String>
+    {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public Nostr live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 to run"
+            );
+            return Ok(());
+        }
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("desktop-public-nostr-live-runtime-pair-alice");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
+                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "nostr live runtime pair receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+
+        let bob_path = fresh_state_path("desktop-public-nostr-live-runtime-pair-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: Some("nostr".to_owned()),
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        assert_eq!(
+            started.transport_diagnostics.route_proof_status,
+            "route-proof-not-available"
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session_id = guard
+            .state
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        let (evidence, report, bob_state) = guard
+            .state
+            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
+                bob,
+                &message_id,
+                Some("nostr"),
+                session_id,
+            )?;
+        guard.persist();
+
+        assert_eq!(evidence.kind.canonical_name(), "nostr");
+        assert!(evidence.offerer_direct_path_ready);
+        assert!(evidence.answerer_direct_path_ready);
+        assert!(evidence.offerer_data_channel_open);
+        assert!(evidence.answerer_data_channel_open);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 1);
+        assert_eq!(report.receipts_applied, 1);
+        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert!(
+            alice_reloaded
+                .messages
+                .iter()
+                .any(|message| message.message_id == message_id
+                    && message.state_key == "peer_receipt")
+        );
+        assert!(bob_state.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+        assert!(bob_state
+            .text_delivery_receipts
+            .iter()
+            .any(|receipt| receipt.message_id == message_id));
+        Ok(())
     }
 
     #[test]
