@@ -9,7 +9,7 @@ Discrypt is **not production-complete** for the full serverless P2P encrypted ap
 - **MQTT public signaling: implemented behind `mqtt-adapter` and latest reruns passed against a real public broker after the adapter began waiting for broker subscription acknowledgements before publishing.**
 - **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
 - **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; default public bootstrap is now disabled while the libp2p/Hickory DNS stack remains audit-blocked, so production IPFS profiles must use explicit direct `/ip4` or `/ip6` multiaddrs until DNS/topic-peer discovery is remediated.**
-- **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
+- **Separate Rust rendezvous service adapter: `discrypt-quic-rendezvous-adapter` now wires the content-blind sibling `discrypt-signaling` service API over validated HTTPS/WSS-or-loopback HTTP endpoints and proves local roundtrip when the sibling binary is available; native `quic://` transport remains explicitly reserved until a native QUIC client is audited.**
 - **Provider-signaled WebRTC data-channel proof: MQTT and Nostr are now green in live public-provider tests when using public STUN and a real network UDP bind.**
 - **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof reaches the Rust transport signaling adapter layer, sealed WebRTC offer/answer exchange, a real WebRTC DataChannel frame over public MQTT/Nostr rendezvous, an opt-in Tauri `send_message(..., transport_proof=true)` path that sends an opaque message-derived frame through public MQTT and Nostr WebRTC diagnostics, a Tauri command path that verifies signed peer delivery receipts against stored encrypted message envelopes, and an env-gated same-process two-profile MQTT proof that carries Alice's serialized text/control envelope frame over the provider-signaled DataChannel, invokes Bob's receiver frame handler to verify/persist the envelope and generate the signed receipt frame, returns that receipt frame, and only then lets Alice apply `peer_receipt`; a local two-state-file regression now reloads Bob and Alice from disk after the frame handling to prove those receipt state transitions persist, but it is still not the complete persistent two-installed-profile peer receipt transport or voice/media-plane proof.
 
@@ -42,7 +42,7 @@ Behavior:
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
 - **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
 
-### Nostr and IPFS real adapters plus remaining fail-closed QUIC readiness groundwork
+### Nostr, IPFS, and separate rendezvous service adapters
 
 Files:
 
@@ -61,10 +61,13 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
-  quic_rendezvous_feature_gate_remains_fail_closed_until_sibling_client_is_wired
+  quic_rendezvous_feature_gate_is_selectable_but_rejects_reserved_native_quic_scheme
+
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
+  discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available -- --nocapture
 ```
 
-Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; QUIC still passes fail-closed guards proving it remains non-selectable until the sibling-service client is implemented and tested.
+Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; the separate Discrypt rendezvous adapter is selectable when feature-gated and uses the sibling service HTTP API for sealed presence/signal/control roundtrips. The adapter still rejects native `quic://` endpoints because the sibling service ADR reserves them until a native QUIC client is implemented and audited.
 
 - Nostr profile handling now preserves every configured relay endpoint when joining a room and publishes/subscribes against the configured relay set instead of silently collapsing a profile to the first relay. The latest single-relay public WebRTC smoke still passes against `wss://nos.lol`; a degraded multi-relay public soak now proves fallback behavior with one intentionally invalid relay, and blocked-relay auth evidence now maps to typed `provider_auth_required`; reproducible public rate-limit evidence remains opportunistic.
 
@@ -255,10 +258,11 @@ npm --prefix apps/ui run test:command-coverage
   - run public-swarm E2E with configured direct bootstrap/rendezvous multiaddrs,
   - add provider-visible metadata capture scans.
 - [x] Lock separate Rust QUIC rendezvous feature-gate/fail-closed readiness and document production requirements.
-- [ ] Wire separate Rust QUIC rendezvous adapter:
-  - use the sibling signaling service as an explicit/self-hosted adapter,
-  - validate QUIC endpoint identity/fingerprint from policy/invite,
-  - add local-network and deployed-service E2E.
+- [ ] Harden separate Rust rendezvous service adapter:
+  - [x] use the sibling signaling service as an explicit/self-hosted adapter over the content-blind `/v1/signals/*` API,
+  - [x] reject native `quic://` endpoints honestly until native QUIC support is audited,
+  - [ ] validate TLS endpoint identity/fingerprint from policy/invite before production use,
+  - [ ] add staged/deployed-service E2E plus provider-visible capture scans.
 
 ### P0: app integration gaps
 
@@ -318,9 +322,9 @@ npm --prefix apps/ui run test:command-coverage
 | Optional public provider-signaled WebRTC data-channel proof | `DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_datachannel_roundtrip -- --nocapture` and `DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol cargo test -q -p discrypt-transport --features nostr-adapter --test public_webrtc_datachannel_e2e public_nostr_signals_real_webrtc_datachannel_roundtrip -- --nocapture` | Latest MQTT and Nostr runs passed. They use `stun:stun.l.google.com:19302`, bind WebRTC UDP to `0.0.0.0:0`, exchange sealed offer/answer through the provider, open a WebRTC DataChannel, and deliver an opaque text/control frame. Damus was rate-limited in one rerun, so `nos.lol` is the latest green public Nostr relay evidence. |
 | IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_resource_policy_is_bounded_and_default_bootstrap_is_parseable -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_bootstrap_policy_rejects_duplicates_and_overflow -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_unreachable_bootstrap_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_oversized_envelope_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_duplicate_storm_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_swarm_runtime_errors_map_to_typed_health -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal/control only; bootstrap/resource policy is bounded and parse-tested with empty public defaults plus explicit direct endpoint validation; unreachable bootstrap, topic mesh, duplicate storms, libp2p listener runtime errors, and oversize failures map to typed health |
 | IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Missing after direct-address hardening. The previous `/dnsaddr/bootstrap.libp2p.io/...` approach is no longer a production default because DNS bootstrap is audit-blocked and generic bootstrap-only peers did not provide a topic mesh. Needs explicit topic-peer/rendezvous multiaddrs. |
-| Planned QUIC public-provider proof | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |
+| Separate rendezvous service proof | `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_feature_gate_is_selectable_but_rejects_reserved_native_quic_scheme -- --nocapture` | Local sibling binary roundtrip passed when `../discrypt-signaling/target/debug/discrypt-signaling-server` is available; native `quic://` endpoint use is still rejected as reserved. Staged/deployed service, TLS/fingerprint, and capture-scan evidence are still missing. |
 
-- Real producer/adapter route proofs still missing in this release gate: multi-relay Nostr soak, live IPFS public-bootstrap/topic-discovery proof, live QUIC public-provider proof, and end-to-end mobile/installed-app transport smoke (tracked separately).
+- Real producer/adapter route proofs still missing in this release gate: live IPFS public-bootstrap/topic-discovery proof, staged/deployed Discrypt rendezvous service proof with TLS/fingerprint/capture evidence, and end-to-end mobile/installed-app transport smoke (tracked separately).
 - Missing adapter check status is intentionally exposed as blockers instead of fake green signals in this phase.
 
 ## How to rerun the current real MQTT proof

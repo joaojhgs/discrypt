@@ -3,9 +3,8 @@
 //! Each required provider has a concrete adapter boundary that validates
 //! profiles, exposes redacted health, and fails closed unless an audited
 //! provider client is compiled behind its explicit Cargo feature. MQTT, Nostr,
-//! and IPFS/libp2p PubSub now have real provider clients behind explicit
-//! adapter features; the Rust QUIC rendezvous adapter remains an explicit
-//! fail-closed boundary until its sibling-service client lands.
+//! IPFS/libp2p PubSub, and the separate Discrypt rendezvous service have real
+//! provider clients behind explicit adapter features.
 
 #[cfg(any(feature = "mqtt-adapter", feature = "ipfs-pubsub-adapter"))]
 use crate::SignalingProviderEndpoint;
@@ -20,7 +19,8 @@ use crate::{
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 use crate::{
     TextControlDataTransport, WebRtcNegotiationConfig, WebRtcNegotiationPayloadKind,
@@ -43,13 +43,15 @@ use tokio::sync::Mutex as AsyncMutex;
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 use tokio::time::Instant;
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 use tokio::time::{timeout, Duration};
 
@@ -201,7 +203,11 @@ pub enum SignalingAdapterFactory {
     /// IPFS/libp2p PubSub fail-closed boundary when feature is disabled.
     #[cfg(not(feature = "ipfs-pubsub-adapter"))]
     IpfsPubsub(FeatureGatedProviderAdapter),
-    /// Rust QUIC rendezvous boundary until real client is wired.
+    /// Rust QUIC rendezvous real implementation when feature-gated client is enabled.
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    DiscryptQuicRendezvous(DiscryptQuicRendezvousProviderAdapter),
+    /// Rust QUIC rendezvous fail-closed boundary when feature is disabled.
+    #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
     DiscryptQuicRendezvous(FeatureGatedProviderAdapter),
 }
 
@@ -241,7 +247,14 @@ impl SignalingAdapterFactory {
                 }
             }
             SignalingAdapterKind::DiscryptQuicRendezvous => {
-                Self::DiscryptQuicRendezvous(FeatureGatedProviderAdapter::new(kind))
+                #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+                {
+                    Self::DiscryptQuicRendezvous(DiscryptQuicRendezvousProviderAdapter)
+                }
+                #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+                {
+                    Self::DiscryptQuicRendezvous(FeatureGatedProviderAdapter::new(kind))
+                }
             }
         }
     }
@@ -262,6 +275,11 @@ impl SignalingAdapterFactory {
             Self::IpfsPubsub(_) => adapter_boundary_for_kind(SignalingAdapterKind::IpfsPubsub),
             #[cfg(not(feature = "ipfs-pubsub-adapter"))]
             Self::IpfsPubsub(adapter) => adapter.boundary(),
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            Self::DiscryptQuicRendezvous(_) => {
+                adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous)
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
             Self::DiscryptQuicRendezvous(adapter) => adapter.boundary(),
         }
     }
@@ -500,7 +518,8 @@ pub async fn probe_provider_adapter_roundtrip(
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
-        feature = "ipfs-pubsub-adapter"
+        feature = "ipfs-pubsub-adapter",
+        feature = "discrypt-quic-rendezvous-adapter"
     )))]
     let _ = (bootstrap_secret, random_entropy);
     probe_provider_adapter_roundtrip_with_factory(
@@ -523,7 +542,8 @@ async fn probe_provider_adapter_roundtrip_with_factory(
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
-        feature = "ipfs-pubsub-adapter"
+        feature = "ipfs-pubsub-adapter",
+        feature = "discrypt-quic-rendezvous-adapter"
     )))]
     let _ = (profile, scope, bootstrap_secret, random_entropy);
     match factory {
@@ -558,7 +578,14 @@ async fn probe_provider_adapter_roundtrip_with_factory(
             }
         }
         SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
-            Err(adapter.boundary().unavailable_error())
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            {
+                probe_with_adapter(adapter, profile, scope, bootstrap_secret, random_entropy).await
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+            {
+                Err(adapter.boundary().unavailable_error())
+            }
         }
     }
 }
@@ -648,7 +675,8 @@ pub async fn probe_provider_webrtc_datachannel_request_response_roundtrip(
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
-        feature = "ipfs-pubsub-adapter"
+        feature = "ipfs-pubsub-adapter",
+        feature = "discrypt-quic-rendezvous-adapter"
     )))]
     let _ = (
         bootstrap_secret,
@@ -683,7 +711,8 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
-        feature = "ipfs-pubsub-adapter"
+        feature = "ipfs-pubsub-adapter",
+        feature = "discrypt-quic-rendezvous-adapter"
     )))]
     let _ = (
         profile,
@@ -756,7 +785,24 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
             }
         }
         SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
-            Err(adapter.boundary().unavailable_error())
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            {
+                probe_webrtc_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    ice_servers,
+                    text_control_frame,
+                    receipt_control_frame,
+                )
+                .await
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+            {
+                Err(adapter.boundary().unavailable_error())
+            }
         }
     }
 }
@@ -764,7 +810,8 @@ async fn probe_provider_webrtc_datachannel_request_response_with_factory(
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 async fn probe_with_adapter<A>(
     adapter: A,
@@ -861,7 +908,8 @@ where
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 async fn probe_webrtc_with_adapter<A>(
     adapter: A,
@@ -1075,7 +1123,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 async fn wait_for_probe<Fut>(mut poll: impl FnMut() -> Fut) -> Result<bool, TransportError>
 where
@@ -1098,7 +1147,8 @@ where
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter"
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
 ))]
 fn redacted_endpoint_label(endpoint: &str) -> String {
     use sha2::Digest as _;
@@ -1215,7 +1265,7 @@ pub const fn adapter_boundary_for_kind(kind: SignalingAdapterKind) -> ProviderAd
         SignalingAdapterKind::DiscryptQuicRendezvous => ProviderAdapterBoundary {
             kind,
             cargo_feature: "discrypt-quic-rendezvous-adapter",
-            readiness: feature_readiness(cfg!(feature = "discrypt-quic-rendezvous-adapter")),
+            readiness: discrypt_quic_rendezvous_feature_readiness(),
         },
     }
 }
@@ -1229,14 +1279,6 @@ pub const fn required_provider_adapter_boundaries() -> [ProviderAdapterBoundary;
         adapter_boundary_for_kind(SignalingAdapterKind::IpfsPubsub),
         adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous),
     ]
-}
-
-const fn feature_readiness(enabled: bool) -> ProviderAdapterReadiness {
-    if enabled {
-        ProviderAdapterReadiness::ImplementationUnavailable
-    } else {
-        ProviderAdapterReadiness::FeatureDisabled
-    }
 }
 
 const fn mqtt_feature_readiness() -> ProviderAdapterReadiness {
@@ -1257,6 +1299,14 @@ const fn nostr_feature_readiness() -> ProviderAdapterReadiness {
 
 const fn ipfs_pubsub_feature_readiness() -> ProviderAdapterReadiness {
     if cfg!(feature = "ipfs-pubsub-adapter") {
+        ProviderAdapterReadiness::ImplementationAvailable
+    } else {
+        ProviderAdapterReadiness::FeatureDisabled
+    }
+}
+
+const fn discrypt_quic_rendezvous_feature_readiness() -> ProviderAdapterReadiness {
+    if cfg!(feature = "discrypt-quic-rendezvous-adapter") {
         ProviderAdapterReadiness::ImplementationAvailable
     } else {
         ProviderAdapterReadiness::FeatureDisabled
@@ -1413,6 +1463,100 @@ pub struct LocalConformanceProviderRoom {
     bus: LocalConformanceProviderBus,
     key: LocalRoomKey,
     local_peer_id: SignalingPeerId,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+/// Real adapter for the separate Discrypt rendezvous service.
+///
+/// The extracted sibling service currently exposes a content-blind HTTPS/WSS
+/// HTTP API at `/v1/signals/*`; native `quic://` transport is still reserved by
+/// the service ADR. This adapter is intentionally named for the product
+/// adapter slot, but it only connects to validated `https://` service URLs or
+/// loopback `http://127.0.0.1` development URLs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiscryptQuicRendezvousProviderAdapter;
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Clone, Debug)]
+pub struct DiscryptQuicRendezvousProviderSession {
+    profile: SignalingAdapterProfile,
+    endpoint_base: String,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+pub struct DiscryptQuicRendezvousProviderRoom {
+    endpoint_base: String,
+    local_peer_id: SignalingPeerId,
+    topic: String,
+    nonce_counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DiscryptRendezvousWireEnvelope {
+    Presence {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    },
+    Signal {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    },
+    Control {
+        schema: u8,
+        from_peer: SignalingPeerId,
+        payload: OpaqueSignalingPayload,
+    },
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiscryptRendezvousSignalKind {
+    Rendezvous,
+    Offer,
+    Answer,
+    Candidate,
+    AdmissionHelper,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Serialize)]
+struct DiscryptRendezvousPublishSignalRequest {
+    client_token_hex: String,
+    nonce_hex: String,
+    kind: DiscryptRendezvousSignalKind,
+    key_hex: String,
+    payload_hex: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Serialize)]
+struct DiscryptRendezvousTakeSignalRequest {
+    client_token_hex: String,
+    nonce_hex: String,
+    kind: DiscryptRendezvousSignalKind,
+    key_hex: String,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Deserialize)]
+struct DiscryptRendezvousTakeSignalsResponse {
+    signals: Vec<DiscryptRendezvousTakenSignal>,
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Deserialize)]
+struct DiscryptRendezvousTakenSignal {
+    kind: DiscryptRendezvousSignalKind,
+    payload_hex: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[cfg(feature = "mqtt-adapter")]
@@ -2197,6 +2341,209 @@ impl IpfsPubsubProviderRoom {
     async fn record_health_fault(inbox: &Arc<AsyncMutex<IpfsPubsubInbox>>, error: TransportError) {
         let mut inbox = inbox.lock().await;
         inbox.health_faults.push(error.to_string());
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_endpoint_base(
+    profile: &SignalingAdapterProfile,
+) -> Result<String, TransportError> {
+    let endpoint = profile
+        .endpoints
+        .first()
+        .ok_or_else(|| {
+            TransportError::InvalidConnectivityPolicy(
+                "discrypt rendezvous profile requires one endpoint".to_owned(),
+            )
+        })?
+        .endpoint
+        .0
+        .trim_end_matches('/')
+        .to_owned();
+    if endpoint.starts_with("quic://") {
+        return Err(TransportError::SignalingAdapter(
+            "discrypt_quic_rendezvous native quic:// transport remains reserved; use the sibling service HTTPS/WSS API endpoint until the native QUIC client is audited"
+                .to_owned(),
+        ));
+    }
+    let base = if let Some(rest) = endpoint.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else {
+        endpoint
+    };
+    Ok(base)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_key(topic: &str, label: &str, peer: Option<&SignalingPeerId>) -> Vec<u8> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"discrypt-rendezvous-service-key-v1");
+    hasher.update(topic.as_bytes());
+    hasher.update(label.as_bytes());
+    if let Some(peer) = peer {
+        hasher.update(peer.0.as_bytes());
+    }
+    hasher.finalize().to_vec()
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_client_token(topic: &str, local_peer_id: &SignalingPeerId) -> Vec<u8> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"discrypt-rendezvous-service-client-token-v1");
+    hasher.update(topic.as_bytes());
+    hasher.update(local_peer_id.0.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_signal_kind(
+    kind: &WebRtcNegotiationPayloadKind,
+) -> DiscryptRendezvousSignalKind {
+    match kind {
+        WebRtcNegotiationPayloadKind::Offer => DiscryptRendezvousSignalKind::Offer,
+        WebRtcNegotiationPayloadKind::Answer => DiscryptRendezvousSignalKind::Answer,
+        WebRtcNegotiationPayloadKind::Candidate => DiscryptRendezvousSignalKind::Candidate,
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_post_json<T, R>(
+    endpoint_base: String,
+    path: &'static str,
+    body: T,
+) -> Result<Option<R>, TransportError>
+where
+    T: Serialize + Send + 'static,
+    R: for<'de> Deserialize<'de> + Send + 'static,
+{
+    let url = format!("{endpoint_base}{path}");
+    let response = ureq::post(&url).send_json(body);
+    match response {
+        Ok(mut response) => response
+            .body_mut()
+            .read_json::<R>()
+            .map(Some)
+            .map_err(|error| {
+                TransportError::SignalingAdapter(format!(
+                    "discrypt rendezvous service response decode failed: {error}"
+                ))
+            }),
+        Err(ureq::Error::StatusCode(404)) => Ok(None),
+        Err(error) => Err(TransportError::SignalingAdapter(format!(
+            "discrypt rendezvous service request failed: {error}"
+        ))),
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+impl DiscryptQuicRendezvousProviderRoom {
+    fn next_nonce_hex(&self) -> String {
+        use sha2::Digest as _;
+        let counter = self
+            .nonce_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"discrypt-rendezvous-service-nonce-v1");
+        hasher.update(self.topic.as_bytes());
+        hasher.update(self.local_peer_id.0.as_bytes());
+        hasher.update(counter.to_be_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn client_token_hex(&self) -> String {
+        hex::encode(discrypt_rendezvous_client_token(
+            &self.topic,
+            &self.local_peer_id,
+        ))
+    }
+
+    async fn publish_envelope(
+        &self,
+        kind: DiscryptRendezvousSignalKind,
+        key: Vec<u8>,
+        envelope: DiscryptRendezvousWireEnvelope,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        let payload = serde_json::to_vec(&envelope).map_err(|err| {
+            TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous envelope encode failed: {err}"
+            ))
+        })?;
+        reject_forbidden_plaintext(&payload)?;
+        let request = DiscryptRendezvousPublishSignalRequest {
+            client_token_hex: self.client_token_hex(),
+            nonce_hex: self.next_nonce_hex(),
+            kind,
+            key_hex: hex::encode(key),
+            payload_hex: hex::encode(payload),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(i64::from(ttl_seconds)),
+        };
+        let endpoint_base = self.endpoint_base.clone();
+        tokio::task::spawn_blocking(move || {
+            discrypt_rendezvous_post_json::<_, serde_json::Value>(
+                endpoint_base,
+                "/v1/signals/publish",
+                request,
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|error| {
+            TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous publish task failed: {error}"
+            ))
+        })?
+    }
+
+    async fn take_envelopes(
+        &self,
+        kind: DiscryptRendezvousSignalKind,
+        key: Vec<u8>,
+    ) -> Result<Vec<DiscryptRendezvousWireEnvelope>, TransportError> {
+        let request = DiscryptRendezvousTakeSignalRequest {
+            client_token_hex: self.client_token_hex(),
+            nonce_hex: self.next_nonce_hex(),
+            kind,
+            key_hex: hex::encode(key),
+        };
+        let endpoint_base = self.endpoint_base.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            discrypt_rendezvous_post_json::<_, DiscryptRendezvousTakeSignalsResponse>(
+                endpoint_base,
+                "/v1/signals/take",
+                request,
+            )
+        })
+        .await
+        .map_err(|error| {
+            TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous take task failed: {error}"
+            ))
+        })??;
+        let Some(response) = response else {
+            return Ok(Vec::new());
+        };
+        response
+            .signals
+            .into_iter()
+            .filter(|signal| signal.kind == kind && signal.expires_at >= chrono::Utc::now())
+            .map(|signal| {
+                let bytes = hex::decode(&signal.payload_hex).map_err(|error| {
+                    TransportError::SignalingAdapter(format!(
+                        "discrypt rendezvous payload hex decode failed: {error}"
+                    ))
+                })?;
+                reject_forbidden_plaintext(&bytes)?;
+                serde_json::from_slice::<DiscryptRendezvousWireEnvelope>(&bytes).map_err(|error| {
+                    TransportError::SignalingAdapter(format!(
+                        "discrypt rendezvous envelope decode failed: {error}"
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -3125,6 +3472,258 @@ impl MqttProviderRoom {
             }
             _ => {}
         }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[async_trait]
+impl SignalingAdapter for DiscryptQuicRendezvousProviderAdapter {
+    type Session = DiscryptQuicRendezvousProviderSession;
+
+    async fn connect(
+        &self,
+        profile: SignalingAdapterProfile,
+    ) -> Result<Self::Session, TransportError> {
+        profile.validate()?;
+        if profile.kind != SignalingAdapterKind::DiscryptQuicRendezvous {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "adapter profile kind {} does not match discrypt_quic_rendezvous adapter",
+                profile.kind.canonical_name()
+            )));
+        }
+        let endpoint_base = discrypt_rendezvous_endpoint_base(&profile)?;
+        let health_url = format!("{endpoint_base}/healthz");
+        let health = tokio::task::spawn_blocking(move || ureq::get(&health_url).call())
+            .await
+            .map_err(|error| {
+                TransportError::SignalingAdapter(format!(
+                    "discrypt rendezvous health task failed: {error}"
+                ))
+            })?;
+        match health {
+            Ok(_) => Ok(Self::Session {
+                profile,
+                endpoint_base,
+            }),
+            Err(error) => Err(TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous service health check failed: {error}"
+            ))),
+        }
+    }
+
+    fn capabilities(&self) -> SignalingAdapterCapabilities {
+        SignalingAdapterCapabilities::production_required()
+    }
+
+    fn observability_redacted(&self) -> SignalingObservability {
+        SignalingObservability {
+            adapter_kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+            endpoint_label: "discrypt_rendezvous#configured_service".to_owned(),
+            health: SignalingHealthState::Healthy,
+            trust_label: AdapterTrustLabel {
+                label: "discrypt_quic_rendezvous".to_owned(),
+                posture: "separate content-blind Discrypt rendezvous service API; native quic:// transport remains reserved until audited".to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[async_trait]
+impl AdapterSession for DiscryptQuicRendezvousProviderSession {
+    type Room = DiscryptQuicRendezvousProviderRoom;
+
+    async fn join(
+        &self,
+        scope: ConversationScope,
+        rendezvous: RendezvousCapability,
+        local_peer_id: SignalingPeerId,
+    ) -> Result<Self::Room, TransportError> {
+        scope.validate()?;
+        if rendezvous.scope != scope {
+            return Err(TransportError::SignalingAdapter(
+                "rendezvous capability scope mismatch".to_owned(),
+            ));
+        }
+        if rendezvous.adapter_kind != SignalingAdapterKind::DiscryptQuicRendezvous {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "rendezvous capability kind {} does not match discrypt_quic_rendezvous adapter",
+                rendezvous.adapter_kind.canonical_name()
+            )));
+        }
+        let _ = &self.profile;
+        Ok(DiscryptQuicRendezvousProviderRoom {
+            endpoint_base: self.endpoint_base.clone(),
+            local_peer_id,
+            topic: rendezvous.topic,
+            nonce_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> SignalingHealth {
+        SignalingHealth {
+            adapter_kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+            state: SignalingHealthState::Healthy,
+            latency_bucket: "unknown".to_owned(),
+            failure_class: None,
+        }
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[async_trait]
+impl RendezvousRoom for DiscryptQuicRendezvousProviderRoom {
+    async fn publish_presence(
+        &self,
+        encrypted_presence: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        if ttl_seconds == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "presence ttl must be non-zero".to_owned(),
+            ));
+        }
+        reject_forbidden_plaintext(&encrypted_presence.bytes)?;
+        self.publish_envelope(
+            DiscryptRendezvousSignalKind::Rendezvous,
+            discrypt_rendezvous_key(&self.topic, "presence", None),
+            DiscryptRendezvousWireEnvelope::Presence {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                payload: encrypted_presence,
+                ttl_seconds,
+            },
+            ttl_seconds,
+        )
+        .await
+    }
+
+    async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
+        let envelopes = self
+            .take_envelopes(
+                DiscryptRendezvousSignalKind::Rendezvous,
+                discrypt_rendezvous_key(&self.topic, "presence", None),
+            )
+            .await?;
+        Ok(envelopes
+            .into_iter()
+            .filter_map(|envelope| match envelope {
+                DiscryptRendezvousWireEnvelope::Presence {
+                    schema: 1,
+                    from_peer,
+                    payload,
+                    ttl_seconds,
+                } if from_peer != self.local_peer_id => Some(PresenceEvent {
+                    peer_id: from_peer,
+                    encrypted_presence: payload,
+                    ttl_seconds,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn send_signal(
+        &self,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&payload.ciphertext)?;
+        let kind = discrypt_rendezvous_signal_kind(&payload.kind);
+        self.publish_envelope(
+            kind,
+            discrypt_rendezvous_key(&self.topic, "signal", Some(&to_peer)),
+            DiscryptRendezvousWireEnvelope::Signal {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                to_peer,
+                payload,
+            },
+            120,
+        )
+        .await
+    }
+
+    async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
+        let mut signals = Vec::new();
+        for kind in [
+            DiscryptRendezvousSignalKind::Offer,
+            DiscryptRendezvousSignalKind::Answer,
+            DiscryptRendezvousSignalKind::Candidate,
+        ] {
+            let envelopes = self
+                .take_envelopes(
+                    kind,
+                    discrypt_rendezvous_key(&self.topic, "signal", Some(&self.local_peer_id)),
+                )
+                .await?;
+            for envelope in envelopes {
+                if let DiscryptRendezvousWireEnvelope::Signal {
+                    schema: 1,
+                    from_peer,
+                    to_peer,
+                    payload,
+                } = envelope
+                {
+                    if to_peer == self.local_peer_id {
+                        signals.push(PeerSignal {
+                            from_peer,
+                            to_peer,
+                            payload,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(signals)
+    }
+
+    async fn broadcast_control(
+        &self,
+        sealed_payload: OpaqueSignalingPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.publish_envelope(
+            DiscryptRendezvousSignalKind::AdmissionHelper,
+            discrypt_rendezvous_key(&self.topic, "control", None),
+            DiscryptRendezvousWireEnvelope::Control {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                payload: sealed_payload,
+            },
+            120,
+        )
+        .await
+    }
+
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        let envelopes = self
+            .take_envelopes(
+                DiscryptRendezvousSignalKind::AdmissionHelper,
+                discrypt_rendezvous_key(&self.topic, "control", None),
+            )
+            .await?;
+        Ok(envelopes
+            .into_iter()
+            .filter_map(|envelope| match envelope {
+                DiscryptRendezvousWireEnvelope::Control {
+                    schema: 1,
+                    from_peer,
+                    payload,
+                } if from_peer != self.local_peer_id => {
+                    Some(ControlBroadcast { from_peer, payload })
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn leave(&self) -> Result<(), TransportError> {
         Ok(())
     }
 }
@@ -4487,7 +5086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
     async fn quic_rendezvous_feature_gate_remains_fail_closed_until_sibling_client_is_wired(
     ) -> Result<(), TransportError> {
         let boundary = adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous);
@@ -4530,6 +5129,45 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn quic_rendezvous_feature_gate_is_selectable_but_rejects_reserved_native_quic_scheme(
+    ) -> Result<(), TransportError> {
+        let boundary = adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous);
+        assert_eq!(
+            boundary.readiness,
+            ProviderAdapterReadiness::ImplementationAvailable
+        );
+        assert_eq!(boundary.failure_class(), "implementation_available");
+        assert!(
+            SignalingAdapterFactory::for_kind(SignalingAdapterKind::DiscryptQuicRendezvous)
+                .selectable()
+        );
+
+        let plan = plan_signaling_adapter_fallback(
+            &[SignalingAdapterKind::DiscryptQuicRendezvous],
+            AdapterFallbackBehavior::ManualOnly,
+            Some(SignalingAdapterKind::DiscryptQuicRendezvous),
+        );
+        assert_eq!(
+            plan.selected,
+            Some(SignalingAdapterKind::DiscryptQuicRendezvous)
+        );
+        assert_eq!(plan.attempts[0].readiness, AdapterReadinessState::Available);
+        assert!(plan.attempts[0].selected);
+
+        let adapter = DiscryptQuicRendezvousProviderAdapter;
+        let error = adapter
+            .connect(valid_profile(SignalingAdapterKind::DiscryptQuicRendezvous)?)
+            .await
+            .expect_err("native quic:// is still reserved by the sibling service ADR");
+        assert!(error
+            .to_string()
+            .contains("native quic:// transport remains reserved"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
     async fn provider_adapter_roundtrip_probe_quic_fails_closed() -> Result<(), TransportError> {
         let scope = crate::ConversationScope::new(
             ConnectivityScopeLevel::Dm,
@@ -4546,6 +5184,117 @@ mod tests {
         assert!(error
             .to_string()
             .contains("discrypt_quic_rendezvous adapter"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn provider_adapter_roundtrip_probe_quic_rejects_reserved_native_scheme(
+    ) -> Result<(), TransportError> {
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(ConnectivityScopeLevel::Dm, b"quic probe dm", "test"),
+        )?;
+        let error = probe_provider_adapter_roundtrip(
+            valid_profile(SignalingAdapterKind::DiscryptQuicRendezvous)?,
+            scope,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+        )
+        .await
+        .expect_err("native quic:// provider probe must stay reserved until native QUIC lands");
+        assert!(error
+            .to_string()
+            .contains("native quic:// transport remains reserved"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    async fn discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available(
+    ) -> Result<(), TransportError> {
+        let server_bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("discrypt-signaling/target/debug/discrypt-signaling-server");
+        if !server_bin.exists() {
+            eprintln!(
+                "skipping sibling service roundtrip: {} is not built",
+                server_bin.display()
+            );
+            return Ok(());
+        }
+        let probe_socket = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| TransportError::Io(error.to_string()))?;
+        let port = probe_socket
+            .local_addr()
+            .map_err(|error| TransportError::Io(error.to_string()))?
+            .port();
+        drop(probe_socket);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut child = std::process::Command::new(&server_bin)
+            .args([
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--public-base-url",
+                "https://127.0.0.1/rendezvous-test",
+                "--name",
+                "discrypt-rendezvous-adapter-test",
+            ])
+            .spawn()
+            .map_err(|error| TransportError::Io(error.to_string()))?;
+
+        let health_url = format!("{endpoint}/healthz");
+        let mut healthy = false;
+        for _ in 0..30 {
+            if ureq::get(&health_url).call().is_ok() {
+                healthy = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !healthy {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TransportError::SignalingAdapter(
+                "sibling signaling service did not become healthy".to_owned(),
+            ));
+        }
+
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"quic sibling service dm",
+                "test",
+            ),
+        )?;
+        let profile = SignalingAdapterProfile {
+            profile_id: "local-discrypt-rendezvous-service".to_owned(),
+            kind: SignalingAdapterKind::DiscryptQuicRendezvous,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new(endpoint),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new(
+                "discrypt_quic_rendezvous",
+                "local sibling service binary",
+            )?,
+        };
+        let probe = probe_provider_adapter_roundtrip(
+            profile,
+            scope,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+        )
+        .await;
+        let _ = child.kill();
+        let _ = child.wait();
+        let probe = probe?;
+        assert!(probe.presence_roundtrip);
+        assert!(probe.signal_roundtrip);
+        assert!(probe.control_roundtrip);
         Ok(())
     }
 

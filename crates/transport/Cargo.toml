@@ -18,7 +18,7 @@ production-storage = []
 mqtt-adapter = ["production-network", "dep:rumqttc", "dep:hex"]
 nostr-adapter = ["production-network", "dep:nostr-sdk", "dep:hex"]
 ipfs-pubsub-adapter = ["production-network", "dep:libp2p", "dep:hex"]
-discrypt-quic-rendezvous-adapter = ["production-network"]
+discrypt-quic-rendezvous-adapter = ["production-network", "dep:ureq", "dep:hex"]
 
 [dependencies]
 rand = { workspace = true }
@@ -39,6 +39,7 @@ hex = { workspace = true, optional = true }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["url", "websocket"], optional = true }
 nostr-sdk = { version = "0.44.1", optional = true }
 libp2p = { version = "0.56.0", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "kad", "identify", "macros"], optional = true }
+ureq = { version = "3.1.4", default-features = false, features = ["json", "rustls"], optional = true }
 futures = "0.3"
 
 [dev-dependencies]

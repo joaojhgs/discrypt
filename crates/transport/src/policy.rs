@@ -248,7 +248,9 @@ impl SignalingProviderEndpoint {
                             || value.starts_with("libp2p://")
                     }
                     SignalingAdapterKind::DiscryptQuicRendezvous => {
-                        value.starts_with("quic://") || value.starts_with("https://")
+                        value.starts_with("quic://")
+                            || value.starts_with("https://")
+                            || value.starts_with("wss://")
                     }
                 };
                 if !valid {
