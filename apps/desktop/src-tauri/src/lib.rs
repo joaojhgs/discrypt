@@ -5037,12 +5037,16 @@ fn run_provider_webrtc_data_channel_probe(
     .map_err(|_| "Provider WebRTC data-channel probe thread panicked".to_owned())?
 }
 
-fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
+fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> Option<String> {
     match kind {
-        InviteSignalingAdapterKind::Mqtt => std::env::var("DISCRYPT_DEFAULT_MQTT_ENDPOINT")
-            .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
-        InviteSignalingAdapterKind::Nostr => std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT")
-            .unwrap_or_else(|_| "wss://relay.damus.io".to_owned()),
+        InviteSignalingAdapterKind::Mqtt => Some(
+            std::env::var("DISCRYPT_DEFAULT_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        ),
+        InviteSignalingAdapterKind::Nostr => Some(
+            std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT")
+                .unwrap_or_else(|_| "wss://relay.damus.io".to_owned()),
+        ),
         InviteSignalingAdapterKind::IpfsPubsub => {
             std::env::var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS")
                 .ok()
@@ -5053,11 +5057,11 @@ fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
                         .find(|endpoint| !endpoint.is_empty())
                         .map(ToOwned::to_owned)
                 })
-                .unwrap_or_else(|| "https://ipfs.discrypt.invalid/bootstrap/pubsub".to_owned())
         }
         InviteSignalingAdapterKind::DiscryptQuicRendezvous => {
             std::env::var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT")
-                .unwrap_or_else(|_| "quic://signaling.discrypt.invalid:443/rendezvous".to_owned())
+                .ok()
+                .filter(|endpoint| !endpoint.trim().is_empty())
         }
     }
 }
@@ -5078,10 +5082,10 @@ fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileVie
         InviteSignalingAdapterKind::DiscryptQuicRendezvous,
     ]
     .into_iter()
-    .map(|kind| {
+    .filter_map(|kind| {
         let adapter_kind = profile_kind_name(&kind);
-        let endpoint = default_adapter_endpoint(&kind);
-        SignalingProfileView {
+        let endpoint = default_adapter_endpoint(&kind)?;
+        Some(SignalingProfileView {
             profile_id: format!("{adapter_kind}-default"),
             adapter_kind: adapter_kind.clone(),
             endpoints: vec![endpoint.clone()],
@@ -5099,7 +5103,7 @@ fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileVie
                 "broadcast_control".to_owned(),
                 "health_telemetry".to_owned(),
             ],
-        }
+        })
     })
     .collect()
 }
@@ -7412,6 +7416,25 @@ mod tests {
     }
 
     #[test]
+    fn default_profiles_omit_unconfigured_ipfs_quic_placeholder_endpoints() {
+        let _guard = test_lock();
+        std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
+        std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
+
+        let profiles = default_signaling_profiles("configured-defaults-only");
+        let kinds = profiles
+            .iter()
+            .map(|profile| profile.adapter_kind.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec!["nostr", "mqtt"]);
+        assert!(profiles.iter().all(|profile| profile
+            .endpoints
+            .iter()
+            .all(|endpoint| !endpoint.contains(".invalid"))));
+    }
+
+    #[test]
     #[cfg(all(feature = "mqtt-adapter", feature = "nostr-adapter"))]
     fn active_connectivity_policy_drives_selected_adapter_order() {
         let _guard = test_lock();
@@ -7445,6 +7468,10 @@ mod tests {
     fn ipfs_pubsub_adapter_feature_reaches_app_state_diagnostics() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("ipfs-pubsub-adapter-diagnostics");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS",
+            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWConfiguredOnly",
+        );
         let state = app_state();
         assert_eq!(
             state.transport_diagnostics.selected_adapter.as_deref(),

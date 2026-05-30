@@ -87,7 +87,7 @@ Behavior:
   provider-signaled WebRTC text/control delivery for the selected per-scope policy, while still
   keeping installed-app UI and voice/media claims separate.
 - Adds an opt-in message composer switch and Tauri `send_message(..., transport_proof=true)` path. When enabled, the backend derives an opaque ciphertext-labeled frame from the message command, sends it over the selected provider-signaled WebRTC DataChannel diagnostic, and marks the message `transport_probe_verified` only if that frame crosses the DataChannel. This still does **not** claim signed peer receipt, remote persistence, or voice/media delivery.
-- Uses public Nostr (`wss://relay.damus.io`) first and public MQTT (`mqtts://broker.emqx.io:8883`) second as zero-config default endpoint candidates when no `DISCRYPT_DEFAULT_*`/`VITE_DISCRYPT_DEFAULT_*` override is supplied; IPFS and QUIC still require explicit endpoint configuration because no production default pubsub rendezvous mesh or self-hosted endpoint has been accepted yet.
+- Uses public Nostr (`wss://relay.damus.io`) first and public MQTT (`mqtts://broker.emqx.io:8883`) second as zero-config default endpoint candidates when no `DISCRYPT_DEFAULT_*`/`VITE_DISCRYPT_DEFAULT_*` override is supplied; IPFS and QUIC are omitted from generated default connectivity profiles unless explicit endpoints are configured because no production default pubsub rendezvous mesh or self-hosted endpoint has been accepted yet.
 - Keeps route/media claims separate: a successful adapter probe proves provider rendezvous only; it does not mark ICE, data-channel, or voice media as connected.
 - Adds a test-only Tauri app-service loader with explicit state-file override so two isolated local profiles can be exercised in one test process without the global command singleton collapsing them into one state file. This is harness groundwork for real two-profile E2E, not a production delivery claim.
 
@@ -238,7 +238,7 @@ npm --prefix apps/ui run typecheck
 ### P0: app integration gaps
 
 - [ ] Add an adapter registry/factory used by Tauri/backend runtime, not only transport tests.
-- [ ] Make per-DM/per-group/per-channel connectivity policy select the real adapter implementation.
+- [x] Make per-DM/per-group/per-channel connectivity policy select from configured real adapter profiles and exclude unconfigured IPFS/QUIC placeholder endpoints from default app/invite profiles.
 - [ ] Carry selected adapter state into UI status honestly: selected provider, health, fallback state, and failure class.
 - [ ] Run two actual app profiles/instances through:
   - setup/recovery,
