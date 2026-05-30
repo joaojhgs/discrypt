@@ -34,7 +34,11 @@ use std::sync::{Arc, Mutex};
     feature = "ipfs-pubsub-adapter"
 ))]
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
 use tokio::time::Instant;
 #[cfg(any(
     feature = "mqtt-adapter",
@@ -291,6 +295,33 @@ pub struct SignalingAdapterFallbackPlan {
     pub selected: Option<SignalingAdapterKind>,
 }
 
+/// Evidence returned by an active provider-adapter roundtrip probe.
+///
+/// This is intentionally limited to signaling/rendezvous evidence. It proves
+/// that two local peers can use the selected provider adapter to exchange
+/// opaque presence, one sealed WebRTC-negotiation envelope, and one sealed
+/// control payload over the configured provider profile. It does **not** claim
+/// that ICE, WebRTC data channels, or media/audio are connected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderAdapterRoundtripProbe {
+    /// Adapter that completed the probe.
+    pub kind: SignalingAdapterKind,
+    /// Profile id supplied by app/runtime policy.
+    pub profile_id: String,
+    /// Redacted provider endpoint label used by the profile.
+    pub endpoint_label: String,
+    /// Committed scope used to derive the rendezvous topic.
+    pub scope_commitment: String,
+    /// Provider-visible derived rendezvous topic/tag.
+    pub rendezvous_topic: String,
+    /// Presence event was received by the peer.
+    pub presence_roundtrip: bool,
+    /// Sealed offer/control signal was received by the peer.
+    pub signal_roundtrip: bool,
+    /// Sealed room-control broadcast was received by the peer.
+    pub control_roundtrip: bool,
+}
+
 impl SignalingAdapterFallbackPlan {
     /// True when at least one candidate was selected.
     #[must_use]
@@ -367,6 +398,235 @@ pub fn plan_signaling_adapter_fallback(
         attempts,
         selected,
     }
+}
+
+/// Run a real provider-adapter signaling roundtrip for a runtime-selected profile.
+///
+/// The probe connects two local peer sessions to the selected provider, joins
+/// the same derived rendezvous capability, then verifies opaque presence,
+/// sealed WebRTC negotiation, and sealed control delivery. It is suitable for
+/// Tauri/backend diagnostics because it exercises the same adapter contract as
+/// production signaling without exposing raw SDP, ICE credentials, identities,
+/// room names, message plaintext, or audio.
+pub async fn probe_provider_adapter_roundtrip(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+) -> Result<ProviderAdapterRoundtripProbe, TransportError> {
+    profile.validate()?;
+    scope.validate()?;
+    #[cfg(not(any(
+        feature = "mqtt-adapter",
+        feature = "nostr-adapter",
+        feature = "ipfs-pubsub-adapter"
+    )))]
+    let _ = (bootstrap_secret, random_entropy);
+    let kind = profile.kind;
+    match kind {
+        SignalingAdapterKind::Mqtt => {
+            #[cfg(feature = "mqtt-adapter")]
+            {
+                return probe_with_adapter(
+                    MqttProviderAdapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "mqtt-adapter"))]
+            {
+                Err(FeatureGatedProviderAdapter::new(kind)
+                    .boundary()
+                    .unavailable_error())
+            }
+        }
+        SignalingAdapterKind::Nostr => {
+            #[cfg(feature = "nostr-adapter")]
+            {
+                return probe_with_adapter(
+                    NostrProviderAdapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "nostr-adapter"))]
+            {
+                Err(FeatureGatedProviderAdapter::new(kind)
+                    .boundary()
+                    .unavailable_error())
+            }
+        }
+        SignalingAdapterKind::IpfsPubsub => {
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            {
+                return probe_with_adapter(
+                    IpfsPubsubProviderAdapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+            {
+                Err(FeatureGatedProviderAdapter::new(kind)
+                    .boundary()
+                    .unavailable_error())
+            }
+        }
+        SignalingAdapterKind::DiscryptQuicRendezvous => Err(FeatureGatedProviderAdapter::new(kind)
+            .boundary()
+            .unavailable_error()),
+    }
+}
+
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+async fn probe_with_adapter<A>(
+    adapter: A,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+) -> Result<ProviderAdapterRoundtripProbe, TransportError>
+where
+    A: SignalingAdapter,
+{
+    let endpoint_label = profile
+        .endpoints
+        .first()
+        .map(|endpoint| redacted_endpoint_label(&endpoint.endpoint.0))
+        .unwrap_or_else(|| "endpoint#missing".to_owned());
+    let capability = RendezvousCapability::derive(
+        scope.clone(),
+        profile.kind,
+        bootstrap_secret,
+        random_entropy,
+        120,
+        profile.metadata_posture,
+        profile.trust_label.clone(),
+    )?;
+    let rendezvous_topic = capability.topic.clone();
+    let alice = SignalingPeerId::new("runtime-probe-alice")?;
+    let bob = SignalingPeerId::new("runtime-probe-bob")?;
+    let alice_session = adapter.connect(profile.clone()).await?;
+    let bob_session = adapter.connect(profile.clone()).await?;
+    let alice_room = alice_session
+        .join(scope.clone(), capability.clone(), alice.clone())
+        .await?;
+    let bob_room = bob_session
+        .join(scope.clone(), capability, bob.clone())
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    alice_room
+        .publish_presence(
+            OpaqueSignalingPayload::new(b"sealed-runtime-probe-presence".to_vec())?,
+            120,
+        )
+        .await?;
+    let presence_roundtrip = wait_for_probe(|| async {
+        let events = bob_room.subscribe_presence().await?;
+        Ok(events.into_iter().any(|event| event.peer_id == alice))
+    })
+    .await?;
+
+    let offer = SealedWebRtcNegotiationPayload {
+        version: 1,
+        kind: crate::WebRtcNegotiationPayloadKind::Offer,
+        nonce: [7_u8; 12],
+        ciphertext: b"sealed-runtime-probe-offer".to_vec(),
+    };
+    alice_room.send_signal(bob.clone(), offer.clone()).await?;
+    let signal_roundtrip = wait_for_probe(|| async {
+        let signals = bob_room.take_signals().await?;
+        Ok(signals.into_iter().any(|signal| {
+            signal.from_peer == alice && signal.to_peer == bob && signal.payload == offer
+        }))
+    })
+    .await?;
+
+    bob_room
+        .broadcast_control(OpaqueSignalingPayload::new(
+            b"sealed-runtime-probe-control".to_vec(),
+        )?)
+        .await?;
+    let control_roundtrip = wait_for_probe(|| async {
+        let controls = alice_room.take_control_payloads().await?;
+        Ok(controls.into_iter().any(|control| control.from_peer == bob))
+    })
+    .await?;
+
+    alice_room.leave().await?;
+    bob_room.leave().await?;
+    alice_session.close().await?;
+    bob_session.close().await?;
+
+    Ok(ProviderAdapterRoundtripProbe {
+        kind: profile.kind,
+        profile_id: profile.profile_id,
+        endpoint_label,
+        scope_commitment: scope.scope_id_commitment,
+        rendezvous_topic,
+        presence_roundtrip,
+        signal_roundtrip,
+        control_roundtrip,
+    })
+}
+
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+async fn wait_for_probe<Fut>(mut poll: impl FnMut() -> Fut) -> Result<bool, TransportError>
+where
+    Fut: std::future::Future<Output = Result<bool, TransportError>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if poll().await? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Err(TransportError::SignalingAdapter(
+                "timed out waiting for provider adapter roundtrip probe".to_owned(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter"
+))]
+fn redacted_endpoint_label(endpoint: &str) -> String {
+    use sha2::Digest as _;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(endpoint.as_bytes());
+    let digest = digest.finalize();
+    let digest = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let scheme = endpoint
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("endpoint");
+    format!("{scheme}#{digest}")
 }
 
 /// Production readiness for a provider adapter boundary.
@@ -2937,6 +3197,26 @@ mod tests {
             .unwrap_or_default();
         assert!(message.contains("discrypt_quic_rendezvous"));
         assert!(message.contains("no audited production provider client is wired"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_adapter_roundtrip_probe_quic_fails_closed() -> Result<(), TransportError> {
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(ConnectivityScopeLevel::Dm, b"quic probe dm", "test"),
+        )?;
+        let error = probe_provider_adapter_roundtrip(
+            valid_profile(SignalingAdapterKind::DiscryptQuicRendezvous)?,
+            scope,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+        )
+        .await
+        .expect_err("QUIC provider probe must fail closed until sibling client is wired");
+        assert!(error
+            .to_string()
+            .contains("discrypt_quic_rendezvous adapter"));
         Ok(())
     }
 

@@ -40,6 +40,7 @@ import {
   setActiveGroup,
   setSelfMute,
   setSpeakerVolume,
+  startSignalingSession,
   startDm,
   verifySafetyNumber,
 } from "./commands";
@@ -212,6 +213,22 @@ function App() {
         error instanceof Error ? error.message : "Command failed",
       );
     }
+  }
+
+  async function probeSelectedAdapter() {
+    const selected = commandState?.transport_diagnostics.selected_adapter ?? null;
+    const scopeLabel =
+      commandState?.active_context?.dm_id ??
+      commandState?.active_context?.group_id ??
+      commandState?.active_context?.channel_id ??
+      "active-scope";
+    await applyCommand(
+      startSignalingSession({
+        scope_label: scopeLabel,
+        adapter_probe: true,
+        adapter_kind: selected,
+      }),
+    );
   }
 
   if (loadError) {
@@ -610,6 +627,7 @@ function App() {
         <TransportStatusStrip
           statuses={appState.transport_status}
           diagnostics={appState.transport_diagnostics}
+          onProbeAdapter={probeSelectedAdapter}
         />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
@@ -1285,9 +1303,11 @@ function ConfigSelect({
 function TransportStatusStrip({
   statuses,
   diagnostics,
+  onProbeAdapter,
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
+  onProbeAdapter: () => void;
 }) {
   const ordered = statuses.length
     ? statuses
@@ -1316,7 +1336,12 @@ function TransportStatusStrip({
             command state provides evidence.
           </p>
         </div>
-        <Badge variant="outline">honest status</Badge>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="outline" onClick={onProbeAdapter}>
+            Probe adapter
+          </Button>
+          <Badge variant="outline">honest status</Badge>
+        </div>
       </div>
       <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
         {ordered.map((item) => (
@@ -1386,6 +1411,19 @@ function TransportStatusStrip({
             <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
               {diagnostics.route_proof_detail}
             </p>
+            <div className="mt-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-[0.12em] text-[hsl(var(--muted-foreground))]">
+                  Adapter probe
+                </span>
+                <Badge variant={transportBadgeVariant(diagnostics.adapter_probe_status)}>
+                  {diagnostics.adapter_probe_status}
+                </Badge>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                {diagnostics.adapter_probe_detail}
+              </p>
+            </div>
             {diagnostics.adapter_fallback_attempts.length ? (
               <div className="mt-3 space-y-1">
                 {diagnostics.adapter_fallback_attempts.map((attempt) => (
@@ -1409,10 +1447,22 @@ function TransportStatusStrip({
 function transportBadgeVariant(
   status: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if (["configured", "signed-endpoint-ready", "clear", "available", "route-proofed"].includes(status)) {
+  if ([
+    "configured",
+    "signed-endpoint-ready",
+    "clear",
+    "available",
+    "route-proofed",
+    "provider-roundtrip-proofed",
+  ].includes(status)) {
     return "success";
   }
-  if (["attention", "last-command-error", "media-gated"].includes(status)) {
+  if ([
+    "attention",
+    "last-command-error",
+    "media-gated",
+    "provider-roundtrip-failed",
+  ].includes(status)) {
     return "warning";
   }
   if (["failed"].includes(status)) {

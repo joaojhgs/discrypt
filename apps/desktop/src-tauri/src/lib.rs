@@ -43,9 +43,12 @@ use discrypt_storage::{
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 use discrypt_transport::{
-    plan_signaling_adapter_fallback, required_provider_adapter_boundaries, AdapterFallbackBehavior,
-    FallbackLeg, SignalingAdapterKind, TransportRoute, TransportSession, TransportSessionSnapshot,
-    TransportSessionState,
+    plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
+    required_provider_adapter_boundaries, AdapterFallbackBehavior, AdapterTrustLabel,
+    ConnectivityScopeLevel, ConversationScope, Endpoint, FallbackLeg, ProviderMetadataPosture,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportRoute, TransportSession,
+    TransportSessionSnapshot, TransportSessionState,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -430,6 +433,22 @@ pub struct InviteView {
     pub revoked: bool,
     /// Honest admission copy.
     pub admission_copy: String,
+}
+
+impl InviteView {
+    fn connectivity_policy(&self) -> ConnectivityPolicyView {
+        ConnectivityPolicyView {
+            connectivity_schema_version: self.connectivity_schema_version,
+            invite_kind: self.invite_kind.clone(),
+            scope_id_commitment: self.scope_id_commitment.clone(),
+            signaling_profiles: self.signaling_profiles.clone(),
+            ice_stun_servers: self.ice_stun_servers.clone(),
+            ice_turn_servers: self.ice_turn_servers.clone(),
+            privacy_label: self.privacy_label.clone(),
+            dm_bootstrap: self.dm_bootstrap.clone(),
+            group_bootstrap: self.group_bootstrap.clone(),
+        }
+    }
 }
 
 /// Command-backed voice participant state.
@@ -864,6 +883,14 @@ pub struct LeaveVoiceRequest {
 pub struct StartSignalingSessionRequest {
     /// Optional stable label for observability and command dedupe.
     pub scope_label: Option<String>,
+    /// When true, run a real provider-adapter opaque signaling roundtrip probe
+    /// using the selected DM/group/invite connectivity policy.
+    #[serde(default)]
+    pub adapter_probe: bool,
+    /// Optional adapter kind override for the probe (`mqtt`, `nostr`,
+    /// `ipfs_pubsub`, or `discrypt_quic_rendezvous`).
+    #[serde(default)]
+    pub adapter_kind: Option<String>,
 }
 
 /// Request to stop a backend signaling transport session.
@@ -962,6 +989,13 @@ pub struct TransportDiagnosticsView {
     pub route_proof_detail: String,
     /// TURN-required status derived from route evidence.
     pub turn_required: String,
+    /// Latest real provider-adapter roundtrip probe status.
+    pub adapter_probe_status: String,
+    /// Evidence or blocker from the latest provider-adapter roundtrip probe.
+    pub adapter_probe_detail: String,
+    /// Structured latest provider-adapter probe evidence, when available.
+    #[serde(default)]
+    pub adapter_probe: Option<SignalingAdapterProbeView>,
 }
 
 /// Readiness and selection metadata for a fallback signaling adapter attempt.
@@ -977,6 +1011,27 @@ pub struct SignalingAdapterFallbackAttemptView {
     pub attempted: bool,
     /// This adapter won selection under the active fallback policy.
     pub selected: bool,
+}
+
+/// Backend evidence from a real provider adapter probe.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignalingAdapterProbeView {
+    /// Adapter kind.
+    pub kind: String,
+    /// Policy profile id.
+    pub profile_id: String,
+    /// Redacted endpoint label.
+    pub endpoint_label: String,
+    /// Scope commitment used for topic derivation.
+    pub scope_commitment: String,
+    /// Provider-visible derived rendezvous topic/tag.
+    pub rendezvous_topic: String,
+    /// Presence proof flag.
+    pub presence_roundtrip: bool,
+    /// Sealed signal proof flag.
+    pub signal_roundtrip: bool,
+    /// Sealed control proof flag.
+    pub control_roundtrip: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1108,6 +1163,10 @@ struct PersistedAppState {
     #[serde(default)]
     text_session: Option<TransportSessionRecord>,
     #[serde(default)]
+    latest_signaling_probe: Option<SignalingAdapterProbeView>,
+    #[serde(default)]
+    latest_signaling_probe_error: Option<String>,
+    #[serde(default)]
     abuse: PersistedAbuseState,
     friend_verified: bool,
     next_sequence: u64,
@@ -1157,8 +1216,8 @@ pub fn app_state() -> AppStateView {
 /// Tauri command: start the backend signaling control-plane transport session.
 pub fn start_signaling_session(request: StartSignalingSessionRequest) -> AppStateView {
     mutate_app_service(|state| {
-        if let Err(error) =
-            state.start_transport_session(BackendTransportMode::Signaling, request.scope_label)
+        if let Err(error) = state
+            .start_transport_session(BackendTransportMode::Signaling, request.scope_label.clone())
         {
             state.push_command_error(
                 "transport.signaling_start_rejected",
@@ -1167,6 +1226,20 @@ pub fn start_signaling_session(request: StartSignalingSessionRequest) -> AppStat
                 error,
                 "Check adapter readiness and connectivity settings before retrying signaling",
             );
+            return;
+        }
+        if request.adapter_probe {
+            if let Err(error) =
+                state.probe_active_signaling_adapter(request.adapter_kind.as_deref())
+            {
+                state.push_command_error(
+                    "transport.signaling_probe_failed",
+                    "start_signaling_session",
+                    "adapter_probe_failed",
+                    error,
+                    "Check adapter feature flags, provider endpoint reachability, and per-scope connectivity policy before claiming signaling",
+                );
+            }
         }
     })
 }
@@ -2687,6 +2760,8 @@ impl PersistedAppState {
             last_command_error: None,
             signaling_session: None,
             text_session: None,
+            latest_signaling_probe: None,
+            latest_signaling_probe_error: None,
             abuse: PersistedAbuseState::default(),
             friend_verified: false,
             next_sequence: 2,
@@ -2758,6 +2833,7 @@ impl PersistedAppState {
             .map(|kind| kind.canonical_name().to_owned());
         let (route_proof_status, route_proof_detail, turn_required) =
             self.route_proof_status(self.signaling_session.as_ref(), self.text_session.as_ref());
+        let (adapter_probe_status, adapter_probe_detail) = self.signaling_probe_status();
         TransportDiagnosticsView {
             adapter_boundaries,
             adapter_fallback_attempts,
@@ -2765,7 +2841,35 @@ impl PersistedAppState {
             route_proof_status,
             route_proof_detail,
             turn_required,
+            adapter_probe_status,
+            adapter_probe_detail,
+            adapter_probe: self.latest_signaling_probe.clone(),
         }
+    }
+
+    fn signaling_probe_status(&self) -> (String, String) {
+        if let Some(probe) = &self.latest_signaling_probe {
+            return (
+                "provider-roundtrip-proofed".to_owned(),
+                format!(
+                    "adapter={} profile={} endpoint={} topic={} presence={} signal={} control={}",
+                    probe.kind,
+                    probe.profile_id,
+                    probe.endpoint_label,
+                    probe.rendezvous_topic,
+                    probe.presence_roundtrip,
+                    probe.signal_roundtrip,
+                    probe.control_roundtrip
+                ),
+            );
+        }
+        if let Some(error) = &self.latest_signaling_probe_error {
+            return ("provider-roundtrip-failed".to_owned(), error.clone());
+        }
+        (
+            "provider-roundtrip-not-run".to_owned(),
+            "Start signaling with adapter_probe=true to verify the selected provider adapter without claiming WebRTC/media connectivity".to_owned(),
+        )
     }
 
     fn route_proof_status(
@@ -2964,6 +3068,173 @@ impl PersistedAppState {
                 format!("Stopped {mode} transport session {stopped_session_id}"),
             );
         }
+    }
+
+    fn probe_active_signaling_adapter(
+        &mut self,
+        requested_kind: Option<&str>,
+    ) -> Result<(), String> {
+        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
+            "No active DM/group/invite connectivity policy is available for signaling probe"
+                .to_owned()
+        })?;
+        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
+        let profile_view = self
+            .select_signaling_profile(&connectivity, requested_kind)
+            .ok_or_else(|| {
+                "No signaling profile matches the requested adapter kind and build readiness"
+                    .to_owned()
+            })?;
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let bootstrap_secret = self.probe_material(
+            "discrypt-runtime-provider-probe-bootstrap-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = self.probe_material(
+            "discrypt-runtime-provider-probe-entropy-v1",
+            &connectivity.scope_id_commitment,
+            &profile.profile_id,
+            16,
+        );
+        let probe = run_provider_adapter_probe(profile, scope, bootstrap_secret, random_entropy)
+            .map_err(|error| {
+                self.latest_signaling_probe = None;
+                self.latest_signaling_probe_error = Some(error.clone());
+                error
+            })?;
+        let view = SignalingAdapterProbeView {
+            kind: probe.kind.canonical_name().to_owned(),
+            profile_id: probe.profile_id,
+            endpoint_label: probe.endpoint_label,
+            scope_commitment: probe.scope_commitment,
+            rendezvous_topic: probe.rendezvous_topic,
+            presence_roundtrip: probe.presence_roundtrip,
+            signal_roundtrip: probe.signal_roundtrip,
+            control_roundtrip: probe.control_roundtrip,
+        };
+        self.latest_signaling_probe_error = None;
+        self.latest_signaling_probe = Some(view.clone());
+        self.push_event(
+            "transport.signaling_probe_ok",
+            format!(
+                "Provider adapter roundtrip proofed for {} profile {}",
+                view.kind, view.profile_id
+            ),
+        );
+        Ok(())
+    }
+
+    fn active_connectivity_policy(
+        &self,
+    ) -> Option<(ConnectivityScopeLevel, ConnectivityPolicyView)> {
+        if let Some(context) = &self.active_context {
+            if let Some(dm_id) = &context.dm_id {
+                if let Some(connectivity) = self
+                    .dms
+                    .iter()
+                    .find(|dm| &dm.dm_id == dm_id)
+                    .and_then(|dm| dm.connectivity.clone())
+                {
+                    return Some((ConnectivityScopeLevel::Dm, connectivity));
+                }
+            }
+            if let Some(group_id) = &context.group_id {
+                if let Some(connectivity) = self
+                    .groups
+                    .iter()
+                    .find(|group| &group.group_id == group_id)
+                    .and_then(|group| group.connectivity.clone())
+                {
+                    return Some((ConnectivityScopeLevel::Group, connectivity));
+                }
+            }
+        }
+        self.invites
+            .last()
+            .map(|invite| {
+                (
+                    ConnectivityScopeLevel::InviteBootstrap,
+                    invite.connectivity_policy(),
+                )
+            })
+            .or_else(|| {
+                self.dms
+                    .first()
+                    .and_then(|dm| dm.connectivity.clone())
+                    .map(|connectivity| (ConnectivityScopeLevel::Dm, connectivity))
+            })
+            .or_else(|| {
+                self.groups
+                    .first()
+                    .and_then(|group| group.connectivity.clone())
+                    .map(|connectivity| (ConnectivityScopeLevel::Group, connectivity))
+            })
+    }
+
+    fn select_signaling_profile(
+        &self,
+        connectivity: &ConnectivityPolicyView,
+        requested_kind: Option<SignalingAdapterKind>,
+    ) -> Option<SignalingProfileView> {
+        if let Some(kind) = requested_kind {
+            return connectivity
+                .signaling_profiles
+                .iter()
+                .find(|profile| {
+                    transport_adapter_kind_from_name(&profile.adapter_kind) == Some(kind)
+                })
+                .cloned();
+        }
+        let requested = connectivity
+            .signaling_profiles
+            .iter()
+            .filter_map(|profile| transport_adapter_kind_from_name(&profile.adapter_kind))
+            .collect::<Vec<_>>();
+        let selected = plan_signaling_adapter_fallback(
+            &requested,
+            AdapterFallbackBehavior::FirstHealthy,
+            None,
+        )
+        .selected?;
+        connectivity
+            .signaling_profiles
+            .iter()
+            .find(|profile| {
+                transport_adapter_kind_from_name(&profile.adapter_kind) == Some(selected)
+            })
+            .cloned()
+    }
+
+    fn probe_material(
+        &self,
+        domain: &str,
+        scope_commitment: &str,
+        profile_id: &str,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut counter = 0_u8;
+        while out.len() < len {
+            let mut hasher = Sha256::new();
+            hasher.update(domain.as_bytes());
+            hasher.update([0]);
+            hasher.update(self.identity_seed_hex.as_bytes());
+            hasher.update([0]);
+            hasher.update(self.local_user_id().as_bytes());
+            hasher.update([0]);
+            hasher.update(scope_commitment.as_bytes());
+            hasher.update([0]);
+            hasher.update(profile_id.as_bytes());
+            hasher.update([0, counter]);
+            out.extend_from_slice(&hasher.finalize());
+            counter = counter.wrapping_add(1);
+        }
+        out.truncate(len);
+        out
     }
 
     fn transport_session_route(&self) -> Option<TransportRoute> {
@@ -4125,6 +4396,102 @@ fn profile_kind_from_name(value: &str) -> InviteSignalingAdapterKind {
         "discrypt_quic_rendezvous" => InviteSignalingAdapterKind::DiscryptQuicRendezvous,
         _ => InviteSignalingAdapterKind::Mqtt,
     }
+}
+
+fn transport_adapter_kind_from_name(value: &str) -> Option<SignalingAdapterKind> {
+    match value {
+        "mqtt" => Some(SignalingAdapterKind::Mqtt),
+        "nostr" => Some(SignalingAdapterKind::Nostr),
+        "ipfs_pubsub" => Some(SignalingAdapterKind::IpfsPubsub),
+        "discrypt_quic_rendezvous" => Some(SignalingAdapterKind::DiscryptQuicRendezvous),
+        _ => None,
+    }
+}
+
+fn transport_profile_from_view(
+    profile: &SignalingProfileView,
+) -> Result<SignalingAdapterProfile, String> {
+    let kind = transport_adapter_kind_from_name(&profile.adapter_kind)
+        .ok_or_else(|| format!("Unknown signaling adapter kind {}", profile.adapter_kind))?;
+    let endpoints = profile
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut provider = SignalingProviderEndpoint::new(
+                Endpoint::new(endpoint.clone()),
+                endpoint_security_for_probe(endpoint),
+            );
+            provider.trust_fingerprint = Some(profile.trust_fingerprint.clone());
+            provider.retained_presence = profile
+                .capabilities
+                .iter()
+                .any(|capability| capability == "retained_presence");
+            provider
+        })
+        .collect::<Vec<_>>();
+    let transport_profile = SignalingAdapterProfile {
+        profile_id: profile.profile_id.clone(),
+        kind,
+        endpoints,
+        metadata_posture: provider_metadata_posture_from_name(&profile.metadata_posture),
+        capabilities: SignalingAdapterCapabilities::production_required(),
+        trust_label: AdapterTrustLabel::new(
+            profile.adapter_kind.clone(),
+            "runtime app-state selected provider adapter; opaque envelopes only",
+        )
+        .map_err(|error| error.to_string())?,
+    };
+    transport_profile
+        .validate()
+        .map_err(|error| error.to_string())?;
+    Ok(transport_profile)
+}
+
+fn endpoint_security_for_probe(endpoint: &str) -> SignalingEndpointSecurity {
+    if endpoint.starts_with("mqtt://127.0.0.1")
+        || endpoint.starts_with("ws://127.0.0.1")
+        || endpoint.starts_with("http://127.0.0.1")
+        || endpoint.starts_with("quic://127.0.0.1")
+        || endpoint.starts_with("/ip4/127.0.0.1/")
+        || endpoint.starts_with("/ip6/::1/")
+    {
+        SignalingEndpointSecurity::LocalDevLoopback
+    } else {
+        SignalingEndpointSecurity::ProductionTls
+    }
+}
+
+fn provider_metadata_posture_from_name(value: &str) -> ProviderMetadataPosture {
+    match value {
+        "random_topic" => ProviderMetadataPosture::RandomTopic,
+        "epoch_rotating_topic" => ProviderMetadataPosture::EpochRotatingTopic,
+        _ => ProviderMetadataPosture::HashedTopic,
+    }
+}
+
+fn run_provider_adapter_probe(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: Vec<u8>,
+    random_entropy: Vec<u8>,
+) -> Result<discrypt_transport::ProviderAdapterRoundtripProbe, String> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Could not start provider probe runtime: {error}"))?;
+        runtime
+            .block_on(probe_provider_adapter_roundtrip(
+                profile,
+                scope,
+                &bootstrap_secret,
+                &random_entropy,
+            ))
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .map_err(|_| "Provider adapter probe thread panicked".to_owned())?
 }
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
@@ -5875,6 +6242,8 @@ mod tests {
 
         let started = start_signaling_session(StartSignalingSessionRequest {
             scope_label: Some("dm:alice-bob".to_owned()),
+            adapter_probe: false,
+            adapter_kind: None,
         });
         assert!(started.last_command_error.is_none());
         let diagnostics = started.transport_diagnostics;
@@ -5907,6 +6276,40 @@ mod tests {
             .transport_status
             .iter()
             .any(|status| status.label == "signaling session" && status.status == "cancelled"));
+    }
+
+    #[test]
+    fn signaling_adapter_probe_surfaces_runtime_blocker_without_route_claim() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("signaling-adapter-probe");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = start_signaling_session(StartSignalingSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            adapter_probe: true,
+            adapter_kind: Some("discrypt_quic_rendezvous".to_owned()),
+        });
+
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("QUIC probe must fail closed until sibling client is wired");
+        assert_eq!(error.code, "adapter_probe_failed");
+        assert_eq!(
+            state.transport_diagnostics.adapter_probe_status,
+            "provider-roundtrip-failed"
+        );
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-proof-not-available"
+        );
+        assert!(state.transport_diagnostics.adapter_probe.is_none());
     }
 
     #[test]

@@ -10,7 +10,7 @@ Discrypt is **not production-complete** for the full serverless P2P encrypted ap
 - **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
 - **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; public bootstrap smoke exists but still requires configured bootstrap multiaddrs.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
-- **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof is at the transport signaling adapter layer, not the complete UI/backend/media plane.
+- **Full app-level two-Tauri-instance DM/group text + voice E2E over those adapters: not done.** Current proof is at the transport signaling adapter layer plus a Tauri command/UI-triggered provider-adapter roundtrip probe; it is still not the complete UI/backend/media plane.
 
 ## What was implemented now
 
@@ -64,6 +64,33 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 ```
 
 Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; QUIC still passes fail-closed guards proving it remains non-selectable until the sibling-service client is implemented and tested.
+
+
+### Tauri runtime adapter probe
+
+Files:
+
+- `crates/transport/src/provider_adapters.rs`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/ui/src/commands.ts`
+- `apps/ui/src/main.tsx`
+
+Behavior:
+
+- Adds `probe_provider_adapter_roundtrip(...)`, a reusable transport-layer probe that connects two local peers through the selected real provider adapter and verifies opaque presence, sealed WebRTC-negotiation payload, and sealed control broadcast delivery.
+- Extends `start_signaling_session` with `adapter_probe=true` and optional `adapter_kind` so the Tauri backend can run the selected DM/group/invite signaling profile instead of only showing static readiness.
+- Persists structured `adapter_probe_status`, `adapter_probe_detail`, and redacted probe evidence into transport diagnostics.
+- Adds a UI "Probe adapter" action in the transport status panel.
+- Keeps route/media claims separate: a successful adapter probe proves provider rendezvous only; it does not mark ICE, data-channel, or voice media as connected.
+
+Verification:
+
+```bash
+cargo test -q -p discrypt-transport provider_adapter_roundtrip_probe_quic_fails_closed
+cargo test -q -p discrypt-desktop signaling_adapter_probe_surfaces_runtime_blocker_without_route_claim
+npm --prefix apps/ui run typecheck
+cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter
+```
 
 ### Public real-network test
 

@@ -261,6 +261,20 @@ export type TransportDiagnosticsView = {
   route_proof_status: string;
   route_proof_detail: string;
   turn_required: string;
+  adapter_probe_status: string;
+  adapter_probe_detail: string;
+  adapter_probe: SignalingAdapterProbeView | null;
+};
+
+export type SignalingAdapterProbeView = {
+  kind: string;
+  profile_id: string;
+  endpoint_label: string;
+  scope_commitment: string;
+  rendezvous_topic: string;
+  presence_roundtrip: boolean;
+  signal_roundtrip: boolean;
+  control_roundtrip: boolean;
 };
 
 export type JoinProgressStepView = {
@@ -480,6 +494,8 @@ export type StartDmRequest = {
 
 export type StartSignalingSessionRequest = {
   scope_label?: string | null;
+  adapter_probe?: boolean;
+  adapter_kind?: string | null;
 };
 
 export type StopSignalingSessionRequest = {
@@ -673,6 +689,10 @@ const fallbackState: AppState = {
     route_proof_detail:
       "Tauri IPC is not connected; local fallback cannot prove backend transport routes",
     turn_required: "not-proven",
+    adapter_probe_status: "provider-roundtrip-not-run",
+    adapter_probe_detail:
+      "Tauri IPC is not connected; local fallback cannot run a provider adapter probe",
+    adapter_probe: null,
   },
   join_progress: [],
   text_state_legend: textStateLegend(),
@@ -1081,6 +1101,13 @@ function deriveTransportDiagnostics(state: AppState): TransportDiagnosticsView {
       state.transport_diagnostics?.route_proof_detail ??
       "Tauri IPC is not connected; local fallback cannot prove backend transport routes",
     turn_required: state.transport_diagnostics?.turn_required ?? "not-proven",
+    adapter_probe_status:
+      state.transport_diagnostics?.adapter_probe_status ??
+      "provider-roundtrip-not-run",
+    adapter_probe_detail:
+      state.transport_diagnostics?.adapter_probe_detail ??
+      "Tauri IPC is not connected; local fallback cannot run a provider adapter probe",
+    adapter_probe: state.transport_diagnostics?.adapter_probe ?? null,
   };
 }
 
