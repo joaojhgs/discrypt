@@ -4580,6 +4580,103 @@ mod tests {
     }
 
     #[test]
+    fn group_and_dm_invites_carry_bootstrap_metadata_and_persist() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("invite-bootstrap-flow");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+        });
+        let group_invite = invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.group_id == group_id);
+        assert!(group_invite.is_some());
+        let Some(group_invite) = group_invite else {
+            return;
+        };
+        assert_eq!(group_invite.connectivity_schema_version, 1);
+        assert_eq!(group_invite.invite_kind, "group_join");
+        assert_eq!(group_invite.scope_id_commitment.len(), 64);
+        assert!(group_invite.group_bootstrap.is_some());
+        assert!(group_invite.dm_bootstrap.is_none());
+        assert_eq!(
+            group_invite.ice_stun_servers,
+            vec!["stun:stun.l.google.com:19302".to_owned()]
+        );
+        assert!(group_invite.ice_turn_servers.is_empty());
+        assert!(group_invite.code.contains("?d="));
+        assert!(!group_invite.code.contains("Private%20Lab"));
+        assert!(!group_invite.code.contains("room_secret="));
+
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state.dms[0].dm_id.clone();
+        let dm_invite_state = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(dm_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "1".to_owned(),
+        });
+        let dm_invite = dm_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.dm_id.as_deref() == Some(dm_id.as_str()));
+        assert!(dm_invite.is_some());
+        let Some(dm_invite) = dm_invite else {
+            return;
+        };
+        assert_eq!(dm_invite.invite_kind, "dm_contact");
+        assert_eq!(dm_invite.group_id, "");
+        assert_eq!(dm_invite.scope_id_commitment.len(), 64);
+        assert!(dm_invite.dm_bootstrap.is_some());
+        assert!(dm_invite.group_bootstrap.is_none());
+        assert!(dm_invite.code.contains("?d="));
+        assert!(!dm_invite.code.contains("Bob"));
+
+        let accepted = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code: dm_invite.code.clone(),
+            display_name: Some("Bob accepted".to_owned()),
+        });
+        assert_eq!(
+            accepted
+                .active_context
+                .as_ref()
+                .and_then(|context| context.dm_id.as_deref()),
+            Some(dm_id.as_str())
+        );
+        assert!(accepted
+            .invites
+            .iter()
+            .any(|invite| invite.invite_kind == "dm_contact" && invite.uses == 1));
+
+        let persisted = load_state().to_view();
+        assert!(persisted
+            .invites
+            .iter()
+            .any(|invite| invite.invite_kind == "group_join"));
+        assert!(persisted
+            .invites
+            .iter()
+            .any(|invite| invite.invite_kind == "dm_contact"));
+        assert!(persisted.dms.iter().any(|dm| dm
+            .connectivity
+            .as_ref()
+            .map(|policy| policy.invite_kind.as_str())
+            == Some("dm_contact")));
+    }
+
+    #[test]
     fn dm_flow_persists_across_reload() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("dm-flow");

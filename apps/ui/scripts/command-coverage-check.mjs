@@ -104,6 +104,18 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "create_dm_invite",
+    exportName: "createDmInvite",
+    args: ["dm_id", "expires", "max_use"],
+    returns: "AppState",
+  },
+  {
+    command: "accept_dm_invite",
+    exportName: "acceptDmInvite",
+    args: ["invite_code", "display_name"],
+    returns: "AppState",
+  },
+  {
     command: "create_channel",
     exportName: "createChannel",
     args: ["group_id", "name", "kind", "retention_status"],
@@ -261,6 +273,8 @@ const requestTypes = [
   ["JoinGroupRequest", ["invite_code", "group_name"]],
   ["SetActiveGroupRequest", ["group_id"]],
   ["CreateInviteRequest", ["group_id", "expires", "max_use"]],
+  ["CreateDmInviteRequest", ["dm_id", "expires", "max_use"]],
+  ["AcceptDmInviteRequest", ["invite_code", "display_name"]],
   ["CreateChannelRequest", ["group_id", "name", "kind", "retention_status"]],
   ["SendMessageRequest", ["target", "body"]],
   ["MessageTargetView", ["kind", "dm_id", "group_id", "channel_id"]],
