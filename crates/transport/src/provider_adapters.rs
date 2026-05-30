@@ -1891,15 +1891,14 @@ const IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS: u64 = 20;
 
 /// Versioned public bootstrap policy for explicit IPFS/libp2p adapter profiles.
 ///
-/// These are generic libp2p bootstrap peers only. They are discovery seeds, not a
-/// guarantee that any peer relays arbitrary Discrypt gossipsub topics; production
-/// group/DM policy still needs a reachable Discrypt topic peer or rendezvous path.
+/// DNS bootstrap is intentionally disabled while the libp2p DNS stack is
+/// audit-blocked. IPFS profiles must provide explicit `/ip4` or `/ip6`
+/// multiaddrs for reachable Discrypt topic peers.
 #[cfg(feature = "ipfs-pubsub-adapter")]
 pub const IPFS_PUBSUB_BOOTSTRAP_POLICY_VERSION: u8 = 1;
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
-pub const IPFS_PUBSUB_PUBLIC_BOOTSTRAP_MULTIADDRS: &[&str] =
-    &["/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfJPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"];
+pub const IPFS_PUBSUB_PUBLIC_BOOTSTRAP_MULTIADDRS: &[&str] = &[];
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
 fn ipfs_err(context: &str, err: impl std::fmt::Display) -> TransportError {
@@ -2165,8 +2164,6 @@ async fn spawn_ipfs_pubsub_room(
             libp2p::yamux::Config::default,
         )
         .map_err(|err| ipfs_err("tcp transport", err))?
-        .with_dns()
-        .map_err(|err| ipfs_err("dns transport", err))?
         .with_behaviour(|keypair| {
             let local_peer_id = libp2p::PeerId::from(keypair.public());
             let gossipsub = libp2p::gossipsub::Behaviour::<
@@ -4078,15 +4075,11 @@ mod tests {
         assert!(!config.flood_publish());
 
         let defaults = ipfs_pubsub_default_bootstrap_addrs().expect("default bootstrap addrs");
-        assert_eq!(
-            defaults.len(),
-            IPFS_PUBSUB_PUBLIC_BOOTSTRAP_MULTIADDRS.len()
-        );
         assert!(
-            defaults.iter().all(ipfs_should_dial),
-            "default bootstrap peers must be dialable discovery seeds"
+            defaults.is_empty(),
+            "default bootstrap is disabled until the libp2p DNS audit blocker is remediated"
         );
-        ipfs_validate_bootstrap_policy(&defaults).expect("default bootstrap policy");
+        ipfs_validate_bootstrap_policy(&defaults).expect("empty default bootstrap policy");
     }
 
     #[test]

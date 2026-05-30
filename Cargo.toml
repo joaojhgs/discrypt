@@ -55,3 +55,5 @@ missing_docs = "allow"
 panic = "warn"
 unwrap_used = "warn"
 expect_used = "warn"
+[patch.crates-io]
+hpke-rs-libcrux = { path = "third_party/hpke-rs-libcrux-0.6.1-discrypt" }

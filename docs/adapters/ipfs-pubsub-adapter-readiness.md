@@ -13,7 +13,7 @@ Current behavior:
 - The adapter validates `SignalingAdapterProfile` endpoints as libp2p multiaddrs.
 - Each room subscribes to a gossipsub topic derived from `RendezvousCapability.topic`.
 - Published gossipsub messages are JSON envelopes containing only sealed/opaque Discrypt signaling payloads.
-- A versioned explicit bootstrap policy (`IPFS_PUBSUB_BOOTSTRAP_POLICY_VERSION=1`) defines allowed public libp2p bootstrap seeds as discovery seeds only, not guaranteed topic relays.
+- A versioned explicit bootstrap policy (`IPFS_PUBSUB_BOOTSTRAP_POLICY_VERSION=1`) currently defines an empty public default while the libp2p/Hickory DNS stack is audit-blocked; production profiles must provide explicit direct `/ip4` or `/ip6` multiaddrs as discovery/topic-peer seeds.
 - Resource limits are enforced in code: max 16 bootstrap endpoints, duplicate endpoint rejection, 64 KiB max transmit/envelope size, bounded command queue, strict validation, flood-publish disabled, and bounded gossipsub mesh/history/duplicate-cache settings.
 - Local duplicate suppression is enabled by message fingerprint.
 - `leave()` unsubscribes from the topic and stops the swarm task.
@@ -44,11 +44,11 @@ The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` a
 
 ## Remaining production hardening checklist
 
-- Public/default bootstrap peer policy is now versioned and parse-tested, with generic `bootstrap.libp2p.io` seed(s) documented as discovery-only and capped by a resource policy. Rotation remains a release-management task before IPFS becomes a default route.
+- Public/default bootstrap peer policy is now versioned and parse-tested, but public defaults are intentionally empty while the libp2p/Hickory DNS stack remains audit-blocked. Explicit direct bootstrap multiaddrs are still capped by the resource policy. Rotation plus topic-peer discovery remains a release-management task before IPFS becomes a default route.
 - Resource-limit configuration is implemented for the current adapter boundary: bounded bootstrap endpoint count, duplicate rejection, 64 KiB transmit/envelope limit, bounded command queue, strict gossipsub validation, flood-publish disabled, and bounded mesh/history/duplicate-cache settings. Full peer-score tuning remains future hardening before default enablement.
 - Typed health mapping now covers oversized envelopes (`provider_message_too_large`) and topic mesh unavailability (`provider_unhealthy`) with redacted `failure_class`/`health_state` details. Remaining typed-health hardening: bootstrap connection failures, resource exhaustion beyond local policy rejection, duplicate storms, and provider-unhealthy swarm events.
 - Add provider-visible metadata capture scans for gossipsub topics and payloads.
-- Add public/realistic bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1`; if public peers are unreliable, keep IPFS non-default and require explicit group/DM configuration.
+- Add public/realistic direct-bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1` and explicit topic-peer/rendezvous multiaddrs; keep IPFS non-default until this passes without DNS bootstrap.
 - Wire this adapter through the Tauri app runtime path and two-profile app E2E; current proof is at the transport adapter boundary.
 
 ## Why this is no longer a fake adapter
