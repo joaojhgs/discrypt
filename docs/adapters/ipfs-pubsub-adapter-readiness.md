@@ -40,7 +40,7 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error -- --nocapture
 ```
 
-The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` and `DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS` contains comma-separated bootstrap multiaddrs.
+The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` and `DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS` contains comma-separated explicit direct topic-peer multiaddrs. When the gate is enabled with generic DNS/bootstrap or bare dialable endpoints, it now fails fast with a typed connectivity-policy error instead of pretending the route is acceptable.
 
 ## Remaining production hardening checklist
 
@@ -48,7 +48,7 @@ The public smoke is still opt-in. It skips unless `DISCRYPT_PUBLIC_IPFS_E2E=1` a
 - Resource-limit configuration is implemented for the current adapter boundary: bounded bootstrap endpoint count, duplicate rejection, 64 KiB transmit/envelope limit, bounded command queue, strict gossipsub validation, flood-publish disabled, and bounded mesh/history/duplicate-cache settings. Full peer-score tuning remains future hardening before default enablement.
 - Typed health mapping covers oversized envelopes (`provider_message_too_large`), topic mesh unavailability, unreachable bootstrap connection, duplicate-envelope storms, and libp2p listener/runtime failures as redacted `failure_class`/`health_state` details.
 - Provider-visible metadata capture is covered by G133 (`npm --prefix apps/ui run test:provider-metadata-capture-g133`) for MQTT, Nostr, IPFS/libp2p, and QUIC adapter boundaries. External host packet captures remain a release-run artifact.
-- Remaining production blocker: add public/realistic direct-bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1` and explicit topic-peer/rendezvous multiaddrs; keep IPFS non-default until this passes without DNS bootstrap.
+- Remaining production blocker: add public/realistic direct-bootstrap evidence with `DISCRYPT_PUBLIC_IPFS_E2E=1` and explicit direct topic-peer multiaddrs; keep IPFS non-default until this passes on real public peers without DNS bootstrap.
 - Tauri runtime can select the adapter through the shared adapter factory when compiled with `ipfs-pubsub-adapter` and given explicit IPFS endpoints, but the remaining app proof is two-profile installed-app E2E over a real public/topic-peer IPFS route.
 
 ## Why this is no longer a fake adapter

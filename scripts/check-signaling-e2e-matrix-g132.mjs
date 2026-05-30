@@ -39,6 +39,7 @@ for (const token of [
   "Nostr public-provider",
   "IPFS public-provider",
   "QUIC public-provider",
+  "direct topic-peer",
 ]) {
   requireText("public-signaling-status-doc", releaseDoc, token);
 }
@@ -106,7 +107,7 @@ const matrixCommands = [
     },
     enabledByEnv: "DISCRYPT_PUBLIC_IPFS_E2E",
     skipReason:
-      "Set DISCRYPT_PUBLIC_IPFS_E2E=1 and DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct topic-peer multiaddr,...> to run this proof.",
+      "Set DISCRYPT_PUBLIC_IPFS_E2E=1 and DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<explicit direct topic-peer multiaddr,...> to run this proof.",
   },
   {
     required: false,

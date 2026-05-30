@@ -146,6 +146,63 @@ fn public_ipfs_profile(endpoints: Vec<String>) -> Result<SignalingAdapterProfile
     })
 }
 
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn validate_public_ipfs_direct_topic_peer_endpoints(
+    endpoints: &[String],
+) -> Result<(), TransportError> {
+    if endpoints.is_empty() {
+        return Err(TransportError::SignalingAdapter(
+            "public IPFS E2E requires at least one bootstrap multiaddr".to_owned(),
+        ));
+    }
+    if endpoints.iter().any(|endpoint| !endpoint.contains("/p2p/")) {
+        return Err(TransportError::InvalidConnectivityPolicy(
+            "public IPFS E2E requires explicit direct topic-peer multiaddrs; DNS/bootstrap or bare dialable endpoints are not accepted".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn public_ipfs_direct_topic_peer_endpoints() -> Result<Vec<String>, TransportError> {
+    let endpoints = std::env::var("DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS")
+        .map_err(|_| {
+            TransportError::SignalingAdapter(
+                "DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS is required for public IPFS E2E"
+                    .to_owned(),
+            )
+        })?
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    validate_public_ipfs_direct_topic_peer_endpoints(&endpoints)?;
+    Ok(endpoints)
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[test]
+fn public_ipfs_direct_topic_peer_validation_rejects_non_topic_peer_endpoints() {
+    let error = validate_public_ipfs_direct_topic_peer_endpoints(&[String::from(
+        "/ip4/203.0.113.10/tcp/4001",
+    )])
+    .expect_err("bare bootstrap endpoint must be rejected");
+    assert!(
+        format!("{error}").contains("direct topic-peer multiaddrs"),
+        "expected direct topic-peer blocker, got: {error}"
+    );
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+#[test]
+fn public_ipfs_direct_topic_peer_validation_accepts_explicit_peer_multiaddrs() {
+    validate_public_ipfs_direct_topic_peer_endpoints(&[String::from(
+        "/ip4/203.0.113.10/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    )])
+    .expect("direct topic-peer endpoint should be accepted");
+}
+
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0_u8; N];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -458,24 +515,7 @@ async fn public_ipfs_two_peer_signaling_smoke() -> Result<(), TransportError> {
         return Ok(());
     }
 
-    let endpoints = std::env::var("DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS")
-        .map_err(|_| {
-            TransportError::SignalingAdapter(
-                "DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS is required for public IPFS E2E"
-                    .to_owned(),
-            )
-        })?
-        .split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if endpoints.is_empty() {
-        return Err(TransportError::SignalingAdapter(
-            "public IPFS E2E requires at least one bootstrap multiaddr".to_owned(),
-        ));
-    }
-
+    let endpoints = public_ipfs_direct_topic_peer_endpoints()?;
     let profile = public_ipfs_profile(endpoints)?;
     let adapter = IpfsPubsubProviderAdapter;
     let alice_session = adapter.connect(profile.clone()).await?;
