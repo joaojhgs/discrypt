@@ -564,6 +564,8 @@ export type StopSignalingSessionRequest = {
 
 export type StartTextSessionRequest = {
   scope_label?: string | null;
+  data_channel_probe?: boolean;
+  adapter_kind?: string | null;
 };
 
 export type StopTextSessionRequest = {

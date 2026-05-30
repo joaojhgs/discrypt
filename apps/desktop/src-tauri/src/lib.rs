@@ -50,11 +50,11 @@ use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
     probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
-    AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityScopeLevel, ConversationScope,
-    Endpoint, FallbackLeg, IceServerConfig, ProviderMetadataPosture, SignalingAdapterCapabilities,
-    SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity,
-    SignalingProviderEndpoint, TransportRoute, TransportSession, TransportSessionSnapshot,
-    TransportSessionState,
+    AdapterFallbackBehavior, AdapterTrustLabel, ConnectionAttempt, ConnectivityPlan,
+    ConnectivityScopeLevel, ConversationScope, Endpoint, FallbackLeg, IceServerConfig,
+    ProviderMetadataPosture, SignalingAdapterCapabilities, SignalingAdapterKind,
+    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportRoute,
+    TransportSession, TransportSessionSnapshot, TransportSessionState,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -1030,6 +1030,15 @@ pub struct StopSignalingSessionRequest {
 pub struct StartTextSessionRequest {
     /// Optional stable label for observability and command dedupe.
     pub scope_label: Option<String>,
+    /// When true, verify the selected provider-signaled WebRTC DataChannel and
+    /// bind that proof to the text session route state. This proves the text/control
+    /// transport, not remote UI persistence or voice/media delivery.
+    #[serde(default)]
+    pub data_channel_probe: bool,
+    /// Optional adapter kind override for the proof (`mqtt`, `nostr`,
+    /// `ipfs_pubsub`, or `discrypt_quic_rendezvous`).
+    #[serde(default)]
+    pub adapter_kind: Option<String>,
 }
 
 /// Request to stop a backend text/control transport session.
@@ -1483,6 +1492,19 @@ pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
                 error,
                 "Check adapter readiness and route diagnostics before retrying text transport",
             );
+            return;
+        }
+        if request.data_channel_probe {
+            match state.probe_active_webrtc_data_channel(request.adapter_kind.as_deref()) {
+                Ok(probe) => state.mark_text_session_data_channel_route_proof(&probe),
+                Err(error) => state.push_command_error(
+                    "transport.text_data_channel_probe_failed",
+                    "start_text_session",
+                    "text_data_channel_probe_failed",
+                    error,
+                    "Check provider reachability, STUN/ICE policy, and selected per-scope connectivity before claiming text/control route proof",
+                ),
+            }
         }
     })
 }
@@ -3517,6 +3539,94 @@ impl PersistedAppState {
             ),
         );
         Ok(())
+    }
+
+    fn mark_text_session_data_channel_route_proof(
+        &mut self,
+        probe: &ProviderWebRtcDataChannelProbeView,
+    ) {
+        if !(probe.offerer_data_channel_open
+            && probe.answerer_data_channel_open
+            && probe.text_control_frame_roundtrip)
+        {
+            self.push_command_error(
+                "transport.text_route_not_proofed",
+                "start_text_session",
+                "text_data_channel_incomplete",
+                "Provider probe did not prove an open bidirectional text/control DataChannel",
+                "Retry after provider signaling and ICE connectivity are healthy",
+            );
+            return;
+        }
+        if !(probe.offerer_direct_path_ready && probe.answerer_direct_path_ready) {
+            self.push_event(
+                "transport.text_route_pending",
+                "DataChannel opened, but direct STUN route readiness was not proven; route state left unconnected until TURN/overlay proof is available".to_owned(),
+            );
+            return;
+        }
+        let endpoint = self
+            .active_connectivity_policy()
+            .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
+            .map(Endpoint::new)
+            .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
+        let plan = ConnectivityPlan {
+            attempts: vec![ConnectionAttempt {
+                leg: FallbackLeg::Stun,
+                endpoint: endpoint.clone(),
+                carries_content: false,
+                ciphertext_only: false,
+                succeeded: true,
+            }],
+            selected: FallbackLeg::Stun,
+            endpoint,
+        };
+        let selected_session = self.transport_session_mut(BackendTransportMode::Text);
+        let Some(record) = selected_session.as_mut() else {
+            self.push_command_error(
+                "transport.text_route_not_proofed",
+                "start_text_session",
+                "text_session_missing",
+                "Text session was not active when DataChannel proof completed",
+                "Start text transport again before probing the provider DataChannel",
+            );
+            return;
+        };
+        let selected = (|| -> Result<(), String> {
+            if matches!(record.state(), TransportSessionState::Signaling) {
+                record
+                    .session
+                    .begin_ice_gathering()
+                    .map_err(|error| error.to_string())?;
+            }
+            if matches!(record.state(), TransportSessionState::IceGathering) {
+                record
+                    .session
+                    .begin_checking()
+                    .map_err(|error| error.to_string())?;
+            }
+            record
+                .session
+                .select_connectivity_plan(plan)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        match selected {
+            Ok(()) => self.push_event(
+                "transport.text_route_proofed",
+                format!(
+                    "Text session route proofed by provider-signaled WebRTC DataChannel using {} profile {}",
+                    probe.kind, probe.profile_id
+                ),
+            ),
+            Err(error) => self.push_command_error(
+                "transport.text_route_not_proofed",
+                "start_text_session",
+                "text_route_state_transition_failed",
+                error,
+                "Retry text transport from a fresh session before claiming a connected route",
+            ),
+        }
     }
 
     fn probe_active_webrtc_data_channel(
@@ -8123,6 +8233,93 @@ mod tests {
             "route-proof-not-available"
         );
         assert!(state.transport_diagnostics.data_channel_probe.is_none());
+        assert!(state.voice_session.is_none());
+    }
+
+    #[test]
+    fn text_session_probe_failure_keeps_route_unproven() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-session-probe-fail");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: true,
+            adapter_kind: Some("discrypt_quic_rendezvous".to_owned()),
+        });
+
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("QUIC text-session DataChannel probe must fail closed");
+        assert_eq!(error.code, "text_data_channel_probe_failed");
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-proof-not-available"
+        );
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| { status.label == "text session" && status.status == "signaling" }));
+    }
+
+    #[test]
+    #[cfg(feature = "mqtt-adapter")]
+    fn public_mqtt_text_session_probe_marks_text_route_when_enabled() {
+        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_TEXT_SESSION_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping desktop public MQTT text session route proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_TEXT_SESSION_E2E=1 to run"
+            );
+            return;
+        }
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("desktop-public-mqtt-text-session");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
+                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        );
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: true,
+            adapter_kind: Some("mqtt".to_owned()),
+        });
+
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
+        );
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-proofed"
+        );
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-proofed"
+        );
+        assert_eq!(
+            state.transport_diagnostics.turn_required,
+            "turn-not-required"
+        );
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| { status.label == "text session" && status.status == "direct" }));
         assert!(state.voice_session.is_none());
     }
 
