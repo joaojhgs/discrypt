@@ -1125,6 +1125,19 @@ pub struct SetSelfMuteRequest {
     pub muted: bool,
 }
 
+/// Request carrying real local microphone level evidence for speaking-state UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateVoiceActivityRequest {
+    /// Session id.
+    pub session_id: String,
+    /// RMS amplitude measured from a real local capture buffer, scaled to i16 full scale.
+    pub rms_i16: u16,
+    /// Peak amplitude measured from a real local capture buffer, scaled to i16 full scale.
+    pub peak_i16: u16,
+    /// Browser/native capture timestamp in milliseconds for event correlation.
+    pub captured_at_ms: u64,
+}
+
 /// Request to set a participant speaker volume.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SetSpeakerVolumeRequest {
@@ -2832,6 +2845,92 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
     })
 }
 
+/// Tauri command: update local speaking state from real microphone level evidence.
+pub fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        let local_user_id = state.local_user_id();
+        if let Some(session) = &mut state.voice_session {
+            if session.session_id != request.session_id {
+                state.push_command_error(
+                    "voice.activity_rejected",
+                    "update_voice_activity",
+                    "voice_session_not_found",
+                    "Voice activity request did not match active session",
+                    "Join the active voice session before sending microphone activity",
+                );
+                return;
+            }
+            if !session.joined {
+                state.push_command_error(
+                    "voice.activity_rejected",
+                    "update_voice_activity",
+                    "voice_not_joined",
+                    "Voice activity was ignored because the voice session is not joined",
+                    "Join a voice channel before sending microphone activity",
+                );
+                return;
+            }
+
+            let evidence_speaking = request.rms_i16 >= 512 || request.peak_i16 >= 2_048;
+            let self_muted = session.self_muted;
+            let speaking = evidence_speaking && !self_muted;
+            if let Some(participant) = session
+                .participants
+                .iter_mut()
+                .find(|participant| participant.id == local_user_id)
+            {
+                participant.speaking = speaking;
+                participant.muted = self_muted;
+            } else {
+                session.participants.push(VoiceParticipantView {
+                    id: local_user_id.clone(),
+                    name: "You".to_owned(),
+                    role: "you".to_owned(),
+                    speaking,
+                    muted: self_muted,
+                    volume: 82,
+                });
+            }
+            session.status_copy = if self_muted {
+                format!(
+                    "Local microphone level observed at {} ms (rms {}, peak {}) but self-mute suppresses speaking state",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                )
+            } else if speaking {
+                format!(
+                    "Local speaking indicator is driven by real microphone level evidence at {} ms (rms {}, peak {}); encrypted media transport remains gated by media-frame E2E",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                )
+            } else {
+                format!(
+                    "Local microphone level observed below speaking threshold at {} ms (rms {}, peak {}); encrypted media transport remains gated by media-frame E2E",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                )
+            };
+            session.route_copy =
+                "Local capture permission, device selection, and microphone level evidence are active; encrypted remote media transport remains gated by media-frame E2E"
+                    .to_owned();
+            state.push_event(
+                "voice.activity",
+                format!(
+                    "Local microphone activity {} (rms {}, peak {})",
+                    if speaking { "speaking" } else { "silent" },
+                    request.rms_i16,
+                    request.peak_i16
+                ),
+            );
+        } else {
+            state.push_command_error(
+                "voice.activity_rejected",
+                "update_voice_activity",
+                "voice_session_not_found",
+                "No active voice session for microphone activity",
+                "Join a voice channel before sending microphone activity",
+            );
+        }
+    })
+}
+
 /// Tauri command: persist a participant speaker volume.
 pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -3178,6 +3277,11 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateView {
+        super::update_voice_activity(request)
+    }
+
+    #[tauri::command]
     pub(super) fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
         super::set_speaker_volume(request)
     }
@@ -3243,6 +3347,7 @@ pub fn run() {
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
+            ipc_commands::update_voice_activity,
             ipc_commands::set_speaker_volume,
             ipc_commands::poll_app_events,
             ipc_commands::deletion_warning,
@@ -7594,6 +7699,25 @@ mod tests {
             .as_ref()
             .map(|session| session.joined)
             .unwrap_or(false));
+        let activity = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: session_id.clone(),
+            rms_i16: 1_800,
+            peak_i16: 7_000,
+            captured_at_ms: 1_234,
+        });
+        assert!(activity
+            .voice_session
+            .as_ref()
+            .and_then(|session| session
+                .participants
+                .iter()
+                .find(|participant| participant.role == "you"))
+            .map(|participant| participant.speaking)
+            .unwrap_or(false));
+        assert!(activity
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.activity"));
         let muted = set_self_mute(SetSelfMuteRequest {
             session_id: session_id.clone(),
             muted: true,
@@ -7602,6 +7726,21 @@ mod tests {
             .voice_session
             .as_ref()
             .map(|session| session.self_muted)
+            .unwrap_or(false));
+        let muted_activity = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: session_id.clone(),
+            rms_i16: 2_000,
+            peak_i16: 9_000,
+            captured_at_ms: 1_260,
+        });
+        assert!(muted_activity
+            .voice_session
+            .as_ref()
+            .and_then(|session| session
+                .participants
+                .iter()
+                .find(|participant| participant.role == "you"))
+            .map(|participant| participant.muted && !participant.speaking)
             .unwrap_or(false));
         let local_user_id = joined
             .profile
@@ -9990,6 +10129,18 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "denied session captured".to_owned())?;
+        let activity_error = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: "missing".to_owned(),
+            rms_i16: 4_000,
+            peak_i16: 12_000,
+            captured_at_ms: 42,
+        });
+        let error = activity_error
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "activity session error".to_owned())?;
+        assert_eq!(error.command, "update_voice_activity");
+        assert_eq!(error.code, "voice_session_not_found");
         let volume_error = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id,
             participant_id: "missing-participant".to_owned(),
@@ -10140,6 +10291,14 @@ mod tests {
             .and_then(|session| session.participants.first())
             .map(|participant| participant.id.clone())
             .ok_or_else(|| "voice participant present".to_owned())?;
+
+        let activity = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: session_id.clone(),
+            rms_i16: 1_024,
+            peak_i16: 3_000,
+            captured_at_ms: 500,
+        });
+        cursor = assert_cursor_advanced(cursor, &activity);
 
         let muted = set_self_mute(SetSelfMuteRequest {
             session_id: session_id.clone(),

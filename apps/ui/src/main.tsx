@@ -42,6 +42,7 @@ import {
   setActiveGroup,
   setSelfMute,
   setSpeakerVolume,
+  updateVoiceActivity,
   startSignalingSession,
   startTextSession,
   startDm,
@@ -76,6 +77,9 @@ type VoiceDeviceAccess = {
   input_device_label: string | null;
   output_device_id: string | null;
   output_device_label: string | null;
+  activity_rms_i16: number | null;
+  activity_peak_i16: number | null;
+  activity_captured_at_ms: number | null;
 };
 
 function asThemeId(value: string): ThemeId {
@@ -90,15 +94,70 @@ function asTemplateId(value: string): TemplateId {
     : discryptUiConfig.activeTemplate;
 }
 
+function emptyVoiceDeviceAccess(
+  microphonePermission: VoiceDeviceAccess["microphone_permission"],
+): VoiceDeviceAccess {
+  return {
+    microphone_permission: microphonePermission,
+    input_device_id: null,
+    input_device_label: null,
+    output_device_id: null,
+    output_device_label: null,
+    activity_rms_i16: null,
+    activity_peak_i16: null,
+    activity_captured_at_ms: null,
+  };
+}
+
+async function measureLocalVoiceActivity(
+  stream: MediaStream,
+): Promise<Pick<
+  VoiceDeviceAccess,
+  "activity_rms_i16" | "activity_peak_i16" | "activity_captured_at_ms"
+>> {
+  const audioWindow = window as Window &
+    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextCtor = window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextCtor) {
+    return {
+      activity_rms_i16: null,
+      activity_peak_i16: null,
+      activity_captured_at_ms: null,
+    };
+  }
+  const context = new AudioContextCtor();
+  try {
+    if (context.state === "suspended") {
+      await context.resume().catch(() => undefined);
+    }
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    await new Promise((resolve) => window.setTimeout(resolve, 140));
+    const buffer = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buffer);
+    let squareSum = 0;
+    let peak = 0;
+    for (const sample of buffer) {
+      const centered = Math.abs(sample - 128) / 128;
+      squareSum += centered * centered;
+      peak = Math.max(peak, centered);
+    }
+    const rms = Math.sqrt(squareSum / buffer.length);
+    return {
+      activity_rms_i16: Math.round(Math.min(1, rms) * 32767),
+      activity_peak_i16: Math.round(Math.min(1, peak) * 32767),
+      activity_captured_at_ms: Date.now(),
+    };
+  } finally {
+    await context.close().catch(() => undefined);
+  }
+}
+
 async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
   if (!navigator.mediaDevices?.getUserMedia) {
-    return {
-      microphone_permission: "denied",
-      input_device_id: null,
-      input_device_label: null,
-      output_device_id: null,
-      output_device_label: null,
-    };
+    return emptyVoiceDeviceAccess("denied");
   }
 
   let stream: MediaStream | null = null;
@@ -114,21 +173,21 @@ async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
     const output =
       devices.find((device) => device.kind === "audiooutput" && device.deviceId) ??
       devices.find((device) => device.kind === "audiooutput");
+    const activity = await measureLocalVoiceActivity(stream).catch(() => ({
+      activity_rms_i16: null,
+      activity_peak_i16: null,
+      activity_captured_at_ms: null,
+    }));
     return {
       microphone_permission: "granted",
       input_device_id: input?.deviceId || "default",
       input_device_label: input?.label || "Default microphone",
       output_device_id: output?.deviceId || "default",
       output_device_label: output?.label || "Default speaker",
+      ...activity,
     };
   } catch {
-    return {
-      microphone_permission: "denied",
-      input_device_id: null,
-      input_device_label: null,
-      output_device_id: null,
-      output_device_label: null,
-    };
+    return emptyVoiceDeviceAccess("denied");
   } finally {
     stream?.getTracks().forEach((track) => track.stop());
   }
@@ -575,14 +634,42 @@ function App() {
         return;
       }
       const voiceAccess = await requestVoiceDeviceAccess();
-      void applyCommand(
-        joinVoice({
-          group_id: activeGroup.group_id,
-          channel_id: voiceChannel.channel_id,
-          ...voiceAccess,
-        }),
-        () => setWorkflow("voice"),
-      );
+      const joinedState = await joinVoice({
+        group_id: activeGroup.group_id,
+        channel_id: voiceChannel.channel_id,
+        microphone_permission: voiceAccess.microphone_permission,
+        input_device_id: voiceAccess.input_device_id,
+        input_device_label: voiceAccess.input_device_label,
+        output_device_id: voiceAccess.output_device_id,
+        output_device_label: voiceAccess.output_device_label,
+      });
+      setCommandState(joinedState);
+      setWorkflow("voice");
+      if (joinedState.last_command_error) {
+        const action = commandErrorToAction(joinedState.last_command_error);
+        setCommandError(
+          action
+            ? `${joinedState.last_command_error.message} — ${action}`
+            : joinedState.last_command_error.message,
+        );
+        return;
+      }
+      const sessionId = joinedState.voice_session?.session_id;
+      if (
+        sessionId &&
+        voiceAccess.activity_rms_i16 !== null &&
+        voiceAccess.activity_peak_i16 !== null &&
+        voiceAccess.activity_captured_at_ms !== null
+      ) {
+        void applyCommand(
+          updateVoiceActivity({
+            session_id: sessionId,
+            rms_i16: voiceAccess.activity_rms_i16,
+            peak_i16: voiceAccess.activity_peak_i16,
+            captured_at_ms: voiceAccess.activity_captured_at_ms,
+          }),
+        );
+      }
       return;
     }
     const sessionId = appState.voice_session?.session_id;

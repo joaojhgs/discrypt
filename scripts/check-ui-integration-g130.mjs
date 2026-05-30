@@ -128,6 +128,7 @@ for (const token of [
   "join_voice",
   "leave_voice",
   "set_self_mute",
+  "update_voice_activity",
   "set_speaker_volume",
   "save_preferences",
 ]) requireText("commands", token);

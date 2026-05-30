@@ -36,6 +36,29 @@ async function bootReadyShell(page) {
         ],
       },
     });
+
+    class E2EAudioContext {
+      state = "running";
+      createMediaStreamSource() {
+        return { connect: () => undefined };
+      }
+      createAnalyser() {
+        return {
+          fftSize: 1024,
+          getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
+        };
+      }
+      resume() {
+        return Promise.resolve();
+      }
+      close() {
+        return Promise.resolve();
+      }
+    }
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: E2EAudioContext,
+    });
   });
   await page.goto("/");
   await expect(
@@ -197,7 +220,8 @@ test("group invite join text channel and voice controls work without fake member
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
   await expect(page.getByText(/Speaking/).first()).toBeVisible();
-  await expect(page.getByText(/silent/).first()).toBeVisible();
+  await expect(page.getByText(/active/).first()).toBeVisible();
+  await expect(page.getByText(/speaking now/).first()).toBeVisible();
   await expect(
     page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
   ).toBeVisible();

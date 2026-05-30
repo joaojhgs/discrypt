@@ -31,6 +31,29 @@ async function installVoiceDevices(page: Page, profile: string) {
         ],
       },
     });
+
+    class E2EAudioContext {
+      state = "running";
+      createMediaStreamSource() {
+        return { connect: () => undefined };
+      }
+      createAnalyser() {
+        return {
+          fftSize: 1024,
+          getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
+        };
+      }
+      resume() {
+        return Promise.resolve();
+      }
+      close() {
+        return Promise.resolve();
+      }
+    }
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: E2EAudioContext,
+    });
   }, profile);
 }
 

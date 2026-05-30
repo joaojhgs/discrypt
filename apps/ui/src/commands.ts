@@ -675,6 +675,13 @@ export type SelfMuteRequest = {
   muted: boolean;
 };
 
+export type UpdateVoiceActivityRequest = {
+  session_id: string;
+  rms_i16: number;
+  peak_i16: number;
+  captured_at_ms: number;
+};
+
 export type SpeakerVolumeRequest = {
   session_id: string;
   participant_id: string;
@@ -2793,6 +2800,78 @@ export async function setSelfMute(request: SelfMuteRequest): Promise<AppState> {
         state,
         "voice.self_mute",
         request.muted ? "Self muted" : "Self unmuted",
+      );
+    }),
+  );
+}
+
+export async function updateVoiceActivity(
+  request: UpdateVoiceActivityRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("update_voice_activity", { request }, () =>
+    mutateFallback((state) => {
+      if (
+        !state.voice_session ||
+        state.voice_session.session_id !== request.session_id
+      ) {
+        pushCommandError(
+          state,
+          "voice.activity_rejected",
+          "update_voice_activity",
+          "voice_session_not_found",
+          state.voice_session
+            ? "Voice activity request did not match active session"
+            : "No active voice session for microphone activity",
+          state.voice_session
+            ? "Join the active voice session before sending microphone activity"
+            : "Join a voice channel before sending microphone activity",
+        );
+        return;
+      }
+      if (!state.voice_session.joined) {
+        pushCommandError(
+          state,
+          "voice.activity_rejected",
+          "update_voice_activity",
+          "voice_not_joined",
+          "Voice activity was ignored because the voice session is not joined",
+          "Join a voice channel before sending microphone activity",
+        );
+        return;
+      }
+      const selfMuted = state.voice_session.self_muted;
+      const speaking =
+        !selfMuted && (request.rms_i16 >= 512 || request.peak_i16 >= 2048);
+      const localId = localUserId(state);
+      let localParticipantFound = false;
+      state.voice_session.participants = state.voice_session.participants.map(
+        (participant) => {
+          if (participant.id !== localId) return participant;
+          localParticipantFound = true;
+          return { ...participant, speaking, muted: selfMuted };
+        },
+      );
+      if (!localParticipantFound) {
+        state.voice_session.participants.push({
+          id: localId,
+          name: "You",
+          role: "you",
+          speaking,
+          muted: selfMuted,
+          volume: 82,
+        });
+      }
+      state.voice_session.route_copy =
+        "Local capture permission, device selection, and microphone level evidence are active; encrypted remote media transport remains gated by media-frame E2E";
+      state.voice_session.status_copy = selfMuted
+        ? `Local microphone level observed at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}) but self-mute suppresses speaking state`
+        : speaking
+          ? `Local speaking indicator is driven by real microphone level evidence at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}); encrypted media transport remains gated by media-frame E2E`
+          : `Local microphone level observed below speaking threshold at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}); encrypted media transport remains gated by media-frame E2E`;
+      pushEvent(
+        state,
+        "voice.activity",
+        `Local microphone activity ${speaking ? "speaking" : "silent"}`,
       );
     }),
   );

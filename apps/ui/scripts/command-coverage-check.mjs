@@ -200,6 +200,12 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "update_voice_activity",
+    exportName: "updateVoiceActivity",
+    args: ["session_id", "rms_i16", "peak_i16", "captured_at_ms"],
+    returns: "AppState",
+  },
+  {
     command: "set_speaker_volume",
     exportName: "setSpeakerVolume",
     args: ["session_id", "participant_id", "volume"],
