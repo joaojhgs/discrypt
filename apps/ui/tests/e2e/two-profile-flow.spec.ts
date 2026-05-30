@@ -62,13 +62,18 @@ async function openProfile(
   return { context, page, errors };
 }
 
-async function sendDm(page: Page, contactName: string, body: string) {
+
+async function openDm(page: Page, contactName: string) {
   await page
     .getByRole("navigation", { name: /workspace sections/i })
     .getByRole("button", { name: "DMs", exact: true })
     .click();
   await page.getByLabel("Contact name").fill(contactName);
   await page.getByRole("button", { name: /start\/open dm/i }).click();
+}
+
+async function sendDm(page: Page, contactName: string, body: string) {
+  await openDm(page, contactName);
   await page.getByRole("textbox", { name: "Message" }).fill(body);
   await page.getByRole("button", { name: /send dm message/i }).click();
   await expect(page.getByText(body)).toBeVisible();
@@ -147,6 +152,35 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     await expect(
       bob.page.getByText("alice to bob local DM harness ping"),
     ).toHaveCount(0);
+
+    await alice.page.reload();
+    await bob.page.reload();
+    await expect(
+      alice.page.getByRole("navigation", { name: /workspace sections/i }),
+    ).toBeVisible();
+    await expect(
+      bob.page.getByRole("navigation", { name: /workspace sections/i }),
+    ).toBeVisible();
+    await openDm(alice.page, "Bob");
+    await openDm(bob.page, "Alice");
+    await expect(
+      alice.page.getByText("alice to bob local DM harness ping"),
+    ).toBeVisible();
+    await expect(
+      bob.page.getByText("bob to alice local DM harness pong"),
+    ).toBeVisible();
+    await expect(
+      alice.page.getByText("bob to alice local DM harness pong"),
+    ).toHaveCount(0);
+    await expect(
+      bob.page.getByText("alice to bob local DM harness ping"),
+    ).toHaveCount(0);
+    await expect(
+      alice.page.getByText(/remote delivery\/read receipts not claimed/i).first(),
+    ).toBeVisible();
+    await expect(
+      bob.page.getByText(/remote delivery\/read receipts not claimed/i).first(),
+    ).toBeVisible();
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
