@@ -1231,12 +1231,25 @@ static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 #[derive(Debug)]
 struct TauriAppService {
     state: PersistedAppState,
+    #[cfg(test)]
+    state_path_override: Option<PathBuf>,
 }
 
 impl TauriAppService {
     fn load() -> Self {
         Self {
             state: load_state(),
+            #[cfg(test)]
+            state_path_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn load_for_test_path(path: PathBuf) -> Self {
+        let mut store = FileAppStore::new(&path);
+        Self {
+            state: load_state_from_store(&mut store),
+            state_path_override: Some(path),
         }
     }
 
@@ -1252,6 +1265,12 @@ impl TauriAppService {
     }
 
     fn persist(&self) {
+        #[cfg(test)]
+        if let Some(path) = &self.state_path_override {
+            let mut store = FileAppStore::new(path);
+            persist_state_to_store(&mut store, &self.state);
+            return;
+        }
         persist_state(&self.state);
     }
 }
@@ -4317,6 +4336,10 @@ fn event_kind_topic(kind: &str) -> &str {
 
 fn load_state() -> PersistedAppState {
     let mut store = app_store();
+    load_state_from_store(&mut store)
+}
+
+fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
     if let Ok(Some(bytes)) = store.load_app_state() {
         if let Ok(state) = serde_json::from_slice::<PersistedAppState>(&bytes) {
             if state.schema_version == APP_STATE_SCHEMA_VERSION {
@@ -4328,8 +4351,12 @@ fn load_state() -> PersistedAppState {
 }
 
 fn persist_state(state: &PersistedAppState) {
+    let mut store = app_store();
+    persist_state_to_store(&mut store, state);
+}
+
+fn persist_state_to_store(store: &mut impl AppStore, state: &PersistedAppState) {
     if let Ok(encoded) = serde_json::to_vec_pretty(state) {
-        let mut store = app_store();
         let _ = store.save_app_state(&encoded);
     }
 }
@@ -5469,6 +5496,56 @@ mod tests {
         let _ = fs::remove_file(&path);
         reset_app_state();
         path
+    }
+
+    #[test]
+    fn test_harness_can_run_two_isolated_app_profiles() {
+        let _guard = test_lock();
+        let alice_path = fresh_state_path("two-profile-alice");
+        let bob_path = fresh_state_path("two-profile-bob");
+        let _ = fs::remove_file(&alice_path);
+        let _ = fs::remove_file(&bob_path);
+
+        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        let alice_view = alice.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Alice".to_owned(),
+                    device_name: Some("Alice laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        let bob_view = bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+
+        assert_ne!(alice_path, bob_path);
+        assert_ne!(
+            alice_view.profile.as_ref().map(|profile| &profile.user_id),
+            bob_view.profile.as_ref().map(|profile| &profile.user_id)
+        );
+        assert_eq!(
+            load_state_from_store(&mut FileAppStore::new(&alice_path))
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.as_str()),
+            Some("Alice")
+        );
+        assert_eq!(
+            load_state_from_store(&mut FileAppStore::new(&bob_path))
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.as_str()),
+            Some("Bob")
+        );
     }
 
     #[test]
