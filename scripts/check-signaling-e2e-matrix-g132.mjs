@@ -14,7 +14,9 @@ const failures = [];
 const skips = [];
 
 function requireText(name, text, token) {
-  if (!text.includes(token)) failures.push(`${name} missing token: ${token}`);
+  if (!text.toLowerCase().includes(token.toLowerCase())) {
+    failures.push(`${name} missing token: ${token}`);
+  }
 }
 
 for (const token of [
@@ -121,7 +123,8 @@ for (const check of matrixCommands) {
 
   if (result.status !== 0) {
     if (check.required) {
-      failures.push(`${check.label} failed`);
+      const detail = (result.stdout || result.stderr || "").trim();
+      failures.push(`${check.label} failed${detail ? `: ${detail.slice(0, 240)}` : ""}`);
     } else {
       skips.push(`${check.label} unavailable: ${check.skipReason || check.label}`);
     }

@@ -27,6 +27,7 @@ This gate is intentionally narrow:
 
 - Local harness proof comes from `harness/multinode/src/lib.rs` (`ConnectivitySignalingPushSmoke`) and transport fallback policy tests in `crates/transport/tests/connectivity_flows.rs`.
 - Public-provider proof is intentionally opt-in to keep CI deterministic while preserving reproducible release evidence from real-broker smoke runs.
+- Adapter fallback behavior is tracked as a required matrix gate in the table below.
 
 ## Real-provider verification matrix (two-profile)
 
