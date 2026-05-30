@@ -7,13 +7,16 @@
 //! boundary behind its explicit Cargo feature.
 
 use crate::{
-    AdapterSession, AdapterTrustLabel, ConversationScope, OpaqueSignalingPayload, PeerSignal,
-    PresenceEvent, RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload,
-    SignalingAdapter, SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingHealth, SignalingHealthState, SignalingObservability, SignalingPeerId, TransportError,
+    AdapterSession, AdapterTrustLabel, ControlBroadcast, ConversationScope, OpaqueSignalingPayload,
+    PeerSignal, PresenceEvent, RendezvousCapability, RendezvousRoom,
+    SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingAdapterCapabilities,
+    SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity, SignalingHealth,
+    SignalingHealthState, SignalingObservability, SignalingPeerId, TransportError,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// Production readiness for a provider adapter boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,6 +152,370 @@ pub struct FeatureGatedProviderRoom {
     boundary: ProviderAdapterBoundary,
 }
 
+/// Shared deterministic in-memory provider bus for local adapter conformance tests.
+///
+/// This is not a production provider client. It deliberately uses the same
+/// [`SignalingAdapter`] contract as real providers so every required adapter
+/// kind can prove opaque presence, sealed negotiation payload, and sealed
+/// control delivery without reaching an external network.
+#[derive(Clone, Debug, Default)]
+pub struct LocalConformanceProviderBus {
+    inner: Arc<Mutex<LocalConformanceState>>,
+}
+
+#[derive(Debug, Default)]
+struct LocalConformanceState {
+    rooms: BTreeMap<LocalRoomKey, LocalRoomState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LocalRoomKey {
+    kind: SignalingAdapterKind,
+    topic: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LocalRoomState {
+    presence: Vec<PresenceEvent>,
+    signals: Vec<PeerSignal>,
+    controls: Vec<ControlBroadcast>,
+}
+
+impl LocalConformanceProviderBus {
+    fn ensure_room(&self, key: LocalRoomKey) -> Result<(), TransportError> {
+        self.with_state(|state| {
+            state.rooms.entry(key).or_default();
+        })
+    }
+
+    fn with_state<T>(
+        &self,
+        update: impl FnOnce(&mut LocalConformanceState) -> T,
+    ) -> Result<T, TransportError> {
+        let mut state = self.inner.lock().map_err(|_| {
+            TransportError::SignalingAdapter("local conformance bus lock poisoned".to_owned())
+        })?;
+        Ok(update(&mut state))
+    }
+
+    /// Return relay-visible test material currently held by the local bus.
+    ///
+    /// Tests use this to assert display names, raw SDP, and raw ICE candidate
+    /// strings never entered provider-visible state.
+    #[must_use]
+    pub fn relay_visible_material_for_tests(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .lock()
+            .map(|state| {
+                state
+                    .rooms
+                    .iter()
+                    .flat_map(|(key, room)| {
+                        let mut material = vec![
+                            key.kind.canonical_name().as_bytes().to_vec(),
+                            key.topic.as_bytes().to_vec(),
+                        ];
+                        material.extend(room.presence.iter().map(|event| {
+                            let mut bytes = event.peer_id.0.as_bytes().to_vec();
+                            bytes.extend_from_slice(&event.encrypted_presence.bytes);
+                            bytes
+                        }));
+                        material.extend(room.signals.iter().map(|signal| {
+                            let mut bytes = signal.from_peer.0.as_bytes().to_vec();
+                            bytes.extend_from_slice(signal.to_peer.0.as_bytes());
+                            bytes.extend_from_slice(&signal.payload.ciphertext);
+                            bytes
+                        }));
+                        material.extend(room.controls.iter().map(|control| {
+                            let mut bytes = control.from_peer.0.as_bytes().to_vec();
+                            bytes.extend_from_slice(&control.payload.bytes);
+                            bytes
+                        }));
+                        material
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Deterministic local adapter that exercises the shared provider contract.
+#[derive(Clone, Debug)]
+pub struct LocalConformanceProviderAdapter {
+    kind: SignalingAdapterKind,
+    bus: LocalConformanceProviderBus,
+}
+
+impl LocalConformanceProviderAdapter {
+    /// Construct a deterministic local adapter for one required provider kind.
+    #[must_use]
+    pub const fn new(kind: SignalingAdapterKind, bus: LocalConformanceProviderBus) -> Self {
+        Self { kind, bus }
+    }
+}
+
+/// Connected deterministic local provider session.
+#[derive(Clone, Debug)]
+pub struct LocalConformanceProviderSession {
+    kind: SignalingAdapterKind,
+    bus: LocalConformanceProviderBus,
+}
+
+/// Joined deterministic local provider room.
+#[derive(Clone, Debug)]
+pub struct LocalConformanceProviderRoom {
+    bus: LocalConformanceProviderBus,
+    key: LocalRoomKey,
+    local_peer_id: SignalingPeerId,
+}
+
+fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(());
+    };
+    let lower = text.to_ascii_lowercase();
+    if [
+        "alice display",
+        "bob display",
+        "family voice",
+        "raw sdp",
+        "raw ice",
+        "v=0",
+        "a=ice-ufrag",
+        "a=ice-pwd",
+        "candidate:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Err(TransportError::PlaintextLeak);
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl SignalingAdapter for LocalConformanceProviderAdapter {
+    type Session = LocalConformanceProviderSession;
+
+    async fn connect(
+        &self,
+        profile: SignalingAdapterProfile,
+    ) -> Result<Self::Session, TransportError> {
+        profile.validate()?;
+        if profile.kind != self.kind {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "adapter profile kind {} does not match local conformance kind {}",
+                profile.kind.canonical_name(),
+                self.kind.canonical_name()
+            )));
+        }
+        if profile
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.security != SignalingEndpointSecurity::LocalDevLoopback)
+        {
+            return Err(TransportError::InvalidConnectivityPolicy(
+                "local conformance adapters require local-dev loopback endpoints".to_owned(),
+            ));
+        }
+        Ok(LocalConformanceProviderSession {
+            kind: self.kind,
+            bus: self.bus.clone(),
+        })
+    }
+
+    fn capabilities(&self) -> SignalingAdapterCapabilities {
+        SignalingAdapterCapabilities::production_required()
+    }
+
+    fn observability_redacted(&self) -> SignalingObservability {
+        SignalingObservability {
+            adapter_kind: self.kind,
+            endpoint_label: format!("local-conformance:{}#redacted", self.kind.canonical_name()),
+            health: SignalingHealthState::Healthy,
+            trust_label: AdapterTrustLabel {
+                label: self.kind.canonical_name().to_owned(),
+                posture: "deterministic local conformance only".to_owned(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl AdapterSession for LocalConformanceProviderSession {
+    type Room = LocalConformanceProviderRoom;
+
+    async fn join(
+        &self,
+        scope: ConversationScope,
+        rendezvous: RendezvousCapability,
+        local_peer_id: SignalingPeerId,
+    ) -> Result<Self::Room, TransportError> {
+        scope.validate()?;
+        if rendezvous.scope != scope {
+            return Err(TransportError::SignalingAdapter(
+                "rendezvous capability scope mismatch".to_owned(),
+            ));
+        }
+        if rendezvous.adapter_kind != self.kind {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "rendezvous capability kind {} does not match local conformance kind {}",
+                rendezvous.adapter_kind.canonical_name(),
+                self.kind.canonical_name()
+            )));
+        }
+        let key = LocalRoomKey {
+            kind: self.kind,
+            topic: rendezvous.topic,
+        };
+        self.bus.ensure_room(key.clone())?;
+        Ok(LocalConformanceProviderRoom {
+            bus: self.bus.clone(),
+            key,
+            local_peer_id,
+        })
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> SignalingHealth {
+        SignalingHealth {
+            adapter_kind: self.kind,
+            state: SignalingHealthState::Healthy,
+            latency_bucket: "local".to_owned(),
+            failure_class: None,
+        }
+    }
+}
+
+#[async_trait]
+impl RendezvousRoom for LocalConformanceProviderRoom {
+    async fn publish_presence(
+        &self,
+        encrypted_presence: OpaqueSignalingPayload,
+        ttl_seconds: u32,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&encrypted_presence.bytes)?;
+        if ttl_seconds == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "presence ttl must be non-zero".to_owned(),
+            ));
+        }
+        self.bus.with_state(|state| {
+            state
+                .rooms
+                .entry(self.key.clone())
+                .or_default()
+                .presence
+                .push(PresenceEvent {
+                    peer_id: self.local_peer_id.clone(),
+                    encrypted_presence,
+                    ttl_seconds,
+                });
+        })
+    }
+
+    async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
+        self.bus.with_state(|state| {
+            state
+                .rooms
+                .get(&self.key)
+                .map(|room| room.presence.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    async fn send_signal(
+        &self,
+        to_peer: SignalingPeerId,
+        payload: SealedWebRtcNegotiationPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&payload.ciphertext)?;
+        self.bus.with_state(|state| {
+            state
+                .rooms
+                .entry(self.key.clone())
+                .or_default()
+                .signals
+                .push(PeerSignal {
+                    from_peer: self.local_peer_id.clone(),
+                    to_peer,
+                    payload,
+                });
+        })
+    }
+
+    async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
+        self.bus.with_state(|state| {
+            let Some(room) = state.rooms.get_mut(&self.key) else {
+                return Vec::new();
+            };
+            let mut delivered = Vec::new();
+            room.signals.retain(|signal| {
+                if signal.to_peer == self.local_peer_id {
+                    delivered.push(signal.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            delivered
+        })
+    }
+
+    async fn broadcast_control(
+        &self,
+        sealed_payload: OpaqueSignalingPayload,
+    ) -> Result<(), TransportError> {
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.bus.with_state(|state| {
+            state
+                .rooms
+                .entry(self.key.clone())
+                .or_default()
+                .controls
+                .push(ControlBroadcast {
+                    from_peer: self.local_peer_id.clone(),
+                    payload: sealed_payload,
+                });
+        })
+    }
+
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        self.bus.with_state(|state| {
+            let Some(room) = state.rooms.get_mut(&self.key) else {
+                return Vec::new();
+            };
+            let mut delivered = Vec::new();
+            room.controls.retain(|control| {
+                if control.from_peer != self.local_peer_id {
+                    delivered.push(control.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            delivered
+        })
+    }
+
+    async fn leave(&self) -> Result<(), TransportError> {
+        self.bus.with_state(|state| {
+            if let Some(room) = state.rooms.get_mut(&self.key) {
+                room.presence
+                    .retain(|event| event.peer_id != self.local_peer_id);
+                room.signals.retain(|signal| {
+                    signal.from_peer != self.local_peer_id && signal.to_peer != self.local_peer_id
+                });
+                room.controls
+                    .retain(|control| control.from_peer != self.local_peer_id);
+            }
+        })
+    }
+}
+
 #[async_trait]
 impl SignalingAdapter for FeatureGatedProviderAdapter {
     type Session = FeatureGatedProviderSession;
@@ -249,6 +616,10 @@ impl RendezvousRoom for FeatureGatedProviderRoom {
         Err(self.boundary.unavailable_error())
     }
 
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        Err(self.boundary.unavailable_error())
+    }
+
     async fn leave(&self) -> Result<(), TransportError> {
         Err(self.boundary.unavailable_error())
     }
@@ -259,7 +630,9 @@ mod tests {
     use super::*;
     use crate::{
         derive_scope_commitment, ConnectivityScopeLevel, Endpoint, ProviderMetadataPosture,
-        SignalingEndpointSecurity, SignalingProviderEndpoint, WebRtcNegotiationPayloadKind,
+        SignalingEndpointSecurity, SignalingProviderEndpoint, WebRtcIceCandidate,
+        WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcSdpType,
+        WebRtcSessionDescription,
     };
 
     fn valid_endpoint(kind: SignalingAdapterKind) -> &'static str {
@@ -270,6 +643,15 @@ mod tests {
                 "/dns/bootstrap.example.invalid/tcp/4001/p2p/12D3KooWBootstrap"
             }
             SignalingAdapterKind::DiscryptQuicRendezvous => "quic://signal.example.invalid",
+        }
+    }
+
+    fn local_endpoint(kind: SignalingAdapterKind) -> &'static str {
+        match kind {
+            SignalingAdapterKind::Mqtt => "mqtt://127.0.0.1:1883",
+            SignalingAdapterKind::Nostr => "ws://127.0.0.1:8080",
+            SignalingAdapterKind::IpfsPubsub => "http://127.0.0.1:5001",
+            SignalingAdapterKind::DiscryptQuicRendezvous => "http://127.0.0.1:9443",
         }
     }
 
@@ -286,6 +668,22 @@ mod tests {
             metadata_posture: ProviderMetadataPosture::HashedTopic,
             capabilities: SignalingAdapterCapabilities::production_required(),
             trust_label: AdapterTrustLabel::new(kind.canonical_name(), "redacted boundary")?,
+        })
+    }
+
+    fn local_profile(
+        kind: SignalingAdapterKind,
+    ) -> Result<SignalingAdapterProfile, TransportError> {
+        Ok(SignalingAdapterProfile {
+            profile_id: format!("local-{}", kind.canonical_name()),
+            kind,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new(local_endpoint(kind)),
+                SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new(kind.canonical_name(), "local conformance")?,
         })
     }
 
@@ -425,9 +823,236 @@ mod tests {
             Err(TransportError::SignalingAdapter(_))
         ));
         assert!(matches!(
+            room.take_control_payloads().await,
+            Err(TransportError::SignalingAdapter(_))
+        ));
+        assert!(matches!(
             room.leave().await,
             Err(TransportError::SignalingAdapter(_))
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_conformance_adapters_deliver_opaque_dm_payloads_without_plaintext_leaks(
+    ) -> Result<(), TransportError> {
+        for kind in [
+            SignalingAdapterKind::Mqtt,
+            SignalingAdapterKind::Nostr,
+            SignalingAdapterKind::IpfsPubsub,
+            SignalingAdapterKind::DiscryptQuicRendezvous,
+        ] {
+            let bus = LocalConformanceProviderBus::default();
+            let adapter = LocalConformanceProviderAdapter::new(kind, bus.clone());
+            let profile = local_profile(kind)?;
+            let alice = SignalingPeerId::new("alice-device")?;
+            let bob = SignalingPeerId::new("bob-device")?;
+            let scope = crate::ConversationScope::new(
+                ConnectivityScopeLevel::Dm,
+                derive_scope_commitment(
+                    ConnectivityScopeLevel::Dm,
+                    b"Alice Display and Bob Display private family voice",
+                    "local conformance",
+                ),
+            )?;
+            let capability = RendezvousCapability::derive(
+                scope.clone(),
+                kind,
+                b"bootstrap secret with more than thirty two bytes",
+                b"random entropy bytes",
+                120,
+                ProviderMetadataPosture::HashedTopic,
+                AdapterTrustLabel::new(kind.canonical_name(), "local conformance")?,
+            )?;
+            let alice_room = adapter
+                .connect(profile.clone())
+                .await?
+                .join(scope.clone(), capability.clone(), alice.clone())
+                .await?;
+            let bob_room = adapter
+                .connect(profile)
+                .await?
+                .join(scope, capability, bob.clone())
+                .await?;
+
+            alice_room
+                .publish_presence(
+                    OpaqueSignalingPayload::new(b"sealed-presence-alice".to_vec())?,
+                    120,
+                )
+                .await?;
+            bob_room
+                .publish_presence(
+                    OpaqueSignalingPayload::new(b"sealed-presence-bob".to_vec())?,
+                    120,
+                )
+                .await?;
+            let bob_presence = bob_room.subscribe_presence().await?;
+            assert!(bob_presence.iter().any(|event| event.peer_id == alice));
+            let alice_presence = alice_room.subscribe_presence().await?;
+            assert!(alice_presence.iter().any(|event| event.peer_id == bob));
+
+            let sealer = WebRtcNegotiationSealer::new([kind as u8 + 1; 32]);
+            let offer = sealer.seal_description(&WebRtcSessionDescription {
+                sdp_type: WebRtcSdpType::Offer,
+                sdp: "v=0\r\na=ice-ufrag:aliceRaw\r\na=ice-pwd:alicePwd\r\n".to_owned(),
+            })?;
+            let answer = sealer.seal_description(&WebRtcSessionDescription {
+                sdp_type: WebRtcSdpType::Answer,
+                sdp: "v=0\r\na=ice-ufrag:bobRaw\r\na=ice-pwd:bobPwd\r\n".to_owned(),
+            })?;
+            let alice_candidate = sealer.seal_candidate(&WebRtcIceCandidate {
+                candidate: "candidate:1 1 UDP 2130706431 192.0.2.10 54400 typ host".to_owned(),
+                sdp_mid: Some("0".to_owned()),
+                sdp_mline_index: Some(0),
+                username_fragment: Some("aliceRaw".to_owned()),
+                url: None,
+            })?;
+            let bob_candidate = sealer.seal_candidate(&WebRtcIceCandidate {
+                candidate: "candidate:2 1 UDP 2130706431 192.0.2.11 54401 typ host".to_owned(),
+                sdp_mid: Some("0".to_owned()),
+                sdp_mline_index: Some(0),
+                username_fragment: Some("bobRaw".to_owned()),
+                url: None,
+            })?;
+
+            alice_room.send_signal(bob.clone(), offer.clone()).await?;
+            alice_room
+                .send_signal(bob.clone(), alice_candidate.clone())
+                .await?;
+            bob_room.send_signal(alice.clone(), answer.clone()).await?;
+            bob_room
+                .send_signal(alice.clone(), bob_candidate.clone())
+                .await?;
+
+            let bob_signals = bob_room.take_signals().await?;
+            assert_eq!(
+                bob_signals
+                    .iter()
+                    .map(|signal| signal.payload.kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    WebRtcNegotiationPayloadKind::Offer,
+                    WebRtcNegotiationPayloadKind::Candidate,
+                ]
+            );
+            assert_eq!(bob_signals[0].payload, offer);
+            assert_eq!(bob_signals[1].payload, alice_candidate);
+
+            let alice_signals = alice_room.take_signals().await?;
+            assert_eq!(
+                alice_signals
+                    .iter()
+                    .map(|signal| signal.payload.kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    WebRtcNegotiationPayloadKind::Answer,
+                    WebRtcNegotiationPayloadKind::Candidate,
+                ]
+            );
+            assert_eq!(alice_signals[0].payload, answer);
+            assert_eq!(alice_signals[1].payload, bob_candidate);
+
+            alice_room
+                .broadcast_control(OpaqueSignalingPayload::new(
+                    b"sealed-control-alice".to_vec(),
+                )?)
+                .await?;
+            let bob_controls = bob_room.take_control_payloads().await?;
+            assert_eq!(bob_controls.len(), 1);
+            assert_eq!(bob_controls[0].from_peer, alice);
+            assert_eq!(bob_controls[0].payload.bytes, b"sealed-control-alice");
+
+            assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
+            let observability = format!(
+                "{:?}{:?}",
+                adapter.observability_redacted(),
+                adapter.connect(local_profile(kind)?).await?.health().await
+            );
+            assert_no_forbidden_text(&observability);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_conformance_adapter_rejects_plaintext_sdp_and_ice_markers(
+    ) -> Result<(), TransportError> {
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus);
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"plaintext rejection dm",
+                "test",
+            ),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Mqtt,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "local conformance")?,
+        )?;
+        let room = adapter
+            .connect(local_profile(SignalingAdapterKind::Mqtt)?)
+            .await?
+            .join(scope, capability, SignalingPeerId::new("alice-device")?)
+            .await?;
+
+        assert!(matches!(
+            room.publish_presence(OpaqueSignalingPayload::new(b"Alice Display".to_vec())?, 120)
+                .await,
+            Err(TransportError::PlaintextLeak)
+        ));
+        assert!(matches!(
+            room.send_signal(
+                SignalingPeerId::new("bob-device")?,
+                SealedWebRtcNegotiationPayload {
+                    version: 1,
+                    kind: WebRtcNegotiationPayloadKind::Offer,
+                    nonce: [1; 12],
+                    ciphertext: b"v=0\r\na=ice-ufrag:raw\r\ncandidate:raw".to_vec(),
+                },
+            )
+            .await,
+            Err(TransportError::PlaintextLeak)
+        ));
+        assert!(matches!(
+            room.broadcast_control(OpaqueSignalingPayload::new(b"raw sdp control".to_vec())?)
+                .await,
+            Err(TransportError::PlaintextLeak)
+        ));
+        Ok(())
+    }
+
+    fn assert_no_forbidden_plaintext(material: &[Vec<u8>]) {
+        for bytes in material {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                assert_no_forbidden_text(text);
+            }
+        }
+    }
+
+    fn assert_no_forbidden_text(text: &str) {
+        let lower = text.to_ascii_lowercase();
+        for marker in [
+            "alice display",
+            "bob display",
+            "family voice",
+            "v=0",
+            "a=ice-ufrag",
+            "a=ice-pwd",
+            "candidate:",
+            "aliceraw",
+            "bobraw",
+        ] {
+            assert!(
+                !lower.contains(marker),
+                "provider-visible material leaked forbidden marker {marker}: {text}"
+            );
+        }
     }
 }

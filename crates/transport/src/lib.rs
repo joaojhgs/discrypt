@@ -33,7 +33,8 @@ pub use policy::{
 };
 pub use provider_adapters::{
     adapter_boundary_for_kind, required_provider_adapter_boundaries, FeatureGatedProviderAdapter,
-    ProviderAdapterBoundary, ProviderAdapterReadiness,
+    LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,
+    ProviderAdapterReadiness,
 };
 use serde::{Deserialize, Serialize};
 pub use session::{
@@ -42,9 +43,9 @@ pub use session::{
     TransportSessionState,
 };
 pub use signaling::{
-    AdapterSession, OpaqueSignalingPayload, PeerSignal, PresenceEvent, RendezvousRoom,
-    SignalingAdapter, SignalingHealth, SignalingHealthState, SignalingObservability,
-    SignalingPeerId,
+    AdapterSession, ControlBroadcast, OpaqueSignalingPayload, PeerSignal, PresenceEvent,
+    RendezvousRoom, SignalingAdapter, SignalingHealth, SignalingHealthState,
+    SignalingObservability, SignalingPeerId,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

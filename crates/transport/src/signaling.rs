@@ -89,6 +89,15 @@ pub struct PeerSignal {
     pub payload: SealedWebRtcNegotiationPayload,
 }
 
+/// Room-wide sealed control payload delivered by an adapter room subscription.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ControlBroadcast {
+    /// Peer that broadcast the control payload.
+    pub from_peer: SignalingPeerId,
+    /// Already-sealed control bytes.
+    pub payload: OpaqueSignalingPayload,
+}
+
 /// Typed provider/adapter health states used for fallback and UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +192,11 @@ pub trait RendezvousRoom: Send + Sync {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError>;
+
+    /// Read available room-wide sealed control payloads.
+    async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        Ok(Vec::new())
+    }
 
     /// Leave the room and clear retained presence where supported.
     async fn leave(&self) -> Result<(), TransportError>;
