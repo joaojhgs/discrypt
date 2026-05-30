@@ -59,7 +59,8 @@
     "test:placeholder-allowlist-g128": "node ../../scripts/check-placeholder-allowlist-g128.mjs",
     "test:release-no-fallback-g129": "node ../../scripts/check-release-no-fallback-g129.mjs",
     "test:ui-integration-g130": "node ../../scripts/check-ui-integration-g130.mjs",
-    "test:final-e2e-g131": "node ../../scripts/check-final-e2e-g131.mjs"
+    "test:final-e2e-g131": "node ../../scripts/check-final-e2e-g131.mjs",
+    "test:stun-turn-provider-privacy-g132": "node ../../scripts/check-stun-turn-provider-privacy-g132.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

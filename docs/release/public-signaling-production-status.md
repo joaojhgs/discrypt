@@ -112,9 +112,21 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 
 - [ ] Dependency/security audit for `rumqttc` and any Nostr/IPFS/libp2p dependencies.
 - [ ] Public provider allowlist/versioning and rotation policy.
+- [ ] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
+  for deterministic harness evidence and optional public-provider MQTT validation.
 - [ ] Provider-visible metadata capture/PCAP tests for MQTT, Nostr, IPFS, and QUIC.
 - [ ] Abuse/rate-limit handling against public relays/brokers.
 - [ ] Full release matrix across Linux desktop package and Android once mobile exists.
+
+#### G132 status
+
+- Added local deterministic proof for STUN→overlay→TURN behavior and provider-privacy hygiene in:
+  - `harness/multinode/src/lib.rs`
+  - `crates/transport/tests/connectivity_flows.rs`
+- Added release gate script:
+  - `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132`
+- Public-provider smoke remains optional to keep default CI deterministic:
+  - set `DISCRYPT_PUBLIC_SIGNALING_E2E=1` to run the MQTT real-broker proof path.
 
 ## How to rerun the current real MQTT proof
 
