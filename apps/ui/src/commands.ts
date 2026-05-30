@@ -1493,8 +1493,10 @@ type ParsedInviteMetadata = {
   maxUses: number;
 };
 
-function defaultSignalingEndpoint(): string {
-  return "https://signaling.discrypt.invalid/v1/rendezvous";
+function defaultSignalingEndpoint(connectivity?: ConnectivityPolicyView): string {
+  return connectivity?.signaling_profiles[0]?.endpoints[0] ??
+    import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
+    "wss://relay.damus.io";
 }
 
 function defaultIceStunServers(): string[] {
@@ -1510,19 +1512,31 @@ function hashCommitment(domain: string, parts: string[]): string {
 }
 
 function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
-  const endpoints: Record<string, string> = {
-    nostr: import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
-      "wss://relay.damus.io",
-    mqtt: import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
-      "mqtts://broker.emqx.io:8883",
-    ipfs_pubsub:
-      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT ??
-      "https://ipfs.discrypt.invalid/bootstrap/pubsub",
-    discrypt_quic_rendezvous:
-      import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT ??
-      "quic://signaling.discrypt.invalid:443/rendezvous",
-  };
-  return Object.entries(endpoints).map(([adapterKind, endpoint]) => ({
+  const endpoints: Array<[string, string]> = [
+    [
+      "nostr",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
+        "wss://relay.damus.io",
+    ],
+    [
+      "mqtt",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
+        "mqtts://broker.emqx.io:8883",
+    ],
+  ];
+  if (import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT) {
+    endpoints.push([
+      "ipfs_pubsub",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT,
+    ]);
+  }
+  if (import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT) {
+    endpoints.push([
+      "discrypt_quic_rendezvous",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT,
+    ]);
+  }
+  return endpoints.map(([adapterKind, endpoint]) => ({
     profile_id: `${adapterKind}-default`,
     adapter_kind: adapterKind,
     endpoints: [endpoint],
@@ -2366,7 +2380,7 @@ export async function createInvite(
       const expires = request.expires || fallbackState.snapshot.invite.expires;
       const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
       const expiresAt = inviteExpirationHorizon(expires);
-      const signalingEndpoint = defaultSignalingEndpoint();
+      const signalingEndpoint = defaultSignalingEndpoint(connectivity);
       const signalingTrustFingerprint = stableHash(
         `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
       );
@@ -2464,7 +2478,7 @@ export async function createDmInvite(
       const expires = request.expires || fallbackState.snapshot.invite.expires;
       const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
       const expiresAt = inviteExpirationHorizon(expires);
-      const signalingEndpoint = defaultSignalingEndpoint();
+      const signalingEndpoint = defaultSignalingEndpoint(connectivity);
       const signalingTrustFingerprint = stableHash(
         `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
       );
