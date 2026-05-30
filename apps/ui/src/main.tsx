@@ -268,6 +268,11 @@ function App() {
         .then((stream) => {
           if (!cancelled) {
             setEventCursor(stream.next_cursor);
+            void loadAppState().then((refreshed) => {
+              if (!cancelled) {
+                setCommandState(refreshed);
+              }
+            });
           }
         })
         .catch(() => undefined);
