@@ -23,6 +23,9 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
   quic_rendezvous_rejects_mismatched_signed_trust_fingerprint -- --nocapture
+
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
+  quic_rendezvous_health_requires_matching_public_base_for_production -- --nocapture
 ```
 
 ## Required production implementation checklist
@@ -30,6 +33,7 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 - Keep the signaling service in the sibling repository and depend only on the audited content-blind `/v1/signals/*` client protocol/API from Discrypt.
 - Accept only signed `https://` endpoint descriptors from app/DM/group/channel policy or signed invite bootstrap metadata for production; `quic://` remains reserved until native QUIC client support lands.
 - Require the signed endpoint trust fingerprint from app/DM/group/channel policy or invite bootstrap metadata before any production/self-hosted endpoint is used, and reject mismatched fingerprints before health probes.
+- Validate `/healthz` status, service label, and advertised `public_base_url`; production/self-hosted service health must advertise the same normalized endpoint being used.
 - Still add TLS certificate/public-key pin validation, ALPN, protocol version, expiry, max payload, abuse/rate-limit policy, and endpoint allowlist proof before production release.
 - Transport only sealed rendezvous, WebRTC offer/answer/candidate, and control envelopes. QUIC rendezvous does not replace WebRTC data/audio.
 - Map trust mismatch, version mismatch, rate-limit, payload-too-large, outage, and provider-unhealthy states to typed health/readiness.

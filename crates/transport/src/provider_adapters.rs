@@ -1563,6 +1563,15 @@ struct DiscryptRendezvousTakenSignal {
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+#[derive(Clone, Debug, Deserialize)]
+struct DiscryptRendezvousHealthResponse {
+    status: String,
+    service: String,
+    public_base_url: String,
+    at_rest_records: usize,
+}
+
 #[cfg(feature = "mqtt-adapter")]
 /// Real MQTT signaling adapter.
 ///
@@ -2415,6 +2424,42 @@ fn discrypt_rendezvous_validate_profile_trust(
         )
     })?;
     discrypt_rendezvous_validate_endpoint_trust(endpoint)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_validate_health(
+    endpoint_base: &str,
+    endpoint_security: SignalingEndpointSecurity,
+    health: &DiscryptRendezvousHealthResponse,
+) -> Result<(), TransportError> {
+    if health.status != "ok" {
+        return Err(TransportError::SignalingAdapter(format!(
+            "discrypt rendezvous service health is not ok: {}",
+            health.status
+        )));
+    }
+    if health.service.trim().is_empty() || health.service.trim() != health.service {
+        return Err(TransportError::SignalingAdapter(
+            "discrypt rendezvous service health label is invalid".to_owned(),
+        ));
+    }
+    if health.public_base_url.trim().is_empty()
+        || health.public_base_url.trim() != health.public_base_url
+    {
+        return Err(TransportError::SignalingAdapter(
+            "discrypt rendezvous service public_base_url is invalid".to_owned(),
+        ));
+    }
+    let advertised = health.public_base_url.trim_end_matches('/');
+    if endpoint_security != SignalingEndpointSecurity::LocalDevLoopback
+        && advertised != endpoint_base
+    {
+        return Err(TransportError::SignalingAdapter(format!(
+            "discrypt rendezvous service public_base_url mismatch: expected {endpoint_base}, got {advertised}"
+        )));
+    }
+    let _ = health.at_rest_records;
+    Ok(())
 }
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
@@ -3537,23 +3582,42 @@ impl SignalingAdapter for DiscryptQuicRendezvousProviderAdapter {
         }
         let endpoint_base = discrypt_rendezvous_endpoint_base(&profile)?;
         discrypt_rendezvous_validate_profile_trust(&profile)?;
+        let endpoint_security = profile
+            .endpoints
+            .first()
+            .map(|endpoint| endpoint.security)
+            .ok_or_else(|| {
+                TransportError::InvalidConnectivityPolicy(
+                    "discrypt rendezvous profile requires one endpoint".to_owned(),
+                )
+            })?;
         let health_url = format!("{endpoint_base}/healthz");
-        let health = tokio::task::spawn_blocking(move || ureq::get(&health_url).call())
-            .await
-            .map_err(|error| {
+        let health = tokio::task::spawn_blocking(move || {
+            let mut response = ureq::get(&health_url).call().map_err(|error| {
                 TransportError::SignalingAdapter(format!(
-                    "discrypt rendezvous health task failed: {error}"
+                    "discrypt rendezvous service health check failed: {error}"
                 ))
             })?;
-        match health {
-            Ok(_) => Ok(Self::Session {
-                profile,
-                endpoint_base,
-            }),
-            Err(error) => Err(TransportError::SignalingAdapter(format!(
-                "discrypt rendezvous service health check failed: {error}"
-            ))),
-        }
+            response
+                .body_mut()
+                .read_json::<DiscryptRendezvousHealthResponse>()
+                .map_err(|error| {
+                    TransportError::SignalingAdapter(format!(
+                        "discrypt rendezvous health response decode failed: {error}"
+                    ))
+                })
+        })
+        .await
+        .map_err(|error| {
+            TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous health task failed: {error}"
+            ))
+        })??;
+        discrypt_rendezvous_validate_health(&endpoint_base, endpoint_security, &health)?;
+        Ok(Self::Session {
+            profile,
+            endpoint_base,
+        })
     }
 
     fn capabilities(&self) -> SignalingAdapterCapabilities {
@@ -5316,6 +5380,59 @@ mod tests {
             .to_string()
             .contains("endpoint trust fingerprint mismatch"));
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_requires_matching_public_base_for_production() {
+        let health = DiscryptRendezvousHealthResponse {
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: "https://other.example.invalid".to_owned(),
+            at_rest_records: 0,
+        };
+        let error = discrypt_rendezvous_validate_health(
+            "https://rendezvous.example.invalid",
+            SignalingEndpointSecurity::ProductionTls,
+            &health,
+        )
+        .expect_err("production health must match selected endpoint");
+        assert!(error.to_string().contains("public_base_url mismatch"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_allows_local_loopback_public_base_mismatch(
+    ) -> Result<(), TransportError> {
+        let health = DiscryptRendezvousHealthResponse {
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: "https://127.0.0.1/rendezvous-test".to_owned(),
+            at_rest_records: 0,
+        };
+        discrypt_rendezvous_validate_health(
+            "http://127.0.0.1:18787",
+            SignalingEndpointSecurity::LocalDevLoopback,
+            &health,
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_rejects_non_ok_status() {
+        let health = DiscryptRendezvousHealthResponse {
+            status: "degraded".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: "https://rendezvous.example.invalid".to_owned(),
+            at_rest_records: 0,
+        };
+        let error = discrypt_rendezvous_validate_health(
+            "https://rendezvous.example.invalid",
+            SignalingEndpointSecurity::ProductionTls,
+            &health,
+        )
+        .expect_err("non-ok health must fail");
+        assert!(error.to_string().contains("health is not ok"));
     }
 
     #[tokio::test]
