@@ -6,7 +6,7 @@ _Last updated: 2026-05-30_
 
 Discrypt is **not production-complete** for the full serverless P2P encrypted app target yet. This update has real MQTT, Nostr, and IPFS/libp2p signaling paths at the Rust transport boundary, but it is still not a complete installed-app proof:
 
-- **MQTT public signaling: implemented behind `mqtt-adapter` and verified against a real public broker.**
+- **MQTT public signaling: implemented behind `mqtt-adapter`; previous public broker proof existed, but the latest rerun against public brokers failed/timed out and is no longer treated as green.**
 - **Nostr signaling: real relay client is wired behind `nostr-adapter` and verified against a public relay.**
 - **IPFS/libp2p PubSub signaling: real rust-libp2p gossipsub client is wired behind `ipfs-pubsub-adapter` and verified with a local two-node transport roundtrip; public bootstrap smoke exists but still requires configured bootstrap multiaddrs.**
 - **Separate Rust QUIC rendezvous adapter: fail-closed groundwork is locked by `discrypt-quic-rendezvous-adapter` feature tests; intended to point at the sibling service once the external adapter client is wired.**
@@ -81,6 +81,7 @@ Behavior:
 - Extends `start_signaling_session` with `adapter_probe=true` and optional `adapter_kind` so the Tauri backend can run the selected DM/group/invite signaling profile instead of only showing static readiness.
 - Persists structured `adapter_probe_status`, `adapter_probe_detail`, and redacted probe evidence into transport diagnostics.
 - Adds a UI "Probe adapter" action in the transport status panel.
+- Uses public Nostr (`wss://relay.damus.io`) first and public MQTT (`mqtts://broker.emqx.io:8883`) second as zero-config default endpoint candidates when no `DISCRYPT_DEFAULT_*`/`VITE_DISCRYPT_DEFAULT_*` override is supplied; IPFS and QUIC still require explicit endpoint configuration because no production default bootstrap/self-hosted endpoint has been accepted yet.
 - Keeps route/media claims separate: a successful adapter probe proves provider rendezvous only; it does not mark ICE, data-channel, or voice media as connected.
 
 Verification:
@@ -92,13 +93,13 @@ npm --prefix apps/ui run typecheck
 cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter
 ```
 
-### Public real-network test
+### Public real-network tests
 
 File:
 
 - `crates/transport/tests/public_signaling_e2e.rs`
 
-Command used:
+MQTT command:
 
 ```bash
 DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
@@ -106,16 +107,30 @@ DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
   public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture
 ```
 
-Result:
+MQTT status:
 
-- Passed against default public broker `mqtts://broker.emqx.io:8883`.
+- A previous run passed against default public broker `mqtts://broker.emqx.io:8883`, but latest reruns are no longer green and MQTT must remain an open production blocker.
+- Latest `broker.emqx.io`, `test.mosquitto.org`, and `broker.hivemq.com` reruns failed respectively with peer-delivery timeout, TLS certificate incompatibility, and network timeout.
+
+Nostr command:
+
+```bash
+DISCRYPT_PUBLIC_NOSTR_E2E=1 \
+DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io \
+  cargo test -q -p discrypt-transport --features nostr-adapter \
+  public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+```
+
+Nostr status:
+
+- Latest rerun passed against `wss://relay.damus.io`.
 - The test creates two independent transport sessions (`alice-device` and `bob-device`) on the same hashed DM rendezvous topic.
-- It verifies:
+- It verifies opaque provider roundtrip only:
   1. Alice publishes sealed presence and Bob receives it.
   2. Alice sends a sealed WebRTC offer envelope to Bob and Bob receives it.
   3. Bob broadcasts sealed control and Alice receives it.
 
-This is a real public MQTT signaling proof, but it is **not** a full two-installed-app proof.
+These are real public signaling proofs at the provider adapter boundary, but they are **not** full two-installed-app data-channel or media proofs.
 
 ## What remains open before production
 
@@ -184,7 +199,7 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 - Added release gate script:
   - `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132`
 - Public-provider smoke remains optional to keep default CI deterministic:
-  - set `DISCRYPT_PUBLIC_SIGNALING_E2E=1` to run the MQTT real-broker proof path.
+  - set `DISCRYPT_PUBLIC_SIGNALING_E2E=1` for MQTT reruns and `DISCRYPT_PUBLIC_NOSTR_E2E=1` for Nostr reruns; MQTT is currently blocked by public-broker failures while Nostr is the latest green public proof.
 
 ### G132 production evidence matrix
 
@@ -194,8 +209,8 @@ This is a real public MQTT signaling proof, but it is **not** a full two-install
 | --- | --- | --- |
 | STUN overlay ordering and TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
 | Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
-| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Opaque transport behavior under a live broker when enabled |
-| Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed once against `wss://relay.damus.io`; `wss://nostr.oxtr.dev` returned blocked |
+| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | **Latest reruns failed**: `mqtts://broker.emqx.io:8883` timed out waiting for peer delivery, `mqtts://test.mosquitto.org:8883` had certificate incompatibility, and `mqtts://broker.hivemq.com:8883` hit network timeout. Keep as open blocker. |
+| Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Latest rerun passed against `wss://relay.damus.io`; `wss://nostr.oxtr.dev` returned blocked |
 | IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal/control only |
 | IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Test exists; public bootstrap run still missing until bootstrap endpoints are selected/configured |
 | Planned QUIC public-provider proof | `cargo test -p discrypt-transport public_quic_two_peer_signaling_smoke --quiet` | **Missing (planned)** |

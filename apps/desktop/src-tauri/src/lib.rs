@@ -2808,10 +2808,22 @@ impl PersistedAppState {
                 }
             })
             .collect();
-        let requested = required_provider_adapter_boundaries()
-            .iter()
-            .map(|boundary| boundary.kind)
-            .collect::<Vec<SignalingAdapterKind>>();
+        let requested = self
+            .active_connectivity_policy()
+            .map(|(_, connectivity)| {
+                connectivity
+                    .signaling_profiles
+                    .iter()
+                    .filter_map(|profile| transport_adapter_kind_from_name(&profile.adapter_kind))
+                    .collect::<Vec<SignalingAdapterKind>>()
+            })
+            .filter(|profiles| !profiles.is_empty())
+            .unwrap_or_else(|| {
+                required_provider_adapter_boundaries()
+                    .iter()
+                    .map(|boundary| boundary.kind)
+                    .collect::<Vec<SignalingAdapterKind>>()
+            });
         let fallback_plan = plan_signaling_adapter_fallback(
             requested.as_slice(),
             AdapterFallbackBehavior::FirstHealthy,
@@ -4496,13 +4508,25 @@ fn run_provider_adapter_probe(
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> String {
     match kind {
-        InviteSignalingAdapterKind::Mqtt => "wss://mqtt.discrypt.invalid/mqtt".to_owned(),
-        InviteSignalingAdapterKind::Nostr => "wss://nostr.discrypt.invalid".to_owned(),
+        InviteSignalingAdapterKind::Mqtt => std::env::var("DISCRYPT_DEFAULT_MQTT_ENDPOINT")
+            .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
+        InviteSignalingAdapterKind::Nostr => std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT")
+            .unwrap_or_else(|_| "wss://relay.damus.io".to_owned()),
         InviteSignalingAdapterKind::IpfsPubsub => {
-            "https://ipfs.discrypt.invalid/bootstrap/pubsub".to_owned()
+            std::env::var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS")
+                .ok()
+                .and_then(|endpoints| {
+                    endpoints
+                        .split(',')
+                        .map(str::trim)
+                        .find(|endpoint| !endpoint.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| "https://ipfs.discrypt.invalid/bootstrap/pubsub".to_owned())
         }
         InviteSignalingAdapterKind::DiscryptQuicRendezvous => {
-            "quic://signaling.discrypt.invalid:443/rendezvous".to_owned()
+            std::env::var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT")
+                .unwrap_or_else(|_| "quic://signaling.discrypt.invalid:443/rendezvous".to_owned())
         }
     }
 }
@@ -4517,8 +4541,8 @@ fn default_redacted_turn_servers() -> Vec<IceTurnServerView> {
 
 fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileView> {
     [
-        InviteSignalingAdapterKind::Mqtt,
         InviteSignalingAdapterKind::Nostr,
+        InviteSignalingAdapterKind::Mqtt,
         InviteSignalingAdapterKind::IpfsPubsub,
         InviteSignalingAdapterKind::DiscryptQuicRendezvous,
     ]
@@ -6330,6 +6354,31 @@ mod tests {
             .expect("mqtt boundary is surfaced");
         assert_eq!(mqtt.readiness, "available");
         assert_eq!(mqtt.failure_class, "available");
+    }
+
+    #[test]
+    #[cfg(all(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+    fn active_connectivity_policy_drives_selected_adapter_order() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("active-policy-selected-adapter");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        assert_eq!(
+            state.transport_diagnostics.selected_adapter.as_deref(),
+            Some("nostr")
+        );
+        let first_attempt = state
+            .transport_diagnostics
+            .adapter_fallback_attempts
+            .first()
+            .expect("active policy fallback attempt");
+        assert_eq!(first_attempt.kind, "nostr");
     }
 
     #[test]

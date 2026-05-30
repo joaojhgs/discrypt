@@ -1328,10 +1328,16 @@ function hashCommitment(domain: string, parts: string[]): string {
 
 function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
   const endpoints: Record<string, string> = {
-    mqtt: "wss://mqtt.discrypt.invalid/mqtt",
-    nostr: "wss://nostr.discrypt.invalid",
-    ipfs_pubsub: "https://ipfs.discrypt.invalid/bootstrap/pubsub",
-    discrypt_quic_rendezvous: "quic://signaling.discrypt.invalid:443/rendezvous",
+    nostr: import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
+      "wss://relay.damus.io",
+    mqtt: import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
+      "mqtts://broker.emqx.io:8883",
+    ipfs_pubsub:
+      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT ??
+      "https://ipfs.discrypt.invalid/bootstrap/pubsub",
+    discrypt_quic_rendezvous:
+      import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT ??
+      "quic://signaling.discrypt.invalid:443/rendezvous",
   };
   return Object.entries(endpoints).map(([adapterKind, endpoint]) => ({
     profile_id: `${adapterKind}-default`,

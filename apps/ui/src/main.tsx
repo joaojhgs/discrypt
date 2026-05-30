@@ -216,7 +216,6 @@ function App() {
   }
 
   async function probeSelectedAdapter() {
-    const selected = commandState?.transport_diagnostics.selected_adapter ?? null;
     const scopeLabel =
       commandState?.active_context?.dm_id ??
       commandState?.active_context?.group_id ??
@@ -226,7 +225,7 @@ function App() {
       startSignalingSession({
         scope_label: scopeLabel,
         adapter_probe: true,
-        adapter_kind: selected,
+        adapter_kind: null,
       }),
     );
   }
