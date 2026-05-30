@@ -50,7 +50,7 @@ use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
 #[cfg(test)]
-use discrypt_transport::TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE;
+use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
     probe_provider_webrtc_datachannel_request_response_roundtrip,
@@ -58,9 +58,10 @@ use discrypt_transport::{
     resume_text_control_runtime_from_probe, AdapterFallbackBehavior, AdapterTrustLabel,
     ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel, ConversationScope, Endpoint,
     FallbackLeg, IceServerConfig, ProviderMetadataPosture, ProviderTextControlRuntimeAttachment,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError, TransportRoute,
-    TransportSession, TransportSessionSnapshot, TransportSessionState, TurnServerConfig,
+    ProviderTextControlRuntimeSpec, SignalingAdapterCapabilities, SignalingAdapterKind,
+    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint, TransportError,
+    TransportRoute, TransportSession, TransportSessionSnapshot, TransportSessionState,
+    TurnServerConfig,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -1285,6 +1286,9 @@ pub struct ProviderWebRtcDataChannelProbeView {
     pub profile_id: String,
     /// Redacted endpoint label.
     pub endpoint_label: String,
+    /// Scope commitment used for topic derivation.
+    #[serde(default)]
+    pub scope_commitment: String,
     /// Provider-visible derived rendezvous topic/tag.
     pub rendezvous_topic: String,
     /// Offerer WebRTC direct path readiness.
@@ -1330,6 +1334,9 @@ pub struct ProviderWebRtcDataChannelProbeView {
     /// SHA-256 of the opaque return receipt/control frame used for the proof.
     #[serde(default)]
     pub receipt_frame_sha256: String,
+    /// Versioned provider runtime handoff material captured by the backend probe.
+    #[serde(default)]
+    pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
 }
 
 impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
@@ -1340,6 +1347,7 @@ impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
             kind: probe.kind.canonical_name().to_owned(),
             profile_id: probe.profile_id,
             endpoint_label: probe.endpoint_label,
+            scope_commitment: probe.scope_commitment,
             rendezvous_topic: probe.rendezvous_topic,
             offerer_direct_path_ready: probe.offerer_direct_path_ready,
             answerer_direct_path_ready: probe.answerer_direct_path_ready,
@@ -1359,6 +1367,7 @@ impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
             text_control_frame_sha256: probe.text_control_frame_sha256,
             receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
             receipt_frame_sha256: probe.receipt_frame_sha256,
+            runtime_spec: probe.runtime_spec,
         }
     }
 }
@@ -2044,12 +2053,16 @@ pub fn attach_text_control_transport_runtime(
             profile_id: String::new(),
             endpoint_label: "unknown-endpoint".to_owned(),
             rendezvous_topic: "unknown-topic".to_owned(),
+            scope_commitment: String::new(),
+            runtime_spec: None,
         },
         |probe| ProviderTextControlRuntimeAttachment {
             adapter_kind: probe.kind.clone(),
             profile_id: probe.profile_id.clone(),
             endpoint_label: probe.endpoint_label.clone(),
             rendezvous_topic: probe.rendezvous_topic.clone(),
+            scope_commitment: probe.scope_commitment.clone(),
+            runtime_spec: probe.runtime_spec.clone().map(Box::new),
         },
     );
     let reason = match resume_text_control_runtime_from_probe(attachment) {
@@ -4544,6 +4557,7 @@ impl PersistedAppState {
             kind: probe.kind.canonical_name().to_owned(),
             profile_id: probe.profile_id,
             endpoint_label: probe.endpoint_label,
+            scope_commitment: probe.scope_commitment,
             rendezvous_topic: probe.rendezvous_topic,
             offerer_direct_path_ready: probe.offerer_direct_path_ready,
             answerer_direct_path_ready: probe.answerer_direct_path_ready,
@@ -4563,6 +4577,7 @@ impl PersistedAppState {
             text_control_frame_sha256: probe.text_control_frame_sha256,
             receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
             receipt_frame_sha256: probe.receipt_frame_sha256,
+            runtime_spec: probe.runtime_spec,
         };
         self.latest_data_channel_probe_error = None;
         self.latest_data_channel_probe = Some(view.clone());
@@ -9971,6 +9986,7 @@ mod tests {
             kind: "unit-test".to_owned(),
             profile_id: "unit-test-profile".to_owned(),
             endpoint_label: "unit-test-endpoint".to_owned(),
+            scope_commitment: "unit-test-scope".to_owned(),
             rendezvous_topic: "unit-test-topic".to_owned(),
             offerer_direct_path_ready: true,
             answerer_direct_path_ready: true,
@@ -9988,6 +10004,7 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
+            runtime_spec: None,
         };
         let attached = mutate_app_service(|state| {
             state.latest_data_channel_probe = Some(synthetic_probe.clone());
@@ -10024,7 +10041,7 @@ mod tests {
             .contains("persisted negotiated offer/answer/ICE bootstrap handoff"));
         assert_eq!(
             command_error.message,
-            TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE
+            TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE
         );
         let service = app_service();
         let guard = service
@@ -10057,6 +10074,7 @@ mod tests {
             kind: "unit-test".to_owned(),
             profile_id: "unit-test-profile".to_owned(),
             endpoint_label: "unit-test-endpoint".to_owned(),
+            scope_commitment: "unit-test-scope".to_owned(),
             rendezvous_topic: "unit-test-topic".to_owned(),
             offerer_direct_path_ready: true,
             answerer_direct_path_ready: true,
@@ -10074,6 +10092,7 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
+            runtime_spec: None,
         };
         let session_id = load_state()
             .text_session
@@ -10755,6 +10774,7 @@ mod tests {
             kind: "mqtt".to_owned(),
             profile_id: "mqtt-default".to_owned(),
             endpoint_label: "mqtts://broker.example".to_owned(),
+            scope_commitment: "scope-commitment".to_owned(),
             rendezvous_topic: "topic-commitment".to_owned(),
             offerer_direct_path_ready: false,
             answerer_direct_path_ready: false,
@@ -10772,6 +10792,7 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
+            runtime_spec: None,
         };
 
         let state = mutate_app_service(|state| {

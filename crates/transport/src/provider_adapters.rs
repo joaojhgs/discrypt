@@ -28,6 +28,7 @@ use crate::{
 ))]
 use crate::{WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator};
 use async_trait::async_trait;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -435,6 +436,9 @@ pub struct ProviderWebRtcDataChannelProbe {
     pub receipt_frame_roundtrip: bool,
     /// SHA-256 of the opaque return receipt/control frame used for the proof.
     pub receipt_frame_sha256: String,
+    /// Versioned serialized runtime handoff material captured during the probe.
+    #[serde(default)]
+    pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
 }
 
 /// Inputs required to resume a provider-backed WebRTC text/control runtime from a
@@ -449,7 +453,16 @@ pub struct ProviderTextControlRuntimeAttachment {
     pub endpoint_label: String,
     /// Rendezvous topic that the peer proof already established.
     pub rendezvous_topic: String,
+    /// Scope commitment used to derive the rendezvous topic.
+    #[serde(default)]
+    pub scope_commitment: String,
+    /// Serialized runtime handoff material derived from the same proof.
+    #[serde(default)]
+    pub runtime_spec: Option<Box<ProviderTextControlRuntimeSpec>>,
 }
+
+/// Current schema version for persisted provider text/control runtime specs.
+pub const PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION: u16 = 1;
 
 /// Explicitly exposed transport-blocker message for provider-backed long-lived
 /// text/control runtime attachment.
@@ -459,6 +472,165 @@ pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
 pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
     "Persisted provider offer/answer/ICE handoff and a long-lived receiver loop are still required before runtime attachment can be established";
 
+/// Typed boundary when a runtime spec is missing from a resume attachment.
+pub const TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE: &str =
+    "provider text/control runtime handoff spec is required for resume";
+
+/// Typed boundary when a runtime spec is stale beyond its validity window.
+pub const TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE: &str =
+    "provider text/control runtime handoff spec is stale";
+
+/// Typed boundary when a runtime spec does not match the resume attachment.
+pub const TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE: &str =
+    "provider text/control runtime handoff spec is incompatible with requested attachment";
+
+/// Persistable handoff from a provider WebRTC proof to a future long-lived text/control runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTextControlRuntimeSpec {
+    /// Version for compatibility checks before runtime attachment.
+    pub schema_version: u16,
+    /// Provider route metadata captured from a proofed rendezvous path.
+    pub attachment: ProviderTextControlRuntimeAttachment,
+    /// Unix timestamp when the handoff was created by the app-service.
+    pub created_at_unix_seconds: i64,
+    /// Unix timestamp after which the handoff must be considered stale.
+    pub expires_at_unix_seconds: i64,
+    /// Sealed WebRTC offer payload needed to resume/complete negotiation.
+    #[serde(default)]
+    pub sealed_offer: Option<SealedWebRtcNegotiationPayload>,
+    /// Sealed WebRTC answer payload needed to resume/complete negotiation.
+    #[serde(default)]
+    pub sealed_answer: Option<SealedWebRtcNegotiationPayload>,
+    /// Sealed ICE candidates cached for the runtime handoff.
+    #[serde(default)]
+    pub sealed_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
+    /// Missing production materials that still prevent live runtime attachment.
+    #[serde(default)]
+    pub missing_material: Vec<String>,
+}
+
+impl ProviderTextControlRuntimeSpec {
+    /// Build a fail-closed handoff from probe evidence when live negotiated material is unavailable.
+    #[must_use]
+    pub fn from_probe_without_negotiation_material(
+        probe: &ProviderWebRtcDataChannelProbe,
+        created_at_unix_seconds: i64,
+        ttl_seconds: i64,
+    ) -> Self {
+        Self {
+            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+            attachment: ProviderTextControlRuntimeAttachment {
+                adapter_kind: probe.kind.canonical_name().to_owned(),
+                profile_id: probe.profile_id.clone(),
+                endpoint_label: probe.endpoint_label.clone(),
+                rendezvous_topic: probe.rendezvous_topic.clone(),
+                scope_commitment: probe.scope_commitment.clone(),
+                runtime_spec: None,
+            },
+            created_at_unix_seconds,
+            expires_at_unix_seconds: created_at_unix_seconds.saturating_add(ttl_seconds.max(0)),
+            sealed_offer: None,
+            sealed_answer: None,
+            sealed_ice_candidates: Vec::new(),
+            missing_material: vec![
+                "sealed WebRTC offer payload was not retained by the probe API".to_owned(),
+                "sealed WebRTC answer payload was not retained by the probe API".to_owned(),
+                "ICE candidate cache was not retained for runtime resume".to_owned(),
+                "installed-app receiver loop is not yet bound to this handoff".to_owned(),
+            ],
+        }
+    }
+
+    /// Build a complete runtime spec from a successful offer/answer/ICE probe path.
+    #[must_use]
+    pub fn from_webrtc_probe(
+        probe: &ProviderWebRtcDataChannelProbe,
+        created_at_unix_seconds: i64,
+        ttl_seconds: i64,
+        sealed_offer: Option<SealedWebRtcNegotiationPayload>,
+        sealed_answer: Option<SealedWebRtcNegotiationPayload>,
+        sealed_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
+    ) -> Self {
+        Self {
+            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+            attachment: ProviderTextControlRuntimeAttachment {
+                adapter_kind: probe.kind.canonical_name().to_owned(),
+                profile_id: probe.profile_id.clone(),
+                endpoint_label: probe.endpoint_label.clone(),
+                rendezvous_topic: probe.rendezvous_topic.clone(),
+                scope_commitment: probe.scope_commitment.clone(),
+                runtime_spec: None,
+            },
+            created_at_unix_seconds,
+            expires_at_unix_seconds: created_at_unix_seconds.saturating_add(ttl_seconds.max(0)),
+            sealed_offer,
+            sealed_answer,
+            sealed_ice_candidates,
+            missing_material: Vec::new(),
+        }
+    }
+
+    /// Validate the spec before attempting a long-lived runtime attachment.
+    pub fn validate_for_runtime_attach(
+        &self,
+        now_unix_seconds: i64,
+        attachment: &ProviderTextControlRuntimeAttachment,
+    ) -> Result<(), TransportError> {
+        self.validate_for_runtime_attach_without_attachment(now_unix_seconds)?;
+        if self.attachment.adapter_kind != attachment.adapter_kind
+            || self.attachment.profile_id != attachment.profile_id
+            || self.attachment.endpoint_label != attachment.endpoint_label
+            || self.attachment.rendezvous_topic != attachment.rendezvous_topic
+            || (!self.attachment.scope_commitment.is_empty()
+                && self.attachment.scope_commitment != attachment.scope_commitment)
+        {
+            return Err(TransportError::Unavailable(
+                TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate this spec for runtime attachment before compatibility binding to the
+    /// active attachment metadata.
+    pub fn validate_for_runtime_attach_without_attachment(
+        &self,
+        now_unix_seconds: i64,
+    ) -> Result<(), TransportError> {
+        if self.schema_version != PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION {
+            return Err(TransportError::Unavailable(format!(
+                "unsupported provider text/control runtime spec version {}",
+                self.schema_version
+            )));
+        }
+        if self.attachment.adapter_kind.is_empty()
+            || self.attachment.profile_id.is_empty()
+            || self.attachment.rendezvous_topic.is_empty()
+        {
+            return Err(TransportError::Unavailable(
+                "provider text/control runtime spec is missing attachment metadata".to_owned(),
+            ));
+        }
+        if now_unix_seconds > self.expires_at_unix_seconds {
+            return Err(TransportError::Unavailable(
+                TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE.to_owned(),
+            ));
+        }
+        if !self.missing_material.is_empty() {
+            return Err(TransportError::Unavailable(format!(
+                "provider text/control runtime spec is missing negotiated material: {}",
+                self.missing_material.join("; ")
+            )));
+        }
+        if self.sealed_offer.is_none() || self.sealed_answer.is_none() {
+            return Err(TransportError::Unavailable(
+                "provider text/control runtime spec lacks sealed offer/answer handoff".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Build a live provider-backed text/control transport runtime from prior peer
 /// proof material.
 ///
@@ -467,8 +639,22 @@ pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
 /// avoid silently pretending that short-lived test probes imply a production
 /// long-lived runtime.
 pub fn resume_text_control_runtime_from_probe(
-    _attachment: ProviderTextControlRuntimeAttachment,
+    attachment: ProviderTextControlRuntimeAttachment,
 ) -> Result<std::sync::Arc<dyn TextControlDataTransport>, TransportError> {
+    let now_unix_seconds = Utc::now().timestamp();
+    let spec = attachment.runtime_spec.as_deref().ok_or_else(|| {
+        TransportError::Unavailable(TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE.to_owned())
+    })?;
+    resume_text_control_runtime_from_spec(&spec, &attachment, now_unix_seconds)
+}
+
+/// Build a live provider-backed text/control transport runtime from a persisted handoff spec.
+pub fn resume_text_control_runtime_from_spec(
+    spec: &ProviderTextControlRuntimeSpec,
+    attachment: &ProviderTextControlRuntimeAttachment,
+    now_unix_seconds: i64,
+) -> Result<std::sync::Arc<dyn TextControlDataTransport>, TransportError> {
+    spec.validate_for_runtime_attach(now_unix_seconds, attachment)?;
     Err(TransportError::Unavailable(
         TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE.to_owned(),
     ))
@@ -1075,6 +1261,10 @@ where
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
     }
+    let mut captured_sealed_offer = Some(sealed_offer.clone());
+    let mut captured_sealed_answer = None;
+    let mut offerer_ice_candidates = Vec::new();
+    let mut answerer_ice_candidates = Vec::new();
     alice_room.send_signal(bob.clone(), sealed_offer).await?;
 
     let mut answer_applied = false;
@@ -1090,9 +1280,9 @@ where
                     let answer = bob_webrtc
                         .create_complete_answer(offer, Duration::from_secs(45))
                         .await?;
-                    bob_room
-                        .send_signal(alice.clone(), sealer.seal_description(&answer)?)
-                        .await?;
+                    let sealed_answer = sealer.seal_description(&answer)?;
+                    captured_sealed_answer = Some(sealed_answer.clone());
+                    bob_room.send_signal(alice.clone(), sealed_answer).await?;
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
                     bob_webrtc
@@ -1124,13 +1314,17 @@ where
         }
 
         for candidate in alice_webrtc.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            offerer_ice_candidates.push(sealed_candidate.clone());
             alice_room
-                .send_signal(bob.clone(), sealer.seal_candidate(&candidate)?)
+                .send_signal(bob.clone(), sealed_candidate)
                 .await?;
         }
         for candidate in bob_webrtc.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            answerer_ice_candidates.push(sealed_candidate.clone());
             bob_room
-                .send_signal(alice.clone(), sealer.seal_candidate(&candidate)?)
+                .send_signal(alice.clone(), sealed_candidate)
                 .await?;
         }
 
@@ -1194,6 +1388,28 @@ where
     let offerer_data = alice_webrtc.text_control_transport_metrics().await;
     let answerer_data = bob_webrtc.text_control_transport_metrics().await;
 
+    let now_unix_seconds = Utc::now().timestamp();
+    let mut runtime_ice_candidates = Vec::new();
+    runtime_ice_candidates.extend(offerer_ice_candidates);
+    runtime_ice_candidates.extend(answerer_ice_candidates);
+    let runtime_spec = ProviderTextControlRuntimeSpec {
+        schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+        attachment: ProviderTextControlRuntimeAttachment {
+            adapter_kind: profile.kind.canonical_name().to_owned(),
+            profile_id: profile.profile_id.clone(),
+            endpoint_label: endpoint_label.clone(),
+            rendezvous_topic: rendezvous_topic.clone(),
+            scope_commitment: scope.scope_id_commitment.clone(),
+            runtime_spec: None,
+        },
+        created_at_unix_seconds: now_unix_seconds,
+        expires_at_unix_seconds: now_unix_seconds.saturating_add(60 * 60),
+        sealed_offer: captured_sealed_offer,
+        sealed_answer: captured_sealed_answer,
+        sealed_ice_candidates: runtime_ice_candidates,
+        missing_material: Vec::new(),
+    };
+
     alice_webrtc.tear_down().await?;
     bob_webrtc.tear_down().await?;
     alice_room.leave().await?;
@@ -1223,6 +1439,7 @@ where
         text_control_frame_sha256: frame_sha256,
         receipt_frame_roundtrip,
         receipt_frame_sha256,
+        runtime_spec: Some(runtime_spec),
     })
 }
 
@@ -6185,15 +6402,182 @@ mod tests {
             profile_id: "unit-test-profile".to_owned(),
             endpoint_label: "unit-test-endpoint".to_owned(),
             rendezvous_topic: "unit-test-topic".to_owned(),
+            scope_commitment: "unit-test-scope".to_owned(),
+            runtime_spec: None,
         };
         let error = match resume_text_control_runtime_from_probe(attach_request) {
             Ok(_) => panic!("runtime attachment path must remain unimplemented"),
             Err(error) => error,
         };
-        assert_eq!(
-            error.to_string(),
-            format!("unavailable: {TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE}")
+        assert!(error
+            .to_string()
+            .contains(TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE));
+    }
+
+    #[test]
+    fn runtime_spec_from_probe_serializes_and_stays_fail_closed_without_handoff_material() {
+        let probe = ProviderWebRtcDataChannelProbe {
+            kind: SignalingAdapterKind::Mqtt,
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "mqtt://redacted".to_owned(),
+            scope_commitment: "scope".to_owned(),
+            rendezvous_topic: "topic".to_owned(),
+            offerer_direct_path_ready: true,
+            answerer_direct_path_ready: true,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "text-sha".to_owned(),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "receipt-sha".to_owned(),
+            runtime_spec: None,
+        };
+        let spec = ProviderTextControlRuntimeSpec::from_probe_without_negotiation_material(
+            &probe, 100, 60,
         );
+        let encoded = serde_json::to_string(&spec).expect("serialize runtime spec");
+        assert!(encoded.contains("unit-test-profile"));
+        assert!(!encoded.contains("text-sha"));
+        let decoded: ProviderTextControlRuntimeSpec =
+            serde_json::from_str(&encoded).expect("decode runtime spec");
+        assert_eq!(
+            decoded.schema_version,
+            PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION
+        );
+        assert_eq!(decoded.attachment.adapter_kind, "mqtt");
+        assert_eq!(decoded.expires_at_unix_seconds, 160);
+        let error = decoded
+            .validate_for_runtime_attach(120, &decoded.attachment)
+            .expect_err("missing offer/answer/ICE must fail closed");
+        assert!(error.to_string().contains("missing negotiated material"));
+    }
+
+    #[test]
+    fn runtime_spec_rejects_stale_handoff_before_runtime_attach() {
+        let spec = ProviderTextControlRuntimeSpec {
+            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+            attachment: ProviderTextControlRuntimeAttachment {
+                adapter_kind: "mqtt".to_owned(),
+                profile_id: "unit-test-profile".to_owned(),
+                endpoint_label: "endpoint".to_owned(),
+                rendezvous_topic: "topic".to_owned(),
+                scope_commitment: "unit-scope".to_owned(),
+                runtime_spec: None,
+            },
+            created_at_unix_seconds: 10,
+            expires_at_unix_seconds: 20,
+            sealed_offer: None,
+            sealed_answer: None,
+            sealed_ice_candidates: Vec::new(),
+            missing_material: Vec::new(),
+        };
+        let error = spec
+            .validate_for_runtime_attach(21, &spec.attachment)
+            .expect_err("expired spec must fail before runtime attach");
+        assert!(error.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn runtime_spec_rejects_incompatible_attachment() {
+        let mut attachment = ProviderTextControlRuntimeAttachment {
+            adapter_kind: "mqtt".to_owned(),
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "endpoint".to_owned(),
+            rendezvous_topic: "topic".to_owned(),
+            scope_commitment: "unit-scope".to_owned(),
+            runtime_spec: None,
+        };
+        let now_unix_seconds = Utc::now().timestamp();
+        let spec = ProviderTextControlRuntimeSpec {
+            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+            attachment: attachment.clone(),
+            created_at_unix_seconds: now_unix_seconds,
+            expires_at_unix_seconds: now_unix_seconds.saturating_add(3600),
+            sealed_offer: Some(SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [7; 12],
+                ciphertext: b"offer".to_vec(),
+            }),
+            sealed_answer: Some(SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Answer,
+                nonce: [8; 12],
+                ciphertext: b"answer".to_vec(),
+            }),
+            sealed_ice_candidates: Vec::new(),
+            missing_material: Vec::new(),
+        };
+        attachment.adapter_kind = "nostr".to_owned();
+        let error = spec
+            .validate_for_runtime_attach(150, &attachment)
+            .expect_err("incompatible adapter must fail before runtime attach");
+        assert!(error
+            .to_string()
+            .contains(TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE));
+    }
+
+    #[test]
+    fn valid_runtime_spec_still_fails_closed_until_runtime_factory_exists() {
+        let attachment = ProviderTextControlRuntimeAttachment {
+            adapter_kind: "mqtt".to_owned(),
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "endpoint".to_owned(),
+            rendezvous_topic: "topic".to_owned(),
+            scope_commitment: "unit-scope".to_owned(),
+            runtime_spec: None,
+        };
+        let now_unix_seconds = Utc::now().timestamp();
+        let spec = ProviderTextControlRuntimeSpec {
+            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
+            attachment: attachment.clone(),
+            created_at_unix_seconds: now_unix_seconds,
+            expires_at_unix_seconds: now_unix_seconds.saturating_add(3600),
+            sealed_offer: Some(SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [7; 12],
+                ciphertext: b"offer".to_vec(),
+            }),
+            sealed_answer: Some(SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Answer,
+                nonce: [8; 12],
+                ciphertext: b"answer".to_vec(),
+            }),
+            sealed_ice_candidates: vec![SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Candidate,
+                nonce: [9; 12],
+                ciphertext: b"candidate".to_vec(),
+            }],
+            missing_material: Vec::new(),
+        };
+        let error =
+            match resume_text_control_runtime_from_spec(&spec, &attachment, now_unix_seconds + 1) {
+                Ok(_) => panic!("validated handoff must not fake a live runtime"),
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));
+
+        let attachment_with_spec = ProviderTextControlRuntimeAttachment {
+            runtime_spec: Some(Box::new(spec)),
+            ..attachment
+        };
+        let error = match resume_text_control_runtime_from_probe(attachment_with_spec) {
+            Ok(_) => panic!("attachment seam must still fail closed without factory"),
+            Err(error) => error,
+        };
         assert!(error
             .to_string()
             .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));

@@ -45,13 +45,16 @@ pub use provider_adapters::{
     probe_provider_webrtc_datachannel_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     required_provider_adapter_registry, resume_text_control_runtime_from_probe,
-    AdapterReadinessState, FeatureGatedProviderAdapter, LocalConformanceProviderAdapter,
-    LocalConformanceProviderBus, ProviderAdapterBoundary, ProviderAdapterReadiness,
-    ProviderAdapterRoundtripProbe, ProviderTextControlRuntimeAttachment,
-    ProviderWebRtcDataChannelProbe, SignalingAdapterFactory, SignalingAdapterFallbackAttempt,
-    SignalingAdapterFallbackPlan, SignalingAdapterRegistryEntry,
+    resume_text_control_runtime_from_spec, AdapterReadinessState, FeatureGatedProviderAdapter,
+    LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,
+    ProviderAdapterReadiness, ProviderAdapterRoundtripProbe, ProviderTextControlRuntimeAttachment,
+    ProviderTextControlRuntimeSpec, ProviderWebRtcDataChannelProbe, SignalingAdapterFactory,
+    SignalingAdapterFallbackAttempt, SignalingAdapterFallbackPlan, SignalingAdapterRegistryEntry,
+    PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
     TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE,
     TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
+    TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE, TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE,
+    TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE,
 };
 use serde::{Deserialize, Serialize};
 pub use session::{
