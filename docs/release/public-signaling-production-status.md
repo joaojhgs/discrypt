@@ -542,3 +542,20 @@ Verification run:
 Remaining gap: this removes a real two-profile attach precondition, but does not
 by itself prove two installed GUI processes completed a public-provider attach
 and sent/received text from the UI.
+
+## 2026-05-30 update: desktop runtime-pair proof now uses role-split constructors
+
+The desktop persisted-state public runtime-pair proof no longer uses the
+single-call in-process pair constructor. Its harness now starts the receiver with
+`start_provider_webrtc_text_control_answer_runtime_with_answerer`, starts the
+sender with `start_provider_webrtc_text_control_offer_runtime`, waits for both
+roles to attach, pumps the sender's persisted outbox over the offerer runtime,
+and verifies the receiver-generated app receipt.
+
+Public evidence rerun:
+
+- MQTT: `DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 timeout 240s cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` passed.
+- Nostr: `DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` passed.
+
+Remaining gap: this is now a stronger two-role persisted-state backend proof, but
+still not a two-window installed GUI Playwright/Tauri UI flow.

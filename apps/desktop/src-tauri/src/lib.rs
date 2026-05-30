@@ -50,7 +50,6 @@ use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
 #[cfg(test)]
-use discrypt_transport::start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer;
 #[cfg(test)]
 use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
@@ -5112,7 +5111,57 @@ impl PersistedAppState {
             runtime.block_on(async move {
                 let answerer_service = receiver_service.clone();
                 let receiver_after = receiver_service.clone();
-                let pair = start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
+                let answerer_profile = profile.clone();
+                let answerer_scope = scope.clone();
+                let answerer_bootstrap_secret = bootstrap_secret.clone();
+                let answerer_random_entropy = random_entropy.clone();
+                let answerer_ice_config = ice_config.clone();
+                let answerer_local_peer_id = receiver_peer_id.clone();
+                let answerer_remote_peer_id = sender_peer_id.clone();
+                let answerer_task = tokio::spawn(async move {
+                    start_provider_webrtc_text_control_answer_runtime_with_answerer(
+                        answerer_profile,
+                        answerer_scope,
+                        &answerer_bootstrap_secret,
+                        &answerer_random_entropy,
+                        discrypt_transport::WebRtcNegotiationConfig::new(answerer_ice_config),
+                        answerer_local_peer_id,
+                        answerer_remote_peer_id,
+                        move |received| {
+                            let frame: TextControlFrameView = serde_json::from_slice(&received)
+                                .map_err(|error| {
+                                    TransportError::Unavailable(format!(
+                                        "receiver could not decode live text/control frame: {error}"
+                                    ))
+                                })?;
+                            let mut response_frame = None;
+                            answerer_service
+                                .lock()
+                                .map_err(|_| {
+                                    TransportError::Unavailable(
+                                        "live runtime receiver service lock poisoned".to_owned(),
+                                    )
+                                })?
+                                .mutate(|state| {
+                                    response_frame = state.handle_text_control_frame(frame);
+                                });
+                            let response_frame = response_frame.ok_or_else(|| {
+                                TransportError::Unavailable(
+                                    "receiver did not accept live text/control frame or generate receipt"
+                                        .to_owned(),
+                                )
+                            })?;
+                            serde_json::to_vec(&response_frame).map_err(|error| {
+                                TransportError::Unavailable(format!(
+                                    "could not encode live text/control response frame: {error}"
+                                ))
+                            })
+                        },
+                    )
+                    .await
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let offerer = start_provider_webrtc_text_control_offer_runtime(
                     profile,
                     scope,
                     &bootstrap_secret,
@@ -5120,43 +5169,31 @@ impl PersistedAppState {
                     discrypt_transport::WebRtcNegotiationConfig::new(ice_config),
                     sender_peer_id,
                     receiver_peer_id,
-                    move |received| {
-                        let frame: TextControlFrameView =
-                            serde_json::from_slice(&received).map_err(|error| {
-                                TransportError::Unavailable(format!(
-                                    "receiver could not decode live text/control frame: {error}"
-                                ))
-                            })?;
-                        let mut response_frame = None;
-                        answerer_service
-                            .lock()
-                            .map_err(|_| {
-                                TransportError::Unavailable(
-                                    "live runtime receiver service lock poisoned".to_owned(),
-                                )
-                            })?
-                            .mutate(|state| {
-                                response_frame = state.handle_text_control_frame(frame);
-                            });
-                        let response_frame = response_frame.ok_or_else(|| {
-                            TransportError::Unavailable(
-                                "receiver did not accept live text/control frame or generate receipt"
-                                    .to_owned(),
-                            )
-                        })?;
-                        serde_json::to_vec(&response_frame).map_err(|error| {
-                            TransportError::Unavailable(format!(
-                                "could not encode live text/control response frame: {error}"
-                            ))
-                        })
-                    },
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-                let evidence = pair.evidence().clone();
+                let answerer = tokio::time::timeout(std::time::Duration::from_secs(50), answerer_task)
+                    .await
+                    .map_err(|_| "timed out waiting for role-split receiver runtime attach".to_owned())?
+                    .map_err(|error| format!("role-split receiver runtime task failed: {error}"))?
+                    .map_err(|error| error.to_string())?;
+                let offerer_evidence = offerer.evidence().clone();
+                let answerer_evidence = answerer.evidence().clone();
+                let evidence = discrypt_transport::ProviderTextControlRuntimeEvidence {
+                    kind: offerer_evidence.kind,
+                    profile_id: offerer_evidence.profile_id,
+                    endpoint_label: offerer_evidence.endpoint_label,
+                    scope_commitment: offerer_evidence.scope_commitment,
+                    rendezvous_topic: offerer_evidence.rendezvous_topic,
+                    offerer_direct_path_ready: offerer_evidence.direct_path_ready,
+                    answerer_direct_path_ready: answerer_evidence.direct_path_ready,
+                    offerer_data_channel_open: offerer_evidence.data_channel_open,
+                    answerer_data_channel_open: answerer_evidence.data_channel_open,
+                    runtime_spec: offerer_evidence.runtime_spec,
+                };
                 let report = sender_state
                     .pump_text_control_transport_once(
-                        pair.transport().as_ref(),
+                        offerer.transport().as_ref(),
                         ListPendingTextControlFramesRequest {
                             target: Some(target),
                             limit: Some(1),
@@ -5165,7 +5202,8 @@ impl PersistedAppState {
                         transport_session_id,
                     )
                     .await;
-                pair.close().await.map_err(|error| error.to_string())?;
+                offerer.close().await.map_err(|error| error.to_string())?;
+                answerer.close().await.map_err(|error| error.to_string())?;
                 let receiver_state = receiver_after
                     .lock()
                     .map_err(|_| "live runtime receiver service lock poisoned".to_owned())?
