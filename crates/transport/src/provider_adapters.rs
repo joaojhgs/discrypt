@@ -1566,9 +1566,19 @@ struct DiscryptRendezvousTakenSignal {
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 #[derive(Clone, Debug, Deserialize)]
 struct DiscryptRendezvousHealthResponse {
+    #[serde(default)]
+    schema_version: Option<u16>,
+    #[serde(default)]
+    protocol_version: Option<String>,
     status: String,
     service: String,
     public_base_url: String,
+    #[serde(default)]
+    max_body_bytes: Option<usize>,
+    #[serde(default)]
+    rate_limit_window_seconds: Option<u64>,
+    #[serde(default)]
+    rate_limit_max_requests: Option<u32>,
     at_rest_records: usize,
 }
 
@@ -2054,6 +2064,18 @@ const IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS: u64 = 20;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 const IPFS_PUBSUB_BOOTSTRAP_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+const DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION: u16 = 1;
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+const DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION: &str = "discrypt-signaling-http-v1";
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+const DISCRYPT_RENDEZVOUS_MIN_MAX_BODY_BYTES: usize = 4096;
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+const DISCRYPT_RENDEZVOUS_MAX_MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Versioned public bootstrap policy for explicit IPFS/libp2p adapter profiles.
 ///
 /// DNS bootstrap is intentionally disabled while the libp2p DNS stack is
@@ -2457,6 +2479,41 @@ fn discrypt_rendezvous_validate_health(
         return Err(TransportError::SignalingAdapter(format!(
             "discrypt rendezvous service public_base_url mismatch: expected {endpoint_base}, got {advertised}"
         )));
+    }
+    if endpoint_security != SignalingEndpointSecurity::LocalDevLoopback {
+        if health.schema_version != Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION) {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health schema_version is unsupported".to_owned(),
+            ));
+        }
+        if health.protocol_version.as_deref() != Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION) {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service protocol_version is unsupported".to_owned(),
+            ));
+        }
+        let Some(max_body_bytes) = health.max_body_bytes else {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing max_body_bytes".to_owned(),
+            ));
+        };
+        if !(DISCRYPT_RENDEZVOUS_MIN_MAX_BODY_BYTES..=DISCRYPT_RENDEZVOUS_MAX_MAX_BODY_BYTES)
+            .contains(&max_body_bytes)
+        {
+            return Err(TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous service max_body_bytes is outside policy bounds: {max_body_bytes}"
+            )));
+        }
+        if health.rate_limit_window_seconds.unwrap_or(0) == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing rate_limit_window_seconds"
+                    .to_owned(),
+            ));
+        }
+        if health.rate_limit_max_requests.unwrap_or(0) == 0 {
+            return Err(TransportError::SignalingAdapter(
+                "discrypt rendezvous service health is missing rate_limit_max_requests".to_owned(),
+            ));
+        }
     }
     let _ = health.at_rest_records;
     Ok(())
@@ -5386,9 +5443,14 @@ mod tests {
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_requires_matching_public_base_for_production() {
         let health = DiscryptRendezvousHealthResponse {
+            schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
+            protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
             status: "ok".to_owned(),
             service: "discrypt-rendezvous".to_owned(),
             public_base_url: "https://other.example.invalid".to_owned(),
+            max_body_bytes: Some(64 * 1024),
+            rate_limit_window_seconds: Some(60),
+            rate_limit_max_requests: Some(120),
             at_rest_records: 0,
         };
         let error = discrypt_rendezvous_validate_health(
@@ -5405,9 +5467,14 @@ mod tests {
     fn quic_rendezvous_health_allows_local_loopback_public_base_mismatch(
     ) -> Result<(), TransportError> {
         let health = DiscryptRendezvousHealthResponse {
+            schema_version: None,
+            protocol_version: None,
             status: "ok".to_owned(),
             service: "discrypt-rendezvous".to_owned(),
             public_base_url: "https://127.0.0.1/rendezvous-test".to_owned(),
+            max_body_bytes: None,
+            rate_limit_window_seconds: None,
+            rate_limit_max_requests: None,
             at_rest_records: 0,
         };
         discrypt_rendezvous_validate_health(
@@ -5421,9 +5488,14 @@ mod tests {
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_rejects_non_ok_status() {
         let health = DiscryptRendezvousHealthResponse {
+            schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
+            protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
             status: "degraded".to_owned(),
             service: "discrypt-rendezvous".to_owned(),
             public_base_url: "https://rendezvous.example.invalid".to_owned(),
+            max_body_bytes: Some(64 * 1024),
+            rate_limit_window_seconds: Some(60),
+            rate_limit_max_requests: Some(120),
             at_rest_records: 0,
         };
         let error = discrypt_rendezvous_validate_health(
@@ -5433,6 +5505,52 @@ mod tests {
         )
         .expect_err("non-ok health must fail");
         assert!(error.to_string().contains("health is not ok"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_requires_production_protocol_metadata() {
+        let health = DiscryptRendezvousHealthResponse {
+            schema_version: None,
+            protocol_version: None,
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: "https://rendezvous.example.invalid".to_owned(),
+            max_body_bytes: None,
+            rate_limit_window_seconds: None,
+            rate_limit_max_requests: None,
+            at_rest_records: 0,
+        };
+        let error = discrypt_rendezvous_validate_health(
+            "https://rendezvous.example.invalid",
+            SignalingEndpointSecurity::ProductionTls,
+            &health,
+        )
+        .expect_err("production health must include schema metadata");
+        assert!(error.to_string().contains("schema_version"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_rejects_unsafe_max_body_policy() {
+        let health = DiscryptRendezvousHealthResponse {
+            schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
+            protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: "https://rendezvous.example.invalid".to_owned(),
+            max_body_bytes: Some(DISCRYPT_RENDEZVOUS_MAX_MAX_BODY_BYTES + 1),
+            rate_limit_window_seconds: Some(60),
+            rate_limit_max_requests: Some(120),
+            at_rest_records: 0,
+        };
+        let error = discrypt_rendezvous_validate_health(
+            "https://rendezvous.example.invalid",
+            SignalingEndpointSecurity::ProductionTls,
+            &health,
+        )
+        .expect_err("production health must keep max body bounded");
+        assert!(error.to_string().contains("max_body_bytes"));
     }
 
     #[tokio::test]
