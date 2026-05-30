@@ -15,6 +15,17 @@ use std::sync::OnceLock;
 use storage::{recover_account, AppStore, AppStoreError, MemoryAppStore, RecoveryMaterial};
 use thiserror::Error;
 
+pub const VOICE_CHANNEL_MEDIA_E2E_GATED_COPY: &str =
+    "Session-state only; media-frame E2E gate required before production voice claims";
+pub const VOICE_SESSION_ROUTE_GATED_COPY: &str =
+    "Local voice controls only; network media route is not connected in this build";
+pub const VOICE_SESSION_NOT_JOINED_COPY: &str =
+    "Not joined; command-backed local voice controls are idle";
+pub const VOICE_SESSION_JOINED_COPY: &str =
+    "Voice session state joined; audio-frame media path is still gated by E2E tests";
+pub const VOICE_SESSION_LEFT_COPY: &str =
+    "Not joined; transport/media unavailable until real adapter gates pass";
+
 /// Room summary returned to UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoomSummary {
@@ -448,7 +459,7 @@ impl<S: AppStore> AppService<S> {
                         ChannelView {
                             name: "Voice Lobby".to_owned(),
                             kind: ChannelKind::Voice,
-                            retention_status: "Session-state only; media-frame E2E gate required before production voice claims".to_owned(),
+                            retention_status: VOICE_CHANNEL_MEDIA_E2E_GATED_COPY.to_owned(),
                         },
                     ],
                 },
@@ -489,12 +500,14 @@ impl<S: AppStore> AppService<S> {
                         ChannelView {
                             name: "#general".to_owned(),
                             kind: ChannelKind::Text,
-                            retention_status: retention_status(&self.state.snapshot.retention.selected),
+                            retention_status: retention_status(
+                                &self.state.snapshot.retention.selected,
+                            ),
                         },
                         ChannelView {
                             name: "Voice Lobby".to_owned(),
                             kind: ChannelKind::Voice,
-                            retention_status: "Session-state only; media-frame E2E gate required before production voice claims".to_owned(),
+                            retention_status: VOICE_CHANNEL_MEDIA_E2E_GATED_COPY.to_owned(),
                         },
                     ],
                 },
@@ -517,10 +530,7 @@ impl<S: AppStore> AppService<S> {
         let server_name = normalize_label(&request.server_name, "discrypt lab");
         let retention = match request.kind {
             ChannelKind::Text => retention_status(&self.state.snapshot.retention.selected),
-            ChannelKind::Voice => {
-                "Session-state only; media-frame E2E gate required before production voice claims"
-                    .to_owned()
-            }
+            ChannelKind::Voice => VOICE_CHANNEL_MEDIA_E2E_GATED_COPY.to_owned(),
         };
         let server_index = self
             .state
@@ -566,9 +576,7 @@ impl<S: AppStore> AppService<S> {
     /// Join the command-backed voice session state.
     pub fn join_voice(&mut self) -> Result<AppSnapshot, AppServiceError> {
         self.state.snapshot.voice_session.joined = true;
-        self.state.snapshot.voice_session.status_copy =
-            "Voice session state joined; audio-frame media path is still gated by E2E tests"
-                .to_owned();
+        self.state.snapshot.voice_session.status_copy = VOICE_SESSION_JOINED_COPY.to_owned();
         self.set_local_voice_speaking(true);
         self.push_activity("Joined command-backed voice session state");
         self.persist()?;
@@ -578,8 +586,7 @@ impl<S: AppStore> AppService<S> {
     /// Leave the command-backed voice session state.
     pub fn leave_voice(&mut self) -> Result<AppSnapshot, AppServiceError> {
         self.state.snapshot.voice_session.joined = false;
-        self.state.snapshot.voice_session.status_copy =
-            "Not joined; transport/media unavailable until real adapter gates pass".to_owned();
+        self.state.snapshot.voice_session.status_copy = VOICE_SESSION_LEFT_COPY.to_owned();
         self.set_local_voice_speaking(false);
         self.push_activity("Left command-backed voice session state");
         self.persist()?;
@@ -896,7 +903,7 @@ fn seed_state() -> AppState {
                     ChannelView {
                         name: "Voice Lobby".to_owned(),
                         kind: ChannelKind::Voice,
-                        retention_status: "Session-state only; media-frame E2E gate required before production voice claims".to_owned(),
+                        retention_status: VOICE_CHANNEL_MEDIA_E2E_GATED_COPY.to_owned(),
                     },
                 ],
             }],
@@ -921,7 +928,7 @@ fn seed_state() -> AppState {
                 transition_copy: "Shortening re-locks older messages retroactively; lengthening applies only to future messages".to_owned(),
             },
             voice: VoiceRoomView {
-                route: "Local voice controls only; network media route is not connected in this build".to_owned(),
+                route: VOICE_SESSION_ROUTE_GATED_COPY.to_owned(),
                 relay_copy: "No relay is active in the desktop harness until real media/socket E2E gates pass".to_owned(),
                 android_path: "Android media routing remains release-gated until platform E2E passes".to_owned(),
             },
@@ -938,8 +945,8 @@ fn seed_state() -> AppState {
                     muted: false,
                     volume: 82,
                 }],
-                status_copy: "Not joined; command-backed local voice controls are idle".to_owned(),
-                route_copy: "Local voice controls only; network media route is not connected in this build".to_owned(),
+                status_copy: VOICE_SESSION_NOT_JOINED_COPY.to_owned(),
+                route_copy: VOICE_SESSION_ROUTE_GATED_COPY.to_owned(),
                 permission_denied_copy: String::new(),
             },
             preferences: PreferencesView {

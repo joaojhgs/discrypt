@@ -22,6 +22,7 @@ use discrypt_core::{
     snapshot_safety_number_matches_identity_keys, AppSnapshot, ChannelKind,
     ChannelView as SnapshotChannelView, DeviceView, MessageView as SnapshotMessageView,
     SafetyVerificationRequest, SafetyVerificationResult, SecurityCopyView, ServerView,
+    VOICE_SESSION_NOT_JOINED_COPY, VOICE_SESSION_ROUTE_GATED_COPY,
 };
 use discrypt_media::{
     MicrophonePermissionState, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
@@ -2813,8 +2814,7 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 session.joined = false;
-                session.status_copy =
-                    "Not joined; command-backed local voice controls are idle".to_owned();
+                session.status_copy = VOICE_SESSION_NOT_JOINED_COPY.to_owned();
                 for participant in &mut session.participants {
                     participant.speaking = false;
                 }
@@ -5182,10 +5182,8 @@ impl PersistedAppState {
                         volume: participant.volume,
                     })
                     .collect(),
-                status_copy: "Not joined; command-backed local voice controls are idle".to_owned(),
-                route_copy:
-                    "Local voice controls only; network media route is not connected in this build"
-                        .to_owned(),
+                status_copy: VOICE_SESSION_NOT_JOINED_COPY.to_owned(),
+                route_copy: VOICE_SESSION_ROUTE_GATED_COPY.to_owned(),
                 permission_denied_copy: String::new(),
             }
         };
