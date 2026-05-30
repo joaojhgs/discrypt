@@ -219,6 +219,246 @@ impl InviteTrustMetadata {
     }
 }
 
+
+/// Signed invite bootstrap descriptor schema version for connectivity policy metadata.
+pub const INVITE_CONNECTIVITY_SCHEMA_VERSION: u32 = 1;
+
+/// Invite bootstrap kind carried in signed descriptors.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteKind {
+    /// Group/server admission invite.
+    GroupJoin,
+    /// First-contact direct-message invite.
+    DmContact,
+    /// Own-device pairing invite/payload.
+    DevicePairing,
+}
+
+impl InviteKind {
+    /// Stable string included in signatures and UI state.
+    #[must_use]
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::GroupJoin => "group_join",
+            Self::DmContact => "dm_contact",
+            Self::DevicePairing => "device_pairing",
+        }
+    }
+}
+
+/// Required signaling adapter kind captured by an invite bootstrap profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteSignalingAdapterKind {
+    /// MQTT broker/WebSocket rendezvous adapter.
+    Mqtt,
+    /// Nostr relay rendezvous adapter.
+    Nostr,
+    /// IPFS/libp2p PubSub rendezvous adapter.
+    IpfsPubsub,
+    /// Separate Rust QUIC rendezvous service adapter.
+    DiscryptQuicRendezvous,
+}
+
+impl InviteSignalingAdapterKind {
+    /// Stable string included in signatures and UI state.
+    #[must_use]
+    pub fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::Mqtt => "mqtt",
+            Self::Nostr => "nostr",
+            Self::IpfsPubsub => "ipfs_pubsub",
+            Self::DiscryptQuicRendezvous => "discrypt_quic_rendezvous",
+        }
+    }
+}
+
+/// One signed signaling adapter profile in an invite bootstrap snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InviteSignalingProfile {
+    /// Stable profile id, unique inside the descriptor.
+    pub profile_id: String,
+    /// Adapter kind selected by this profile.
+    pub adapter_kind: InviteSignalingAdapterKind,
+    /// Broker/relay/bootstrap/QUIC endpoint URLs for the adapter.
+    pub endpoints: Vec<String>,
+    /// Provider-visible room namespace commitment, never a display name.
+    pub room_topic_commitment: String,
+    /// Endpoint/service/relay trust fingerprint or public-key commitment.
+    pub trust_fingerprint: String,
+    /// Publish/subscribe TTL in seconds.
+    pub ttl_seconds: u32,
+    /// Public provider metadata posture.
+    pub metadata_posture: String,
+    /// Abuse/rate-limit policy hint surfaced to UI/backend.
+    pub rate_limit_policy: String,
+    /// Adapter capabilities asserted by this profile.
+    pub capabilities: Vec<String>,
+}
+
+impl InviteSignalingProfile {
+    fn validate(&self) -> Result<(), InviteError> {
+        if self.profile_id.trim().is_empty()
+            || self.endpoints.is_empty()
+            || self.endpoints.iter().any(|endpoint| {
+                endpoint.trim() != endpoint || endpoint.is_empty() || endpoint.len() > 512
+            })
+            || !is_hex_fingerprint(&self.room_topic_commitment)
+            || !is_hex_fingerprint(&self.trust_fingerprint)
+            || self.ttl_seconds == 0
+            || self.metadata_posture.trim().is_empty()
+            || self.rate_limit_policy.trim().is_empty()
+            || self.capabilities.is_empty()
+        {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// DM-specific signed bootstrap metadata for first-contact negotiation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DmInviteBootstrap {
+    /// Commitment to inviter identity, not the display alias.
+    pub inviter_identity_commitment: String,
+    /// Bounded-use contact token commitment.
+    pub contact_token_commitment: String,
+    /// Reply rendezvous capability commitment.
+    pub reply_rendezvous_commitment: String,
+}
+
+impl DmInviteBootstrap {
+    fn validate(&self) -> Result<(), InviteError> {
+        if !is_hex_fingerprint(&self.inviter_identity_commitment)
+            || !is_hex_fingerprint(&self.contact_token_commitment)
+            || !is_hex_fingerprint(&self.reply_rendezvous_commitment)
+        {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// Group-specific signed bootstrap metadata for admission and channel-policy inheritance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupInviteBootstrap {
+    /// Commitment to group identity/scope, not the group display name.
+    pub group_identity_commitment: String,
+    /// Commitment to role/admission policy.
+    pub role_admission_policy_commitment: String,
+    /// Commitment to the channel policy inheritance snapshot.
+    pub channel_policy_commitment: String,
+}
+
+impl GroupInviteBootstrap {
+    fn validate(&self) -> Result<(), InviteError> {
+        if !is_hex_fingerprint(&self.group_identity_commitment)
+            || !is_hex_fingerprint(&self.role_admission_policy_commitment)
+            || !is_hex_fingerprint(&self.channel_policy_commitment)
+        {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// Signed bootstrap metadata shared by group invites and first-contact DM invites.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InviteBootstrapMetadata {
+    /// Connectivity schema version for forward-compatible parsers.
+    pub connectivity_schema_version: u32,
+    /// Invite kind, such as group join or DM contact.
+    pub invite_kind: InviteKind,
+    /// Commitment to the group, DM, or device-pairing scope; never the display name.
+    pub scope_id_commitment: String,
+    /// Ordered signaling profiles allowed for bootstrap.
+    pub signaling_profiles: Vec<InviteSignalingProfile>,
+    /// UI privacy label explaining provider-visible metadata.
+    pub privacy_label: String,
+    /// Optional DM contact bootstrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dm_bootstrap: Option<DmInviteBootstrap>,
+    /// Optional group admission bootstrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_bootstrap: Option<GroupInviteBootstrap>,
+}
+
+impl InviteBootstrapMetadata {
+    /// Construct group-join bootstrap metadata and validate it.
+    pub fn group_join(
+        scope_id_commitment: impl Into<String>,
+        signaling_profiles: Vec<InviteSignalingProfile>,
+        group_bootstrap: GroupInviteBootstrap,
+    ) -> Result<Self, InviteError> {
+        let metadata = Self {
+            connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
+            invite_kind: InviteKind::GroupJoin,
+            scope_id_commitment: scope_id_commitment.into(),
+            signaling_profiles,
+            privacy_label: "Provider-visible topics are derived commitments; group names, channel names, and room secrets are not included".to_owned(),
+            dm_bootstrap: None,
+            group_bootstrap: Some(group_bootstrap),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    /// Construct first-contact DM bootstrap metadata and validate it.
+    pub fn dm_contact(
+        scope_id_commitment: impl Into<String>,
+        signaling_profiles: Vec<InviteSignalingProfile>,
+        dm_bootstrap: DmInviteBootstrap,
+    ) -> Result<Self, InviteError> {
+        let metadata = Self {
+            connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
+            invite_kind: InviteKind::DmContact,
+            scope_id_commitment: scope_id_commitment.into(),
+            signaling_profiles,
+            privacy_label: "Provider-visible topics are derived commitments; contact aliases, safety numbers, and room secrets are not included".to_owned(),
+            dm_bootstrap: Some(dm_bootstrap),
+            group_bootstrap: None,
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    /// Validate signed bootstrap metadata without requiring any raw scope secret.
+    pub fn validate(&self) -> Result<(), InviteError> {
+        if self.connectivity_schema_version == 0
+            || !is_hex_fingerprint(&self.scope_id_commitment)
+            || self.signaling_profiles.is_empty()
+            || self.privacy_label.trim().is_empty()
+        {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        for profile in &self.signaling_profiles {
+            profile.validate()?;
+        }
+        match self.invite_kind {
+            InviteKind::GroupJoin => {
+                if self.dm_bootstrap.is_some() {
+                    return Err(InviteError::InvalidEndpointPolicy);
+                }
+                self.group_bootstrap
+                    .as_ref()
+                    .ok_or(InviteError::InvalidEndpointPolicy)?
+                    .validate()
+            }
+            InviteKind::DmContact => {
+                if self.group_bootstrap.is_some() {
+                    return Err(InviteError::InvalidEndpointPolicy);
+                }
+                self.dm_bootstrap
+                    .as_ref()
+                    .ok_or(InviteError::InvalidEndpointPolicy)?
+                    .validate()
+            }
+            InviteKind::DevicePairing => Ok(()),
+        }
+    }
+}
+
 /// Production invite metadata required to locate and validate the rendezvous endpoint.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteSignalingMetadata {
