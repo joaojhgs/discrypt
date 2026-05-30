@@ -9371,6 +9371,76 @@ mod tests {
     }
 
     #[test]
+    fn text_control_pump_reports_missing_runtime() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-transport-pump-runtime-missing");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let message_id = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "transport runtime unavailable".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        })
+        .messages
+        .first()
+        .map(|message| message.message_id.clone())
+        .unwrap();
+
+        let state_before = load_state();
+        assert!(
+            state_before
+                .text_control_outbox
+                .iter()
+                .any(|frame| frame.message_id == message_id),
+            "expected unsent frame in text control outbox",
+        );
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(8),
+        });
+
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("transport runtime is not attached")),
+            "expected missing-runtime failure detail",
+        );
+        assert_eq!(
+            report.frames_sent, 0,
+            "no frames should send without runtime"
+        );
+        assert_eq!(
+            report.receipts_applied, 0,
+            "no receipts should apply without transport runtime"
+        );
+        assert_eq!(
+            report.response_frames_received, 0,
+            "no response frames should be received without runtime"
+        );
+
+        let state_after = load_state();
+        let command_error = state_after
+            .last_command_error
+            .expect("missing transport runtime should be reported as a command error");
+        assert_eq!(command_error.command, "pump_text_control_transport_once");
+        assert_eq!(command_error.code, "transport_runtime_missing");
+    }
+
+    #[test]
     #[cfg(feature = "mqtt-adapter")]
     fn public_mqtt_two_profile_receipt_crosses_provider_webrtc_when_enabled() -> Result<(), String>
     {
