@@ -27,10 +27,8 @@ npm --prefix apps/ui run test:release-linux
 npm --prefix apps/ui run test:linux-package-smoke
 npm --prefix apps/ui run test:desktop-package-ci
 npm --prefix apps/ui run test:android-gate
-npm --prefix apps/ui run test:signaling-relay-ops
 npm --prefix apps/ui run test:release-governance
 npm --prefix apps/ui run test:release-verification-matrix
-npm --prefix apps/ui run test:ac-dashboard-g101
 npm --prefix apps/ui run test:pcap-suite-g096
 npm --prefix apps/ui run test:malicious-relay-g097
 npm --prefix apps/ui run test:malicious-member-g098

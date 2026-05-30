@@ -8,8 +8,8 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const docs = read("docs/security/g096-pcap-acceptance-suite.md");
 const harness = read("harness/multinode/src/lib.rs");
-const signalingPaths = read("external/signaling-repository/tests/process_webrtc_transport_paths.rs");
-const signalingExchange = read("external/signaling-repository/tests/process_signal_exchange.rs");
+const signalingPaths = read("../discrypt-signaling/tests/process_webrtc_transport_paths.rs");
+const signalingExchange = read("../discrypt-signaling/tests/process_signal_exchange.rs");
 const push = read("crates/push/src/lib.rs");
 const failures = [];
 
@@ -75,8 +75,8 @@ if (/external host packet captures pass|libpcap capture passed|tcpdump capture p
 
 const commands = [
   ["cargo", ["test", "-p", "discrypt-multinode-harness", "pcap_acceptance_matrix_covers_ac1_ac8_ac15_ac18_and_metadata", "--quiet"]],
-  ["cargo", ["test", "-p", "external-signaling", "--test", "process_webrtc_transport_paths", "--quiet"]],
-  ["cargo", ["test", "-p", "external-signaling", "--test", "process_signal_exchange", "--quiet"]],
+  ["cargo", ["test", "--manifest-path", "../discrypt-signaling/Cargo.toml", "-p", "discrypt-signaling", "--test", "process_webrtc_transport_paths", "--quiet"]],
+  ["cargo", ["test", "--manifest-path", "../discrypt-signaling/Cargo.toml", "-p", "discrypt-signaling", "--test", "process_signal_exchange", "--quiet"]],
   ["cargo", ["test", "-p", "discrypt-push", "android_wake_envelope_is_content_free", "--quiet"]],
 ];
 for (const [cmd, args] of commands) {

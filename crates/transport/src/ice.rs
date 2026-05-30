@@ -63,7 +63,7 @@ pub fn turn_stun_credential_decision() -> TurnStunCredentialDecision {
         ephemeral_credential_service: "TURN service REST auth credentials: username is unix-expiry:subject, credential is base64(HMAC-SHA1(static_auth_secret, username)), carried only as ephemeral TurnServerConfig material",
         invite_descriptor_reference: "InviteSignalingMetadata signs ice_endpoint_policy into StoredInvite signing bytes so invite descriptors reference signaling, STUN, TURN, expiry, and trust metadata together",
         credential_rotation: "TURN credentials carry credential_expires_at; clients reject expired or incomplete credentials before WebRTC offer generation and operators rotate by issuing a fresh invite/group policy",
-        self_hosting_docs: "external/signaling-repository/deploy/external-signaling.env.example, TURN service.conf.example, compose.yml, and external-signaling-operations.md document EXTERNAL_TURN_STATIC_AUTH_SECRET and TURN service self-hosting",
+        self_hosting_docs: "../discrypt-signaling/deploy/discrypt-signaling.env.example, TURN service.conf.example, compose.yml, and external-signaling-operations.md document EXTERNAL_TURN_STATIC_AUTH_SECRET and TURN service self-hosting",
     }
 }
 
@@ -755,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_rest_credential_issuer_generates_ephemeral_TURN service_credentials(
+    fn turn_rest_credential_issuer_generates_ephemeral_turn_service_credentials(
     ) -> Result<(), TransportError> {
         let now = DateTime::parse_from_rfc3339("2026-05-29T22:00:00Z")
             .map_err(|err| TransportError::InvalidIcePolicy(err.to_string()))?

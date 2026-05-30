@@ -19,14 +19,14 @@ The launch gate uses the deterministic repository-local G096 pcap acceptance
 suite as the CI capture gate and reserves external host packet captures for the
 final release-run evidence package:
 
-- `AuditFixture` and `PcapEvent` in `external/signaling-repository/src/lib.rs` are the shared
+- `AuditFixture` and `PcapEvent` in `../discrypt-signaling/src/lib.rs` are the shared
   pcap-style row model for provider-visible bytes.
 - `MetadataMatrix::approved_v1` is the exact expected exposure matrix for
   Signaling, STUN, TURN, Push FCM, PeerRelay, and VolunteerStorageRelay rows.
-- `external/signaling-repository/tests/process_webrtc_transport_paths.rs` drives direct,
+- `../discrypt-signaling/tests/process_webrtc_transport_paths.rs` drives direct,
   overlay, and TURN modes through separate peer processes and records
   ciphertext-only pcap-style rows.
-- `external/signaling-repository/tests/process_signal_exchange.rs` starts a real local
+- `../discrypt-signaling/tests/process_signal_exchange.rs` starts a real local
   signaling server process and client processes, then calls the admin at-rest
   audit endpoint.
 - `harness/multinode/src/lib.rs::pcap_acceptance_matrix_smoke` combines AC1,
@@ -118,14 +118,14 @@ A pcap/forbidden-byte gate passes only when all thresholds hold:
 
 Required gates for this decision:
 
-1. `cargo test -p external-signaling pcap_forbidden_byte_tooling_decision_covers_adr_007 --quiet`
+1. `cargo test --manifest-path ../discrypt-signaling/Cargo.toml -p discrypt-signaling pcap_forbidden_byte_tooling_decision_covers_adr_007 --quiet`
    proves the code-level launch decision covers capture tooling, redaction,
    forbidden-token generation, artifact storage, and thresholds.
 2. `cargo test -p discrypt-multinode-harness pcap_acceptance_matrix_covers_ac1_ac8_ac15_ac18_and_metadata --quiet`
    proves the acceptance matrix and forbidden scanner are wired.
-3. `cargo test -p external-signaling --test process_webrtc_transport_paths --quiet`
+3. `cargo test --manifest-path ../discrypt-signaling/Cargo.toml -p discrypt-signaling --test process_webrtc_transport_paths --quiet`
    proves direct, overlay, and TURN process paths produce ciphertext-only rows.
-4. `cargo test -p external-signaling --test process_signal_exchange --quiet`
+4. `cargo test --manifest-path ../discrypt-signaling/Cargo.toml -p discrypt-signaling --test process_signal_exchange --quiet`
    proves local server/client exchange and redacted admin at-rest audit.
 5. `cargo test -p discrypt-push android_wake_envelope_is_content_free --quiet`
    proves Android wake provider bytes are content-free.

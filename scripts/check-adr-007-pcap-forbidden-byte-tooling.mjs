@@ -9,9 +9,9 @@ const read = (path) => readFileSync(resolve(repoRoot, path), 'utf8');
 const files = {
   adr: read('docs/adr/adr-007-pcap-and-forbidden-byte-tooling.md'),
   g096: read('docs/security/g096-pcap-acceptance-suite.md'),
-  signaling: read('external/signaling-repository/src/lib.rs'),
-  webrtcPaths: read('external/signaling-repository/tests/process_webrtc_transport_paths.rs'),
-  signalExchange: read('external/signaling-repository/tests/process_signal_exchange.rs'),
+  signaling: read('../discrypt-signaling/src/lib.rs'),
+  webrtcPaths: read('../discrypt-signaling/tests/process_webrtc_transport_paths.rs'),
+  signalExchange: read('../discrypt-signaling/tests/process_signal_exchange.rs'),
   harness: read('harness/multinode/src/lib.rs'),
   pcapCheck: read('scripts/check-pcap-suite-g096.mjs'),
   packageJson: read('apps/ui/package.json'),
@@ -68,13 +68,13 @@ for (const token of ['two_process_webrtc_paths_pass_with_ciphertext_only_pcap_au
 for (const token of ['separate_process_clients_exchange_generated_offer_answer_and_candidate', 'forbidden_tokens_scanned', 'assert_no_forbidden_plaintext', 'zero_linkage']) requireText('signalExchange', token);
 for (const token of ['PcapAcceptanceMatrixSmoke', 'forbidden_scanner_covers_release_tokens', 'MetadataMatrix::approved_v1', 'contains_any_token(b"prefix message-body suffix"', 'contains_any_token(b"prefix mls-epoch-secret suffix"']) requireText('harness', token);
 for (const token of ['test:pcap-suite-g096', 'test:adr-007-pcap-forbidden-byte-tooling']) requireText('packageJson', token);
-for (const token of ['G096 pcap suite check passed', 'external-signaling', 'process_signal_exchange']) requireText('pcapCheck', token);
+for (const token of ['G096 pcap suite check passed', 'discrypt-signaling', 'process_signal_exchange']) requireText('pcapCheck', token);
 
 if (/TODO|FIXME|unimplemented!|todo!/i.test(files.adr)) failures.push('ADR-007 contains unfinished-work marker');
 if (/external host packet captures pass|libpcap capture passed|tcpdump capture passed/i.test(files.adr)) failures.push('ADR-007 overclaims external capture evidence');
 if (/raw packet captures.*normal CI artifacts/i.test(files.adr) === false) failures.push('ADR-007 must forbid raw packet captures in normal CI artifacts');
 
-run('ADR-007 decision unit', 'cargo', ['test', '-p', 'external-signaling', 'pcap_forbidden_byte_tooling_decision_covers_adr_007', '--quiet']);
+run('ADR-007 decision unit', 'cargo', ['test', '--manifest-path', '../discrypt-signaling/Cargo.toml', '-p', 'discrypt-signaling', 'pcap_forbidden_byte_tooling_decision_covers_adr_007', '--quiet']);
 run('G096 pcap suite', 'npm', ['--prefix', 'apps/ui', 'run', 'test:pcap-suite-g096']);
 
 if (failures.length > 0) {

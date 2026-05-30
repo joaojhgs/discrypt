@@ -40,4 +40,4 @@ Discrypt uses a split media architecture:
 - `crates/media/src/transform_bridge.rs` — keyless encoded-frame bridge that exposes protected bytes, KIDs, and counters only.
 - `apps/ui/src/media/transform.ts` — TypeScript boundary that rejects raw-key handling.
 - `crates/media/src/capture.rs` — Rust `libopus-rs` capture/encode/decode path for native and harness media frames.
-- `crates/transport/src/webrtc_negotiation.rs` and `external/signaling-repository/tests/process_webrtc_transport_paths.rs` — native `webrtc` crate negotiation and process verification.
+- `crates/transport/src/webrtc_negotiation.rs` and `../discrypt-signaling/tests/process_webrtc_transport_paths.rs` — native `webrtc` crate negotiation and process verification.

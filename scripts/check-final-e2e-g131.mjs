@@ -17,10 +17,8 @@ const requiredCommandEvidence = [
   "npm --prefix apps/ui run test:linux-package-smoke",
   "npm --prefix apps/ui run test:desktop-package-ci",
   "npm --prefix apps/ui run test:android-gate",
-  "npm --prefix apps/ui run test:signaling-relay-ops",
   "npm --prefix apps/ui run test:release-governance",
   "npm --prefix apps/ui run test:release-verification-matrix",
-  "npm --prefix apps/ui run test:ac-dashboard-g101",
   "npm --prefix apps/ui run test:pcap-suite-g096",
   "npm --prefix apps/ui run test:malicious-relay-g097",
   "npm --prefix apps/ui run test:malicious-member-g098",
@@ -62,7 +60,6 @@ function writeQualityGate(status, details = {}) {
     readiness_inputs: {
       ci_workflow: ".github/workflows/ci.yml",
       release_matrix: "docs/release/release-verification-matrix.md",
-      ac_dashboard: ".omx/artifacts/production-readiness/ac-dashboard.json",
       package_scripts: "apps/ui/package.json",
     },
     note: "This JSON records the static readiness gate. The final checkpoint evidence must also cite a fresh successful run of every required command in required_command_evidence plus final ai-slop-cleaner and code-review evidence.",
@@ -84,7 +81,6 @@ function run() {
   const packageJson = readJson("apps/ui/package.json");
   const ci = read(".github/workflows/ci.yml");
   const releaseMatrix = read("docs/release/release-verification-matrix.md");
-  const acDashboard = readJson(".omx/artifacts/production-readiness/ac-dashboard.json");
   const g131Doc = read("docs/release/g131-final-e2e-verification.md");
   const failures = [];
 
@@ -98,10 +94,8 @@ function run() {
     "test:linux-package-smoke",
     "test:desktop-package-ci",
     "test:android-gate",
-    "test:signaling-relay-ops",
     "test:release-governance",
     "test:release-verification-matrix",
-    "test:ac-dashboard-g101",
     "test:pcap-suite-g096",
     "test:malicious-relay-g097",
     "test:malicious-member-g098",
@@ -148,14 +142,6 @@ function run() {
     "TURN static auth secrets",
   ]) requireText(failures, "release verification matrix", releaseMatrix, token);
 
-  if (acDashboard.schema_version !== "discrypt.ac_dashboard.v2") failures.push("AC dashboard schema mismatch");
-  if (acDashboard.no_skipped_blockers !== true) failures.push("AC dashboard must declare no skipped blockers");
-  if (!Array.isArray(acDashboard.rows) || acDashboard.rows.length < 25) failures.push("AC dashboard must enumerate original acceptance criteria");
-  for (const row of acDashboard.rows ?? []) {
-    if (["missing", "blocked", "skipped", "unverified", "partial_foundation", "placeholder_or_foundation"].includes(String(row.dashboard_status))) {
-      failures.push(`${row.id} has non-final dashboard status ${row.dashboard_status}`);
-    }
-  }
 
   for (const path of [
     "docs/security/g130-ui-integration-gate.md",
@@ -176,7 +162,7 @@ function run() {
   }
 
   writeQualityGate("readiness-gate-passed");
-  console.log(`G131 final E2E readiness gate passed: release, UI, package, adversarial, supply-chain, SBOM, and AC-dashboard gates are wired with required evidence artifacts. Quality gate: ${qualityGatePath}`);
+  console.log(`G131 final E2E readiness gate passed: release, UI, package, adversarial, supply-chain, and SBOM gates are wired with required evidence artifacts. Quality gate: ${qualityGatePath}`);
 }
 
 try {

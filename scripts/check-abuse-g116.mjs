@@ -9,7 +9,7 @@ const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const desktop = read("apps/desktop/src-tauri/src/lib.rs");
 const delivery = read("crates/mls-delivery/src/lib.rs");
 const admission = read("crates/admission/src/lib.rs");
-const signaling = read("external/signaling-repository/src/server.rs");
+const signaling = read("../discrypt-signaling/src/server.rs");
 const abuse = read("crates/abuse/src/lib.rs");
 const docs = read("docs/phase-5-governance-admission-recovery-abuse.md");
 const failures = [];
@@ -68,7 +68,7 @@ for (const token of [
 const checks = [
   ["cargo", ["test", "-p", "discrypt-abuse", "rate_limits_invites_and_spam_and_scores_freeloading", "--quiet"]],
   ["cargo", ["test", "-p", "discrypt-admission", "online_helper_flow_rate_limits_and_signs_expiring_proofs", "--quiet"]],
-  ["cargo", ["test", "-p", "external-signaling", "guarded_requests_reject_replay_and_rate_limit_with_structured_errors", "--quiet"]],
+  ["cargo", ["test", "--manifest-path", "../discrypt-signaling/Cargo.toml", "-p", "discrypt-signaling", "guarded_requests_reject_replay_and_rate_limit_with_structured_errors", "--quiet"]],
   ["cargo", ["test", "-p", "discrypt-mls-delivery", "outbound_text_pipeline_enforces_abuse_gate_before_storage_or_transport", "--quiet"]],
   ["cargo", ["test", "-p", "discrypt-desktop", "abuse_rate_limits_invite_consume_helper_and_text_send_commands", "--quiet"]],
 ];

@@ -24,7 +24,7 @@ discrypt-abuse = { path = "../../../crates/abuse", version = "0.1.0" }
 discrypt-mls-core = { path = "../../../crates/mls-core", version = "0.1.0" }
 discrypt-media = { path = "../../../crates/media", version = "0.1.0" }
 discrypt-storage = { path = "../../../crates/storage", version = "0.1.0" }
-external-signaling = { path = "../../../external/signaling-repository", version = "0.1.0" }
+external-signaling = { package = "discrypt-signaling", path = "../../../../discrypt-signaling", version = "0.1.0" }
 discrypt-transport = { path = "../../../crates/transport", version = "0.1.0" }
 base64 = { workspace = true }
 chrono = { workspace = true }

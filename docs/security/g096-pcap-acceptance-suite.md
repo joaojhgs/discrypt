@@ -15,8 +15,8 @@ G096 adds a deterministic pcap acceptance suite for the release-gated network-ob
 ## Test entry points
 
 - `cargo test -p discrypt-multinode-harness pcap_acceptance_matrix_covers_ac1_ac8_ac15_ac18_and_metadata --quiet`
-- `cargo test -p external-signaling --test process_webrtc_transport_paths --quiet`
-- `cargo test -p external-signaling --test process_signal_exchange --quiet`
+- `cargo test --manifest-path ../discrypt-signaling/Cargo.toml -p discrypt-signaling --test process_webrtc_transport_paths --quiet`
+- `cargo test --manifest-path ../discrypt-signaling/Cargo.toml -p discrypt-signaling --test process_signal_exchange --quiet`
 - `cargo test -p discrypt-push android_wake_envelope_is_content_free --quiet`
 - `npm --prefix apps/ui run test:pcap-suite-g096`
 

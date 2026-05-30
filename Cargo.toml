@@ -7,7 +7,6 @@ members = [
   "crates/storage",
   "crates/admission",
   "crates/transport",
-  "external/signaling-repository",
   "crates/relay-overlay",
   "crates/media",
   "crates/abuse",

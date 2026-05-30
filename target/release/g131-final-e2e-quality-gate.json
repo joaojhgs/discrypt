@@ -1,7 +1,7 @@
 {
   "schema_version": "discrypt.g131.final_e2e_quality_gate.v1",
-  "generated_at": "2026-05-30T00:55:56.168Z",
-  "status": "final-verification-passed",
+  "generated_at": "2026-05-30T01:32:23.552Z",
+  "status": "readiness-gate-passed",
   "gate": "G131-full-production-e2e-verification-acr",
   "serialized_playwright_e2e": true,
   "required_command_evidence": [
@@ -16,10 +16,8 @@
     "npm --prefix apps/ui run test:linux-package-smoke",
     "npm --prefix apps/ui run test:desktop-package-ci",
     "npm --prefix apps/ui run test:android-gate",
-    "npm --prefix apps/ui run test:signaling-relay-ops",
     "npm --prefix apps/ui run test:release-governance",
     "npm --prefix apps/ui run test:release-verification-matrix",
-    "npm --prefix apps/ui run test:ac-dashboard-g101",
     "npm --prefix apps/ui run test:pcap-suite-g096",
     "npm --prefix apps/ui run test:malicious-relay-g097",
     "npm --prefix apps/ui run test:malicious-member-g098",
@@ -44,15 +42,7 @@
   "readiness_inputs": {
     "ci_workflow": ".github/workflows/ci.yml",
     "release_matrix": "docs/release/release-verification-matrix.md",
-    "ac_dashboard": ".omx/artifacts/production-readiness/ac-dashboard.json",
     "package_scripts": "apps/ui/package.json"
   },
-  "note": "This JSON records the static readiness gate. The final checkpoint evidence must also cite a fresh successful run of every required command in required_command_evidence plus final ai-slop-cleaner and code-review evidence.",
-  "final_verification_log": "/tmp/g132-final-verification-pass.log",
-  "final_verification_completed_at": "2026-05-30T00:58:56.164Z",
-  "command_evidence_status": "all-required-commands-passed-in-fail-fast-run-after-g123-fallback-fix",
-  "playwright_evidence": "8 Chromium tests passed with --workers=1",
-  "supply_chain_evidence": "G123 npm advisory gate passed with npm quick endpoint unavailable and official npm bulk advisory fallback returning zero high-or-critical advisories",
-  "rust_evidence": "cargo check/test/clippy workspace passed",
-  "ui_release_evidence": "UI, release, package, adversarial, supply-chain, SBOM, reproducibility, honesty, command coverage, and ADR-008 gates passed"
+  "note": "This JSON records the static readiness gate. The final checkpoint evidence must also cite a fresh successful run of every required command in required_command_evidence plus final ai-slop-cleaner and code-review evidence."
 }

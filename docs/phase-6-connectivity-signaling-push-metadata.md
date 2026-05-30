@@ -6,7 +6,7 @@ content-free Android FCM wake envelopes, and pcap-style metadata matrix fixtures
 
 ## Implementation map
 
-- `external/signaling-repository/src/lib.rs`
+- `../discrypt-signaling/src/lib.rs`
   - `ReferenceSignalingServer` stores only opaque rendezvous blobs in memory.
   - request endpoint/IP metadata is transient and deliberately not included in
     at-rest records.

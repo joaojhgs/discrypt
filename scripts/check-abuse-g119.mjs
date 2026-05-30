@@ -43,8 +43,8 @@ for (const token of [
 
 const checks = [
   ["cargo", ["test", "-p", "discrypt-multinode-harness", "abuse_e2e_smoke_covers_g119_gate", "--quiet"]],
-  ["cargo", ["test", "-p", "external-signaling", "oversized_body_is_rejected_before_json_parsing", "--quiet"]],
-  ["cargo", ["test", "-p", "external-signaling", "guarded_requests_reject_replay_and_rate_limit_with_structured_errors", "--quiet"]],
+  ["cargo", ["test", "--manifest-path", "../discrypt-signaling/Cargo.toml", "-p", "discrypt-signaling", "oversized_body_is_rejected_before_json_parsing", "--quiet"]],
+  ["cargo", ["test", "--manifest-path", "../discrypt-signaling/Cargo.toml", "-p", "discrypt-signaling", "guarded_requests_reject_replay_and_rate_limit_with_structured_errors", "--quiet"]],
   ["cargo", ["test", "-p", "discrypt-desktop", "abuse_rate_limits_invite_consume_helper_and_text_send_commands", "--quiet"]],
   ["cargo", ["test", "-p", "discrypt-relay-overlay", "relay_contribution_accounting_penalizes_freeloaders_in_route_ranking", "--quiet"]],
 ];

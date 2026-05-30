@@ -379,25 +379,25 @@
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
     },
     {
-      "path": "external/signaling-repository/src/lib.rs",
+      "path": "../discrypt-signaling/src/lib.rs",
       "pattern": "local-dev",
       "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
       "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
     },
     {
-      "path": "external/signaling-repository/src/production_status.rs",
+      "path": "../discrypt-signaling/src/production_status.rs",
       "pattern": "local-dev",
       "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
     },
     {
-      "path": "external/signaling-repository/src/production_status.rs",
+      "path": "../discrypt-signaling/src/production_status.rs",
       "pattern": "local-dev",
       "expected": "/// True when harness/local-dev code is part of this build and must be labelled non-production.",
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
     },
     {
-      "path": "external/signaling-repository/src/production_status.rs",
+      "path": "../discrypt-signaling/src/production_status.rs",
       "pattern": "local-dev",
       "expected": "local_dev: cfg!(feature = \"local-dev\"),",
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."

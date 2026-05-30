@@ -66,7 +66,7 @@ See [`docs/phase-7-ux-e2e-hardening.md`](docs/phase-7-ux-e2e-hardening.md) for t
 
 ## Phase 6 connectivity/signaling/push/metadata slice
 
-- `external/signaling-repository/src/lib.rs` provides the content-blind rendezvous reference server, at-rest inspection records, metadata matrix, and pcap-style audit fixtures.
+- `../discrypt-signaling/src/lib.rs` provides the content-blind rendezvous reference server, at-rest inspection records, metadata matrix, and pcap-style audit fixtures.
 - `crates/transport/src/lib.rs` plans strict STUN→relay-overlay→TURN fallback and honors owner/group custom endpoints while marking overlay/TURN as ciphertext-only.
 - `crates/push/src/lib.rs` builds content-free Android FCM wake envelopes with hashed tokens and auditable provider-visible bytes.
 - `harness/multinode::connectivity_signaling_push_smoke` exercises AC13/AC15/AC18/AC-METADATA foundations end-to-end.

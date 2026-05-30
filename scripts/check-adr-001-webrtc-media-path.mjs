@@ -60,7 +60,7 @@ if (failures.length === 0) {
   const commands = [
     ["cargo", ["test", "-p", "discrypt-media", "transport", "--quiet"]],
     ["cargo", ["test", "-p", "discrypt-media", "transform_bridge", "--quiet"]],
-    ["cargo", ["test", "-p", "external-signaling", "two_process_webrtc_paths_pass_with_ciphertext_only_pcap_audit", "--quiet"]],
+    ["cargo", ["test", "--manifest-path", "../discrypt-signaling/Cargo.toml", "-p", "discrypt-signaling", "two_process_webrtc_paths_pass_with_ciphertext_only_pcap_audit", "--quiet"]],
   ];
   for (const [cmd, args] of commands) {
     const run = spawnSync(cmd, args, { cwd: repoRoot, encoding: "utf8" });

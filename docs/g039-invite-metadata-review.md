@@ -29,7 +29,7 @@ commitment:
     and revocation event ids.
   - Canonical signing currently covers invite id, room-secret commitment, issuer
     public key, expiry, and max-use.
-- `external/signaling-repository/src/client.rs`
+- `../discrypt-signaling/src/client.rs`
   - `SignalingClientConfig` validates a public endpoint string for supported
     schemes and keeps client token/nonce seed requirements explicit.
 - `apps/desktop/src-tauri/src/lib.rs`

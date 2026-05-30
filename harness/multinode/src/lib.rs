@@ -3571,7 +3571,7 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
             b"opaque-endpoint-hint".to_vec(),
             now + Duration::minutes(5),
         ),
-        Endpoint::new("198.51.100.9:4242"),
+        external_signaling::transport::Endpoint::new("198.51.100.9:4242"),
         now,
     )?;
     let signaling_zero_linkage_at_rest =
