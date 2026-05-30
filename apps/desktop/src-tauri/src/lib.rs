@@ -1652,7 +1652,7 @@ impl TauriAppService {
         persist_state(&self.state);
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn attach_text_control_transport_runtime(
         &mut self,
         transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
@@ -1664,9 +1664,21 @@ impl TauriAppService {
         });
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn clear_text_control_transport_runtime(&mut self) {
         self.text_control_transport_runtime = None;
+    }
+
+    fn clear_text_control_transport_runtime_if_session_mismatch(
+        &mut self,
+        active_session_id: Option<&str>,
+    ) {
+        let Some(runtime) = &self.text_control_transport_runtime else {
+            return;
+        };
+        if Some(runtime.session_id.as_str()) != active_session_id {
+            self.text_control_transport_runtime = None;
+        }
     }
 
     fn pump_text_control_transport_once(
@@ -1860,19 +1872,33 @@ pub fn stop_signaling_session(request: StopSignalingSessionRequest) -> AppStateV
 
 /// Tauri command: start the backend text/control data-plane transport session.
 pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
-    mutate_app_service(|state| {
-        if let Err(error) =
-            state.start_transport_session(BackendTransportMode::Text, request.scope_label)
-        {
-            state.push_command_error(
-                "transport.text_start_rejected",
-                "start_text_session",
-                "transport_start_failed",
-                error,
-                "Check adapter readiness and route diagnostics before retrying text transport",
-            );
-            return;
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    let started_session_id = {
+        let state = &mut guard.state;
+        match state.start_transport_session(BackendTransportMode::Text, request.scope_label) {
+            Ok(started_session_id) => started_session_id,
+            Err(error) => {
+                state.push_command_error(
+                    "transport.text_start_rejected",
+                    "start_text_session",
+                    "transport_start_failed",
+                    error,
+                    "Check adapter readiness and route diagnostics before retrying text transport",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
         }
+    };
+    guard.clear_text_control_transport_runtime_if_session_mismatch(Some(
+        started_session_id.as_str(),
+    ));
+    {
+        let state = &mut guard.state;
         if request.data_channel_probe {
             match state.probe_active_webrtc_data_channel(request.adapter_kind.as_deref()) {
                 Ok(probe) => state.mark_text_session_data_channel_route_proof(&probe),
@@ -1885,14 +1911,26 @@ pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
                 ),
             }
         }
-    })
+    }
+    guard.persist();
+    guard.to_view()
 }
 
 /// Tauri command: stop the backend text/control data-plane transport session.
 pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
-    mutate_app_service(|state| {
-        state.stop_transport_session(BackendTransportMode::Text, request.session_id);
-    })
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    let stopped_session_id = guard
+        .state
+        .stop_transport_session(BackendTransportMode::Text, request.session_id);
+    if stopped_session_id.is_some() {
+        guard.clear_text_control_transport_runtime_if_session_mismatch(None);
+    }
+    guard.persist();
+    guard.to_view()
 }
 
 /// Tauri command: create a new local user and unlock the shell.
@@ -3999,24 +4037,28 @@ impl PersistedAppState {
         Ok(session_id)
     }
 
-    fn stop_transport_session(&mut self, mode: BackendTransportMode, session_id: Option<String>) {
+    fn stop_transport_session(
+        &mut self,
+        mode: BackendTransportMode,
+        session_id: Option<String>,
+    ) -> Option<String> {
         let stopped_session_id = {
             let slot = self.transport_session_mut(mode);
             let Some(record) = slot.as_mut() else {
-                return;
+                return None;
             };
             if session_id
                 .as_ref()
                 .is_some_and(|requested_id| requested_id != &record.session_id)
             {
-                return;
+                return None;
             }
 
             if matches!(
                 record.state(),
                 TransportSessionState::Failed | TransportSessionState::Cancelled
             ) {
-                return;
+                return None;
             }
 
             if record.session.tear_down("stop requested").is_ok() {
@@ -4026,12 +4068,13 @@ impl PersistedAppState {
             }
         };
 
-        if let Some(stopped_session_id) = stopped_session_id {
+        if let Some(stopped_session_id) = &stopped_session_id {
             self.push_event(
                 format!("{mode}.session_stopped"),
                 format!("Stopped {mode} transport session {stopped_session_id}"),
             );
         }
+        stopped_session_id
     }
 
     fn probe_active_signaling_adapter(
@@ -9615,6 +9658,96 @@ mod tests {
         assert_eq!(command_error.code, "text_session_id_mismatch");
 
         clear_text_control_transport_runtime_for_test();
+    }
+
+    #[test]
+    fn text_control_runtime_clears_when_text_session_stops() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-runtime-clears-on-stop");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let receiver_path = fresh_state_path("text-control-runtime-clears-on-stop-bob");
+        let _ = fs::remove_file(&receiver_path);
+        let transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(receiver_path),
+        ));
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("text-control-stop".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active");
+        attach_text_control_transport_runtime_for_test(transport, active_session_id.clone());
+
+        let stopped = stop_text_session(StopTextSessionRequest {
+            session_id: Some(active_session_id),
+        });
+        assert!(stopped.last_command_error.is_none(), "{stopped:?}");
+
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.text_control_transport_runtime.is_none(),
+            "stopping a text session must drop the owned runtime"
+        );
+        let runtime_status = guard.text_control_runtime_status_row();
+        assert_eq!(runtime_status.status, "inactive");
+    }
+
+    #[test]
+    fn text_control_runtime_clears_when_text_session_restarts_with_new_scope() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-runtime-clears-on-restart");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let receiver_path = fresh_state_path("text-control-runtime-clears-on-restart-bob");
+        let _ = fs::remove_file(&receiver_path);
+        let transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(receiver_path),
+        ));
+
+        let first = start_text_session(StartTextSessionRequest {
+            scope_label: Some("first-text-scope".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(first.last_command_error.is_none(), "{first:?}");
+        let first_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("first text session should be active");
+        attach_text_control_transport_runtime_for_test(transport, first_session_id);
+
+        let restarted = start_text_session(StartTextSessionRequest {
+            scope_label: Some("second-text-scope".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(restarted.last_command_error.is_none(), "{restarted:?}");
+
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.text_control_transport_runtime.is_none(),
+            "starting a different text session must drop the stale runtime"
+        );
+        let runtime_status = guard.text_control_runtime_status_row();
+        assert_eq!(runtime_status.status, "not-attached");
     }
 
     #[test]
