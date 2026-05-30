@@ -222,6 +222,17 @@ impl InviteTrustMetadata {
 /// Signed invite bootstrap descriptor schema version for connectivity policy metadata.
 pub const INVITE_CONNECTIVITY_SCHEMA_VERSION: u32 = 1;
 
+/// Signed provider allowlist/rotation policy schema version.
+pub const INVITE_PROVIDER_POLICY_VERSION: u32 = 1;
+
+fn default_provider_policy_version() -> u32 {
+    INVITE_PROVIDER_POLICY_VERSION
+}
+
+fn default_provider_rotation_policy() -> String {
+    "rotate by issuing a fresh signed invite/connectivity policy when endpoint trust, rate limits, or availability changes".to_owned()
+}
+
 /// Invite bootstrap kind carried in signed descriptors.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -294,6 +305,15 @@ pub struct InviteSignalingProfile {
     pub rate_limit_policy: String,
     /// Adapter capabilities asserted by this profile.
     pub capabilities: Vec<String>,
+    /// Signed provider policy schema version for endpoint allowlist and rotation semantics.
+    #[serde(default = "default_provider_policy_version")]
+    pub provider_policy_version: u32,
+    /// Commitments for endpoints explicitly allowed by this profile.
+    #[serde(default)]
+    pub endpoint_allowlist_commitments: Vec<String>,
+    /// Human-readable rotation rule surfaced to operators and clients.
+    #[serde(default = "default_provider_rotation_policy")]
+    pub provider_rotation_policy: String,
 }
 
 impl InviteSignalingProfile {
@@ -309,6 +329,14 @@ impl InviteSignalingProfile {
             || self.metadata_posture.trim().is_empty()
             || self.rate_limit_policy.trim().is_empty()
             || self.capabilities.is_empty()
+            || self.provider_policy_version != INVITE_PROVIDER_POLICY_VERSION
+            || self.endpoint_allowlist_commitments.is_empty()
+            || self
+                .endpoint_allowlist_commitments
+                .iter()
+                .any(|commitment| !is_hex_fingerprint(commitment))
+            || self.provider_rotation_policy.trim().is_empty()
+            || self.provider_rotation_policy.trim() != self.provider_rotation_policy
         {
             return Err(InviteError::InvalidEndpointPolicy);
         }

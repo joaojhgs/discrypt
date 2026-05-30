@@ -245,6 +245,9 @@ export type SignalingProfileView = {
   metadata_posture: string;
   rate_limit_policy: string;
   capabilities: string[];
+  provider_policy_version: number;
+  endpoint_allowlist_commitments: string[];
+  provider_rotation_policy: string;
 };
 
 export type DmInviteBootstrapView = {
@@ -1490,6 +1493,15 @@ function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView
     ttl_seconds: 300,
     metadata_posture: "hashed_topic",
     rate_limit_policy: "bounded publish/take with provider backoff",
+    provider_policy_version: 1,
+    endpoint_allowlist_commitments: [
+      hashCommitment("discrypt-provider-endpoint-allowlist-v1", [
+        adapterKind,
+        endpoint,
+      ]),
+    ],
+    provider_rotation_policy:
+      "rotate by issuing a fresh signed invite/connectivity policy when endpoint trust, rate limits, or availability changes",
     capabilities: [
       "presence_ttl",
       "trickle_ice",

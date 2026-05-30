@@ -262,6 +262,10 @@ fn test_bootstrap_profile(scope: &str) -> InviteSignalingProfile {
         metadata_posture: "hashed_topic".to_owned(),
         rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
         capabilities: vec!["presence_ttl".to_owned(), "trickle_ice".to_owned()],
+        provider_policy_version: discrypt_admission::INVITE_PROVIDER_POLICY_VERSION,
+        endpoint_allowlist_commitments: vec![test_commitment('e')],
+        provider_rotation_policy: "rotate by issuing a fresh signed invite/connectivity policy"
+            .to_owned(),
     }
 }
 

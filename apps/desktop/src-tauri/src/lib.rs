@@ -15,7 +15,7 @@ use discrypt_admission::{
     signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
     InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind, InviteSignalingAdapterKind,
     InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
-    INVITE_CONNECTIVITY_SCHEMA_VERSION,
+    INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_PROVIDER_POLICY_VERSION,
 };
 use discrypt_core::{
     app_snapshot as core_app_snapshot, identity_recovery_verification_smoke,
@@ -326,6 +326,15 @@ pub struct SignalingProfileView {
     pub rate_limit_policy: String,
     /// Adapter capabilities asserted by this profile.
     pub capabilities: Vec<String>,
+    /// Provider policy schema version for allowlist and rotation semantics.
+    #[serde(default = "default_provider_policy_version")]
+    pub provider_policy_version: u32,
+    /// Hash commitments for endpoints explicitly allowed by this profile.
+    #[serde(default)]
+    pub endpoint_allowlist_commitments: Vec<String>,
+    /// Endpoint/provider rotation policy shown to operators and enforced by signed invites.
+    #[serde(default = "default_provider_rotation_policy")]
+    pub provider_rotation_policy: String,
 }
 
 /// DM-specific bootstrap metadata persisted after first-contact invite parsing.
@@ -5353,9 +5362,58 @@ fn transport_adapter_kind_from_name(value: &str) -> Option<SignalingAdapterKind>
     }
 }
 
+fn default_provider_policy_version() -> u32 {
+    INVITE_PROVIDER_POLICY_VERSION
+}
+
+fn default_provider_rotation_policy() -> String {
+    "rotate by issuing a fresh signed invite/connectivity policy when endpoint trust, rate limits, or availability changes".to_owned()
+}
+
+fn endpoint_allowlist_commitment(adapter_kind: &str, endpoint: &str) -> String {
+    hash_commitment(
+        "discrypt-provider-endpoint-allowlist-v1",
+        &[adapter_kind, endpoint],
+    )
+}
+
+fn validate_provider_policy(profile: &SignalingProfileView) -> Result<(), String> {
+    if profile.provider_policy_version != INVITE_PROVIDER_POLICY_VERSION {
+        return Err(format!(
+            "Unsupported provider policy version {}",
+            profile.provider_policy_version
+        ));
+    }
+    if profile.provider_rotation_policy.trim().is_empty()
+        || profile.provider_rotation_policy.trim() != profile.provider_rotation_policy
+    {
+        return Err("Provider rotation policy must be non-empty and trimmed".to_owned());
+    }
+    if profile.endpoint_allowlist_commitments.is_empty() {
+        return Err("Provider endpoint allowlist commitments must not be empty".to_owned());
+    }
+    let allowed = profile
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint_allowlist_commitment(&profile.adapter_kind, endpoint))
+        .collect::<std::collections::BTreeSet<_>>();
+    let declared = profile
+        .endpoint_allowlist_commitments
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !allowed.is_subset(&declared) {
+        return Err(
+            "Provider endpoint is not covered by the signed allowlist commitments".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn transport_profile_from_view(
     profile: &SignalingProfileView,
 ) -> Result<SignalingAdapterProfile, String> {
+    validate_provider_policy(profile)?;
     let kind = transport_adapter_kind_from_name(&profile.adapter_kind)
         .ok_or_else(|| format!("Unknown signaling adapter kind {}", profile.adapter_kind))?;
     let endpoints = profile
@@ -5565,6 +5623,12 @@ fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileVie
             ttl_seconds: 300,
             metadata_posture: "hashed_topic".to_owned(),
             rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
+            provider_policy_version: INVITE_PROVIDER_POLICY_VERSION,
+            endpoint_allowlist_commitments: vec![endpoint_allowlist_commitment(
+                &adapter_kind,
+                &endpoint,
+            )],
+            provider_rotation_policy: default_provider_rotation_policy(),
             capabilities: vec![
                 "presence_ttl".to_owned(),
                 "trickle_ice".to_owned(),
@@ -5640,6 +5704,9 @@ fn profile_to_admission(profile: &SignalingProfileView) -> InviteSignalingProfil
         metadata_posture: profile.metadata_posture.clone(),
         rate_limit_policy: profile.rate_limit_policy.clone(),
         capabilities: profile.capabilities.clone(),
+        provider_policy_version: profile.provider_policy_version,
+        endpoint_allowlist_commitments: profile.endpoint_allowlist_commitments.clone(),
+        provider_rotation_policy: profile.provider_rotation_policy.clone(),
     }
 }
 
@@ -5654,6 +5721,9 @@ fn profile_from_admission(profile: &InviteSignalingProfile) -> SignalingProfileV
         metadata_posture: profile.metadata_posture.clone(),
         rate_limit_policy: profile.rate_limit_policy.clone(),
         capabilities: profile.capabilities.clone(),
+        provider_policy_version: profile.provider_policy_version,
+        endpoint_allowlist_commitments: profile.endpoint_allowlist_commitments.clone(),
+        provider_rotation_policy: profile.provider_rotation_policy.clone(),
     }
 }
 
@@ -8219,6 +8289,41 @@ mod tests {
             .endpoints
             .iter()
             .all(|endpoint| !endpoint.contains(".invalid"))));
+    }
+
+    #[test]
+    fn default_profiles_carry_provider_allowlist_and_rotation_policy() {
+        let _guard = test_lock();
+        std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
+        std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
+
+        let profiles = default_signaling_profiles("allowlist-scope");
+        assert!(!profiles.is_empty());
+        for profile in &profiles {
+            assert_eq!(
+                profile.provider_policy_version,
+                INVITE_PROVIDER_POLICY_VERSION
+            );
+            assert!(!profile.endpoint_allowlist_commitments.is_empty());
+            assert!(profile
+                .provider_rotation_policy
+                .contains("fresh signed invite"));
+            for endpoint in &profile.endpoints {
+                assert!(profile.endpoint_allowlist_commitments.contains(
+                    &endpoint_allowlist_commitment(&profile.adapter_kind, endpoint)
+                ));
+            }
+            transport_profile_from_view(profile).expect("default profile policy validates");
+        }
+
+        let mut tampered = profiles
+            .into_iter()
+            .find(|profile| profile.adapter_kind == "nostr")
+            .expect("nostr default profile");
+        tampered.endpoints = vec!["wss://relay.example.com".to_owned()];
+        let error = transport_profile_from_view(&tampered)
+            .expect_err("tampered endpoint must not pass signed allowlist validation");
+        assert!(error.contains("signed allowlist"));
     }
 
     #[test]

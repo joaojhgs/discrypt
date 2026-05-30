@@ -281,7 +281,7 @@ npm --prefix apps/ui run test:command-coverage
 ### P0: security/release gaps
 
 - [ ] Dependency/security audit for `rumqttc` and any Nostr/IPFS/libp2p dependencies.
-- [ ] Public provider allowlist/versioning and rotation policy.
+- [x] Public provider allowlist/versioning and rotation policy. Signed invite/app signaling profiles now carry `provider_policy_version`, endpoint allowlist commitments, and provider rotation policy text; Tauri validates endpoint commitments before converting profiles into transport probes, and invite bootstrap validation rejects empty/malformed provider-policy metadata.
 - [ ] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
   for deterministic harness evidence and optional public-provider MQTT validation.
 - [ ] Provider-visible metadata capture/PCAP tests for MQTT, Nostr, IPFS, and QUIC.
