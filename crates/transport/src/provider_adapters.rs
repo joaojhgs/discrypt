@@ -26,7 +26,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{timeout, Duration, Instant};
 
 /// End-to-end readiness state used by registry and fallback planning.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterReadinessState {
     /// Adapter feature is not enabled in this build.
@@ -104,7 +112,7 @@ pub struct SignalingAdapterRegistryEntry {
 impl SignalingAdapterRegistryEntry {
     /// Static readiness projected into runtime planning state.
     #[must_use]
-    pub const fn readiness_state(self) -> AdapterReadinessState {
+    pub fn readiness_state(self) -> AdapterReadinessState {
         match self.boundary.readiness {
             ProviderAdapterReadiness::FeatureDisabled => AdapterReadinessState::FeatureDisabled,
             ProviderAdapterReadiness::ImplementationUnavailable => {
@@ -179,13 +187,19 @@ impl SignalingAdapterFactory {
 
     /// Readiness for this entry in fallback planning.
     #[must_use]
-    pub const fn readiness_state(self) -> AdapterReadinessState {
-        self.boundary().readiness_state()
+    pub fn readiness_state(self) -> AdapterReadinessState {
+        match self.boundary().readiness {
+            ProviderAdapterReadiness::FeatureDisabled => AdapterReadinessState::FeatureDisabled,
+            ProviderAdapterReadiness::ImplementationUnavailable => {
+                AdapterReadinessState::ImplementationUnavailable
+            }
+            ProviderAdapterReadiness::ImplementationAvailable => AdapterReadinessState::Available,
+        }
     }
 
     /// True when this entry can be selected for attempts.
     #[must_use]
-    pub const fn selectable(self) -> bool {
+    pub fn selectable(self) -> bool {
         self.readiness_state().selectable()
     }
 }
@@ -1530,6 +1544,7 @@ mod tests {
     #[test]
     fn plan_signaling_adapter_fallback_try_all_deduplicates_and_marks_selected() {
         let requested = dedup_requested_kinds();
+        let _registry = required_provider_adapter_boundaries();
         let plan =
             plan_signaling_adapter_fallback(&requested, AdapterFallbackBehavior::TryAll, None);
 
