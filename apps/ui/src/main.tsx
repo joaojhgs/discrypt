@@ -18,6 +18,7 @@ import {
   JoinProgressStepView,
   RuntimeModeView,
   TextStateView,
+  TransportDiagnosticsView,
   TransportStatusView,
   VoiceParticipantView,
   VoiceSessionView,
@@ -606,7 +607,10 @@ function App() {
             Invite ready: {appState.invites.at(-1)?.code}
           </p>
         ) : null}
-        <TransportStatusStrip statuses={appState.transport_status} />
+        <TransportStatusStrip
+          statuses={appState.transport_status}
+          diagnostics={appState.transport_diagnostics}
+        />
         <WorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
         <ScrollArea className="min-h-0 flex-1 px-4 pb-4 md:px-6 md:pb-6">
           {workflow === "setup" ? (
@@ -1278,7 +1282,13 @@ function ConfigSelect({
   );
 }
 
-function TransportStatusStrip({ statuses }: { statuses: TransportStatusView[] }) {
+function TransportStatusStrip({
+  statuses,
+  diagnostics,
+}: {
+  statuses: TransportStatusView[];
+  diagnostics?: TransportDiagnosticsView;
+}) {
   const ordered = statuses.length
     ? statuses
     : [
@@ -1328,6 +1338,70 @@ function TransportStatusStrip({ statuses }: { statuses: TransportStatusView[] })
           </div>
         ))}
       </div>
+      {diagnostics ? (
+        <div className="mt-3 grid gap-3 border-t border-[hsl(var(--border))] pt-3 lg:grid-cols-[1.1fr_0.9fr]">
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+                Adapter readiness
+              </p>
+              <Badge variant={diagnostics.selected_adapter ? "success" : "secondary"}>
+                {diagnostics.selected_adapter ?? "none selected"}
+              </Badge>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {diagnostics.adapter_boundaries.map((boundary) => (
+                <div
+                  key={boundary.kind}
+                  className="rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-xs font-semibold">
+                      {boundary.kind}
+                    </span>
+                    <Badge variant={transportBadgeVariant(boundary.readiness)}>
+                      {boundary.readiness}
+                    </Badge>
+                  </div>
+                  <p className="mt-1 text-xs text-[hsl(var(--muted-foreground))]">
+                    Feature {boundary.cargo_feature}; failure class{" "}
+                    {boundary.failure_class}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+              Route proof
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Badge variant={transportBadgeVariant(diagnostics.route_proof_status)}>
+                {diagnostics.route_proof_status}
+              </Badge>
+              <Badge variant={transportBadgeVariant(diagnostics.turn_required)}>
+                TURN {diagnostics.turn_required}
+              </Badge>
+            </div>
+            <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              {diagnostics.route_proof_detail}
+            </p>
+            {diagnostics.adapter_fallback_attempts.length ? (
+              <div className="mt-3 space-y-1">
+                {diagnostics.adapter_fallback_attempts.map((attempt) => (
+                  <p
+                    key={`${attempt.kind}-${attempt.readiness}`}
+                    className="text-xs text-[hsl(var(--muted-foreground))]"
+                  >
+                    {attempt.selected ? "✓" : attempt.attempted ? "•" : "○"}{" "}
+                    {attempt.kind}: {attempt.readiness} ({attempt.failure_class})
+                  </p>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1335,7 +1409,7 @@ function TransportStatusStrip({ statuses }: { statuses: TransportStatusView[] })
 function transportBadgeVariant(
   status: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if (["configured", "signed-endpoint-ready", "clear"].includes(status)) {
+  if (["configured", "signed-endpoint-ready", "clear", "available", "route-proofed"].includes(status)) {
     return "success";
   }
   if (["attention", "last-command-error", "media-gated"].includes(status)) {

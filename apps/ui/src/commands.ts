@@ -239,6 +239,30 @@ export type TransportStatusView = {
   detail: string;
 };
 
+export type SignalingAdapterBoundaryView = {
+  kind: string;
+  cargo_feature: string;
+  readiness: string;
+  failure_class: string;
+};
+
+export type SignalingAdapterFallbackAttemptView = {
+  kind: string;
+  readiness: string;
+  failure_class: string;
+  attempted: boolean;
+  selected: boolean;
+};
+
+export type TransportDiagnosticsView = {
+  adapter_boundaries: SignalingAdapterBoundaryView[];
+  adapter_fallback_attempts: SignalingAdapterFallbackAttemptView[];
+  selected_adapter: string | null;
+  route_proof_status: string;
+  route_proof_detail: string;
+  turn_required: string;
+};
+
 export type JoinProgressStepView = {
   key: string;
   label: string;
@@ -355,6 +379,7 @@ export type AppState = {
   event_cursor: number;
   last_command_error: CommandErrorView | null;
   transport_status: TransportStatusView[];
+  transport_diagnostics: TransportDiagnosticsView;
   join_progress: JoinProgressStepView[];
   text_state_legend: TextStateView[];
   voice_states: VoiceStateView[];
@@ -451,6 +476,22 @@ export type SavePreferencesRequest = {
 
 export type StartDmRequest = {
   display_name: string;
+};
+
+export type StartSignalingSessionRequest = {
+  scope_label?: string | null;
+};
+
+export type StopSignalingSessionRequest = {
+  session_id?: string | null;
+};
+
+export type StartTextSessionRequest = {
+  scope_label?: string | null;
+};
+
+export type StopTextSessionRequest = {
+  session_id?: string | null;
 };
 
 export type SendMessageRequest = {
@@ -624,6 +665,15 @@ const fallbackState: AppState = {
   event_cursor: 1,
   last_command_error: null,
   transport_status: [],
+  transport_diagnostics: {
+    adapter_boundaries: [],
+    adapter_fallback_attempts: [],
+    selected_adapter: null,
+    route_proof_status: "route-proof-not-available",
+    route_proof_detail:
+      "Tauri IPC is not connected; local fallback cannot prove backend transport routes",
+    turn_required: "not-proven",
+  },
   join_progress: [],
   text_state_legend: textStateLegend(),
   voice_states: [],
@@ -723,6 +773,7 @@ function syncSnapshot(state: AppState): AppState {
     .map((event) => event.summary);
   state.event_cursor = state.events.at(-1)?.sequence ?? 0;
   state.transport_status = deriveTransportStatus(state);
+  state.transport_diagnostics = deriveTransportDiagnostics(state);
   state.join_progress = deriveJoinProgress(state);
   state.text_state_legend = textStateLegend();
   state.voice_states = deriveVoiceStates(state);
@@ -987,6 +1038,50 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
         "No failed transport command is currently reported",
     },
   ];
+}
+
+function deriveTransportDiagnostics(state: AppState): TransportDiagnosticsView {
+  return {
+    adapter_boundaries:
+      state.transport_diagnostics?.adapter_boundaries?.length
+        ? state.transport_diagnostics.adapter_boundaries
+        : [
+            {
+              kind: "mqtt",
+              cargo_feature: "mqtt-adapter",
+              readiness: "local_fallback_unknown",
+              failure_class: "tauri_ipc_unavailable",
+            },
+            {
+              kind: "nostr",
+              cargo_feature: "nostr-adapter",
+              readiness: "implementation_unavailable",
+              failure_class: "implementation_unavailable",
+            },
+            {
+              kind: "ipfs_pubsub",
+              cargo_feature: "ipfs-pubsub-adapter",
+              readiness: "implementation_unavailable",
+              failure_class: "implementation_unavailable",
+            },
+            {
+              kind: "discrypt_quic_rendezvous",
+              cargo_feature: "discrypt-quic-rendezvous-adapter",
+              readiness: "implementation_unavailable",
+              failure_class: "implementation_unavailable",
+            },
+          ],
+    adapter_fallback_attempts:
+      state.transport_diagnostics?.adapter_fallback_attempts ?? [],
+    selected_adapter: state.transport_diagnostics?.selected_adapter ?? null,
+    route_proof_status:
+      state.transport_diagnostics?.route_proof_status ??
+      "route-proof-not-available",
+    route_proof_detail:
+      state.transport_diagnostics?.route_proof_detail ??
+      "Tauri IPC is not connected; local fallback cannot prove backend transport routes",
+    turn_required: state.transport_diagnostics?.turn_required ?? "not-proven",
+  };
 }
 
 function pushEvent(state: AppState, kind: string, summary: string): void {
@@ -1564,6 +1659,64 @@ export async function loadCompatibilityAppSnapshot(): Promise<AppSnapshot> {
 export async function loadAppSnapshot(): Promise<AppSnapshot> {
   const state = await loadAppState();
   return state.snapshot;
+}
+
+export async function startSignalingSession(
+  request: StartSignalingSessionRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("start_signaling_session", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      pushEvent(
+        state,
+        "transport.signaling_start_rejected",
+        "Tauri IPC unavailable; local fallback cannot start a real signaling transport session",
+      );
+    }),
+  );
+}
+
+export async function stopSignalingSession(
+  request: StopSignalingSessionRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("stop_signaling_session", { request }, () =>
+    mutateFallback((state) => {
+      pushEvent(
+        state,
+        "transport.signaling_stopped",
+        "Local fallback recorded signaling stop; no backend transport session was active",
+      );
+    }),
+  );
+}
+
+export async function startTextSession(
+  request: StartTextSessionRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("start_text_session", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      pushEvent(
+        state,
+        "transport.text_start_rejected",
+        "Tauri IPC unavailable; local fallback cannot start a real text transport session",
+      );
+    }),
+  );
+}
+
+export async function stopTextSession(
+  request: StopTextSessionRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("stop_text_session", { request }, () =>
+    mutateFallback((state) => {
+      pushEvent(
+        state,
+        "transport.text_stopped",
+        "Local fallback recorded text transport stop; no backend transport session was active",
+      );
+    }),
+  );
 }
 
 export async function createUser(

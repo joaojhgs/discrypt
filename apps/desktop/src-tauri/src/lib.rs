@@ -1154,6 +1154,54 @@ pub fn app_state() -> AppStateView {
     with_state(|state| state.to_view())
 }
 
+/// Tauri command: start the backend signaling control-plane transport session.
+pub fn start_signaling_session(request: StartSignalingSessionRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        if let Err(error) =
+            state.start_transport_session(BackendTransportMode::Signaling, request.scope_label)
+        {
+            state.push_command_error(
+                "transport.signaling_start_rejected",
+                "start_signaling_session",
+                "transport_start_failed",
+                error,
+                "Check adapter readiness and connectivity settings before retrying signaling",
+            );
+        }
+    })
+}
+
+/// Tauri command: stop the backend signaling control-plane transport session.
+pub fn stop_signaling_session(request: StopSignalingSessionRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.stop_transport_session(BackendTransportMode::Signaling, request.session_id);
+    })
+}
+
+/// Tauri command: start the backend text/control data-plane transport session.
+pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        if let Err(error) =
+            state.start_transport_session(BackendTransportMode::Text, request.scope_label)
+        {
+            state.push_command_error(
+                "transport.text_start_rejected",
+                "start_text_session",
+                "transport_start_failed",
+                error,
+                "Check adapter readiness and route diagnostics before retrying text transport",
+            );
+        }
+    })
+}
+
+/// Tauri command: stop the backend text/control data-plane transport session.
+pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.stop_transport_session(BackendTransportMode::Text, request.session_id);
+    })
+}
+
 /// Tauri command: create a new local user and unlock the shell.
 pub fn create_user(request: CreateUserRequest) -> AppStateView {
     mutate_app_service(|state| state.create_user(request, false))
@@ -2423,6 +2471,26 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn start_signaling_session(request: StartSignalingSessionRequest) -> AppStateView {
+        super::start_signaling_session(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn stop_signaling_session(request: StopSignalingSessionRequest) -> AppStateView {
+        super::stop_signaling_session(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
+        super::start_text_session(request)
+    }
+
+    #[tauri::command]
+    pub(super) fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
+        super::stop_text_session(request)
+    }
+
+    #[tauri::command]
     pub(super) fn create_user(request: CreateUserRequest) -> AppStateView {
         super::create_user(request)
     }
@@ -2557,6 +2625,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc_commands::app_snapshot,
             ipc_commands::app_state,
+            ipc_commands::start_signaling_session,
+            ipc_commands::stop_signaling_session,
+            ipc_commands::start_text_session,
+            ipc_commands::stop_text_session,
             ipc_commands::create_user,
             ipc_commands::recover_user,
             ipc_commands::verify_safety_number,
@@ -2958,7 +3030,12 @@ impl PersistedAppState {
             .map(|invite| !invite.ice_turn_servers.is_empty())
             .unwrap_or(false);
         let last_error = self.last_command_error.as_ref();
-        vec![
+        let route_connected = self.transport_session_connected();
+        let route = self.transport_session_route();
+        let transport_error = self.transport_session_error();
+        let reconnecting = self.has_transport_reconnect();
+        let transport_failed = self.transport_session_failed();
+        let mut rows = vec![
             TransportStatusView {
                 label: "signaling".to_owned(),
                 status: latest_invite
@@ -2994,13 +3071,17 @@ impl PersistedAppState {
             },
             TransportStatusView {
                 label: "direct".to_owned(),
-                status: if voice_joined {
+                status: if route_connected {
+                    "route-proofed"
+                } else if voice_joined {
                     "media-gated"
                 } else {
                     "no-direct-proof"
                 }
                 .to_owned(),
-                detail: "Direct path is only shown as connected after transport/session state proves it; this command state has no direct route proof yet".to_owned(),
+                detail: route
+                    .map(|route| format!("Backend route evidence is available: {:?}", route))
+                    .unwrap_or_else(|| "Direct path is only shown as connected after transport/session state proves it; this command state has no direct route proof yet".to_owned()),
             },
             TransportStatusView {
                 label: "overlay".to_owned(),
@@ -3014,24 +3095,77 @@ impl PersistedAppState {
             },
             TransportStatusView {
                 label: "degraded".to_owned(),
-                status: last_error.map(|_| "attention").unwrap_or("clear").to_owned(),
-                detail: last_error
-                    .map(|error| format!("Last command issue {}: {}", error.code, error.message))
+                status: if last_error.is_some() || transport_error.is_some() {
+                    "attention"
+                } else {
+                    "clear"
+                }
+                .to_owned(),
+                detail: transport_error
+                    .or_else(|| {
+                        last_error
+                            .map(|error| format!("Last command issue {}: {}", error.code, error.message))
+                    })
                     .unwrap_or_else(|| "No degraded command state is currently reported".to_owned()),
             },
             TransportStatusView {
                 label: "reconnecting".to_owned(),
-                status: "idle".to_owned(),
+                status: if reconnecting { "active" } else { "idle" }.to_owned(),
                 detail: "Reconnect orchestration is displayed only when event state reports reconnect attempts".to_owned(),
             },
             TransportStatusView {
                 label: "failed".to_owned(),
-                status: last_error.map(|_| "last-command-error").unwrap_or("clear").to_owned(),
+                status: if transport_failed {
+                    "failed"
+                } else if last_error.is_some() {
+                    "last-command-error"
+                } else {
+                    "clear"
+                }
+                .to_owned(),
                 detail: last_error
                     .map(|error| error.recovery_hint.clone())
                     .unwrap_or_else(|| "No failed transport command is currently reported".to_owned()),
             },
-        ]
+        ];
+        if let Some(session) = &self.signaling_session {
+            rows.push(Self::transport_session_status_row(session));
+        }
+        if let Some(session) = &self.text_session {
+            rows.push(Self::transport_session_status_row(session));
+        }
+        rows
+    }
+
+    fn transport_session_status_row(session: &TransportSessionRecord) -> TransportStatusView {
+        let snapshot = session.snapshot();
+        TransportStatusView {
+            label: format!("{} session", session.mode.label()),
+            status: Self::transport_state_label(snapshot.state).to_owned(),
+            detail: format!(
+                "session={} scope={} mode={} last_error={}",
+                session.session_id,
+                session.scope_label,
+                session.mode.label(),
+                snapshot.last_error.unwrap_or_else(|| "none".to_owned()),
+            ),
+        }
+    }
+
+    fn transport_state_label(state: TransportSessionState) -> &'static str {
+        match state {
+            TransportSessionState::Idle => "idle",
+            TransportSessionState::Signaling => "signaling",
+            TransportSessionState::IceGathering => "ice_gathering",
+            TransportSessionState::Checking => "checking",
+            TransportSessionState::Direct => "direct",
+            TransportSessionState::OverlayRelay => "overlay_relay",
+            TransportSessionState::TurnRelay => "turn_relay",
+            TransportSessionState::Reconnecting => "reconnecting",
+            TransportSessionState::Disconnected => "disconnected",
+            TransportSessionState::Failed => "failed",
+            TransportSessionState::Cancelled => "cancelled",
+        }
     }
 
     fn join_progress(&self) -> Vec<JoinProgressStepView> {
@@ -5733,6 +5867,51 @@ mod tests {
         assert_eq!(health.voice_ready, cfg!(feature = "production-media"));
         assert!(health.honest_copy_ready);
         assert!(abuse_controls_contract_covers_g116());
+    }
+
+    #[test]
+    fn transport_session_commands_surface_backend_diagnostics() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("transport-session-commands");
+
+        let started = start_signaling_session(StartSignalingSessionRequest {
+            scope_label: Some("dm:alice-bob".to_owned()),
+        });
+        assert!(started.last_command_error.is_none());
+        let diagnostics = started.transport_diagnostics;
+        assert!(
+            diagnostics
+                .adapter_boundaries
+                .iter()
+                .any(|boundary| boundary.kind == "mqtt")
+        );
+        assert!(
+            diagnostics
+                .adapter_fallback_attempts
+                .iter()
+                .any(|attempt| attempt.attempted)
+        );
+        assert_eq!(diagnostics.route_proof_status, "route-proof-not-available");
+        assert!(started
+            .transport_status
+            .iter()
+            .any(|status| status.label == "signaling session" && status.status == "signaling"));
+
+        let session_id = started
+            .transport_status
+            .iter()
+            .find(|status| status.label == "signaling session")
+            .expect("signaling session status row")
+            .detail
+            .clone();
+        assert!(session_id.contains("session="));
+
+        let stopped = stop_signaling_session(StopSignalingSessionRequest { session_id: None });
+        assert!(stopped.last_command_error.is_none());
+        assert!(stopped
+            .transport_status
+            .iter()
+            .any(|status| status.label == "signaling session" && status.status == "cancelled"));
     }
 
     #[test]
