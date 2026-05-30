@@ -27,6 +27,8 @@ use sha2::Digest;
 use std::collections::BTreeMap;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 use std::collections::BTreeSet;
+#[cfg(feature = "ipfs-pubsub-adapter")]
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 #[cfg(any(
     feature = "mqtt-adapter",
@@ -1110,6 +1112,18 @@ enum IpfsPubsubCommand {
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
+#[derive(libp2p::swarm::NetworkBehaviour)]
+#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+struct IpfsPubsubBehaviour {
+    gossipsub: libp2p::gossipsub::Behaviour<
+        libp2p::gossipsub::IdentityTransform,
+        libp2p::gossipsub::AllowAllSubscriptionFilter,
+    >,
+    kademlia: libp2p::kad::Behaviour<libp2p::kad::store::MemoryStore>,
+    identify: libp2p::identify::Behaviour,
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IpfsPubsubWireEnvelope {
@@ -1292,6 +1306,11 @@ fn ipfs_topic(rendezvous: &RendezvousCapability) -> libp2p::gossipsub::IdentTopi
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_provider_key(topic: &libp2p::gossipsub::IdentTopic) -> libp2p::kad::RecordKey {
+    libp2p::kad::RecordKey::new(&format!("discrypt-pubsub-provider-v1/{}", topic.hash()))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
 fn ipfs_multiaddr_from_endpoint(
     endpoint: &SignalingProviderEndpoint,
 ) -> Result<libp2p::Multiaddr, TransportError> {
@@ -1306,6 +1325,35 @@ fn ipfs_multiaddr_from_endpoint(
 fn ipfs_should_dial(addr: &libp2p::Multiaddr) -> bool {
     let text = addr.to_string();
     !(text.contains("/tcp/0") || text.contains("/udp/0"))
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_peer_id_from_multiaddr(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
+    addr.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "ipfs-pubsub-adapter")]
+fn ipfs_pubsub_no_topic_mesh_error(
+    error: libp2p::gossipsub::PublishError,
+    connected_peers: usize,
+    subscribed_peers: usize,
+    mesh_peers: usize,
+) -> TransportError {
+    if matches!(error, libp2p::gossipsub::PublishError::InsufficientPeers) {
+        TransportError::SignalingAdapter(format!(
+            "ipfs_pubsub topic_mesh_unavailable: publish has insufficient topic peers \
+             (connected_peers={connected_peers}, subscribed_topic_peers={subscribed_peers}, \
+             mesh_peers={mesh_peers}); generic libp2p bootstrap peers do not relay arbitrary \
+             gossipsub topics. Configure at least one reachable Discrypt/IPFS pubsub peer for \
+             this rendezvous topic, or a public DHT/rendezvous path where participants can \
+             advertise and discover the same topic provider record before publishing"
+        ))
+    } else {
+        ipfs_err("publish", error)
+    }
 }
 
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -1416,6 +1464,7 @@ async fn spawn_ipfs_pubsub_room(
     local_peer_id: SignalingPeerId,
 ) -> Result<IpfsPubsubProviderRoom, TransportError> {
     let topic = ipfs_topic(&rendezvous);
+    let provider_key = ipfs_provider_key(&topic);
     let mut config = libp2p::gossipsub::ConfigBuilder::default();
     config
         .heartbeat_initial_delay(Duration::from_millis(200))
@@ -1425,6 +1474,11 @@ async fn spawn_ipfs_pubsub_room(
     let gossipsub_config = config
         .build()
         .map_err(|err| ipfs_err("gossipsub config", err))?;
+    let bootstrap_addrs = profile
+        .endpoints
+        .iter()
+        .map(ipfs_multiaddr_from_endpoint)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -1433,8 +1487,11 @@ async fn spawn_ipfs_pubsub_room(
             libp2p::yamux::Config::default,
         )
         .map_err(|err| ipfs_err("tcp transport", err))?
+        .with_dns()
+        .map_err(|err| ipfs_err("dns transport", err))?
         .with_behaviour(|keypair| {
-            libp2p::gossipsub::Behaviour::<
+            let local_peer_id = libp2p::PeerId::from(keypair.public());
+            let gossipsub = libp2p::gossipsub::Behaviour::<
                 libp2p::gossipsub::IdentityTransform,
                 libp2p::gossipsub::AllowAllSubscriptionFilter,
             >::new(
@@ -1443,12 +1500,35 @@ async fn spawn_ipfs_pubsub_room(
             )
             .unwrap_or_else(|error| {
                 panic!("validated ipfs_pubsub gossipsub config failed: {error}")
-            })
+            });
+            let mut kad_config = libp2p::kad::Config::new(libp2p::kad::PROTOCOL_NAME);
+            kad_config
+                .set_query_timeout(Duration::from_secs(20))
+                .set_replication_factor(NonZeroUsize::new(3).expect("non-zero replication"));
+            let kademlia = libp2p::kad::Behaviour::with_config(
+                local_peer_id,
+                libp2p::kad::store::MemoryStore::new(local_peer_id),
+                kad_config,
+            );
+            let identify = libp2p::identify::Behaviour::new(
+                libp2p::identify::Config::new(
+                    "/discrypt/ipfs-pubsub/1.0.0".to_owned(),
+                    keypair.public(),
+                )
+                .with_agent_version("discrypt-ipfs-pubsub/0.1.0".to_owned())
+                .with_push_listen_addr_updates(true),
+            );
+            IpfsPubsubBehaviour {
+                gossipsub,
+                kademlia,
+                identify,
+            }
         })
         .map_err(|error| ipfs_err("swarm behaviour", error))?
         .build();
     swarm
         .behaviour_mut()
+        .gossipsub
         .subscribe(&topic)
         .map_err(|err| ipfs_err("subscribe topic", err))?;
     swarm
@@ -1458,12 +1538,26 @@ async fn spawn_ipfs_pubsub_room(
                 .map_err(|err| ipfs_err("listen multiaddr parse", err))?,
         )
         .map_err(|err| ipfs_err("listen", err))?;
-    for endpoint in &profile.endpoints {
-        let addr = ipfs_multiaddr_from_endpoint(endpoint)?;
+    for addr in &bootstrap_addrs {
+        if let Some(peer_id) = ipfs_peer_id_from_multiaddr(addr) {
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer_id, addr.clone());
+        }
         if ipfs_should_dial(&addr) {
-            let _ = swarm.dial(addr);
+            let _ = swarm.dial(addr.clone());
         }
     }
+    let _ = swarm.behaviour_mut().kademlia.bootstrap();
+    let _ = swarm
+        .behaviour_mut()
+        .kademlia
+        .start_providing(provider_key.clone());
+    let _ = swarm
+        .behaviour_mut()
+        .kademlia
+        .get_providers(provider_key.clone());
 
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(128);
     let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
@@ -1474,6 +1568,8 @@ async fn spawn_ipfs_pubsub_room(
     let task_local_peer_id = local_peer_id.clone();
     let mut listen_tx = Some(listen_tx);
     let task_topic = topic.clone();
+    let task_topic_hash = topic.hash();
+    let task_provider_key = provider_key.clone();
 
     tokio::spawn(async move {
         use futures::StreamExt;
@@ -1483,16 +1579,37 @@ async fn spawn_ipfs_pubsub_room(
                     let Some(command) = command else { break; };
                     match command {
                         IpfsPubsubCommand::Publish { payload, result } => {
+                            let mesh_peers = swarm
+                                .behaviour()
+                                .gossipsub
+                                .mesh_peers(&task_topic_hash)
+                                .count();
+                            let subscribed_peers = swarm
+                                .behaviour()
+                                .gossipsub
+                                .all_peers()
+                                .filter(|(_, topics)| topics.iter().any(|topic| **topic == task_topic_hash))
+                                .count();
+                            let connected_peers = swarm.connected_peers().count();
                             let outcome = swarm
                                 .behaviour_mut()
+                                .gossipsub
                                 .publish(task_topic.clone(), payload)
                                 .map(|_| ())
-                                .map_err(|err| ipfs_err("publish", err));
+                                .map_err(|err| {
+                                    ipfs_pubsub_no_topic_mesh_error(
+                                        err,
+                                        connected_peers,
+                                        subscribed_peers,
+                                        mesh_peers,
+                                    )
+                                });
                             let _ = result.send(outcome);
                         }
                         IpfsPubsubCommand::Leave { result } => {
                             let outcome = swarm
                                 .behaviour_mut()
+                                .gossipsub
                                 .unsubscribe(&task_topic)
                                 .map(|_| ())
                                 .map_err(|err| ipfs_err("unsubscribe", err));
@@ -1511,18 +1628,45 @@ async fn spawn_ipfs_pubsub_room(
                             }
                         }
                         libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            swarm.behaviour_mut().add_explicit_peer(&peer_id);
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            let _ = swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .get_providers(task_provider_key.clone());
                         }
                         libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            swarm.behaviour_mut().remove_explicit_peer(&peer_id);
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         }
-                        libp2p::swarm::SwarmEvent::Behaviour(libp2p::gossipsub::Event::Message { message, .. }) => {
+                        libp2p::swarm::SwarmEvent::Behaviour(IpfsPubsubBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. })) => {
                             let _ = IpfsPubsubProviderRoom::record_message(
                                 &task_inbox,
                                 &task_local_peer_id,
                                 message.data,
                             )
                             .await;
+                        }
+                        libp2p::swarm::SwarmEvent::Behaviour(IpfsPubsubBehaviourEvent::Kademlia(
+                            libp2p::kad::Event::OutboundQueryProgressed {
+                                result:
+                                    libp2p::kad::QueryResult::GetProviders(Ok(
+                                        libp2p::kad::GetProvidersOk::FoundProviders { providers, .. },
+                                    )),
+                                ..
+                            },
+                        )) => {
+                            for peer_id in providers {
+                                if peer_id != *swarm.local_peer_id() {
+                                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                    let _ = swarm.dial(peer_id);
+                                }
+                            }
+                        }
+                        libp2p::swarm::SwarmEvent::Behaviour(IpfsPubsubBehaviourEvent::Identify(
+                            libp2p::identify::Event::Received { peer_id, info, .. },
+                        )) => {
+                            for addr in info.listen_addrs {
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                            }
                         }
                         _ => {}
                     }
@@ -3225,6 +3369,26 @@ mod tests {
         alice_room.leave().await?;
         bob_room.leave().await?;
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "ipfs-pubsub-adapter")]
+    fn ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error() {
+        let error = ipfs_pubsub_no_topic_mesh_error(
+            libp2p::gossipsub::PublishError::InsufficientPeers,
+            1,
+            0,
+            0,
+        );
+
+        let TransportError::SignalingAdapter(message) = error else {
+            panic!("expected signaling adapter error");
+        };
+        assert!(message.contains("topic_mesh_unavailable"));
+        assert!(message.contains("connected_peers=1"));
+        assert!(message.contains("subscribed_topic_peers=0"));
+        assert!(message.contains("generic libp2p bootstrap peers do not relay"));
+        assert!(message.contains("reachable Discrypt/IPFS pubsub peer"));
     }
 
     #[tokio::test]
