@@ -1123,6 +1123,16 @@ pub struct StopTextSessionRequest {
     pub session_id: Option<String>,
 }
 
+/// Request to attach a long-lived text/control transport runtime to the active
+/// text session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachTextControlTransportRuntimeRequest {
+    /// Optional expected session id for explicit attach scoping. If present and the
+    /// active text session does not match, attach is rejected.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Request to set self mute state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SetSelfMuteRequest {
@@ -1961,6 +1971,77 @@ pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
     if stopped_session_id.is_some() {
         guard.clear_text_control_transport_runtime_if_session_mismatch(None);
     }
+    guard.persist();
+    guard.to_view()
+}
+
+/// Tauri command: bind an app-service text/control runtime to the active text
+/// session. This is currently a fail-closed gate while the provider-negotiated
+/// long-lived attachment path is implemented.
+pub fn attach_text_control_transport_runtime(
+    request: AttachTextControlTransportRuntimeRequest,
+) -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+
+    let Some(session) = guard.state.transport_session(BackendTransportMode::Text) else {
+        guard.state.push_command_error(
+            "transport.text_runtime_attach_rejected",
+            "attach_text_control_transport_runtime",
+            "text_session_missing",
+            "No active text transport session exists",
+            "Start a text session before attaching transport runtime",
+        );
+        guard.persist();
+        return guard.to_view();
+    };
+
+    let active_session_id = session.session_id.clone();
+    let active_session_state = session.state();
+
+    if let Some(expected_session_id) = request.session_id {
+        if expected_session_id != active_session_id {
+            guard.state.push_command_error(
+                "transport.text_runtime_attach_rejected",
+                "attach_text_control_transport_runtime",
+                "text_session_id_mismatch",
+                format!(
+                    "text transport session {} does not match attach request {}",
+                    active_session_id, expected_session_id
+                ),
+                "Use the current active text session id when attaching runtime",
+            );
+            guard.persist();
+            return guard.to_view();
+        }
+    }
+
+    if !active_session_state.is_connected() {
+        guard.state.push_command_error(
+            "transport.text_runtime_attach_rejected",
+            "attach_text_control_transport_runtime",
+            "text_session_not_connected",
+            format!(
+                "text transport session {} is {}",
+                active_session_id,
+                PersistedAppState::transport_state_label(active_session_state)
+            ),
+            "Complete a provider DataChannel proof and route transition before binding a runtime",
+        );
+        guard.persist();
+        return guard.to_view();
+    }
+
+    guard.state.push_command_error(
+        "transport.text_runtime_attach_unavailable",
+        "attach_text_control_transport_runtime",
+        "transport_runtime_not_supported",
+        "provider-backed text/control runtime attachment is not implemented in this build",
+        "Use pump_text_control_transport_once with an explicitly injected transport runtime during internal tests until long-lived attachment is wired",
+    );
     guard.persist();
     guard.to_view()
 }
@@ -3513,6 +3594,13 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn attach_text_control_transport_runtime(
+        request: AttachTextControlTransportRuntimeRequest,
+    ) -> AppStateView {
+        super::attach_text_control_transport_runtime(request)
+    }
+
+    #[tauri::command]
     pub(super) fn create_user(request: CreateUserRequest) -> AppStateView {
         super::create_user(request)
     }
@@ -3701,6 +3789,7 @@ pub fn run() {
             ipc_commands::stop_signaling_session,
             ipc_commands::start_text_session,
             ipc_commands::stop_text_session,
+            ipc_commands::attach_text_control_transport_runtime,
             ipc_commands::create_user,
             ipc_commands::recover_user,
             ipc_commands::verify_safety_number,
@@ -9719,6 +9808,161 @@ mod tests {
         assert_eq!(command_error.code, "text_session_id_mismatch");
 
         clear_text_control_transport_runtime_for_test();
+    }
+
+    #[test]
+    fn attach_text_control_transport_runtime_rejects_without_active_session() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-missing-session");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+
+        let state =
+            attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
+                session_id: None,
+            });
+        let command_error = state
+            .last_command_error
+            .expect("missing session should fail");
+        assert_eq!(
+            command_error.command, "attach_text_control_transport_runtime",
+            "attach command should report missing-session failure source"
+        );
+        assert_eq!(
+            command_error.code, "text_session_missing",
+            "attach precondition should fail when no text session exists"
+        );
+    }
+
+    #[test]
+    fn attach_text_control_transport_runtime_rejects_stale_session_id() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-stale-session");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("attach-stale-session".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+
+        let state =
+            attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
+                session_id: Some("stale-text-session".to_owned()),
+            });
+        let command_error = state
+            .last_command_error
+            .expect("session mismatch should fail");
+        assert_eq!(
+            command_error.command, "attach_text_control_transport_runtime",
+            "stale session should fail at attach"
+        );
+        assert_eq!(command_error.code, "text_session_id_mismatch");
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.text_control_transport_runtime.is_none(),
+            "attach rejection must not create runtime state"
+        );
+        assert_ne!(
+            active_session_id, "stale-text-session",
+            "test should use a stale session id"
+        );
+    }
+
+    #[test]
+    fn attach_text_control_transport_runtime_exposes_missing_provider_implementation() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-missing-implementation");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("attach-unsupported".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+
+        let synthetic_probe = ProviderWebRtcDataChannelProbeView {
+            kind: "unit-test".to_owned(),
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "unit-test-endpoint".to_owned(),
+            rendezvous_topic: "unit-test-topic".to_owned(),
+            offerer_direct_path_ready: true,
+            answerer_direct_path_ready: true,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "b".repeat(64),
+        };
+        let attached = mutate_app_service(|state| {
+            state.latest_data_channel_probe = Some(synthetic_probe.clone());
+            state.mark_text_session_data_channel_route_proof(&synthetic_probe);
+        });
+        assert!(
+            attached
+                .transport_status
+                .iter()
+                .any(|status| status.label == "text session" && status.status == "direct"),
+            "synthetic route proof should transition text session to direct"
+        );
+        assert!(attached.last_command_error.is_none());
+
+        let session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should remain active");
+        let state =
+            attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
+                session_id: Some(session_id),
+            });
+        let command_error = state
+            .last_command_error
+            .expect("attach should fail until provider runtime path is wired");
+        assert_eq!(
+            command_error.command,
+            "attach_text_control_transport_runtime"
+        );
+        assert_eq!(command_error.code, "transport_runtime_not_supported");
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.text_control_transport_runtime.is_none(),
+            "unsupported attach path must remain fail-closed"
+        );
     }
 
     #[test]
