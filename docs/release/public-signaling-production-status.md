@@ -282,8 +282,8 @@ npm --prefix apps/ui run test:command-coverage
 
 - [ ] Dependency/security audit for `rumqttc` and any Nostr/IPFS/libp2p dependencies. Latest `cargo audit` is documented in `docs/release/dependency-security-audit.md` and remains release-blocking due vulnerable `hickory-proto`, `libcrux-chacha20poly1305`, `ring 0.16`, and old `rustls-webpki` edges.
 - [x] Public provider allowlist/versioning and rotation policy. Signed invite/app signaling profiles now carry `provider_policy_version`, endpoint allowlist commitments, and provider rotation policy text; Tauri validates endpoint commitments before converting profiles into transport probes, and invite bootstrap validation rejects empty/malformed provider-policy metadata.
-- [ ] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
-  for deterministic harness evidence and optional public-provider MQTT validation.
+- [x] Connect STUN/TURN fallback and provider-privacy proof into a dedicated release gate (G132)
+  for deterministic harness evidence and optional public-provider MQTT validation. `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132` passed and runs both local cargo gates by default; real distinct-machine STUN/TURN release evidence remains tracked separately above.
 - [ ] Provider-visible metadata capture/PCAP tests for MQTT, Nostr, IPFS, and QUIC.
 - [ ] Abuse/rate-limit handling against public relays/brokers.
 - [ ] Full release matrix across Linux desktop package and Android once mobile exists.
