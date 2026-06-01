@@ -92,6 +92,18 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "set_active_channel",
+    exportName: "setActiveChannel",
+    args: ["group_id", "channel_id"],
+    returns: "AppState",
+  },
+  {
+    command: "set_active_dm",
+    exportName: "setActiveDm",
+    args: ["dm_id"],
+    returns: "AppState",
+  },
+  {
     command: "join_group",
     exportName: "joinGroup",
     args: ["invite_code", "group_name"],
@@ -122,9 +134,26 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "set_active_channel",
+    exportName: "setActiveChannel",
+    args: ["group_id", "channel_id"],
+    returns: "AppState",
+  },
+  {
+    command: "set_active_dm",
+    exportName: "setActiveDm",
+    args: ["dm_id"],
+    returns: "AppState",
+  },
+  {
     command: "start_signaling_session",
     exportName: "startSignalingSession",
-    args: ["scope_label", "adapter_probe", "data_channel_probe", "adapter_kind"],
+    args: [
+      "scope_label",
+      "adapter_probe",
+      "data_channel_probe",
+      "adapter_kind",
+    ],
     returns: "AppState",
   },
   {
@@ -148,7 +177,7 @@ const expectedCommands = [
   {
     command: "attach_text_control_transport_runtime",
     exportName: "attachTextControlTransportRuntime",
-    args: ["session_id"],
+    args: ["session_id", "runtime_role", "local_peer_id", "remote_peer_id"],
     returns: "AppState",
   },
   {
@@ -344,23 +373,43 @@ const requestTypes = [
   ["CreateGroupRequest", ["name", "retention"]],
   ["JoinGroupRequest", ["invite_code", "group_name"]],
   ["SetActiveGroupRequest", ["group_id"]],
+  ["SetActiveChannelRequest", ["group_id", "channel_id"]],
+  ["SetActiveDmRequest", ["dm_id"]],
   ["CreateInviteRequest", ["group_id", "expires", "max_use"]],
   ["CreateDmInviteRequest", ["dm_id", "expires", "max_use"]],
   ["AcceptDmInviteRequest", ["invite_code", "display_name"]],
   ["CreateChannelRequest", ["group_id", "name", "kind", "retention_status"]],
-  ["StartSignalingSessionRequest", ["scope_label", "adapter_probe", "data_channel_probe", "adapter_kind"]],
+  [
+    "StartSignalingSessionRequest",
+    ["scope_label", "adapter_probe", "data_channel_probe", "adapter_kind"],
+  ],
   ["StopSignalingSessionRequest", ["session_id"]],
-  ["StartTextSessionRequest", ["scope_label", "data_channel_probe", "adapter_kind"]],
+  [
+    "StartTextSessionRequest",
+    ["scope_label", "data_channel_probe", "adapter_kind"],
+  ],
   ["StopTextSessionRequest", ["session_id"]],
   [
     "AttachTextControlTransportRuntimeRequest",
     ["session_id", "runtime_role", "local_peer_id", "remote_peer_id"],
   ],
   ["SendMessageRequest", ["target", "body"]],
-  ["ApplyTextDeliveryReceiptRequest", ["message_id", "receipt", "recipient_verifying_key_hex"]],
-  ["ReceiveTextDeliveryEnvelopeRequest", ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"]],
-  ["ListPendingTextControlFramesRequest", ["target", "limit", "operation_timeout_ms"]],
-  ["MarkTextControlFrameSentRequest", ["message_id", "frame_sha256", "transport_session_id"]],
+  [
+    "ApplyTextDeliveryReceiptRequest",
+    ["message_id", "receipt", "recipient_verifying_key_hex"],
+  ],
+  [
+    "ReceiveTextDeliveryEnvelopeRequest",
+    ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"],
+  ],
+  [
+    "ListPendingTextControlFramesRequest",
+    ["target", "limit", "operation_timeout_ms"],
+  ],
+  [
+    "MarkTextControlFrameSentRequest",
+    ["message_id", "frame_sha256", "transport_session_id"],
+  ],
   ["HandleTextControlFrameRequest", ["frame"]],
   ["MessageTargetView", ["kind", "dm_id", "group_id", "channel_id"]],
   ["JoinVoiceRequest", ["group_id", "channel_id"]],
@@ -406,13 +455,21 @@ if (!commands.includes('"app_state"')) {
   failures.push("frontend command client must invoke app_state");
 }
 if (!commands.includes("RESET_APP_CONFIRMATION_PHRASE")) {
-  failures.push("resetAppState must require the shared destructive confirmation phrase");
+  failures.push(
+    "resetAppState must require the shared destructive confirmation phrase",
+  );
 }
 if (!commands.includes('"confirmation_required"')) {
-  failures.push("resetAppState fallback must surface typed confirmation_required errors");
+  failures.push(
+    "resetAppState fallback must surface typed confirmation_required errors",
+  );
 }
-if (commands.includes('export async function resetAppState(): Promise<AppState>')) {
-  failures.push("resetAppState must not be callable without an explicit confirmation request");
+if (
+  commands.includes("export async function resetAppState(): Promise<AppState>")
+) {
+  failures.push(
+    "resetAppState must not be callable without an explicit confirmation request",
+  );
 }
 
 const forbiddenLegacyDtoTokens = [
@@ -445,7 +502,6 @@ for (const token of forbiddenLocalProductState) {
   }
 }
 
-
 const productionClaimTerms = [
   "P2P",
   "WebRTC",
@@ -476,7 +532,7 @@ const allowedProductionClaimContext = [
   "backend-state",
   "returned by state",
   "honest_copy_ready",
-  "media-frame E2E",
+  "backend media-route evidence",
   "socket/media adapter E2E",
   "webrtc-datachannel-proofed",
   "webrtc-datachannel-failed",
@@ -532,13 +588,17 @@ for (const [label, source] of [
 }
 
 if (!rust.includes("honest_copy_ready")) {
-  failures.push("Tauri command_health must expose honest_copy_ready for copy gates");
+  failures.push(
+    "Tauri command_health must expose honest_copy_ready for copy gates",
+  );
 }
 if (!commands.includes("honest_copy_ready")) {
   failures.push("TS CommandHealth must carry honest_copy_ready for copy gates");
 }
 if (!rust.includes("transport_status: Vec<TransportStatusView>")) {
-  failures.push("Tauri AppStateView must expose backend-derived transport_status");
+  failures.push(
+    "Tauri AppStateView must expose backend-derived transport_status",
+  );
 }
 if (!commands.includes("transport_status: TransportStatusView[]")) {
   failures.push("TS AppState must carry backend-derived transport_status");
@@ -574,40 +634,132 @@ if (!main.includes("voiceStateBadgeVariant")) {
   failures.push("voice UI must map backend voice states to visible badges");
 }
 if (!rust.includes("runtime_mode: RuntimeModeView")) {
-  failures.push("Tauri AppStateView must expose runtime_mode for production label gating");
+  failures.push(
+    "Tauri AppStateView must expose runtime_mode for production label gating",
+  );
 }
 if (!commands.includes("runtime_mode: RuntimeModeView")) {
-  failures.push("TS AppState must carry runtime_mode for production label gating");
+  failures.push(
+    "TS AppState must carry runtime_mode for production label gating",
+  );
 }
 if (!main.includes("RuntimeModeBanner")) {
   failures.push("UI must visibly mark local-dev/harness runtime mode");
 }
 if (!rust.includes("UI_THEME_IDS") || !rust.includes("UI_TEMPLATE_IDS")) {
-  failures.push("backend preferences must constrain theme/template IDs to app-config-compatible allowlists");
+  failures.push(
+    "backend preferences must constrain theme/template IDs to app-config-compatible allowlists",
+  );
 }
-if (!commands.includes("discryptUiConfig.themes") || !commands.includes("discryptUiConfig.templates")) {
-  failures.push("frontend preferences must normalize through apps/ui/src/app-config.ts definitions");
+if (
+  !commands.includes("discryptUiConfig.themes") ||
+  !commands.includes("discryptUiConfig.templates")
+) {
+  failures.push(
+    "frontend preferences must normalize through apps/ui/src/app-config.ts definitions",
+  );
 }
-if (!main.includes("discryptUiConfig.themes") || !main.includes("savePreferences")) {
-  failures.push("UI must keep theme/template selectors sourced from app-config and persisted through savePreferences");
+if (
+  !main.includes("discryptUiConfig.themes") ||
+  !main.includes("savePreferences")
+) {
+  failures.push(
+    "UI must keep theme/template selectors sourced from app-config and persisted through savePreferences",
+  );
 }
 if (!main.includes("runtimeMode.production_labels_enabled")) {
-  failures.push("UI must gate production label badge state from runtimeMode.production_labels_enabled");
+  failures.push(
+    "UI must gate production label badge state from runtimeMode.production_labels_enabled",
+  );
 }
-if (!main.includes("message.state_label") || !main.includes("message.state_detail")) {
-  failures.push("Message bubbles must display per-message state label and detail");
+if (
+  !main.includes("message.state_label") ||
+  !main.includes("message.state_detail")
+) {
+  failures.push(
+    "Message bubbles must display per-message state label and detail",
+  );
 }
 if (!main.includes("Group join progress")) {
-  failures.push("join UI must label the command-backed group join progress timeline");
+  failures.push(
+    "join UI must label the command-backed group join progress timeline",
+  );
 }
 if (!main.includes("evidence-gated by command state")) {
-  failures.push("join progress UI must explain progress requires command-state evidence");
+  failures.push(
+    "join progress UI must explain progress requires command-state evidence",
+  );
 }
 if (!main.includes("TransportStatusStrip")) {
   failures.push("UI must render backend-derived transport statuses");
 }
 if (!main.includes("Backend-derived state only")) {
-  failures.push("transport status UI must explain that connectivity claims require backend evidence");
+  failures.push(
+    "transport status UI must explain that connectivity claims require backend evidence",
+  );
+}
+if (
+  main.includes('id="runtime-local-peer"') ||
+  main.includes('id="runtime-remote-peer"')
+) {
+  failures.push(
+    "production UI must not expose manual text runtime peer pairing inputs",
+  );
+}
+if (
+  !main.includes("not user-entered pairing fields") ||
+  !main.includes("ensureTextRuntimeForActiveScope")
+) {
+  failures.push(
+    "text runtime attachment must derive peers from invite/connectivity state and start automatically",
+  );
+}
+if (!main.includes("messageTransportProof || Boolean(window.__TAURI__?.core?.invoke)")) {
+  failures.push("native/Tauri text sends must request transport proof automatically without manual pairing controls");
+}
+if (!main.includes('tauriListen<AppEventStreamView>("app_event"')) {
+  failures.push("native/Tauri UI must subscribe to app_event push events");
+}
+if (!main.includes("tauriListen ? 30000 : 5000")) {
+  failures.push("poll_app_events must be fallback/health-resync only when app_event push is available");
+}
+if (!main.includes("window.__TAURI__?.event?.listen")) {
+  failures.push("native UI must install a Tauri app_event listener");
+}
+if (
+  !main.includes("APP_EVENT_FALLBACK_POLL_MS") ||
+  !main.includes("startFallbackPolling")
+) {
+  failures.push("poll_app_events must remain a named fallback path, not the primary native update path");
+}
+if (!main.includes("APP_EVENT_HEALTH_RESYNC_MS")) {
+  failures.push("native app_event listener must retain a slow health-resync poll");
+}
+const voiceCleanupEffects = (
+  main.match(/return \(\) => \{\n      voiceCaptureRef\.current\?\.getTracks\(\)\.forEach/g) ?? []
+).length;
+if (voiceCleanupEffects !== 1) {
+  failures.push(
+    `voice media unmount cleanup must have exactly one effect, found ${voiceCleanupEffects}`,
+  );
+}
+for (const forbiddenManualTextControl of [
+  "runtime-local-peer",
+  "runtime-remote-peer",
+  "Listen as answerer",
+  "Connect as offerer",
+]) {
+  if (main.includes(forbiddenManualTextControl)) {
+    failures.push(
+      `production UI must not expose manual text runtime pairing controls (${forbiddenManualTextControl})`,
+    );
+  }
+}
+if (main.includes("id=\"runtime-local-peer\"") || main.includes("id=\"runtime-remote-peer\"")) {
+  failures.push("production UI must not expose manual text runtime peer pairing inputs");
+}
+if (!main.includes("not user-entered pairing fields") || !main.includes("ensureTextRuntimeForActiveScope")) {
+  failures.push("text runtime attachment must derive peers from invite/connectivity state and start automatically");
 }
 for (const inviteUiToken of [
   "Latest invite descriptor",
@@ -618,32 +770,44 @@ for (const inviteUiToken of [
   "Max-use limit",
 ]) {
   if (!main.includes(inviteUiToken)) {
-    failures.push(`invite UI missing production metadata surface: ${inviteUiToken}`);
+    failures.push(
+      `invite UI missing production metadata surface: ${inviteUiToken}`,
+    );
   }
 }
-if (!main.includes("Danger zone") || !main.includes("resetPhrase !== RESET_APP_CONFIRMATION_PHRASE")) {
-  failures.push("UI must gate destructive reset behind the typed danger-zone confirmation phrase");
+if (
+  !main.includes("Danger zone") ||
+  !main.includes("resetPhrase !== RESET_APP_CONFIRMATION_PHRASE")
+) {
+  failures.push(
+    "UI must gate destructive reset behind the typed danger-zone confirmation phrase",
+  );
 }
 for (const e2eToken of [
   "setup workflow remains readable and completes",
   "group invite join text channel and voice controls work without fake members",
   "local-dev e2e persistence survives browser reload",
-  "small-window navigation exposes setup groups invites text and voice",
-  "transport status surfaces signaling not-ready state before invite metadata",
+  "small-window navigation exposes topbar controls without overflow",
+  "production UX hides diagnostics and manual transport controls by default",
   "mediaDevices",
-  "toHaveValue(\"61\")",
+  'toHaveValue("61")',
 ]) {
   if (!statefulE2e.includes(e2eToken)) {
     failures.push(`Playwright stateful UX coverage missing: ${e2eToken}`);
   }
 }
-if (!commands.includes("FALLBACK_STORAGE_KEY") || !commands.includes("persistFallbackState")) {
-  failures.push("local-dev fallback must persist command-backed state for reload UX E2E coverage");
+if (
+  !commands.includes("FALLBACK_STORAGE_KEY") ||
+  !commands.includes("persistFallbackState")
+) {
+  failures.push(
+    "local-dev fallback must persist command-backed state for reload UX E2E coverage",
+  );
 }
 
 const commandBackedCopy = [
   "command-backed",
-  "media-frame E2E",
+  "backend media-route evidence",
   "pending on offline devices",
 ];
 for (const copy of commandBackedCopy) {

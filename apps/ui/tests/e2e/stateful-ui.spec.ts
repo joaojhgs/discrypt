@@ -83,7 +83,7 @@ test("first run creates user and empty shell does not blank", async ({
   await expect(
     page.getByRole("heading", { name: /direct messages/i }),
   ).toBeVisible();
-  await expect(page.getByText(/local command-backed dm state/i)).toBeVisible();
+  await expect(page.getByText(/backend-persisted local dm state/i)).toBeVisible();
 });
 
 test("setup workflow remains readable and completes", async ({ page }) => {
@@ -137,6 +137,7 @@ test("direct message send stays command-backed", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+// transport status surfaces signaling not-ready state before invite metadata
 test("group invite join text channel and voice controls work without fake members", async ({
   page,
 }) => {
@@ -148,6 +149,16 @@ test("group invite join text channel and voice controls work without fake member
 
   await page.getByRole("button", { name: "Create group" }).click();
   await page.getByLabel("Group name").fill("Private Lab");
+  await page.locator('select[aria-label="Signaling adapter"]').selectOption("mqtt");
+  await page
+    .getByLabel("Signaling endpoint")
+    .fill("mqtts://broker.emqx.io:8883");
+  await page
+    .getByLabel("STUN servers")
+    .fill("stun:stun.l.google.com:19302, stun:stun.cloudflare.com:3478");
+  await page
+    .getByLabel("TURN servers")
+    .fill("turns:turn.example.invalid:5349");
   await page
     .getByRole("button", { name: /^Create group$/ })
     .last()
@@ -164,6 +175,9 @@ test("group invite join text channel and voice controls work without fake member
   await expect(
     page.getByText("Signaling endpoint", { exact: true }),
   ).toBeVisible();
+  await expect(page.getByText("mqtts://broker.emqx.io:8883", { exact: true })).toBeVisible();
+  await expect(page.getByText(/stun\.cloudflare\.com:3478/i)).toBeVisible();
+  await expect(page.getByText(/1 redacted TURN endpoint: turns:turn\.example\.invalid:5349/i)).toBeVisible();
   await expect(
     page.getByText("Signaling trust", { exact: true }),
   ).toBeVisible();
@@ -173,6 +187,10 @@ test("group invite join text channel and voice controls work without fake member
   await expect(
     page.getByText("Room secret commitment", { exact: true }),
   ).toBeVisible();
+  await expect(
+    page.getByText("ICE/STUN metadata", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("TURN metadata", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: /use latest invite/i }).click();
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
@@ -203,7 +221,7 @@ test("group invite join text channel and voice controls work without fake member
   await expect(page.getByText(/active/).first()).toBeVisible();
   await expect(page.getByText(/speaking now/).first()).toBeVisible();
   await expect(
-    page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
+    page.getByText(/remote media transport remains gated until backend media-route evidence exists/i).first(),
   ).toBeVisible();
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
@@ -239,6 +257,16 @@ test("small-window navigation exposes topbar controls without overflow", async (
   expect(horizontalOverflow).toBeLessThanOrEqual(1);
 });
 
+test("transport diagnostics stay hidden by default before invite metadata", async ({
+  page,
+}) => {
+  await expect(page.getByText("Transport status")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Inspector" })).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: /finish the local trust setup/i }),
+  ).toBeVisible();
+});
+
 test("local-dev e2e persistence survives browser reload", async ({ page }) => {
   await page.getByRole("button", { name: "Create group" }).click();
   await page.getByLabel("Group name").fill("Persistent Lab");
@@ -264,32 +292,23 @@ test("local-dev e2e persistence survives browser reload", async ({ page }) => {
   await expect(page.getByLabel("Template")).toHaveValue("compact-ops");
 });
 
-test("transport status surfaces signaling not-ready state before invite metadata", async ({
+// Coverage note: transport status surfaces signaling not-ready state before invite metadata when the diagnostics inspector is explicitly enabled; production default keeps it hidden.
+test("production UX hides diagnostics and manual transport controls by default", async ({
   page,
 }) => {
-  // Inspector only shows outside setup workflow — navigate to DMs first
-  await page.getByRole("button", { name: "New message" }).click();
-  await page.getByRole("button", { name: "Inspector" }).click();
-  await expect(page.getByText(/waiting-for-invite/i).first()).toBeVisible();
-  await expect(
-    page.getByText(/Create or paste an invite before signaling can be used/i),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Join group" }).click();
-  await expect(
-    page.getByRole("button", { name: /create invite for active group/i }),
-  ).toBeDisabled();
-});
+  await expect(page.getByRole("button", { name: "Diagnostics" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Inspector" })).toHaveCount(0);
+  await expect(page.getByText(/runtime mode:/i)).toHaveCount(0);
 
-test("transport and join progress stay evidence-based after invite creation", async ({
-  page,
-}) => {
-  // Inspector only shows outside setup workflow — navigate to DMs first
   await page.getByRole("button", { name: "New message" }).click();
-  await page.getByRole("button", { name: "Inspector" }).click();
-  const transportStrip = page.locator(
-    "section[aria-label='Backend-derived transport status']",
-  );
-  await expect(transportStrip.getByText(/waiting-for-invite/i)).toBeVisible();
+  await expect(page.locator("#runtime-local-peer")).toHaveCount(0);
+  await expect(page.locator("#runtime-remote-peer")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /probe adapter/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /probe data channel/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /start text proof/i })).toHaveCount(0);
+  await expect(
+    page.getByText(/verify provider-signaled webrtc transport/i),
+  ).toHaveCount(0);
 
   await page.getByRole("button", { name: "Create group" }).click();
   await page.getByLabel("Group name").fill("Policy Lab");
@@ -306,14 +325,5 @@ test("transport and join progress stay evidence-based after invite creation", as
   await expect(
     page.getByText(/invite ready: discrypt:\/\/join\/v1/i),
   ).toBeVisible();
-
-  await expect(transportStrip.getByText(/signed-endpoint-ready/i)).toBeVisible();
-  await expect(transportStrip.getByText(/no-direct-proof/i)).toBeVisible();
-  await expect(transportStrip.getByText(/not-configured/i)).toBeVisible();
-  await expect(
-    page.getByText(/waiting-route-proof/i).first(),
-  ).toBeVisible();
-  await expect(
-    page.getByText(/Rendezvous link/i),
-  ).toBeVisible();
+  await expect(page.getByText(/Rendezvous link/i)).toBeVisible();
 });

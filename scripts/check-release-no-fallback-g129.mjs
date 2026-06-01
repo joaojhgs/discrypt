@@ -41,6 +41,8 @@ for (const token of [
   "forbiddenReleaseFeatures",
   '"harness", "local-dev"',
   "release builds must not include non-production features",
+  "delete releaseEnv.VITE_DISCRYPT_SHOW_DIAGNOSTICS",
+  'run("npm", ["--prefix", "apps/ui", "run", "build"], { env: releaseEnv })',
   '"test:release-no-fallback-g129"',
 ]) requireText("releaseLinux", token);
 for (const token of ["test:release-no-fallback-g129", "harness/local-dev"]) requireText("releaseCheck", token);
@@ -74,6 +76,9 @@ if (planResult.status !== 0) {
   }
   if (rendered.includes("VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1")) {
     failures.push("release dry-run must not enable VITE_DISCRYPT_LOCAL_DEV_FALLBACK");
+  }
+  if (rendered.includes("VITE_DISCRYPT_SHOW_DIAGNOSTICS=1")) {
+    failures.push("release dry-run must not enable VITE_DISCRYPT_SHOW_DIAGNOSTICS");
   }
   const forbidden = plan.releaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
   if (forbidden.length > 0) failures.push(`release dry-run includes forbidden features: ${forbidden.join(",")}`);

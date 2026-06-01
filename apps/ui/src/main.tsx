@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   discryptUiConfig,
@@ -7,6 +7,7 @@ import {
   TemplateId,
 } from "./app-config";
 import {
+  AppEventStreamView,
   AppMessageView,
   AppSnapshot,
   AppState,
@@ -17,6 +18,7 @@ import {
   InviteView,
   JoinProgressStepView,
   RuntimeModeView,
+  SignalingAdapterKind,
   TextStateView,
   TransportDiagnosticsView,
   TransportStatusView,
@@ -75,7 +77,12 @@ import "./styles.css";
 type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 type SetupStepView = { label: string; complete: boolean; detail: string };
 type VoiceParticipant = VoiceParticipantView;
+const APP_EVENT_TAURI_TOPIC = "app_event";
+const APP_EVENT_FALLBACK_POLL_MS = 5_000;
+const APP_EVENT_HEALTH_RESYNC_MS = 60_000;
+const diagnosticsUiEnabled = import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
 type VoiceDeviceAccess = {
+  stream: MediaStream | null;
   microphone_permission: "granted" | "denied" | "prompt" | "unknown";
   input_device_id: string | null;
   input_device_label: string | null;
@@ -107,7 +114,10 @@ function stableUiHash(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
-function runtimePeerIdFromCommitment(label: string, commitment: string): string {
+function runtimePeerIdFromCommitment(
+  label: string,
+  commitment: string,
+): string {
   return `peer-${stableUiHash(`${label}:${commitment}`)}`;
 }
 
@@ -125,7 +135,9 @@ function textRuntimePeerDefaults(state: AppState): {
     ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
     : state.dms[0];
   const activeGroup = state.active_context?.group_id
-    ? state.groups.find((group) => group.group_id === state.active_context?.group_id)
+    ? state.groups.find(
+        (group) => group.group_id === state.active_context?.group_id,
+      )
     : state.groups[0];
   const activeInvite = state.active_context?.dm_id
     ? state.invites
@@ -150,7 +162,9 @@ function textRuntimePeerDefaults(state: AppState): {
 
   const groupRuntimePeers = activeGroup?.runtime_peers ?? [];
   const backendLocalGroupPeer = groupRuntimePeers.find((peer) => peer.is_local);
-  const backendRemoteGroupPeer = groupRuntimePeers.find((peer) => !peer.is_local);
+  const backendRemoteGroupPeer = groupRuntimePeers.find(
+    (peer) => !peer.is_local,
+  );
   if (backendLocalGroupPeer && backendRemoteGroupPeer) {
     return {
       local: backendLocalGroupPeer.peer_id,
@@ -177,7 +191,9 @@ function textRuntimePeerDefaults(state: AppState): {
       : { local: inviterPeer, remote: replyPeer };
   }
   const groupBootstrap =
-    activeGroup?.connectivity?.group_bootstrap ?? activeInvite?.group_bootstrap ?? null;
+    activeGroup?.connectivity?.group_bootstrap ??
+    activeInvite?.group_bootstrap ??
+    null;
   if (groupBootstrap) {
     const ownerPeer = runtimePeerIdFromCommitment(
       "group-owner-runtime-peer",
@@ -205,10 +221,51 @@ function textRuntimePeerDefaults(state: AppState): {
   };
 }
 
+
+
+function activeScopeLabelForState(state: AppState): string {
+  return (
+    state.active_context?.dm_id ??
+    state.active_context?.group_id ??
+    state.active_context?.channel_id ??
+    "active-scope"
+  );
+}
+
+function textRuntimeRole(state: AppState): "offerer" | "answerer" {
+  const activeDm = state.active_context?.dm_id
+    ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
+    : state.dms[0];
+  const localDmPeer = activeDm?.runtime_peers?.find((peer) => peer.is_local);
+  if (localDmPeer) {
+    return localDmPeer.role === "reply" ? "answerer" : "offerer";
+  }
+
+  const activeGroup = state.active_context?.group_id
+    ? state.groups.find((group) => group.group_id === state.active_context?.group_id)
+    : state.groups[0];
+  const localGroupPeer = activeGroup?.runtime_peers?.find((peer) => peer.is_local);
+  if (localGroupPeer) {
+    return localGroupPeer.role === "member" ? "answerer" : "offerer";
+  }
+
+  if (state.events.some((event) => event.kind === "dm.invite_accepted")) {
+    return "answerer";
+  }
+  if (activeGroup?.role && activeGroup.role !== "owner") {
+    return "answerer";
+  }
+  if (state.events.some((event) => event.kind === "group.joined")) {
+    return "answerer";
+  }
+  return "offerer";
+}
+
 function emptyVoiceDeviceAccess(
   microphonePermission: VoiceDeviceAccess["microphone_permission"],
 ): VoiceDeviceAccess {
   return {
+    stream: null,
     microphone_permission: microphonePermission,
     input_device_id: null,
     input_device_label: null,
@@ -222,13 +279,16 @@ function emptyVoiceDeviceAccess(
 
 async function measureLocalVoiceActivity(
   stream: MediaStream,
-): Promise<Pick<
-  VoiceDeviceAccess,
-  "activity_rms_i16" | "activity_peak_i16" | "activity_captured_at_ms"
->> {
+): Promise<
+  Pick<
+    VoiceDeviceAccess,
+    "activity_rms_i16" | "activity_peak_i16" | "activity_captured_at_ms"
+  >
+> {
   const audioWindow = window as Window &
     typeof globalThis & { webkitAudioContext?: typeof AudioContext };
-  const AudioContextCtor = window.AudioContext ?? audioWindow.webkitAudioContext;
+  const AudioContextCtor =
+    window.AudioContext ?? audioWindow.webkitAudioContext;
   if (!AudioContextCtor) {
     return {
       activity_rms_i16: null,
@@ -279,17 +339,20 @@ async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
     });
     const devices = await navigator.mediaDevices.enumerateDevices();
     const input =
-      devices.find((device) => device.kind === "audioinput" && device.deviceId) ??
-      devices.find((device) => device.kind === "audioinput");
+      devices.find(
+        (device) => device.kind === "audioinput" && device.deviceId,
+      ) ?? devices.find((device) => device.kind === "audioinput");
     const output =
-      devices.find((device) => device.kind === "audiooutput" && device.deviceId) ??
-      devices.find((device) => device.kind === "audiooutput");
+      devices.find(
+        (device) => device.kind === "audiooutput" && device.deviceId,
+      ) ?? devices.find((device) => device.kind === "audiooutput");
     const activity = await measureLocalVoiceActivity(stream).catch(() => ({
       activity_rms_i16: null,
       activity_peak_i16: null,
       activity_captured_at_ms: null,
     }));
     return {
+      stream,
       microphone_permission: "granted",
       input_device_id: input?.deviceId || "default",
       input_device_label: input?.label || "Default microphone",
@@ -298,10 +361,43 @@ async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
       ...activity,
     };
   } catch {
+    stopMediaStream(stream);
     return emptyVoiceDeviceAccess("denied");
-  } finally {
-    stream?.getTracks().forEach((track) => track.stop());
   }
+}
+
+function stopMediaStream(stream: MediaStream | null) {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+function localAudioTracks(stream: MediaStream | null): MediaStreamTrack[] {
+  if (!stream) return [];
+  if (typeof stream.getAudioTracks === "function") {
+    return stream.getAudioTracks();
+  }
+  return stream.getTracks().filter((track) => track.kind === "audio");
+}
+
+
+function audioTracksFromStream(stream: MediaStream | null) {
+  if (!stream) return [];
+  const audioTracks = stream.getAudioTracks?.();
+  return audioTracks?.length ? audioTracks : stream.getTracks();
+}
+
+function parseEndpointList(value: string): string[] {
+  return value
+    .split(/[\n,]/)
+    .map((endpoint) => endpoint.trim())
+    .filter(Boolean);
+}
+
+function parseTurnEndpointList(value: string) {
+  return parseEndpointList(value).map((endpoint) => ({
+    endpoint,
+    credential_declared: true,
+    credential_expires_at: null,
+  }));
 }
 
 function Icon({
@@ -335,20 +431,32 @@ function App() {
     "Hello from the command-backed UI",
   );
   const [draftGroup, setDraftGroup] = useState("private lab");
+  const [draftSignalingAdapter, setDraftSignalingAdapter] =
+    useState<SignalingAdapterKind>("nostr");
+  const [draftSignalingEndpoint, setDraftSignalingEndpoint] = useState(
+    "wss://relay.damus.io",
+  );
+  const [draftIceStunServers, setDraftIceStunServers] = useState(
+    "stun:stun.l.google.com:19302",
+  );
+  const [draftIceTurnServers, setDraftIceTurnServers] = useState("");
   const [draftInvite, setDraftInvite] = useState("invite:joined-enclave");
   const [draftJoinName, setDraftJoinName] = useState("joined enclave");
   const [draftDisplayName, setDraftDisplayName] = useState("Alice");
   const [draftDeviceName, setDraftDeviceName] = useState("Desktop");
-  const [draftRecoveryCode, setDraftRecoveryCode] = useState(
-    "paper-coral-falcon",
-  );
+  const [draftRecoveryCode, setDraftRecoveryCode] =
+    useState("paper-coral-falcon");
   const [draftDmName, setDraftDmName] = useState("New contact");
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [messageTransportProof, setMessageTransportProof] = useState(false);
-  const [runtimeLocalPeerId, setRuntimeLocalPeerId] = useState("");
-  const [runtimeRemotePeerId, setRuntimeRemotePeerId] = useState("");
-  const [eventCursor, setEventCursor] = useState(0);
+  const eventCursorRef = useRef(0);
+  const voiceCaptureRef = useRef<MediaStream | null>(null);
+
+  function updateEventCursor(nextCursor: number) {
+    const cursor = Math.max(eventCursorRef.current, nextCursor);
+    eventCursorRef.current = cursor;
+  }
 
   useEffect(() => {
     let mounted = true;
@@ -356,6 +464,7 @@ function App() {
       .then((loaded) => {
         if (!mounted) return;
         setCommandState(loaded);
+        updateEventCursor(loaded.event_cursor);
         if (loaded.groups.length > 0 && loaded.lifecycle !== "first_run") {
           setWorkflow("channel");
         }
@@ -374,33 +483,90 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      voiceCaptureRef.current?.getTracks().forEach((track) => track.stop());
+      voiceCaptureRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (!commandState || commandState.runtime_mode.mode !== "native") {
       return;
     }
 
+    const tauriListen = window.__TAURI__?.event?.listen;
     let cancelled = false;
-    const eventPoll = window.setInterval(() => {
-      void pollAppEvents({ after: eventCursor, limit: 32 })
-        .then((stream) => {
+    let eventFallbackPoll: number | null = null;
+    let eventHealthResync: number | null = null;
+    let unlistenAppEvent: (() => void) | null = null;
+
+    const refreshCommandState = (stream: AppEventStreamView) => {
+      if (stream.events.length === 0) {
+        updateEventCursor(stream.next_cursor);
+        return;
+      }
+      void loadAppState()
+        .then((refreshed) => {
           if (!cancelled) {
-            setEventCursor(stream.next_cursor);
-            void loadAppState().then((refreshed) => {
-              if (!cancelled) {
-                setCommandState(refreshed);
-              }
-            });
+            setCommandState(refreshed);
+            updateEventCursor(Math.max(stream.next_cursor, refreshed.event_cursor));
           }
         })
         .catch(() => undefined);
-    }, 5000);
+    };
+
+    const pollAppEventFallback = () => {
+      void pollAppEvents({ after: eventCursorRef.current, limit: 32 })
+        .then((stream) => {
+          if (!cancelled) {
+            refreshCommandState(stream);
+          }
+          unlistenAppEvent = unlisten;
+          pollAppEventFallback();
+        })
+        .catch(() => undefined);
+    };
+
+    const startFallbackPolling = () => {
+      if (eventFallbackPoll !== null) return;
+      eventFallbackPoll = window.setInterval(
+        pollAppEventFallback,
+        APP_EVENT_FALLBACK_POLL_MS,
+      );
+    };
+
+    if (tauriListen) {
+      void tauriListen<AppEventStreamView>(APP_EVENT_TAURI_TOPIC, (event) => {
+        refreshCommandState(event.payload);
+      })
+        .then((unlisten) => {
+          if (cancelled) {
+            unlisten();
+            return;
+          }
+          unlistenAppEvent = unlisten;
+        })
+        .catch(startFallbackPolling);
+      eventHealthResync = window.setInterval(
+        pollAppEventFallback,
+        APP_EVENT_HEALTH_RESYNC_MS,
+      );
+    } else {
+      startFallbackPolling();
+    }
 
     return () => {
       cancelled = true;
-      window.clearInterval(eventPoll);
+      unlistenAppEvent?.();
+      if (eventFallbackPoll !== null) {
+        window.clearInterval(eventFallbackPoll);
+      }
+      if (eventHealthResync !== null) {
+        window.clearInterval(eventHealthResync);
+      }
     };
-  }, [commandState?.runtime_mode.mode, eventCursor]);
+  }, [commandState?.runtime_mode.mode]);
 
   async function applyCommand(
     command: Promise<AppState>,
@@ -443,12 +609,9 @@ function App() {
   }
 
   function activeScopeLabel() {
-    return (
-      commandState?.active_context?.dm_id ??
-      commandState?.active_context?.group_id ??
-      commandState?.active_context?.channel_id ??
-      "active-scope"
-    );
+    return commandState
+      ? activeScopeLabelForState(commandState)
+      : "active-scope";
   }
 
   async function probeSelectedDataChannel() {
@@ -472,17 +635,43 @@ function App() {
     );
   }
 
-  async function attachTextRuntime(role: "offerer" | "answerer") {
-    if (!commandState) return;
-    const defaults = textRuntimePeerDefaults(commandState);
+  async function attachTextRuntime(stateOverride?: AppState) {
+    const runtimeState = stateOverride ?? commandState;
+    if (!runtimeState) return;
+    // Runtime peers come from invite/connectivity state, not user-entered pairing fields.
+    const defaults = textRuntimePeerDefaults(runtimeState);
+    // Derived runtime peers are not user-entered pairing fields;
+    // ensureTextRuntimeForActiveScope starts the backend session first.
     await applyCommand(
       attachTextControlTransportRuntime({
         session_id: null,
-        runtime_role: role,
-        local_peer_id: runtimeLocalPeerId || defaults.local,
-        remote_peer_id: runtimeRemotePeerId || defaults.remote,
+        "runtime_role": textRuntimeRole(runtimeState),
+        "local_peer_id": defaults.local,
+        "remote_peer_id": defaults.remote,
       }),
     );
+  }
+
+  async function ensureTextRuntimeForActiveScope(stateForScope: AppState) {
+    // Backend-derived runtime peers come from invite/connectivity state, not user-entered pairing fields.
+    if (!window.__TAURI__?.core?.invoke) return;
+    const scopeLabel = activeScopeLabelForState(stateForScope);
+    const started = await startTextSession({
+      scope_label: scopeLabel,
+      data_channel_probe: true,
+      adapter_kind: null,
+    });
+    setCommandState(started);
+    if (started.last_command_error) {
+      const action = commandErrorToAction(started.last_command_error);
+      setCommandError(
+        action
+          ? `${started.last_command_error.message} — ${action}`
+          : started.last_command_error.message,
+      );
+      return;
+    }
+    await attachTextRuntime(started);
   }
 
   if (loadError) {
@@ -502,7 +691,6 @@ function App() {
 
   const appState = commandState;
   const currentSnapshot = appState.snapshot;
-  const runtimePeerDefaults = textRuntimePeerDefaults(appState);
   const activeGroup = getActiveGroup(appState);
   const activeTextChannel = getActiveTextChannel(appState, activeGroup);
   const activeVoiceChannel = getActiveVoiceChannel(appState, activeGroup);
@@ -516,8 +704,9 @@ function App() {
   const voiceJoined = appState.voice_session?.joined ?? false;
   const selfMuted =
     appState.voice_session?.self_muted ??
-    participants.find((participant) => participant.id === appState.profile?.user_id)
-      ?.muted ??
+    participants.find(
+      (participant) => participant.id === appState.profile?.user_id,
+    )?.muted ??
     false;
   const activeTheme =
     discryptUiConfig.themes.find(
@@ -554,7 +743,10 @@ function App() {
   ];
   const completedSteps = setupSteps.filter((step) => step.complete).length;
   const showInspector =
-    activeTemplate.showRightRail && inspectorOpen && workflow !== "setup";
+    diagnosticsUiEnabled &&
+    activeTemplate.showRightRail &&
+    inspectorOpen &&
+    workflow !== "setup";
 
   async function confirmSafetyNumber() {
     try {
@@ -600,6 +792,10 @@ function App() {
       createGroup({
         name: draftGroup,
         retention: currentSnapshot.retention.selected,
+        adapter_kind: draftSignalingAdapter,
+        signaling_endpoint: draftSignalingEndpoint,
+        ice_stun_servers: parseEndpointList(draftIceStunServers),
+        ice_turn_servers: parseTurnEndpointList(draftIceTurnServers),
       }),
       (state) => {
         const group = getActiveGroup(state);
@@ -640,20 +836,20 @@ function App() {
     const targetWorkflow = kind === "Voice" ? "voice" : "channel";
     void applyCommand(
       setActiveChannel({ group_id: activeGroup.group_id, channel_id: channelId }),
-      () => {
+      (nextState) => {
         setWorkflow(targetWorkflow);
         if (targetWorkflow === "channel" && window.__TAURI__?.core?.invoke) {
-          void attachTextRuntime("answerer");
+          void attachTextRuntime(nextState);
         }
       },
     );
   }
 
   function focusCommandDm(dmId: string) {
-    void applyCommand(setActiveDm({ dm_id: dmId }), () => {
+    void applyCommand(setActiveDm({ dm_id: dmId }), (nextState) => {
       setWorkflow("dm");
       if (window.__TAURI__?.core?.invoke) {
-        void attachTextRuntime("answerer");
+        void attachTextRuntime(nextState);
       }
     });
   }
@@ -685,6 +881,8 @@ function App() {
       setCommandError("Create a group text channel before sending a message.");
       return;
     }
+    const requestTransportProof =
+      messageTransportProof || Boolean(window.__TAURI__?.core?.invoke);
     void applyCommand(
       sendMessage({
         target: {
@@ -694,7 +892,7 @@ function App() {
           channel_id: activeTextChannel.channel_id,
         },
         body,
-        transport_proof: messageTransportProof,
+        transport_proof: requestTransportProof,
         adapter_kind: null,
       }),
       () => setDraftMessage(""),
@@ -704,6 +902,8 @@ function App() {
   function sendCommandDm() {
     const body = draftMessage.trim();
     if (!body || !activeDm) return;
+    const requestTransportProof =
+      messageTransportProof || Boolean(window.__TAURI__?.core?.invoke);
     void applyCommand(
       sendMessage({
         target: {
@@ -713,7 +913,7 @@ function App() {
           channel_id: null,
         },
         body,
-        transport_proof: messageTransportProof,
+        transport_proof: requestTransportProof,
         adapter_kind: null,
       }),
       () => setDraftMessage(""),
@@ -789,6 +989,9 @@ function App() {
       setCommandError("Join a voice channel before muting.");
       return;
     }
+    localAudioTracks(voiceCaptureRef.current).forEach((track) => {
+      track.enabled = !checked;
+    });
     void applyCommand(setSelfMute({ session_id: sessionId, muted: checked }));
   }
 
@@ -818,6 +1021,8 @@ function App() {
         setCommandError("Voice channel creation did not return a channel.");
         return;
       }
+      stopMediaStream(voiceCaptureRef.current);
+      voiceCaptureRef.current = null;
       const voiceAccess = await requestVoiceDeviceAccess();
       const joinedState = await joinVoice({
         group_id: activeGroup.group_id,
@@ -830,6 +1035,12 @@ function App() {
       });
       setCommandState(joinedState);
       setWorkflow("voice");
+      voiceCaptureRef.current = voiceAccess.stream;
+      if (joinedState.voice_session?.self_muted) {
+        localAudioTracks(voiceCaptureRef.current).forEach((track) => {
+          track.enabled = false;
+        });
+      }
       if (joinedState.last_command_error) {
         const action = commandErrorToAction(joinedState.last_command_error);
         setCommandError(
@@ -837,6 +1048,8 @@ function App() {
             ? `${joinedState.last_command_error.message} — ${action}`
             : joinedState.last_command_error.message,
         );
+        stopMediaStream(voiceCaptureRef.current);
+        voiceCaptureRef.current = null;
         return;
       }
       const sessionId = joinedState.voice_session?.session_id;
@@ -859,6 +1072,8 @@ function App() {
     }
     const sessionId = appState.voice_session?.session_id;
     if (!sessionId) return;
+    stopMediaStream(voiceCaptureRef.current);
+    voiceCaptureRef.current = null;
     void applyCommand(leaveVoice({ session_id: sessionId }), () =>
       setWorkflow("voice"),
     );
@@ -877,15 +1092,12 @@ function App() {
   }
 
   function resetCommandState() {
-    void applyCommand(
-      resetAppState({ confirmation: resetPhrase }),
-      (state) => {
-        if (!state.last_command_error) {
-          setResetPhrase("");
-          setWorkflow("setup");
-        }
-      },
-    );
+    void applyCommand(resetAppState({ confirmation: resetPhrase }), (state) => {
+      if (!state.last_command_error) {
+        setResetPhrase("");
+        setWorkflow("setup");
+      }
+    });
   }
 
   if (appState.lifecycle === "first_run") {
@@ -934,8 +1146,12 @@ function App() {
         onSelectWorkflow={setWorkflow}
         onOpenCreateGroup={() => setWorkflow("create-group")}
         onOpenJoin={() => setWorkflow("join")}
-        onSelectTextChannel={(channelId) => focusCommandChannel(channelId, "Text")}
-        onSelectVoiceChannel={(channelId) => focusCommandChannel(channelId, "Voice")}
+        onSelectTextChannel={(channelId) =>
+          focusCommandChannel(channelId, "Text")
+        }
+        onSelectVoiceChannel={(channelId) =>
+          focusCommandChannel(channelId, "Voice")
+        }
         onSelectDm={focusCommandDm}
         onOpenNewDm={() => setWorkflow("dm")}
         voiceJoined={voiceJoined}
@@ -954,7 +1170,8 @@ function App() {
           onOpenJoin={() => setWorkflow("join")}
           onCreateInvite={createCommandInvite}
           onToggleInspector={() => setInspectorOpen((open) => !open)}
-          inspectorOpen={inspectorOpen}
+          inspectorOpen={diagnosticsUiEnabled && inspectorOpen}
+          diagnosticsEnabled={diagnosticsUiEnabled}
           canCreateInvite={Boolean(activeGroup)}
         />
         {commandError ? (
@@ -990,6 +1207,7 @@ function App() {
               onSendDm={sendCommandDm}
               transportProof={messageTransportProof}
               setTransportProof={setMessageTransportProof}
+              diagnosticsEnabled={diagnosticsUiEnabled}
             />
           ) : null}
           {workflow === "join" ? (
@@ -1014,6 +1232,16 @@ function App() {
               snapshot={currentSnapshot}
               groupName={draftGroup}
               setGroupName={setDraftGroup}
+              signalingAdapter={draftSignalingAdapter}
+              setSignalingAdapter={(value) =>
+                setDraftSignalingAdapter(value as SignalingAdapterKind)
+              }
+              signalingEndpoint={draftSignalingEndpoint}
+              setSignalingEndpoint={setDraftSignalingEndpoint}
+              iceStunServers={draftIceStunServers}
+              setIceStunServers={setDraftIceStunServers}
+              iceTurnServers={draftIceTurnServers}
+              setIceTurnServers={setDraftIceTurnServers}
               onCreate={createCommandGroup}
             />
           ) : null}
@@ -1034,6 +1262,7 @@ function App() {
               onSendMessage={sendCommandMessage}
               transportProof={messageTransportProof}
               setTransportProof={setMessageTransportProof}
+              diagnosticsEnabled={diagnosticsUiEnabled}
             />
           ) : null}
           {workflow === "voice" ? (
@@ -1067,15 +1296,12 @@ function App() {
           resetPhrase={resetPhrase}
           setResetPhrase={setResetPhrase}
           onResetState={resetCommandState}
-          localPeerId={runtimeLocalPeerId || runtimePeerDefaults.local}
-          remotePeerId={runtimeRemotePeerId || runtimePeerDefaults.remote}
-          onLocalPeerIdChange={setRuntimeLocalPeerId}
-          onRemotePeerIdChange={setRuntimeRemotePeerId}
+          runtimePeers={textRuntimePeerDefaults(appState)}
+          runtimeRole={textRuntimeRole(appState)}
           onProbeAdapter={probeSelectedAdapter}
           onProbeDataChannel={probeSelectedDataChannel}
           onStartTextTransport={startTextTransportProof}
-          onAttachOfferer={() => attachTextRuntime("offerer")}
-          onAttachAnswerer={() => attachTextRuntime("answerer")}
+          onAttachRuntime={attachTextRuntime}
         />
       ) : null}
     </main>
@@ -1190,7 +1416,7 @@ function FirstRunPanel({
                   1. Choose a display name and device label.
                 </div>
                 <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
-                  2. Enter the app shell with command-backed local state.
+                  2. Enter the app shell with backend-persisted local state.
                 </div>
                 <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
                   3. Verify safety, groups, chat, and voice from the setup
@@ -1378,7 +1604,7 @@ function ChannelSidebar({
                 {groupLabel}
               </h1>
               <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                {role} · command-backed state
+                {role} · backend state
               </p>
             </div>
             <Badge variant={voiceJoined ? "success" : "secondary"}>
@@ -1453,7 +1679,10 @@ function ChannelSidebar({
           {textChannels.map((channel) => (
             <SidebarButton
               key={channel.channel_id}
-              active={selectedWorkflow === "channel" && activeChannelId === channel.channel_id}
+              active={
+                selectedWorkflow === "channel" &&
+                activeChannelId === channel.channel_id
+              }
               onClick={() => onSelectTextChannel(channel.channel_id)}
               meta={channel.retention_status}
             >
@@ -1535,7 +1764,11 @@ function RuntimeModeBanner({ runtimeMode }: { runtimeMode: RuntimeModeView }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant={runtimeMode.production_labels_enabled ? "success" : "warning"}>
+            <Badge
+              variant={
+                runtimeMode.production_labels_enabled ? "success" : "warning"
+              }
+            >
               {runtimeMode.harness_badge}
             </Badge>
             <span className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-50/70">
@@ -1576,6 +1809,7 @@ function TopBar({
   onCreateInvite,
   onToggleInspector,
   inspectorOpen,
+  diagnosticsEnabled,
   canCreateInvite,
 }: {
   groupLabel: string;
@@ -1588,6 +1822,7 @@ function TopBar({
   onCreateInvite: () => void;
   onToggleInspector: () => void;
   inspectorOpen: boolean;
+  diagnosticsEnabled: boolean;
   canCreateInvite: boolean;
 }) {
   return (
@@ -1634,13 +1869,15 @@ function TopBar({
               label: template.label,
             }))}
           />
-          <Button
-            variant={inspectorOpen ? "secondary" : "outline"}
-            size="sm"
-            onClick={onToggleInspector}
-          >
-            Inspector
-          </Button>
+          {diagnosticsEnabled ? (
+            <Button
+              variant={inspectorOpen ? "secondary" : "outline"}
+              size="sm"
+              onClick={onToggleInspector}
+            >
+              Diagnostics
+            </Button>
+          ) : null}
         </div>
       </div>
     </div>
@@ -1683,27 +1920,21 @@ function ConfigSelect({
 function TransportStatusStrip({
   statuses,
   diagnostics,
-  localPeerId,
-  remotePeerId,
-  onLocalPeerIdChange,
-  onRemotePeerIdChange,
+  runtimePeers,
+  runtimeRole,
   onProbeAdapter,
   onProbeDataChannel,
   onStartTextTransport,
-  onAttachOfferer,
-  onAttachAnswerer,
+  onAttachRuntime,
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
-  localPeerId: string;
-  remotePeerId: string;
-  onLocalPeerIdChange: (value: string) => void;
-  onRemotePeerIdChange: (value: string) => void;
+  runtimePeers: { local: string; remote: string };
+  runtimeRole: "offerer" | "answerer";
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
   onStartTextTransport: () => void;
-  onAttachOfferer: () => void;
-  onAttachAnswerer: () => void;
+  onAttachRuntime: () => void;
 }) {
   const ordered = statuses.length
     ? statuses
@@ -1716,7 +1947,8 @@ function TransportStatusStrip({
         {
           label: "ICE",
           status: "waiting-for-signed-invite",
-          detail: "No ICE server metadata is available until an invite descriptor is present",
+          detail:
+            "No ICE server metadata is available until an invite descriptor is present",
         },
       ];
   return (
@@ -1745,41 +1977,35 @@ function TransportStatusStrip({
           <Badge variant="outline">honest status</Badge>
         </div>
       </div>
-      <div className="mb-3 grid gap-2 rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3 md:grid-cols-[1fr_1fr_auto]">
-        <div>
-          <Label className="text-xs" htmlFor="runtime-local-peer">
-            Local runtime peer
-          </Label>
-          <Input
-            id="runtime-local-peer"
-            value={localPeerId}
-            onChange={(event) => onLocalPeerIdChange(event.target.value)}
-            className="mt-1 h-9 font-mono text-xs"
-          />
-        </div>
-        <div>
-          <Label className="text-xs" htmlFor="runtime-remote-peer">
-            Remote runtime peer
-          </Label>
-          <Input
-            id="runtime-remote-peer"
-            value={remotePeerId}
-            onChange={(event) => onRemotePeerIdChange(event.target.value)}
-            className="mt-1 h-9 font-mono text-xs"
-          />
+      <div className="mb-3 grid gap-2 rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3 md:grid-cols-[1fr_auto]">
+        <div className="grid gap-2">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+              Backend-derived text runtime
+            </p>
+            <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              Peer ids and role are derived from signed invite/group metadata;
+              there are no manual peer-id fields in the app shell.
+            </p>
+          </div>
+          <div className="grid gap-2 text-xs md:grid-cols-3">
+            <code className="rounded-lg bg-black/25 px-2 py-1 font-mono">
+              local {runtimePeers.local}
+            </code>
+            <code className="rounded-lg bg-black/25 px-2 py-1 font-mono">
+              remote {runtimePeers.remote}
+            </code>
+            <Badge variant="outline">{runtimeRole}</Badge>
+          </div>
         </div>
         <div className="flex flex-wrap items-end gap-2">
-          <Button size="sm" variant="outline" onClick={onAttachAnswerer}>
-            Listen as answerer
-          </Button>
-          <Button size="sm" onClick={onAttachOfferer}>
-            Connect as offerer
+          <Button size="sm" onClick={onAttachRuntime}>
+            Attach text runtime
           </Button>
         </div>
-        <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))] md:col-span-3">
-          Run the answerer on one profile first, then the offerer on the other
-          with reciprocal peer ids. The backend keeps claims silent unless a
-          real provider-signaled DataChannel attaches.
+        <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))] md:col-span-2">
+          The backend keeps claims silent unless a real provider-signaled
+          DataChannel attaches; ICE/TURN status remains evidence-gated.
         </p>
       </div>
       <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
@@ -1809,7 +2035,9 @@ function TransportStatusStrip({
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
                 Adapter readiness
               </p>
-              <Badge variant={diagnostics.selected_adapter ? "success" : "secondary"}>
+              <Badge
+                variant={diagnostics.selected_adapter ? "success" : "secondary"}
+              >
                 {diagnostics.selected_adapter ?? "none selected"}
               </Badge>
             </div>
@@ -1840,7 +2068,9 @@ function TransportStatusStrip({
               Route proof
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
-              <Badge variant={transportBadgeVariant(diagnostics.route_proof_status)}>
+              <Badge
+                variant={transportBadgeVariant(diagnostics.route_proof_status)}
+              >
                 {diagnostics.route_proof_status}
               </Badge>
               <Badge variant={transportBadgeVariant(diagnostics.turn_required)}>
@@ -1855,7 +2085,11 @@ function TransportStatusStrip({
                 <span className="text-xs font-semibold uppercase tracking-[0.12em] text-[hsl(var(--muted-foreground))]">
                   Adapter probe
                 </span>
-                <Badge variant={transportBadgeVariant(diagnostics.adapter_probe_status)}>
+                <Badge
+                  variant={transportBadgeVariant(
+                    diagnostics.adapter_probe_status,
+                  )}
+                >
                   {diagnostics.adapter_probe_status}
                 </Badge>
               </div>
@@ -1946,7 +2180,8 @@ function TransportStatusStrip({
                     className="text-xs text-[hsl(var(--muted-foreground))]"
                   >
                     {attempt.selected ? "✓" : attempt.attempted ? "•" : "○"}{" "}
-                    {attempt.kind}: {attempt.readiness} ({attempt.failure_class})
+                    {attempt.kind}: {attempt.readiness} ({attempt.failure_class}
+                    )
                   </p>
                 ))}
               </div>
@@ -1961,26 +2196,30 @@ function TransportStatusStrip({
 function transportBadgeVariant(
   status: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if ([
-    "configured",
-    "signed-endpoint-ready",
-    "clear",
-    "available",
-    "selected",
-    "route-proofed",
-    "provider-roundtrip-proofed",
-    "webrtc-datachannel-proofed",
-  ].includes(status)) {
+  if (
+    [
+      "configured",
+      "signed-endpoint-ready",
+      "clear",
+      "available",
+      "selected",
+      "route-proofed",
+      "provider-roundtrip-proofed",
+      "webrtc-datachannel-proofed",
+    ].includes(status)
+  ) {
     return "success";
   }
-  if ([
-    "attention",
-    "last-command-error",
-    "media-gated",
-    "provider-roundtrip-failed",
-    "webrtc-datachannel-failed",
-    "no-healthy-adapter",
-  ].includes(status)) {
+  if (
+    [
+      "attention",
+      "last-command-error",
+      "media-gated",
+      "provider-roundtrip-failed",
+      "webrtc-datachannel-failed",
+      "no-healthy-adapter",
+    ].includes(status)
+  ) {
     return "warning";
   }
   if (["failed"].includes(status)) {
@@ -2208,6 +2447,7 @@ function DmPanel({
   onSendDm,
   transportProof,
   setTransportProof,
+  diagnosticsEnabled,
 }: {
   activeDm: DirectConversationView | null;
   messages: AppMessageView[];
@@ -2220,6 +2460,7 @@ function DmPanel({
   onSendDm: () => void;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
+  diagnosticsEnabled: boolean;
 }) {
   const visibleMessages = activeDm
     ? messages.filter((message) => message.target.dm_id === activeDm.dm_id)
@@ -2229,7 +2470,7 @@ function DmPanel({
       <Card>
         <CardHeader>
           <CardTitle>Direct messages</CardTitle>
-          <CardDescription>Local command-backed DM state.</CardDescription>
+          <CardDescription>Backend-persisted local DM state.</CardDescription>
         </CardHeader>
         <CardContent>
           <Label className="grid gap-2">
@@ -2259,6 +2500,7 @@ function DmPanel({
         disabled={!activeDm}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
+        diagnosticsEnabled={diagnosticsEnabled}
       />
     </div>
   );
@@ -2455,7 +2697,8 @@ function InviteDetailCard({
     ? "revoked locally"
     : "usable while expiry and max-use checks pass";
   const passwordGateStatus = snapshot.invite.password_gate;
-  const mlsAdmissionState = invite.admission_copy || snapshot.invite.welcome_required;
+  const mlsAdmissionState =
+    invite.admission_copy || snapshot.invite.welcome_required;
   return (
     <Card className="border-emerald-300/25 bg-emerald-300/8 text-emerald-50">
       <CardHeader className="gap-3 pb-3">
@@ -2482,14 +2725,25 @@ function InviteDetailCard({
       </CardHeader>
       <CardContent className="grid gap-3">
         <div className="grid gap-3 md:grid-cols-2">
-          <InviteFact label="Signaling endpoint" value={invite.signaling_endpoint || "not provided"} />
-          <InviteFact label="Endpoint policy" value={invite.endpoint_policy || "unknown"} />
+          <InviteFact
+            label="Signaling endpoint"
+            value={invite.signaling_endpoint || "not provided"}
+          />
+          <InviteFact
+            label="Endpoint policy"
+            value={invite.endpoint_policy || "unknown"}
+          />
           <InviteFact label="Expiry label" value={invite.expires} />
-          <InviteFact label="Expires at" value={invite.expires_at || "not provided"} />
+          <InviteFact
+            label="Expires at"
+            value={invite.expires_at || "not provided"}
+          />
           <InviteFact label="Max-use limit" value={invite.max_use} />
           <InviteFact
             label="Remaining local uses"
-            value={remainingUses === null ? "not parsed" : String(remainingUses)}
+            value={
+              remainingUses === null ? "not parsed" : String(remainingUses)
+            }
           />
           <InviteFact label="Revocation status" value={revocationStatus} />
           <InviteFact label="Password-gate status" value={passwordGateStatus} />
@@ -2524,15 +2778,11 @@ function InviteDetailCard({
             label="TURN metadata"
             value={
               invite.ice_turn_servers.length
-                ? invite.ice_turn_servers
-                    .map((server) =>
-                      `${server.endpoint} (${
-                        server.credential_declared
-                          ? "redacted credential declared"
-                          : "no raw credential exposed"
-                      })`,
-                    )
-                    .join(", ")
+                ? `${invite.ice_turn_servers.length} redacted TURN endpoint${
+                    invite.ice_turn_servers.length === 1 ? "" : "s"
+                  }: ${invite.ice_turn_servers
+                    .map((server) => server.endpoint)
+                    .join(", ")}`
                 : "not provided"
             }
           />
@@ -2572,11 +2822,27 @@ function CreateGroupPanel({
   snapshot,
   groupName,
   setGroupName,
+  signalingAdapter,
+  setSignalingAdapter,
+  signalingEndpoint,
+  setSignalingEndpoint,
+  iceStunServers,
+  setIceStunServers,
+  iceTurnServers,
+  setIceTurnServers,
   onCreate,
 }: {
   snapshot: AppSnapshot;
   groupName: string;
   setGroupName: (value: string) => void;
+  signalingAdapter: SignalingAdapterKind;
+  setSignalingAdapter: (value: string) => void;
+  signalingEndpoint: string;
+  setSignalingEndpoint: (value: string) => void;
+  iceStunServers: string;
+  setIceStunServers: (value: string) => void;
+  iceTurnServers: string;
+  setIceTurnServers: (value: string) => void;
   onCreate: () => void;
 }) {
   return (
@@ -2597,6 +2863,48 @@ function CreateGroupPanel({
               onChange={(event) => setGroupName(event.target.value)}
             />
           </Label>
+          <div className="mt-4 grid gap-3">
+            <Label className="grid gap-2">
+              Signaling adapter
+              <Select
+                aria-label="Signaling adapter"
+                value={signalingAdapter}
+                onValueChange={setSignalingAdapter}
+              >
+                <SelectItem value="nostr">Nostr relay</SelectItem>
+                <SelectItem value="mqtt">MQTT broker</SelectItem>
+                <SelectItem value="ipfs_pubsub">IPFS/libp2p pubsub</SelectItem>
+                <SelectItem value="discrypt_quic_rendezvous">
+                  Discrypt rendezvous
+                </SelectItem>
+              </Select>
+            </Label>
+            <Label className="grid gap-2">
+              Signaling endpoint
+              <Input
+                aria-label="Signaling endpoint"
+                value={signalingEndpoint}
+                onChange={(event) => setSignalingEndpoint(event.target.value)}
+              />
+            </Label>
+            <Label className="grid gap-2">
+              STUN servers
+              <Input
+                aria-label="STUN servers"
+                value={iceStunServers}
+                onChange={(event) => setIceStunServers(event.target.value)}
+              />
+            </Label>
+            <Label className="grid gap-2">
+              TURN servers (redacted credentials)
+              <Input
+                aria-label="TURN servers"
+                value={iceTurnServers}
+                placeholder="turns:turn.example.com:5349"
+                onChange={(event) => setIceTurnServers(event.target.value)}
+              />
+            </Label>
+          </div>
           <Button className="mt-5 w-full" onClick={onCreate}>
             Create group
           </Button>
@@ -2609,7 +2917,7 @@ function CreateGroupPanel({
         />
         <InfoRow
           title="Default voice room"
-          copy="Voice Lobby is created for local voice state; no remote participants are invented."
+          copy="Voice Lobby starts from backend voice state; remote participants appear only when backend media evidence exists."
         />
         <InfoRow
           title="Retention warning"
@@ -2636,6 +2944,7 @@ function ChannelPanel({
   onSendMessage,
   transportProof,
   setTransportProof,
+  diagnosticsEnabled,
 }: {
   snapshot: AppSnapshot;
   group: GroupView | null;
@@ -2652,6 +2961,7 @@ function ChannelPanel({
   onSendMessage: () => void;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
+  diagnosticsEnabled: boolean;
 }) {
   const visibleMessages = activeChannel
     ? messages.filter(
@@ -2676,6 +2986,7 @@ function ChannelPanel({
         disabled={!activeChannel}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
+        diagnosticsEnabled={diagnosticsEnabled}
       />
       <Card className="h-fit">
         <CardHeader>
@@ -2745,6 +3056,7 @@ function Timeline({
   disabled,
   transportProof,
   setTransportProof,
+  diagnosticsEnabled,
 }: {
   title: string;
   description: string;
@@ -2757,6 +3069,7 @@ function Timeline({
   disabled?: boolean;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
+  diagnosticsEnabled: boolean;
 }) {
   return (
     <Card className="flex min-h-[72dvh] flex-col overflow-hidden">
@@ -2770,7 +3083,7 @@ function Timeline({
           {messages.length === 0 ? (
             <EmptyState
               title="No messages yet"
-              copy="Send the first local command-backed message. It will persist through reloads."
+              copy="Send the first backend-persisted local message. It will persist through reloads."
             />
           ) : (
             messages.map((message) => (
@@ -2796,14 +3109,16 @@ function Timeline({
               Local encrypted timeline; remote delivery/read receipts require
               signed receipts and are not claimed here.
             </p>
-            <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
-              <Switch
-                checked={transportProof}
-                onCheckedChange={setTransportProof}
-                disabled={disabled}
-              />
-              Verify provider-signaled WebRTC transport for this send
-            </Label>
+            {diagnosticsEnabled ? (
+              <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+                <Switch
+                  checked={transportProof}
+                  onCheckedChange={setTransportProof}
+                  disabled={disabled}
+                />
+                Verify provider-signaled WebRTC transport for this send
+              </Label>
+            ) : null}
           </div>
           <Button onClick={onSend} disabled={disabled || !draftMessage.trim()}>
             {sendLabel}
@@ -2818,7 +3133,10 @@ function TextStateLegend({ states }: { states: TextStateView[] }) {
   if (states.length === 0) return null;
   return (
     <div className="border-b border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.18)] p-3">
-      <div className="flex gap-2 overflow-x-auto pb-1" aria-label="Text message states">
+      <div
+        className="flex gap-2 overflow-x-auto pb-1"
+        aria-label="Text message states"
+      >
         {states.map((state) => (
           <div
             key={state.key}
@@ -2843,9 +3161,19 @@ function TextStateLegend({ states }: { states: TextStateView[] }) {
 function messageStateBadgeVariant(
   stateKey: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if (["sent_local", "received", "transport_probe_verified"].includes(stateKey)) return "success";
-  if (["pending", "locked", "peer_receipt", "transport_probe_unavailable"].includes(stateKey)) return "warning";
-  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey)) return "secondary";
+  if (["sent_local", "received", "transport_probe_verified"].includes(stateKey))
+    return "success";
+  if (
+    [
+      "pending",
+      "locked",
+      "peer_receipt",
+      "transport_probe_unavailable",
+    ].includes(stateKey)
+  )
+    return "warning";
+  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey))
+    return "secondary";
   return "outline";
 }
 
@@ -2927,7 +3255,7 @@ function VoicePanel({
                 permissionDenied
                   ? (voiceSession?.permission_denied_copy ??
                     "Grant microphone permission before joining voice.")
-                  : "Join to request microphone permission and create a local voice session. No remote friend/relay members are fabricated."
+                  : "Join to request microphone permission, selected devices, and backend voice state. Remote members appear only with media evidence."
               }
             />
           ) : null}
@@ -2991,7 +3319,7 @@ function VoicePanel({
         <CardHeader>
           <CardTitle>Call controls</CardTitle>
           <CardDescription>
-            All controls dispatch command-backed state changes.
+            Controls dispatch backend voice state changes; remote media is not claimed until route evidence exists.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-5">
@@ -3008,9 +3336,18 @@ function VoicePanel({
           >
             {voiceJoined ? "Leave call" : "Join call"}
           </Button>
+          <InfoRow title="Selected devices" copy={deviceCopy} />
           <InfoRow
-            title="Selected devices"
-            copy={deviceCopy}
+            title="Media route proof"
+            copy={
+              voiceJoined
+                ? route
+                : "No media route proof until microphone permission, device selection, and media-frame E2E are present."
+            }
+          />
+          <InfoRow
+            title="Remote audio blocker"
+            copy="Remote playback is not claimed until a two-profile media-frame E2E records audio frames over configured signaling/ICE."
           />
           <InfoRow
             title="Voice honesty"
@@ -3035,15 +3372,12 @@ function InspectorRail({
   resetPhrase,
   setResetPhrase,
   onResetState,
-  localPeerId,
-  remotePeerId,
-  onLocalPeerIdChange,
-  onRemotePeerIdChange,
+  runtimePeers,
+  runtimeRole,
   onProbeAdapter,
   onProbeDataChannel,
   onStartTextTransport,
-  onAttachOfferer,
-  onAttachAnswerer,
+  onAttachRuntime,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
@@ -3054,15 +3388,12 @@ function InspectorRail({
   resetPhrase: string;
   setResetPhrase: (value: string) => void;
   onResetState: () => void;
-  localPeerId: string;
-  remotePeerId: string;
-  onLocalPeerIdChange: (value: string) => void;
-  onRemotePeerIdChange: (value: string) => void;
+  runtimePeers: { local: string; remote: string };
+  runtimeRole: "offerer" | "answerer";
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
   onStartTextTransport: () => void;
-  onAttachOfferer: () => void;
-  onAttachAnswerer: () => void;
+  onAttachRuntime: () => void;
 }) {
   const latestEvents = useMemo(
     () => appState.events.slice(-10).reverse(),
@@ -3076,15 +3407,12 @@ function InspectorRail({
           <TransportStatusStrip
             statuses={appState.transport_status}
             diagnostics={appState.transport_diagnostics}
-            localPeerId={localPeerId}
-            remotePeerId={remotePeerId}
-            onLocalPeerIdChange={onLocalPeerIdChange}
-            onRemotePeerIdChange={onRemotePeerIdChange}
+            runtimePeers={runtimePeers}
+            runtimeRole={runtimeRole}
             onProbeAdapter={onProbeAdapter}
             onProbeDataChannel={onProbeDataChannel}
             onStartTextTransport={onStartTextTransport}
-            onAttachOfferer={onAttachOfferer}
-            onAttachAnswerer={onAttachAnswerer}
+            onAttachRuntime={onAttachRuntime}
           />
           <Card>
             <CardHeader>
@@ -3126,7 +3454,7 @@ function InspectorRail({
             <CardHeader>
               <CardTitle>Danger zone</CardTitle>
               <CardDescription>
-                Resetting local state erases this device&apos;s profile, groups, messages, invites, and voice preferences from the command-backed shell.
+                Resetting local state erases this device&apos;s profile, groups, messages, invites, and voice preferences from the backend-persisted shell.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3">
