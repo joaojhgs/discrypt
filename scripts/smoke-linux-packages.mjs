@@ -97,9 +97,15 @@ function dockerSmoke({ image, name, files, script }) {
   };
 }
 
-const deb = firstFile("deb", ".deb");
-const rpm = firstFile("rpm", ".rpm");
-const appImage = firstFile("appimage", ".AppImage");
+const deb = dryRun
+  ? resolve(bundleRoot, "deb/discrypt_0.1.0_amd64.deb")
+  : firstFile("deb", ".deb");
+const rpm = dryRun
+  ? resolve(bundleRoot, "rpm/discrypt-0.1.0-1.x86_64.rpm")
+  : firstFile("rpm", ".rpm");
+const appImage = dryRun
+  ? resolve(bundleRoot, "appimage/discrypt_0.1.0_amd64.AppImage")
+  : firstFile("appimage", ".AppImage");
 
 const steps = [];
 steps.push(run("dpkg-deb", ["-I", deb]));
