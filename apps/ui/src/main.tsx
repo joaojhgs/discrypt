@@ -62,6 +62,7 @@ import {
   verifySafetyNumber,
 } from "./commands";
 import {
+  startNativeRustVoiceMediaSession,
   startWebViewVoiceMediaSession,
   VoiceMediaSessionHandle,
 } from "./voice-media";
@@ -135,7 +136,13 @@ function isLocalVoiceParticipant(
 }
 
 function isUsableMediaStream(value: unknown): value is MediaStream {
-  return typeof MediaStream !== "undefined" && value instanceof MediaStream;
+  if (!value || typeof value !== "object") return false;
+  if (typeof MediaStream !== "undefined" && value instanceof MediaStream) return true;
+  const candidate = value as { getAudioTracks?: unknown; getTracks?: unknown };
+  return (
+    typeof candidate.getAudioTracks === "function" ||
+    typeof candidate.getTracks === "function"
+  );
 }
 
 function remoteAudioSource(
@@ -460,6 +467,19 @@ function startLocalVoiceActivityCapture(
 
 async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
   if (!navigator.mediaDevices?.getUserMedia) {
+    if (window.__TAURI__?.core?.invoke) {
+      return {
+        stream: null,
+        microphone_permission: "granted",
+        input_device_id: "native-rust-default-capture",
+        input_device_label: "Native Rust capture source",
+        output_device_id: "native-rust-default-playback",
+        output_device_label: "Native Rust playback sink",
+        activity_rms_i16: null,
+        activity_peak_i16: null,
+        activity_captured_at_ms: null,
+      };
+    }
     return emptyVoiceDeviceAccess("denied");
   }
 
@@ -1370,85 +1390,124 @@ function App() {
         return;
       }
       const sessionId = joinedState.voice_session?.session_id;
-      if (sessionId && voiceAccess.stream) {
-        stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
-          voiceAccess.stream,
-          (sample) => {
-            const trackEnabled = localAudioTracks(voiceAccess.stream).some(
-              (track) => track.enabled,
-            );
-            setLocalVoiceSpeaking(
-              trackEnabled &&
-                (sample.activity_rms_i16 >= 512 ||
-                  sample.activity_peak_i16 >= 2048),
-            );
+      if (sessionId) {
+        if (voiceAccess.stream) {
+          stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
+            voiceAccess.stream,
+            (sample) => {
+              const trackEnabled = localAudioTracks(voiceAccess.stream).some(
+                (track) => track.enabled,
+              );
+              setLocalVoiceSpeaking(
+                trackEnabled &&
+                  (sample.activity_rms_i16 >= 512 ||
+                    sample.activity_peak_i16 >= 2048),
+              );
+              void applyCommand(
+                updateVoiceActivity({
+                  session_id: sessionId,
+                  rms_i16: sample.activity_rms_i16,
+                  peak_i16: sample.activity_peak_i16,
+                  captured_at_ms: sample.activity_captured_at_ms,
+                }),
+              );
+            },
+          );
+          if (
+            voiceAccess.activity_rms_i16 !== null &&
+            voiceAccess.activity_peak_i16 !== null &&
+            voiceAccess.activity_captured_at_ms !== null
+          ) {
             void applyCommand(
               updateVoiceActivity({
                 session_id: sessionId,
-                rms_i16: sample.activity_rms_i16,
-                peak_i16: sample.activity_peak_i16,
-                captured_at_ms: sample.activity_captured_at_ms,
+                rms_i16: voiceAccess.activity_rms_i16,
+                peak_i16: voiceAccess.activity_peak_i16,
+                captured_at_ms: voiceAccess.activity_captured_at_ms,
               }),
             );
-          },
-        );
-        if (
-          voiceAccess.activity_rms_i16 !== null &&
-          voiceAccess.activity_peak_i16 !== null &&
-          voiceAccess.activity_captured_at_ms !== null
-        ) {
-          void applyCommand(
-            updateVoiceActivity({
-              session_id: sessionId,
-              rms_i16: voiceAccess.activity_rms_i16,
-              peak_i16: voiceAccess.activity_peak_i16,
-              captured_at_ms: voiceAccess.activity_captured_at_ms,
-            }),
-          );
+          }
         }
-        const voiceSession = joinedState.voice_session;
-        const voicePeers = textRuntimePeerDefaults(joinedState);
+        let mediaState = joinedState;
+        if (window.__TAURI__?.core?.invoke) {
+          await ensureTextRuntimeForActiveScope(joinedState);
+          mediaState = commandState ?? joinedState;
+        }
+        const voiceSession = mediaState.voice_session ?? joinedState.voice_session;
+        const voicePeers = textRuntimePeerDefaults(mediaState);
         if (voiceSession) {
-          voiceMediaSessionRef.current = startWebViewVoiceMediaSession({
-            session: voiceSession,
-            localStream: voiceAccess.stream,
-            localPeerId: voicePeers.local,
-            remotePeerId: voicePeers.remote,
-            role: textRuntimeRole(joinedState),
-            connectivity: voiceConnectivityForState(joinedState),
-            onRemoteTrack: (track) => {
-              if (isUsableMediaStream(track.stream)) {
-                setVoiceRemoteStreams((current) => ({
-                  ...current,
-                  [track.participant_id]: track.stream,
-                }));
+          const forceNativeRustVoice = Boolean(
+            (
+              window as typeof window & {
+                __discryptG012ForceNativeRustVoice?: boolean;
               }
-            },
-            onRemoteMedia: (evidence) => {
-              if (isUsableMediaStream(evidence.stream)) {
-                setVoiceRemoteStreams((current) => ({
-                  ...current,
-                  [evidence.participant_id]: evidence.stream,
-                }));
-              }
-              void applyCommand(
-              attachVoiceRemoteMedia({
-                session_id: voiceSession.session_id,
-                participant_id: evidence.participant_id,
-                participant_name: evidence.participant_name,
-                remote_peer_id: evidence.remote_peer_id,
-                stream_id: evidence.stream_id,
-                audio_track_id: evidence.audio_track_id,
-                playback_element_id: evidence.playback_element_id,
-                local_audio_tracks_sent: evidence.local_audio_tracks_sent,
-                received_audio_frames: evidence.received_audio_frames,
-                speaking: evidence.speaking,
-                attached_at_ms: evidence.attached_at_ms,
-              }),
-            );
-            },
-            onStatus: (status) => setCommandError(status),
-          });
+            ).__discryptG012ForceNativeRustVoice ||
+              window.localStorage?.getItem(
+                "discrypt:g012:force-native-rust-voice",
+              ) === "1",
+          );
+          const canUseWebViewRtc = Boolean(
+            !forceNativeRustVoice &&
+              voiceAccess.stream &&
+              typeof RTCPeerConnection !== "undefined" &&
+              localAudioTracks(voiceAccess.stream).length > 0,
+          );
+          if (canUseWebViewRtc && voiceAccess.stream) {
+            voiceMediaSessionRef.current = startWebViewVoiceMediaSession({
+              session: voiceSession,
+              localStream: voiceAccess.stream,
+              localPeerId: voicePeers.local,
+              remotePeerId: voicePeers.remote,
+              role: textRuntimeRole(mediaState),
+              connectivity: voiceConnectivityForState(mediaState),
+              onRemoteTrack: (track) => {
+                if (isUsableMediaStream(track.stream)) {
+                  setVoiceRemoteStreams((current) => ({
+                    ...current,
+                    [track.participant_id]: track.stream,
+                  }));
+                }
+              },
+              onRemoteMedia: (evidence) => {
+                if (isUsableMediaStream(evidence.stream)) {
+                  setVoiceRemoteStreams((current) => ({
+                    ...current,
+                    [evidence.participant_id]: evidence.stream,
+                  }));
+                }
+                void applyCommand(
+                  attachVoiceRemoteMedia({
+                    session_id: voiceSession.session_id,
+                    participant_id: evidence.participant_id,
+                    participant_name: evidence.participant_name,
+                    remote_peer_id: evidence.remote_peer_id,
+                    stream_id: evidence.stream_id,
+                    audio_track_id: evidence.audio_track_id,
+                    playback_element_id: evidence.playback_element_id,
+                    local_audio_tracks_sent: evidence.local_audio_tracks_sent,
+                    received_audio_frames: evidence.received_audio_frames,
+                    speaking: evidence.speaking,
+                    attached_at_ms: evidence.attached_at_ms,
+                  }),
+                );
+              },
+              onStatus: (status) => setCommandError(status),
+            });
+          } else {
+            voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
+              session: voiceSession,
+              localPeerId: voicePeers.local,
+              remotePeerId: voicePeers.remote,
+              role: textRuntimeRole(mediaState),
+              connectivity: voiceConnectivityForState(mediaState),
+              onState: (state) => setCommandState(state as AppState),
+              onStatus: (status) => {
+                if (!/proof generated|proof received/i.test(status)) {
+                  setCommandError(status);
+                }
+              },
+            });
+          }
         }
       }
       return;

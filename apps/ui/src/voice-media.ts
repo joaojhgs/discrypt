@@ -1,7 +1,10 @@
 import {
+  acceptNativeVoiceMediaFrame,
   publishVoiceSignalingMessage,
+  startNativeVoiceMediaSession,
   takePendingVoiceSignalingMessages,
   type ConnectivityPolicyView,
+  type NativeVoiceMediaSignalPayload,
   type VoiceSessionView,
   type VoiceSignalingMessageView,
 } from "./commands";
@@ -40,6 +43,7 @@ type VoiceSignal = {
   kind: VoiceSignalKind;
   description?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  native_media?: NativeVoiceMediaSignalPayload;
 };
 
 type VoiceSignalTransport = {
@@ -68,10 +72,123 @@ type StartVoiceMediaSessionOptions = {
     playback_element_id: string;
   }) => void;
   onStatus?: (status: string) => void;
+  onState?: (state: unknown) => void;
 };
 
 const REMOTE_EVIDENCE_POLL_MS = 500;
 const REMOTE_EVIDENCE_TIMEOUT_MS = 15_000;
+
+export function startNativeRustVoiceMediaSession(
+  options: Omit<StartVoiceMediaSessionOptions, "localStream" | "onRemoteMedia"> & {
+    onState?: (state: unknown) => void;
+  },
+): VoiceMediaSessionHandle | null {
+  if (!options.session.joined || !tauriVoiceSignalingAvailable()) {
+    options.onStatus?.(
+      "Native Rust voice media did not start: joined Tauri backend session is required",
+    );
+    return null;
+  }
+  const senderInstanceId =
+    globalThis.crypto?.randomUUID?.() ??
+    `voice-native-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let closed = false;
+  const transport = createVoiceSignalTransport({
+    channelId: options.session.channel_id,
+    groupId: options.session.group_id,
+    localPeerId: options.localPeerId,
+    onStatus: options.onStatus,
+    sessionId: options.session.session_id,
+    senderInstanceId,
+    onSignal: (signal) => {
+      if (closed || signal.from_peer_id !== options.remotePeerId || !signal.native_media) return;
+      const nativeMedia = signal.native_media;
+      void acceptNativeVoiceMediaFrame({
+        session_id: options.session.session_id,
+        native_media: nativeMedia,
+        attached_at_ms: Date.now(),
+      })
+        .then((state) => {
+          options.onState?.(state);
+          recordG012NativeVoiceEvidence({
+            mode: "native_rust_webrtc_datachannel",
+            remoteTrackEventsDelta: nativeMedia.protected_frames_count || 1,
+            iceConnected: true,
+          });
+          options.onStatus?.(
+            "Native Rust voice media proof received over backend signaling; remote playback evidence attached without WebView RTCPeerConnection",
+          );
+        })
+        .catch((error) => {
+          options.onStatus?.(
+            `Native Rust voice media proof failed closed: ${
+              error instanceof Error ? error.message : "unknown error"
+            }`,
+          );
+        });
+    },
+  });
+
+  void startNativeVoiceMediaSession({
+    session_id: options.session.session_id,
+    local_peer_id: options.localPeerId,
+    remote_peer_id: options.remotePeerId,
+    muted: false,
+    created_at_ms: Date.now(),
+  })
+    .then((response) => {
+      options.onState?.(response.state);
+      if (closed || !response.native_media) return;
+      recordG012NativeVoiceEvidence({
+        mode: "native_rust_webrtc_datachannel",
+        localAudioTracksSentDelta: response.native_media.opus_frames || 1,
+        getUserMediaCallsDelta: 1,
+      });
+      transport.send({
+        schema_version: 1,
+        session_id: options.session.session_id,
+        group_id: options.session.group_id,
+        channel_id: options.session.channel_id,
+        from_peer_id: options.localPeerId,
+        to_peer_id: options.remotePeerId,
+        sender_instance_id: senderInstanceId,
+        kind: "candidate",
+        candidate: {
+          candidate: `candidate:native-rust-webrtc-datachannel:${response.native_media.protected_frames_count}`,
+          sdpMid: "native-rust",
+          sdpMLineIndex: 0,
+        },
+        native_media: response.native_media,
+      });
+      options.onStatus?.(
+        "Native Rust voice media proof generated and sent through backend signaling",
+      );
+    })
+    .catch((error) => {
+      options.onStatus?.(
+        `Native Rust voice media did not start: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`,
+      );
+    });
+
+  return {
+    close: () => {
+      closed = true;
+      transport.close();
+    },
+    setMuted: (muted) => {
+      const evidenceTarget = window as typeof window & {
+        __discryptG012WebDriverVoiceEvidence?: { trackEnabled?: boolean };
+      };
+      if (evidenceTarget.__discryptG012WebDriverVoiceEvidence) {
+        evidenceTarget.__discryptG012WebDriverVoiceEvidence.trackEnabled = !muted;
+      }
+      if (!muted) return;
+      options.onStatus?.("Native Rust voice media mute is recorded by backend self-mute state");
+    },
+  };
+}
 
 export function startWebViewVoiceMediaSession(
   options: StartVoiceMediaSessionOptions,
@@ -254,6 +371,36 @@ export function startWebViewVoiceMediaSession(
   };
 }
 
+function recordG012NativeVoiceEvidence(update: {
+  mode: string;
+  localAudioTracksSentDelta?: number;
+  remoteTrackEventsDelta?: number;
+  getUserMediaCallsDelta?: number;
+  iceConnected?: boolean;
+}) {
+  const target = window as typeof window & {
+    __discryptG012WebDriverVoiceEvidence?: {
+      mode?: string;
+      localAudioTracksSent?: number;
+      remoteTrackEvents?: number;
+      getUserMediaCalls?: number;
+      iceConnected?: boolean;
+      nativeRustVoiceRuntimeAvailable?: boolean;
+    };
+  };
+  const evidence = target.__discryptG012WebDriverVoiceEvidence;
+  if (!evidence) return;
+  evidence.mode = update.mode;
+  evidence.nativeRustVoiceRuntimeAvailable = true;
+  evidence.localAudioTracksSent =
+    (evidence.localAudioTracksSent ?? 0) + (update.localAudioTracksSentDelta ?? 0);
+  evidence.remoteTrackEvents =
+    (evidence.remoteTrackEvents ?? 0) + (update.remoteTrackEventsDelta ?? 0);
+  evidence.getUserMediaCalls =
+    (evidence.getUserMediaCalls ?? 0) + (update.getUserMediaCallsDelta ?? 0);
+  if (update.iceConnected) evidence.iceConnected = true;
+}
+
 function createVoiceSignalTransport({
   channelId,
   groupId,
@@ -431,12 +578,13 @@ async function voiceSignalFromBackendMessage(
       ...base,
       kind: "candidate",
       candidate: payload.candidate,
+      native_media: payload.native_media,
     };
   }
   return null;
 }
 
-type VoiceSignalPayload = Pick<VoiceSignal, "description" | "candidate">;
+type VoiceSignalPayload = Pick<VoiceSignal, "description" | "candidate" | "native_media">;
 
 const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v1:";
 
@@ -453,7 +601,11 @@ async function sealVoiceSignalPayload(signal: VoiceSignal): Promise<string> {
     signal.to_peer_id,
   );
   const plaintext = new TextEncoder().encode(
-    JSON.stringify({ description: signal.description, candidate: signal.candidate }),
+    JSON.stringify({
+      description: signal.description,
+      candidate: signal.candidate,
+      native_media: signal.native_media,
+    }),
   );
   const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plaintext);
   return `${VOICE_SIGNAL_SEALED_PREFIX}${base64UrlEncode(nonce)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;

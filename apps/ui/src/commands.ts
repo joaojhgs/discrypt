@@ -757,6 +757,52 @@ export type TakePendingVoiceSignalingMessagesResponse = {
   messages: VoiceSignalingMessageView[];
 };
 
+export type NativeVoiceProtectedFrameView = {
+  kid: number[];
+  counter: number;
+  bytes: number[];
+};
+
+export type NativeVoiceMediaSignalPayload = {
+  schema_version: "discrypt.native_voice_media.v1" | string;
+  session_id: string;
+  group_id: string;
+  channel_id: string;
+  from_peer_id: string;
+  to_peer_id: string;
+  media_path: "native_rust_webrtc_datachannel" | string;
+  boundary: string;
+  capture_source: string;
+  rms_i16: number;
+  peak_i16: number;
+  speaking: boolean;
+  opus_frames: number;
+  protected_frames_count: number;
+  opus_payload_bytes: number;
+  protected_payload_bytes: number;
+  protected_frames: NativeVoiceProtectedFrameView[];
+  created_at_ms: number;
+};
+
+export type StartNativeVoiceMediaSessionRequest = {
+  session_id: string;
+  local_peer_id: string;
+  remote_peer_id: string;
+  muted?: boolean;
+  created_at_ms: number;
+};
+
+export type StartNativeVoiceMediaSessionResponse = {
+  state: AppState;
+  native_media?: NativeVoiceMediaSignalPayload | null;
+};
+
+export type AcceptNativeVoiceMediaFrameRequest = {
+  session_id: string;
+  native_media: NativeVoiceMediaSignalPayload;
+  attached_at_ms: number;
+};
+
 export type TextControlFrameView =
   | {
       kind: "envelope";
@@ -3476,6 +3522,45 @@ export async function takePendingVoiceSignalingMessages(
       });
       return { state, messages: [] };
     },
+  );
+}
+
+export async function startNativeVoiceMediaSession(
+  request: StartNativeVoiceMediaSessionRequest,
+): Promise<StartNativeVoiceMediaSessionResponse> {
+  return invokeOrFallback<StartNativeVoiceMediaSessionResponse>(
+    "start_native_voice_media_session",
+    { request },
+    () => {
+      const state = mutateFallback((draft) => {
+        pushCommandError(
+          draft,
+          "voice.native_media_rejected",
+          "start_native_voice_media_session",
+          "native_voice_media_unavailable",
+          "Local fallback web runtime cannot start native Rust voice media; Tauri backend is required",
+          "Run the native Tauri app before claiming native Rust voice media proof",
+        );
+      });
+      return { state, native_media: null };
+    },
+  );
+}
+
+export async function acceptNativeVoiceMediaFrame(
+  request: AcceptNativeVoiceMediaFrameRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("accept_native_voice_media_frame", { request }, () =>
+    mutateFallback((state) => {
+      pushCommandError(
+        state,
+        "voice.native_media_rejected",
+        "accept_native_voice_media_frame",
+        "native_voice_media_unavailable",
+        "Local fallback web runtime cannot accept native Rust voice media; Tauri backend is required",
+        "Run the native Tauri app before claiming native Rust voice media proof",
+      );
+    }),
   );
 }
 
