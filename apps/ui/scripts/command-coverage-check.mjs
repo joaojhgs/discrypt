@@ -149,18 +149,6 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
-    command: "set_active_channel",
-    exportName: "setActiveChannel",
-    args: ["group_id", "channel_id"],
-    returns: "AppState",
-  },
-  {
-    command: "set_active_dm",
-    exportName: "setActiveDm",
-    args: ["dm_id"],
-    returns: "AppState",
-  },
-  {
     command: "start_signaling_session",
     exportName: "startSignalingSession",
     args: [
@@ -343,6 +331,20 @@ const rustManifest = [...rust.matchAll(/ipc_commands::([a-zA-Z0-9_]+)/g)].map(
 );
 const uniqueRustManifest = [...new Set(rustManifest)];
 const expectedNames = expectedCommands.map((entry) => entry.command);
+for (const command of expectedNames) {
+  if (expectedNames.indexOf(command) !== expectedNames.lastIndexOf(command)) {
+    failures.push(`duplicate command manifest entry: ${command}`);
+  }
+}
+const expectedExportNames = expectedCommands.map((entry) => entry.exportName);
+for (const exportName of expectedExportNames) {
+  if (
+    expectedExportNames.indexOf(exportName) !==
+    expectedExportNames.lastIndexOf(exportName)
+  ) {
+    failures.push(`duplicate command export manifest entry: ${exportName}`);
+  }
+}
 for (const command of uniqueRustManifest) {
   if (!expectedNames.includes(command)) {
     failures.push(
