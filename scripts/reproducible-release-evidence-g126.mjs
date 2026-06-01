@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const out = resolve(repoRoot, valueAfter("--out") ?? "target/release/reproducibility-g126.json");
+const bundleRoot = resolve(repoRoot, valueAfter("--bundle-dir") ?? "target/release/bundle");
+const sbomRoot = resolve(repoRoot, valueAfter("--sbom-dir") ?? "target/sbom");
 function valueAfter(flag) { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; }
 function run(command, commandArgs) {
   const result = spawnSync(command, commandArgs, { cwd: repoRoot, encoding: "utf8", maxBuffer: 1024 * 1024 * 8 });
@@ -43,8 +45,8 @@ function walk(dir, predicate, output = []) {
 const rustToolchain = readFileSync(resolve(repoRoot, "rust-toolchain.toml"), "utf8");
 const nodeVersion = readFileSync(resolve(repoRoot, ".node-version"), "utf8").trim();
 const osRelease = parseOsRelease(readOptional("/etc/os-release"));
-const packageArtifacts = walk(resolve(repoRoot, "target/release/bundle"), (path) => /\.(deb|rpm|AppImage)$/i.test(path)).sort();
-const sboms = walk(resolve(repoRoot, "target/sbom"), (path) => /\.json$/i.test(path)).sort();
+const packageArtifacts = walk(bundleRoot, (path) => /\.(deb|rpm|AppImage)$/i.test(path)).sort();
+const sboms = walk(sbomRoot, (path) => /\.json$/i.test(path)).sort();
 const evidence = {
   schema: "discrypt.g126.reproducible-release-evidence.v1",
   git: {

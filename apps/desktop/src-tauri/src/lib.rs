@@ -37,7 +37,7 @@ use discrypt_mls_delivery::{
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
-#[cfg(not(all(target_os = "linux", feature = "production-storage")))]
+#[cfg(any(test, not(all(target_os = "linux", feature = "production-storage"))))]
 use discrypt_storage::FileAppStore;
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
 use discrypt_storage::LinuxOsKeychain;
@@ -49,7 +49,6 @@ use discrypt_storage::{
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
-#[cfg(test)]
 #[cfg(test)]
 use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
@@ -1971,9 +1970,15 @@ impl TauriAppService {
     }
 
     fn mutate(&mut self, update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
-        self.state.last_command_error = None;
-        update(&mut self.state);
-        self.persist();
+        let mut candidate = self.state.clone();
+        candidate.last_command_error = None;
+        update(&mut candidate);
+        match self.persist_candidate(&candidate) {
+            Ok(()) => self.state = candidate,
+            Err(error) => {
+                self.state.last_command_error = Some(error);
+            }
+        }
         self.to_view()
     }
 
@@ -2088,16 +2093,17 @@ impl TauriAppService {
         }
     }
 
-    fn persist(&mut self) {
+    fn persist_candidate(&self, state: &PersistedAppState) -> Result<(), CommandErrorView> {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
             let mut store = FileAppStore::new(path);
-            if let Err(error) = persist_state_to_store(&mut store, &self.state) {
-                self.state.last_command_error = Some(error);
-            }
-            return;
+            return persist_state_to_store(&mut store, state);
         }
-        if let Err(error) = persist_state(&self.state) {
+        persist_state(state)
+    }
+
+    fn persist(&mut self) {
+        if let Err(error) = self.persist_candidate(&self.state) {
             self.state.last_command_error = Some(error);
         }
     }
@@ -8228,9 +8234,15 @@ fn mutate_app_service_with_result<T>(
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.state.last_command_error = None;
-    let result = update(&mut guard.state);
-    guard.persist();
+    let mut candidate = guard.state.clone();
+    candidate.last_command_error = None;
+    let result = update(&mut candidate);
+    match guard.persist_candidate(&candidate) {
+        Ok(()) => guard.state = candidate,
+        Err(error) => {
+            guard.state.last_command_error = Some(error);
+        }
+    }
     let view = guard.to_view();
     (view, result)
 }
@@ -8414,8 +8426,7 @@ fn initial_state_with_persistence_error(
     recovery_hint: impl Into<String>,
 ) -> PersistedAppState {
     let mut state = PersistedAppState::initial();
-    state.last_command_error =
-        Some(persistence_command_error(code, message, recovery_hint));
+    state.last_command_error = Some(persistence_command_error(code, message, recovery_hint));
     state
 }
 
@@ -8424,10 +8435,14 @@ fn persistence_command_error(
     message: impl Into<String>,
     recovery_hint: impl Into<String>,
 ) -> CommandErrorView {
+    let code = code.into();
+    let _redacted_detail = redact_sensitive_observable_copy(message);
     CommandErrorView {
-        code: code.into(),
+        code: code.clone(),
         command: "app_persistence".to_owned(),
-        message: redact_sensitive_observable_copy(message),
+        message: format!(
+            "Persistence/security error {code}; detailed storage failure copy is redacted from observable state."
+        ),
         recovery_hint: redact_sensitive_observable_copy(recovery_hint),
     }
 }
@@ -13753,6 +13768,98 @@ mod tests {
         assert_eq!(
             production_path.file_name().and_then(|value| value.to_str()),
             Some(APP_STATE_STORE_FILENAME)
+        );
+    }
+
+    #[test]
+    fn corrupt_persisted_state_surfaces_recovery_error_instead_of_silent_first_run() {
+        let _guard = test_lock();
+        let path = fresh_state_path("corrupt-state");
+        fs::write(&path, b"{not-json").expect("write corrupt app state");
+        let mut store = FileAppStore::new(&path);
+        let state = load_state_from_store(&mut store);
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("corrupt persisted state must surface an error");
+        assert_eq!(error.command, "app_persistence");
+        assert_eq!(error.code, "state_decode_failed");
+        assert!(
+            error
+                .recovery_hint
+                .contains("do not silently treat this as a first-run profile"),
+            "{error:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persistence_save_failure_keeps_live_state_unchanged_and_fail_closed() {
+        let _guard = test_lock();
+        let path = fresh_state_path("save-fail-closed");
+        fs::create_dir_all(&path).expect("create directory at state file path");
+        let mut service = TauriAppService {
+            state: PersistedAppState::initial(),
+            text_control_transport_runtime: None,
+            pending_text_control_transport_runtime: None,
+            state_path_override: Some(path.clone()),
+        };
+
+        let view = service.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Alice Should Not Commit".to_owned(),
+                    device_name: None,
+                },
+                false,
+            );
+        });
+
+        assert!(
+            service.state.profile.is_none(),
+            "failed persistence must not swap candidate state into the live service"
+        );
+        assert!(
+            view.profile.is_none(),
+            "returned view must remain pre-mutation"
+        );
+        let error = service
+            .state
+            .last_command_error
+            .as_ref()
+            .expect("save failure must be surfaced");
+        assert_eq!(error.code, "state_save_failed");
+        assert_eq!(error.command, "app_persistence");
+        assert!(
+            error
+                .message
+                .contains("detailed storage failure copy is redacted"),
+            "{error:?}"
+        );
+        assert!(
+            !error.message.contains("Alice Should Not Commit"),
+            "observable error must not leak uncommitted state"
+        );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn persistence_errors_default_redact_unrecognized_failure_details() {
+        let error = persistence_command_error(
+            "state_save_failed",
+            "database failure leaked-secret-token-12345",
+            "Check disk/keychain availability before continuing; the app did not confirm persistence.",
+        );
+        assert_eq!(error.code, "state_save_failed");
+        assert!(
+            error
+                .message
+                .contains("detailed storage failure copy is redacted"),
+            "{error:?}"
+        );
+        assert!(
+            !error.message.contains("leaked-secret-token-12345"),
+            "unrecognized secret-like storage errors must not be copied verbatim"
         );
     }
 

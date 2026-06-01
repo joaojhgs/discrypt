@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const outDir = resolve(repoRoot, valueAfter("--out-dir") ?? "target/sbom");
+const bundleRoot = resolve(repoRoot, valueAfter("--bundle-dir") ?? "target/release/bundle");
 const requirePackagedArtifacts = args.includes("--require-packaged-artifacts");
 const allowMissingPackagedArtifacts = args.includes("--allow-missing-packaged-artifacts");
 
@@ -44,6 +45,31 @@ function walk(dir, predicate, output = []) {
 function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
+function stableSourceDateEpoch() {
+  const envEpoch = process.env.SOURCE_DATE_EPOCH;
+  if (envEpoch && /^\d+$/.test(envEpoch)) return Number(envEpoch);
+  const result = spawnSync("git", ["log", "-1", "--format=%ct"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.status === 0 && /^\d+$/.test(result.stdout.trim())) {
+    return Number(result.stdout.trim());
+  }
+  return 0;
+}
+function isoFromEpoch(epochSeconds) {
+  return new Date(epochSeconds * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+function namespaceSeed(artifactPaths) {
+  const hash = createHash("sha256");
+  hash.update(sha256(resolve(repoRoot, "Cargo.lock")));
+  hash.update(sha256(resolve(repoRoot, "apps/ui/package-lock.json")));
+  for (const path of artifactPaths) {
+    hash.update(relative(repoRoot, path));
+    hash.update(sha256(path));
+  }
+  return hash.digest("hex");
+}
 function spdxId(value) {
   return `SPDXRef-${value.replace(/[^A-Za-z0-9.-]+/g, "-").replace(/^-+|-+$/g, "")}`;
 }
@@ -57,13 +83,14 @@ const indexPath = resolve(outDir, "discrypt-sbom-index.json");
 const rustSbom = run("cargo", ["sbom", "--output-format", "spdx_json_2_3"], rustPath);
 const npmSbom = run("npm", ["--prefix", "apps/ui", "sbom", "--sbom-format", "spdx", "--sbom-type", "application"], npmPath);
 
-const bundleRoot = resolve(repoRoot, "target/release/bundle");
 const artifactPaths = walk(bundleRoot, (path) => /\.(deb|rpm|AppImage)$/i.test(path)).sort();
 if (requirePackagedArtifacts && artifactPaths.length === 0 && !allowMissingPackagedArtifacts) {
   fail("no packaged artifacts found under target/release/bundle; run npm --prefix apps/ui run release:linux first");
 }
 
-const now = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+const sourceDateEpoch = stableSourceDateEpoch();
+const now = isoFromEpoch(sourceDateEpoch);
+const documentSeed = namespaceSeed(artifactPaths);
 const artifactPackages = artifactPaths.map((path) => {
   const rel = relative(repoRoot, path);
   const size = statSync(path).size;
@@ -93,7 +120,7 @@ const packageDocument = {
   dataLicense: "CC0-1.0",
   SPDXID: "SPDXRef-DOCUMENT",
   name: "discrypt-packaged-artifacts",
-  documentNamespace: `https://example.invalid/discrypt/sbom/packaged-artifacts/${Date.now()}`,
+  documentNamespace: `https://example.invalid/discrypt/sbom/packaged-artifacts/${documentSeed}`,
   creationInfo: {
     created: now,
     creators: ["Tool: scripts/generate-sbom-g124.mjs", "Organization: Discrypt project"],
@@ -116,8 +143,9 @@ const index = {
   source: {
     cargoLock: { path: "Cargo.lock", sha256: sha256(resolve(repoRoot, "Cargo.lock")) },
     packageLock: { path: "apps/ui/package-lock.json", sha256: sha256(resolve(repoRoot, "apps/ui/package-lock.json")) },
-    packageArtifacts: "target/release/bundle",
+    packageArtifacts: relative(repoRoot, bundleRoot),
     linuxBundleTargets: bundleTargets,
+    sourceDateEpoch,
   },
   packagedArtifacts: artifactPaths.map((path) => ({
     path: relative(repoRoot, path),

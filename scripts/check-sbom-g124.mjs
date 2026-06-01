@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -42,13 +42,30 @@ for (const token of ["test:sbom-g124", "SBOM generated for Rust, npm, and packag
 }
 
 const outDir = mkdtempSync(resolve(tmpdir(), "discrypt-g124-sbom-"));
+const bundleDir = mkdtempSync(resolve(tmpdir(), "discrypt-g124-bundles-"));
 try {
+  for (const [subdir, name] of [
+    ["deb", "discrypt_0.1.0_amd64.deb"],
+    ["rpm", "discrypt-0.1.0-1.x86_64.rpm"],
+    ["appimage", "discrypt_0.1.0_amd64.AppImage"],
+  ]) {
+    const dir = resolve(bundleDir, subdir);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(resolve(dir, name), `discrypt-g124-test-artifact:${name}\n`);
+  }
   const result = spawnSync(process.execPath, [
     "scripts/generate-sbom-g124.mjs",
     "--out-dir",
     outDir,
+    "--bundle-dir",
+    bundleDir,
     "--require-packaged-artifacts",
-  ], { cwd: repoRoot, encoding: "utf8", maxBuffer: 1024 * 1024 * 32 });
+  ], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { ...process.env, SOURCE_DATE_EPOCH: "1780330000" },
+    maxBuffer: 1024 * 1024 * 32,
+  });
   if (result.status !== 0) {
     failures.push(`generate-sbom-g124 failed:\n${result.stdout}\n${result.stderr}`.trim());
   } else {
@@ -76,6 +93,7 @@ try {
   }
 } finally {
   rmSync(outDir, { recursive: true, force: true });
+  rmSync(bundleDir, { recursive: true, force: true });
 }
 
 if (failures.length > 0) {

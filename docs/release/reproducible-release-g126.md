@@ -22,6 +22,23 @@ This writes `target/release/reproducibility-g126.json` with git commit,
 lockfile hashes, Rust/Node/npm/Tauri/cargo-audit/cargo-deny/cargo-sbom versions,
 release features, package artifact hashes, and SBOM hashes.
 
+## Prerequisite order
+
+`npm --prefix apps/ui run test:repro-g126` is an evidence-completeness gate,
+not a standalone dry-run. It is expected to fail with missing package artifact or
+SBOM hashes until the release lane has first produced Linux bundles and SBOMs.
+For G011 release evidence, run the gates in this order on the integrated leader
+branch:
+
+1. `npm --prefix apps/ui run test:release-linux` to verify the dry-run plan.
+2. `npm --prefix apps/ui run release:linux` to build `.deb`, `.rpm`, and
+   `.AppImage` artifacts.
+3. `npm --prefix apps/ui run sbom:g124` to generate packaged-artifact SBOMs
+   from those bundles.
+4. `npm --prefix apps/ui run repro:g126` to record the artifact/SBOM hashes.
+5. `npm --prefix apps/ui run test:repro-g126` to prove the recorded
+   reproducibility evidence is complete.
+
 ## Rebuild recipe
 
 1. Check out the recorded git commit.

@@ -22,6 +22,7 @@ for (const token of [
   "npm --prefix apps/ui run smoke:linux-packages",
   "Build unsigned macOS package artifacts",
   "Build unsigned Windows package artifacts",
+  "macOS/Windows package artifacts are build-only until platform trust, SBOM, and reproducibility parity are added.",
   "@tauri-apps/cli@2.11.2 build",
   "--config apps/desktop/src-tauri/tauri.conf.json",
   "--features tauri-runtime,production-network,production-media",

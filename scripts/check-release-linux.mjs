@@ -37,6 +37,7 @@ for (const token of [
   "npm --prefix apps/ui run test:ui-integration-g130",
   "npm --prefix apps/ui run build",
   "cargo test -p discrypt-desktop --features",
+  "production_storage_persists_sealed_envelope_without_plain_state",
   "npx --yes @tauri-apps/cli@2.11.2 build",
   "--bundles deb,rpm,appimage",
   "node scripts/generate-sbom-g124.mjs --out-dir target/sbom --require-packaged-artifacts",

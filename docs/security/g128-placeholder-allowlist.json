@@ -21,6 +21,12 @@
     {
       "path": ".github/workflows/android.yml",
       "pattern": "emulat",
+      "expected": "\"emulator\" \\",
+      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/android.yml",
+      "pattern": "emulat",
       "expected": "- docs/release/android-build-emulator-gate.md",
       "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
     },
@@ -28,12 +34,6 @@
       "path": ".github/workflows/android.yml",
       "pattern": "emulat",
       "expected": "- uses: reactivecircus/android-emulator-runner@v2",
-      "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
-    },
-    {
-      "path": ".github/workflows/android.yml",
-      "pattern": "emulat",
-      "expected": "\"emulator\" \\",
       "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
     },
     {
@@ -161,6 +161,12 @@
       "pattern": "local-dev",
       "expected": "safetyNumber: groupSafetyHash(`local-dev-fallback:${publicKey}`),",
       "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/voice-media.ts",
+      "pattern": "local-dev",
+      "expected": "\"Voice signaling unavailable: Tauri IPC is absent and local-dev/test BroadcastChannel fallback is disabled\",",
+      "reason": "Voice signaling remains fail-closed outside Tauri unless the explicit local-dev/test fallback harness is enabled; G129 keeps this path out of production release claims."
     },
     {
       "path": "crates/abuse/src/lib.rs",
@@ -471,8 +477,20 @@
     {
       "path": "crates/transport/src/lib.rs",
       "pattern": "local-dev",
+      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
+      "reason": "Compile-time harness/local-dev gate is explicitly excluded from production builds and surfaced by production status checks."
+    },
+    {
+      "path": "crates/transport/src/lib.rs",
+      "pattern": "local-dev",
       "expected": "//! builds keep `harness` and `local-dev` disabled; production claims require the",
       "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+    },
+    {
+      "path": "crates/transport/src/policy.rs",
+      "pattern": "local-dev",
+      "expected": "\"local-dev signaling endpoints must be loopback cleartext only\".to_owned(),",
+      "reason": "Policy validation rejects non-loopback cleartext local-dev endpoints, documenting a test-only boundary rather than production fallback."
     },
     {
       "path": "crates/transport/src/production_status.rs",
@@ -493,28 +511,16 @@
       "reason": "ProductionStatus reports whether harness/local-dev feature flags are compiled so release gates can reject non-production builds."
     },
     {
-      "path": "crates/transport/src/lib.rs",
+      "path": "crates/transport/src/provider_adapters.rs",
       "pattern": "local-dev",
-      "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
-      "reason": "Compile-time harness/local-dev gate is explicitly excluded from production builds and surfaced by production status checks."
+      "expected": "\"local conformance adapters require local-dev loopback endpoints\".to_owned(),",
+      "reason": "Provider adapter validation rejects conformance endpoints unless they are loopback local-dev endpoints used for tests only."
     },
     {
       "path": "crates/transport/src/signaling.rs",
       "pattern": "local-dev",
       "expected": "#[cfg(any(test, feature = \"harness\", feature = \"local-dev\"))]",
       "reason": "Compile-time harness/local-dev test support is excluded from production builds and remains auditable by the release gate."
-    },
-    {
-      "path": "crates/transport/src/policy.rs",
-      "pattern": "local-dev",
-      "expected": "\"local-dev signaling endpoints must be loopback cleartext only\".to_owned(),",
-      "reason": "Policy validation rejects non-loopback cleartext local-dev endpoints, documenting a test-only boundary rather than production fallback."
-    },
-    {
-      "path": "crates/transport/src/provider_adapters.rs",
-      "pattern": "local-dev",
-      "expected": "\"local conformance adapters require local-dev loopback endpoints\".to_owned(),",
-      "reason": "Provider adapter validation rejects conformance endpoints unless they are loopback local-dev endpoints used for tests only."
     },
     {
       "path": "crates/transport/src/signaling.rs",

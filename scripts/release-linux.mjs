@@ -94,7 +94,14 @@ steps.push(
   run("npm", ["--prefix", "apps/ui", "run", "test:release-no-fallback-g129"], { env: releaseEnv }),
   run("npm", ["--prefix", "apps/ui", "run", "test:ui-integration-g130"], { env: releaseEnv }),
   run("npm", ["--prefix", "apps/ui", "run", "build"], { env: releaseEnv }),
-  run("cargo", ["test", "-p", "discrypt-desktop", "--features", releaseFeatures.join(",")]),
+  run("cargo", [
+    "test",
+    "-p",
+    "discrypt-desktop",
+    "--features",
+    releaseFeatures.join(","),
+    "production_storage_persists_sealed_envelope_without_plain_state",
+  ]),
   run("npx", [
     "--yes",
     tauriCli,
