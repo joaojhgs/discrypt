@@ -1997,6 +1997,7 @@ struct OpenMlsGroupHandleRecord {
     status_copy: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct OpenMlsAdmissionKeyPackage {
     group_id: String,
     member_identity: String,
@@ -2004,6 +2005,7 @@ struct OpenMlsAdmissionKeyPackage {
     package: OpenMlsMemberPackage,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
@@ -2232,6 +2234,7 @@ impl TauriAppService {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn openmls_store_path(&self) -> PathBuf {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
@@ -2240,13 +2243,14 @@ impl TauriAppService {
         app_openmls_store_path()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn request_openmls_admission_key_package(
         &mut self,
         group_id: &str,
     ) -> Result<OpenMlsAdmissionKeyPackage, String> {
         self.state.ensure_ready_profile();
         let member_identity = self.state.local_user_id();
-        let mut engine = OpenMlsGroupEngine::open(self.openmls_store_path())
+        let engine = OpenMlsGroupEngine::open(self.openmls_store_path())
             .map_err(|error| format!("OpenMLS joiner provider could not be opened: {error}"))?;
         let package = engine
             .generate_member_package(member_identity.as_bytes())
@@ -2267,6 +2271,7 @@ impl TauriAppService {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn issue_openmls_admission_welcome(
         &mut self,
         key_package: &OpenMlsAdmissionKeyPackage,
@@ -2329,6 +2334,7 @@ impl TauriAppService {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn join_openmls_group_from_welcome(
         &mut self,
         welcome: &OpenMlsAdmissionWelcome,
@@ -9068,6 +9074,7 @@ fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> 
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn upsert_openmls_group_handle(state: &mut PersistedAppState, record: OpenMlsGroupHandleRecord) {
     if let Some(existing) = state
         .openmls_groups
