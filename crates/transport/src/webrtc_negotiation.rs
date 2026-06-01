@@ -1427,7 +1427,9 @@ mod tests {
         config.ice_transport_policy = WebRtcIceTransportPolicy::RelayOnly;
 
         let Err(error) = WebRtcNegotiator::new(config).await else {
-            panic!("relay-only hard-NAT policy must not run without TURN");
+            return Err(TransportError::InvalidIcePolicy(
+                "relay-only hard-NAT policy must not run without TURN".to_owned(),
+            ));
         };
         assert!(format!("{error}").contains("relay-only WebRTC policy requires"));
         Ok(())
