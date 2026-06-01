@@ -2106,6 +2106,31 @@ struct TauriAppService {
     state_path_override: Option<PathBuf>,
 }
 
+#[cfg(test)]
+struct TestAppStatePathOverrideGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestAppStatePathOverrideGuard {
+    fn activate(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("DISCRYPT_APP_STATE_PATH");
+        std::env::set_var("DISCRYPT_APP_STATE_PATH", path);
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAppStatePathOverrideGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var("DISCRYPT_APP_STATE_PATH", previous);
+        } else {
+            std::env::remove_var("DISCRYPT_APP_STATE_PATH");
+        }
+    }
+}
+
 impl TauriAppService {
     fn load() -> Self {
         Self {
@@ -2133,6 +2158,11 @@ impl TauriAppService {
     }
 
     fn mutate(&mut self, update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
+        #[cfg(test)]
+        let _state_path_override_guard = self
+            .state_path_override
+            .as_deref()
+            .map(TestAppStatePathOverrideGuard::activate);
         let mut candidate = self.state.clone();
         candidate.last_command_error = None;
         update(&mut candidate);
