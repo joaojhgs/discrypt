@@ -10,6 +10,7 @@ const requiredCommandEvidence = [
   "npm --prefix apps/ui run test:final-e2e-g131",
   "npm --prefix apps/ui run test:release-two-profile-harness-g010",
   "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
+  "npm --prefix apps/ui run test:g011-boundary",
   "npm --prefix apps/ui run test:e2e",
   "npm --prefix apps/ui run test:ui-integration-g130",
   "npm --prefix apps/ui run test:release-no-fallback-g129",
@@ -89,6 +90,7 @@ function run() {
 
   for (const script of [
     "test:e2e",
+    "test:g011-boundary",
     "test:release-two-profile-harness-g010",
     "release:two-profile-harness-g010",
     "release:two-profile-harness-g010:dry-run",
@@ -139,6 +141,8 @@ function run() {
     "cargo clippy --workspace --all-targets --quiet -- -D warnings",
     "npm --prefix apps/ui run test:release-two-profile-harness-g010",
     "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
+    "npm --prefix apps/ui run test:g011-boundary",
+  "npm --prefix apps/ui run test:g011-boundary",
   ]) requireText(failures, "G131 final verification doc", g131Doc, token);
 
   for (const token of [
@@ -150,6 +154,7 @@ function run() {
     "Sensitive data exclusion",
     "signaling admin audit tokens",
     "TURN static auth secrets",
+    "G011/G012 boundary and unsupported-path gate",
   ]) requireText(failures, "release verification matrix", releaseMatrix, token);
 
 

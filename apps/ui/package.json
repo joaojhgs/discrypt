@@ -14,6 +14,7 @@
     "test:g007-voice-media": "node scripts/g007-voice-media-e2e.mjs",
     "test:g010-native-command-e2e": "node scripts/g010-native-command-e2e.mjs",
     "test:g010-adapter-public-matrix": "node ../../scripts/check-g010-adapter-public-matrix.mjs",
+    "test:g011-boundary": "node ../../scripts/check-g011-boundary-gate.mjs",
     "test:honesty": "node scripts/honesty-gates.mjs",
     "release:linux": "node ../../scripts/release-linux.mjs",
     "release:linux:dry-run": "node ../../scripts/release-linux.mjs --dry-run",
