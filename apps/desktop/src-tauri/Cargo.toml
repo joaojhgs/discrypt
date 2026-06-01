@@ -15,7 +15,7 @@ local-dev = ["discrypt-core/local-dev", "discrypt-media/local-dev", "discrypt-st
 production-network = ["discrypt-core/production-network", "discrypt-media/production-network", "discrypt-storage/production-network", "discrypt-transport/production-network", "external-signaling/production-network"]
 production-media = ["discrypt-core/production-media", "discrypt-media/production-media", "discrypt-storage/production-media"]
 production-storage = ["discrypt-core/production-storage", "discrypt-media/production-storage", "discrypt-storage/production-storage"]
-tauri-runtime = ["dep:tauri", "dep:tauri-build", "tauri/wry", "dep:webkit2gtk"]
+tauri-runtime = ["dep:tauri", "dep:tauri-build", "dep:webkit2gtk", "tauri/wry"]
 mqtt-adapter = ["production-network", "discrypt-transport/mqtt-adapter"]
 nostr-adapter = ["production-network", "discrypt-transport/nostr-adapter"]
 ipfs-pubsub-adapter = ["production-network", "discrypt-transport/ipfs-pubsub-adapter"]
@@ -51,3 +51,6 @@ tauri-build = { version = "2.5.3", optional = true , features = [] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+webkit2gtk = { version = "2.0.2", optional = true }
