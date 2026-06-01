@@ -1972,7 +1972,6 @@ struct OpenMlsAdmissionKeyPackage {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
     owner_signer_public_key_hex: String,
@@ -7668,46 +7667,8 @@ impl PersistedAppState {
                 Ok((group_id, sender_key))
             })
             .and_then(|(group_id, sender_key)| {
-                let decrypted_plaintext = match self
-                    .openmls_text_exporter_for_target(&request.target, &group_id)
-                {
-                    Ok((text_exporter_secret, current_epoch, _local_leaf)) => {
-                        let mut receive_state = TextReceiveState::default();
-                        let mut recipient_store = InMemoryTextRecipientStore::default();
-                        let mut receive_events = InMemoryTextReceiveEvents::default();
-                        let mut authorized_sender_leaves = BTreeSet::new();
-                        authorized_sender_leaves.insert(request.envelope.sender_leaf);
-                        let renderable = TextInboundPipeline::new(
-                            &mut receive_state,
-                            &mut recipient_store,
-                            &mut receive_events,
-                        )
-                        .receive(
-                            TextInboundRequest {
-                                group_id: group_id.clone(),
-                                channel_id: request.target.channel_id.clone().unwrap_or_default(),
-                                current_epoch,
-                                authorized_sender_leaves,
-                                envelope: request.envelope.clone(),
-                                received_at_ms: self.next_sequence.saturating_add(1),
-                                retention_allows_decrypt: true,
-                            },
-                            &text_exporter_secret,
-                            &sender_key,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        match renderable.state {
-                            TextRenderState::Decrypted(bytes) => Some(
-                                String::from_utf8(bytes)
-                                    .map_err(|_| "decrypted text was not valid UTF-8".to_owned())?,
-                            ),
-                            TextRenderState::Locked { reason } => {
-                                return Err(format!("OpenMLS text plaintext locked: {reason}"));
-                            }
-                        }
-                    }
-                    Err(_) => None,
-                };
+                let plaintext_render =
+                    self.receive_text_plaintext_render(&request, &group_id, &sender_key)?;
                 let recipient_leaf = request.recipient_leaf.unwrap_or(1);
                 let recipient_seed = self.identity_seed_bytes();
                 let recipient_signer = SigningKey::from_bytes(&recipient_seed);
@@ -7744,36 +7705,19 @@ impl PersistedAppState {
                 {
                     let sequence = self.next_sequence;
                     self.next_sequence = self.next_sequence.saturating_add(1);
-                    let plaintext_rendered = decrypted_plaintext.is_some();
-                    let body = decrypted_plaintext.unwrap_or_else(|| {
-                        format!(
-                            "Encrypted message envelope received (ciphertext_hash={})",
-                            hex::encode(request.envelope.ciphertext_hash())
-                        )
-                    });
+                    let (body, status, state_key, state_label, render_detail) =
+                        plaintext_render.message_fields(&request.envelope);
                     self.messages.push(MessageView {
                         message_id: request.envelope.message_id.clone(),
                         target: request.target.clone(),
                         author_id: request.envelope.sender_device_id.clone(),
                         author: format!("Peer {}", key_fingerprint(&sender_key)),
                         body,
-                        status: if plaintext_rendered {
-                            "OpenMLS exporter-backed encrypted peer envelope verified, decrypted, and persisted; signed delivery receipt generated".to_owned()
-                        } else {
-                            "signed encrypted peer envelope verified and persisted; plaintext decrypt/render still requires the MLS receive loop".to_owned()
-                        },
-                        state_key: if plaintext_rendered {
-                            "received_plaintext".to_owned()
-                        } else {
-                            "received_envelope".to_owned()
-                        },
-                        state_label: if plaintext_rendered {
-                            "Plaintext received".to_owned()
-                        } else {
-                            "Envelope received".to_owned()
-                        },
+                        status,
+                        state_key,
+                        state_label,
                         state_detail: format!(
-                            "Verified sender={} {} {} and generated signed delivery receipt{}",
+                            "Verified sender={} {} {}; {render_detail}; generated signed delivery receipt",
                             key_fingerprint(&sender_key),
                             redacted_message_ref(&request.envelope.message_id),
                             redacted_observable_ref("group_binding", &group_id),
@@ -7797,17 +7741,7 @@ impl PersistedAppState {
                     format!(
                         "Verified encrypted peer envelope {} and generated signed receipt ({})",
                         redacted_message_ref(&request.envelope.message_id),
-                        if self
-                            .messages
-                            .iter()
-                            .any(|message| {
-                                message.message_id == request.envelope.message_id
-                                    && message.state_key == "received_plaintext"
-                            }) {
-                            "plaintext_rendered"
-                        } else {
-                            "envelope_only"
-                        }
+                        plaintext_render.event_label()
                     ),
                 );
                 Ok((receipt, recipient_verifying_key_hex))
