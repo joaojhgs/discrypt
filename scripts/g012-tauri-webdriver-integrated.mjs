@@ -700,18 +700,30 @@ try {
     voice?.alice?.iceConnected &&
     voice?.bob?.iceConnected,
   );
-  const nativeVoiceProbe = {
-    alice: voice?.alice?.nativeProbe ?? voice?.before_leave?.alice?.evidence?.nativeProbe ?? null,
-    bob: voice?.bob?.nativeProbe ?? voice?.before_leave?.bob?.evidence?.nativeProbe ?? null,
-  };
+  let voiceRemoteMediaStatus = "voice_remote_media_not_observed";
+  if (nativeVoiceLoopbackObserved) {
+    voiceRemoteMediaStatus = "native_rtc_generated_audio_loopback";
+  } else if (syntheticVoiceFallbackObserved) {
+    voiceRemoteMediaStatus = "synthetic_peerconnection_fallback_loopback";
+  } else if (voiceLoopbackObserved) {
+    voiceRemoteMediaStatus = "non_native_browser_media_harness_loopback";
+  }
   const summary = {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
-    production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_generated_audio_voice_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
-    voice_remote_media_status: nativeVoiceLoopbackObserved ? "native_rtc_generated_audio_loopback" : voiceLoopbackObserved ? "synthetic_peerconnection_fallback_loopback" : "voice_remote_media_not_observed",
-    native_voice_production_proof: nativeVoiceLoopbackObserved,
-    native_voice_probe: nativeVoiceProbe,
+    production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
+    voice_remote_media_status: voiceRemoteMediaStatus,
+    g012_checkpoint_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved,
+    voice_proof: {
+      loopback_observed: voiceLoopbackObserved,
+      native_generated_audio_observed: nativeVoiceLoopbackObserved,
+      synthetic_fallback_observed: syntheticVoiceFallbackObserved,
+      production_claim_allowed: nativeVoiceLoopbackObserved,
+      blocker: nativeVoiceLoopbackObserved
+        ? "physical two-device microphone/speaker proof is still outside this automated generated-audio harness"
+        : "native RTCPeerConnection generated-audio loopback was not observed in both Tauri WebViews",
+    },
     run_id: runId,
     artifact_root: rel(artifactRoot),
     invite_prefix: invite.slice(0, 48),
