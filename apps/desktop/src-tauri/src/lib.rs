@@ -608,6 +608,44 @@ impl Default for VoiceMediaRuntimeView {
     }
 }
 
+/// Backend-owned voice signaling exchange state for browser RTCPeerConnection setup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceSignalingStateView {
+    /// Voice session id this signaling state is scoped to.
+    pub session_id: String,
+    /// Provider/runtime peer id derived from persisted invite/bootstrap state.
+    pub local_peer_id: String,
+    /// Provider/runtime peer id for the remote participant derived from persisted state.
+    pub remote_peer_id: String,
+    /// Local WebRTC negotiation role (`offerer` or `answerer`) derived from runtime peer state.
+    pub role: String,
+    /// Pending local offer/answer/candidate frames queued to the text/control outbox.
+    pub pending_local_signals: u32,
+    /// Remote offer/answer/candidate frames received from the provider-signaled text/control path.
+    pub received_remote_signals: u32,
+    /// Last local or remote signal kind observed for this voice session.
+    #[serde(default)]
+    pub last_signal_kind: Option<String>,
+    /// Honest state/evidence copy for UI and audit surfaces.
+    pub status_copy: String,
+}
+
+impl Default for VoiceSignalingStateView {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            local_peer_id: String::new(),
+            remote_peer_id: String::new(),
+            role: "not-started".to_owned(),
+            pending_local_signals: 0,
+            received_remote_signals: 0,
+            last_signal_kind: None,
+            status_copy: "Voice signaling has not started; no SDP or ICE has crossed backend state"
+                .to_owned(),
+        }
+    }
+}
+
 /// Command-backed channel-scoped voice session state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSessionView {
@@ -633,6 +671,9 @@ pub struct VoiceSessionView {
     /// Backend-owned media runtime/session boundary.
     #[serde(default)]
     pub media_runtime: VoiceMediaRuntimeView,
+    /// Backend-owned voice signaling exchange state for RTCPeerConnection setup.
+    #[serde(default)]
+    pub signaling: VoiceSignalingStateView,
     /// Participant roster.
     pub participants: Vec<VoiceParticipantView>,
     /// Honest route/status copy.
@@ -1106,6 +1147,11 @@ pub enum TextControlFrameView {
         #[serde(default)]
         recipient_leaf: Option<u32>,
     },
+    /// Backend-state-only browser media offer/answer/candidate message for the browser media runtime; this struct alone does not claim remote audio.
+    VoiceSignal {
+        /// Voice signaling payload validated and persisted by the backend.
+        signal: VoiceSignalingMessageView,
+    },
     /// Signed delivery receipt returning to an envelope sender.
     Receipt {
         /// Message id being acknowledged.
@@ -1188,6 +1234,87 @@ pub struct HandleTextControlFrameResponse {
     pub state: AppStateView,
     /// Optional response frame to send back over the same text/control transport.
     pub response_frame: Option<TextControlFrameView>,
+}
+
+/// Backend-state-only browser media signaling payload carried over the text/control route; no remote audio is claimed here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceSignalingMessageView {
+    /// Stable id for idempotency across transport retries.
+    pub signal_id: String,
+    /// Voice session id the signal belongs to.
+    pub session_id: String,
+    /// Group id containing the voice channel.
+    pub group_id: String,
+    /// Voice channel id.
+    pub channel_id: String,
+    /// Local app participant id of the sender.
+    pub sender_participant_id: String,
+    /// Provider/runtime peer id of the sender.
+    pub sender_peer_id: String,
+    /// Provider/runtime peer id expected to receive this signal.
+    pub recipient_peer_id: String,
+    /// `offer`, `answer`, or `candidate`.
+    pub signal_kind: String,
+    /// Opaque SDP for offer/answer signals.
+    #[serde(default)]
+    pub sdp: Option<String>,
+    /// Opaque ICE candidate string for candidate signals.
+    #[serde(default)]
+    pub candidate: Option<String>,
+    /// ICE candidate SDP mid.
+    #[serde(default)]
+    pub sdp_mid: Option<String>,
+    /// ICE candidate media-line index.
+    #[serde(default)]
+    pub sdp_m_line_index: Option<u16>,
+    /// Browser/native timestamp in milliseconds for correlation.
+    pub created_at_ms: u64,
+}
+
+/// Request to queue an outbound backend-state-only voice offer/answer/candidate; remote media remains pending until proven.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishVoiceSignalingMessageRequest {
+    /// Active voice session id.
+    pub session_id: String,
+    /// `offer`, `answer`, or `candidate`.
+    pub signal_kind: String,
+    /// Opaque SDP for offer/answer signals.
+    #[serde(default)]
+    pub sdp: Option<String>,
+    /// Opaque ICE candidate string for candidate signals.
+    #[serde(default)]
+    pub candidate: Option<String>,
+    /// ICE candidate SDP mid.
+    #[serde(default)]
+    pub sdp_mid: Option<String>,
+    /// ICE candidate media-line index.
+    #[serde(default)]
+    pub sdp_m_line_index: Option<u16>,
+    /// Optional stable id supplied by the browser for idempotency.
+    #[serde(default)]
+    pub signal_id: Option<String>,
+    /// Browser/native timestamp in milliseconds for correlation.
+    pub created_at_ms: u64,
+}
+
+/// Request to drain pending inbound WebRTC voice signaling messages from backend state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TakePendingVoiceSignalingMessagesRequest {
+    /// Optional voice session id filter. Defaults to the active voice session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Optional result cap. Defaults to 50 and is clamped to 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Response containing state plus inbound voice signaling messages for RTCPeerConnection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TakePendingVoiceSignalingMessagesResponse {
+    /// Updated application state after draining messages.
+    pub state: AppStateView,
+    /// Inbound offer/answer/candidate messages not-delivered to the browser runtime yet.
+    pub messages: Vec<VoiceSignalingMessageView>,
 }
 
 /// One-shot text/control transport pump report for a session-loop iteration.
@@ -1768,6 +1895,11 @@ struct TextControlOutboxRecord {
     last_transport_session_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct VoiceSignalingInboxRecord {
+    signal: VoiceSignalingMessageView,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -1786,6 +1918,8 @@ struct PersistedAppState {
     text_delivery_receipts: Vec<TextDeliveryReceiptRecord>,
     #[serde(default)]
     text_control_outbox: Vec<TextControlOutboxRecord>,
+    #[serde(default)]
+    voice_signaling_inbox: Vec<VoiceSignalingInboxRecord>,
     voice_session: Option<VoiceSessionView>,
     invites: Vec<InviteView>,
     devices: Vec<DeviceView>,
@@ -3952,6 +4086,33 @@ pub fn handle_text_control_frame(
     }
 }
 
+/// Tauri command: queue an outbound backend-state-only voice offer/answer/candidate; no remote media is claimed.
+pub fn publish_voice_signaling_message(
+    request: PublishVoiceSignalingMessageRequest,
+) -> AppStateView {
+    mutate_app_service(|state| {
+        if let Err(error) = state.enqueue_voice_signaling_outbox(request) {
+            state.push_command_error(
+                "voice.signal_rejected",
+                "publish_voice_signaling_message",
+                "voice_signal_queue_failed",
+                error,
+                "Join voice with provider-derived runtime peers before queueing SDP/ICE; send queued frames only over the backend text/control transport",
+            );
+        }
+    })
+}
+
+/// Tauri command: drain inbound backend-state-only voice offer/answer/candidate messages for the browser runtime.
+pub fn take_pending_voice_signaling_messages(
+    request: TakePendingVoiceSignalingMessagesRequest,
+) -> TakePendingVoiceSignalingMessagesResponse {
+    let (state, messages) = mutate_app_service_with_result(|state| {
+        state.take_pending_voice_signaling_messages(request)
+    });
+    TakePendingVoiceSignalingMessagesResponse { state, messages }
+}
+
 /// Tauri command: join a voice channel.
 pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -3976,6 +4137,17 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             input_device: selection.input_device.clone(),
             output_device: selection.output_device.clone(),
             media_runtime: voice_media_runtime_for_join(&session_id, &selection),
+            signaling: VoiceSignalingStateView {
+                session_id: session_id.clone(),
+                status_copy: if capture_allowed {
+                    "Voice signaling waits for provider-derived peer ids before SDP/ICE exchange"
+                        .to_owned()
+                } else {
+                    "Voice signaling did not start because capture permission/device gates failed"
+                        .to_owned()
+                },
+                ..VoiceSignalingStateView::default()
+            },
             participants: default_voice_participants(&local_user_id, false),
             route_copy: if capture_allowed {
                 "Backend recorded a webview local-capture runtime boundary; remote WebRTC audio transport remains fail-closed until media-route evidence attaches; speaking indicators wait for media audio-level/VAD events".to_owned()
@@ -4018,7 +4190,27 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 session.joined = false;
+                let leaving_session_id = session.session_id.clone();
                 session.media_runtime = voice_media_runtime_for_leave(&session.session_id);
+                session.signaling = VoiceSignalingStateView {
+                    session_id: session.session_id.clone(),
+                    role: "stopped".to_owned(),
+                    status_copy:
+                        "Voice signaling stopped by leave; pending inbound SDP/ICE was cleared"
+                            .to_owned(),
+                    ..VoiceSignalingStateView::default()
+                };
+                state
+                    .voice_signaling_inbox
+                    .retain(|record| record.signal.session_id != leaving_session_id);
+                state
+                    .text_control_outbox
+                    .retain(|record| match &record.frame {
+                        TextControlFrameView::VoiceSignal { signal } => {
+                            signal.session_id != leaving_session_id
+                        }
+                        _ => true,
+                    });
                 session.route_copy =
                     "Voice media runtime stopped; no local capture or remote playback route is active"
                         .to_owned();
@@ -4773,6 +4965,26 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn publish_voice_signaling_message(
+        app_handle: tauri::AppHandle,
+        request: PublishVoiceSignalingMessageRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::publish_voice_signaling_message(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn take_pending_voice_signaling_messages(
+        app_handle: tauri::AppHandle,
+        request: TakePendingVoiceSignalingMessagesRequest,
+    ) -> TakePendingVoiceSignalingMessagesResponse {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::take_pending_voice_signaling_messages(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn join_voice(
         app_handle: tauri::AppHandle,
         request: JoinVoiceRequest,
@@ -4897,6 +5109,8 @@ pub fn run() {
             ipc_commands::pump_text_control_transport_once,
             ipc_commands::mark_text_control_frame_sent,
             ipc_commands::handle_text_control_frame,
+            ipc_commands::publish_voice_signaling_message,
+            ipc_commands::take_pending_voice_signaling_messages,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
@@ -4932,6 +5146,7 @@ impl PersistedAppState {
             text_delivery_envelopes: Vec::new(),
             text_delivery_receipts: Vec::new(),
             text_control_outbox: Vec::new(),
+            voice_signaling_inbox: Vec::new(),
             voice_session: None,
             invites: Vec::new(),
             devices: Vec::new(),
@@ -6101,6 +6316,209 @@ impl PersistedAppState {
         Ok(())
     }
 
+    fn enqueue_voice_signaling_outbox(
+        &mut self,
+        request: PublishVoiceSignalingMessageRequest,
+    ) -> Result<(), String> {
+        let session = self
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "No active voice session for voice signaling".to_owned())?;
+        if session.session_id != request.session_id {
+            return Err(
+                "Voice signaling request did not match the active voice session".to_owned(),
+            );
+        }
+        if !session.joined {
+            return Err("Voice signaling requires a joined voice session".to_owned());
+        }
+        let signal_kind = normalize_voice_signal_kind(&request.signal_kind)?;
+        validate_voice_signal_payload(
+            &signal_kind,
+            request.sdp.as_deref(),
+            request.candidate.as_deref(),
+        )?;
+        let attachment = self.active_runtime_peer_attachment_for_text_control()?;
+        let local_user_id = self.local_user_id();
+        let signal_id = request
+            .signal_id
+            .unwrap_or_else(|| stable_id("voice-signal", &request.session_id, self.next_sequence));
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(session.group_id.clone()),
+            channel_id: Some(session.channel_id.clone()),
+        };
+        let signal = VoiceSignalingMessageView {
+            signal_id: signal_id.clone(),
+            session_id: session.session_id.clone(),
+            group_id: session.group_id.clone(),
+            channel_id: session.channel_id.clone(),
+            sender_participant_id: local_user_id,
+            sender_peer_id: attachment.local_peer_id.0.clone(),
+            recipient_peer_id: attachment.remote_peer_id.0.clone(),
+            signal_kind: signal_kind.clone(),
+            sdp: request.sdp,
+            candidate: request.candidate,
+            sdp_mid: request.sdp_mid,
+            sdp_m_line_index: request.sdp_m_line_index,
+            created_at_ms: request.created_at_ms,
+        };
+        let frame = TextControlFrameView::VoiceSignal { signal };
+        let frame_sha256 = text_control_frame_sha256(&frame)?;
+        if let Some(existing) = self
+            .text_control_outbox
+            .iter_mut()
+            .find(|record| record.message_id == signal_id)
+        {
+            existing.target = target;
+            existing.frame = frame;
+            existing.frame_sha256 = frame_sha256;
+            existing.state_key = "pending".to_owned();
+        } else {
+            self.text_control_outbox.push(TextControlOutboxRecord {
+                message_id: signal_id.clone(),
+                target,
+                frame,
+                frame_sha256,
+                attempts: 0,
+                state_key: "pending".to_owned(),
+                last_transport_session_id: None,
+            });
+        }
+        if let Some(session) = &mut self.voice_session {
+            session.signaling = VoiceSignalingStateView {
+                session_id: session.session_id.clone(),
+                local_peer_id: attachment.local_peer_id.0,
+                remote_peer_id: attachment.remote_peer_id.0,
+                role: runtime_role_label(Some(attachment.role)).to_owned(),
+                pending_local_signals: session.signaling.pending_local_signals.saturating_add(1),
+                received_remote_signals: session.signaling.received_remote_signals,
+                last_signal_kind: Some(signal_kind.clone()),
+                status_copy: format!(
+                    "Queued voice {signal_kind} through provider-derived text/control signaling; browser RTCPeerConnection may send it only via the attached backend transport"
+                ),
+            };
+        }
+        self.push_event(
+            "voice.signal_queued",
+            format!("Queued voice {signal_kind} for provider-signaled transport"),
+        );
+        Ok(())
+    }
+
+    fn handle_voice_signal_frame(&mut self, signal: VoiceSignalingMessageView) {
+        let result = self.validate_inbound_voice_signal(&signal);
+        if let Err(error) = result {
+            self.push_command_error(
+                "voice.signal_rejected",
+                "handle_text_control_frame",
+                "voice_signal_invalid",
+                error,
+                "Accept only provider-signaled voice SDP/ICE for the active joined voice session and remote peer",
+            );
+            return;
+        }
+        if !self
+            .voice_signaling_inbox
+            .iter()
+            .any(|record| record.signal.signal_id == signal.signal_id)
+        {
+            self.voice_signaling_inbox.push(VoiceSignalingInboxRecord {
+                signal: signal.clone(),
+            });
+        }
+        if let Some(session) = &mut self.voice_session {
+            session.signaling.received_remote_signals =
+                session.signaling.received_remote_signals.saturating_add(1);
+            session.signaling.last_signal_kind = Some(signal.signal_kind.clone());
+            if session.signaling.remote_peer_id.is_empty() {
+                session.signaling.remote_peer_id = signal.sender_peer_id.clone();
+            }
+            if session.signaling.local_peer_id.is_empty() {
+                session.signaling.local_peer_id = signal.recipient_peer_id.clone();
+            }
+            session.signaling.status_copy = format!(
+                "Received provider-signaled voice {} for browser RTCPeerConnection; pending inbound SDP/ICE must be applied before claiming remote audio",
+                signal.signal_kind
+            );
+        }
+        self.push_event(
+            "voice.signal_received",
+            format!(
+                "Received voice {} over text/control transport",
+                signal.signal_kind
+            ),
+        );
+    }
+
+    fn validate_inbound_voice_signal(
+        &self,
+        signal: &VoiceSignalingMessageView,
+    ) -> Result<(), String> {
+        normalize_voice_signal_kind(&signal.signal_kind)?;
+        validate_voice_signal_payload(
+            &signal.signal_kind,
+            signal.sdp.as_deref(),
+            signal.candidate.as_deref(),
+        )?;
+        let session = self
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "No active voice session for inbound voice signaling".to_owned())?;
+        if !session.joined {
+            return Err("Inbound voice signaling requires a joined voice session".to_owned());
+        }
+        if session.session_id != signal.session_id
+            || session.group_id != signal.group_id
+            || session.channel_id != signal.channel_id
+        {
+            return Err(
+                "Inbound voice signal did not match the active voice session scope".to_owned(),
+            );
+        }
+        let local_user_id = self.local_user_id();
+        if signal.sender_participant_id == local_user_id || signal.sender_peer_id.is_empty() {
+            return Err("Inbound voice signal must come from a non-local provider peer".to_owned());
+        }
+        Ok(())
+    }
+
+    fn take_pending_voice_signaling_messages(
+        &mut self,
+        request: TakePendingVoiceSignalingMessagesRequest,
+    ) -> Vec<VoiceSignalingMessageView> {
+        let session_id = request.session_id.or_else(|| {
+            self.voice_session
+                .as_ref()
+                .map(|session| session.session_id.clone())
+        });
+        let limit = request.limit.unwrap_or(50).clamp(1, 200);
+        let mut taken = Vec::new();
+        let mut retained = Vec::new();
+        for record in self.voice_signaling_inbox.drain(..) {
+            let matches_session = session_id
+                .as_ref()
+                .map_or(true, |expected| &record.signal.session_id == expected);
+            if matches_session && taken.len() < limit {
+                taken.push(record.signal);
+            } else {
+                retained.push(record);
+            }
+        }
+        self.voice_signaling_inbox = retained;
+        if !taken.is_empty() {
+            self.push_event(
+                "voice.signal_delivered",
+                format!(
+                    "Delivered {} pending voice signaling message(s) to browser runtime",
+                    taken.len()
+                ),
+            );
+        }
+        taken
+    }
+
     fn list_pending_text_control_frames(
         &self,
         request: &ListPendingTextControlFramesRequest,
@@ -6504,6 +6922,10 @@ impl PersistedAppState {
                     }
                     Err(_) => None,
                 }
+            }
+            TextControlFrameView::VoiceSignal { signal } => {
+                self.handle_voice_signal_frame(signal);
+                None
             }
             TextControlFrameView::Receipt {
                 message_id,
@@ -8066,6 +8488,41 @@ fn default_voice_participants(
         muted: false,
         volume: 82,
     }]
+}
+
+fn normalize_voice_signal_kind(kind: &str) -> Result<String, String> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "offer" => Ok("offer".to_owned()),
+        "answer" => Ok("answer".to_owned()),
+        "candidate" => Ok("candidate".to_owned()),
+        other => Err(format!("unsupported voice signal kind {other}")),
+    }
+}
+
+fn validate_voice_signal_payload(
+    signal_kind: &str,
+    sdp: Option<&str>,
+    candidate: Option<&str>,
+) -> Result<(), String> {
+    match signal_kind {
+        "offer" | "answer" => {
+            let sdp = sdp.unwrap_or_default().trim();
+            if sdp.is_empty() || !sdp.contains("v=0") {
+                return Err(
+                    "voice offer/answer requires opaque SDP containing a session description"
+                        .to_owned(),
+                );
+            }
+        }
+        "candidate" => {
+            let candidate = candidate.unwrap_or_default().trim();
+            if candidate.is_empty() || !candidate.contains("candidate") {
+                return Err("voice ICE candidate signal requires a candidate string".to_owned());
+            }
+        }
+        _ => return Err("unsupported voice signal kind".to_owned()),
+    }
+    Ok(())
 }
 
 fn voice_media_runtime_for_join(
@@ -11949,6 +12406,142 @@ mod tests {
     }
 
     #[test]
+    fn voice_signaling_uses_provider_text_control_outbox_and_inbox() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("voice-signaling-state");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .ok_or_else(|| "group missing".to_owned())?;
+        let local_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "local runtime peer missing".to_owned())?
+            .peer_id
+            .clone();
+        let remote_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "remote runtime peer missing".to_owned())?
+            .peer_id
+            .clone();
+        let voice_channel = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group.group_id.clone(),
+            channel_id: voice_channel.channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic".to_owned()),
+            input_device_label: Some("Mic".to_owned()),
+            output_device_id: Some("speaker".to_owned()),
+            output_device_label: Some("Speaker".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        let queued = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
+            session_id: session_id.clone(),
+            signal_kind: "offer".to_owned(),
+            sdp: Some("v=0\r\na=sendrecv".to_owned()),
+            candidate: None,
+            sdp_mid: None,
+            sdp_m_line_index: None,
+            signal_id: Some("voice-signal-offer-1".to_owned()),
+            created_at_ms: 42,
+        });
+        let signaling = queued
+            .voice_session
+            .as_ref()
+            .map(|session| session.signaling.clone())
+            .ok_or_else(|| "signaling state missing".to_owned())?;
+        assert_eq!(signaling.local_peer_id, local_peer);
+        assert_eq!(signaling.remote_peer_id, remote_peer);
+        assert_eq!(signaling.pending_local_signals, 1);
+        let pending = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(10),
+            operation_timeout_ms: None,
+        });
+        assert!(pending
+            .frames
+            .iter()
+            .any(|frame| matches!(frame.frame, TextControlFrameView::VoiceSignal { .. })));
+
+        let local_user_id = queued
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "profile missing".to_owned())?;
+        let handled = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: TextControlFrameView::VoiceSignal {
+                signal: VoiceSignalingMessageView {
+                    signal_id: "voice-signal-answer-1".to_owned(),
+                    session_id: session_id.clone(),
+                    group_id: group.group_id.clone(),
+                    channel_id: voice_channel.channel_id.clone(),
+                    sender_participant_id: "remote-member".to_owned(),
+                    sender_peer_id: remote_peer.clone(),
+                    recipient_peer_id: local_peer.clone(),
+                    signal_kind: "answer".to_owned(),
+                    sdp: Some("v=0\r\na=recvonly".to_owned()),
+                    candidate: None,
+                    sdp_mid: None,
+                    sdp_m_line_index: None,
+                    created_at_ms: 43,
+                },
+            },
+        });
+        assert!(handled.response_frame.is_none());
+        assert_ne!(local_user_id, "remote-member");
+        assert_eq!(
+            handled
+                .state
+                .voice_session
+                .as_ref()
+                .map(|session| session.signaling.received_remote_signals),
+            Some(1)
+        );
+        let taken =
+            take_pending_voice_signaling_messages(TakePendingVoiceSignalingMessagesRequest {
+                session_id: Some(session_id.clone()),
+                limit: Some(10),
+            });
+        assert_eq!(taken.messages.len(), 1);
+        assert_eq!(taken.messages[0].signal_kind, "answer");
+        let drained =
+            take_pending_voice_signaling_messages(TakePendingVoiceSignalingMessagesRequest {
+                session_id: Some(session_id.clone()),
+                limit: Some(10),
+            });
+        assert!(drained.messages.is_empty());
+        let left = leave_voice(LeaveVoiceRequest { session_id });
+        assert!(left
+            .voice_session
+            .as_ref()
+            .is_some_and(|session| session.signaling.role == "stopped"));
+        Ok(())
+    }
+
+    #[test]
     fn dm_flow_persists_across_reload() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("dm-flow");
@@ -12183,6 +12776,84 @@ mod tests {
             .all(|participant| !participant.speaking));
         assert!(!left.groups.is_empty());
         assert_eq!(left.lifecycle, AppLifecycle::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn voice_remote_media_rejects_local_or_incomplete_evidence() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("voice-invalid-remote-media");
+        let created = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let local_user_id = created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "local profile id".to_owned())?;
+        let group_state = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "joined voice session".to_owned())?;
+
+        let rejected = attach_voice_remote_media(AttachVoiceRemoteMediaRequest {
+            session_id,
+            participant_id: local_user_id,
+            participant_name: "Alice local loopback".to_owned(),
+            remote_peer_id: "peer-local-loopback".to_owned(),
+            stream_id: "stream-local-loopback".to_owned(),
+            audio_track_id: "track-local-loopback".to_owned(),
+            playback_element_id: "audio-local-loopback".to_owned(),
+            local_audio_tracks_sent: 1,
+            received_audio_frames: 0,
+            speaking: true,
+            attached_at_ms: 1_700_000_000_000,
+        });
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("voice_remote_media_evidence_invalid")
+        );
+        let session = rejected
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "voice session remains after rejected evidence".to_owned())?;
+        assert_eq!(session.media_runtime.boundary, "webview-local-capture");
+        assert!(!session.media_runtime.remote_transport_active);
+        assert!(session.media_runtime.remote_audio.is_empty());
+        assert!(session
+            .participants
+            .iter()
+            .all(|participant| participant.role == "you"));
         Ok(())
     }
 

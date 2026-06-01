@@ -238,6 +238,27 @@ const expectedCommands = [
     returns: "HandleTextControlFrameResponse",
   },
   {
+    command: "publish_voice_signaling_message",
+    exportName: "publishVoiceSignalingMessage",
+    args: [
+      "session_id",
+      "signal_kind",
+      "sdp",
+      "candidate",
+      "sdp_mid",
+      "sdp_m_line_index",
+      "signal_id",
+      "created_at_ms",
+    ],
+    returns: "AppState",
+  },
+  {
+    command: "take_pending_voice_signaling_messages",
+    exportName: "takePendingVoiceSignalingMessages",
+    args: ["session_id", "limit"],
+    returns: "TakePendingVoiceSignalingMessagesResponse",
+  },
+  {
     command: "join_voice",
     exportName: "joinVoice",
     args: ["group_id", "channel_id"],
