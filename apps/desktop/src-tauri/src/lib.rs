@@ -11625,6 +11625,15 @@ mod tests {
             .welcome
             .as_ref()
             .ok_or_else(|| "OpenMLS add-member did not return a Welcome".to_owned())?;
+        let welcome_issuer = SigningKey::generate(&mut OsRng);
+        let admission_invite_id = Uuid::new_v4();
+        let authorized_welcome = AuthorizedWelcome::sign(
+            admission_invite_id.to_string(),
+            group_id.as_bytes().to_vec(),
+            welcome,
+            Utc::now() + Duration::minutes(5),
+            &welcome_issuer,
+        );
         let room_secret_hash: [u8; 32] = hex::decode(&invite.room_secret_hash)
             .map_err(|error| format!("invite room-secret commitment was not hex: {error}"))?
             .try_into()
@@ -11633,7 +11642,7 @@ mod tests {
         let mut invite_id_bytes = [0_u8; 16];
         invite_id_bytes.copy_from_slice(&invite_id_digest[..16]);
         let mut admission_invite = Invite {
-            id: Uuid::from_bytes(invite_id_bytes),
+            id: admission_invite_id,
             room_secret_hash,
             expires_at: Utc::now() + Duration::minutes(5),
             max_uses: invite
