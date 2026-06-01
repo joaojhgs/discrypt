@@ -3963,7 +3963,9 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             .as_ref()
             .map(|profile| profile.display_name.clone())
             .unwrap_or_else(|| "Alice".to_owned());
-        let message_id = format!("msg-{sequence}");
+        let author_id = state.local_user_id();
+        let author_commitment = hash_commitment("discrypt-message-id-author-v1", &[&author_id]);
+        let message_id = format!("msg-{}-{sequence}", &author_commitment[..16]);
         let mut status = "local encrypted author log; remote delivery/read receipts not claimed without signed receipt".to_owned();
         let mut state_key = "sent_local".to_owned();
         let mut state_label = "Sent locally".to_owned();
@@ -4030,7 +4032,7 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
         let message = MessageView {
             message_id,
             target: request.target,
-            author_id: state.local_user_id(),
+            author_id,
             author,
             body: body.to_owned(),
             status,
@@ -6743,15 +6745,15 @@ impl PersistedAppState {
                 ));
                 continue;
             }
-            if self.last_command_error.as_ref().is_some_and(|error| {
+            if let Some(error) = self.last_command_error.as_ref().filter(|error| {
                 matches!(
                     error.command.as_str(),
                     "handle_text_control_frame" | "apply_text_delivery_receipt"
                 )
             }) {
                 failures.push(format!(
-                    "{}: text/control response verification failed",
-                    frame_ref
+                    "{}: text/control response verification failed: {} ({})",
+                    frame_ref, error.code, error.message
                 ));
                 continue;
             }
