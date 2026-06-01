@@ -528,9 +528,19 @@ export type DevicePairingPayloadView = {
   rejected_reason: string | null;
 };
 
+export type SignalingAdapterKind =
+  | "nostr"
+  | "mqtt"
+  | "ipfs_pubsub"
+  | "discrypt_quic_rendezvous";
+
 export type CreateGroupRequest = {
   name: string;
   retention: string;
+  adapter_kind?: SignalingAdapterKind | string | null;
+  signaling_endpoint?: string | null;
+  ice_stun_servers?: string[] | null;
+  ice_turn_servers?: IceTurnServerView[] | null;
 };
 
 export type JoinGroupRequest = {
@@ -607,7 +617,7 @@ export type StopTextSessionRequest = {
 
 export type AttachTextControlTransportRuntimeRequest = {
   session_id?: string | null;
-  runtime_role?: "offerer" | "answerer" | string | null;
+  runtime_role?: "offerer" | "answerer" | null;
   local_peer_id?: string | null;
   remote_peer_id?: string | null;
 };
@@ -763,6 +773,13 @@ type TauriInvoke = <T>(
   args?: Record<string, unknown>,
 ) => Promise<T>;
 
+type TauriEventCallback<T> = (event: { payload: T }) => void;
+type TauriUnlisten = () => void;
+type TauriListen = <T>(
+  event: string,
+  handler: TauriEventCallback<T>,
+) => Promise<TauriUnlisten>;
+
 const LOCAL_DEV_FALLBACK_ENABLED =
   import.meta.env.DEV ||
   import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
@@ -775,6 +792,9 @@ declare global {
     __TAURI__?: {
       core?: {
         invoke?: TauriInvoke;
+      };
+      event?: {
+        listen?: TauriListen;
       };
     };
   }
@@ -828,7 +848,7 @@ const fallbackSnapshot: AppSnapshot = {
     input_device: null,
     output_device: null,
     participants: [],
-    status_copy: "Not joined; command-backed local voice controls are idle",
+    status_copy: "Not joined; backend voice controls are idle",
     route_copy:
       "Route copy is harness-backed until socket/media adapter E2E passes",
     permission_denied_copy: "",
@@ -842,7 +862,7 @@ const fallbackSnapshot: AppSnapshot = {
   ],
   connectivity: {
     fallback_chain:
-      "Command-backed policy: STUN → relay-overlay → TURN; runtime transport remains release-gated until E2E passes",
+      "Backend policy: STUN → relay-overlay → TURN; runtime transport remains release-gated until E2E passes",
     metadata_copy:
       "Content-private and metadata-minimizing, not metadata-anonymous",
     push_copy:
@@ -988,7 +1008,7 @@ function syncSnapshot(state: AppState): AppState {
         input_device: null,
         output_device: null,
         participants: [],
-        status_copy: "Not joined; command-backed local voice controls are idle",
+        status_copy: "Not joined; backend voice controls are idle",
         route_copy:
           "Local voice controls only; network media route is not connected in this build",
         permission_denied_copy: "",
@@ -1057,7 +1077,7 @@ function deriveVoiceStates(state: AppState): VoiceStateView[] {
       key: "joining",
       label: "Joining",
       status: joined ? "joined" : "idle",
-      detail: "Join command creates a local voice session and records selected devices",
+      detail: "Join creates backend voice state and records selected devices",
     },
     {
       key: "ice_checking",
@@ -1076,7 +1096,7 @@ function deriveVoiceStates(state: AppState): VoiceStateView[] {
       key: "muted",
       label: "Muted",
       status: muted ? "muted" : "unmuted",
-      detail: "Mute state is command-backed and suppresses outbound local media frames",
+      detail: "Mute state is backend persisted and suppresses outbound local media frames",
     },
     {
       key: "speaking",
@@ -1565,33 +1585,14 @@ function hashCommitment(domain: string, parts: string[]): string {
   return stableHash(`${domain}:${parts.join(":")}`);
 }
 
-function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
-  const endpoints: Array<[string, string]> = [
-    [
-      "nostr",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
-        "wss://relay.damus.io",
-    ],
-    [
-      "mqtt",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
-        "mqtts://broker.emqx.io:8883",
-    ],
-  ];
-  if (import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT) {
-    endpoints.push([
-      "ipfs_pubsub",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT,
-    ]);
-  }
-  if (import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT) {
-    endpoints.push([
-      "discrypt_quic_rendezvous",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT,
-    ]);
-  }
-  return endpoints.map(([adapterKind, endpoint]) => ({
-    profile_id: `${adapterKind}-default`,
+function signalingProfileForEndpoint(
+  scopeCommitment: string,
+  adapterKind: string,
+  endpoint: string,
+  profileId = `${adapterKind}-custom`,
+): SignalingProfileView {
+  return {
+    profile_id: profileId,
     adapter_kind: adapterKind,
     endpoints: [endpoint],
     room_topic_commitment: hashCommitment(
@@ -1619,7 +1620,42 @@ function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView
       "broadcast_control",
       "health_telemetry",
     ],
-  }));
+  };
+}
+
+function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
+  const endpoints: Array<[string, string]> = [
+    [
+      "nostr",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
+        "wss://relay.damus.io",
+    ],
+    [
+      "mqtt",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
+        "mqtts://broker.emqx.io:8883",
+    ],
+  ];
+  if (import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT) {
+    endpoints.push([
+      "ipfs_pubsub",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT,
+    ]);
+  }
+  if (import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT) {
+    endpoints.push([
+      "discrypt_quic_rendezvous",
+      import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT,
+    ]);
+  }
+  return endpoints.map(([adapterKind, endpoint]) =>
+    signalingProfileForEndpoint(
+      scopeCommitment,
+      adapterKind,
+      endpoint,
+      `${adapterKind}-default`,
+    ),
+  );
 }
 
 function runtimePeerIdFromCommitment(label: string, commitment: string): string {
@@ -1688,15 +1724,50 @@ function groupRuntimePeers(
   ];
 }
 
-function groupConnectivityPolicy(groupId: string): ConnectivityPolicyView {
+function selectedSignalingProfiles(
+  scope: string,
+  adapterKind?: string | null,
+  endpoint?: string | null,
+): SignalingProfileView[] {
+  const normalizedEndpoint = endpoint?.trim();
+  if (adapterKind && normalizedEndpoint) {
+    return [signalingProfileForEndpoint(scope, adapterKind, normalizedEndpoint)];
+  }
+  return defaultSignalingProfiles(scope);
+}
+
+function selectedIceStunServers(servers?: string[] | null): string[] {
+  const normalized = (servers ?? [])
+    .map((server) => server.trim())
+    .filter(Boolean);
+  return normalized.length ? normalized : defaultIceStunServers();
+}
+
+function selectedIceTurnServers(
+  servers?: IceTurnServerView[] | null,
+): IceTurnServerView[] {
+  return (servers ?? []).filter((server) => server.endpoint.trim());
+}
+
+function groupConnectivityPolicy(
+  groupId: string,
+  options: Pick<
+    CreateGroupRequest,
+    "adapter_kind" | "signaling_endpoint" | "ice_stun_servers" | "ice_turn_servers"
+  > = {},
+): ConnectivityPolicyView {
   const scope = hashCommitment("discrypt-group-scope-commitment-v1", [groupId]);
   return {
     connectivity_schema_version: 1,
     invite_kind: "group_join",
     scope_id_commitment: scope,
-    signaling_profiles: defaultSignalingProfiles(scope),
-    ice_stun_servers: defaultIceStunServers(),
-    ice_turn_servers: defaultRedactedTurnServers(),
+    signaling_profiles: selectedSignalingProfiles(
+      scope,
+      options.adapter_kind,
+      options.signaling_endpoint,
+    ),
+    ice_stun_servers: selectedIceStunServers(options.ice_stun_servers),
+    ice_turn_servers: selectedIceTurnServers(options.ice_turn_servers),
     privacy_label:
       "Group invite topics are derived commitments; group names, channel names, and room secrets are not exposed",
     dm_bootstrap: null,
@@ -2371,7 +2442,7 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
           participant_id: participantId,
           display_name: displayName,
           local_only_copy:
-            "Local harness-backed DM; no remote delivery is claimed",
+            "Local DM; remote delivery is not claimed until backend proof is available",
           runtime_peers: dmRuntimePeers(connectivity, "inviter"),
           connectivity,
         });
@@ -2396,7 +2467,7 @@ export async function createGroup(
       const name = request.name.trim() || "private lab";
       const groupId = `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
-        const connectivity = groupConnectivityPolicy(groupId);
+        const connectivity = groupConnectivityPolicy(groupId, request);
         state.groups.push({
           group_id: groupId,
           name,
@@ -2637,8 +2708,8 @@ export async function createInvite(
         endpointPolicy,
         signalingTrustFingerprint,
         signalingTrustStatus: trustStatus,
-        iceStunServers: defaultIceStunServers(),
-        iceTurnServers: defaultRedactedTurnServers(),
+        iceStunServers: connectivity.ice_stun_servers,
+        iceTurnServers: connectivity.ice_turn_servers,
         roomSecretHash,
         connectivity,
         expiresAt,
@@ -2662,8 +2733,8 @@ export async function createInvite(
         signaling_trust_fingerprint: signalingTrustFingerprint,
         signaling_trust_status: trustStatus,
         endpoint_policy: endpointPolicy,
-        ice_stun_servers: defaultIceStunServers(),
-        ice_turn_servers: defaultRedactedTurnServers(),
+        ice_stun_servers: connectivity.ice_stun_servers,
+        ice_turn_servers: connectivity.ice_turn_servers,
         expires,
         expires_at: expiresAt,
         max_use: maxUse,
@@ -2734,8 +2805,8 @@ export async function createDmInvite(
         endpointPolicy,
         signalingTrustFingerprint,
         signalingTrustStatus: trustStatus,
-        iceStunServers: defaultIceStunServers(),
-        iceTurnServers: defaultRedactedTurnServers(),
+        iceStunServers: connectivity.ice_stun_servers,
+        iceTurnServers: connectivity.ice_turn_servers,
         roomSecretHash,
         connectivity,
         expiresAt,
@@ -2759,8 +2830,8 @@ export async function createDmInvite(
         signaling_trust_fingerprint: signalingTrustFingerprint,
         signaling_trust_status: trustStatus,
         endpoint_policy: endpointPolicy,
-        ice_stun_servers: defaultIceStunServers(),
-        ice_turn_servers: defaultRedactedTurnServers(),
+        ice_stun_servers: connectivity.ice_stun_servers,
+        ice_turn_servers: connectivity.ice_turn_servers,
         expires,
         expires_at: expiresAt,
         max_use: maxUse,
@@ -2955,7 +3026,7 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
           },
         ],
         route_copy: captureAllowed
-          ? "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E; speaking indicators wait for media audio-level/VAD events"
+          ? "Local capture permission and device selection are ready; remote media transport remains gated until backend media-route evidence exists; speaking indicators wait for media audio-level/VAD events"
           : "No voice route opened because microphone permission/input selection is not granted",
         status_copy: captureAllowed
           ? `Microphone capture authorized using ${inputDevice?.label ?? "Default microphone"} and playback routed to ${outputDevice?.label ?? "system default"}`
@@ -2971,7 +3042,7 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
         dm_id: null,
       };
       if (captureAllowed) {
-        pushEvent(state, "voice.joined", "Joined command-backed local voice session");
+        pushEvent(state, "voice.joined", "Joined backend voice session after local media permission");
       } else {
         pushCommandError(
           state,
@@ -3011,14 +3082,14 @@ export async function leaveVoice(
       }
       state.voice_session.joined = false;
       state.voice_session.status_copy =
-        "Not joined; command-backed local voice controls are idle";
+        "Not joined; backend voice controls are idle";
       state.voice_session.participants = state.voice_session.participants.map(
         (participant) => ({
           ...participant,
           speaking: false,
         }),
       );
-      pushEvent(state, "voice.left", "Left command-backed local voice session");
+      pushEvent(state, "voice.left", "Left backend voice session");
     }),
   );
 }
@@ -3121,12 +3192,12 @@ export async function updateVoiceActivity(
         });
       }
       state.voice_session.route_copy =
-        "Local capture permission, device selection, and microphone level evidence are active; encrypted remote media transport remains gated by media-frame E2E";
+        "Local capture permission, device selection, and microphone level evidence are active; remote media transport remains gated until backend media-route evidence exists";
       state.voice_session.status_copy = selfMuted
         ? `Local microphone level observed at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}) but self-mute suppresses speaking state`
         : speaking
-          ? `Local speaking indicator is driven by real microphone level evidence at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}); encrypted media transport remains gated by media-frame E2E`
-          : `Local microphone level observed below speaking threshold at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}); encrypted media transport remains gated by media-frame E2E`;
+          ? `Local speaking indicator is driven by real microphone level evidence at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}); remote media transport remains gated until backend media-route evidence exists`
+          : `Local microphone level observed below speaking threshold at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}); remote media transport remains gated until backend media-route evidence exists`;
       pushEvent(
         state,
         "voice.activity",

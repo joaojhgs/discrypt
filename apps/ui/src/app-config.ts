@@ -135,14 +135,3 @@ export const activityFeed = [
   "Voice relay is disabled until media/socket E2E gates pass",
   "Deletion copy includes offline-device caveat",
 ];
-
-export const initialVoiceRoster = [
-  {
-    id: "local-profile-pending",
-    name: "You",
-    role: "you",
-    speaking: false,
-    muted: false,
-    volume: 82,
-  },
-];

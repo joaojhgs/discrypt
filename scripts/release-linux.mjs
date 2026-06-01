@@ -85,14 +85,15 @@ const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH ?? capture("git", ["log", 
 const releaseEnv = { ...process.env, SOURCE_DATE_EPOCH: sourceDateEpoch };
 delete releaseEnv.VITE_DISCRYPT_LOCAL_DEV_FALLBACK;
 delete releaseEnv.DISCRYPT_LOCAL_DEV_FALLBACK;
+delete releaseEnv.VITE_DISCRYPT_SHOW_DIAGNOSTICS;
 const steps = [];
 steps.push(
-  run("npm", ["--prefix", "apps/ui", "ci"]),
-  run("npm", ["--prefix", "apps/ui", "run", "test:honesty"]),
-  run("npm", ["--prefix", "apps/ui", "run", "test:command-coverage"]),
-  run("npm", ["--prefix", "apps/ui", "run", "test:release-no-fallback-g129"]),
-  run("npm", ["--prefix", "apps/ui", "run", "test:ui-integration-g130"]),
-  run("npm", ["--prefix", "apps/ui", "run", "build"]),
+  run("npm", ["--prefix", "apps/ui", "ci"], { env: releaseEnv }),
+  run("npm", ["--prefix", "apps/ui", "run", "test:honesty"], { env: releaseEnv }),
+  run("npm", ["--prefix", "apps/ui", "run", "test:command-coverage"], { env: releaseEnv }),
+  run("npm", ["--prefix", "apps/ui", "run", "test:release-no-fallback-g129"], { env: releaseEnv }),
+  run("npm", ["--prefix", "apps/ui", "run", "test:ui-integration-g130"], { env: releaseEnv }),
+  run("npm", ["--prefix", "apps/ui", "run", "build"], { env: releaseEnv }),
   run("cargo", ["test", "-p", "discrypt-desktop", "--features", releaseFeatures.join(",")]),
   run("npx", [
     "--yes",

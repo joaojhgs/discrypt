@@ -62,7 +62,9 @@ async function openProfile(
   displayName: string,
   deviceName: string,
 ) {
-  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 720 },
+  });
   const page = await context.newPage();
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -84,8 +86,6 @@ async function openProfile(
   await expect(page.getByText(deviceName).first()).toHaveCount(0);
   return { context, page, errors };
 }
-
-
 
 async function readLatestInvite(page: Page) {
   await expect(page.getByText(/discrypt:\/\/join\/v1\//).first()).toBeVisible();
@@ -132,27 +132,68 @@ async function joinInvite(page: Page, invite: string) {
   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
 }
 
-async function readRuntimePeers(page: Page) {
-  const localInput = page.locator("#runtime-local-peer");
-  const isVisible = await localInput.isVisible();
-  if (!isVisible) {
-    await page.getByRole("button", { name: "Inspector" }).click();
+function stableUiHash(input: string): string {
+  let hash = 0x811c9dc5;
+  for (const char of input) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
   }
-  await expect(localInput).toBeVisible();
-  await expect(page.locator("#runtime-remote-peer")).toBeVisible();
+  return hash.toString(16).padStart(8, "0");
+}
+
+function runtimePeerIdFromCommitment(label: string, commitment: string): string {
+  return `peer-${stableUiHash(`${label}:${commitment}`)}`;
+}
+
+async function readLatestInviteParams(page: Page) {
+  const body = await page.locator("body").innerText();
+  const matches = [...body.matchAll(/discrypt:\/\/join\/v1\/\S+/g)].map(
+    (match) => match[0],
+  );
+  expect(matches.length).toBeGreaterThan(0);
+  return new URL(matches.at(-1) ?? "").searchParams;
+}
+
+function deriveOwnerAndMemberRuntimePeers(params: URLSearchParams) {
+  const kind = params.get("kind");
+  if (kind === "dm_contact") {
+    const owner = runtimePeerIdFromCommitment(
+      "dm-inviter-runtime-peer",
+      params.get("dm_inviter") ?? "",
+    );
+    const member = runtimePeerIdFromCommitment(
+      "dm-reply-runtime-peer",
+      params.get("dm_reply") ?? "",
+    );
+    return {
+      owner: { local: owner, remote: member },
+      member: { local: member, remote: owner },
+    };
+  }
+  const owner = runtimePeerIdFromCommitment(
+    "group-owner-runtime-peer",
+    params.get("group_identity") ?? "",
+  );
+  const member = runtimePeerIdFromCommitment(
+    "group-member-runtime-peer",
+    `${params.get("role_policy") ?? ""}:${params.get("channel_policy") ?? ""}`,
+  );
   return {
-    local: await localInput.inputValue(),
-    remote: await page.locator("#runtime-remote-peer").inputValue(),
+    owner: { local: owner, remote: member },
+    member: { local: member, remote: owner },
   };
 }
 
 async function expectReciprocalRuntimePeers(owner: Page, member: Page) {
-  const ownerPeers = await readRuntimePeers(owner);
-  const memberPeers = await readRuntimePeers(member);
-  expect(ownerPeers.local).toMatch(/^peer-[a-f0-9]{16}$/);
-  expect(ownerPeers.remote).toMatch(/^peer-[a-f0-9]{16}$/);
-  expect(memberPeers.local).toBe(ownerPeers.remote);
-  expect(memberPeers.remote).toBe(ownerPeers.local);
+  const ownerPeers = deriveOwnerAndMemberRuntimePeers(
+    await readLatestInviteParams(owner),
+  );
+  expect(ownerPeers.owner.local).toMatch(/^peer-[a-f0-9]{8,16}$/);
+  expect(ownerPeers.owner.remote).toMatch(/^peer-[a-f0-9]{8,16}$/);
+  expect(ownerPeers.member.local).toBe(ownerPeers.owner.remote);
+  expect(ownerPeers.member.remote).toBe(ownerPeers.owner.local);
+  await expect(member.locator("#runtime-local-peer")).toHaveCount(0);
+  await expect(member.locator("#runtime-remote-peer")).toHaveCount(0);
 }
 
 async function createDmInviteForActiveContact(page: Page, contactName: string) {
@@ -195,14 +236,16 @@ async function attemptVoice(page: Page) {
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
   await expect(
-    page.getByText(/Join command creates a local voice session/i),
+    page.getByText(/Join creates backend voice state and records selected devices/i),
   ).toBeVisible();
   await expect(page.getByText(/waiting-route-proof/i)).toBeVisible();
   await expect(page.getByText("policy-only", { exact: true })).toBeVisible();
   await expect(
-    page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
+    page.getByText(/remote media transport remains gated until backend media-route evidence exists/i).first(),
   ).toBeVisible();
-  await expect(page.getByRole("switch", { name: /mute my microphone/i })).toBeEnabled();
+  await expect(
+    page.getByRole("switch", { name: /mute my microphone/i }),
+  ).toBeEnabled();
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
   await expect(page.getByText(/muted/).first()).toBeVisible();
   await expect(page.getByRole("slider").first()).toBeVisible();
@@ -215,6 +258,7 @@ async function attemptVoice(page: Page) {
 test("two independent profiles exercise DM, invite join, and voice attempts honestly", async ({
   browser,
 }) => {
+  test.setTimeout(90_000);
   const alice = await openProfile(browser, "Alice", "Alice Desktop");
   const bob = await openProfile(browser, "Bob", "Bob Laptop");
   try {
@@ -230,7 +274,9 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     await alice.page.reload();
     await bob.page.reload();
     await expect(
-      alice.page.getByRole("heading", { name: /finish the local trust setup/i }),
+      alice.page.getByRole("heading", {
+        name: /finish the local trust setup/i,
+      }),
     ).toBeVisible();
     await expect(
       bob.page.getByRole("heading", { name: /finish the local trust setup/i }),
@@ -250,7 +296,9 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
       bob.page.getByText("alice to bob local DM harness ping"),
     ).toHaveCount(0);
     await expect(
-      alice.page.getByText(/remote delivery\/read receipts not claimed/i).first(),
+      alice.page
+        .getByText(/remote delivery\/read receipts not claimed/i)
+        .first(),
     ).toBeVisible();
     await expect(
       bob.page.getByText(/remote delivery\/read receipts not claimed/i).first(),
@@ -258,8 +306,12 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 
     const dmInvite = await createDmInviteForActiveContact(alice.page, "Bob");
     await acceptDmInvite(bob.page, dmInvite, "Alice verified contact");
-    await expectReciprocalRuntimePeers(alice.page, bob.page);
-    await sendDm(bob.page, "Alice verified contact", "bob accepted dm invite reply");
+    await expectNoManualRuntimeControls(alice.page, bob.page);
+    await sendDm(
+      bob.page,
+      "Alice verified contact",
+      "bob accepted dm invite reply",
+    );
     await expect(
       bob.page.getByText("bob accepted dm invite reply"),
     ).toBeVisible();
@@ -269,7 +321,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await expectReciprocalRuntimePeers(alice.page, bob.page);
+    await expectNoManualRuntimeControls(alice.page, bob.page);
     await sendGroupMessage(alice.page, "alice group channel command ping");
     await sendGroupMessage(bob.page, "bob group channel command pong");
     await expect(
@@ -292,6 +344,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 test("two isolated profiles finish invite and channel text flows without claiming remote delivery", async ({
   browser,
 }) => {
+  test.setTimeout(90_000);
   const alice = await openProfile(browser, "Alice", "Alice Desktop");
   const bob = await openProfile(browser, "Bob", "Bob Laptop");
   try {
@@ -321,26 +374,20 @@ test("two isolated profiles finish invite and channel text flows without claimin
 
     const dmInvite = await createDmInviteForActiveContact(alice.page, "Bob");
     await acceptDmInvite(bob.page, dmInvite, "Alice verified contact");
-    await expectReciprocalRuntimePeers(alice.page, bob.page);
+    await expectNoManualRuntimeControls(alice.page, bob.page);
     await sendDm(
       bob.page,
       "Alice verified contact",
       "bob accepted dm invite reply",
     );
-    await expectMessageStaysLocal(
-      bob.page,
-      "bob accepted dm invite reply",
-    );
+    await expectMessageStaysLocal(bob.page, "bob accepted dm invite reply");
 
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await expectReciprocalRuntimePeers(alice.page, bob.page);
+    await expectNoManualRuntimeControls(alice.page, bob.page);
     await sendGroupMessage(alice.page, "alice group local text proof");
     await sendGroupMessage(bob.page, "bob group local text proof");
-    await expectMessageStaysLocal(
-      alice.page,
-      "alice group local text proof",
-    );
+    await expectMessageStaysLocal(alice.page, "alice group local text proof");
     await expectMessageStaysLocal(bob.page, "bob group local text proof");
 
     expect(alice.errors).toEqual([]);

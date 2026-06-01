@@ -92,6 +92,8 @@ const TEXT_SEND_LIMIT: u32 = 20;
 const ADMISSION_HELPER_ATTEMPT_LIMIT: u32 = 5;
 const SIGNALING_ACTION_LIMIT: u32 = 60;
 const ABUSE_WINDOW_SECONDS: i64 = 60;
+#[cfg_attr(not(feature = "tauri-runtime"), allow(dead_code))]
+const APP_EVENT_TAURI_TOPIC: &str = "app_event";
 const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
     "Provider-backed long-lived attachment is intentionally disabled while this app-service only owns short-lived transport probes; add persisted negotiated offer/answer/ICE bootstrap handoff and a persistent installed-app receiver loop for peer routing before attaching";
 
@@ -854,6 +856,18 @@ pub struct CreateGroupRequest {
     pub name: String,
     /// Default retention label for new text channels.
     pub retention: String,
+    /// Optional production signaling adapter override for this group/invite scope.
+    #[serde(default)]
+    pub adapter_kind: Option<String>,
+    /// Optional provider endpoint override for the selected signaling adapter.
+    #[serde(default)]
+    pub signaling_endpoint: Option<String>,
+    /// Optional STUN endpoints for this group/invite scope.
+    #[serde(default)]
+    pub ice_stun_servers: Option<Vec<String>>,
+    /// Optional redacted TURN endpoint metadata for this group/invite scope.
+    #[serde(default)]
+    pub ice_turn_servers: Option<Vec<IceTurnServerView>>,
 }
 
 /// Request to focus an existing group from the server rail.
@@ -1772,17 +1786,19 @@ impl TauriAppService {
         }
 
         match (&self.text_control_transport_runtime, session_active) {
-            (Some(runtime), true) if runtime.session_id == session.session_id => TransportStatusView {
-                label: "text/control runtime".to_owned(),
-                status: "attached".to_owned(),
-                detail: format!(
-                    "App-service text/control pump owns runtime session {} role={} local_peer={} remote_peer={} and can drain signed pending frames",
-                    runtime.session_id,
-                    runtime_role_label(runtime.role),
-                    runtime.local_peer_id.as_deref().unwrap_or("test-harness"),
-                    runtime.remote_peer_id.as_deref().unwrap_or("test-harness")
-                ),
-            },
+            (Some(runtime), true) if runtime.session_id == session.session_id => {
+                TransportStatusView {
+                    label: "text/control runtime".to_owned(),
+                    status: "attached".to_owned(),
+                    detail: format!(
+                        "App-service text/control pump owns runtime session {} role={} local_peer={} remote_peer={} and can drain signed pending frames",
+                        runtime.session_id,
+                        runtime_role_label(runtime.role),
+                        runtime.local_peer_id.as_deref().unwrap_or("test-harness"),
+                        runtime.remote_peer_id.as_deref().unwrap_or("test-harness")
+                    ),
+                }
+            }
             (Some(runtime), true) => TransportStatusView {
                 label: "text/control runtime".to_owned(),
                 status: "stale-runtime".to_owned(),
@@ -2370,7 +2386,7 @@ pub fn attach_text_control_transport_runtime(
                         "attach_text_control_transport_runtime",
                         "transport_runtime_attach_failed",
                         error,
-                        "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and STUN/TURN policy allows WebRTC",
+                        "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and provider-signaled STUN/TURN policy proves WebRTC attach readiness",
                     );
                 }
             }
@@ -2657,8 +2673,9 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
                 dm_id: dm_id.clone(),
                 participant_id: participant_id.clone(),
                 display_name: display_name.clone(),
-                local_only_copy: "Local harness-backed DM; no remote delivery is claimed"
-                    .to_owned(),
+                local_only_copy:
+                    "Local DM; remote delivery is not claimed until backend proof is available"
+                        .to_owned(),
                 runtime_peers,
                 connectivity: Some(connectivity),
             });
@@ -2686,7 +2703,7 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
         let name = normalize_label(&request.name, "private lab");
         let group_id = stable_id("group", &name, state.next_sequence);
         if !state.groups.iter().any(|group| group.name == name) {
-            let connectivity = group_connectivity_policy(&group_id);
+            let connectivity = group_connectivity_policy_from_request(&group_id, &request);
             let runtime_peers = group_runtime_peers(Some(&connectivity), "owner");
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
@@ -2750,12 +2767,11 @@ pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
 pub fn set_active_channel(request: SetActiveChannelRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
-        let group = state
-            .groups
-            .iter()
-            .find(|g| g.group_id == request.group_id);
+        let group = state.groups.iter().find(|g| g.group_id == request.group_id);
         let channel = group.and_then(|g| {
-            g.channels.iter().find(|c| c.channel_id == request.channel_id)
+            g.channels
+                .iter()
+                .find(|c| c.channel_id == request.channel_id)
         });
         if let Some(ch) = channel {
             let kind = match ch.kind {
@@ -2768,10 +2784,7 @@ pub fn set_active_channel(request: SetActiveChannelRequest) -> AppStateView {
                 channel_id: Some(request.channel_id.clone()),
                 dm_id: None,
             });
-            state.push_event(
-                "channel.focused",
-                format!("Focused channel {}", ch.name),
-            );
+            state.push_event("channel.focused", format!("Focused channel {}", ch.name));
         } else {
             state.push_command_error(
                 "channel.focus_missing",
@@ -3030,7 +3043,6 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let ice_config = descriptor.ice_server_config_at(None, Utc::now()).ok();
         let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
             Ok(code) => code,
             Err(error) => {
@@ -3063,14 +3075,8 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             signaling_trust_status: "signed endpoint fingerprint; verify before MLS Welcome"
                 .to_owned(),
             endpoint_policy: "production_tls".to_owned(),
-            ice_stun_servers: ice_config
-                .as_ref()
-                .map(ice_stun_server_views)
-                .unwrap_or_default(),
-            ice_turn_servers: ice_config
-                .as_ref()
-                .map(ice_turn_server_views)
-                .unwrap_or_default(),
+            ice_stun_servers: connectivity.ice_stun_servers.clone(),
+            ice_turn_servers: connectivity.ice_turn_servers.clone(),
             expires,
             expires_at,
             max_use,
@@ -3203,7 +3209,6 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let ice_config = descriptor.ice_server_config_at(None, Utc::now()).ok();
         let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
             Ok(code) => code,
             Err(error) => {
@@ -3235,14 +3240,8 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
             signaling_trust_fingerprint,
             signaling_trust_status: "signed endpoint fingerprint; verify before DM accept".to_owned(),
             endpoint_policy: "production_tls".to_owned(),
-            ice_stun_servers: ice_config
-                .as_ref()
-                .map(ice_stun_server_views)
-                .unwrap_or_default(),
-            ice_turn_servers: ice_config
-                .as_ref()
-                .map(ice_turn_server_views)
-                .unwrap_or_default(),
+            ice_stun_servers: connectivity.ice_stun_servers.clone(),
+            ice_turn_servers: connectivity.ice_turn_servers.clone(),
             expires,
             expires_at,
             max_use,
@@ -4020,135 +4019,208 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn start_signaling_session(request: StartSignalingSessionRequest) -> AppStateView {
-        super::start_signaling_session(request)
+    pub(super) fn start_signaling_session(
+        app_handle: tauri::AppHandle,
+        request: StartSignalingSessionRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::start_signaling_session(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn stop_signaling_session(request: StopSignalingSessionRequest) -> AppStateView {
-        super::stop_signaling_session(request)
+    pub(super) fn stop_signaling_session(
+        app_handle: tauri::AppHandle,
+        request: StopSignalingSessionRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::stop_signaling_session(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
-        super::start_text_session(request)
+    pub(super) fn start_text_session(
+        app_handle: tauri::AppHandle,
+        request: StartTextSessionRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::start_text_session(request))
     }
 
     #[tauri::command]
-    pub(super) fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
-        super::stop_text_session(request)
+    pub(super) fn stop_text_session(
+        app_handle: tauri::AppHandle,
+        request: StopTextSessionRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::stop_text_session(request))
     }
 
     #[tauri::command]
     pub(super) fn attach_text_control_transport_runtime(
+        app_handle: tauri::AppHandle,
         request: AttachTextControlTransportRuntimeRequest,
     ) -> AppStateView {
-        super::attach_text_control_transport_runtime(request)
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::attach_text_control_transport_runtime(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn create_user(request: CreateUserRequest) -> AppStateView {
-        super::create_user(request)
+    pub(super) fn create_user(
+        app_handle: tauri::AppHandle,
+        request: CreateUserRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::create_user(request))
     }
 
     #[tauri::command]
-    pub(super) fn recover_user(request: RecoverUserRequest) -> AppStateView {
-        super::recover_user(request)
+    pub(super) fn recover_user(
+        app_handle: tauri::AppHandle,
+        request: RecoverUserRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::recover_user(request))
     }
 
     #[tauri::command]
     pub(super) fn verify_safety_number(
+        app_handle: tauri::AppHandle,
         request: SafetyVerificationRequest,
     ) -> SafetyVerificationResult {
-        super::verify_safety_number(request)
+        super::run_command_with_event_emit(&app_handle, || super::verify_safety_number(request))
     }
 
     #[tauri::command]
     pub(super) fn create_device_pairing_payload(
+        app_handle: tauri::AppHandle,
         request: CreateDevicePairingPayloadRequest,
     ) -> DevicePairingPayloadView {
-        super::create_device_pairing_payload(request)
+        super::run_command_with_event_emit(&app_handle, || {
+            super::create_device_pairing_payload(request)
+        })
     }
 
     #[tauri::command]
     pub(super) fn accept_device_pairing_payload(
+        app_handle: tauri::AppHandle,
         request: AcceptDevicePairingPayloadRequest,
     ) -> AppStateView {
-        super::accept_device_pairing_payload(request)
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::accept_device_pairing_payload(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
-        super::save_preferences(request)
+    pub(super) fn save_preferences(
+        app_handle: tauri::AppHandle,
+        request: SavePreferencesRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::save_preferences(request))
     }
 
     #[tauri::command]
-    pub(super) fn start_dm(request: StartDmRequest) -> AppStateView {
-        super::start_dm(request)
+    pub(super) fn start_dm(app_handle: tauri::AppHandle, request: StartDmRequest) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::start_dm(request))
     }
 
     #[tauri::command]
-    pub(super) fn create_group(request: CreateGroupRequest) -> AppStateView {
-        super::create_group(request)
+    pub(super) fn create_group(
+        app_handle: tauri::AppHandle,
+        request: CreateGroupRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::create_group(request))
     }
 
     #[tauri::command]
-    pub(super) fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
-        super::set_active_group(request)
+    pub(super) fn set_active_group(
+        app_handle: tauri::AppHandle,
+        request: SetActiveGroupRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::set_active_group(request))
     }
 
     #[tauri::command]
-    pub(super) fn set_active_channel(request: SetActiveChannelRequest) -> AppStateView {
-        super::set_active_channel(request)
+    pub(super) fn set_active_channel(
+        app_handle: tauri::AppHandle,
+        request: SetActiveChannelRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::set_active_channel(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn set_active_dm(request: SetActiveDmRequest) -> AppStateView {
-        super::set_active_dm(request)
+    pub(super) fn set_active_dm(
+        app_handle: tauri::AppHandle,
+        request: SetActiveDmRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::set_active_dm(request))
     }
 
     #[tauri::command]
-    pub(super) fn join_group(request: JoinGroupRequest) -> AppStateView {
-        super::join_group(request)
+    pub(super) fn join_group(
+        app_handle: tauri::AppHandle,
+        request: JoinGroupRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::join_group(request))
     }
 
     #[tauri::command]
-    pub(super) fn create_invite(request: CreateInviteRequest) -> AppStateView {
-        super::create_invite(request)
+    pub(super) fn create_invite(
+        app_handle: tauri::AppHandle,
+        request: CreateInviteRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::create_invite(request))
     }
 
     #[tauri::command]
-    pub(super) fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
-        super::create_dm_invite(request)
+    pub(super) fn create_dm_invite(
+        app_handle: tauri::AppHandle,
+        request: CreateDmInviteRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::create_dm_invite(request))
     }
 
     #[tauri::command]
-    pub(super) fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
-        super::accept_dm_invite(request)
+    pub(super) fn accept_dm_invite(
+        app_handle: tauri::AppHandle,
+        request: AcceptDmInviteRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::accept_dm_invite(request))
     }
 
     #[tauri::command]
-    pub(super) fn create_channel(request: CreateChannelRequest) -> AppStateView {
-        super::create_channel(request)
+    pub(super) fn create_channel(
+        app_handle: tauri::AppHandle,
+        request: CreateChannelRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::create_channel(request))
     }
 
     #[tauri::command]
-    pub(super) fn send_message(request: SendMessageRequest) -> AppStateView {
-        super::send_message(request)
+    pub(super) fn send_message(
+        app_handle: tauri::AppHandle,
+        request: SendMessageRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::send_message(request))
     }
 
     #[tauri::command]
     pub(super) fn apply_text_delivery_receipt(
+        app_handle: tauri::AppHandle,
         request: ApplyTextDeliveryReceiptRequest,
     ) -> AppStateView {
-        super::apply_text_delivery_receipt(request)
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::apply_text_delivery_receipt(request)
+        })
     }
 
     #[tauri::command]
     pub(super) fn receive_text_delivery_envelope(
+        app_handle: tauri::AppHandle,
         request: ReceiveTextDeliveryEnvelopeRequest,
     ) -> ReceiveTextDeliveryEnvelopeResponse {
-        super::receive_text_delivery_envelope(request)
+        super::run_receive_text_delivery_envelope_with_event_emit(&app_handle, || {
+            super::receive_text_delivery_envelope(request)
+        })
     }
 
     #[tauri::command]
@@ -4160,48 +4232,78 @@ mod ipc_commands {
 
     #[tauri::command]
     pub(super) fn pump_text_control_transport_once(
+        app_handle: tauri::AppHandle,
         request: ListPendingTextControlFramesRequest,
     ) -> TextControlTransportPumpReportView {
-        super::pump_text_control_transport_once(request)
+        let previous_cursor = super::latest_app_event_cursor();
+        let report = super::pump_text_control_transport_once(request);
+        let state = super::app_state();
+        super::emit_app_event_stream(&app_handle, &state, previous_cursor);
+        report
     }
 
     #[tauri::command]
     pub(super) fn mark_text_control_frame_sent(
+        app_handle: tauri::AppHandle,
         request: MarkTextControlFrameSentRequest,
     ) -> AppStateView {
-        super::mark_text_control_frame_sent(request)
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::mark_text_control_frame_sent(request)
+        })
     }
 
     #[tauri::command]
     pub(super) fn handle_text_control_frame(
+        app_handle: tauri::AppHandle,
         request: HandleTextControlFrameRequest,
     ) -> HandleTextControlFrameResponse {
-        super::handle_text_control_frame(request)
+        super::run_handle_text_control_frame_with_event_emit(&app_handle, || {
+            super::handle_text_control_frame(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn join_voice(request: JoinVoiceRequest) -> AppStateView {
-        super::join_voice(request)
+    pub(super) fn join_voice(
+        app_handle: tauri::AppHandle,
+        request: JoinVoiceRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::join_voice(request))
     }
 
     #[tauri::command]
-    pub(super) fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
-        super::leave_voice(request)
+    pub(super) fn leave_voice(
+        app_handle: tauri::AppHandle,
+        request: LeaveVoiceRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::leave_voice(request))
     }
 
     #[tauri::command]
-    pub(super) fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
-        super::set_self_mute(request)
+    pub(super) fn set_self_mute(
+        app_handle: tauri::AppHandle,
+        request: SetSelfMuteRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || super::set_self_mute(request))
     }
 
     #[tauri::command]
-    pub(super) fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateView {
-        super::update_voice_activity(request)
+    pub(super) fn update_voice_activity(
+        app_handle: tauri::AppHandle,
+        request: UpdateVoiceActivityRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::update_voice_activity(request)
+        })
     }
 
     #[tauri::command]
-    pub(super) fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
-        super::set_speaker_volume(request)
+    pub(super) fn set_speaker_volume(
+        app_handle: tauri::AppHandle,
+        request: SetSpeakerVolumeRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::set_speaker_volume(request)
+        })
     }
 
     #[tauri::command]
@@ -4225,8 +4327,13 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn reset_app_state(request: ResetAppStateRequest) -> AppStateView {
-        super::reset_app_state_confirmed(request)
+    pub(super) fn reset_app_state(
+        app_handle: tauri::AppHandle,
+        request: ResetAppStateRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::reset_app_state_confirmed(request)
+        })
     }
 }
 
@@ -6983,6 +7090,88 @@ fn mutate_app_service_with_result<T>(
     (view, result)
 }
 
+#[cfg_attr(not(any(test, feature = "tauri-runtime")), allow(dead_code))]
+fn app_event_stream_after_view(state: &AppStateView, cursor: u64) -> AppEventStreamView {
+    let events = state
+        .events
+        .iter()
+        .filter(|event| event.sequence > cursor)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_cursor = events
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(state.event_cursor);
+    AppEventStreamView {
+        events,
+        cursor,
+        next_cursor,
+        has_more: false,
+        subscribed_kinds: Vec::new(),
+    }
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn latest_app_event_cursor() -> u64 {
+    with_state(|state| state.latest_event_cursor())
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn emit_app_event_stream(
+    app_handle: &tauri::AppHandle,
+    state: &AppStateView,
+    previous_cursor: u64,
+) {
+    use tauri::Emitter as _;
+
+    let stream = app_event_stream_after_view(state, previous_cursor);
+    if !stream.events.is_empty() {
+        let _ = app_handle.emit(APP_EVENT_TAURI_TOPIC, stream);
+    }
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn run_app_state_command_with_event_emit(
+    app_handle: &tauri::AppHandle,
+    command: impl FnOnce() -> AppStateView,
+) -> AppStateView {
+    let previous_cursor = latest_app_event_cursor();
+    let state = command();
+    emit_app_event_stream(app_handle, &state, previous_cursor);
+    state
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn run_command_with_event_emit<T>(app_handle: &tauri::AppHandle, command: impl FnOnce() -> T) -> T {
+    let previous_cursor = latest_app_event_cursor();
+    let output = command();
+    let state = app_state();
+    emit_app_event_stream(app_handle, &state, previous_cursor);
+    output
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn run_receive_text_delivery_envelope_with_event_emit(
+    app_handle: &tauri::AppHandle,
+    command: impl FnOnce() -> ReceiveTextDeliveryEnvelopeResponse,
+) -> ReceiveTextDeliveryEnvelopeResponse {
+    let previous_cursor = latest_app_event_cursor();
+    let response = command();
+    emit_app_event_stream(app_handle, &response.state, previous_cursor);
+    response
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn run_handle_text_control_frame_with_event_emit(
+    app_handle: &tauri::AppHandle,
+    command: impl FnOnce() -> HandleTextControlFrameResponse,
+) -> HandleTextControlFrameResponse {
+    let previous_cursor = latest_app_event_cursor();
+    let response = command();
+    emit_app_event_stream(app_handle, &response.state, previous_cursor);
+    response
+}
+
 fn normalize_event_subscriptions(raw: &[String]) -> Vec<String> {
     let mut normalized = raw
         .iter()
@@ -7826,6 +8015,40 @@ fn default_redacted_turn_servers() -> Vec<IceTurnServerView> {
     Vec::new()
 }
 
+fn signaling_profile_for_endpoint(
+    scope_commitment: &str,
+    kind: InviteSignalingAdapterKind,
+    endpoint: String,
+    profile_suffix: &str,
+) -> SignalingProfileView {
+    let adapter_kind = profile_kind_name(&kind);
+    SignalingProfileView {
+        profile_id: format!("{adapter_kind}-{profile_suffix}"),
+        adapter_kind: adapter_kind.clone(),
+        endpoints: vec![endpoint.clone()],
+        room_topic_commitment: hash_commitment(
+            "discrypt-rendezvous-topic-commitment-v1",
+            &[scope_commitment, &adapter_kind],
+        ),
+        trust_fingerprint: signaling_fingerprint_for_endpoint(&endpoint),
+        ttl_seconds: 300,
+        metadata_posture: "hashed_topic".to_owned(),
+        rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
+        provider_policy_version: INVITE_PROVIDER_POLICY_VERSION,
+        endpoint_allowlist_commitments: vec![endpoint_allowlist_commitment(
+            &adapter_kind,
+            &endpoint,
+        )],
+        provider_rotation_policy: default_provider_rotation_policy(),
+        capabilities: vec![
+            "presence_ttl".to_owned(),
+            "trickle_ice".to_owned(),
+            "broadcast_control".to_owned(),
+            "health_telemetry".to_owned(),
+        ],
+    }
+}
+
 fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileView> {
     [
         InviteSignalingAdapterKind::Nostr,
@@ -7835,33 +8058,13 @@ fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileVie
     ]
     .into_iter()
     .filter_map(|kind| {
-        let adapter_kind = profile_kind_name(&kind);
         let endpoint = default_adapter_endpoint(&kind)?;
-        Some(SignalingProfileView {
-            profile_id: format!("{adapter_kind}-default"),
-            adapter_kind: adapter_kind.clone(),
-            endpoints: vec![endpoint.clone()],
-            room_topic_commitment: hash_commitment(
-                "discrypt-rendezvous-topic-commitment-v1",
-                &[scope_commitment, &adapter_kind],
-            ),
-            trust_fingerprint: signaling_fingerprint_for_endpoint(&endpoint),
-            ttl_seconds: 300,
-            metadata_posture: "hashed_topic".to_owned(),
-            rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
-            provider_policy_version: INVITE_PROVIDER_POLICY_VERSION,
-            endpoint_allowlist_commitments: vec![endpoint_allowlist_commitment(
-                &adapter_kind,
-                &endpoint,
-            )],
-            provider_rotation_policy: default_provider_rotation_policy(),
-            capabilities: vec![
-                "presence_ttl".to_owned(),
-                "trickle_ice".to_owned(),
-                "broadcast_control".to_owned(),
-                "health_telemetry".to_owned(),
-            ],
-        })
+        Some(signaling_profile_for_endpoint(
+            scope_commitment,
+            kind,
+            endpoint,
+            "default",
+        ))
     })
     .collect()
 }
@@ -7939,15 +8142,57 @@ fn group_runtime_peers(
     ]
 }
 
-fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
+fn group_connectivity_policy_from_request(
+    group_id: &str,
+    request: &CreateGroupRequest,
+) -> ConnectivityPolicyView {
     let scope_id_commitment = hash_commitment("discrypt-group-scope-commitment-v1", &[group_id]);
+    let signaling_profiles = request
+        .adapter_kind
+        .as_deref()
+        .zip(request.signaling_endpoint.as_deref())
+        .and_then(|(kind, endpoint)| {
+            let endpoint = endpoint.trim();
+            (!endpoint.is_empty()).then(|| {
+                vec![signaling_profile_for_endpoint(
+                    &scope_id_commitment,
+                    profile_kind_from_name(kind),
+                    endpoint.to_owned(),
+                    "custom",
+                )]
+            })
+        })
+        .unwrap_or_else(|| default_signaling_profiles(&scope_id_commitment));
+    let ice_stun_servers = request
+        .ice_stun_servers
+        .as_ref()
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|server| server.trim())
+                .filter(|server| !server.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|servers| !servers.is_empty())
+        .unwrap_or_else(default_ice_stun_servers);
+    let ice_turn_servers = request
+        .ice_turn_servers
+        .clone()
+        .map(|servers| {
+            servers
+                .into_iter()
+                .filter(|server| !server.endpoint.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(default_redacted_turn_servers);
     ConnectivityPolicyView {
         connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
         invite_kind: InviteKind::GroupJoin.canonical_name().to_owned(),
         scope_id_commitment: scope_id_commitment.clone(),
-        signaling_profiles: default_signaling_profiles(&scope_id_commitment),
-        ice_stun_servers: default_ice_stun_servers(),
-        ice_turn_servers: default_redacted_turn_servers(),
+        signaling_profiles,
+        ice_stun_servers,
+        ice_turn_servers,
         privacy_label: "Group invite topics are derived commitments; group names, channel names, and room secrets are not exposed".to_owned(),
         dm_bootstrap: None,
         group_bootstrap: Some(GroupInviteBootstrapView {
@@ -7962,6 +8207,20 @@ fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
             ),
         }),
     }
+}
+
+fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
+    group_connectivity_policy_from_request(
+        group_id,
+        &CreateGroupRequest {
+            name: String::new(),
+            retention: String::new(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        },
+    )
 }
 
 fn dm_connectivity_policy(dm_id: &str, participant_id: &str) -> ConnectivityPolicyView {
@@ -8883,6 +9142,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group = group_state
             .groups
@@ -9273,6 +9536,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group_state.groups[0].group_id.clone();
         let invite_state = create_invite(CreateInviteRequest {
@@ -9362,6 +9629,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "ICE Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let invite_state = create_invite(CreateInviteRequest {
             group_id: Some(group_state.groups[0].group_id.clone()),
@@ -9393,6 +9664,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group_state.groups[0].group_id.clone();
         let invite_state = create_invite(CreateInviteRequest {
@@ -9472,11 +9747,12 @@ mod tests {
             .invites
             .iter()
             .any(|invite| invite.invite_kind == "dm_contact"));
-        assert!(persisted.dms.iter().any(|dm| dm
-            .connectivity
-            .as_ref()
-            .map(|policy| policy.invite_kind.as_str())
-            == Some("dm_contact")));
+        assert!(persisted.dms.iter().any(|dm| {
+            dm.connectivity
+                .as_ref()
+                .map(|policy| policy.invite_kind.as_str())
+                == Some("dm_contact")
+        }));
     }
 
     #[test]
@@ -9565,6 +9841,64 @@ mod tests {
     }
 
     #[test]
+    fn create_group_persists_custom_signaling_and_ice_policy() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("custom-group-connectivity-policy");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let state = create_group(CreateGroupRequest {
+            name: "Custom Voice Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "stun:stun.cloudflare.com:3478".to_owned(),
+            ]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.invalid:5349".to_owned(),
+                credential_declared: true,
+                credential_expires_at: Some("2026-06-02T00:00:00Z".to_owned()),
+            }]),
+        });
+        let connectivity = state
+            .groups
+            .first()
+            .and_then(|group| group.connectivity.as_ref())
+            .ok_or_else(|| "custom group connectivity missing".to_owned())?;
+        assert_eq!(connectivity.signaling_profiles.len(), 1);
+        assert_eq!(connectivity.signaling_profiles[0].adapter_kind, "mqtt");
+        assert_eq!(
+            connectivity.signaling_profiles[0].endpoints,
+            vec!["mqtts://broker.emqx.io:8883".to_owned()]
+        );
+        assert_eq!(
+            connectivity.ice_stun_servers,
+            vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "stun:stun.cloudflare.com:3478".to_owned(),
+            ]
+        );
+        assert_eq!(connectivity.ice_turn_servers.len(), 1);
+        assert!(connectivity.ice_turn_servers[0].credential_declared);
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: state.groups.first().map(|group| group.group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+        });
+        let invite = invite_state
+            .invites
+            .last()
+            .ok_or_else(|| "custom group invite missing".to_owned())?;
+        assert_eq!(invite.signaling_profiles, connectivity.signaling_profiles);
+        assert_eq!(invite.ice_stun_servers, connectivity.ice_stun_servers);
+        assert_eq!(invite.ice_turn_servers, connectivity.ice_turn_servers);
+        Ok(())
+    }
+
+    #[test]
     fn group_invite_join_persists_signed_runtime_peers() -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("group-runtime-peers-alice");
@@ -9575,6 +9909,10 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         assert!(created.last_command_error.is_none(), "{created:?}");
         let owner_group = created
@@ -9689,10 +10027,18 @@ mod tests {
         let alpha = create_group(CreateGroupRequest {
             name: "Alpha Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         create_group(CreateGroupRequest {
             name: "Beta Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let alpha_id = alpha.groups[0].group_id.clone();
         let focused = set_active_group(SetActiveGroupRequest {
@@ -9715,6 +10061,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group_state.groups[0].group_id.clone();
         let channel_state = create_channel(CreateChannelRequest {
@@ -9833,6 +10183,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group_state.groups[0].group_id.clone();
         let channel_state = create_channel(CreateChannelRequest {
@@ -9880,6 +10234,10 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group_state.groups[0].group_id.clone();
         let first = create_channel(CreateChannelRequest {
@@ -10009,6 +10367,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Status Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group.groups[0].group_id.clone();
         let state = create_invite(CreateInviteRequest {
@@ -10057,6 +10419,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Join Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let state = create_invite(CreateInviteRequest {
             group_id: Some(group.groups[0].group_id.clone()),
@@ -10126,6 +10492,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Voice State Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group.groups[0].group_id.clone();
         let channel = create_channel(CreateChannelRequest {
@@ -11983,6 +12353,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Integration Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group
             .groups
@@ -12549,6 +12923,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group
             .active_context
@@ -12794,6 +13172,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group
             .active_context
@@ -12985,7 +13367,10 @@ mod tests {
                 || state.messages[0]
                     .state_detail
                     .contains("implementation_unavailable")
-                || state.messages[0].state_detail.contains("not enabled"),
+                || state.messages[0].state_detail.contains("not enabled")
+                || state.messages[0]
+                    .state_detail
+                    .contains("No signaling profile matches"),
             "{}",
             state.messages[0].state_detail
         );
@@ -13137,10 +13522,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(kinds, vec!["nostr", "mqtt"]);
-        assert!(profiles.iter().all(|profile| profile
-            .endpoints
-            .iter()
-            .all(|endpoint| !endpoint.contains(".invalid"))));
+        assert!(profiles.iter().all(|profile| {
+            profile
+                .endpoints
+                .iter()
+                .all(|endpoint| !endpoint.contains(".invalid"))
+        }));
     }
 
     #[test]
@@ -13250,6 +13637,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Abuse Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group.groups[0].group_id.clone();
         for index in 0..INVITE_CREATE_LIMIT {
@@ -13443,6 +13834,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Error Lab".to_owned(),
             retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         assert!(group.last_command_error.is_none());
         let group_id = group
@@ -13559,6 +13954,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Cursor Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         cursor = assert_cursor_advanced(cursor, &group);
         let group_id = group
@@ -13692,6 +14091,10 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Stream Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
         });
         let group_id = group
             .groups
@@ -13803,6 +14206,220 @@ mod tests {
         assert!(drained.events.is_empty());
         assert_eq!(drained.cursor, topic_events.next_cursor);
         Ok(())
+    }
+
+    #[test]
+    fn message_mutations_prepare_tauri_push_event_payloads_from_persisted_cursor(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("message-push-events");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let before_message_cursor = dm.event_cursor;
+        let dm_id = dm
+            .dms
+            .first()
+            .map(|dm| dm.dm_id.clone())
+            .ok_or_else(|| "dm created".to_owned())?;
+
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "dm".to_owned(),
+                dm_id: Some(dm_id),
+                group_id: None,
+                channel_id: None,
+            },
+            body: "push me".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let push_payload = app_event_stream_after_view(&sent, before_message_cursor);
+
+        assert_eq!(push_payload.cursor, before_message_cursor);
+        assert_eq!(push_payload.next_cursor, sent.event_cursor);
+        assert!(!push_payload.has_more);
+        assert_eq!(push_payload.subscribed_kinds, Vec::<String>::new());
+        assert!(!push_payload.events.is_empty());
+        assert!(push_payload
+            .events
+            .iter()
+            .all(|event| event.sequence > before_message_cursor));
+        assert!(push_payload
+            .events
+            .iter()
+            .any(|event| event.kind == "message.sent"));
+        assert_eq!(
+            push_payload.events.last().map(|event| event.sequence),
+            Some(sent.event_cursor)
+        );
+
+        let persisted = load_state().to_view();
+        let persisted_payload = app_event_stream_after_view(&persisted, before_message_cursor);
+        assert_eq!(persisted_payload, push_payload);
+        Ok(())
+    }
+
+    #[test]
+    fn voice_mutations_prepare_tauri_push_event_payloads_from_persisted_cursor()
+    -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("voice-push-events");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Voice Lab".to_owned(),
+            retention: "session".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group created".to_owned())?;
+        let voice_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Voice Ops".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let before_voice_cursor = voice_channel.event_cursor;
+        let channel_id = voice_channel
+            .groups
+            .first()
+            .and_then(|group| group.channels.last())
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel created".to_owned())?;
+
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+        let push_payload = app_event_stream_after_view(&joined, before_voice_cursor);
+
+        assert_eq!(push_payload.cursor, before_voice_cursor);
+        assert_eq!(push_payload.next_cursor, joined.event_cursor);
+        assert!(!push_payload.events.is_empty());
+        assert!(push_payload
+            .events
+            .iter()
+            .all(|event| event.sequence > before_voice_cursor));
+        assert!(push_payload
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.joined"));
+        Ok(())
+    }
+
+    #[test]
+    fn tauri_runtime_mutating_commands_are_wired_to_push_app_event_streams() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("const APP_EVENT_TAURI_TOPIC: &str = \"app_event\""));
+        assert!(source.contains("app_handle.emit(APP_EVENT_TAURI_TOPIC, stream)"));
+
+        fn command_wrapper<'a>(source: &'a str, command: &str) -> &'a str {
+            let marker = format!("pub(super) fn {command}");
+            let start = source.find(&marker).unwrap_or_else(|| {
+                panic!("missing Tauri command wrapper for {command}");
+            });
+            let rest = &source[start..];
+            let end = rest
+                .find("\n    #[tauri::command]")
+                .unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        for command in [
+            "start_signaling_session",
+            "stop_signaling_session",
+            "start_text_session",
+            "stop_text_session",
+            "attach_text_control_transport_runtime",
+            "create_user",
+            "recover_user",
+            "accept_device_pairing_payload",
+            "save_preferences",
+            "start_dm",
+            "create_group",
+            "set_active_group",
+            "set_active_channel",
+            "set_active_dm",
+            "join_group",
+            "create_invite",
+            "create_dm_invite",
+            "accept_dm_invite",
+            "create_channel",
+            "send_message",
+            "apply_text_delivery_receipt",
+            "mark_text_control_frame_sent",
+            "pump_text_control_transport_once",
+            "join_voice",
+            "leave_voice",
+            "set_self_mute",
+            "update_voice_activity",
+            "set_speaker_volume",
+        ] {
+            let start = source
+                .find(&format!("pub(super) fn {command}("))
+                .unwrap_or_else(|| panic!("missing {command} wrapper"));
+            let rest = &source[start..];
+            let end = rest.find("\n    #[tauri::command]").unwrap_or(rest.len());
+            let wrapper = &rest[..end];
+            assert!(
+                wrapper.contains("app_handle: tauri::AppHandle"),
+                "{command} wrapper must accept AppHandle for push app_event emission"
+            );
+            assert!(
+                wrapper.contains(&format!("super::{command}(request)")),
+                "{command} wrapper must call the underlying mutator inside an event-emitting helper"
+            );
+            assert!(
+                wrapper.contains("run_app_state_command_with_event_emit")
+                    || wrapper.contains("emit_app_event_stream"),
+                "{command} wrapper must emit an app_event stream after mutation"
+            );
+        }
+
+        let reset = command_wrapper(source, "reset_app_state");
+        assert!(reset.contains("app_handle: tauri::AppHandle"));
+        assert!(reset.contains("run_app_state_command_with_event_emit(&app_handle"));
+        assert!(reset.contains("super::reset_app_state_confirmed(request)"));
+
+        for command in [
+            "verify_safety_number",
+            "create_device_pairing_payload",
+            "pump_text_control_transport_once",
+        ] {
+            let wrapper = command_wrapper(source, command);
+            assert!(
+                wrapper.contains("app_handle: tauri::AppHandle"),
+                "{command} must accept AppHandle for app_event emission"
+            );
+            assert!(
+                wrapper.contains("run_command_with_event_emit(&app_handle"),
+                "{command} must emit app_event stream after non-AppState mutation"
+            );
+            assert!(wrapper.contains(&format!("super::{command}(request)")));
+        }
+
+        let receive = command_wrapper(source, "receive_text_delivery_envelope");
+        assert!(receive.contains("run_receive_text_delivery_envelope_with_event_emit(&app_handle"));
+        let handle = command_wrapper(source, "handle_text_control_frame");
+        assert!(handle.contains("run_handle_text_control_frame_with_event_emit(&app_handle"));
     }
 
     #[test]
