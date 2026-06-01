@@ -34,15 +34,14 @@ use discrypt_mls_core::{
     Identity, OpenMlsGroupEngine, OpenMlsMemberPackage, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    DeliveryError, InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextDeliveryReceipt,
-    TextDeliveryReceiptInput, TextInboundPipeline, TextInboundRequest, TextMessageEnvelope,
-    TextMessageEnvelopeInput, TextReceiveState, TextRenderState, TextRetentionMetadata,
+    DeliveryError, InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextAuthorLogEnvelope,
+    TextAuthorLogStore, TextDeliveryReceipt, TextDeliveryReceiptInput, TextInboundPipeline,
+    TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
+    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextReceiveState,
+    TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEvent, TextSendEventSink,
 };
 #[cfg(test)]
-use discrypt_mls_delivery::{
-    InMemoryTextAuthorLog, InMemoryTextSendEvents, InMemoryTextTransport, TextOutboundPipeline,
-    TextOutboundRequest, TextSelectedRoute,
-};
+use discrypt_mls_delivery::{InMemoryTextAuthorLog, InMemoryTextSendEvents, InMemoryTextTransport};
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
 #[cfg(any(test, not(all(target_os = "linux", feature = "production-storage"))))]
@@ -1972,6 +1971,7 @@ struct OpenMlsAdmissionKeyPackage {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
     owner_signer_public_key_hex: String,
@@ -2256,8 +2256,7 @@ impl TauriAppService {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-
+    #[allow(dead_code)]
     fn openmls_store_path(&self) -> PathBuf {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
@@ -2266,8 +2265,7 @@ impl TauriAppService {
         app_openmls_store_path()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-
+    #[allow(dead_code)]
     fn request_openmls_admission_key_package(
         &mut self,
         group_id: &str,
@@ -2296,8 +2294,7 @@ impl TauriAppService {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-
+    #[allow(dead_code)]
     fn issue_openmls_admission_welcome(
         &mut self,
         key_package: &OpenMlsAdmissionKeyPackage,
@@ -2360,8 +2357,7 @@ impl TauriAppService {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-
+    #[allow(dead_code)]
     fn join_openmls_group_from_welcome(
         &mut self,
         welcome: &OpenMlsAdmissionWelcome,
@@ -7009,6 +7005,18 @@ impl PersistedAppState {
                 .map_err(|error| error.to_string())?
             }
         };
+        let route = self.selected_text_route_for_outbox(message_id);
+        let mut author_log = AppTextAuthorLog::default();
+        let mut transport = AppTextOutboxTransport::default();
+        let mut events = AppTextSendEvents::default();
+        let receipt = TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
+            .send(request, route, &text_exporter_secret, &signing_key)
+            .map_err(|error| error.to_string())?;
+        if author_log.entries.len() != 1 || transport.frames.len() != 1 {
+            return Err(
+                "text outbound pipeline did not persist and queue exactly one envelope".to_owned(),
+            );
+        }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
             group_id,
@@ -9050,6 +9058,7 @@ fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> 
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn upsert_openmls_group_handle(state: &mut PersistedAppState, record: OpenMlsGroupHandleRecord) {
     if let Some(existing) = state
         .openmls_groups
@@ -16006,12 +16015,6 @@ mod tests {
             .find(|channel| matches!(channel.kind, ChannelKind::Text))
             .map(|channel| channel.channel_id.clone())
             .ok_or_else(|| "text channel missing".to_owned())?;
-        let delivery_group_id = text_delivery_group_id(&MessageTargetView {
-            kind: "channel".to_owned(),
-            dm_id: None,
-            group_id: Some(group_id.clone()),
-            channel_id: Some(channel_id.clone()),
-        })?;
         let mut engine = OpenMlsGroupEngine::open(app_openmls_store_path())
             .map_err(|error| error.to_string())?;
         let handle = load_state()
@@ -16026,7 +16029,7 @@ mod tests {
             .load_group(&group_id, &signer_public_key)
             .map_err(|error| error.to_string())?;
         let text_exporter_secret = engine
-            .export_secret(&group_id, "discrypt/text", delivery_group_id.as_bytes(), 32)
+            .export_secret(&group_id, TEXT_EXPORTER_LABEL, TEXT_EXPORTER_CONTEXT, 32)
             .map_err(|error| error.to_string())?;
         let sender = SigningKey::generate(&mut OsRng);
         let envelope = openmls_text_envelope_for_test(
@@ -16051,8 +16054,9 @@ mod tests {
         });
 
         assert!(response.receipt.is_some(), "{response:?}");
-        assert!(response.last_command_error.is_none(), "{response:?}");
+        assert!(response.state.last_command_error.is_none(), "{response:?}");
         let message = response
+            .state
             .messages
             .iter()
             .find(|message| message.message_id == "msg-openmls-plaintext")
@@ -16118,6 +16122,7 @@ mod tests {
         });
         assert!(invalid_signer.receipt.is_none(), "{invalid_signer:?}");
         assert!(invalid_signer
+            .state
             .messages
             .iter()
             .all(|message| message.body != "must not render"));
@@ -16138,6 +16143,7 @@ mod tests {
         });
         assert!(invalid_exporter.receipt.is_some(), "{invalid_exporter:?}");
         let message = invalid_exporter
+            .state
             .messages
             .iter()
             .find(|message| message.message_id == "msg-invalid-exporter")
