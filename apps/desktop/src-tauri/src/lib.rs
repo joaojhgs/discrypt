@@ -5639,6 +5639,53 @@ mod ipc_commands {
     }
 }
 
+#[cfg(all(
+    feature = "tauri-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+fn enable_platform_webview_media(app_handle: &tauri::AppHandle) {
+    use tauri::Manager;
+    use webkit2gtk::{traits::SettingsExt, traits::WebViewExt};
+
+    let Some(webview) = app_handle.get_webview_window("main") else {
+        eprintln!("discrypt: main Tauri WebView not found; WebRTC settings were not applied");
+        return;
+    };
+
+    let _ = webview.with_webview(|platform_webview| {
+        let webkit_view = platform_webview.inner();
+        if let Some(settings) = WebViewExt::settings(&webkit_view) {
+            settings.set_enable_media_stream(true);
+            settings.set_enable_webrtc(true);
+            eprintln!(
+                "discrypt: enabled WebKitGTK media-stream={} webrtc={} for native voice proof",
+                settings.enables_media_stream(),
+                settings.enables_webrtc()
+            );
+        } else {
+            eprintln!("discrypt: WebKitGTK settings unavailable; native WebRTC may remain disabled");
+        }
+    });
+}
+
+#[cfg(all(
+    feature = "tauri-runtime",
+    not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+fn enable_platform_webview_media(_app_handle: &tauri::AppHandle) {}
+
 /// Run the native Tauri shell with the command surface registered for frontend IPC.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5648,6 +5695,7 @@ pub fn run() {
             enable_platform_webview_voice_features(app)?;
             let app_handle = app.handle().clone();
             let _ = TAURI_APP_HANDLE.set(app_handle.clone());
+            enable_platform_webview_media(&app_handle);
             start_text_control_transport_runtime_pump(app_handle);
             Ok(())
         })
