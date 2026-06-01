@@ -12,6 +12,7 @@
     "test:production-copy": "node scripts/command-coverage-check.mjs",
     "test:e2e": "VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 vite build && playwright test --workers=1",
     "test:g007-voice-media": "node scripts/g007-voice-media-e2e.mjs",
+    "test:g012-voice-media-proof": "node scripts/g012-voice-media-proof.mjs",
     "test:g010-native-command-e2e": "node scripts/g010-native-command-e2e.mjs",
     "test:g010-adapter-public-matrix": "node ../../scripts/check-g010-adapter-public-matrix.mjs",
     "test:g011-boundary": "node ../../scripts/check-g011-boundary-gate.mjs",
