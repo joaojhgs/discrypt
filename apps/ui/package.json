@@ -79,7 +79,9 @@
     "test:g010-release-harness:public": "node ../../scripts/g010-release-harness.mjs --mode=public",
     "test:g010-release-contract": "node ../../scripts/check-g010-release-harness.mjs",
     "test:g010-tauri-launch-dry-run": "node ../../scripts/g010-tauri-two-profile-launch.mjs",
-    "test:g011-production-status-sync": "node ../../scripts/check-production-status-sync-g011.mjs"
+    "test:g011-production-status-sync": "node ../../scripts/check-production-status-sync-g011.mjs",
+    "g012:tauri-two-profile-e2e": "node ../../scripts/g012-tauri-two-profile-e2e.mjs",
+    "test:g012-tauri-two-profile-e2e": "node ../../scripts/check-g012-tauri-two-profile-e2e.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
