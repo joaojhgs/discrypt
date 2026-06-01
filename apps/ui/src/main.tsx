@@ -4046,7 +4046,7 @@ function VoicePanel({
             copy={
               remoteTransportActive
                 ? mediaRuntime.status_copy
-                : "Encrypted media transport remains gated by media-frame E2E; remote audio is blocked until backend media-route evidence confirms a real route."
+                : "Backend route proof required: encrypted media transport remains gated by media-frame E2E; remote audio is blocked until backend media-route evidence confirms a real route."
             }
           />
           <InfoRow
