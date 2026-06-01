@@ -6756,6 +6756,65 @@ impl PersistedAppState {
         Ok((evidence, report, receiver_state))
     }
 
+    fn openmls_text_exporter_secret(&self, group_id: &str) -> Result<Vec<u8>, String> {
+        let handle = self
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == group_id)
+            .ok_or_else(|| {
+                format!(
+                    "OpenMLS group state is missing for {}",
+                    redacted_observable_ref("group", group_id)
+                )
+            })?;
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("OpenMLS signer public key is not valid hex: {error}"))?;
+        let mut engine = OpenMlsGroupEngine::open(app_openmls_store_path())
+            .map_err(|error| format!("OpenMLS provider could not be opened: {error}"))?;
+        engine
+            .load_group(group_id, &signer_public_key)
+            .map_err(|error| format!("OpenMLS group could not be loaded: {error}"))?;
+        engine
+            .export_secret(group_id, TEXT_EXPORTER_LABEL, TEXT_EXPORTER_CONTEXT, 32)
+            .map_err(|error| format!("OpenMLS text exporter failed: {error}"))
+    }
+
+    fn selected_text_route_for_outbox(&self, message_id: &str) -> TextSelectedRoute {
+        let (session_id, route_label, overlay_hops) = self
+            .text_session
+            .as_ref()
+            .map(|session| {
+                (
+                    session.session_id.clone(),
+                    match session.state() {
+                        TransportSessionState::TurnRelay => "turn-ciphertext",
+                        TransportSessionState::OverlayRelay => "overlay-ciphertext",
+                        TransportSessionState::Direct => "direct-ciphertext",
+                        _ => "pending-text-control-outbox",
+                    }
+                    .to_owned(),
+                    if matches!(session.state(), TransportSessionState::OverlayRelay) {
+                        1
+                    } else {
+                        0
+                    },
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    format!("text-control-outbox:{message_id}"),
+                    "pending-text-control-outbox".to_owned(),
+                    0,
+                )
+            });
+        TextSelectedRoute {
+            session_id,
+            route_label,
+            overlay_hops,
+            ciphertext_only: true,
+        }
+    }
+
     fn text_delivery_envelope_record(
         &mut self,
         target: &MessageTargetView,
@@ -6766,32 +6825,89 @@ impl PersistedAppState {
         let group_id = text_delivery_group_id(target)?;
         let seed = self.identity_seed_bytes();
         let signing_key = SigningKey::from_bytes(&seed);
-        let ciphertext =
-            opaque_text_control_frame_for_message(self, target, message_id, body, sequence);
-        let envelope = TextMessageEnvelope::sign(
-            &group_id,
-            TextMessageEnvelopeInput {
-                epoch: 1,
-                sender_leaf: 1,
-                sender_device_id: self.local_user_id(),
-                sequence,
-                message_id: message_id.to_owned(),
-                retention: TextRetentionMetadata {
-                    policy: "app-default".to_owned(),
-                    created_at_ms: sequence,
-                    expires_at_ms: None,
-                    delete_after_read: false,
+        if target.kind != "channel" {
+            let ciphertext =
+                opaque_text_control_frame_for_message(self, target, message_id, body, sequence);
+            let envelope = TextMessageEnvelope::sign(
+                &group_id,
+                TextMessageEnvelopeInput {
+                    epoch: 1,
+                    sender_leaf: 1,
+                    sender_device_id: self.local_user_id(),
+                    sequence,
+                    message_id: message_id.to_owned(),
+                    retention: TextRetentionMetadata {
+                        policy: "app-default".to_owned(),
+                        created_at_ms: sequence,
+                        expires_at_ms: None,
+                        delete_after_read: false,
+                    },
+                    content_ciphertext: ciphertext,
                 },
-                content_ciphertext: ciphertext,
+                &signing_key,
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(TextDeliveryEnvelopeRecord {
+                message_id: message_id.to_owned(),
+                group_id,
+                sender_verifying_key_hex: hex::encode(signing_key.verifying_key().as_bytes()),
+                envelope,
+            });
+        }
+
+        let openmls_group_id = target
+            .group_id
+            .as_deref()
+            .ok_or_else(|| "channel delivery target requires group_id".to_owned())?;
+        let channel_id = target
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| "channel delivery target requires channel_id".to_owned())?;
+        let openmls_epoch = self
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == openmls_group_id)
+            .ok_or_else(|| {
+                format!(
+                    "OpenMLS group state is missing for {}",
+                    redacted_observable_ref("group", openmls_group_id)
+                )
+            })?
+            .epoch;
+        let text_exporter_secret = self.openmls_text_exporter_secret(openmls_group_id)?;
+        let request = TextOutboundRequest {
+            group_id: group_id.clone(),
+            channel_id: channel_id.to_owned(),
+            epoch: openmls_epoch,
+            sender_leaf: 1,
+            sender_device_id: self.local_user_id(),
+            sequence,
+            message_id: message_id.to_owned(),
+            retention: TextRetentionMetadata {
+                policy: "app-default".to_owned(),
+                created_at_ms: sequence,
+                expires_at_ms: None,
+                delete_after_read: false,
             },
-            &signing_key,
-        )
-        .map_err(|error| error.to_string())?;
+            plaintext: body.as_bytes().to_vec(),
+            sent_at_ms: sequence,
+            now: Utc::now(),
+        };
+        let route = self.selected_text_route_for_outbox(message_id);
+        let mut author_log = AppTextAuthorLog::default();
+        let mut transport = AppTextOutboxTransport::default();
+        let mut events = AppTextSendEvents::default();
+        let receipt = TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
+            .send(request, route, &text_exporter_secret, &signing_key)
+            .map_err(|error| error.to_string())?;
+        if author_log.entries.len() != 1 || transport.frames.len() != 1 {
+            return Err("text outbound pipeline did not persist and queue exactly one envelope".to_owned());
+        }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
             group_id,
             sender_verifying_key_hex: hex::encode(signing_key.verifying_key().as_bytes()),
-            envelope,
+            envelope: receipt.envelope,
         })
     }
 
