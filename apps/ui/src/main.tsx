@@ -4042,7 +4042,15 @@ function VoicePanel({
           </Button>
           <InfoRow title="Selected devices" copy={deviceCopy} />
           <InfoRow
-            title="Remote audio"
+            title="Media route proof"
+            copy={
+              remoteTransportActive
+                ? mediaRuntime.status_copy
+                : "Encrypted media transport remains gated by media-frame E2E; remote audio is blocked until backend media-route evidence confirms a real route."
+            }
+          />
+          <InfoRow
+            title="Remote audio blocker"
             copy={
               voiceJoined
                 ? remoteTransportActive

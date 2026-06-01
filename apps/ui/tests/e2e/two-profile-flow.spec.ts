@@ -301,6 +301,9 @@ async function attemptVoice(page: Page) {
     .toBe(true);
   expect((await readVoiceTrackState(page)).stopCount).toBe(0);
   await expect(
+    page.getByText(/encrypted media transport remains gated by media-frame E2E/i).first(),
+  ).toBeVisible();
+  await expect(
     page.getByText(/remote audio is not connected yet/i).first(),
   ).toBeVisible();
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
