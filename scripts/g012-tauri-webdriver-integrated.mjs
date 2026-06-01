@@ -10,7 +10,9 @@ const leaderRoot = process.env.OMX_TEAM_LEADER_CWD ? resolve(process.env.OMX_TEA
 const argv = process.argv.slice(2);
 const run = argv.includes("--run");
 const skipBuild = argv.includes("--skip-build") || process.env.DISCRYPT_G012_WEBDRIVER_SKIP_BUILD === "1";
-const requireNativeVoice = argv.includes("--require-native-voice") || process.env.DISCRYPT_G012_REQUIRE_NATIVE_VOICE === "1";
+const requireNativeVoice = argv.includes("--require-native-voice") ||
+  process.env.DISCRYPT_G012_REQUIRE_NATIVE_VOICE === "1" ||
+  process.env.DISCRYPT_G012_WEBDRIVER_REQUIRE_NATIVE_VOICE === "1";
 const runId = valueAfter("--run-id") ?? process.env.DISCRYPT_G012_WEBDRIVER_RUN_ID ?? `g012-webdriver-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 const artifactRoot = resolve(repoRoot, valueAfter("--artifact-dir") ?? process.env.DISCRYPT_G012_WEBDRIVER_ARTIFACT_DIR ?? `target/g012-e2e/${runId}`);
 const logDir = resolve(artifactRoot, "logs");
@@ -30,7 +32,6 @@ const appBinary = process.env.DISCRYPT_G012_APP_BINARY
       resolve(leaderRoot, "target/debug/discrypt-desktop"),
     ]);
 const basePort = Number(process.env.DISCRYPT_G012_WEBDRIVER_BASE_PORT ?? valueAfter("--base-port") ?? 4510);
-const requireNativeVoice = argv.includes("--require-native-voice") || process.env.DISCRYPT_G012_WEBDRIVER_REQUIRE_NATIVE_VOICE === "1";
 const disableSyntheticVoiceFallback = argv.includes("--disable-synthetic-voice-fallback") || process.env.DISCRYPT_G012_WEBDRIVER_DISABLE_SYNTHETIC_VOICE_FALLBACK === "1";
 if (!Number.isInteger(basePort) || basePort < 1024 || basePort > 65000) failCli("base port must be a valid high TCP port", 2);
 
@@ -554,9 +555,13 @@ async function installVoiceHarness(profile) {
         ? 'native AudioContext unavailable for generated audio'
         : 'native RTCPeerConnection unavailable in Tauri WebView';
     }
-    evidence.nativeProbe.fallbackReason ||= typeof NativeRTCPeerConnection !== 'function'
+    evidence.fallbackReason ||= typeof NativeRTCPeerConnection !== 'function'
       ? 'RTCPeerConnection is unavailable in this Tauri/WebKit WebView'
       : 'AudioContext generated-audio MediaStream support is unavailable in this Tauri/WebKit WebView';
+    if (arguments[1]) {
+      evidence.mode = 'native_rtc_unavailable';
+      return true;
+    }
     evidence.mode = 'synthetic_peerconnection_fallback';
     evidence.syntheticFallback = true;
     const track = { id: profileName + '-track', kind: 'audio', label: profileName + ' microphone', readyState: 'live', get enabled() { return evidence.trackEnabled; }, set enabled(v) { evidence.trackEnabled = Boolean(v); }, stop() { evidence.trackStopCount += 1; evidence.trackEnabled = false; } };
@@ -567,7 +572,7 @@ async function installVoiceHarness(profile) {
     class G012PeerConnection { constructor() { evidence.peerConnectionsConstructed += 1; this.connectionState = 'new'; this.iceConnectionState = 'new'; this.ontrack = null; this.onicecandidate = null; } addTrack(localTrack, localStream) { if (localTrack?.kind === 'audio') evidence.localAudioTracksSent += 1; queueMicrotask(() => { this.connectionState = 'connected'; this.iceConnectionState = 'connected'; evidence.iceConnected = true; const remoteTrack = { id: arguments[0] + '-remote-track', kind: 'audio', label: arguments[0] + ' remote', readyState: 'live', enabled: true, addEventListener() {}, removeEventListener() {} }; const remoteStream = { id: arguments[0] + '-remote-stream', getTracks: () => [remoteTrack], getAudioTracks: () => [remoteTrack] }; evidence.remoteTrackEvents += 1; this.ontrack?.({ track: remoteTrack, streams: [remoteStream], receiver: { track: remoteTrack } }); this.onicecandidate?.({ candidate: null }); }); return { track: localTrack, stream: localStream }; } createOffer() { return Promise.resolve({ type: 'offer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } createAnswer() { return Promise.resolve({ type: 'answer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } setLocalDescription(desc) { this.localDescription = desc; return Promise.resolve(); } setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); } addIceCandidate() { return Promise.resolve(); } getStats() { return Promise.resolve(new Map([['inbound-audio', { type: 'inbound-rtp', kind: 'audio', mediaType: 'audio', packetsReceived: 12, audioLevel: 0.2 }]])); } getSenders() { return [{ track }]; } close() { evidence.peerConnectionsClosed += 1; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; } }
     Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: G012PeerConnection });
     return true;
-  `, [profile.display_name.toLowerCase(), requireNativeVoice]);
+  `, [profile.display_name.toLowerCase(), requireNativeVoice || disableSyntheticVoiceFallback]);
 }
 
 async function joinVoice(profile) {
@@ -691,12 +696,32 @@ try {
     (voice?.alice?.mode === "synthetic_peerconnection_fallback" ||
       voice?.bob?.mode === "synthetic_peerconnection_fallback"),
   );
+  const nativeVoiceCapability = {
+    alice: voice?.alice
+      ? {
+          mode: voice.alice.mode,
+          nativeAudioContextAvailable: Boolean(voice.alice.nativeAudioContextAvailable),
+          nativeRTCPeerConnectionAvailable: Boolean(voice.alice.nativeRTCPeerConnectionAvailable),
+          nativeGeneratedAudioTrackAvailable: Boolean(voice.alice.nativeGeneratedAudioTrackAvailable),
+          fallbackReason: voice.alice.fallbackReason ?? null,
+        }
+      : null,
+    bob: voice?.bob
+      ? {
+          mode: voice.bob.mode,
+          nativeAudioContextAvailable: Boolean(voice.bob.nativeAudioContextAvailable),
+          nativeRTCPeerConnectionAvailable: Boolean(voice.bob.nativeRTCPeerConnectionAvailable),
+          nativeGeneratedAudioTrackAvailable: Boolean(voice.bob.nativeGeneratedAudioTrackAvailable),
+          fallbackReason: voice.bob.fallbackReason ?? null,
+        }
+      : null,
+  };
   const summary = {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
-    voice_remote_media_status: nativeVoiceLoopbackObserved ? "native_rtc_generated_audio_loopback" : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "browser_media_harness_loopback" : "voice_remote_media_not_observed",
+    voice_remote_media_status: nativeVoiceLoopbackObserved ? "native_rtc_generated_audio_loopback" : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
     g012_checkpoint_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved,
     voice_proof: {
       loopback_observed: voiceLoopbackObserved,

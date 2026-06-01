@@ -43,9 +43,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tauri = { version = "2.11.2", optional = true, default-features = false , features = [] }
 
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
-webkit2gtk = { version = "2.0.2", optional = true, features = ["v2_40"] }
-
 [build-dependencies]
 tauri-build = { version = "2.5.3", optional = true , features = [] }
 
@@ -53,4 +50,4 @@ tauri-build = { version = "2.5.3", optional = true , features = [] }
 async-trait = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-webkit2gtk = { version = "2.0.2", optional = true }
+webkit2gtk = { version = "2.0.2", optional = true, features = ["v2_40"] }
