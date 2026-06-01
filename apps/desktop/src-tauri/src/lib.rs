@@ -2196,6 +2196,7 @@ impl TauriAppService {
                 redacted_observable_ref("group", group_id)
             ),
         );
+        self.persist();
         Ok(OpenMlsAdmissionKeyPackage {
             group_id: group_id.to_owned(),
             member_identity,
@@ -2255,6 +2256,7 @@ impl TauriAppService {
                 redacted_observable_ref("group", &key_package.group_id)
             ),
         );
+        self.persist();
         Ok(OpenMlsAdmissionWelcome {
             group_id: key_package.group_id.clone(),
             owner_signer_public_key_hex: owner_record.signer_public_key_hex,
@@ -2310,6 +2312,7 @@ impl TauriAppService {
                 redacted_observable_ref("group", &welcome.group_id)
             ),
         );
+        self.persist();
         Ok(())
     }
 
@@ -8680,6 +8683,21 @@ fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> 
     }
 }
 
+fn upsert_openmls_group_handle(
+    state: &mut PersistedAppState,
+    record: OpenMlsGroupHandleRecord,
+) {
+    if let Some(existing) = state
+        .openmls_groups
+        .iter_mut()
+        .find(|existing| existing.group_id == record.group_id)
+    {
+        *existing = record;
+    } else {
+        state.openmls_groups.push(record);
+    }
+}
+
 fn key_fingerprint(key: &VerifyingKey) -> String {
     let digest = Sha256::digest(key.as_bytes());
     hex::encode(&digest[..10])
@@ -9138,7 +9156,10 @@ fn app_store_path() -> PathBuf {
 }
 
 fn app_openmls_store_path() -> PathBuf {
-    let app_state_path = app_store_path();
+    openmls_store_path_for_app_state_path(&app_store_path())
+}
+
+fn openmls_store_path_for_app_state_path(app_state_path: &std::path::Path) -> PathBuf {
     let file_name = app_state_path
         .file_name()
         .and_then(|name| name.to_str())
