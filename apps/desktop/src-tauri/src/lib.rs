@@ -6978,6 +6978,18 @@ impl PersistedAppState {
                 .map_err(|error| error.to_string())?
             }
         };
+        let route = self.selected_text_route_for_outbox(message_id);
+        let mut author_log = AppTextAuthorLog::default();
+        let mut transport = AppTextOutboxTransport::default();
+        let mut events = AppTextSendEvents::default();
+        let receipt = TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
+            .send(request, route, &text_exporter_secret, &signing_key)
+            .map_err(|error| error.to_string())?;
+        if author_log.entries.len() != 1 || transport.frames.len() != 1 {
+            return Err(
+                "text outbound pipeline did not persist and queue exactly one envelope".to_owned(),
+            );
+        }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
             group_id,
@@ -13867,15 +13879,15 @@ mod tests {
     }
 
     #[test]
-    fn openmls_admission_bridge_joins_two_profiles_with_exporter_parity() -> Result<(), String> {
+    fn g012_channel_send_uses_openmls_exporter_for_text_ciphertext() -> Result<(), String> {
         let _guard = test_lock();
-        let alice_path = reset_with_temp_state("openmls-admission-alice");
+        reset_with_temp_state("g012-openmls-outbound-text");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
         });
         let created = create_group(CreateGroupRequest {
-            name: "Admission Lab".to_owned(),
+            name: "OpenMLS Text Lab".to_owned(),
             retention: "24 hours".to_owned(),
             adapter_kind: None,
             signaling_endpoint: None,
@@ -13883,109 +13895,133 @@ mod tests {
             ice_turn_servers: None,
         });
         assert!(created.last_command_error.is_none(), "{created:?}");
-        let group_id = created
+        let group = created
             .groups
             .iter()
-            .find(|group| group.name == "Admission Lab")
-            .map(|group| group.group_id.clone())
+            .find(|group| group.name == "OpenMLS Text Lab")
             .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group.group_id.clone()),
+            channel_id: Some(channel_id),
+        };
 
-        let bob_path = fresh_state_path("openmls-admission-bob");
-        let _ = fs::remove_file(&bob_path);
-        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
-        bob.state.create_user(
-            CreateUserRequest {
-                display_name: "Bob".to_owned(),
-                device_name: Some("Bob laptop".to_owned()),
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "openmls exporter ciphertext".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(sent.last_command_error.is_none(), "{sent:?}");
+        let message_id = sent
+            .messages
+            .last()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "sent message missing".to_owned())?;
+        let persisted = load_state();
+        let envelope_record = persisted
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "OpenMLS text envelope missing".to_owned())?;
+        assert_eq!(envelope_record.group_id, text_delivery_group_id(&target)?);
+        assert!(!envelope_record
+            .envelope
+            .content_ciphertext
+            .starts_with(b"ciphertext:discrypt-text-control-proof"));
+        let exporter = persisted.openmls_text_exporter_secret(&group.group_id)?;
+        let plaintext = discrypt_mls_delivery::decrypt_text_envelope(
+            &envelope_record.group_id,
+            &exporter,
+            &envelope_record.envelope,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(plaintext, b"openmls exporter ciphertext");
+        let placeholder_secret = opaque_text_control_frame_for_message(
+            &persisted,
+            &target,
+            &message_id,
+            "openmls exporter ciphertext",
+            envelope_record.envelope.sequence,
+        );
+        assert!(discrypt_mls_delivery::decrypt_text_envelope(
+            &envelope_record.group_id,
+            &placeholder_secret,
+            &envelope_record.envelope,
+        )
+        .is_err());
+        let pending = persisted
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "text/control outbox frame missing".to_owned())?;
+        assert_eq!(pending.state_key, "pending");
+        Ok(())
+    }
+
+    #[test]
+    fn g012_channel_send_fails_closed_without_openmls_group_state() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("g012-openmls-outbound-missing-state");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Missing MLS Text Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .iter()
+            .find(|group| group.name == "Missing MLS Text Lab")
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.openmls_groups.clear();
+        }
+
+        let rejected = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group.group_id.clone()),
+                channel_id: Some(channel_id),
             },
-            false,
-        );
-        bob.persist();
-        let bob_package = bob.request_openmls_admission_key_package(&group_id)?;
-        assert_eq!(bob_package.group_id, group_id);
-        assert_eq!(bob_package.member_identity, bob.state.local_user_id());
-        assert!(!bob_package.signer_public_key_hex.is_empty());
-
-        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
-        let welcome = alice.issue_openmls_admission_welcome(&bob_package)?;
-        assert_eq!(welcome.group_id, group_id);
-        assert_eq!(welcome.epoch, 1);
-        assert_eq!(
-            welcome.member_signer_public_key_hex,
-            bob_package.signer_public_key_hex
-        );
-        assert!(!welcome.owner_signer_public_key_hex.is_empty());
-        assert!(!welcome.welcome_bytes.is_empty());
-
-        bob.join_openmls_group_from_welcome(&welcome)?;
-        let bob_handle = bob
-            .state
-            .openmls_groups
-            .iter()
-            .find(|handle| handle.group_id == group_id)
-            .cloned()
-            .ok_or_else(|| "bob OpenMLS handle missing after Welcome join".to_owned())?;
-        assert_eq!(bob_handle.epoch, welcome.epoch);
-        assert_eq!(
-            bob_handle.signer_public_key_hex,
-            bob_package.signer_public_key_hex
-        );
-        assert_eq!(
-            bob_handle.confirmation_tag_sha256,
-            welcome.confirmation_tag_sha256
-        );
-
-        let alice_handle = alice
-            .state
-            .openmls_groups
-            .iter()
-            .find(|handle| handle.group_id == group_id)
-            .cloned()
-            .ok_or_else(|| "alice OpenMLS handle missing after Welcome issue".to_owned())?;
-        assert_eq!(alice_handle.epoch, welcome.epoch);
-        assert_eq!(
-            alice_handle.confirmation_tag_sha256,
-            welcome.confirmation_tag_sha256
-        );
-
-        let mut alice_engine = OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(
-            &alice_path,
-        ))
-        .map_err(|error| format!("alice OpenMLS provider could not be reopened: {error}"))?;
-        alice_engine
-            .load_group(
-                &group_id,
-                &hex::decode(&alice_handle.signer_public_key_hex)
-                    .map_err(|error| format!("alice signer handle was not hex: {error}"))?,
-            )
-            .map_err(|error| format!("alice OpenMLS group could not be rehydrated: {error}"))?;
-        let mut bob_engine =
-            OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(&bob_path))
-                .map_err(|error| format!("bob OpenMLS provider could not be reopened: {error}"))?;
-        bob_engine
-            .load_group(
-                &group_id,
-                &hex::decode(&bob_handle.signer_public_key_hex)
-                    .map_err(|error| format!("bob signer handle was not hex: {error}"))?,
-            )
-            .map_err(|error| format!("bob OpenMLS group could not be rehydrated: {error}"))?;
-
-        let context = format!("g012-admission:{group_id}");
-        let alice_export = alice_engine
-            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
-            .map_err(|error| format!("alice exporter failed: {error}"))?;
-        let bob_export = bob_engine
-            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
-            .map_err(|error| format!("bob exporter failed: {error}"))?;
-        assert_eq!(alice_export, bob_export);
-        assert_eq!(alice_export.len(), 32);
-
-        let persisted_bob = load_state_from_store(&mut FileAppStore::new(&bob_path));
-        assert!(persisted_bob.openmls_groups.iter().any(|handle| {
-            handle.group_id == group_id
-                && handle.signer_public_key_hex == bob_handle.signer_public_key_hex
-                && handle.epoch == welcome.epoch
-        }));
+            body: "must not send without MLS".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let error = rejected
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "missing OpenMLS send should fail closed".to_owned())?;
+        assert_eq!(error.command, "send_message");
+        assert_eq!(error.code, "text_delivery_envelope_failed");
+        assert!(error.message.contains("OpenMLS group state is missing"));
+        assert!(rejected.messages.is_empty());
+        assert!(load_state().text_control_outbox.is_empty());
         Ok(())
     }
 
