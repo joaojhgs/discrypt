@@ -4762,6 +4762,62 @@ pub fn take_pending_voice_signaling_messages(
     TakePendingVoiceSignalingMessagesResponse { state, messages }
 }
 
+/// Tauri command: produce a Rust-owned native voice media proof frame for signaling.
+pub fn start_native_voice_media_session(
+    request: StartNativeVoiceMediaSessionRequest,
+) -> StartNativeVoiceMediaSessionResponse {
+    let (state, native_media) = mutate_app_service_with_result(|state| {
+        match build_native_voice_media_signal(state, &request) {
+            Ok(native_media) => {
+                if let Some(session) = &mut state.voice_session {
+                    session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
+                    session.media_runtime.local_capture_active = true;
+                    session.media_runtime.fail_closed_reason = "Remote native Rust media proof has not been received yet; playback claims remain gated until a non-local protected frame arrives over backend signaling".to_owned();
+                    session.media_runtime.status_copy = format!(
+                        "Native Rust voice media generated {} Opus/SFrame frame(s) for provider-derived peer {}; waiting for remote proof",
+                        native_media.protected_frames_count, request.remote_peer_id
+                    );
+                    session.signaling.local_peer_id = request.local_peer_id.clone();
+                    session.signaling.remote_peer_id = request.remote_peer_id.clone();
+                    session.signaling.status_copy =
+                        "Native Rust voice media proof is ready to be sealed and sent through backend text/control signaling".to_owned();
+                }
+                state.push_event(
+                    "voice.native_media_started",
+                    "Generated native Rust Opus/SFrame voice proof frame for backend signaling",
+                );
+                Some(native_media)
+            }
+            Err(error) => {
+                state.push_command_error(
+                    "voice.native_media_rejected",
+                    "start_native_voice_media_session",
+                    "native_voice_media_start_failed",
+                    error,
+                    "Join voice with backend-derived runtime peers before starting the native Rust media path",
+                );
+                None
+            }
+        }
+    });
+    StartNativeVoiceMediaSessionResponse { state, native_media }
+}
+
+/// Tauri command: accept one remote native Rust media proof delivered through backend signaling.
+pub fn accept_native_voice_media_frame(request: AcceptNativeVoiceMediaFrameRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        if let Err(error) = accept_native_voice_media_signal(state, request) {
+            state.push_command_error(
+                "voice.native_media_rejected",
+                "accept_native_voice_media_frame",
+                "native_voice_media_invalid",
+                error,
+                "Accept only non-local native Rust media proof frames delivered through backend voice signaling",
+            );
+        }
+    })
+}
+
 /// Tauri command: join a voice channel.
 pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
