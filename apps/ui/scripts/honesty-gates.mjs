@@ -148,6 +148,46 @@ if (productionReadyAdvert.test(uiText) && !backendProof.test(uiText)) {
   );
 }
 
+const g006PrivacyRequiredRust = [
+  {
+    token: "redacted_message_ref(message_id)",
+    message: "G006 text/control outbox events must redact raw message ids",
+  },
+  {
+    token: 'redacted_observable_ref("room_topic", &probe.rendezvous_topic)',
+    message: "G006 transport-proof copy must redact provider room/rendezvous topics",
+  },
+  {
+    token: 'redacted_observable_ref("scope", &session.scope_label)',
+    message: "G006 transport status must redact raw room/scope labels",
+  },
+];
+for (const { token, message } of g006PrivacyRequiredRust) {
+  if (!rust.includes(token)) failures.push(message);
+}
+
+const g006ForbiddenRustCopy = [
+  {
+    pattern: /topic=\{\}\s+frame_sha256/,
+    message: "G006 transport-proof copy must not display raw rendezvous topic",
+  },
+  {
+    pattern: /scope=\{\}\s+mode=/,
+    message: "G006 transport status must not display raw scope labels",
+  },
+  {
+    pattern: /Queued signed text\/control frame for \{message_id\}/,
+    message: "G006 outbox queue event must not display raw message id",
+  },
+  {
+    pattern: /"Verified signed peer receipt for \{\}",\s*request\.message_id/,
+    message: "G006 receipt event must not display raw message id",
+  },
+];
+for (const { pattern, message } of g006ForbiddenRustCopy) {
+  if (pattern.test(rust)) failures.push(message);
+}
+
 const docsPath = resolve(repoRoot, "docs/ui-honesty-gates.md");
 if (!existsSync(docsPath)) {
   failures.push("Good Taste UI honesty constraints doc is missing: docs/ui-honesty-gates.md");

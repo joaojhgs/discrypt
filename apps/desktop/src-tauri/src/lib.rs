@@ -1249,6 +1249,13 @@ pub struct AttachTextControlTransportRuntimeRequest {
     /// Stable, scoped remote peer id for provider-visible routing.
     #[serde(default)]
     pub remote_peer_id: Option<String>,
+    /// Derive runtime role and peer ids from persisted DM/group invite state.
+    ///
+    /// This is the production UI path: users never type peer ids manually.
+    /// Legacy callers that omit this flag and omit explicit role/peer ids still
+    /// hit the fail-closed probe-resume boundary.
+    #[serde(default)]
+    pub derive_from_state: bool,
 }
 
 /// Request to set self mute state.
@@ -1615,6 +1622,22 @@ struct TextControlRuntimeAttachInputs {
     bootstrap_secret: Vec<u8>,
     random_entropy: Vec<u8>,
     ice_config: IceServerConfig,
+}
+
+#[derive(Clone)]
+struct TextControlRuntimePeerAttachment {
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+}
+
+struct TextControlRuntimeAttachJob {
+    command_name: &'static str,
+    active_session_id: String,
+    inputs: TextControlRuntimeAttachInputs,
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
 }
 
 impl fmt::Debug for TextControlTransportRuntime {
@@ -2171,6 +2194,45 @@ pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
             }
         }
     }
+    if request.data_channel_probe
+        && guard
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .is_some_and(|session| session.state().is_connected())
+        && guard.text_control_transport_runtime.is_none()
+        && guard.pending_text_control_transport_runtime.is_none()
+    {
+        if let Ok(attachment) = guard
+            .state
+            .active_runtime_peer_attachment_for_text_control()
+        {
+            match guard
+                .state
+                .text_control_runtime_inputs_for_active_scope(request.adapter_kind.as_deref())
+            {
+                Ok(runtime_inputs) => {
+                    let job = prepare_text_control_runtime_attach_job(
+                        &mut guard,
+                        "start_text_session",
+                        started_session_id.clone(),
+                        runtime_inputs,
+                        attachment,
+                    );
+                    let view = guard.to_view();
+                    drop(guard);
+                    spawn_text_control_runtime_attach(job);
+                    return view;
+                }
+                Err(error) => guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "start_text_session",
+                    "text_runtime_scope_unavailable",
+                    error,
+                    "Open a DM/group/invite context with a configured signaling profile before starting automatic text/control runtime attach",
+                ),
+            }
+        }
+    }
     guard.persist();
     guard.to_view()
 }
@@ -2193,8 +2255,9 @@ pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
 }
 
 /// Tauri command: bind an app-service text/control runtime to the active text
-/// session. Role-split requests start a real provider-backed runtime; legacy
-/// no-role requests remain fail-closed rather than resuming stale probe SDP.
+/// session. DM/group requests derive role-split peer ids from backend-owned
+/// signed invite metadata; legacy no-scope requests remain fail-closed rather
+/// than resuming stale probe SDP.
 pub fn attach_text_control_transport_runtime(
     request: AttachTextControlTransportRuntimeRequest,
 ) -> AppStateView {
@@ -2236,32 +2299,37 @@ pub fn attach_text_control_transport_runtime(
         }
     }
 
-    if !active_session_state.is_connected() {
-        guard.state.push_command_error(
-            "transport.text_runtime_attach_rejected",
-            "attach_text_control_transport_runtime",
-            "text_session_not_connected",
-            format!(
-                "text transport session {} is {}",
-                active_session_id,
-                PersistedAppState::transport_state_label(active_session_state)
-            ),
-            "Complete a provider DataChannel proof and route transition before binding a runtime",
-        );
-        guard.persist();
-        return guard.to_view();
-    }
+    let derived_attachment = if request.derive_from_state {
+        match guard
+            .state
+            .active_runtime_peer_attachment_for_text_control()
+        {
+            Ok(attachment) => Some(attachment),
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "attach_text_control_transport_runtime",
+                    "text_runtime_scope_unavailable",
+                    error,
+                    "Open a DM/group context created from signed invite/connectivity metadata before attaching the backend runtime",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        }
+    } else {
+        None
+    };
 
-    if let Some(runtime_role) = request.runtime_role.as_deref() {
-        let role = match runtime_role {
-            "offerer" => ProviderTextControlRuntimePeerRole::Offerer,
-            "answerer" => ProviderTextControlRuntimePeerRole::Answerer,
-            other => {
+    let explicit_attachment = if let Some(runtime_role) = request.runtime_role.as_deref() {
+        let role = match parse_text_control_runtime_role(runtime_role) {
+            Ok(role) => role,
+            Err(error) => {
                 guard.state.push_command_error(
                     "transport.text_runtime_attach_rejected",
                     "attach_text_control_transport_runtime",
                     "text_runtime_role_invalid",
-                    format!("Unsupported text/control runtime role {other}"),
+                    error,
                     "Use runtime_role=offerer or runtime_role=answerer with scoped local/remote peer ids",
                 );
                 guard.persist();
@@ -2318,6 +2386,16 @@ pub fn attach_text_control_transport_runtime(
                 return guard.to_view();
             }
         };
+        Some(TextControlRuntimePeerAttachment {
+            role,
+            local_peer_id,
+            remote_peer_id,
+        })
+    } else {
+        None
+    };
+
+    if let Some(attachment) = explicit_attachment.or(derived_attachment) {
         let runtime_inputs = match guard
             .state
             .text_control_runtime_inputs_for_active_scope(None)
@@ -2335,99 +2413,33 @@ pub fn attach_text_control_transport_runtime(
                 return guard.to_view();
             }
         };
-        let pending = PendingTextControlTransportRuntime {
-            session_id: active_session_id.clone(),
-            role,
-            local_peer_id: local_peer_id.0.clone(),
-            remote_peer_id: remote_peer_id.0.clone(),
-        };
-        guard.pending_text_control_transport_runtime = Some(pending.clone());
-        guard.state.push_event(
-            "transport.text_runtime_attach_started",
-            format!(
-                "Starting provider-backed text/control runtime session {} as {} local_peer={} remote_peer={}",
-                active_session_id,
-                runtime_role_label(Some(role)),
-                pending.local_peer_id,
-                pending.remote_peer_id
-            ),
+        let job = prepare_text_control_runtime_attach_job(
+            &mut guard,
+            "attach_text_control_transport_runtime",
+            active_session_id.clone(),
+            runtime_inputs,
+            attachment,
         );
-        guard.persist();
         let view = guard.to_view();
         drop(guard);
-
-        std::thread::spawn(move || {
-            let executor = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-            {
-                Ok(executor) => Arc::new(executor),
-                Err(error) => {
-                    let service = app_service();
-                    let mut guard = service
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.pending_text_control_transport_runtime = None;
-                    guard.state.push_command_error(
-                        "transport.text_runtime_attach_unavailable",
-                        "attach_text_control_transport_runtime",
-                        "transport_runtime_executor_unavailable",
-                        format!("Could not start text/control runtime executor: {error}"),
-                        "Retry after the backend can construct a Tokio executor for the live provider runtime",
-                    );
-                    guard.persist();
-                    return;
-                }
-            };
-
-            let runtime_result = start_role_split_text_control_runtime(
-                executor.clone(),
-                runtime_inputs,
-                role,
-                local_peer_id,
-                remote_peer_id,
-            );
-            let service = app_service();
-            let mut guard = service
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match runtime_result {
-                Ok(runtime) => {
-                    guard.attach_owned_text_control_transport_runtime(
-                        runtime,
-                        executor,
-                        active_session_id.clone(),
-                    );
-                    guard.state.push_event(
-                        "transport.text_runtime_attached",
-                        format!(
-                            "Attached provider-backed text/control runtime session {} as {}",
-                            active_session_id,
-                            runtime_role_label(Some(role))
-                        ),
-                    );
-                }
-                Err(error) => {
-                    if guard
-                        .pending_text_control_transport_runtime
-                        .as_ref()
-                        .is_some_and(|pending| pending.session_id == active_session_id)
-                    {
-                        guard.pending_text_control_transport_runtime = None;
-                    }
-                    guard.state.push_command_error(
-                        "transport.text_runtime_attach_unavailable",
-                        "attach_text_control_transport_runtime",
-                        "transport_runtime_attach_failed",
-                        error,
-                        "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and provider-signaled STUN/TURN policy proves WebRTC attach readiness",
-                    );
-                }
-            }
-            guard.persist();
-        });
+        spawn_text_control_runtime_attach(job);
         return view;
+    }
+
+    if !active_session_state.is_connected() {
+        guard.state.push_command_error(
+            "transport.text_runtime_attach_rejected",
+            "attach_text_control_transport_runtime",
+            "text_session_not_connected",
+            format!(
+                "text transport session {} is {}",
+                active_session_id,
+                PersistedAppState::transport_state_label(active_session_state)
+            ),
+            "Complete a provider DataChannel proof and route transition before binding a legacy probe-resume runtime, or use derive_from_state for backend-owned DM/group runtime attach",
+        );
+        guard.persist();
+        return guard.to_view();
     }
 
     let attachment = guard.state.latest_data_channel_probe.as_ref().map_or_else(
@@ -3705,10 +3717,10 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                     state_key = "transport_probe_verified".to_owned();
                     state_label = "Transport proofed".to_owned();
                     state_detail = format!(
-                        "Opaque text/control frame crossed adapter={} profile={} topic={} frame_sha256={} receipt_return={}; this is not a signed peer receipt",
+                        "Opaque text/control frame crossed adapter={} profile={} {} frame_sha256={} receipt_return={}; this is not a signed peer receipt",
                         probe.kind,
                         probe.profile_id,
-                        probe.rendezvous_topic,
+                        redacted_observable_ref("room_topic", &probe.rendezvous_topic),
                         probe.text_control_frame_sha256,
                         probe.receipt_frame_roundtrip
                     );
@@ -4803,11 +4815,11 @@ impl PersistedAppState {
             return (
                 "provider-roundtrip-proofed".to_owned(),
                 format!(
-                    "adapter={} profile={} endpoint={} topic={} presence={} signal={} control={}",
+                    "adapter={} profile={} endpoint={} {} presence={} signal={} control={}",
                     probe.kind,
                     probe.profile_id,
                     probe.endpoint_label,
-                    probe.rendezvous_topic,
+                    redacted_observable_ref("room_topic", &probe.rendezvous_topic),
                     probe.presence_roundtrip,
                     probe.signal_roundtrip,
                     probe.control_roundtrip
@@ -4828,11 +4840,11 @@ impl PersistedAppState {
             return (
                 "webrtc-datachannel-proofed".to_owned(),
                 format!(
-                    "adapter={} profile={} endpoint={} topic={} offerer_direct={} answerer_direct={} offerer_turn={} answerer_turn={} turn_servers={}/{} relay_local={}/{} relay_remote={}/{} offerer_open={} answerer_open={} frame={}",
+                    "adapter={} profile={} endpoint={} {} offerer_direct={} answerer_direct={} offerer_turn={} answerer_turn={} turn_servers={}/{} relay_local={}/{} relay_remote={}/{} offerer_open={} answerer_open={} frame={}",
                     probe.kind,
                     probe.profile_id,
                     probe.endpoint_label,
-                    probe.rendezvous_topic,
+                    redacted_observable_ref("room_topic", &probe.rendezvous_topic),
                     probe.offerer_direct_path_ready,
                     probe.answerer_direct_path_ready,
                     probe.offerer_turn_fallback_ready,
@@ -4893,11 +4905,11 @@ impl PersistedAppState {
             "route-report-stored"
         };
         let detail = format!(
-            "session={} route_report: selected={} attempted=[{}] endpoint={} limitation={}",
+            "session={} route_report: selected={} attempted=[{}] {} limitation={}",
             session.mode.label(),
             selected,
             attempted,
-            report.endpoint.0,
+            redacted_observable_ref("endpoint", &report.endpoint.0),
             report.limitation,
         );
         let turn_required = if selected == "turn" {
@@ -5002,7 +5014,11 @@ impl PersistedAppState {
             }
         }
 
-        let session_id = stable_id(mode.session_id_prefix(), &label, self.next_sequence);
+        let session_id = stable_id(
+            mode.session_id_prefix(),
+            &redacted_observable_token("scope", &label),
+            self.next_sequence,
+        );
         self.next_sequence = self.next_sequence.saturating_add(1);
         let mut session = TransportSession::new();
         if let Err(error) = session.begin_signaling() {
@@ -5120,6 +5136,42 @@ impl PersistedAppState {
             ),
         );
         Ok(())
+    }
+
+    fn mark_text_session_runtime_route_proof(
+        &mut self,
+        evidence: &discrypt_transport::ProviderTextControlRuntimePeerEvidence,
+    ) {
+        let proof = ProviderWebRtcDataChannelProbeView {
+            kind: evidence.kind.canonical_name().to_owned(),
+            profile_id: evidence.profile_id.clone(),
+            endpoint_label: evidence.endpoint_label.clone(),
+            scope_commitment: evidence.scope_commitment.clone(),
+            rendezvous_topic: redacted_observable_ref("room_topic", &evidence.rendezvous_topic),
+            offerer_direct_path_ready: evidence.direct_path_ready,
+            answerer_direct_path_ready: evidence.direct_path_ready,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: evidence.data_channel_open,
+            answerer_data_channel_open: evidence.data_channel_open,
+            text_control_frame_roundtrip: evidence.data_channel_open,
+            text_control_frame_sha256: redacted_observable_token(
+                "frame",
+                &evidence.rendezvous_topic,
+            ),
+            receipt_frame_roundtrip: evidence.data_channel_open,
+            receipt_frame_sha256: redacted_observable_token("receipt", &evidence.rendezvous_topic),
+            runtime_spec: Some(evidence.runtime_spec.clone()),
+        };
+        self.latest_data_channel_probe_error = None;
+        self.latest_data_channel_probe = Some(proof.clone());
+        self.mark_text_session_data_channel_route_proof(&proof);
     }
 
     fn mark_text_session_data_channel_route_proof(
@@ -5798,7 +5850,10 @@ impl PersistedAppState {
         });
         self.push_event(
             "message.outbox_queued",
-            format!("Queued signed text/control frame for {message_id}"),
+            format!(
+                "Queued signed text/control frame for {}",
+                redacted_message_ref(message_id)
+            ),
         );
         Ok(())
     }
@@ -5873,7 +5928,7 @@ impl PersistedAppState {
             "message.outbox_sent",
             format!(
                 "Marked text/control frame {} sent to transport",
-                request.message_id
+                redacted_message_ref(&request.message_id)
             ),
         );
         Ok(())
@@ -5897,12 +5952,13 @@ impl PersistedAppState {
         let operation_timeout = Self::text_control_transport_operation_timeout(&request);
 
         for frame in &pending {
+            let frame_ref = redacted_message_ref(&frame.message_id);
             let outbound = match serde_json::to_vec(&frame.frame) {
                 Ok(outbound) => outbound,
                 Err(error) => {
                     failures.push(format!(
                         "{}: encode text/control frame failed: {error}",
-                        frame.message_id
+                        frame_ref
                     ));
                     continue;
                 }
@@ -5921,7 +5977,7 @@ impl PersistedAppState {
             } {
                 failures.push(format!(
                     "{}: send text/control frame failed: {error}",
-                    frame.message_id
+                    frame_ref
                 ));
                 continue;
             }
@@ -5933,7 +5989,7 @@ impl PersistedAppState {
             }) {
                 failures.push(format!(
                     "{}: mark text/control frame sent failed: {error}",
-                    frame.message_id
+                    frame_ref
                 ));
                 continue;
             }
@@ -5944,14 +6000,14 @@ impl PersistedAppState {
                 Ok(Err(error)) => {
                     failures.push(format!(
                         "{}: receive text/control response failed: {error}",
-                        frame.message_id
+                        frame_ref
                     ));
                     continue;
                 }
                 Err(_) => {
                     failures.push(format!(
                         "{}: receive text/control response failed: receive text/control response timed out after {} ms",
-                        frame.message_id,
+                        frame_ref,
                         operation_timeout.as_millis()
                     ));
                     continue;
@@ -5963,7 +6019,7 @@ impl PersistedAppState {
                 Err(error) => {
                     failures.push(format!(
                         "{}: decode text/control response failed: {error}",
-                        frame.message_id
+                        frame_ref
                     ));
                     continue;
                 }
@@ -5972,7 +6028,7 @@ impl PersistedAppState {
             if self.handle_text_control_frame(inbound_frame).is_some() {
                 failures.push(format!(
                     "{}: response frame unexpectedly generated another response",
-                    frame.message_id
+                    frame_ref
                 ));
                 continue;
             }
@@ -5984,7 +6040,7 @@ impl PersistedAppState {
             }) {
                 failures.push(format!(
                     "{}: text/control response verification failed",
-                    frame.message_id
+                    frame_ref
                 ));
                 continue;
             }
@@ -6069,7 +6125,10 @@ impl PersistedAppState {
         });
         self.push_event(
             "message.receipt_verified",
-            format!("Verified signed peer receipt for {}", request.message_id),
+            format!(
+                "Verified signed peer receipt for {}",
+                redacted_message_ref(&request.message_id)
+            ),
         );
         Ok(())
     }
@@ -6140,10 +6199,10 @@ impl PersistedAppState {
                         state_key: "received_envelope".to_owned(),
                         state_label: "Envelope received".to_owned(),
                         state_detail: format!(
-                            "Verified sender={} message={} group_binding={} and generated signed delivery receipt",
+                            "Verified sender={} {} {} and generated signed delivery receipt",
                             key_fingerprint(&sender_key),
-                            request.envelope.message_id,
-                            group_id
+                            redacted_message_ref(&request.envelope.message_id),
+                            redacted_observable_ref("group_binding", &group_id)
                         ),
                         peer_receipt: None,
                         sent_at: format!("remote-{sequence}"),
@@ -6158,7 +6217,7 @@ impl PersistedAppState {
                     "message.envelope_received",
                     format!(
                         "Verified encrypted peer envelope {} and generated signed receipt",
-                        request.envelope.message_id
+                        redacted_message_ref(&request.envelope.message_id)
                     ),
                 );
                 Ok((receipt, recipient_verifying_key_hex))
@@ -6303,10 +6362,17 @@ impl PersistedAppState {
             })
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn active_runtime_peer_ids_for_text_control(
         &self,
     ) -> Result<(SignalingPeerId, SignalingPeerId), String> {
+        let attachment = self.active_runtime_peer_attachment_for_text_control()?;
+        Ok((attachment.local_peer_id, attachment.remote_peer_id))
+    }
+
+    fn active_runtime_peer_attachment_for_text_control(
+        &self,
+    ) -> Result<TextControlRuntimePeerAttachment, String> {
         let context = self.active_context.as_ref().ok_or_else(|| {
             "No active DM/group context is available for text/control runtime peer attachment"
                 .to_owned()
@@ -6337,10 +6403,17 @@ impl PersistedAppState {
                         "Active DM {dm_id} has no remote runtime peer from signed bootstrap metadata"
                     )
                 })?;
-            return Ok((
-                SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string())?,
-                SignalingPeerId::new(remote.peer_id.clone()).map_err(|error| error.to_string())?,
-            ));
+            return Ok(TextControlRuntimePeerAttachment {
+                role: if local.role == "reply" {
+                    ProviderTextControlRuntimePeerRole::Answerer
+                } else {
+                    ProviderTextControlRuntimePeerRole::Offerer
+                },
+                local_peer_id: SignalingPeerId::new(local.peer_id.clone())
+                    .map_err(|error| error.to_string())?,
+                remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
+                    .map_err(|error| error.to_string())?,
+            });
         }
         if let Some(group_id) = &context.group_id {
             let group = self
@@ -6370,10 +6443,17 @@ impl PersistedAppState {
                         "Active group {group_id} has no remote runtime peer from signed bootstrap metadata"
                     )
                 })?;
-            return Ok((
-                SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string())?,
-                SignalingPeerId::new(remote.peer_id.clone()).map_err(|error| error.to_string())?,
-            ));
+            return Ok(TextControlRuntimePeerAttachment {
+                role: if local.role == "member" {
+                    ProviderTextControlRuntimePeerRole::Answerer
+                } else {
+                    ProviderTextControlRuntimePeerRole::Offerer
+                },
+                local_peer_id: SignalingPeerId::new(local.peer_id.clone())
+                    .map_err(|error| error.to_string())?,
+                remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
+                    .map_err(|error| error.to_string())?,
+            });
         }
         Err(
             "Active context is not a DM or group for text/control runtime peer attachment"
@@ -6686,9 +6766,9 @@ impl PersistedAppState {
             label: format!("{} session", session.mode.label()),
             status: Self::transport_state_label(snapshot.state).to_owned(),
             detail: format!(
-                "session={} scope={} mode={} last_error={}",
+                "session={} {} mode={} last_error={}",
                 session.session_id,
-                session.scope_label,
+                redacted_observable_ref("scope", &session.scope_label),
                 session.mode.label(),
                 snapshot.last_error.unwrap_or_else(|| "none".to_owned()),
             ),
@@ -7336,6 +7416,22 @@ fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> 
 fn key_fingerprint(key: &VerifyingKey) -> String {
     let digest = Sha256::digest(key.as_bytes());
     hex::encode(&digest[..10])
+}
+
+fn redacted_observable_ref(kind: &str, value: &str) -> String {
+    if value.trim().is_empty() {
+        return format!("{kind}_ref=empty");
+    }
+    format!("{kind}_ref={}", redacted_observable_token(kind, value))
+}
+
+fn redacted_observable_token(kind: &str, value: &str) -> String {
+    let digest = hash_commitment("discrypt-observable-redaction-v1", &[kind, value]);
+    digest[..16].to_owned()
+}
+
+fn redacted_message_ref(message_id: &str) -> String {
+    redacted_observable_ref("message", message_id)
 }
 
 #[cfg(test)]
@@ -8039,6 +8135,128 @@ fn runtime_role_label(role: Option<ProviderTextControlRuntimePeerRole>) -> &'sta
         Some(ProviderTextControlRuntimePeerRole::Answerer) => "answerer",
         None => "test-harness",
     }
+}
+
+fn parse_text_control_runtime_role(
+    role: &str,
+) -> Result<ProviderTextControlRuntimePeerRole, String> {
+    match role {
+        "offerer" => Ok(ProviderTextControlRuntimePeerRole::Offerer),
+        "answerer" => Ok(ProviderTextControlRuntimePeerRole::Answerer),
+        other => Err(format!("Unsupported text/control runtime role {other}")),
+    }
+}
+
+fn prepare_text_control_runtime_attach_job(
+    guard: &mut TauriAppService,
+    command_name: &'static str,
+    active_session_id: String,
+    runtime_inputs: TextControlRuntimeAttachInputs,
+    attachment: TextControlRuntimePeerAttachment,
+) -> TextControlRuntimeAttachJob {
+    let pending = PendingTextControlTransportRuntime {
+        session_id: active_session_id.clone(),
+        role: attachment.role,
+        local_peer_id: attachment.local_peer_id.0.clone(),
+        remote_peer_id: attachment.remote_peer_id.0.clone(),
+    };
+    guard.pending_text_control_transport_runtime = Some(pending.clone());
+    guard.state.push_event(
+        "transport.text_runtime_attach_started",
+        format!(
+            "Starting backend-owned provider-backed text/control runtime session {} as {} local_peer={} remote_peer={}",
+            active_session_id,
+            runtime_role_label(Some(attachment.role)),
+            pending.local_peer_id,
+            pending.remote_peer_id
+        ),
+    );
+    guard.persist();
+    TextControlRuntimeAttachJob {
+        command_name,
+        active_session_id,
+        inputs: runtime_inputs,
+        role: attachment.role,
+        local_peer_id: attachment.local_peer_id,
+        remote_peer_id: attachment.remote_peer_id,
+    }
+}
+
+fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
+    std::thread::spawn(move || {
+        let executor = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(executor) => Arc::new(executor),
+            Err(error) => {
+                let service = app_service();
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.pending_text_control_transport_runtime = None;
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_unavailable",
+                    job.command_name,
+                    "transport_runtime_executor_unavailable",
+                    format!("Could not start text/control runtime executor: {error}"),
+                    "Retry after the backend can construct a Tokio executor for the live provider runtime",
+                );
+                guard.persist();
+                return;
+            }
+        };
+
+        let runtime_result = start_role_split_text_control_runtime(
+            executor.clone(),
+            job.inputs,
+            job.role,
+            job.local_peer_id,
+            job.remote_peer_id,
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match runtime_result {
+            Ok(runtime) => {
+                guard
+                    .state
+                    .mark_text_session_runtime_route_proof(runtime.evidence());
+                guard.attach_owned_text_control_transport_runtime(
+                    runtime,
+                    executor,
+                    job.active_session_id.clone(),
+                );
+                guard.state.push_event(
+                    "transport.text_runtime_attached",
+                    format!(
+                        "Attached backend-owned provider-backed text/control runtime session {} as {}",
+                        job.active_session_id,
+                        runtime_role_label(Some(job.role))
+                    ),
+                );
+            }
+            Err(error) => {
+                if guard
+                    .pending_text_control_transport_runtime
+                    .as_ref()
+                    .is_some_and(|pending| pending.session_id == job.active_session_id)
+                {
+                    guard.pending_text_control_transport_runtime = None;
+                }
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_unavailable",
+                    job.command_name,
+                    "transport_runtime_attach_failed",
+                    error,
+                    "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and provider-signaled STUN/TURN policy proves WebRTC attach readiness",
+                );
+            }
+        }
+        guard.persist();
+    });
 }
 
 fn start_role_split_text_control_runtime(
@@ -13384,6 +13602,48 @@ mod tests {
     }
 
     #[test]
+    fn backend_derives_text_runtime_attachment_without_manual_pairing_fields() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        reset_with_temp_state("backend-derived-runtime-attachment");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let state = load_state();
+        let attachment = state.active_runtime_peer_attachment_for_text_control()?;
+        let active_dm_id = state
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.as_ref())
+            .ok_or_else(|| "expected active DM context".to_owned())?;
+        let dm = state
+            .dms
+            .iter()
+            .find(|dm| &dm.dm_id == active_dm_id)
+            .ok_or_else(|| "expected active DM".to_owned())?;
+        let local = dm
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "expected backend local runtime peer".to_owned())?;
+        let remote = dm
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "expected backend remote runtime peer".to_owned())?;
+
+        assert_eq!(attachment.role, ProviderTextControlRuntimePeerRole::Offerer);
+        assert_eq!(attachment.local_peer_id.0, local.peer_id);
+        assert_eq!(attachment.remote_peer_id.0, remote.peer_id);
+        Ok(())
+    }
+
+    #[test]
     fn g004_two_profile_state_survives_reload_with_invites_receipts_voice_and_preferences(
     ) -> Result<(), String> {
         let _guard = test_lock();
@@ -16227,6 +16487,105 @@ mod tests {
         assert!(receive.contains("run_receive_text_delivery_envelope_with_event_emit(&app_handle"));
         let handle = command_wrapper(source, "handle_text_control_frame");
         assert!(handle.contains("run_handle_text_control_frame_with_event_emit(&app_handle"));
+    }
+
+    #[test]
+    fn g006_observable_transport_copy_redacts_room_scope_and_message_ids() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("g006-privacy-redaction");
+
+        create_user(CreateUserRequest {
+            display_name: "Alice Redaction".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob Redaction".to_owned(),
+        });
+        let dm_id = dm_state
+            .dms
+            .first()
+            .map(|dm| dm.dm_id.clone())
+            .ok_or_else(|| "DM should exist".to_owned())?;
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_id),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "privacy gate hello".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent
+            .messages
+            .first()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "sent message should be visible".to_owned())?;
+        let pending = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(1),
+            operation_timeout_ms: None,
+        });
+        let frame = pending
+            .frames
+            .first()
+            .ok_or_else(|| "pending text/control frame should exist".to_owned())?;
+        let raw_scope = "private-room raw-sdp v=0 raw-ice message-topic";
+        let text_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some(raw_scope.to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(text_session
+            .transport_status
+            .iter()
+            .any(|row| row.detail.contains("scope_ref=")));
+        let marked = mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+            message_id: message_id.clone(),
+            frame_sha256: frame.frame_sha256.clone(),
+            transport_session_id: Some("redacted-test-session".to_owned()),
+        });
+
+        let observable = marked
+            .events
+            .iter()
+            .map(|event| event.summary.as_str())
+            .chain(
+                marked
+                    .transport_status
+                    .iter()
+                    .map(|row| row.detail.as_str()),
+            )
+            .chain(
+                marked
+                    .messages
+                    .iter()
+                    .map(|message| message.status.as_str()),
+            )
+            .chain(
+                marked
+                    .messages
+                    .iter()
+                    .map(|message| message.state_detail.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !observable.contains(&message_id),
+            "observable copy must not include raw message id: {observable}"
+        );
+        assert!(
+            !observable.contains(raw_scope),
+            "observable copy must not include raw room/scope label: {observable}"
+        );
+        assert!(
+            observable.contains("message_ref=") && observable.contains("scope_ref="),
+            "observable copy should expose redacted refs for support/debuggability: {observable}"
+        );
+        Ok(())
     }
 
     #[test]

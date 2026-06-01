@@ -633,6 +633,7 @@ export type AttachTextControlTransportRuntimeRequest = {
   runtime_role?: "offerer" | "answerer" | null;
   local_peer_id?: string | null;
   remote_peer_id?: string | null;
+  derive_from_state?: boolean;
 };
 
 export type SendMessageRequest = {
@@ -1587,6 +1588,14 @@ function defaultSignalingEndpoint(connectivity?: ConnectivityPolicyView): string
   return connectivity?.signaling_profiles[0]?.endpoints[0] ??
     import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
     "wss://relay.damus.io";
+}
+
+function endpointPolicyForSignalingEndpoint(endpoint: string): string {
+  return /^(?:mqtt|ws|http|quic):\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)|^\/ip[46]\/(?:127\.0\.0\.1|::1)\//i.test(
+    endpoint,
+  )
+    ? "local_dev_loopback"
+    : "production_tls";
 }
 
 function defaultIceStunServers(): string[] {
@@ -2919,7 +2928,7 @@ export async function createInvite(
       const signalingTrustFingerprint = stableHash(
         `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
       );
-      const endpointPolicy = "production_tls";
+      const endpointPolicy = endpointPolicyForSignalingEndpoint(signalingEndpoint);
       const trustStatus =
         "signed endpoint fingerprint; verify before MLS Welcome";
       const inviteMetadata: ParsedInviteMetadata = {
@@ -3017,7 +3026,7 @@ export async function createDmInvite(
       const signalingTrustFingerprint = stableHash(
         `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
       );
-      const endpointPolicy = "production_tls";
+      const endpointPolicy = endpointPolicyForSignalingEndpoint(signalingEndpoint);
       const trustStatus = "signed endpoint fingerprint; verify before DM accept";
       const inviteMetadata: ParsedInviteMetadata = {
         inviteKey,
