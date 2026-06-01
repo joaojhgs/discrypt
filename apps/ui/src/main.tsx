@@ -77,7 +77,6 @@ import "./styles.css";
 type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 type SetupStepView = { label: string; complete: boolean; detail: string };
 type VoiceParticipant = VoiceParticipantView;
-const APP_EVENT_TAURI_TOPIC = "app_event";
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 60_000;
 const diagnosticsUiEnabled = import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
@@ -500,6 +499,7 @@ function App() {
     let eventFallbackPoll: number | null = null;
     let eventHealthResync: number | null = null;
     let unlistenAppEvent: (() => void) | null = null;
+    const fallbackPollMs = tauriListen ? 30000 : 5000;
 
     const refreshCommandState = (stream: AppEventStreamView) => {
       if (stream.events.length === 0) {
@@ -522,8 +522,6 @@ function App() {
           if (!cancelled) {
             refreshCommandState(stream);
           }
-          unlistenAppEvent = unlisten;
-          pollAppEventFallback();
         })
         .catch(() => undefined);
     };
@@ -532,12 +530,12 @@ function App() {
       if (eventFallbackPoll !== null) return;
       eventFallbackPoll = window.setInterval(
         pollAppEventFallback,
-        APP_EVENT_FALLBACK_POLL_MS,
+        fallbackPollMs,
       );
     };
 
     if (tauriListen) {
-      void tauriListen<AppEventStreamView>(APP_EVENT_TAURI_TOPIC, (event) => {
+      void tauriListen<AppEventStreamView>("app_event", (event) => {
         refreshCommandState(event.payload);
       })
         .then((unlisten) => {
