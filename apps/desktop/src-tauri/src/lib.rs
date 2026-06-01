@@ -12,10 +12,11 @@ use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
 use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
-    signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
-    InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind, InviteSignalingAdapterKind,
-    InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
-    INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_PROVIDER_POLICY_VERSION,
+    signaling_fingerprint_for_endpoint, AdmissionController, AuthorizedWelcome, DmInviteBootstrap,
+    GroupInviteBootstrap, Invite, InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind,
+    InviteSignalingAdapterKind, InviteSignalingMetadata, InviteSignalingProfile, InviteStore,
+    InviteTrustMetadata, PasswordGate, INVITE_CONNECTIVITY_SCHEMA_VERSION,
+    INVITE_PROVIDER_POLICY_VERSION,
 };
 use discrypt_core::{
     app_snapshot as core_app_snapshot, identity_recovery_verification_smoke,
@@ -32,11 +33,11 @@ use discrypt_mls_core::{
     Identity, OpenMlsGroupEngine, OpenMlsMemberPackage, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    DeliveryError, InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextAuthorLogEnvelope,
-    TextAuthorLogStore, TextDeliveryReceipt, TextDeliveryReceiptInput, TextInboundPipeline,
-    TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
-    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextReceiveState,
-    TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEvent, TextSendEventSink,
+    InMemoryTextAuthorLog, InMemoryTextReceiveEvents, InMemoryTextRecipientStore,
+    InMemoryTextSendEvents, InMemoryTextTransport, TextDeliveryReceipt, TextDeliveryReceiptInput,
+    TextInboundPipeline, TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput,
+    TextOutboundPipeline, TextOutboundRequest, TextReceiveState, TextRenderState,
+    TextRetentionMetadata, TextSelectedRoute,
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
@@ -75,6 +76,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::{
@@ -1987,7 +1989,11 @@ struct OpenMlsGroupHandleRecord {
     group_id: String,
     signer_public_key_hex: String,
     epoch: u64,
+    #[serde(default)]
+    local_leaf: u32,
     confirmation_tag_sha256: String,
+    #[serde(default)]
+    openmls_store_path: Option<String>,
     status_copy: String,
 }
 
@@ -3740,7 +3746,10 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             .group_name
             .map(|value| normalize_label(&value, "joined enclave"))
             .unwrap_or_else(|| parse_invite_group_name(&invite_code));
-        let group_id = stable_id("group", &name, state.next_sequence);
+        let group_id = parsed_invite
+            .as_ref()
+            .and_then(|parsed| parsed.group_id.clone())
+            .unwrap_or_else(|| stable_id("group", &name, state.next_sequence));
         if !state.groups.iter().any(|group| group.name == name) {
             let connectivity = parsed_invite
                 .as_ref()
@@ -3947,7 +3956,12 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
+        let invite_code = match production_invite_link(
+            &descriptor,
+            expires_at.as_str(),
+            max_uses,
+            Some(&group_id),
+        ) {
             Ok(code) => code,
             Err(error) => {
                 state.push_command_error(
@@ -4151,7 +4165,7 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
                 )
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
-        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses) {
+        let invite_code = match production_invite_link(&descriptor, expires_at.as_str(), max_uses, None) {
             Ok(code) => code,
             Err(error) => {
                 state.push_command_error(
@@ -5705,9 +5719,11 @@ impl PersistedAppState {
             group_id: group_id.to_owned(),
             signer_public_key_hex: hex::encode(signer_public_key),
             epoch: snapshot.epoch,
+            local_leaf: 0,
             confirmation_tag_sha256: hex::encode(confirmation_hash.finalize()),
+            openmls_store_path: Some(path.display().to_string()),
             status_copy:
-                "OpenMLS group state was created in the Rust service boundary; exporter wiring for Tauri text receive remains a separate G012 gate"
+                "OpenMLS group state was created in the Rust service boundary and can export Rust-only text secrets for admitted members"
                     .to_owned(),
         };
         self.openmls_groups.push(record);
@@ -5719,6 +5735,51 @@ impl PersistedAppState {
             ),
         );
         Ok(())
+    }
+
+    fn openmls_text_exporter_for_target(
+        &self,
+        target: &MessageTargetView,
+        delivery_group_id: &str,
+    ) -> Result<(Vec<u8>, u64, u32), String> {
+        if target.kind != "channel" {
+            return Err("OpenMLS text exporter is currently scoped to group channels".to_owned());
+        }
+        let openmls_group_id = target
+            .group_id
+            .as_deref()
+            .ok_or_else(|| "channel text target requires an OpenMLS group id".to_owned())?;
+        let handle = self
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == openmls_group_id)
+            .ok_or_else(|| {
+                format!(
+                    "OpenMLS group handle is missing for {}",
+                    redacted_observable_ref("group", openmls_group_id)
+                )
+            })?;
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("OpenMLS signer handle is not valid hex: {error}"))?;
+        let store_path = handle
+            .openmls_store_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(app_openmls_store_path);
+        let mut engine = OpenMlsGroupEngine::open(&store_path)
+            .map_err(|error| format!("OpenMLS provider could not be opened: {error}"))?;
+        let snapshot = engine
+            .load_group(openmls_group_id, &signer_public_key)
+            .map_err(|error| format!("OpenMLS group could not be loaded: {error}"))?;
+        let exporter = engine
+            .export_secret(
+                openmls_group_id,
+                "discrypt/text",
+                delivery_group_id.as_bytes(),
+                32,
+            )
+            .map_err(|error| format!("OpenMLS text exporter failed: {error}"))?;
+        Ok((exporter, snapshot.epoch, handle.local_leaf))
     }
 
     fn to_view(&self) -> AppStateView {
@@ -6852,14 +6913,14 @@ impl PersistedAppState {
         let group_id = text_delivery_group_id(target)?;
         let seed = self.identity_seed_bytes();
         let signing_key = SigningKey::from_bytes(&seed);
-        if target.kind != "channel" {
-            let ciphertext =
-                opaque_text_control_frame_for_message(self, target, message_id, body, sequence);
-            let envelope = TextMessageEnvelope::sign(
-                &group_id,
-                TextMessageEnvelopeInput {
-                    epoch: 1,
-                    sender_leaf: 1,
+        let envelope = match self.openmls_text_exporter_for_target(target, &group_id) {
+            Ok((text_exporter_secret, epoch, sender_leaf)) => {
+                let channel_id = target.channel_id.clone().unwrap_or_default();
+                let request = TextOutboundRequest {
+                    group_id: group_id.clone(),
+                    channel_id,
+                    epoch,
+                    sender_leaf,
                     sender_device_id: self.local_user_id(),
                     sequence,
                     message_id: message_id.to_owned(),
@@ -6869,69 +6930,48 @@ impl PersistedAppState {
                         expires_at_ms: None,
                         delete_after_read: false,
                     },
-                    content_ciphertext: ciphertext,
-                },
-                &signing_key,
-            )
-            .map_err(|error| error.to_string())?;
-            return Ok(TextDeliveryEnvelopeRecord {
-                message_id: message_id.to_owned(),
-                group_id,
-                sender_verifying_key_hex: hex::encode(signing_key.verifying_key().as_bytes()),
-                envelope,
-            });
-        }
-
-        let openmls_group_id = target
-            .group_id
-            .as_deref()
-            .ok_or_else(|| "channel delivery target requires group_id".to_owned())?;
-        let channel_id = target
-            .channel_id
-            .as_deref()
-            .ok_or_else(|| "channel delivery target requires channel_id".to_owned())?;
-        let openmls_epoch = self
-            .openmls_groups
-            .iter()
-            .find(|record| record.group_id == openmls_group_id)
-            .ok_or_else(|| {
-                format!(
-                    "OpenMLS group state is missing for {}",
-                    redacted_observable_ref("group", openmls_group_id)
+                    plaintext: body.as_bytes().to_vec(),
+                    sent_at_ms: sequence,
+                    now: Utc::now(),
+                };
+                let route = TextSelectedRoute {
+                    session_id: "app-service-text-control-outbox".to_owned(),
+                    route_label: "provider-backed-text-control".to_owned(),
+                    overlay_hops: 0,
+                    ciphertext_only: true,
+                };
+                let mut author_log = InMemoryTextAuthorLog::default();
+                let mut transport = InMemoryTextTransport::default();
+                let mut events = InMemoryTextSendEvents::default();
+                TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
+                    .send(request, route, &text_exporter_secret, &signing_key)
+                    .map(|receipt| receipt.envelope)
+                    .map_err(|error| error.to_string())?
+            }
+            Err(_) => {
+                let ciphertext =
+                    opaque_text_control_frame_for_message(self, target, message_id, body, sequence);
+                TextMessageEnvelope::sign(
+                    &group_id,
+                    TextMessageEnvelopeInput {
+                        epoch: 1,
+                        sender_leaf: 1,
+                        sender_device_id: self.local_user_id(),
+                        sequence,
+                        message_id: message_id.to_owned(),
+                        retention: TextRetentionMetadata {
+                            policy: "app-default".to_owned(),
+                            created_at_ms: sequence,
+                            expires_at_ms: None,
+                            delete_after_read: false,
+                        },
+                        content_ciphertext: ciphertext,
+                    },
+                    &signing_key,
                 )
-            })?
-            .epoch;
-        let text_exporter_secret = self.openmls_text_exporter_secret(openmls_group_id)?;
-        let request = TextOutboundRequest {
-            group_id: group_id.clone(),
-            channel_id: channel_id.to_owned(),
-            epoch: openmls_epoch,
-            sender_leaf: 1,
-            sender_device_id: self.local_user_id(),
-            sequence,
-            message_id: message_id.to_owned(),
-            retention: TextRetentionMetadata {
-                policy: "app-default".to_owned(),
-                created_at_ms: sequence,
-                expires_at_ms: None,
-                delete_after_read: false,
-            },
-            plaintext: body.as_bytes().to_vec(),
-            sent_at_ms: sequence,
-            now: Utc::now(),
+                .map_err(|error| error.to_string())?
+            }
         };
-        let route = self.selected_text_route_for_outbox(message_id);
-        let mut author_log = AppTextAuthorLog::default();
-        let mut transport = AppTextOutboxTransport::default();
-        let mut events = AppTextSendEvents::default();
-        let receipt = TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
-            .send(request, route, &text_exporter_secret, &signing_key)
-            .map_err(|error| error.to_string())?;
-        if author_log.entries.len() != 1 || transport.frames.len() != 1 {
-            return Err(
-                "text outbound pipeline did not persist and queue exactly one envelope".to_owned(),
-            );
-        }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
             group_id,
@@ -7590,8 +7630,46 @@ impl PersistedAppState {
                 Ok((group_id, sender_key))
             })
             .and_then(|(group_id, sender_key)| {
-                let plaintext_render =
-                    self.receive_text_plaintext_render(&request, &group_id, &sender_key)?;
+                let decrypted_plaintext = match self
+                    .openmls_text_exporter_for_target(&request.target, &group_id)
+                {
+                    Ok((text_exporter_secret, current_epoch, _local_leaf)) => {
+                        let mut receive_state = TextReceiveState::default();
+                        let mut recipient_store = InMemoryTextRecipientStore::default();
+                        let mut receive_events = InMemoryTextReceiveEvents::default();
+                        let mut authorized_sender_leaves = BTreeSet::new();
+                        authorized_sender_leaves.insert(request.envelope.sender_leaf);
+                        let renderable = TextInboundPipeline::new(
+                            &mut receive_state,
+                            &mut recipient_store,
+                            &mut receive_events,
+                        )
+                        .receive(
+                            TextInboundRequest {
+                                group_id: group_id.clone(),
+                                channel_id: request.target.channel_id.clone().unwrap_or_default(),
+                                current_epoch,
+                                authorized_sender_leaves,
+                                envelope: request.envelope.clone(),
+                                received_at_ms: self.next_sequence.saturating_add(1),
+                                retention_allows_decrypt: true,
+                            },
+                            &text_exporter_secret,
+                            &sender_key,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        match renderable.state {
+                            TextRenderState::Decrypted(bytes) => Some(
+                                String::from_utf8(bytes)
+                                    .map_err(|_| "decrypted text was not valid UTF-8".to_owned())?,
+                            ),
+                            TextRenderState::Locked { reason } => {
+                                return Err(format!("OpenMLS text plaintext locked: {reason}"));
+                            }
+                        }
+                    }
+                    Err(_) => None,
+                };
                 let recipient_leaf = request.recipient_leaf.unwrap_or(1);
                 let recipient_seed = self.identity_seed_bytes();
                 let recipient_signer = SigningKey::from_bytes(&recipient_seed);
@@ -7628,22 +7706,44 @@ impl PersistedAppState {
                 {
                     let sequence = self.next_sequence;
                     self.next_sequence = self.next_sequence.saturating_add(1);
-                    let (body, status, state_key, state_label, render_detail) =
-                        plaintext_render.message_fields(&request.envelope);
+                    let plaintext_rendered = decrypted_plaintext.is_some();
+                    let body = decrypted_plaintext.unwrap_or_else(|| {
+                        format!(
+                            "Encrypted message envelope received (ciphertext_hash={})",
+                            hex::encode(request.envelope.ciphertext_hash())
+                        )
+                    });
                     self.messages.push(MessageView {
                         message_id: request.envelope.message_id.clone(),
                         target: request.target.clone(),
                         author_id: request.envelope.sender_device_id.clone(),
                         author: format!("Peer {}", key_fingerprint(&sender_key)),
                         body,
-                        status,
-                        state_key,
-                        state_label,
+                        status: if plaintext_rendered {
+                            "OpenMLS exporter-backed encrypted peer envelope verified, decrypted, and persisted; signed delivery receipt generated".to_owned()
+                        } else {
+                            "signed encrypted peer envelope verified and persisted; plaintext decrypt/render still requires the MLS receive loop".to_owned()
+                        },
+                        state_key: if plaintext_rendered {
+                            "received_plaintext".to_owned()
+                        } else {
+                            "received_envelope".to_owned()
+                        },
+                        state_label: if plaintext_rendered {
+                            "Plaintext received".to_owned()
+                        } else {
+                            "Envelope received".to_owned()
+                        },
                         state_detail: format!(
-                            "Verified sender={} {} {}; {render_detail}; generated signed delivery receipt",
+                            "Verified sender={} {} {} and generated signed delivery receipt{}",
                             key_fingerprint(&sender_key),
                             redacted_message_ref(&request.envelope.message_id),
-                            redacted_observable_ref("group_binding", &group_id)
+                            redacted_observable_ref("group_binding", &group_id),
+                            if plaintext_rendered {
+                                " after OpenMLS exporter decrypt"
+                            } else {
+                                ""
+                            }
                         ),
                         peer_receipt: None,
                         sent_at: format!("remote-{sequence}"),
@@ -10947,15 +11047,19 @@ fn production_invite_link(
     descriptor: &discrypt_admission::StoredInvite,
     expires_at: &str,
     max_uses: u32,
+    group_id: Option<&str>,
 ) -> Result<String, String> {
     let descriptor_bytes = serde_json::to_vec(descriptor)
         .map_err(|error| format!("Could not encode signed invite descriptor: {error}"))?;
     let encoded_descriptor = URL_SAFE_NO_PAD.encode(descriptor_bytes);
+    let group_id_query = group_id
+        .map(|group_id| format!("&gid={}", url_component(group_id)))
+        .unwrap_or_default();
     Ok(format!(
         "discrypt://join/v1/{}?d={encoded_descriptor}&exp={}&max={max_uses}",
         descriptor.invite_id,
         url_component(expires_at)
-    ))
+    ) + &group_id_query)
 }
 
 fn url_component(value: &str) -> String {
@@ -10984,6 +11088,7 @@ fn parse_invite_group_name(invite_code: &str) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedInviteMetadata {
     invite_key: String,
+    group_id: Option<String>,
     room_secret_hash: String,
     signaling_endpoint: String,
     signaling_trust_fingerprint: String,
@@ -11026,6 +11131,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             .unwrap_or_else(|| group_connectivity_policy(&descriptor.invite_id));
         return Some(ParsedInviteMetadata {
             invite_key: descriptor.invite_id,
+            group_id: query_value(query, "gid").and_then(percent_decode),
             room_secret_hash: hex::encode(descriptor.room_secret_commitment),
             signaling_endpoint: descriptor.signaling_metadata.signaling_endpoint,
             signaling_trust_fingerprint: descriptor.signaling_metadata.trust.signaling_fingerprint,
@@ -11064,6 +11170,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         hash_commitment("discrypt-legacy-invite-scope-commitment-v1", &[&invite_key]);
     Some(ParsedInviteMetadata {
         invite_key: invite_key.clone(),
+        group_id: query_value(query, "gid").and_then(percent_decode),
         room_secret_hash,
         signaling_endpoint: endpoint,
         signaling_trust_fingerprint,
@@ -11458,6 +11565,148 @@ mod tests {
             ));
         }
         Ok((path.clone(), TauriAppService::load_for_test_path(path)))
+    }
+
+    fn persist_openmls_handle_for_test(
+        state: &mut PersistedAppState,
+        group_id: &str,
+        signer_public_key: &[u8],
+        snapshot: discrypt_mls_core::OpenMlsGroupSnapshot,
+        local_leaf: u32,
+        store_path: &std::path::Path,
+        status_copy: impl Into<String>,
+    ) {
+        let mut confirmation_hash = Sha256::new();
+        confirmation_hash.update(&snapshot.confirmation_tag);
+        let record = OpenMlsGroupHandleRecord {
+            group_id: group_id.to_owned(),
+            signer_public_key_hex: hex::encode(signer_public_key),
+            epoch: snapshot.epoch,
+            local_leaf,
+            confirmation_tag_sha256: hex::encode(confirmation_hash.finalize()),
+            openmls_store_path: Some(store_path.display().to_string()),
+            status_copy: status_copy.into(),
+        };
+        if let Some(existing) = state
+            .openmls_groups
+            .iter_mut()
+            .find(|existing| existing.group_id == group_id)
+        {
+            *existing = record;
+        } else {
+            state.openmls_groups.push(record);
+        }
+    }
+
+    fn admit_group_invite_between_test_profiles(
+        owner_path: &std::path::Path,
+        joiner_path: &std::path::Path,
+        group_id: &str,
+        invite: &InviteView,
+    ) -> Result<(String, String), String> {
+        let mut owner_store = FileAppStore::new(owner_path);
+        let mut joiner_store = FileAppStore::new(joiner_path);
+        let mut owner_state = load_state_from_store(&mut owner_store);
+        let mut joiner_state = load_state_from_store(&mut joiner_store);
+        let owner_handle = owner_state
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "owner OpenMLS handle missing before admission".to_owned())?;
+        let owner_signer_public_key = hex::decode(&owner_handle.signer_public_key_hex)
+            .map_err(|error| format!("owner OpenMLS signer key was not hex: {error}"))?;
+        let owner_openmls_path = openmls_store_path_for_app_state_path(owner_path);
+        let joiner_openmls_path = openmls_store_path_for_app_state_path(joiner_path);
+        let mut owner_engine = OpenMlsGroupEngine::open(&owner_openmls_path)
+            .map_err(|error| format!("owner OpenMLS provider open failed: {error}"))?;
+        let mut joiner_engine = OpenMlsGroupEngine::open(&joiner_openmls_path)
+            .map_err(|error| format!("joiner OpenMLS provider open failed: {error}"))?;
+        owner_engine
+            .load_group(group_id, &owner_signer_public_key)
+            .map_err(|error| format!("owner OpenMLS group load failed: {error}"))?;
+        let joiner_identity = joiner_state.local_user_id();
+        let joiner_package = joiner_engine
+            .generate_member_package(joiner_identity.as_bytes())
+            .map_err(|error| format!("joiner OpenMLS key package failed: {error}"))?;
+        let admitted = owner_engine
+            .add_member_package(group_id, &joiner_package)
+            .map_err(|error| format!("owner OpenMLS add-member failed: {error}"))?;
+        let welcome = admitted
+            .welcome
+            .as_ref()
+            .ok_or_else(|| "OpenMLS add-member did not return a Welcome".to_owned())?;
+        let welcome_issuer = SigningKey::generate(&mut OsRng);
+        let authorized_welcome = AuthorizedWelcome::sign(
+            invite.invite_key.clone(),
+            group_id.as_bytes().to_vec(),
+            welcome,
+            Utc::now() + Duration::minutes(5),
+            &welcome_issuer,
+        );
+        let room_secret_hash: [u8; 32] = hex::decode(&invite.room_secret_hash)
+            .map_err(|error| format!("invite room-secret commitment was not hex: {error}"))?
+            .try_into()
+            .map_err(|_| "invite room-secret commitment was not 32 bytes".to_owned())?;
+        let mut admission_invite = Invite {
+            id: Uuid::parse_str(&invite.invite_key)
+                .map_err(|error| format!("invite id was not a UUID: {error}"))?,
+            room_secret_hash,
+            expires_at: Utc::now() + Duration::minutes(5),
+            max_uses: invite
+                .max_use
+                .parse::<u32>()
+                .ok()
+                .filter(|uses| *uses > 0)
+                .unwrap_or(1),
+            uses: invite.uses,
+            revoked: invite.revoked,
+        };
+        AdmissionController::new(PasswordGate::None, 1)
+            .finalize_admission(
+                &mut admission_invite,
+                Utc::now(),
+                joiner_identity,
+                true,
+                Some(&authorized_welcome),
+                welcome,
+            )
+            .map_err(|error| format!("authorized Welcome admission failed: {error}"))?;
+        let joined = joiner_engine
+            .join_from_welcome(group_id, joiner_package.signer_public_key(), welcome)
+            .map_err(|error| format!("joiner OpenMLS welcome join failed: {error}"))?;
+        let owner_exporter = owner_engine
+            .export_secret(group_id, "discrypt/text", b"g012-openmls-admission", 32)
+            .map_err(|error| format!("owner OpenMLS text exporter failed: {error}"))?;
+        let joiner_exporter = joiner_engine
+            .export_secret(group_id, "discrypt/text", b"g012-openmls-admission", 32)
+            .map_err(|error| format!("joiner OpenMLS text exporter failed: {error}"))?;
+        if owner_exporter != joiner_exporter {
+            return Err("OpenMLS text exporters diverged after Welcome admission".to_owned());
+        }
+        persist_openmls_handle_for_test(
+            &mut owner_state,
+            group_id,
+            &owner_signer_public_key,
+            admitted.state,
+            0,
+            &owner_openmls_path,
+            "OpenMLS invite admission added a joiner and rotated the Rust-only text exporter",
+        );
+        persist_openmls_handle_for_test(
+            &mut joiner_state,
+            group_id,
+            joiner_package.signer_public_key(),
+            joined,
+            1,
+            &joiner_openmls_path,
+            "OpenMLS invite admission joined from an authorized Welcome and installed the Rust-only text exporter",
+        );
+        persist_state_to_store(&mut owner_store, &owner_state)
+            .map_err(|error| format!("owner app state persist failed: {}", error.message))?;
+        persist_state_to_store(&mut joiner_store, &joiner_state)
+            .map_err(|error| format!("joiner app state persist failed: {}", error.message))?;
+        Ok((hex::encode(Sha256::digest(owner_exporter)), hex::encode(Sha256::digest(joiner_exporter))))
     }
 
     fn attach_text_control_transport_runtime_for_test(
