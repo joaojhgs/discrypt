@@ -16298,6 +16298,18 @@ mod tests {
             .find(|channel| channel.kind == ChannelKind::Text)
             .map(|channel| channel.channel_id.clone())
             .ok_or_else(|| "bob text channel missing".to_owned())?;
+        assert_eq!(
+            bob_group_id, alice_group_id,
+            "signed invite must install the inviter's OpenMLS group id"
+        );
+        let (owner_exporter_sha256, joiner_exporter_sha256) =
+            admit_group_invite_between_test_profiles(
+                &alice_path,
+                &bob_path,
+                &alice_group_id,
+                &group_invite,
+            )?;
+        assert_eq!(owner_exporter_sha256, joiner_exporter_sha256);
 
         reload_global_app_service_from_path(&alice_path);
         let alice_target = MessageTargetView {
@@ -16359,7 +16371,9 @@ mod tests {
         assert!(alice_delivered.peer_receipt.is_some());
         let bob_after_alice = load_state_from_store(&mut FileAppStore::new(&bob_path));
         assert!(bob_after_alice.messages.iter().any(|message| {
-            message.message_id == alice_message_id && message.state_key == "received_envelope"
+            message.message_id == alice_message_id
+                && message.state_key == "received_plaintext"
+                && message.body == "g012 alice to bob encrypted group text"
         }));
 
         reload_global_app_service_from_path(&bob_path);
@@ -16415,7 +16429,9 @@ mod tests {
         assert!(bob_delivered.peer_receipt.is_some());
         let alice_after_bob = load_state_from_store(&mut FileAppStore::new(&alice_path));
         assert!(alice_after_bob.messages.iter().any(|message| {
-            message.message_id == bob_message_id && message.state_key == "received_envelope"
+            message.message_id == bob_message_id
+                && message.state_key == "received_plaintext"
+                && message.body == "g012 bob to alice encrypted group text"
         }));
 
         if let Ok(artifact_path) = std::env::var("DISCRYPT_G012_TEXT_PROOF_ARTIFACT") {
@@ -16450,13 +16466,20 @@ mod tests {
                     "invite_kind": group_invite.invite_kind,
                     "invite_uses": bob_after.invites.iter().find(|invite| invite.invite_key == group_invite.invite_key).map(|invite| invite.uses).unwrap_or(0),
                 },
+                "openmls_admission": {
+                    "welcome_admission": "authorized_openmls_welcome_joined",
+                    "owner_exporter_sha256": owner_exporter_sha256,
+                    "joiner_exporter_sha256": joiner_exporter_sha256,
+                    "exporters_match": true,
+                },
                 "deliveries": [
                     {
                         "direction": "alice_to_bob",
                         "message_id": alice_message_id,
                         "sender_state_after_reload": alice_delivered.state_key,
                         "sender_peer_receipt": alice_delivered.peer_receipt.is_some(),
-                        "receiver_state_after_reload": "received_envelope",
+                        "receiver_state_after_reload": "received_plaintext",
+                        "receiver_plaintext_rendered": true,
                         "frames_sent": alice_report.frames_sent,
                         "response_frames_received": alice_report.response_frames_received,
                         "receipts_applied": alice_report.receipts_applied,
@@ -16469,7 +16492,8 @@ mod tests {
                         "message_id": bob_message_id,
                         "sender_state_after_reload": bob_delivered.state_key,
                         "sender_peer_receipt": bob_delivered.peer_receipt.is_some(),
-                        "receiver_state_after_reload": "received_envelope",
+                        "receiver_state_after_reload": "received_plaintext",
+                        "receiver_plaintext_rendered": true,
                         "frames_sent": bob_report.frames_sent,
                         "response_frames_received": bob_report.response_frames_received,
                         "receipts_applied": bob_report.receipts_applied,
@@ -16481,8 +16505,9 @@ mod tests {
                 "claims": [
                     "two isolated Tauri AppService profile stores",
                     "signed group invite accepted by second profile",
+                    "authorized OpenMLS Welcome admission installed matching text exporters",
                     "text/control transport pump delivered opaque encrypted envelopes both directions",
-                    "receiver persisted received_envelope rows",
+                    "receiver decrypted and persisted received_plaintext rows",
                     "sender persisted signed peer_receipt state after reload"
                 ]
             });
