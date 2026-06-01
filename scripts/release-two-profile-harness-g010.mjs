@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -13,6 +14,7 @@ const launchBuilt = args.includes("--launch-built") || process.env.DISCRYPT_G010
 const runBrowserFlow = !args.includes("--skip-browser-flow") && process.env.DISCRYPT_G010_SKIP_BROWSER_FLOW !== "1";
 const runRustMatrix = !args.includes("--skip-rust-matrix") && process.env.DISCRYPT_G010_SKIP_RUST_MATRIX !== "1";
 const artifactRoot = resolve(repoRoot, valueAfter("--artifact-dir") ?? "target/release/g010-two-profile-harness");
+const playwrightOutputDir = resolve(artifactRoot, "playwright-output");
 const profileRoot = resolve(artifactRoot, "profiles");
 const profileState = {
   alice: resolve(profileRoot, "alice", "app-state.discrypt-store"),
@@ -45,7 +47,7 @@ const localAdapterMatrix = [
     id: "browser-two-profile-ui",
     kind: "local-browser",
     command: "npx",
-    args: ["playwright", "test", "tests/e2e/two-profile-flow.spec.ts", "--workers=1", "--reporter=json", "--output", "../../target/release/g010-two-profile-harness/playwright-output"],
+    args: ["playwright", "test", "tests/e2e/two-profile-flow.spec.ts", "--workers=1", "--reporter=json", "--output", playwrightOutputDir],
     cwd: "apps/ui",
     env: { VITE_DISCRYPT_LOCAL_DEV_FALLBACK: "1", PLAYWRIGHT_HTML_OPEN: "never" },
     stdout: "browser-two-profile-flow.json",
@@ -221,7 +223,20 @@ function publicStepStatus(step) {
   return runStep(step, step.env);
 }
 
-function launchBuiltProfiles() {
+async function sleep(ms) {
+  await new Promise((resolveWait) => setTimeout(resolveWait, ms));
+}
+
+function childIsRunning(child) {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+async function waitForExit(child, timeoutMs) {
+  if (!childIsRunning(child)) return true;
+  return Promise.race([once(child, "exit").then(() => true), sleep(timeoutMs).then(() => false)]);
+}
+
+async function launchBuiltProfiles() {
   const binary = resolve(repoRoot, "target/release", process.platform === "win32" ? `${desktopCrate}.exe` : desktopCrate);
   const step = {
     id: "tauri-built-two-profile-launch",
@@ -231,13 +246,15 @@ function launchBuiltProfiles() {
     profiles: Object.fromEntries(Object.entries(profileState).map(([name, path]) => [name, rel(path)])),
   };
   if (!launchBuilt) return { ...step, status: "skipped", reason: "set --launch-built or DISCRYPT_G010_LAUNCH_BUILT=1 after building the Tauri binary" };
-  if (!existsSync(binary)) throw new Error(`built Tauri binary not found at ${binary}; run npm --prefix apps/ui run release:linux or cargo build -p discrypt-desktop --features tauri-runtime first`);
+  if (!existsSync(binary)) throw new Error(`built Tauri binary not found at ${binary}; run npm --prefix apps/ui run release:linux or cargo build --release -p discrypt-desktop --features tauri-runtime,local-dev first so DISCRYPT_APP_STATE_PATH profile isolation is honored`);
   if (dryRun) return { ...step, status: "planned" };
   mkdirSync(resolve(profileRoot, "alice"), { recursive: true });
   mkdirSync(resolve(profileRoot, "bob"), { recursive: true });
   const children = Object.entries(profileState).map(([name, statePath]) => {
     const stdout = resolve(artifactRoot, `${name}-tauri.stdout.log`);
     const stderr = resolve(artifactRoot, `${name}-tauri.stderr.log`);
+    const stdoutStream = createWriteStream(stdout, { flags: "w" });
+    const stderrStream = createWriteStream(stderr, { flags: "w" });
     const child = spawn(binary, [], {
       cwd: repoRoot,
       env: {
@@ -248,22 +265,43 @@ function launchBuiltProfiles() {
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const out = [];
-    const err = [];
-    child.stdout.on("data", (chunk) => out.push(chunk));
-    child.stderr.on("data", (chunk) => err.push(chunk));
-    return { name, child, stdout, stderr, out, err };
+    child.stdout.pipe(stdoutStream);
+    child.stderr.pipe(stderrStream);
+    return { name, child, stdout, stderr, stdoutStream, stderrStream };
   });
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 8000);
+  await sleep(8000);
+  const earlyExit = children.find((entry) => !childIsRunning(entry.child));
   for (const entry of children) {
-    if (entry.child.exitCode === null) entry.child.kill("SIGTERM");
-    writeText(entry.stdout, Buffer.concat(entry.out).toString("utf8"));
-    writeText(entry.stderr, Buffer.concat(entry.err).toString("utf8"));
+    if (childIsRunning(entry.child)) entry.child.kill("SIGTERM");
+  }
+  await Promise.all(children.map((entry) => waitForExit(entry.child, 5000)));
+  for (const entry of children) {
+    if (childIsRunning(entry.child)) entry.child.kill("SIGKILL");
+  }
+  await Promise.all(children.map((entry) => waitForExit(entry.child, 2000)));
+  await Promise.all(children.flatMap((entry) => [
+    new Promise((resolveFinish) => entry.stdoutStream.end(resolveFinish)),
+    new Promise((resolveFinish) => entry.stderrStream.end(resolveFinish)),
+  ]));
+  const logs = Object.fromEntries(children.map((entry) => [entry.name, {
+    stdout: rel(entry.stdout),
+    stderr: rel(entry.stderr),
+    pid: entry.child.pid,
+    exitCode: entry.child.exitCode,
+    signalCode: entry.child.signalCode,
+  }]));
+  if (earlyExit) {
+    return {
+      ...step,
+      status: "failed",
+      reason: `${earlyExit.name} exited before the 8000ms launch window elapsed`,
+      logs,
+    };
   }
   return {
     ...step,
     status: "passed",
-    logs: Object.fromEntries(children.map((entry) => [entry.name, { stdout: rel(entry.stdout), stderr: rel(entry.stderr) }])),
+    logs,
   };
 }
 
@@ -322,7 +360,7 @@ async function main() {
       results.push({ ...step, rendered: renderCommand(step), status: "skipped_public_matrix_disabled", reason: "set --include-public or DISCRYPT_G010_PUBLIC_MATRIX=1" });
     }
   }
-  results.push(launchBuiltProfiles());
+  results.push(await launchBuiltProfiles());
   const report = {
     ...plan,
     completed_at: new Date().toISOString(),

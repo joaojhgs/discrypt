@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const argv = process.argv.slice(2);
@@ -16,6 +17,12 @@ if (!["dev", "build"].includes(appMode)) {
 const runId =
   process.env.DISCRYPT_G010_RUN_ID ||
   `tauri-launch-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+const devServerPort = Number(process.env.DISCRYPT_G010_DEV_SERVER_PORT || 1420);
+if (!Number.isInteger(devServerPort) || devServerPort <= 0 || devServerPort > 65_535) {
+  console.error("DISCRYPT_G010_DEV_SERVER_PORT must be an integer TCP port.");
+  process.exit(2);
+}
+const devServerUrl = `http://127.0.0.1:${devServerPort}`;
 const tauriFeatures = (process.env.DISCRYPT_G010_TAURI_FEATURES || "tauri-runtime,local-dev")
   .split(",")
   .map((feature) => feature.trim())
@@ -67,7 +74,7 @@ const manifest = {
   manual_pairing_required: false,
   profiles,
   shared_frontend: {
-    url: "http://127.0.0.1:1420",
+    url: devServerUrl,
     log_path: resolve(logDir, "vite-shared.log"),
   },
   commands: [],
@@ -145,14 +152,67 @@ function spawnLogged(label, command, args, options) {
     cwd: options.cwd,
     env: { ...process.env, ...options.env },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
   child.stdout.on("data", (chunk) => appendFileSync(options.logPath, chunk));
   child.stderr.on("data", (chunk) => appendFileSync(options.logPath, chunk));
+  const entry = { label, pid: child.pid, command, args, cwd: options.cwd, log_path: options.logPath };
+  manifest.commands.push(entry);
   child.on("exit", (code, signal) => {
-    appendFileSync(options.logPath, `\nexited_at=${new Date().toISOString()} code=${code} signal=${signal}\n`);
+    const exitedAt = new Date().toISOString();
+    entry.exit_code = code;
+    entry.exit_signal = signal;
+    entry.exited_at = exitedAt;
+    appendFileSync(options.logPath, `\nexited_at=${exitedAt} code=${code} signal=${signal}\n`);
   });
-  manifest.commands.push({ label, pid: child.pid, command, args, cwd: options.cwd, log_path: options.logPath });
   return child;
+}
+
+function syncChildExitEntry(child) {
+  const entry = manifest.commands.find((command) => command.pid === child.pid);
+  if (!entry) return;
+  entry.exit_code = child.exitCode;
+  entry.exit_signal = child.signalCode;
+  if (!entry.exited_at && !childIsRunning(child)) entry.exited_at = new Date().toISOString();
+}
+
+function childIsRunning(child) {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+async function sleep(ms) {
+  await new Promise((resolveWait) => setTimeout(resolveWait, ms));
+}
+
+async function waitForExit(child, timeoutMs) {
+  if (!childIsRunning(child)) return true;
+  const timeout = sleep(timeoutMs).then(() => false);
+  return Promise.race([once(child, "exit").then(() => true), timeout]);
+}
+
+async function stopChildren(children) {
+  for (const child of children.slice().reverse()) {
+    if (childIsRunning(child)) terminateChild(child, "SIGTERM");
+  }
+  await Promise.all(children.map((child) => waitForExit(child, 5_000)));
+  for (const child of children.slice().reverse()) {
+    if (childIsRunning(child)) terminateChild(child, "SIGKILL");
+  }
+  await Promise.all(children.map((child) => waitForExit(child, 2_000)));
+  for (const child of children) syncChildExitEntry(child);
+}
+
+function terminateChild(child, signal) {
+  if (!childIsRunning(child)) return;
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-child.pid, signal);
+    } else {
+      child.kill(signal);
+    }
+  } catch {
+    child.kill(signal);
+  }
 }
 
 if (appMode === "build") {
@@ -176,11 +236,11 @@ if (appMode === "build") {
 const vite = spawnLogged(
   "shared vite dev server",
   "npm",
-  ["run", "dev", "--", "--host", "127.0.0.1", "--port", "1420", "--strictPort"],
+  ["run", "dev", "--", "--host", "127.0.0.1", "--port", String(devServerPort), "--strictPort"],
   { cwd: resolve(repoRoot, "apps/ui"), logPath: manifest.shared_frontend.log_path, env: {} },
 );
 
-await new Promise((resolveWait) => setTimeout(resolveWait, Number(process.env.DISCRYPT_G010_VITE_WAIT_MS || 5_000)));
+await sleep(Number(process.env.DISCRYPT_G010_VITE_WAIT_MS || 5_000));
 const children = [vite];
 for (const profile of Object.values(profiles)) {
   const command = tauriCommandFor(profile);
@@ -194,13 +254,15 @@ for (const profile of Object.values(profiles)) {
 }
 
 const durationMs = Number(process.env.DISCRYPT_G010_LAUNCH_DURATION_MS || 20_000);
-await new Promise((resolveWait) => setTimeout(resolveWait, durationMs));
-for (const child of children.reverse()) {
-  if (!child.killed) child.kill("SIGTERM");
-}
-await new Promise((resolveWait) => setTimeout(resolveWait, 1_500));
-for (const child of children) {
-  if (!child.killed) child.kill("SIGKILL");
+await sleep(durationMs);
+const earlyExit = children.find((child) => !childIsRunning(child));
+await stopChildren(children);
+if (earlyExit) {
+  writeManifest("failed");
+  console.error(
+    `G010 Tauri two-profile launch failed: ${earlyExit.spawnargs?.join(" ") || earlyExit.pid} exited before the ${durationMs}ms runtime window elapsed with code=${earlyExit.exitCode} signal=${earlyExit.signalCode}`,
+  );
+  process.exit(earlyExit.exitCode ?? 1);
 }
 writeManifest("passed");
 console.log(`G010 Tauri two-profile launch artifact: ${resolve(artifactRoot, "tauri-launch-manifest.json")}`);
