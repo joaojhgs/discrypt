@@ -60,12 +60,12 @@ use discrypt_transport::{
     start_provider_webrtc_text_control_answer_runtime_with_answerer,
     start_provider_webrtc_text_control_offer_runtime, AdapterFallbackBehavior, AdapterTrustLabel,
     ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel, ConversationScope, Endpoint,
-    FallbackLeg, IceServerConfig, ProviderMetadataPosture, ProviderTextControlRuntimeAttachment,
-    ProviderTextControlRuntimePeerRole, ProviderTextControlRuntimeSpec,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
-    TransportRoute, TransportSession, TransportSessionSnapshot, TransportSessionState,
-    TurnServerConfig,
+    FallbackLeg, IceEndpointPolicy, IceServerConfig, ProviderMetadataPosture,
+    ProviderTextControlRuntimeAttachment, ProviderTextControlRuntimePeerRole,
+    ProviderTextControlRuntimeSpec, SignalingAdapterCapabilities, SignalingAdapterKind,
+    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint,
+    TransportError, TransportRoute, TransportSession, TransportSessionSnapshot,
+    TransportSessionState, TurnServerConfig,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -2897,6 +2897,13 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 runtime_peers,
                 connectivity: Some(connectivity),
             });
+        } else if let Some(parsed) = parsed_invite.as_ref() {
+            if let Some(existing_group) = state.groups.iter_mut().find(|group| group.name == name) {
+                existing_group.role = "member".to_owned();
+                existing_group.runtime_peers =
+                    group_runtime_peers(Some(&parsed.connectivity), "member");
+                existing_group.connectivity = Some(parsed.connectivity.clone());
+            }
         }
         let active_group_id = state
             .groups
@@ -3004,6 +3011,19 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
                 return;
             }
         };
+        let _ice_endpoint_policy = match ice_endpoint_policy_from_connectivity(&connectivity) {
+            Ok(policy) => policy,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_ice_policy_invalid",
+                    error.to_string(),
+                    "Recreate the group connectivity policy before issuing an invite",
+                );
+                return;
+            }
+        };
         let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
         let max_use = normalize_label(&request.max_use, "Max-use is enforced before MLS admission");
         let expires_at = invite_expiration_horizon(&expires);
@@ -3013,7 +3033,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
         let signaling_endpoint = default_signaling_endpoint();
         let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
-        let signaling_metadata = InviteSignalingMetadata::new(
+        let mut signaling_metadata = InviteSignalingMetadata::new(
             signaling_endpoint.clone(),
             InviteEndpointPolicy::ProductionTls,
             InviteTrustMetadata::new(
@@ -3022,7 +3042,26 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             )
             .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
         )
+        .and_then(
+            |metadata| match signed_ice_endpoint_policy_from_connectivity(&connectivity) {
+                Some(policy) => metadata.with_ice_endpoint_policy(policy),
+                None => Ok(metadata),
+            },
+        )
         .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
+        if let Ok(ice_config) = ice_config_from_connectivity(&connectivity) {
+            if let Ok(ice_policy) = discrypt_transport::IceEndpointPolicy::new(
+                ice_config.stun_servers.clone(),
+                ice_config.turn_servers.clone(),
+            ) {
+                if let Ok(with_ice_policy) = signaling_metadata
+                    .clone()
+                    .with_ice_endpoint_policy(ice_policy)
+                {
+                    signaling_metadata = with_ice_policy;
+                }
+            }
+        }
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = invite_store
@@ -3169,6 +3208,19 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
                 return;
             }
         };
+        let _ice_endpoint_policy = match ice_endpoint_policy_from_connectivity(&connectivity) {
+            Ok(policy) => policy,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_dm_invite",
+                    "invite_ice_policy_invalid",
+                    error.to_string(),
+                    "Recreate the DM connectivity policy before issuing an invite",
+                );
+                return;
+            }
+        };
         let sequence = state.next_sequence;
         let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
         let max_use = normalize_label(&request.max_use, "Max-use is enforced before DM acceptance");
@@ -3179,7 +3231,7 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
         let room_secret = format!("dm-contact-secret:{}:{}:{}", dm.dm_id, invite_key, sequence);
         let signaling_endpoint = default_signaling_endpoint();
         let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
-        let signaling_metadata = InviteSignalingMetadata::new(
+        let mut signaling_metadata = InviteSignalingMetadata::new(
             signaling_endpoint.clone(),
             InviteEndpointPolicy::ProductionTls,
             InviteTrustMetadata::new(
@@ -3188,7 +3240,26 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
             )
             .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
         )
+        .and_then(
+            |metadata| match signed_ice_endpoint_policy_from_connectivity(&connectivity) {
+                Some(policy) => metadata.with_ice_endpoint_policy(policy),
+                None => Ok(metadata),
+            },
+        )
         .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
+        if let Ok(ice_config) = ice_config_from_connectivity(&connectivity) {
+            if let Ok(ice_policy) = discrypt_transport::IceEndpointPolicy::new(
+                ice_config.stun_servers.clone(),
+                ice_config.turn_servers.clone(),
+            ) {
+                if let Ok(with_ice_policy) = signaling_metadata
+                    .clone()
+                    .with_ice_endpoint_policy(ice_policy)
+                {
+                    signaling_metadata = with_ice_policy;
+                }
+            }
+        }
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = invite_store
@@ -4043,7 +4114,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: StartTextSessionRequest,
     ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || super::start_text_session(request))
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::start_text_session(request)
+        })
     }
 
     #[tauri::command]
@@ -4051,7 +4124,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: StopTextSessionRequest,
     ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || super::stop_text_session(request))
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::stop_text_session(request)
+        })
     }
 
     #[tauri::command]
@@ -4113,7 +4188,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: SavePreferencesRequest,
     ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || super::save_preferences(request))
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::save_preferences(request)
+        })
     }
 
     #[tauri::command]
@@ -4134,7 +4211,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: SetActiveGroupRequest,
     ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || super::set_active_group(request))
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::set_active_group(request)
+        })
     }
 
     #[tauri::command]
@@ -4176,7 +4255,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: CreateDmInviteRequest,
     ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || super::create_dm_invite(request))
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::create_dm_invite(request)
+        })
     }
 
     #[tauri::command]
@@ -4184,7 +4265,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: AcceptDmInviteRequest,
     ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || super::accept_dm_invite(request))
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::accept_dm_invite(request)
+        })
     }
 
     #[tauri::command]
@@ -4235,11 +4318,9 @@ mod ipc_commands {
         app_handle: tauri::AppHandle,
         request: ListPendingTextControlFramesRequest,
     ) -> TextControlTransportPumpReportView {
-        let previous_cursor = super::latest_app_event_cursor();
-        let report = super::pump_text_control_transport_once(request);
-        let state = super::app_state();
-        super::emit_app_event_stream(&app_handle, &state, previous_cursor);
-        report
+        super::run_command_with_event_emit(&app_handle, || {
+            super::pump_text_control_transport_once(request)
+        })
     }
 
     #[tauri::command]
@@ -6813,7 +6894,9 @@ impl PersistedAppState {
     fn apply_account_recovery(&mut self, recovery: &AccountRecovery) {
         if let Some(profile) = &mut self.profile {
             profile.recovery_status = format!(
-                "Account continuity restored with verified local identity material for {} room(s) and {} device(s); content keys restored: {}",
+                "Account continuity restored with verified local identity material for {} room(s) and {} device(s); rooms: {}; devices: {}; content keys restored: {}",
+                recovery.room_memberships.len(),
+                recovery.device_count,
                 recovery.room_memberships.len(),
                 recovery.device_count,
                 recovery.content_keys_restored
@@ -7950,6 +8033,13 @@ where
 fn ice_config_from_connectivity(
     connectivity: &ConnectivityPolicyView,
 ) -> Result<IceServerConfig, discrypt_transport::TransportError> {
+    let policy = ice_endpoint_policy_from_connectivity(connectivity)?;
+    IceServerConfig::new(policy.stun_servers, policy.turn_servers)
+}
+
+fn ice_endpoint_policy_from_connectivity(
+    connectivity: &ConnectivityPolicyView,
+) -> Result<IceEndpointPolicy, discrypt_transport::TransportError> {
     let stun_servers = connectivity
         .ice_stun_servers
         .iter()
@@ -7959,9 +8049,22 @@ fn ice_config_from_connectivity(
     let mut turn_servers = connectivity
         .ice_turn_servers
         .iter()
-        .filter(|server| !server.credential_declared)
         .map(|server| {
-            TurnServerConfig::new(Endpoint::new(server.endpoint.clone()), None, None, None)
+            let (username, credential, credential_expires_at) = if server.credential_declared {
+                (
+                    Some("redacted-turn-username".to_owned()),
+                    Some("redacted-turn-credential".to_owned()),
+                    server.credential_expires_at.clone(),
+                )
+            } else {
+                (None, None, None)
+            };
+            TurnServerConfig::new(
+                Endpoint::new(server.endpoint.clone()),
+                username,
+                credential,
+                credential_expires_at,
+            )
         })
         .collect::<Vec<_>>();
     if let Ok(endpoint) = std::env::var("DISCRYPT_PUBLIC_TURN_ENDPOINT") {
@@ -7975,7 +8078,7 @@ fn ice_config_from_connectivity(
             ));
         }
     }
-    IceServerConfig::new(stun_servers, turn_servers)
+    IceEndpointPolicy::new(stun_servers, turn_servers)
 }
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> Option<String> {
@@ -8249,6 +8352,25 @@ fn dm_connectivity_policy(dm_id: &str, participant_id: &str) -> ConnectivityPoli
         }),
         group_bootstrap: None,
     }
+}
+
+fn signed_ice_endpoint_policy_from_connectivity(
+    connectivity: &ConnectivityPolicyView,
+) -> Option<IceEndpointPolicy> {
+    let stun_servers = connectivity
+        .ice_stun_servers
+        .iter()
+        .map(|endpoint| Endpoint::new(endpoint.clone()))
+        .collect::<Vec<_>>();
+    let turn_servers = connectivity
+        .ice_turn_servers
+        .iter()
+        .filter(|server| !server.credential_declared && server.credential_expires_at.is_none())
+        .map(|server| {
+            TurnServerConfig::new(Endpoint::new(server.endpoint.clone()), None, None, None)
+        })
+        .collect::<Vec<_>>();
+    IceEndpointPolicy::new(stun_servers, turn_servers).ok()
 }
 
 fn profile_to_admission(profile: &SignalingProfileView) -> InviteSignalingProfile {
@@ -9123,6 +9245,22 @@ mod tests {
             AppLifecycle::Ready,
             "alice profile should reach ready state"
         );
+        let alice_user_id = alice_user
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "alice profile id should persist".to_owned())?;
+        let alice_device_key = alice_user
+            .devices
+            .first()
+            .map(|device| device.device_key.clone())
+            .ok_or_else(|| "alice device key should persist".to_owned())?;
+        let themed = save_preferences(SavePreferencesRequest {
+            theme_id: "ocean-contrast".to_owned(),
+            template_id: "compact-ops".to_owned(),
+        });
+        assert_eq!(themed.preferences.theme_id, "ocean-contrast");
+        assert_eq!(themed.preferences.template_id, "compact-ops");
 
         let dm_state = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
@@ -9142,10 +9280,17 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "stun:stun.cloudflare.com:3478".to_owned(),
+            ]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.invalid:5349".to_owned(),
+                credential_declared: false,
+                credential_expires_at: None,
+            }]),
         });
         let group = group_state
             .groups
@@ -9153,12 +9298,84 @@ mod tests {
             .cloned()
             .ok_or_else(|| "alice should have a created group".to_owned())?;
         let group_id = group.group_id.clone();
+        let group_connectivity = group
+            .connectivity
+            .clone()
+            .ok_or_else(|| "group connectivity should persist".to_owned())?;
+        assert_eq!(
+            group_connectivity.signaling_profiles[0].adapter_kind,
+            "mqtt"
+        );
+        assert_eq!(
+            group_connectivity.ice_stun_servers,
+            vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "stun:stun.cloudflare.com:3478".to_owned(),
+            ]
+        );
+        assert_eq!(group_connectivity.ice_turn_servers.len(), 1);
         let group_channel_id = group
             .channels
             .iter()
             .find(|channel| channel.kind == ChannelKind::Text)
             .map(|channel| channel.channel_id.clone())
             .ok_or_else(|| "group should include a text channel".to_owned())?;
+        let voice_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "group should include a voice channel".to_owned())?;
+        let voice_joined = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: voice_channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-alice".to_owned()),
+            input_device_label: Some("Alice microphone".to_owned()),
+            output_device_id: Some("speaker-alice".to_owned()),
+            output_device_label: Some("Alice speaker".to_owned()),
+        });
+        let voice_session_id = voice_joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session should persist".to_owned())?;
+        let muted = set_self_mute(SetSelfMuteRequest {
+            session_id: voice_session_id.clone(),
+            muted: true,
+        });
+        assert!(muted
+            .voice_session
+            .as_ref()
+            .map(|session| session.self_muted)
+            .unwrap_or(false));
+        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: voice_session_id.clone(),
+            participant_id: alice_user_id.clone(),
+            volume: 55,
+        });
+        assert_eq!(
+            volume
+                .voice_session
+                .as_ref()
+                .and_then(|session| session
+                    .participants
+                    .iter()
+                    .find(|participant| participant.id == alice_user_id))
+                .map(|participant| participant.volume),
+            Some(55)
+        );
+        let focused_text = set_active_channel(SetActiveChannelRequest {
+            group_id: group_id.clone(),
+            channel_id: group_channel_id.clone(),
+        });
+        assert_eq!(
+            focused_text
+                .active_context
+                .as_ref()
+                .and_then(|context| context.channel_id.as_deref()),
+            Some(group_channel_id.as_str())
+        );
         let group_invite_state = create_invite(CreateInviteRequest {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
@@ -9187,8 +9404,7 @@ mod tests {
             invite_code: group_invite.code.clone(),
             group_name: Some("Private Lab".to_owned()),
         });
-        std::env::set_var("DISCRYPT_APP_STATE_PATH", &alice_path);
-        reset_app_state();
+        reload_global_app_service_from_path(&alice_path);
 
         let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
         assert!(bob_dm_state.last_command_error.is_none());
@@ -9198,11 +9414,50 @@ mod tests {
                 .as_ref()
                 .is_some_and(|policy| policy.scope_id_commitment == dm_invite.scope_id_commitment)
         }));
+        let bob_view_after_reload = TauriAppService::load_for_test_path(bob_path.clone())
+            .state
+            .to_view();
+        let bob_user_id = bob_view_after_reload
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "bob profile should reload".to_owned())?;
+        assert_ne!(alice_user_id, bob_user_id);
         assert!(bob
             .state
             .groups
             .iter()
             .any(|group| group.name == "Private Lab"));
+        let bob_group = bob_view_after_reload
+            .groups
+            .iter()
+            .find(|group| group.name == "Private Lab")
+            .ok_or_else(|| "bob group should reload".to_owned())?;
+        let bob_connectivity = bob_group
+            .connectivity
+            .as_ref()
+            .ok_or_else(|| "bob group connectivity should reload".to_owned())?;
+        assert_eq!(
+            bob_connectivity.scope_id_commitment,
+            group_invite.scope_id_commitment
+        );
+        assert_eq!(
+            bob_connectivity.signaling_profiles,
+            group_connectivity.signaling_profiles
+        );
+        assert_eq!(
+            bob_connectivity.ice_stun_servers,
+            group_connectivity.ice_stun_servers
+        );
+        assert_eq!(
+            bob_connectivity.ice_turn_servers,
+            group_connectivity.ice_turn_servers
+        );
+        assert!(bob_view_after_reload.invites.iter().any(|invite| {
+            invite.invite_key == group_invite.invite_key
+                && invite.uses == 1
+                && invite.max_use == group_invite.max_use
+        }));
 
         let target = MessageTargetView {
             kind: "channel".to_owned(),
@@ -9249,6 +9504,98 @@ mod tests {
         assert_eq!(message.state_key, "peer_receipt");
 
         let alice_view = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert_eq!(
+            alice_view
+                .profile
+                .as_ref()
+                .map(|profile| profile.user_id.as_str()),
+            Some(alice_user_id.as_str())
+        );
+        assert_eq!(
+            alice_view
+                .devices
+                .first()
+                .map(|device| device.device_key.as_str()),
+            Some(alice_device_key.as_str())
+        );
+        assert_eq!(alice_view.preferences.theme_id, "ocean-contrast");
+        assert_eq!(alice_view.preferences.template_id, "compact-ops");
+        assert!(alice_view.dms.iter().any(|dm| {
+            dm.dm_id == dm_id
+                && dm.connectivity.as_ref().is_some_and(|policy| {
+                    policy.scope_id_commitment == dm_invite.scope_id_commitment
+                        && policy.invite_kind == "dm_contact"
+                })
+        }));
+        let reloaded_group = alice_view
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "alice group missing after reload".to_owned())?;
+        assert_eq!(
+            reloaded_group.connectivity.as_ref(),
+            Some(&group_connectivity)
+        );
+        assert!(reloaded_group
+            .channels
+            .iter()
+            .any(|channel| channel.channel_id == group_channel_id
+                && channel.kind == ChannelKind::Text));
+        assert!(reloaded_group
+            .channels
+            .iter()
+            .any(|channel| channel.channel_id == voice_channel_id
+                && channel.kind == ChannelKind::Voice));
+        assert_eq!(
+            alice_view
+                .active_context
+                .as_ref()
+                .and_then(|context| context.channel_id.as_deref()),
+            Some(group_channel_id.as_str())
+        );
+        let reloaded_voice = alice_view
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "voice session missing after reload".to_owned())?;
+        assert_eq!(reloaded_voice.session_id, voice_session_id);
+        assert_eq!(reloaded_voice.channel_id, voice_channel_id);
+        assert!(reloaded_voice.joined);
+        assert!(reloaded_voice.self_muted);
+        assert_eq!(
+            reloaded_voice
+                .input_device
+                .as_ref()
+                .map(|device| device.device_id.as_str()),
+            Some("mic-alice")
+        );
+        assert_eq!(
+            reloaded_voice
+                .output_device
+                .as_ref()
+                .map(|device| device.device_id.as_str()),
+            Some("speaker-alice")
+        );
+        assert_eq!(
+            reloaded_voice
+                .participants
+                .iter()
+                .find(|participant| participant.id == alice_user_id)
+                .map(|participant| (participant.muted, participant.volume)),
+            Some((true, 55))
+        );
+        assert!(alice_view.invites.iter().any(|invite| {
+            invite.invite_key == dm_invite.invite_key
+                && invite.invite_kind == "dm_contact"
+                && invite.uses == 0
+                && !invite.revoked
+        }));
+        assert!(alice_view.invites.iter().any(|invite| {
+            invite.invite_key == group_invite.invite_key
+                && invite.invite_kind == "group_join"
+                && invite.signaling_profiles == group_connectivity.signaling_profiles
+                && invite.ice_stun_servers == group_connectivity.ice_stun_servers
+                && invite.ice_turn_servers == group_connectivity.ice_turn_servers
+        }));
         let persisted_message = alice_view
             .messages
             .iter()
@@ -9263,6 +9610,409 @@ mod tests {
         assert!(persisted_message.peer_receipt.is_some());
         assert_eq!(
             persisted_message
+                .peer_receipt
+                .as_ref()
+                .map(|receipt| receipt.recipient_key_fingerprint.as_str()),
+            Some(key_fingerprint(&bob_key).as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn g004_two_profile_persistent_state_reloads_full_invite_policy_surface() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("g004-full-surface-alice");
+
+        let alice_user = create_user(CreateUserRequest {
+            display_name: "Alice G004".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let alice_profile_id = alice_user
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "alice profile missing".to_owned())?;
+        assert_eq!(alice_user.lifecycle, AppLifecycle::Ready);
+        assert_eq!(alice_user.devices.len(), 1);
+
+        let alice_preferences = save_preferences(SavePreferencesRequest {
+            theme_id: "ocean-contrast".to_owned(),
+            template_id: "compact-ops".to_owned(),
+        });
+        assert_eq!(alice_preferences.preferences.theme_id, "ocean-contrast");
+
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob G004".to_owned(),
+        });
+        let dm = dm_state
+            .dms
+            .iter()
+            .find(|dm| dm.display_name == "Bob G004")
+            .cloned()
+            .ok_or_else(|| "alice DM missing".to_owned())?;
+        let dm_invite_state = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(dm.dm_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+        });
+        let dm_invite = dm_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.dm_id.as_deref() == Some(dm.dm_id.as_str()))
+            .cloned()
+            .ok_or_else(|| "DM invite missing".to_owned())?;
+
+        let group_state = create_group(CreateGroupRequest {
+            name: "G004 Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.example.invalid:8883".to_owned()),
+            ice_stun_servers: Some(vec![
+                "stun:stun.l.google.com:19302".to_owned(),
+                "stun:stun.cloudflare.com:3478".to_owned(),
+            ]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.invalid:5349".to_owned(),
+                credential_declared: false,
+                credential_expires_at: None,
+            }]),
+        });
+        let group = group_state
+            .groups
+            .iter()
+            .find(|group| group.name == "G004 Lab")
+            .cloned()
+            .ok_or_else(|| "alice group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let text_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "default text channel missing".to_owned())?;
+        let extra_channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "field-notes".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        assert!(extra_channel_state.groups.iter().any(|group| {
+            group.channels
+                .iter()
+                .any(|channel| channel.name == "#field-notes")
+        }));
+        let voice_channel_id = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        })
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .and_then(|group| {
+            group
+                .channels
+                .iter()
+                .find(|channel| channel.name == "Ops Voice")
+        })
+        .map(|channel| channel.channel_id.clone())
+        .ok_or_else(|| "voice channel missing".to_owned())?;
+
+        let group_invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+        });
+        let group_invite = group_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "group invite missing".to_owned())?;
+        let parsed_group_invite = parse_invite_metadata(&group_invite.code)
+            .ok_or_else(|| "signed G004 group invite descriptor should parse".to_owned())?;
+        assert_eq!(
+            parsed_group_invite.ice_stun_servers,
+            group
+                .connectivity
+                .as_ref()
+                .map_or_else(Vec::new, |policy| { policy.ice_stun_servers.clone() })
+        );
+        assert_eq!(
+            parsed_group_invite.ice_turn_servers,
+            group
+                .connectivity
+                .as_ref()
+                .map_or_else(Vec::new, |policy| { policy.ice_turn_servers.clone() })
+        );
+
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: Some(text_channel_id.clone()),
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "G004 persistent receipt".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent
+            .messages
+            .iter()
+            .find(|message| message.body == "G004 persistent receipt")
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "alice message missing".to_owned())?;
+        let envelope_record = load_state()
+            .text_delivery_envelopes
+            .into_iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "alice persisted envelope missing".to_owned())?;
+
+        let joined_voice = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: voice_channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("alice-mic".to_owned()),
+            input_device_label: Some("Alice microphone".to_owned()),
+            output_device_id: Some("alice-speaker".to_owned()),
+            output_device_label: Some("Alice speaker".to_owned()),
+        });
+        let voice_session_id = joined_voice
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "alice voice session missing".to_owned())?;
+        let muted_voice = set_self_mute(SetSelfMuteRequest {
+            session_id: voice_session_id.clone(),
+            muted: true,
+        });
+        assert!(muted_voice
+            .voice_session
+            .as_ref()
+            .map(|session| session.self_muted)
+            .unwrap_or(false));
+        let volume_voice = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: voice_session_id,
+            participant_id: alice_profile_id.clone(),
+            volume: 37,
+        });
+        assert_eq!(
+            volume_voice
+                .voice_session
+                .as_ref()
+                .and_then(|session| session.participants.first())
+                .map(|participant| participant.volume),
+            Some(37)
+        );
+        let focused_text_channel = set_active_channel(SetActiveChannelRequest {
+            group_id: group_id.clone(),
+            channel_id: text_channel_id.clone(),
+        });
+        assert_eq!(
+            focused_text_channel.active_context.as_ref().map(|context| (
+                context.kind.as_str(),
+                context.group_id.as_deref(),
+                context.channel_id.as_deref()
+            )),
+            Some((
+                "text_channel",
+                Some(group_id.as_str()),
+                Some(text_channel_id.as_str())
+            ))
+        );
+
+        let alice_reloaded_before_receipt =
+            load_state_from_store(&mut FileAppStore::new(&alice_path)).to_view();
+        assert_eq!(
+            alice_reloaded_before_receipt
+                .profile
+                .as_ref()
+                .map(|profile| profile.user_id.as_str()),
+            Some(alice_profile_id.as_str())
+        );
+        assert_eq!(
+            alice_reloaded_before_receipt.preferences,
+            UiPreferencesView {
+                theme_id: "ocean-contrast".to_owned(),
+                template_id: "compact-ops".to_owned(),
+            }
+        );
+        let reloaded_group = alice_reloaded_before_receipt
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "alice reloaded group missing".to_owned())?;
+        let reloaded_connectivity = reloaded_group
+            .connectivity
+            .as_ref()
+            .ok_or_else(|| "alice reloaded group connectivity missing".to_owned())?;
+        assert_eq!(reloaded_connectivity.signaling_profiles[0].adapter_kind, "mqtt");
+        assert_eq!(reloaded_connectivity.ice_stun_servers.len(), 2);
+        assert_eq!(reloaded_connectivity.ice_turn_servers.len(), 1);
+        assert!(reloaded_group
+            .channels
+            .iter()
+            .any(|channel| channel.name == "#field-notes"));
+        assert!(reloaded_group
+            .channels
+            .iter()
+            .any(|channel| channel.channel_id == voice_channel_id));
+        assert_eq!(
+            alice_reloaded_before_receipt
+                .voice_session
+                .as_ref()
+                .map(|session| (
+                    session.self_muted,
+                    session.input_device.as_ref().map(|device| device.device_id.as_str()),
+                    session.output_device.as_ref().map(|device| device.device_id.as_str()),
+                    session.participants.first().map(|participant| participant.volume)
+                )),
+            Some((true, Some("alice-mic"), Some("alice-speaker"), Some(37)))
+        );
+        assert_eq!(
+            alice_reloaded_before_receipt
+                .active_context
+                .as_ref()
+                .map(|context| (
+                    context.kind.as_str(),
+                    context.group_id.as_deref(),
+                    context.channel_id.as_deref()
+                )),
+            Some((
+                "text_channel",
+                Some(group_id.as_str()),
+                Some(text_channel_id.as_str())
+            ))
+        );
+        assert!(alice_reloaded_before_receipt.invites.iter().any(|invite| {
+            invite.invite_kind == "dm_contact"
+                && invite.max_use == "2"
+                && invite.scope_id_commitment == dm_invite.scope_id_commitment
+        }));
+        assert!(alice_reloaded_before_receipt.invites.iter().any(|invite| {
+            invite.invite_kind == "group_join"
+                && invite.max_use == "2"
+                && invite.scope_id_commitment == group_invite.scope_id_commitment
+                && invite.ice_turn_servers.len() == 1
+        }));
+
+        let bob_path = reset_with_temp_state("g004-full-surface-bob");
+        let bob_user = recover_user(RecoverUserRequest {
+            display_name: "Bob G004".to_owned(),
+            recovery_code: "g004-paper-coral-falcon".to_owned(),
+            device_name: Some("Bob recovered laptop".to_owned()),
+            recovery_room_memberships: vec!["G004 Lab".to_owned()],
+            recovered_device_count: Some(1),
+            use_sealed_account_backup: false,
+        });
+        let bob_profile_id = bob_user
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "bob profile missing".to_owned())?;
+        assert_ne!(alice_profile_id, bob_profile_id);
+        assert!(bob_user
+            .profile
+            .as_ref()
+            .map(|profile| profile.recovery_status.contains("rooms: 1"))
+            .unwrap_or(false));
+        save_preferences(SavePreferencesRequest {
+            theme_id: "midnight-steel".to_owned(),
+            template_id: "command-center".to_owned(),
+        });
+        let accepted_dm = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code: dm_invite.code.clone(),
+            display_name: Some("Alice G004".to_owned()),
+        });
+        assert!(accepted_dm.last_command_error.is_none(), "{accepted_dm:?}");
+        let joined_group = join_group(JoinGroupRequest {
+            invite_code: group_invite.code.clone(),
+            group_name: Some("G004 Lab".to_owned()),
+        });
+        assert!(joined_group.last_command_error.is_none(), "{joined_group:?}");
+        let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target: target.clone(),
+            envelope: envelope_record.envelope.clone(),
+            sender_verifying_key_hex: envelope_record.sender_verifying_key_hex.clone(),
+            recipient_leaf: Some(2),
+        });
+        let receipt = receipt_response
+            .receipt
+            .ok_or_else(|| "bob receipt missing".to_owned())?;
+        let recipient_verifying_key_hex = receipt_response
+            .recipient_verifying_key_hex
+            .ok_or_else(|| "bob receipt key missing".to_owned())?;
+
+        let bob_reloaded = load_state_from_store(&mut FileAppStore::new(&bob_path)).to_view();
+        assert_eq!(
+            bob_reloaded
+                .profile
+                .as_ref()
+                .map(|profile| profile.user_id.as_str()),
+            Some(bob_profile_id.as_str())
+        );
+        assert_eq!(bob_reloaded.preferences.theme_id, "midnight-steel");
+        assert!(bob_reloaded.active_context.as_ref().is_some_and(|context| {
+            context.kind == "group"
+                && context.group_id.as_deref().is_some_and(|active_group_id| {
+                    bob_reloaded
+                        .groups
+                        .iter()
+                        .any(|group| group.name == "G004 Lab" && group.group_id == active_group_id)
+                })
+        }));
+        assert!(bob_reloaded.dms.iter().any(|dm| {
+            dm.display_name == "Alice G004"
+                && dm
+                    .connectivity
+                    .as_ref()
+                    .is_some_and(|policy| policy.scope_id_commitment == dm_invite.scope_id_commitment)
+        }));
+        assert!(bob_reloaded.groups.iter().any(|group| {
+            group.name == "G004 Lab"
+                && group.role == "member"
+                && group
+                    .connectivity
+                    .as_ref()
+                    .is_some_and(|policy| {
+                        policy.scope_id_commitment == group_invite.scope_id_commitment
+                            && policy.ice_stun_servers == group_invite.ice_stun_servers
+                            && policy.ice_turn_servers == group_invite.ice_turn_servers
+                    })
+        }));
+        assert!(bob_reloaded.invites.iter().any(|invite| {
+            invite.invite_kind == "dm_contact" && invite.uses == 1 && !invite.revoked
+        }));
+        assert!(bob_reloaded.invites.iter().any(|invite| {
+            invite.invite_kind == "group_join" && invite.uses == 1 && !invite.revoked
+        }));
+        assert!(bob_reloaded.messages.iter().any(|message| {
+            message.message_id == message_id && message.state_key == "received_envelope"
+        }));
+
+        reload_global_app_service_from_path(&alice_path);
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: recipient_verifying_key_hex.clone(),
+        });
+        assert!(receipted.last_command_error.is_none(), "{receipted:?}");
+        let alice_reloaded_after_receipt =
+            load_state_from_store(&mut FileAppStore::new(&alice_path)).to_view();
+        let reloaded_message = alice_reloaded_after_receipt
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "alice receipted message missing after reload".to_owned())?;
+        let bob_key = verifying_key_from_hex(&recipient_verifying_key_hex)
+            .ok_or_else(|| "bob receipt key should decode".to_owned())?;
+        assert_eq!(reloaded_message.state_key, "peer_receipt");
+        assert_eq!(
+            reloaded_message
                 .peer_receipt
                 .as_ref()
                 .map(|receipt| receipt.recipient_key_fingerprint.as_str()),
@@ -11994,6 +12744,425 @@ mod tests {
     }
 
     #[test]
+    fn g004_two_profile_state_survives_reload_with_invites_receipts_voice_and_preferences(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("g004-persistent-state-alice");
+        let alice_created = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        assert!(
+            alice_created.last_command_error.is_none(),
+            "{alice_created:?}"
+        );
+        let alice_identity_key = alice_created
+            .devices
+            .iter()
+            .find(|device| device.local)
+            .map(|device| device.identity_key.clone())
+            .ok_or_else(|| "Alice local identity key missing".to_owned())?;
+        assert!(snapshot_safety_number_matches_identity_keys(
+            &alice_created.snapshot
+        ));
+
+        let alice_preferences = save_preferences(SavePreferencesRequest {
+            theme_id: "ocean-contrast".to_owned(),
+            template_id: "compact-ops".to_owned(),
+        });
+        assert!(alice_preferences.last_command_error.is_none());
+
+        let dm = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let alice_dm_id = dm
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .ok_or_else(|| "Alice active DM missing".to_owned())?;
+        let dm_invite = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(alice_dm_id),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(dm_invite.last_command_error.is_none(), "{dm_invite:?}");
+        let dm_invite_code = dm_invite
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "DM invite code missing".to_owned())?;
+
+        let group = create_group(CreateGroupRequest {
+            name: "G004 Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.example.test:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.test:3478".to_owned()]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.test:5349".to_owned(),
+                credential_declared: false,
+                credential_expires_at: None,
+            }]),
+        });
+        assert!(group.last_command_error.is_none(), "{group:?}");
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group id missing".to_owned())?;
+        let group_connectivity = group
+            .groups
+            .first()
+            .and_then(|group| group.connectivity.clone())
+            .ok_or_else(|| "group connectivity missing".to_owned())?;
+        assert_eq!(
+            group_connectivity.ice_stun_servers,
+            vec!["stun:stun.example.test:3478".to_owned()]
+        );
+        assert_eq!(
+            group_connectivity.ice_turn_servers[0].endpoint,
+            "turns:turn.example.test:5349"
+        );
+
+        let text_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "ops".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        assert!(
+            text_channel.last_command_error.is_none(),
+            "{text_channel:?}"
+        );
+        let text_channel_id = text_channel
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Text && channel.name == "#ops")
+            })
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel id missing".to_owned())?;
+        let voice_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        assert!(
+            voice_channel.last_command_error.is_none(),
+            "{voice_channel:?}"
+        );
+        let voice_channel_id = voice_channel
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group.channels.iter().find(|channel| {
+                    channel.kind == ChannelKind::Voice && channel.name == "Ops Voice"
+                })
+            })
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel id missing".to_owned())?;
+
+        let group_invite = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "2 days".to_owned(),
+            max_use: "2 uses".to_owned(),
+        });
+        assert!(
+            group_invite.last_command_error.is_none(),
+            "{group_invite:?}"
+        );
+        let group_invite_row = group_invite
+            .invites
+            .last()
+            .cloned()
+            .ok_or_else(|| "group invite missing".to_owned())?;
+        assert_eq!(
+            group_invite_row.invite_kind,
+            InviteKind::GroupJoin.canonical_name()
+        );
+        assert_eq!(
+            group_invite_row.ice_stun_servers,
+            group_connectivity.ice_stun_servers
+        );
+        assert_eq!(
+            group_invite_row.ice_turn_servers,
+            group_connectivity.ice_turn_servers
+        );
+        assert!(!group_invite_row.revoked);
+        let group_invite_code = group_invite_row.code.clone();
+
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id.clone()),
+                channel_id: Some(text_channel_id.clone()),
+            },
+            body: "G004 reload receipt proof".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(sent.last_command_error.is_none(), "{sent:?}");
+        let message_id = sent
+            .messages
+            .last()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "message id missing".to_owned())?;
+        let persisted_after_send = load_state();
+        let envelope = persisted_after_send
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "persisted envelope missing".to_owned())?;
+        let recipient_signer = SigningKey::generate(&mut OsRng);
+        let receipt = TextDeliveryReceipt::sign(
+            &envelope.group_id,
+            TextDeliveryReceiptInput {
+                message_id: message_id.clone(),
+                recipient_leaf: 2,
+                recipient_device_id: "bob-laptop".to_owned(),
+                received_at_ms: 42_000,
+                envelope_ciphertext_hash: envelope.envelope.ciphertext_hash(),
+            },
+            &recipient_signer,
+        )
+        .map_err(|error| error.to_string())?;
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: hex::encode(recipient_signer.verifying_key().as_bytes()),
+        });
+        assert!(receipted.last_command_error.is_none(), "{receipted:?}");
+        assert_eq!(
+            receipted
+                .messages
+                .iter()
+                .find(|message| message.message_id == message_id)
+                .map(|message| message.state_key.as_str()),
+            Some("peer_receipt")
+        );
+
+        let voice_joined = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: voice_channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-alice".to_owned()),
+            input_device_label: Some("Alice microphone".to_owned()),
+            output_device_id: Some("speaker-alice".to_owned()),
+            output_device_label: Some("Alice speaker".to_owned()),
+        });
+        assert!(
+            voice_joined.last_command_error.is_none(),
+            "{voice_joined:?}"
+        );
+        let session_id = voice_joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session id missing".to_owned())?;
+        let muted = set_self_mute(SetSelfMuteRequest {
+            session_id: session_id.clone(),
+            muted: true,
+        });
+        assert!(muted.last_command_error.is_none(), "{muted:?}");
+        let local_participant_id = muted
+            .voice_session
+            .as_ref()
+            .and_then(|session| session.participants.first())
+            .map(|participant| participant.id.clone())
+            .ok_or_else(|| "voice participant id missing".to_owned())?;
+        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id,
+            participant_id: local_participant_id,
+            volume: 37,
+        });
+        assert!(volume.last_command_error.is_none(), "{volume:?}");
+
+        reload_global_app_service_from_path(&alice_path);
+        let alice_reloaded = app_state();
+        assert_eq!(alice_reloaded.lifecycle, AppLifecycle::Ready);
+        assert_eq!(alice_reloaded.preferences.theme_id, "ocean-contrast");
+        assert_eq!(alice_reloaded.preferences.template_id, "compact-ops");
+        assert_eq!(
+            alice_reloaded
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .and_then(|group| group.connectivity.as_ref())
+                .map(|connectivity| connectivity.ice_turn_servers.clone()),
+            Some(group_connectivity.ice_turn_servers.clone())
+        );
+        assert!(alice_reloaded
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .is_some_and(|group| {
+                group.role == "owner"
+                    && group
+                        .channels
+                        .iter()
+                        .any(|channel| channel.channel_id == text_channel_id)
+                    && group
+                        .channels
+                        .iter()
+                        .any(|channel| channel.channel_id == voice_channel_id)
+            }));
+        assert!(alice_reloaded
+            .dms
+            .iter()
+            .any(|dm| dm.display_name == "Bob" && !dm.runtime_peers.is_empty()));
+        assert!(alice_reloaded
+            .invites
+            .iter()
+            .any(|invite| invite.invite_kind == InviteKind::DmContact.canonical_name()));
+        assert!(alice_reloaded
+            .invites
+            .iter()
+            .any(
+                |invite| invite.invite_kind == InviteKind::GroupJoin.canonical_name()
+                    && invite.max_use == "2 uses"
+                    && !invite.revoked
+            ));
+        let reloaded_message = alice_reloaded
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "reloaded message missing".to_owned())?;
+        assert_eq!(reloaded_message.state_key, "peer_receipt");
+        assert!(reloaded_message.peer_receipt.is_some());
+        let reloaded_voice = alice_reloaded
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "reloaded voice session missing".to_owned())?;
+        assert!(reloaded_voice.joined);
+        assert!(reloaded_voice.self_muted);
+        assert_eq!(
+            reloaded_voice
+                .input_device
+                .as_ref()
+                .map(|device| device.device_id.as_str()),
+            Some("mic-alice")
+        );
+        assert_eq!(
+            reloaded_voice
+                .output_device
+                .as_ref()
+                .map(|device| device.device_id.as_str()),
+            Some("speaker-alice")
+        );
+        assert!(reloaded_voice
+            .participants
+            .iter()
+            .any(|participant| participant.muted && participant.volume == 37));
+        assert_eq!(
+            alice_reloaded
+                .active_context
+                .as_ref()
+                .and_then(|context| context.channel_id.as_deref()),
+            Some(voice_channel_id.as_str())
+        );
+
+        let bob_path = reset_with_temp_state("g004-persistent-state-bob");
+        let bob_recovered = recover_user(RecoverUserRequest {
+            display_name: "Bob".to_owned(),
+            recovery_code: "paper-coral-falcon".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+            recovery_room_memberships: vec!["Recovered Bob Room".to_owned()],
+            recovered_device_count: Some(2),
+            use_sealed_account_backup: false,
+        });
+        assert!(
+            bob_recovered.last_command_error.is_none(),
+            "{bob_recovered:?}"
+        );
+        assert!(bob_recovered.profile.as_ref().is_some_and(|profile| profile
+            .recovery_status
+            .contains("content keys restored: false")));
+        let bob_identity_key = bob_recovered
+            .devices
+            .iter()
+            .find(|device| device.local)
+            .map(|device| device.identity_key.clone())
+            .ok_or_else(|| "Bob local identity key missing".to_owned())?;
+        assert_ne!(
+            alice_identity_key, bob_identity_key,
+            "G004 requires two independent users, not a shared local profile"
+        );
+
+        let bob_dm = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code: dm_invite_code,
+            display_name: Some("Alice".to_owned()),
+        });
+        assert!(bob_dm.last_command_error.is_none(), "{bob_dm:?}");
+        let bob_group = join_group(JoinGroupRequest {
+            invite_code: group_invite_code,
+            group_name: Some("G004 Lab".to_owned()),
+        });
+        assert!(bob_group.last_command_error.is_none(), "{bob_group:?}");
+        save_preferences(SavePreferencesRequest {
+            theme_id: "midnight-steel".to_owned(),
+            template_id: "command-center".to_owned(),
+        });
+        reload_global_app_service_from_path(&bob_path);
+        let bob_reloaded = app_state();
+        assert_eq!(bob_reloaded.lifecycle, AppLifecycle::Ready);
+        assert_eq!(bob_reloaded.preferences.theme_id, "midnight-steel");
+        assert!(bob_reloaded
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.display_name == "Bob"
+                && profile
+                    .recovery_status
+                    .contains("content keys restored: false")));
+        assert!(bob_reloaded.devices.len() >= 2);
+        assert!(bob_reloaded.dms.iter().any(|dm| dm.display_name == "Alice"
+            && dm
+                .connectivity
+                .as_ref()
+                .is_some_and(|connectivity| connectivity.invite_kind
+                    == InviteKind::DmContact.canonical_name())));
+        assert!(
+            bob_reloaded
+                .groups
+                .iter()
+                .any(|group| group.name == "G004 Lab"
+                    && group.role == "member"
+                    && group
+                        .connectivity
+                        .as_ref()
+                        .is_some_and(|connectivity| connectivity.ice_stun_servers
+                            == vec!["stun:stun.example.test:3478".to_owned()]
+                            && connectivity.ice_turn_servers
+                                == group_connectivity.ice_turn_servers)),
+            "Bob groups after reload: {:?}; expected TURN {:?}",
+            bob_reloaded.groups,
+            group_connectivity.ice_turn_servers
+        );
+        assert!(bob_reloaded.invites.iter().any(|invite| invite.uses == 1
+            && invite.invite_kind == InviteKind::GroupJoin.canonical_name()
+            && invite.ice_turn_servers == group_connectivity.ice_turn_servers));
+
+        reload_global_app_service_from_path(&alice_path);
+        let alice_final = app_state();
+        assert_eq!(alice_final.preferences.theme_id, "ocean-contrast");
+        assert_eq!(alice_final.devices[0].identity_key, alice_identity_key);
+        assert!(
+            alice_final
+                .messages
+                .iter()
+                .any(|message| message.message_id == message_id
+                    && message.state_key == "peer_receipt")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn text_control_runtime_clears_when_text_session_stops() {
         let _guard = test_lock();
         reset_with_temp_state("text-control-runtime-clears-on-stop");
@@ -14265,8 +15434,8 @@ mod tests {
     }
 
     #[test]
-    fn voice_mutations_prepare_tauri_push_event_payloads_from_persisted_cursor()
-    -> Result<(), String> {
+    fn voice_mutations_prepare_tauri_push_event_payloads_from_persisted_cursor(
+    ) -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("voice-push-events");
         create_user(CreateUserRequest {
@@ -14337,9 +15506,7 @@ mod tests {
                 panic!("missing Tauri command wrapper for {command}");
             });
             let rest = &source[start..];
-            let end = rest
-                .find("\n    #[tauri::command]")
-                .unwrap_or(rest.len());
+            let end = rest.find("\n    #[tauri::command]").unwrap_or(rest.len());
             &rest[..end]
         }
 
@@ -14366,7 +15533,6 @@ mod tests {
             "send_message",
             "apply_text_delivery_receipt",
             "mark_text_control_frame_sent",
-            "pump_text_control_transport_once",
             "join_voice",
             "leave_voice",
             "set_self_mute",
@@ -14389,6 +15555,7 @@ mod tests {
             );
             assert!(
                 wrapper.contains("run_app_state_command_with_event_emit")
+                    || wrapper.contains("run_command_with_event_emit")
                     || wrapper.contains("emit_app_event_stream"),
                 "{command} wrapper must emit an app_event stream after mutation"
             );
