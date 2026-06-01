@@ -21,6 +21,8 @@ const screenshotDir = resolve(artifactRoot, "screenshots");
 for (const dir of [artifactRoot, logDir, profileDir, screenshotDir]) mkdirSync(dir, { recursive: true });
 
 const durationMs = Number(valueAfter("--duration-ms") ?? process.env.DISCRYPT_G012_LAUNCH_DURATION_MS ?? 20_000);
+const launchReadyTimeoutMs = Number(valueAfter("--launch-ready-timeout-ms") ?? process.env.DISCRYPT_G012_LAUNCH_READY_TIMEOUT_MS ?? 120_000);
+const skipBuildPreflight = argv.includes("--skip-build-preflight") || process.env.DISCRYPT_G012_SKIP_BUILD_PREFLIGHT === "1";
 const viteUrl = process.env.DISCRYPT_G012_VITE_URL ?? "http://127.0.0.1:1420";
 const tauriFeatures = (process.env.DISCRYPT_G012_TAURI_FEATURES || "tauri-runtime,local-dev")
   .split(",")
@@ -97,6 +99,10 @@ function rel(path) {
 
 function render(command) {
   return [command.command, ...command.args].join(" ");
+}
+
+function stripAnsi(text) {
+  return text.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
 }
 
 function sha256IfExists(path) {
@@ -190,6 +196,8 @@ function preflightChecks() {
     cargo_tauri_cli: commandExists("cargo") ? spawnSync("cargo", ["tauri", "--version"], { cwd: resolve(repoRoot, "apps/desktop/src-tauri"), encoding: "utf8" }) : { status: 127, stdout: "", stderr: "cargo missing" },
     node_modules_present: existsSync(resolve(repoRoot, "apps/ui/node_modules")),
     screenshot_capability: ["gnome-screenshot", "import", "scrot", "xwd"].find(commandExists) ?? null,
+    build_preflight_enabled: !skipBuildPreflight,
+    launch_ready_timeout_ms: launchReadyTimeoutMs,
   };
   checks.cargo_tauri_cli = {
     status: checks.cargo_tauri_cli.status,
@@ -212,6 +220,7 @@ function spawnLogged(label, command, args, options) {
     cwd: options.cwd,
     env: { ...process.env, ...options.env },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
   child.stdout.on("data", (chunk) => appendFileSync(options.logPath, chunk));
   child.stderr.on("data", (chunk) => appendFileSync(options.logPath, chunk));
@@ -262,7 +271,63 @@ function captureScreenshot(label) {
   };
 }
 
-function summarize(children, screenshots) {
+async function terminateProcess(entry, signal) {
+  if (entry.child.exitCode !== null || entry.child.signalCode !== null) return;
+  try {
+    if (process.platform === "win32") entry.child.kill(signal);
+    else process.kill(-entry.child.pid, signal);
+  } catch {
+    try {
+      entry.child.kill(signal);
+    } catch {
+      // Process may already have exited.
+    }
+  }
+}
+
+async function terminateChildren(children) {
+  for (const entry of [...children].reverse()) await terminateProcess(entry, "SIGTERM");
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1_500));
+  for (const entry of [...children].reverse()) await terminateProcess(entry, "SIGKILL");
+  await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+}
+
+async function runBuildPreflight() {
+  if (skipBuildPreflight) return { status: "skipped", reason: "--skip-build-preflight or DISCRYPT_G012_SKIP_BUILD_PREFLIGHT=1" };
+  const build = {
+    command: "cargo",
+    args: ["build", "-p", "discrypt-desktop", "--features", tauriFeatureArg],
+    cwd: repoRoot,
+  };
+  const buildLog = resolve(logDir, "tauri-build-preflight.log");
+  const result = spawnSync(build.command, build.args, { cwd: build.cwd, encoding: "utf8", env: process.env, maxBuffer: 1024 * 1024 * 128 });
+  writeFileSync(buildLog, `${result.stdout || ""}\n${result.stderr || ""}`);
+  const status = { ...build, status: result.status === 0 ? "passed" : "failed", exit_status: result.status, log_path: rel(buildLog), sha256: sha256IfExists(buildLog) };
+  manifest.preflight.build = status;
+  writeManifest(result.status === 0 ? "build-preflight-passed" : "failed", { preflight: manifest.preflight });
+  if (result.status !== 0) throw new Error(`Tauri build preflight failed: ${rel(buildLog)}`);
+  return status;
+}
+
+async function waitForLogPattern(path, pattern, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = "";
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      latest = readFileSync(path, "utf8");
+      const normalized = stripAnsi(latest);
+      if (pattern.test(normalized)) return { label, status: "ready", pattern: String(pattern), log_path: rel(path) };
+      if (/exited_at=.*code=(?!null)|error while running discrypt Tauri application|panicked at/i.test(normalized)) {
+        throw new Error(`${label} exited or failed before launch readiness; see ${rel(path)}`);
+      }
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  const tail = latest.split(/\r?\n/).slice(-20).join("\n");
+  throw new Error(`${label} did not reach Tauri binary launch readiness within ${timeoutMs}ms; see ${rel(path)}; tail=${stripAnsi(tail)}`);
+}
+
+function summarize(children, screenshots, launchReadiness) {
   const logs = Object.fromEntries(
     Object.entries(profiles).map(([name, profile]) => [name, { path: rel(profile.log_path), sha256: sha256IfExists(profile.log_path) }]),
   );
@@ -277,6 +342,7 @@ function summarize(children, screenshots) {
     profile_state_files: Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { path: rel(profile.state_path), exists: existsSync(profile.state_path), sha256: sha256IfExists(profile.state_path) }])),
     logs,
     screenshots,
+    launch_readiness: launchReadiness,
     processes: children.map((entry) => ({ label: entry.label, pid: entry.child.pid, exitCode: entry.child.exitCode, signalCode: entry.child.signalCode })),
     next_g012_steps: [
       "Drive setup/recovery UX inside both launched Tauri windows.",
@@ -302,14 +368,7 @@ if (!preflight.ok) {
 
 const children = [];
 try {
-  if (appMode === "build") {
-    const preflightBuild = tauriCommandFor(profiles.alice).preflight;
-    const result = spawnSync(preflightBuild.command, preflightBuild.args, { cwd: preflightBuild.cwd, encoding: "utf8", env: process.env, maxBuffer: 1024 * 1024 * 64 });
-    const buildLog = resolve(logDir, "tauri-build-preflight.log");
-    writeFileSync(buildLog, `${result.stdout || ""}\n${result.stderr || ""}`);
-    manifest.preflight.build = { ...preflightBuild, status: result.status, log_path: rel(buildLog), sha256: sha256IfExists(buildLog) };
-    if (result.status !== 0) throw new Error(`Tauri build preflight failed: ${rel(buildLog)}`);
-  }
+  await runBuildPreflight();
 
   if (!noVite) {
     children.push({ label: "shared vite dev server", child: spawnLogged("shared vite dev server", "npm", ["run", "dev", "--", "--host", "127.0.0.1", "--port", "1420", "--strictPort"], { cwd: resolve(repoRoot, "apps/ui"), env: {}, logPath: manifest.shared_frontend.log_path }) });
@@ -320,25 +379,22 @@ try {
     const command = tauriCommandFor(profile);
     children.push({ label: `tauri ${profile.name}`, child: spawnLogged(`tauri ${profile.name}`, command.command, command.args, { cwd: command.cwd, env: command.env, logPath: profile.log_path }) });
   }
+  const launchReadiness = [];
+  for (const profile of Object.values(profiles)) {
+    launchReadiness.push(await waitForLogPattern(profile.log_path, /Running .*discrypt-desktop|Finished .*dev.*profile/i, launchReadyTimeoutMs, `tauri ${profile.name}`));
+  }
+  writeManifest("launch-ready", { launch_readiness: launchReadiness });
   await new Promise((resolveWait) => setTimeout(resolveWait, Math.max(2_000, Math.floor(durationMs / 2))));
   const screenshots = [captureScreenshot("two-profile-launch-midrun")];
   await new Promise((resolveWait) => setTimeout(resolveWait, Math.max(0, durationMs - Math.max(2_000, Math.floor(durationMs / 2)))));
   screenshots.push(captureScreenshot("two-profile-launch-before-stop"));
 
-  for (const entry of [...children].reverse()) {
-    if (entry.child.exitCode === null) entry.child.kill("SIGTERM");
-  }
-  await new Promise((resolveWait) => setTimeout(resolveWait, 1_500));
-  for (const entry of children) {
-    if (entry.child.exitCode === null) entry.child.kill("SIGKILL");
-  }
-  const summary = summarize(children, screenshots);
+  await terminateChildren(children);
+  const summary = summarize(children, screenshots, launchReadiness);
   writeManifest("passed", { summary: rel(summaryPath) });
   console.log(`G012 Tauri two-profile launch artifact: ${summary.artifact_root}`);
 } catch (error) {
-  for (const entry of [...children].reverse()) {
-    if (entry.child.exitCode === null) entry.child.kill("SIGTERM");
-  }
+  await terminateChildren(children);
   const message = error instanceof Error ? error.message : String(error);
   writeManifest("failed", { error: message });
   console.error(`g012-tauri-two-profile-e2e: ${message}`);
