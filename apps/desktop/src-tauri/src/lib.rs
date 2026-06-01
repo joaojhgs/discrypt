@@ -1969,7 +1969,6 @@ struct OpenMlsAdmissionKeyPackage {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
     owner_signer_public_key_hex: String,
@@ -2226,6 +2225,7 @@ impl TauriAppService {
                 redacted_observable_ref("group", group_id)
             ),
         );
+        self.persist();
         Ok(OpenMlsAdmissionKeyPackage {
             group_id: group_id.to_owned(),
             member_identity,
@@ -2322,16 +2322,13 @@ impl TauriAppService {
                 "OpenMLS joined confirmation tag did not match owner Welcome state".to_owned(),
             );
         }
-        let openmls_store_path = self.openmls_store_path().display().to_string();
         upsert_openmls_group_handle(
             &mut self.state,
             OpenMlsGroupHandleRecord {
                 group_id: welcome.group_id.clone(),
                 signer_public_key_hex: welcome.member_signer_public_key_hex.clone(),
                 epoch: snapshot.epoch,
-                local_leaf: 1,
                 confirmation_tag_sha256,
-                openmls_store_path: Some(openmls_store_path),
                 status_copy:
                     "OpenMLS member joined from an authorized Welcome and persisted signer handle"
                         .to_owned(),
@@ -13999,6 +13996,129 @@ mod tests {
                 dm_id: None,
                 group_id: Some(group.group_id.clone()),
                 channel_id: Some(channel_id),
+            },
+            false,
+        );
+        bob.persist();
+        let bob_package = bob.request_openmls_admission_key_package(&group_id)?;
+        assert_eq!(bob_package.group_id, group_id);
+        assert_eq!(bob_package.member_identity, bob.state.local_user_id());
+        assert!(!bob_package.signer_public_key_hex.is_empty());
+
+        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
+        let welcome = alice.issue_openmls_admission_welcome(&bob_package)?;
+        assert_eq!(welcome.group_id, group_id);
+        assert_eq!(welcome.epoch, 1);
+        assert_eq!(
+            welcome.member_signer_public_key_hex,
+            bob_package.signer_public_key_hex
+        );
+        assert!(!welcome.owner_signer_public_key_hex.is_empty());
+        assert!(!welcome.welcome_bytes.is_empty());
+
+        bob.join_openmls_group_from_welcome(&welcome)?;
+        let bob_handle = bob
+            .state
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "bob OpenMLS handle missing after Welcome join".to_owned())?;
+        assert_eq!(bob_handle.epoch, welcome.epoch);
+        assert_eq!(
+            bob_handle.signer_public_key_hex,
+            bob_package.signer_public_key_hex
+        );
+        assert_eq!(
+            bob_handle.confirmation_tag_sha256,
+            welcome.confirmation_tag_sha256
+        );
+
+        let alice_handle = alice
+            .state
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "alice OpenMLS handle missing after Welcome issue".to_owned())?;
+        assert_eq!(alice_handle.epoch, welcome.epoch);
+        assert_eq!(
+            alice_handle.confirmation_tag_sha256,
+            welcome.confirmation_tag_sha256
+        );
+
+        let mut alice_engine = OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(
+            &alice_path,
+        ))
+        .map_err(|error| format!("alice OpenMLS provider could not be reopened: {error}"))?;
+        alice_engine
+            .load_group(
+                &group_id,
+                &hex::decode(&alice_handle.signer_public_key_hex)
+                    .map_err(|error| format!("alice signer handle was not hex: {error}"))?,
+            )
+            .map_err(|error| format!("alice OpenMLS group could not be rehydrated: {error}"))?;
+        let mut bob_engine =
+            OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(&bob_path))
+                .map_err(|error| format!("bob OpenMLS provider could not be reopened: {error}"))?;
+        bob_engine
+            .load_group(
+                &group_id,
+                &hex::decode(&bob_handle.signer_public_key_hex)
+                    .map_err(|error| format!("bob signer handle was not hex: {error}"))?,
+            )
+            .map_err(|error| format!("bob OpenMLS group could not be rehydrated: {error}"))?;
+
+        let context = format!("g012-admission:{group_id}");
+        let alice_export = alice_engine
+            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
+            .map_err(|error| format!("alice exporter failed: {error}"))?;
+        let bob_export = bob_engine
+            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
+            .map_err(|error| format!("bob exporter failed: {error}"))?;
+        assert_eq!(alice_export, bob_export);
+        assert_eq!(alice_export.len(), 32);
+
+        let persisted_bob = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        assert!(persisted_bob.openmls_groups.iter().any(|handle| {
+            handle.group_id == group_id
+                && handle.signer_public_key_hex == bob_handle.signer_public_key_hex
+                && handle.epoch == welcome.epoch
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn openmls_admission_bridge_joins_two_profiles_with_exporter_parity() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("openmls-admission-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Admission Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .iter()
+            .find(|group| group.name == "Admission Lab")
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+
+        let bob_path = fresh_state_path("openmls-admission-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        bob.state.create_user(
+            CreateUserRequest {
+                display_name: "Bob".to_owned(),
+                device_name: Some("Bob laptop".to_owned()),
             },
             false,
         );
