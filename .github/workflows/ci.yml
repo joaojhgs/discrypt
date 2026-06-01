@@ -93,6 +93,10 @@ jobs:
         working-directory: apps/ui
       - run: npm run test:security-privacy-g009
         working-directory: apps/ui
+      - run: npm run test:g010-adapter-public-matrix
+        working-directory: apps/ui
+      - run: npm run test:g010-release-contract
+        working-directory: apps/ui
       - run: npm run test:no-placeholders-g127
         working-directory: apps/ui
       - run: npm run test:placeholder-allowlist-g128

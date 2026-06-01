@@ -11164,6 +11164,387 @@ mod tests {
     }
 
     #[test]
+    fn g010_native_command_e2e_setup_group_invite_text_voice_is_honest() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("g010-native-command-alice");
+
+        let alice_created = create_user(CreateUserRequest {
+            display_name: "Alice G010".to_owned(),
+            device_name: Some("Alice native desktop".to_owned()),
+        });
+        assert_eq!(alice_created.lifecycle, AppLifecycle::Ready);
+        let alice_profile_id = alice_created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "alice native command profile missing".to_owned())?;
+        assert!(alice_created.devices.iter().any(|device| device.local));
+
+        let alice_dm = start_dm(StartDmRequest {
+            display_name: "Bob G010".to_owned(),
+        });
+        let alice_dm_id = alice_dm
+            .dms
+            .iter()
+            .find(|dm| dm.display_name == "Bob G010")
+            .map(|dm| dm.dm_id.clone())
+            .ok_or_else(|| "alice native DM missing".to_owned())?;
+        let dm_invite_state = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(alice_dm_id.clone()),
+            expires: "24 hours".to_owned(),
+            max_use: "1 use".to_owned(),
+        });
+        assert!(
+            dm_invite_state.last_command_error.is_none(),
+            "{dm_invite_state:?}"
+        );
+        let dm_invite = dm_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.dm_id.as_deref() == Some(alice_dm_id.as_str()))
+            .cloned()
+            .ok_or_else(|| "native DM invite missing".to_owned())?;
+        assert_eq!(
+            dm_invite.invite_kind,
+            InviteKind::DmContact.canonical_name()
+        );
+
+        let alice_group_state = create_group(CreateGroupRequest {
+            name: "G010 Native Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.example.invalid:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.invalid:5349".to_owned(),
+                credential_declared: false,
+                credential_expires_at: None,
+            }]),
+        });
+        assert!(
+            alice_group_state.last_command_error.is_none(),
+            "{alice_group_state:?}"
+        );
+        let alice_group = alice_group_state
+            .groups
+            .iter()
+            .find(|group| group.name == "G010 Native Lab")
+            .cloned()
+            .ok_or_else(|| "alice native group missing".to_owned())?;
+        let alice_group_id = alice_group.group_id.clone();
+        let alice_text_channel_id = alice_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "alice native text channel missing".to_owned())?;
+        let alice_voice_channel_id = alice_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "alice native voice channel missing".to_owned())?;
+        let alice_connectivity = alice_group
+            .connectivity
+            .clone()
+            .ok_or_else(|| "alice group connectivity missing".to_owned())?;
+        let group_invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(alice_group_id.clone()),
+            expires: "24 hours".to_owned(),
+            max_use: "2 uses".to_owned(),
+        });
+        assert!(
+            group_invite_state.last_command_error.is_none(),
+            "{group_invite_state:?}"
+        );
+        let group_invite = group_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.group_id == alice_group_id)
+            .cloned()
+            .ok_or_else(|| "native group invite missing".to_owned())?;
+        assert_eq!(
+            group_invite.invite_kind,
+            InviteKind::GroupJoin.canonical_name()
+        );
+        assert_eq!(
+            group_invite.signaling_profiles,
+            alice_connectivity.signaling_profiles
+        );
+        assert_eq!(
+            group_invite.ice_stun_servers,
+            alice_connectivity.ice_stun_servers
+        );
+        assert_eq!(
+            group_invite.ice_turn_servers,
+            alice_connectivity.ice_turn_servers
+        );
+
+        let alice_target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(alice_group_id.clone()),
+            channel_id: Some(alice_text_channel_id.clone()),
+        };
+        let alice_sent = send_message(SendMessageRequest {
+            target: alice_target.clone(),
+            body: "g010 native command text proof".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(alice_sent.last_command_error.is_none(), "{alice_sent:?}");
+        let alice_message = alice_sent
+            .messages
+            .iter()
+            .find(|message| message.body == "g010 native command text proof")
+            .cloned()
+            .ok_or_else(|| "alice native message missing".to_owned())?;
+        assert_eq!(alice_message.state_key, "sent_local");
+        assert!(alice_message
+            .status
+            .contains("remote delivery/read receipts not claimed"));
+        let alice_envelope = load_state()
+            .text_delivery_envelopes
+            .into_iter()
+            .find(|record| record.message_id == alice_message.message_id)
+            .ok_or_else(|| "alice native text envelope missing".to_owned())?;
+
+        let alice_voice_joined = join_voice(JoinVoiceRequest {
+            group_id: alice_group_id.clone(),
+            channel_id: alice_voice_channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("alice-native-mic".to_owned()),
+            input_device_label: Some("Alice native microphone".to_owned()),
+            output_device_id: Some("alice-native-speaker".to_owned()),
+            output_device_label: Some("Alice native speaker".to_owned()),
+        });
+        assert!(
+            alice_voice_joined.last_command_error.is_none(),
+            "{alice_voice_joined:?}"
+        );
+        let alice_voice_session = alice_voice_joined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "alice voice session missing".to_owned())?;
+        assert!(alice_voice_session.joined);
+        assert_eq!(alice_voice_session.participants.len(), 1);
+        assert!(!alice_voice_session.media_runtime.remote_transport_active);
+        assert!(alice_voice_session.media_runtime.remote_audio.is_empty());
+        let alice_session_id = alice_voice_session.session_id.clone();
+        let alice_muted = set_self_mute(SetSelfMuteRequest {
+            session_id: alice_session_id.clone(),
+            muted: true,
+        });
+        assert!(alice_muted
+            .voice_session
+            .as_ref()
+            .map(|session| session.self_muted)
+            .unwrap_or(false));
+        let alice_left = leave_voice(LeaveVoiceRequest {
+            session_id: alice_session_id,
+        });
+        assert!(!alice_left
+            .voice_session
+            .as_ref()
+            .map(|session| session.joined)
+            .unwrap_or(true));
+
+        let bob_path = reset_with_temp_state("g010-native-command-bob");
+        let bob_created = create_user(CreateUserRequest {
+            display_name: "Bob G010".to_owned(),
+            device_name: Some("Bob native laptop".to_owned()),
+        });
+        let bob_profile_id = bob_created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "bob native command profile missing".to_owned())?;
+        assert_ne!(alice_profile_id, bob_profile_id);
+        let accepted_dm = accept_dm_invite(AcceptDmInviteRequest {
+            invite_code: dm_invite.code.clone(),
+            display_name: Some("Alice native contact".to_owned()),
+        });
+        assert!(accepted_dm.last_command_error.is_none(), "{accepted_dm:?}");
+        assert!(accepted_dm.dms.iter().any(|dm| {
+            dm.display_name == "Alice native contact"
+                && dm.connectivity.as_ref().is_some_and(|policy| {
+                    policy.scope_id_commitment == dm_invite.scope_id_commitment
+                        && policy.invite_kind == InviteKind::DmContact.canonical_name()
+                })
+        }));
+
+        let joined_group = join_group(JoinGroupRequest {
+            invite_code: group_invite.code.clone(),
+            group_name: Some("G010 Native Lab".to_owned()),
+        });
+        assert!(
+            joined_group.last_command_error.is_none(),
+            "{joined_group:?}"
+        );
+        let bob_group = joined_group
+            .groups
+            .iter()
+            .find(|group| group.name == "G010 Native Lab")
+            .cloned()
+            .ok_or_else(|| "bob native group missing".to_owned())?;
+        assert_eq!(bob_group.role, "member");
+        assert!(bob_group.connectivity.as_ref().is_some_and(|policy| {
+            policy.scope_id_commitment == group_invite.scope_id_commitment
+                && policy.ice_stun_servers == group_invite.ice_stun_servers
+                && policy.ice_turn_servers == group_invite.ice_turn_servers
+        }));
+        let bob_text_channel_id = bob_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "bob native text channel missing".to_owned())?;
+        let bob_voice_channel_id = bob_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "bob native voice channel missing".to_owned())?;
+        let bob_sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(bob_group.group_id.clone()),
+                channel_id: Some(bob_text_channel_id),
+            },
+            body: "g010 bob local text remains local".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(bob_sent.last_command_error.is_none(), "{bob_sent:?}");
+        assert!(bob_sent.messages.iter().any(|message| {
+            message.body == "g010 bob local text remains local" && message.state_key == "sent_local"
+        }));
+
+        let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target: alice_target,
+            envelope: alice_envelope.envelope,
+            sender_verifying_key_hex: alice_envelope.sender_verifying_key_hex,
+            recipient_leaf: Some(2),
+        });
+        assert!(
+            receipt_response.state.last_command_error.is_none(),
+            "{receipt_response:?}"
+        );
+        assert!(receipt_response.state.messages.iter().any(|message| {
+            message.message_id == alice_message.message_id
+                && message.state_key == "received_envelope"
+        }));
+        let receipt = receipt_response
+            .receipt
+            .ok_or_else(|| "bob native receipt missing".to_owned())?;
+        let receipt_key = receipt_response
+            .recipient_verifying_key_hex
+            .ok_or_else(|| "bob native receipt key missing".to_owned())?;
+
+        let bob_voice_joined = join_voice(JoinVoiceRequest {
+            group_id: bob_group.group_id.clone(),
+            channel_id: bob_voice_channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("bob-native-mic".to_owned()),
+            input_device_label: Some("Bob native microphone".to_owned()),
+            output_device_id: Some("bob-native-speaker".to_owned()),
+            output_device_label: Some("Bob native speaker".to_owned()),
+        });
+        assert!(
+            bob_voice_joined.last_command_error.is_none(),
+            "{bob_voice_joined:?}"
+        );
+        let bob_voice_session = bob_voice_joined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "bob voice session missing".to_owned())?;
+        assert!(bob_voice_session.joined);
+        assert_eq!(bob_voice_session.participants.len(), 1);
+        assert!(!bob_voice_session.media_runtime.remote_transport_active);
+        assert!(bob_voice_session.media_runtime.remote_audio.is_empty());
+        let bob_session_id = bob_voice_session.session_id.clone();
+        assert!(set_self_mute(SetSelfMuteRequest {
+            session_id: bob_session_id.clone(),
+            muted: true,
+        })
+        .voice_session
+        .as_ref()
+        .map(|session| session.self_muted)
+        .unwrap_or(false));
+        assert!(!leave_voice(LeaveVoiceRequest {
+            session_id: bob_session_id,
+        })
+        .voice_session
+        .as_ref()
+        .map(|session| session.joined)
+        .unwrap_or(true));
+
+        let bob_reloaded = load_state_from_store(&mut FileAppStore::new(&bob_path)).to_view();
+        assert!(bob_reloaded.messages.iter().any(|message| {
+            message.message_id == alice_message.message_id
+                && message.state_key == "received_envelope"
+        }));
+
+        reload_global_app_service_from_path(&alice_path);
+        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+            message_id: alice_message.message_id.clone(),
+            receipt,
+            recipient_verifying_key_hex: receipt_key.clone(),
+        });
+        assert!(receipted.last_command_error.is_none(), "{receipted:?}");
+        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path)).to_view();
+        assert!(alice_reloaded.messages.iter().any(|message| {
+            message.message_id == alice_message.message_id
+                && message.state_key == "peer_receipt"
+                && message.peer_receipt.is_some()
+        }));
+        assert!(alice_reloaded.invites.iter().any(|invite| {
+            invite.invite_key == group_invite.invite_key
+                && invite.invite_kind == InviteKind::GroupJoin.canonical_name()
+                && !invite.revoked
+        }));
+
+        let observable = alice_reloaded
+            .events
+            .iter()
+            .map(|event| event.summary.as_str())
+            .chain(
+                alice_reloaded
+                    .messages
+                    .iter()
+                    .map(|message| message.status.as_str()),
+            )
+            .chain(
+                bob_reloaded
+                    .events
+                    .iter()
+                    .map(|event| event.summary.as_str()),
+            )
+            .chain(
+                bob_reloaded
+                    .messages
+                    .iter()
+                    .map(|message| message.status.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        for forbidden in [
+            "manual pairing",
+            "qr pairing",
+            "fake production",
+            "production-ready",
+        ] {
+            assert!(
+                !observable.contains(forbidden),
+                "native command E2E must not surface forbidden claim {forbidden}: {observable}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn g004_two_profile_persistent_state_reloads_full_invite_policy_surface() -> Result<(), String>
     {
         let _guard = test_lock();

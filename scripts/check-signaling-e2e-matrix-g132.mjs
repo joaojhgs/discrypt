@@ -28,6 +28,7 @@ for (const token of [
   "Nostr",
   "IPFS",
   "QUIC",
+  "TURN",
 ]) {
   requireText("g132-security-doc", securityDoc, token);
 }
@@ -40,6 +41,7 @@ for (const token of [
   "IPFS public-provider",
   "QUIC public-provider",
   "direct topic-peer",
+  "relay-only TURN",
 ]) {
   requireText("public-signaling-status-doc", releaseDoc, token);
 }
@@ -139,6 +141,39 @@ const matrixCommands = [
     enabledByEnv: "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E",
     skipReason:
       "Set DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 and DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... to run this deployed-service proof.",
+  },
+  {
+    required: false,
+    label: "Public MQTT relay-only TURN WebRTC DataChannel (opt-in real provider)",
+    command: "cargo",
+    args: [
+      "test",
+      "-q",
+      "-p",
+      "discrypt-transport",
+      "--features",
+      "mqtt-adapter",
+      "--test",
+      "public_webrtc_datachannel_e2e",
+      "public_mqtt_relay_only_turn_fallback_roundtrip_when_configured",
+      "--",
+      "--nocapture",
+    ],
+    env: {
+      DISCRYPT_PUBLIC_TURN_E2E: "1",
+      ...(process.env.DISCRYPT_PUBLIC_TURN_ENDPOINT
+        ? { DISCRYPT_PUBLIC_TURN_ENDPOINT: process.env.DISCRYPT_PUBLIC_TURN_ENDPOINT }
+        : {}),
+      ...(process.env.DISCRYPT_PUBLIC_TURN_USERNAME
+        ? { DISCRYPT_PUBLIC_TURN_USERNAME: process.env.DISCRYPT_PUBLIC_TURN_USERNAME }
+        : {}),
+      ...(process.env.DISCRYPT_PUBLIC_TURN_CREDENTIAL
+        ? { DISCRYPT_PUBLIC_TURN_CREDENTIAL: process.env.DISCRYPT_PUBLIC_TURN_CREDENTIAL }
+        : {}),
+    },
+    enabledByEnv: "DISCRYPT_PUBLIC_TURN_E2E",
+    skipReason:
+      "Set DISCRYPT_PUBLIC_TURN_E2E=1 plus DISCRYPT_PUBLIC_TURN_ENDPOINT, DISCRYPT_PUBLIC_TURN_USERNAME, and DISCRYPT_PUBLIC_TURN_CREDENTIAL to run this relay-only TURN proof.",
   },
   {
     required: false,
