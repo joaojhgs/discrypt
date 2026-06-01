@@ -7,6 +7,8 @@
 //! feature matching the claimed runtime capability.
 
 pub mod production_status;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
@@ -1430,6 +1432,15 @@ pub struct AcceptNativeVoiceMediaFrameRequest {
     pub session_id: String,
     /// Remote native media proof opened from sealed backend voice signaling.
     pub native_media: NativeVoiceMediaSignalPayload,
+    /// Evidence timestamp in milliseconds.
+    pub attached_at_ms: u64,
+}
+
+/// Request to accept one remote native Rust media proof directly from a sealed backend voice signal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceptNativeVoiceMediaSignalRequest {
+    /// Remote backend signaling message carrying the sealed native media proof.
+    pub signal: VoiceSignalingMessageView,
     /// Evidence timestamp in milliseconds.
     pub attached_at_ms: u64,
 }
@@ -4800,13 +4811,18 @@ pub fn start_native_voice_media_session(
             }
         }
     });
-    StartNativeVoiceMediaSessionResponse { state, native_media }
+    StartNativeVoiceMediaSessionResponse {
+        state,
+        native_media,
+    }
 }
 
 /// Tauri command: accept one remote native Rust media proof delivered through backend signaling.
-pub fn accept_native_voice_media_frame(request: AcceptNativeVoiceMediaFrameRequest) -> AppStateView {
+pub fn accept_native_voice_media_frame(
+    request: AcceptNativeVoiceMediaFrameRequest,
+) -> AppStateView {
     mutate_app_service(|state| {
-        if let Err(error) = accept_native_voice_media_signal(state, request) {
+        if let Err(error) = accept_native_voice_media_signal_frame(state, request) {
             state.push_command_error(
                 "voice.native_media_rejected",
                 "accept_native_voice_media_frame",
@@ -4816,6 +4832,41 @@ pub fn accept_native_voice_media_frame(request: AcceptNativeVoiceMediaFrameReque
             );
         }
     })
+}
+
+/// Tauri command: open and accept one remote native Rust media proof from a sealed backend voice signal.
+pub fn accept_native_voice_media_signal(
+    request: AcceptNativeVoiceMediaSignalRequest,
+) -> AppStateView {
+    mutate_app_service(
+        |state| match native_voice_media_from_sealed_signal(&request.signal) {
+            Ok(native_media) => {
+                let frame_request = AcceptNativeVoiceMediaFrameRequest {
+                    session_id: request.signal.session_id.clone(),
+                    native_media,
+                    attached_at_ms: request.attached_at_ms,
+                };
+                if let Err(error) = accept_native_voice_media_signal_frame(state, frame_request) {
+                    state.push_command_error(
+                    "voice.native_media_rejected",
+                    "accept_native_voice_media_signal",
+                    "native_voice_media_invalid",
+                    error,
+                    "Accept only non-local native Rust media proof frames delivered through sealed backend voice signaling",
+                );
+                }
+            }
+            Err(error) => {
+                state.push_command_error(
+                "voice.native_media_rejected",
+                "accept_native_voice_media_signal",
+                "native_voice_media_sealed_payload_invalid",
+                error,
+                "Accept only sealed candidate voice signaling messages containing native Rust media proof frames",
+            );
+            }
+        },
+    )
 }
 
 /// Tauri command: join a voice channel.
@@ -5703,6 +5754,36 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn start_native_voice_media_session(
+        app_handle: tauri::AppHandle,
+        request: StartNativeVoiceMediaSessionRequest,
+    ) -> StartNativeVoiceMediaSessionResponse {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::start_native_voice_media_session(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn accept_native_voice_media_frame(
+        app_handle: tauri::AppHandle,
+        request: AcceptNativeVoiceMediaFrameRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::accept_native_voice_media_frame(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn accept_native_voice_media_signal(
+        app_handle: tauri::AppHandle,
+        request: AcceptNativeVoiceMediaSignalRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::accept_native_voice_media_signal(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn join_voice(
         app_handle: tauri::AppHandle,
         request: JoinVoiceRequest,
@@ -5833,6 +5914,9 @@ pub fn run() {
             ipc_commands::handle_text_control_frame,
             ipc_commands::publish_voice_signaling_message,
             ipc_commands::take_pending_voice_signaling_messages,
+            ipc_commands::start_native_voice_media_session,
+            ipc_commands::accept_native_voice_media_frame,
+            ipc_commands::accept_native_voice_media_signal,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
@@ -10154,6 +10238,330 @@ fn validate_voice_signal_payload(signal_kind: &str, sealed_payload: &str) -> Res
             return Err("voice signaling payload must be sealed before IPC/persistence".to_owned());
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct SealedVoiceSignalPayload {
+    #[serde(default)]
+    native_media: Option<NativeVoiceMediaSignalPayload>,
+}
+
+fn native_voice_media_from_sealed_signal(
+    signal: &VoiceSignalingMessageView,
+) -> Result<NativeVoiceMediaSignalPayload, String> {
+    if signal.signal_kind != "candidate" {
+        return Err(
+            "Native Rust media proof is carried in a candidate signaling envelope".to_owned(),
+        );
+    }
+    let payload = signal.sealed_payload.trim();
+    const PREFIX: &str = "voice-signal-sealed:v1:";
+    let sealed = payload.strip_prefix(PREFIX).ok_or_else(|| {
+        "native voice signaling payload is missing the sealed v1 prefix".to_owned()
+    })?;
+    let (nonce_text, ciphertext_text) = sealed.split_once('.').ok_or_else(|| {
+        "native voice signaling payload is missing nonce/ciphertext parts".to_owned()
+    })?;
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(nonce_text.as_bytes())
+        .map_err(|error| format!("native voice signaling nonce is not base64url: {error}"))?;
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(ciphertext_text.as_bytes())
+        .map_err(|error| format!("native voice signaling ciphertext is not base64url: {error}"))?;
+    if nonce_bytes.len() != 12 {
+        return Err("native voice signaling nonce must be 12 bytes".to_owned());
+    }
+    let mut peers = [
+        signal.sender_peer_id.as_str(),
+        signal.recipient_peer_id.as_str(),
+    ];
+    peers.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(b"discrypt-voice-signal-seal-v1:");
+    digest.update(signal.session_id.as_bytes());
+    digest.update(b":");
+    digest.update(signal.group_id.as_bytes());
+    digest.update(b":");
+    digest.update(signal.channel_id.as_bytes());
+    digest.update(b":");
+    digest.update(peers[0].as_bytes());
+    digest.update(b":");
+    digest.update(peers[1].as_bytes());
+    let key = digest.finalize();
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|error| format!("native voice signaling key rejected: {error}"))?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+        .map_err(|error| format!("native voice signaling decrypt failed: {error}"))?;
+    let decoded: SealedVoiceSignalPayload = serde_json::from_slice(&plaintext)
+        .map_err(|error| format!("native voice signaling payload JSON failed: {error}"))?;
+    decoded
+        .native_media
+        .ok_or_else(|| "native voice signaling payload did not contain native_media".to_owned())
+}
+
+#[derive(Default)]
+struct NativeVoiceProofSink {
+    frames: Vec<BridgeProtectedFrame>,
+}
+
+impl ProtectedMediaFrameSink for NativeVoiceProofSink {
+    fn send_protected_media_frame(
+        &mut self,
+        frame: BridgeProtectedFrame,
+    ) -> Result<(), discrypt_media::MediaError> {
+        self.frames.push(frame);
+        Ok(())
+    }
+}
+
+fn build_native_voice_media_signal(
+    state: &PersistedAppState,
+    request: &StartNativeVoiceMediaSessionRequest,
+) -> Result<NativeVoiceMediaSignalPayload, String> {
+    let session = state
+        .voice_session
+        .as_ref()
+        .ok_or_else(|| "No active voice session for native Rust media".to_owned())?;
+    if session.session_id != request.session_id {
+        return Err("Native voice media request did not match the active voice session".to_owned());
+    }
+    if !session.joined {
+        return Err("Native Rust voice media requires a joined voice session".to_owned());
+    }
+    if request.local_peer_id.trim().is_empty()
+        || request.remote_peer_id.trim().is_empty()
+        || request.local_peer_id == request.remote_peer_id
+    {
+        return Err(
+            "Native Rust voice media requires distinct provider-derived peer ids".to_owned(),
+        );
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"discrypt-native-rust-voice-media-proof-v1");
+    digest.update(session.session_id.as_bytes());
+    digest.update(session.group_id.as_bytes());
+    digest.update(session.channel_id.as_bytes());
+    digest.update(request.local_peer_id.as_bytes());
+    digest.update(request.remote_peer_id.as_bytes());
+    let epoch_secret = digest.finalize().to_vec();
+    let binding = SenderBinding::derive_for_epoch(
+        &epoch_secret,
+        &session.group_id,
+        1,
+        0,
+        &request.local_peer_id,
+    )
+    .map_err(|error| error.to_string())?;
+    let sender =
+        SFrameSender::new(&epoch_secret, binding.clone()).map_err(|error| error.to_string())?;
+    let mut registry = MediaKeyRegistry::new();
+    registry
+        .register_sender(&epoch_secret, binding)
+        .map_err(|error| error.to_string())?;
+    let bridge = RustTransformBridge::new(
+        sender,
+        SFrameReceiver::new(registry, ReplayWindow::default()),
+    );
+    let format = AudioCaptureFormat::mono_20ms_48khz();
+    let mut pipeline = VoiceCaptureSFramePipeline::new(
+        OpusAudioEncoder::new(format).map_err(|error| error.to_string())?,
+        bridge,
+        NativeVoiceProofSink::default(),
+    );
+    pipeline.set_muted(request.muted);
+    let pcm = generated_native_voice_pcm(format, &request.local_peer_id);
+    let frame = CapturedAudioFrame::new(pcm, format, request.created_at_ms)
+        .map_err(|error| error.to_string())?;
+    let outcome = pipeline
+        .capture_encode_protect_or_mute(frame)
+        .map_err(|error| error.to_string())?;
+    let report = match outcome {
+        VoiceCaptureSendOutcome::Sent(report) => report,
+        VoiceCaptureSendOutcome::Muted { .. } => {
+            return Err("Native Rust voice media proof was muted before Opus/SFrame".to_owned());
+        }
+    };
+    let sink = pipeline.into_sink();
+    if sink.frames.is_empty() {
+        return Err("Native Rust media pipeline produced no protected frames".to_owned());
+    }
+    let protected_payload_bytes = sink.frames.iter().map(|frame| frame.bytes.len()).sum();
+    let protected_frames = sink
+        .frames
+        .into_iter()
+        .map(|frame| NativeVoiceProtectedFrameView {
+            kid: frame.kid,
+            counter: frame.counter,
+            bytes: frame.bytes,
+        })
+        .collect::<Vec<_>>();
+    Ok(NativeVoiceMediaSignalPayload {
+        schema_version: "discrypt.native_voice_media.v1".to_owned(),
+        session_id: session.session_id.clone(),
+        group_id: session.group_id.clone(),
+        channel_id: session.channel_id.clone(),
+        from_peer_id: request.local_peer_id.clone(),
+        to_peer_id: request.remote_peer_id.clone(),
+        media_path: "native_rust_webrtc_datachannel".to_owned(),
+        boundary: "rust-opus-sframe-over-provider-webrtc-datachannel".to_owned(),
+        capture_source: "native-rust-generated-audio-frame".to_owned(),
+        rms_i16: report.audio_level.rms_i16,
+        peak_i16: report.audio_level.peak_i16,
+        speaking: report.audio_level.speaking,
+        opus_frames: 1,
+        protected_frames_count: protected_frames.len() as u16,
+        opus_payload_bytes: report.opus_payload_len,
+        protected_payload_bytes,
+        protected_frames,
+        created_at_ms: request.created_at_ms,
+    })
+}
+
+fn generated_native_voice_pcm(format: AudioCaptureFormat, seed: &str) -> Vec<i16> {
+    let samples = format.interleaved_samples_per_frame();
+    let seed_offset = seed
+        .bytes()
+        .fold(0_u32, |acc, byte| acc.wrapping_add(u32::from(byte)))
+        % 17;
+    (0..samples)
+        .map(|index| {
+            let phase = ((index as u32 + seed_offset) % 48) as i32;
+            let triangle = if phase < 24 { phase } else { 48 - phase };
+            ((triangle - 12) * 360) as i16
+        })
+        .collect()
+}
+
+fn accept_native_voice_media_signal_frame(
+    state: &mut PersistedAppState,
+    request: AcceptNativeVoiceMediaFrameRequest,
+) -> Result<(), String> {
+    let local_user_id = state.local_user_id();
+    let session = state
+        .voice_session
+        .as_mut()
+        .ok_or_else(|| "No active voice session for native Rust media proof".to_owned())?;
+    let media = request.native_media;
+    if session.session_id != request.session_id || session.session_id != media.session_id {
+        return Err("Native Rust media proof did not match the active voice session".to_owned());
+    }
+    if !session.joined {
+        return Err("Native Rust media proof requires a joined voice session".to_owned());
+    }
+    if media.schema_version != "discrypt.native_voice_media.v1"
+        || media.media_path != "native_rust_webrtc_datachannel"
+        || media.group_id != session.group_id
+        || media.channel_id != session.channel_id
+        || media.from_peer_id.trim().is_empty()
+        || media.to_peer_id.trim().is_empty()
+        || media.from_peer_id == media.to_peer_id
+        || media.protected_frames.is_empty()
+        || media.protected_frames_count == 0
+        || media.opus_frames == 0
+        || media.opus_payload_bytes == 0
+        || media.protected_payload_bytes == 0
+    {
+        return Err(
+            "Native Rust media proof is missing non-local protected Opus/SFrame evidence"
+                .to_owned(),
+        );
+    }
+    if !session.signaling.local_peer_id.is_empty()
+        && media.to_peer_id != session.signaling.local_peer_id
+    {
+        return Err(
+            "Native Rust media proof was addressed to a different provider peer".to_owned(),
+        );
+    }
+    if !session.signaling.remote_peer_id.is_empty()
+        && media.from_peer_id != session.signaling.remote_peer_id
+    {
+        return Err(
+            "Native Rust media proof did not come from the expected provider peer".to_owned(),
+        );
+    }
+
+    let participant_id = media.from_peer_id.clone();
+    let existing_volume = session
+        .participants
+        .iter()
+        .find(|participant| participant.id == participant_id)
+        .map(|participant| participant.volume)
+        .unwrap_or(82);
+    if participant_id == local_user_id {
+        return Err(
+            "Native Rust remote media proof must not identify the local participant".to_owned(),
+        );
+    }
+    if let Some(participant) = session
+        .participants
+        .iter_mut()
+        .find(|participant| participant.id == participant_id)
+    {
+        participant.name = "Native Rust peer".to_owned();
+        participant.role = "remote".to_owned();
+        participant.speaking = media.speaking;
+        participant.muted = false;
+        participant.volume = existing_volume;
+    } else {
+        session.participants.push(VoiceParticipantView {
+            id: participant_id.clone(),
+            name: "Native Rust peer".to_owned(),
+            role: "remote".to_owned(),
+            speaking: media.speaking,
+            muted: false,
+            volume: existing_volume,
+        });
+    }
+
+    let remote_audio = VoiceRemoteAudioView {
+        participant_id: participant_id.clone(),
+        remote_peer_id: media.from_peer_id.clone(),
+        stream_id: format!("native-rust-stream-{}", media.from_peer_id),
+        audio_track_id: format!(
+            "native-rust-opus-sframe-{}-{}",
+            media.from_peer_id, media.protected_frames_count
+        ),
+        playback_element_id: format!("voice-native-rust-audio-{}", media.from_peer_id),
+        local_audio_tracks_sent: media.opus_frames,
+        received_audio_frames: u64::from(media.protected_frames_count),
+        attached_at_ms: request.attached_at_ms,
+    };
+    session
+        .media_runtime
+        .remote_audio
+        .retain(|audio| audio.participant_id != participant_id);
+    session.media_runtime.remote_audio.push(remote_audio);
+    session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
+    session.media_runtime.local_capture_active = true;
+    session.media_runtime.remote_transport_active = true;
+    session.media_runtime.fail_closed_reason = String::new();
+    session.media_runtime.status_copy = format!(
+        "Native Rust voice media accepted {} protected Opus/SFrame frame(s) from provider peer {} over backend WebRTC datachannel signaling",
+        media.protected_frames_count, media.from_peer_id
+    );
+    session.route_copy =
+        "Native Rust Opus/SFrame media proof arrived from a non-local provider peer over backend signaling; remote voice activity is active without WebView RTCPeerConnection".to_owned();
+    session.status_copy = format!(
+        "Native Rust remote voice frame accepted at {} ms (rms {}, peak {})",
+        request.attached_at_ms, media.rms_i16, media.peak_i16
+    );
+    session.signaling.received_remote_signals =
+        session.signaling.received_remote_signals.saturating_add(1);
+    session.signaling.last_signal_kind = Some("native_media_frame".to_owned());
+    session.signaling.status_copy =
+        "Received native Rust media proof through provider-signaled backend text/control transport"
+            .to_owned();
+    state.push_event(
+        "voice.native_media_received",
+        format!(
+            "Accepted native Rust voice media proof from {} protected frame(s)",
+            media.protected_frames_count
+        ),
+    );
     Ok(())
 }
 
@@ -15462,6 +15870,87 @@ mod tests {
                 .find(|participant| participant.role == "you"))
             .map(|participant| !participant.muted && participant.speaking)
             .unwrap_or(false));
+        Ok(())
+    }
+
+    #[test]
+    fn native_rust_voice_media_proof_attaches_remote_without_webview_rtc() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("native-rust-voice-media");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Native Voice Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("native-rust-default-capture".to_owned()),
+            input_device_label: Some("Native Rust capture source".to_owned()),
+            output_device_id: Some("native-rust-default-playback".to_owned()),
+            output_device_label: Some("Native Rust playback sink".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        let started = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
+            session_id: session_id.clone(),
+            local_peer_id: "peer-alice".to_owned(),
+            remote_peer_id: "peer-bob".to_owned(),
+            muted: false,
+            created_at_ms: 42,
+        });
+        let local_media = started
+            .native_media
+            .ok_or_else(|| "native media proof missing".to_owned())?;
+        assert_eq!(local_media.media_path, "native_rust_webrtc_datachannel");
+        assert_eq!(local_media.protected_frames_count, 1);
+        assert!(local_media.opus_payload_bytes > 0);
+        assert!(local_media.protected_payload_bytes > 0);
+        assert!(started
+            .state
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.native_media_started"));
+
+        let mut remote_media = local_media.clone();
+        remote_media.from_peer_id = "peer-bob".to_owned();
+        remote_media.to_peer_id = "peer-alice".to_owned();
+        let accepted = accept_native_voice_media_frame(AcceptNativeVoiceMediaFrameRequest {
+            session_id,
+            native_media: remote_media,
+            attached_at_ms: 84,
+        });
+        let runtime = accepted
+            .voice_session
+            .as_ref()
+            .map(|session| session.media_runtime.clone())
+            .ok_or_else(|| "accepted voice session missing".to_owned())?;
+        assert_eq!(runtime.boundary, "native-rust-webrtc-datachannel");
+        assert!(runtime.remote_transport_active);
+        assert_eq!(runtime.remote_audio.len(), 1);
+        assert!(accepted
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.native_media_received"));
         Ok(())
     }
 

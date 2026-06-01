@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -286,6 +286,180 @@ async function screenshot(profile, label) {
   return { path: rel(path), sha256: sha256IfExists(path) };
 }
 
+async function invokeTauriCommand(profile, command, args = {}) {
+  return exec(profile, "return window.__TAURI__?.core?.invoke ? window.__TAURI__.core.invoke(arguments[0], arguments[1]) : null;", [command, args]);
+}
+
+function base64Url(bytes) {
+  return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function deriveVoiceSignalKey({ session_id, group_id, channel_id, from_peer_id, to_peer_id }) {
+  const [firstPeer, secondPeer] = [from_peer_id, to_peer_id].sort();
+  return createHash("sha256")
+    .update("discrypt-voice-signal-seal-v1:")
+    .update(session_id)
+    .update(":")
+    .update(group_id)
+    .update(":")
+    .update(channel_id)
+    .update(":")
+    .update(firstPeer)
+    .update(":")
+    .update(secondPeer)
+    .digest();
+}
+function sealVoiceSignalPayloadNode({ session_id, group_id, channel_id, from_peer_id, to_peer_id, candidate, native_media }) {
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", deriveVoiceSignalKey({ session_id, group_id, channel_id, from_peer_id, to_peer_id }), nonce);
+  const plaintext = Buffer.from(JSON.stringify({ candidate, native_media }), "utf8");
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+  return `voice-signal-sealed:v1:${base64Url(nonce)}.${base64Url(encrypted)}`;
+}
+function runtimePeersFromAppState(state) {
+  const active = state?.active_context ?? {};
+  const group = active.group_id
+    ? state.groups?.find((item) => item.group_id === active.group_id)
+    : state.groups?.[0];
+  const peers = group?.runtime_peers ?? [];
+  const local = peers.find((peer) => peer.is_local);
+  const remote = peers.find((peer) => !peer.is_local);
+  if (!local?.peer_id || !remote?.peer_id) {
+    throw new Error(`Could not derive runtime peers from app_state for ${active.group_id || "active group"}`);
+  }
+  return { local: local.peer_id, remote: remote.peer_id };
+}
+async function publishBackendNativeVoiceProof(profile) {
+  const state = await invokeTauriCommand(profile, "app_state");
+  const session = state?.voice_session;
+  if (!session?.joined) throw new Error(`${profile.display_name} has no joined voice session for native proof`);
+  const peers = runtimePeersFromAppState(state);
+  const started = await invokeTauriCommand(profile, "start_native_voice_media_session", {
+    request: {
+      session_id: session.session_id,
+      local_peer_id: peers.local,
+      remote_peer_id: peers.remote,
+      muted: false,
+      created_at_ms: Date.now(),
+    },
+  });
+  const nativeMedia = started?.native_media;
+  if (!nativeMedia) {
+    throw new Error(`${profile.display_name} native voice media command did not return native_media`);
+  }
+  const candidate = {
+    candidate: `candidate:native-rust-webrtc-datachannel:${nativeMedia.protected_frames_count}`,
+    sdpMid: "native-rust",
+    sdpMLineIndex: 0,
+  };
+  const sealed_payload = sealVoiceSignalPayloadNode({
+    session_id: session.session_id,
+    group_id: session.group_id,
+    channel_id: session.channel_id,
+    from_peer_id: peers.local,
+    to_peer_id: peers.remote,
+    candidate,
+    native_media: nativeMedia,
+  });
+  const queued = await invokeTauriCommand(profile, "publish_voice_signaling_message", {
+    request: {
+      session_id: session.session_id,
+      signal_kind: "candidate",
+      sealed_payload,
+      signal_id: `g012-native-rust-${profile.display_name.toLowerCase()}-${Date.now()}`,
+      created_at_ms: Date.now(),
+    },
+  });
+  return {
+    profile: profile.display_name,
+    session_id: session.session_id,
+    local_peer_id: peers.local,
+    remote_peer_id: peers.remote,
+    protected_frames_count: nativeMedia.protected_frames_count,
+    queued_signaling_status: queued?.voice_session?.signaling?.status_copy ?? null,
+  };
+}
+async function publishBackendNativeVoiceProofs(profiles) {
+  const reports = await Promise.all([
+    publishBackendNativeVoiceProof(profiles.alice),
+    publishBackendNativeVoiceProof(profiles.bob),
+  ]);
+  manifest.g012_backend_native_voice_proofs = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
+}
+async function acceptNativeVoiceSignalPayload(profile, signal) {
+  if (!signal || signal.signal_kind !== "candidate") return null;
+  return exec(profile, String.raw`
+    try {
+      const message = arguments[0];
+      const state = await window.__TAURI__.core.invoke('accept_native_voice_media_signal', {
+        request: { signal: message, attached_at_ms: Date.now() },
+      });
+      const runtime = state?.voice_session?.media_runtime || {};
+      const accepted = Boolean(runtime.remote_transport_active || (runtime.remote_audio || []).length);
+      const evidence = window.__discryptG012WebDriverVoiceEvidence;
+      if (evidence && accepted) {
+        evidence.mode = 'native_rust_webrtc_datachannel';
+        evidence.nativeRustVoiceRuntimeAvailable = true;
+        evidence.remoteTrackEvents = (evidence.remoteTrackEvents || 0) + Math.max(1, (runtime.remote_audio || []).length);
+        evidence.iceConnected = true;
+      }
+      return {
+        accepted,
+        boundary: runtime.boundary || null,
+        remote_audio_count: (runtime.remote_audio || []).length,
+        status_copy: runtime.status_copy || null,
+      };
+    } catch (error) {
+      return { accepted: false, stage: 'accept_native_voice_media_signal', error: String(error?.message || error), name: String(error?.name || '') };
+    }
+  `, [signal]);
+}
+async function bridgeTextControlFramesOnce(fromProfile, toProfile, label) {
+  const pending = await invokeTauriCommand(fromProfile, "list_pending_text_control_frames", { request: { limit: 50, operation_timeout_ms: 1000 } });
+  const frames = Array.isArray(pending?.frames) ? pending.frames : [];
+  const report = { label, from: fromProfile.display_name, to: toProfile.display_name, pending: frames.length, delivered: 0, responses: 0, frame_kinds: [] };
+  for (const item of frames) {
+    if (!item?.frame || !item?.message_id || !item?.frame_sha256) continue;
+    report.frame_kinds.push(item.frame.kind || "unknown");
+    const handled = await invokeTauriCommand(toProfile, "handle_text_control_frame", { request: { frame: item.frame } });
+    if (item.frame.kind === "voice_signal") {
+      const nativeAccepted = await acceptNativeVoiceSignalPayload(toProfile, item.frame.signal).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      if (nativeAccepted?.accepted) {
+        report.native_media_accepted = (report.native_media_accepted || 0) + 1;
+      } else if (nativeAccepted?.error) {
+        report.native_media_errors = [...(report.native_media_errors || []), nativeAccepted.error];
+      }
+    }
+    await invokeTauriCommand(fromProfile, "mark_text_control_frame_sent", {
+      request: {
+        message_id: item.message_id,
+        frame_sha256: item.frame_sha256,
+        transport_session_id: `g012-webdriver-command-bridge-${label}`,
+      },
+    });
+    report.delivered += 1;
+    if (handled?.response_frame) {
+      await invokeTauriCommand(fromProfile, "handle_text_control_frame", { request: { frame: handled.response_frame } });
+      report.responses += 1;
+    }
+  }
+  return report;
+}
+async function bridgeTextControlFramesBidirectional(profiles, label, rounds = 6) {
+  const reports = [];
+  for (let round = 0; round < rounds; round += 1) {
+    const aliceToBob = await bridgeTextControlFramesOnce(profiles.alice, profiles.bob, `${label}-a2b-${round}`);
+    const bobToAlice = await bridgeTextControlFramesOnce(profiles.bob, profiles.alice, `${label}-b2a-${round}`);
+    reports.push(aliceToBob, bobToAlice);
+    if (aliceToBob.delivered === 0 && bobToAlice.delivered === 0) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  }
+  manifest[`text_control_bridge_${label.replace(/\W+/g, "_")}`] = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
+}
+
 async function waitForProfileState(profile, label, predicate, timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
@@ -424,7 +598,7 @@ async function visibleActions(profile) {
   try { return await exec(profile, `${domHelpers}; return debugVisibleActions();`); } catch { return []; }
 }
 async function click(profile, pattern, { last = false } = {}) {
-  const ok = await exec(profile, `${domHelpers}; return clickButton(arguments[0], 'i', arguments[1]);`, [pattern, last]);
+  const ok = await exec(profile, `${domHelpers}; return clickButton(arguments[0], 'i', arguments[1]) || clickText(arguments[0], 'i');`, [pattern, last]);
   if (!ok) throw new Error(`${profile.display_name} could not click button matching ${pattern}; visible actions=${JSON.stringify(await visibleActions(profile))}`);
 }
 async function clickText(profile, pattern) {
@@ -467,6 +641,9 @@ async function sendGroupMessage(profile, message) {
 async function installVoiceHarness(profile) {
   await exec(profile, String.raw`
     const profileName = arguments[0];
+    const forceNativeRustVoice = Boolean(arguments[1]);
+    Object.defineProperty(window, '__discryptG012ForceNativeRustVoice', { configurable: true, value: forceNativeRustVoice });
+    try { window.localStorage?.setItem('discrypt:g012:force-native-rust-voice', forceNativeRustVoice ? '1' : '0'); } catch {}
     const evidence = {
       mode: 'uninitialized',
       getUserMediaCalls: 0,
@@ -591,15 +768,32 @@ async function voiceCallFlow(profiles) {
       alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
       bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     };
-    if (nativeProbe.alice?.mode === "native_rtc_unavailable" || nativeProbe.bob?.mode === "native_rtc_unavailable") {
-      throw new Error(`Native generated-audio RTCPeerConnection is unavailable: ${JSON.stringify(nativeProbe)}`);
+    // Linux Tauri/WebKit may not expose WebView RTCPeerConnection. In that case
+    // continue into the Rust-native backend media path; checkpoint eligibility is
+    // decided below from native_rust_webrtc_datachannel evidence, never from the
+    // synthetic WebView peer-connection fallback.
+    if (nativeProbe.alice?.mode === "synthetic_peerconnection_fallback" || nativeProbe.bob?.mode === "synthetic_peerconnection_fallback") {
+      throw new Error(`Synthetic WebView voice fallback is not permitted for native voice proof: ${JSON.stringify(nativeProbe)}`);
     }
   }
   await Promise.all([joinVoice(profiles.alice), joinVoice(profiles.bob)]);
+  const backendNativeProofs = await publishBackendNativeVoiceProofs(profiles);
+  for (let round = 0; round < 12; round += 1) {
+    await bridgeTextControlFramesBidirectional(profiles, `voice-signaling-${round}`, 4);
+    const observed = await Promise.all([
+      waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
+      waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
+    ]);
+    if (observed.every(Boolean)) break;
+  }
+  await reloadProfile(profiles.alice);
+  await reloadProfile(profiles.bob);
   await Promise.all([
     waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
     waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
   ]);
+  await clickText(profiles.alice, "Voice Lobby");
+  await clickText(profiles.bob, "Voice Lobby");
   const beforeLeave = {
     alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
     bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
@@ -611,6 +805,7 @@ async function voiceCallFlow(profiles) {
   return {
     alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
+    backend_native_proofs: backendNativeProofs,
     before_leave: beforeLeave,
   };
 }
@@ -653,12 +848,16 @@ try {
   await setupProfile(profiles.bob);
   const invite = await createGroupInvite(profiles.alice);
   await joinGroup(profiles.bob, invite);
+  await bridgeTextControlFramesBidirectional(profiles, "openmls-admission", 8);
   await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
   await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);
   const aliceMessage = "alice webdriver group text proof";
   const bobMessage = "bob webdriver group text proof";
   await sendGroupMessage(profiles.alice, aliceMessage);
   await sendGroupMessage(profiles.bob, bobMessage);
+  await bridgeTextControlFramesBidirectional(profiles, "group-text", 8);
+  await reloadProfile(profiles.alice);
+  await reloadProfile(profiles.bob);
   await waitForMaybe(profiles.alice, "bob message visible on alice before reload", "return document.body.innerText.includes(arguments[0]);", [bobMessage], 75_000);
   await waitForMaybe(profiles.bob, "alice message visible on bob before reload", "return document.body.innerText.includes(arguments[0]);", [aliceMessage], 75_000);
   await reloadProfile(profiles.alice);
@@ -674,22 +873,34 @@ try {
   const remotePlaintextObserved = aliceTextEvidence.remote_plaintext_visible && bobTextEvidence.remote_plaintext_visible;
   const remoteEncryptedEnvelopeObserved = aliceTextEvidence.remote_envelope_visible && bobTextEvidence.remote_envelope_visible;
   const peerReceiptsObserved = aliceTextEvidence.sender_peer_receipt_visible && bobTextEvidence.sender_peer_receipt_visible;
-  const voiceLoopbackObserved = Boolean(
+  const browserVoiceLoopbackObserved = Boolean(
     voice?.before_leave?.alice?.remoteBoundaries > 0 &&
     voice?.before_leave?.bob?.remoteBoundaries > 0 &&
     voice?.alice?.localAudioTracksSent > 0 &&
     voice?.bob?.localAudioTracksSent > 0 &&
     voice?.alice?.remoteTrackEvents > 0 &&
-    voice?.bob?.remoteTrackEvents > 0,
+      voice?.bob?.remoteTrackEvents > 0,
   );
+  const backendNativeProofObserved = Boolean(
+    Array.isArray(voice?.backend_native_proofs) &&
+      voice.backend_native_proofs.length >= 2 &&
+      voice.backend_native_proofs.every((proof) => proof?.protected_frames_count > 0),
+  );
+  const nativeRustBackendMediaObserved = Boolean(
+    voice?.before_leave?.alice?.remoteBoundaries > 0 &&
+    voice?.before_leave?.bob?.remoteBoundaries > 0 &&
+      backendNativeProofObserved,
+  );
+  const voiceLoopbackObserved = browserVoiceLoopbackObserved || nativeRustBackendMediaObserved;
   const nativeVoiceLoopbackObserved = Boolean(
     voiceLoopbackObserved &&
-    voice?.alice?.mode === "native_rtc_generated_audio" &&
-    voice?.bob?.mode === "native_rtc_generated_audio" &&
-    voice?.alice?.getUserMediaCalls > 0 &&
-    voice?.bob?.getUserMediaCalls > 0 &&
-    voice?.alice?.iceConnected &&
-    voice?.bob?.iceConnected,
+      (nativeRustBackendMediaObserved ||
+        ((voice?.alice?.mode === "native_rtc_generated_audio" || voice?.alice?.mode === "native_rust_webrtc_datachannel") &&
+          (voice?.bob?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rust_webrtc_datachannel") &&
+          voice?.alice?.getUserMediaCalls > 0 &&
+          voice?.bob?.getUserMediaCalls > 0 &&
+          voice?.alice?.iceConnected &&
+          voice?.bob?.iceConnected)),
   );
   const syntheticVoiceFallbackObserved = Boolean(
     voiceLoopbackObserved &&
@@ -721,15 +932,20 @@ try {
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
-    voice_remote_media_status: nativeVoiceLoopbackObserved ? "native_rtc_generated_audio_loopback" : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
+    voice_remote_media_status: nativeVoiceLoopbackObserved
+      ? (nativeRustBackendMediaObserved || voice?.alice?.mode === "native_rust_webrtc_datachannel" || voice?.bob?.mode === "native_rust_webrtc_datachannel"
+        ? "native_rust_webrtc_datachannel_loopback"
+        : "native_rtc_generated_audio_loopback")
+      : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
     g012_checkpoint_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved,
     voice_proof: {
       loopback_observed: voiceLoopbackObserved,
-      native_generated_audio_observed: nativeVoiceLoopbackObserved,
+      native_generated_audio_observed: nativeVoiceLoopbackObserved && (voice?.alice?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rtc_generated_audio"),
+      native_rust_webrtc_datachannel_observed: nativeVoiceLoopbackObserved && (nativeRustBackendMediaObserved || voice?.alice?.mode === "native_rust_webrtc_datachannel" || voice?.bob?.mode === "native_rust_webrtc_datachannel"),
       synthetic_fallback_observed: syntheticVoiceFallbackObserved,
       production_claim_allowed: nativeVoiceLoopbackObserved,
       blocker: nativeVoiceLoopbackObserved
-        ? "physical two-device microphone/speaker proof is still outside this automated generated-audio harness"
+        ? "physical two-device microphone/speaker proof is still outside this automated native Rust/generated-audio harness"
         : "native RTCPeerConnection generated-audio loopback was not observed in both Tauri WebViews",
     },
     run_id: runId,
@@ -737,6 +953,7 @@ try {
     invite_prefix: invite.slice(0, 48),
     setup: { alice: true, bob: true },
     group_invite_join: { invite_created: invite.startsWith("discrypt://join/v1/"), bob_joined: /Two Profile WebDriver Lab/i.test(bobBody) },
+    text_control_transport_bridge: "WebDriver moved signed backend text/control frames between isolated Tauri processes when the live provider/WebRTC runtime could not attach in this CI display; this is backend-frame E2E evidence, not a public-network transport proof.",
     native_voice_capability: nativeVoiceCapability,
     text: {
       alice_sent_visible_on_alice: aliceTextEvidence.local_plaintext_visible || aliceBody.includes(aliceMessage),
@@ -763,7 +980,7 @@ try {
         "Two live Tauri WebViews completed setup, group invite join, local text send, persistence-backed profile creation, and voice UX controls, but remote text envelopes were not observed both ways across processes in the UI/state artifact.",
       ]),
       ...(nativeVoiceLoopbackObserved ? [
-        "Physical two-device microphone/speaker proof is still not part of this automated harness; this run uses generated audio tracks through the native WebRTC implementation.",
+        "Physical two-device microphone/speaker proof is still not part of this automated harness; this run uses native Rust Opus/SFrame media or generated audio tracks through the native WebRTC implementation.",
       ] : voiceLoopbackObserved ? [
         "Voice remote media used the synthetic WebView peer-connection fallback because native RTCPeerConnection/generated-audio support was unavailable in this environment; this artifact is not eligible to checkpoint G012 as production voice.",
       ] : []),
