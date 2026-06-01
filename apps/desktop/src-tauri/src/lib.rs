@@ -32,10 +32,9 @@ use discrypt_mls_core::{
     Identity, OpenMlsGroupEngine, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    DeliveryError, TextAuthorLogEnvelope, TextAuthorLogStore, TextDeliveryReceipt,
-    TextDeliveryReceiptInput, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
-    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextRetentionMetadata,
-    TextSelectedRoute, TextSendEvent, TextSendEventSink,
+    DeliveryError, InMemoryTextRecipientStore, InMemoryTextReceiveEvents, TextDeliveryReceipt,
+    TextDeliveryReceiptInput, TextInboundPipeline, TextInboundRequest, TextMessageEnvelope,
+    TextMessageEnvelopeInput, TextReceiveState, TextRenderState, TextRetentionMetadata,
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
