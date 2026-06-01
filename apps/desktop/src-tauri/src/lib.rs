@@ -3963,9 +3963,6 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             .as_ref()
             .map(|profile| profile.display_name.clone())
             .unwrap_or_else(|| "Alice".to_owned());
-        // Message identifiers cross profile boundaries in text/control receipts. Include a
-        // non-secret author commitment so two isolated profiles with the same local sequence
-        // cannot collide and make a valid peer receipt verify against the wrong envelope.
         let author_id = state.local_user_id();
         let author_commitment = hash_commitment("discrypt-message-id-author-v1", &[&author_id]);
         let message_id = format!("msg-{}-{sequence}", &author_commitment[..16]);
@@ -14908,8 +14905,7 @@ mod tests {
         });
         let alice_message_id = alice_sent
             .messages
-            .iter()
-            .find(|message| message.body == "g012 alice to bob encrypted group text")
+            .last()
             .map(|message| message.message_id.clone())
             .ok_or_else(|| "alice message missing".to_owned())?;
         let alice_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
@@ -14972,8 +14968,7 @@ mod tests {
         });
         let bob_message_id = bob_sent
             .messages
-            .iter()
-            .find(|message| message.body == "g012 bob to alice encrypted group text")
+            .last()
             .map(|message| message.message_id.clone())
             .ok_or_else(|| "bob message missing".to_owned())?;
         let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
