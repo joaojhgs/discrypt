@@ -78,7 +78,8 @@
     "test:g010-release-harness": "node ../../scripts/g010-release-harness.mjs --mode=local",
     "test:g010-release-harness:public": "node ../../scripts/g010-release-harness.mjs --mode=public",
     "test:g010-release-contract": "node ../../scripts/check-g010-release-harness.mjs",
-    "test:g010-tauri-launch-dry-run": "node ../../scripts/g010-tauri-two-profile-launch.mjs"
+    "test:g010-tauri-launch-dry-run": "node ../../scripts/g010-tauri-two-profile-launch.mjs",
+    "test:g011-production-status-sync": "node ../../scripts/check-production-status-sync-g011.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
@@ -97,5 +98,6 @@
     "@types/react": "19.2.15",
     "@types/react-dom": "19.2.3",
     "playwright": "^1.60.0"
-  }
+  },
+  "packageManager": "npm@10.9.4"
 }

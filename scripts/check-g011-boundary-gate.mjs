@@ -43,9 +43,9 @@ if (packageJson.scripts?.["test:g011-boundary"] !== "node ../../scripts/check-g0
 for (const token of [
   "Discrypt is **not production-ready yet**",
   "does not prove Tauri IPC, actual provider signaling, remote WebRTC data delivery, or voice media",
-  "| G011 Production ready | Not done |",
+  "| G011 Production ready | In progress / not closed |",
   "| G012 Two-user Tauri E2E text + voice | Not done |",
-  "not complete until real Tauri and two-user artifacts exist",
+  "G012 still requires the real two-installed-user Tauri text-plus-voice artifact bundle",
 ]) requireText("production gap matrix", productionGap, token);
 
 for (const token of [

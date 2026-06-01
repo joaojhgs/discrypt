@@ -20,14 +20,25 @@ Phase 7 UX/E2E hardening adds the serializable command snapshot, native shell co
 
 ## Commands
 
+Use these repository-local checks for ordinary development, then follow
+[`docs/release/release-verification-matrix.md`](docs/release/release-verification-matrix.md)
+for G011 production-readiness evidence. G011 remains separate from the later G012
+two-installed-user Tauri text-plus-voice E2E proof.
+
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo audit
-cargo deny check
-cargo sbom --output-format spdx_json_2_3 > discrypt.spdx.json
-cd apps/ui && npm ci && npm run typecheck && npm run build && npm audit --audit-level=moderate
+npm --prefix apps/ui ci
+npm --prefix apps/ui run typecheck
+npm --prefix apps/ui run build
+npm --prefix apps/ui run test:release-verification-matrix
+npm --prefix apps/ui run test:g011-boundary
+npm --prefix apps/ui run test:security-privacy-g009
+npm --prefix apps/ui run test:cargo-audit-g122
+npm --prefix apps/ui run test:cargo-deny-g121
+npm --prefix apps/ui run test:npm-audit-g123
 ```
 
 ## Security wording

@@ -1,7 +1,7 @@
 {
   "schema": "discrypt.g125.crypto-sensitive-dependencies.v1",
   "policy": "lockfile-first; vendoring is not the default unless release isolation requires it",
-  "cargoLockSha256": "3cfa910a9a45aaf558d919e1141faa734b3cfd4b7c6fa1eb9c1539aa160decf9",
+  "cargoLockSha256": "baf65f298e4c73858e2d686fa8ab0468785f3602bafe925c47e0dd98ac9305d7",
   "packageLockSha256": "e3ec401a884fbc8004868f6f03bd3ef09b4f24aa5999ce61b8eef943eda8bdf0",
   "directCrates": [
     {
@@ -131,6 +131,11 @@
     },
     {
       "name": "chacha20",
+      "version": "0.10.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "chacha20",
       "version": "0.9.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
@@ -206,8 +211,8 @@
     },
     {
       "name": "hpke-rs-libcrux",
-      "version": "0.6.1",
-      "source": "registry+https://github.com/rust-lang/crates.io-index"
+      "version": "0.6.1+discrypt.1",
+      "source": "workspace"
     },
     {
       "name": "hpke-rs-rust-crypto",
@@ -226,17 +231,17 @@
     },
     {
       "name": "libcrux-aead",
-      "version": "0.0.7",
+      "version": "0.0.8",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
       "name": "libcrux-aesgcm",
-      "version": "0.0.7",
+      "version": "0.0.8",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
       "name": "libcrux-chacha20poly1305",
-      "version": "0.0.7",
+      "version": "0.0.8",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
@@ -255,6 +260,11 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
+      "name": "libcrux-hacl-rs",
+      "version": "0.0.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
       "name": "libcrux-hkdf",
       "version": "0.0.6",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -267,6 +277,11 @@
     {
       "name": "libcrux-intrinsics",
       "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-intrinsics",
+      "version": "0.0.7",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
@@ -296,7 +311,7 @@
     },
     {
       "name": "libcrux-poly1305",
-      "version": "0.0.5",
+      "version": "0.0.6",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
@@ -317,6 +332,11 @@
     {
       "name": "libcrux-traits",
       "version": "0.0.6",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libcrux-traits",
+      "version": "0.0.7",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {

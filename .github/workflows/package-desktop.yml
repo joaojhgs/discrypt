@@ -89,6 +89,7 @@ jobs:
       - run: npm --prefix apps/ui run test:command-coverage
       - run: npm --prefix apps/ui run build
       - name: Build unsigned macOS package artifacts
+        # macOS/Windows package artifacts are build-only until platform trust, SBOM, and reproducibility parity are added.
         run: >
           npx --yes @tauri-apps/cli@2.11.2 build
           --config apps/desktop/src-tauri/tauri.conf.json
@@ -117,6 +118,7 @@ jobs:
       - run: npm --prefix apps/ui run test:command-coverage
       - run: npm --prefix apps/ui run build
       - name: Build unsigned Windows package artifacts
+        # macOS/Windows package artifacts are build-only until platform trust, SBOM, and reproducibility parity are added.
         run: >
           npx --yes @tauri-apps/cli@2.11.2 build
           --config apps/desktop/src-tauri/tauri.conf.json
