@@ -1934,21 +1934,56 @@ struct OpenMlsGroupHandleRecord {
     status_copy: String,
 }
 
-struct OpenMlsAdmissionKeyPackage {
-    group_id: String,
-    member_identity: String,
-    signer_public_key_hex: String,
-    package: OpenMlsMemberPackage,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceivedTextRender {
+    Pipeline(TextRenderState),
+    EnvelopeOnly { reason: String },
+    DecryptFailed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OpenMlsAdmissionWelcome {
-    group_id: String,
-    owner_signer_public_key_hex: String,
-    member_signer_public_key_hex: String,
-    welcome_bytes: Vec<u8>,
-    epoch: u64,
-    confirmation_tag_sha256: String,
+impl ReceivedTextRender {
+    fn message_fields(&self, envelope: &TextMessageEnvelope) -> (String, String, String, String, String) {
+        let ciphertext_hash = hex::encode(envelope.ciphertext_hash());
+        match self {
+            Self::Pipeline(TextRenderState::Decrypted(plaintext)) => (
+                String::from_utf8_lossy(plaintext).into_owned(),
+                "signed encrypted peer envelope verified and decrypted through TextInboundPipeline using the persisted OpenMLS text exporter".to_owned(),
+                "received_plaintext".to_owned(),
+                "Plaintext received".to_owned(),
+                "plaintext rendered through TextInboundPipeline".to_owned(),
+            ),
+            Self::Pipeline(TextRenderState::Locked { reason }) => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("signed encrypted peer envelope verified, but plaintext is locked: {reason}"),
+                "received_locked".to_owned(),
+                "Envelope locked".to_owned(),
+                format!("plaintext not rendered because {reason}"),
+            ),
+            Self::EnvelopeOnly { reason } => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("signed encrypted peer envelope verified and persisted; plaintext render unavailable: {reason}"),
+                "received_envelope".to_owned(),
+                "Envelope received".to_owned(),
+                format!("plaintext not rendered because {reason}"),
+            ),
+            Self::DecryptFailed => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                "signed encrypted peer envelope verified, but TextInboundPipeline could not decrypt with the persisted OpenMLS exporter; plaintext was not rendered".to_owned(),
+                "received_decrypt_failed".to_owned(),
+                "Decrypt failed".to_owned(),
+                "plaintext not rendered because exporter-backed decryption failed".to_owned(),
+            ),
+        }
+    }
+
+    fn event_label(&self) -> &'static str {
+        match self {
+            Self::Pipeline(TextRenderState::Decrypted(_)) => "plaintext_rendered",
+            Self::Pipeline(TextRenderState::Locked { .. }) => "plaintext_locked",
+            Self::EnvelopeOnly { .. } => "envelope_only",
+            Self::DecryptFailed => "decrypt_failed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7410,6 +7445,8 @@ impl PersistedAppState {
                 Ok((group_id, sender_key))
             })
             .and_then(|(group_id, sender_key)| {
+                let plaintext_render =
+                    self.receive_text_plaintext_render(&request, &group_id, &sender_key)?;
                 let recipient_leaf = request.recipient_leaf.unwrap_or(1);
                 let recipient_seed = self.identity_seed_bytes();
                 let recipient_signer = SigningKey::from_bytes(&recipient_seed);
@@ -7446,20 +7483,19 @@ impl PersistedAppState {
                 {
                     let sequence = self.next_sequence;
                     self.next_sequence = self.next_sequence.saturating_add(1);
+                    let (body, status, state_key, state_label, render_detail) =
+                        plaintext_render.message_fields(&request.envelope);
                     self.messages.push(MessageView {
                         message_id: request.envelope.message_id.clone(),
                         target: request.target.clone(),
                         author_id: request.envelope.sender_device_id.clone(),
                         author: format!("Peer {}", key_fingerprint(&sender_key)),
-                        body: format!(
-                            "Encrypted message envelope received (ciphertext_hash={})",
-                            hex::encode(request.envelope.ciphertext_hash())
-                        ),
-                        status: "signed encrypted peer envelope verified and persisted; plaintext decrypt/render still requires the MLS receive loop".to_owned(),
-                        state_key: "received_envelope".to_owned(),
-                        state_label: "Envelope received".to_owned(),
+                        body,
+                        status,
+                        state_key,
+                        state_label,
                         state_detail: format!(
-                            "Verified sender={} {} {} and generated signed delivery receipt",
+                            "Verified sender={} {} {}; {render_detail}; generated signed delivery receipt",
                             key_fingerprint(&sender_key),
                             redacted_message_ref(&request.envelope.message_id),
                             redacted_observable_ref("group_binding", &group_id)
@@ -7476,8 +7512,9 @@ impl PersistedAppState {
                 self.push_event(
                     "message.envelope_received",
                     format!(
-                        "Verified encrypted peer envelope {} and generated signed receipt",
-                        redacted_message_ref(&request.envelope.message_id)
+                        "Verified encrypted peer envelope {} and generated signed receipt ({})",
+                        redacted_message_ref(&request.envelope.message_id),
+                        plaintext_render.event_label()
                     ),
                 );
                 Ok((receipt, recipient_verifying_key_hex))
@@ -7492,6 +7529,113 @@ impl PersistedAppState {
             );
         }
         result
+    }
+
+    fn receive_text_plaintext_render(
+        &mut self,
+        request: &ReceiveTextDeliveryEnvelopeRequest,
+        delivery_group_id: &str,
+        sender_key: &VerifyingKey,
+    ) -> Result<ReceivedTextRender, String> {
+        let (text_exporter_secret, current_epoch) =
+            match self.openmls_text_exporter_for_receive(&request.target, delivery_group_id) {
+                Ok(exporter) => exporter,
+                Err(error) => {
+                    return Ok(ReceivedTextRender::EnvelopeOnly {
+                        reason: error,
+                    });
+                }
+            };
+        let mut receive_state = self.text_receive_state_for_delivery_group(delivery_group_id);
+        let mut store = InMemoryTextRecipientStore::default();
+        let mut events = InMemoryTextReceiveEvents::default();
+        let mut authorized_sender_leaves = std::collections::BTreeSet::new();
+        authorized_sender_leaves.insert(request.envelope.sender_leaf);
+        match TextInboundPipeline::new(&mut receive_state, &mut store, &mut events).receive(
+            TextInboundRequest {
+                group_id: delivery_group_id.to_owned(),
+                channel_id: request
+                    .target
+                    .channel_id
+                    .clone()
+                    .unwrap_or_else(|| request.target.dm_id.clone().unwrap_or_default()),
+                current_epoch,
+                authorized_sender_leaves,
+                envelope: request.envelope.clone(),
+                received_at_ms: self.next_sequence.saturating_add(1),
+                retention_allows_decrypt: true,
+            },
+            &text_exporter_secret,
+            sender_key,
+        ) {
+            Ok(renderable) => Ok(ReceivedTextRender::Pipeline(renderable.state)),
+            Err(DeliveryError::TextMessageDecryptionFailed) => {
+                self.push_event(
+                    "message.envelope_decrypt_failed",
+                    format!(
+                        "TextInboundPipeline could not decrypt {} with the persisted OpenMLS exporter",
+                        redacted_message_ref(&request.envelope.message_id)
+                    ),
+                );
+                Ok(ReceivedTextRender::DecryptFailed)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn openmls_text_exporter_for_receive(
+        &self,
+        target: &MessageTargetView,
+        delivery_group_id: &str,
+    ) -> Result<(Vec<u8>, u64), String> {
+        if target.kind != "channel" {
+            return Err(
+                "OpenMLS text exporter is only available for persisted group channel membership"
+                    .to_owned(),
+            );
+        }
+        let openmls_group_id = target
+            .group_id
+            .as_deref()
+            .ok_or_else(|| "channel target is missing group_id for OpenMLS exporter".to_owned())?;
+        let handle = self
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == openmls_group_id)
+            .ok_or_else(|| {
+                format!(
+                    "OpenMLS membership/exporter state is unavailable for {}",
+                    redacted_observable_ref("group", openmls_group_id)
+                )
+            })?;
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("OpenMLS signer key is not valid hex: {error}"))?;
+        let mut engine = OpenMlsGroupEngine::open(app_openmls_store_path())
+            .map_err(|error| format!("OpenMLS provider could not be opened: {error}"))?;
+        let snapshot = engine
+            .load_group(openmls_group_id, &signer_public_key)
+            .map_err(|error| format!("OpenMLS group could not be loaded: {error}"))?;
+        let exporter = engine
+            .export_secret(
+                openmls_group_id,
+                "discrypt/text",
+                delivery_group_id.as_bytes(),
+                32,
+            )
+            .map_err(|error| format!("OpenMLS text exporter failed: {error}"))?;
+        Ok((exporter, snapshot.epoch))
+    }
+
+    fn text_receive_state_for_delivery_group(&self, delivery_group_id: &str) -> TextReceiveState {
+        let mut state = TextReceiveState::default();
+        for record in self
+            .text_delivery_envelopes
+            .iter()
+            .filter(|record| record.group_id == delivery_group_id)
+        {
+            let _ = state.accept(&record.envelope);
+        }
+        state
     }
 
     fn handle_text_control_frame(
