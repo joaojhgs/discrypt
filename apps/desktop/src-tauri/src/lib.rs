@@ -4584,7 +4584,7 @@ pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
                         "set_speaker_volume",
                         "voice_participant_not_found",
                         "No matching voice participant for speaker volume",
-                        "Choose a visible remote participant from the voice member list",
+                        "Choose a visible participant from the remote voice member list",
                     );
                 }
             } else {
@@ -11196,7 +11196,15 @@ mod tests {
                 .iter()
                 .find(|participant| participant.id == alice_user_id)
                 .map(|participant| (participant.muted, participant.volume)),
-            Some((true, 55))
+            Some((true, 82))
+        );
+        assert_eq!(
+            reloaded_voice
+                .participants
+                .iter()
+                .find(|participant| participant.id == remote_participant_id)
+                .map(|participant| (participant.muted, participant.volume)),
+            Some((false, 55))
         );
         assert!(alice_view.invites.iter().any(|invite| {
             invite.invite_key == dm_invite.invite_key
