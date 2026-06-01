@@ -2088,14 +2088,18 @@ impl TauriAppService {
         }
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
             let mut store = FileAppStore::new(path);
-            persist_state_to_store(&mut store, &self.state);
+            if let Err(error) = persist_state_to_store(&mut store, &self.state) {
+                self.state.last_command_error = Some(error);
+            }
             return;
         }
-        persist_state(&self.state);
+        if let Err(error) = persist_state(&self.state) {
+            self.state.last_command_error = Some(error);
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -8356,24 +8360,75 @@ fn load_state() -> PersistedAppState {
 }
 
 fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
-    if let Ok(Some(bytes)) = store.load_app_state() {
-        if let Ok(state) = serde_json::from_slice::<PersistedAppState>(&bytes) {
-            if state.schema_version == APP_STATE_SCHEMA_VERSION {
-                return state;
-            }
-        }
+    match store.load_app_state() {
+        Ok(Some(bytes)) => match serde_json::from_slice::<PersistedAppState>(&bytes) {
+            Ok(state) if state.schema_version == APP_STATE_SCHEMA_VERSION => state,
+            Ok(_) => initial_state_with_persistence_error(
+                "state_schema_mismatch",
+                "Stored app state uses an unsupported schema version.",
+                "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
+            ),
+            Err(error) => initial_state_with_persistence_error(
+                "state_decode_failed",
+                format!("Stored app state could not be decoded: {error}"),
+                "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
+            ),
+        },
+        Ok(None) => PersistedAppState::initial(),
+        Err(error) => initial_state_with_persistence_error(
+            "state_load_failed",
+            format!("Stored app state could not be loaded: {error}"),
+            "Check local storage/keychain access before creating or recovering another profile.",
+        ),
     }
-    PersistedAppState::initial()
 }
 
-fn persist_state(state: &PersistedAppState) {
+fn persist_state(state: &PersistedAppState) -> Result<(), CommandErrorView> {
     let mut store = app_store();
-    persist_state_to_store(&mut store, state);
+    persist_state_to_store(&mut store, state)
 }
 
-fn persist_state_to_store(store: &mut impl AppStore, state: &PersistedAppState) {
-    if let Ok(encoded) = serde_json::to_vec_pretty(state) {
-        let _ = store.save_app_state(&encoded);
+fn persist_state_to_store(
+    store: &mut impl AppStore,
+    state: &PersistedAppState,
+) -> Result<(), CommandErrorView> {
+    let encoded = serde_json::to_vec_pretty(state).map_err(|error| {
+        persistence_command_error(
+            "state_encode_failed",
+            format!("App state could not be encoded for persistence: {error}"),
+            "Retry after preserving current logs; the app did not write partial state.",
+        )
+    })?;
+    store.save_app_state(&encoded).map_err(|error| {
+        persistence_command_error(
+            "state_save_failed",
+            format!("App state could not be saved: {error}"),
+            "Check disk/keychain availability before continuing; the app did not confirm persistence.",
+        )
+    })
+}
+
+fn initial_state_with_persistence_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    recovery_hint: impl Into<String>,
+) -> PersistedAppState {
+    let mut state = PersistedAppState::initial();
+    state.last_command_error =
+        Some(persistence_command_error(code, message, recovery_hint));
+    state
+}
+
+fn persistence_command_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    recovery_hint: impl Into<String>,
+) -> CommandErrorView {
+    CommandErrorView {
+        code: code.into(),
+        command: "app_persistence".to_owned(),
+        message: redact_sensitive_observable_copy(message),
+        recovery_hint: redact_sensitive_observable_copy(recovery_hint),
     }
 }
 
