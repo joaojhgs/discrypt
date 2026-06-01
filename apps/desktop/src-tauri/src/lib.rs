@@ -29,12 +29,14 @@ use discrypt_media::{
 };
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
-    Identity, OpenMlsGroupEngine, SafetyNumber,
+    Identity, OpenMlsGroupEngine, OpenMlsMemberPackage, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    DeliveryError, InMemoryTextRecipientStore, InMemoryTextReceiveEvents, TextDeliveryReceipt,
-    TextDeliveryReceiptInput, TextInboundPipeline, TextInboundRequest, TextMessageEnvelope,
-    TextMessageEnvelopeInput, TextReceiveState, TextRenderState, TextRetentionMetadata,
+    DeliveryError, InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextAuthorLogEnvelope,
+    TextAuthorLogStore, TextDeliveryReceipt, TextDeliveryReceiptInput, TextInboundPipeline,
+    TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
+    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextReceiveState,
+    TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEvent, TextSendEventSink,
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
@@ -1894,6 +1896,61 @@ impl TextSendEventSink for AppTextSendEvents {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceivedTextRender {
+    Pipeline(TextRenderState),
+    EnvelopeOnly { reason: String },
+    DecryptFailed,
+}
+
+impl ReceivedTextRender {
+    fn message_fields(
+        &self,
+        envelope: &TextMessageEnvelope,
+    ) -> (String, String, String, String, String) {
+        let ciphertext_hash = hex::encode(envelope.ciphertext_hash());
+        match self {
+            Self::Pipeline(TextRenderState::Decrypted(plaintext)) => (
+                String::from_utf8_lossy(plaintext).into_owned(),
+                "signed encrypted peer envelope verified and decrypted through TextInboundPipeline using the persisted OpenMLS text exporter".to_owned(),
+                "received_plaintext".to_owned(),
+                "Plaintext received".to_owned(),
+                "plaintext rendered through TextInboundPipeline".to_owned(),
+            ),
+            Self::Pipeline(TextRenderState::Locked { reason }) => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("signed encrypted peer envelope verified, but plaintext is locked: {reason}"),
+                "received_locked".to_owned(),
+                "Envelope locked".to_owned(),
+                format!("plaintext not rendered because {reason}"),
+            ),
+            Self::EnvelopeOnly { reason } => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("signed encrypted peer envelope verified and persisted; plaintext render unavailable: {reason}"),
+                "received_envelope".to_owned(),
+                "Envelope received".to_owned(),
+                format!("plaintext not rendered because {reason}"),
+            ),
+            Self::DecryptFailed => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                "signed encrypted peer envelope verified, but TextInboundPipeline could not decrypt with the persisted OpenMLS exporter; plaintext was not rendered".to_owned(),
+                "received_decrypt_failed".to_owned(),
+                "Decrypt failed".to_owned(),
+                "plaintext not rendered because exporter-backed decryption failed".to_owned(),
+            ),
+        }
+    }
+
+    fn event_label(&self) -> &'static str {
+        match self {
+            Self::Pipeline(TextRenderState::Decrypted(_)) => "plaintext_rendered",
+            Self::Pipeline(TextRenderState::Locked { .. }) => "plaintext_locked",
+            Self::EnvelopeOnly { .. } => "envelope_only",
+            Self::DecryptFailed => "decrypt_failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct TextDeliveryEnvelopeRecord {
     message_id: String,
@@ -2255,6 +2312,7 @@ impl TauriAppService {
                 redacted_observable_ref("group", &key_package.group_id)
             ),
         );
+        self.persist();
         Ok(OpenMlsAdmissionWelcome {
             group_id: key_package.group_id.clone(),
             owner_signer_public_key_hex: owner_record.signer_public_key_hex,
@@ -2275,13 +2333,19 @@ impl TauriAppService {
         let mut engine = OpenMlsGroupEngine::open(self.openmls_store_path())
             .map_err(|error| format!("OpenMLS joiner provider could not be opened: {error}"))?;
         let snapshot = engine
-            .join_from_welcome(&welcome.group_id, &signer_public_key, &welcome.welcome_bytes)
+            .join_from_welcome(
+                &welcome.group_id,
+                &signer_public_key,
+                &welcome.welcome_bytes,
+            )
             .map_err(|error| format!("OpenMLS Welcome could not be joined: {error}"))?;
         let mut confirmation_hash = Sha256::new();
         confirmation_hash.update(&snapshot.confirmation_tag);
         let confirmation_tag_sha256 = hex::encode(confirmation_hash.finalize());
         if confirmation_tag_sha256 != welcome.confirmation_tag_sha256 {
-            return Err("OpenMLS joined confirmation tag did not match owner Welcome state".to_owned());
+            return Err(
+                "OpenMLS joined confirmation tag did not match owner Welcome state".to_owned(),
+            );
         }
         upsert_openmls_group_handle(
             &mut self.state,
@@ -2310,6 +2374,7 @@ impl TauriAppService {
                 redacted_observable_ref("group", &welcome.group_id)
             ),
         );
+        self.persist();
         Ok(())
     }
 
@@ -6863,7 +6928,9 @@ impl PersistedAppState {
             .send(request, route, &text_exporter_secret, &signing_key)
             .map_err(|error| error.to_string())?;
         if author_log.entries.len() != 1 || transport.frames.len() != 1 {
-            return Err("text outbound pipeline did not persist and queue exactly one envelope".to_owned());
+            return Err(
+                "text outbound pipeline did not persist and queue exactly one envelope".to_owned(),
+            );
         }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
@@ -7619,9 +7686,7 @@ impl PersistedAppState {
             match self.openmls_text_exporter_for_receive(&request.target, delivery_group_id) {
                 Ok(exporter) => exporter,
                 Err(error) => {
-                    return Ok(ReceivedTextRender::EnvelopeOnly {
-                        reason: error,
-                    });
+                    return Ok(ReceivedTextRender::EnvelopeOnly { reason: error });
                 }
             };
         let mut receive_state = self.text_receive_state_for_delivery_group(delivery_group_id);
@@ -8871,8 +8936,6 @@ impl From<&TextControlOutboxRecord> for TextControlOutboxFrameView {
             frame_sha256: record.frame_sha256.clone(),
         }
     }
-
-
 }
 
 fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, String> {
@@ -8905,10 +8968,7 @@ fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> 
     }
 }
 
-fn upsert_openmls_group_handle(
-    state: &mut PersistedAppState,
-    record: OpenMlsGroupHandleRecord,
-) {
+fn upsert_openmls_group_handle(state: &mut PersistedAppState, record: OpenMlsGroupHandleRecord) {
     if let Some(existing) = state
         .openmls_groups
         .iter_mut()
@@ -13610,7 +13670,10 @@ mod tests {
             .cloned()
             .ok_or_else(|| "bob OpenMLS handle missing after Welcome join".to_owned())?;
         assert_eq!(bob_handle.epoch, welcome.epoch);
-        assert_eq!(bob_handle.signer_public_key_hex, bob_package.signer_public_key_hex);
+        assert_eq!(
+            bob_handle.signer_public_key_hex,
+            bob_package.signer_public_key_hex
+        );
         assert_eq!(
             bob_handle.confirmation_tag_sha256,
             welcome.confirmation_tag_sha256
@@ -13640,10 +13703,9 @@ mod tests {
                     .map_err(|error| format!("alice signer handle was not hex: {error}"))?,
             )
             .map_err(|error| format!("alice OpenMLS group could not be rehydrated: {error}"))?;
-        let mut bob_engine = OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(
-            &bob_path,
-        ))
-        .map_err(|error| format!("bob OpenMLS provider could not be reopened: {error}"))?;
+        let mut bob_engine =
+            OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(&bob_path))
+                .map_err(|error| format!("bob OpenMLS provider could not be reopened: {error}"))?;
         bob_engine
             .load_group(
                 &group_id,
