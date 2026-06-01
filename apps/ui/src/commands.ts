@@ -92,6 +92,28 @@ export type VoiceMediaRuntimeView = {
   remote_audio_streams?: VoiceRemoteAudioStreamView[];
 };
 
+export type VoiceSignalingStateView = {
+  session_id: string;
+  local_peer_id: string;
+  remote_peer_id: string;
+  role: string;
+  pending_local_signals: number;
+  received_remote_signals: number;
+  last_signal_kind?: string | null;
+  status_copy: string;
+};
+
+const inactiveVoiceSignalingState: VoiceSignalingStateView = {
+  session_id: "",
+  local_peer_id: "",
+  remote_peer_id: "",
+  role: "not-started",
+  pending_local_signals: 0,
+  received_remote_signals: 0,
+  last_signal_kind: null,
+  status_copy: "Voice signaling has not started; no SDP or ICE has crossed backend state",
+};
+
 const inactiveVoiceMediaRuntime: VoiceMediaRuntimeView = {
   runtime_id: "voice-runtime:not-started",
   boundary: "not-started",
@@ -468,6 +490,7 @@ export type VoiceSessionView = {
   input_device: VoiceDeviceDescriptor | null;
   output_device: VoiceDeviceDescriptor | null;
   media_runtime: VoiceMediaRuntimeView;
+  signaling: VoiceSignalingStateView;
   participants: VoiceParticipantView[];
   route_copy: string;
   status_copy: string;
@@ -703,6 +726,43 @@ export type ReceiveTextDeliveryEnvelopeResponse = {
   recipient_verifying_key_hex: string | null;
 };
 
+export type VoiceSignalingMessageView = {
+  signal_id: string;
+  session_id: string;
+  group_id: string;
+  channel_id: string;
+  sender_participant_id: string;
+  sender_peer_id: string;
+  recipient_peer_id: string;
+  signal_kind: "offer" | "answer" | "candidate" | string;
+  sdp?: string | null;
+  candidate?: string | null;
+  sdp_mid?: string | null;
+  sdp_m_line_index?: number | null;
+  created_at_ms: number;
+};
+
+export type PublishVoiceSignalingMessageRequest = {
+  session_id: string;
+  signal_kind: "offer" | "answer" | "candidate" | string;
+  sdp?: string | null;
+  candidate?: string | null;
+  sdp_mid?: string | null;
+  sdp_m_line_index?: number | null;
+  signal_id?: string | null;
+  created_at_ms: number;
+};
+
+export type TakePendingVoiceSignalingMessagesRequest = {
+  session_id?: string | null;
+  limit?: number | null;
+};
+
+export type TakePendingVoiceSignalingMessagesResponse = {
+  state: AppState;
+  messages: VoiceSignalingMessageView[];
+};
+
 export type TextControlFrameView =
   | {
       kind: "envelope";
@@ -710,6 +770,10 @@ export type TextControlFrameView =
       envelope: TextMessageEnvelope;
       sender_verifying_key_hex: string;
       recipient_leaf?: number | null;
+    }
+  | {
+      kind: "voice_signal";
+      signal: VoiceSignalingMessageView;
     }
   | {
       kind: "receipt";
@@ -1034,6 +1098,10 @@ function normalizeVoiceSessionRuntime(state: AppState): void {
     state.voice_session.joined,
   );
   state.voice_session.media_runtime.remote_audio ??= [];
+  state.voice_session.signaling ??= {
+    ...inactiveVoiceSignalingState,
+    session_id: state.voice_session.session_id,
+  };
 }
 
 function cloneState(state: AppState): AppState {
@@ -3312,6 +3380,48 @@ export async function createChannel(
   );
 }
 
+export async function publishVoiceSignalingMessage(
+  request: PublishVoiceSignalingMessageRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "publish_voice_signaling_message",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "voice.signal_rejected",
+          "publish_voice_signaling_message",
+          "voice_signal_queue_failed",
+          "Local fallback web runtime cannot persist provider-signaled voice SDP/ICE; native Rust/Tauri command path is required",
+          "Run the native app with provider-derived runtime peers before queueing voice signaling",
+        );
+      }),
+  );
+}
+
+export async function takePendingVoiceSignalingMessages(
+  request: TakePendingVoiceSignalingMessagesRequest = {},
+): Promise<TakePendingVoiceSignalingMessagesResponse> {
+  return invokeOrFallback<TakePendingVoiceSignalingMessagesResponse>(
+    "take_pending_voice_signaling_messages",
+    { request },
+    () => {
+      const state = mutateFallback((draft) => {
+        pushCommandError(
+          draft,
+          "voice.signal_take_rejected",
+          "take_pending_voice_signaling_messages",
+          "voice_signal_inbox_unavailable",
+          "Local fallback web runtime cannot drain backend voice signaling; native Rust/Tauri command path is required",
+          "Run the native app and process provider-signaled SDP/ICE from backend state",
+        );
+      });
+      return { state, messages: [] };
+    },
+  );
+}
+
 export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("join_voice", { request }, () =>
     mutateFallback((state) => {
@@ -3365,6 +3475,13 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
               status_copy:
                 "No local capture or remote playback route is active because voice permission was denied",
             },
+        signaling: {
+          ...inactiveVoiceSignalingState,
+          session_id: `voice-${request.channel_id}`,
+          status_copy: captureAllowed
+            ? "Voice signaling waits for provider-derived peer ids before SDP/ICE exchange"
+            : "Voice signaling did not start because capture permission/device gates failed",
+        },
         participants: [
           {
             id: localUserId(state),
@@ -3456,6 +3573,12 @@ export async function leaveVoice(
         fail_closed_reason: "",
         status_copy:
           "Voice media runtime stopped by leave; local tracks and remote playback are inactive",
+      };
+      state.voice_session.signaling = {
+        ...inactiveVoiceSignalingState,
+        session_id: state.voice_session.session_id,
+        role: "stopped",
+        status_copy: "Voice signaling stopped by leave; pending inbound SDP/ICE was cleared",
       };
       const localId = localUserId(state);
       state.voice_session.participants = state.voice_session.participants

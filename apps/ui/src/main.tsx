@@ -53,12 +53,17 @@ import {
   setSelfMute,
   setSpeakerVolume,
   updateVoiceActivity,
+  attachVoiceRemoteMedia,
   startSignalingSession,
   startTextSession,
   attachTextControlTransportRuntime,
   startDm,
   verifySafetyNumber,
 } from "./commands";
+import {
+  startWebViewVoiceMediaSession,
+  VoiceMediaSessionHandle,
+} from "./voice-media";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -276,6 +281,17 @@ function activeScopeLabelForState(state: AppState): string {
     state.active_context?.group_id ??
     state.active_context?.channel_id ??
     "active-scope"
+  );
+}
+
+function voiceConnectivityForState(state: AppState) {
+  const group = getActiveGroup(state);
+  const voiceChannel = getActiveVoiceChannel(state, group);
+  return (
+    voiceChannel?.connectivity ??
+    group?.connectivity ??
+    state.connectivity_defaults ??
+    null
   );
 }
 
@@ -561,13 +577,26 @@ function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [messageTransportProof, setMessageTransportProof] = useState(false);
   const [localVoiceSpeaking, setLocalVoiceSpeaking] = useState(false);
+  const [voiceRemoteStreams, setVoiceRemoteStreams] = useState<
+    Record<string, MediaStream>
+  >({});
   const eventCursorRef = useRef(0);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
+  const voiceMediaSessionRef = useRef<VoiceMediaSessionHandle | null>(null);
   const stopVoiceActivityCaptureRef = useRef<StopVoiceActivityCapture | null>(
     null,
   );
 
+  function cleanupVoiceMediaSession() {
+    voiceMediaSessionRef.current?.close();
+    voiceMediaSessionRef.current = null;
+    setVoiceRemoteStreams({});
+  }
+
   function stopLocalVoiceCapture() {
+    voiceMediaSessionRef.current?.close();
+    voiceMediaSessionRef.current = null;
+    setVoiceRemoteStreams({});
     stopVoiceActivityCaptureRef.current?.();
     stopVoiceActivityCaptureRef.current = null;
     stopMediaStream(voiceCaptureRef.current);
@@ -605,15 +634,7 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    return () => {
-      voiceCaptureRef.current?.getTracks().forEach((track) => track.stop());
-      stopVoiceActivityCaptureRef.current?.();
-      stopVoiceActivityCaptureRef.current = null;
-      voiceCaptureRef.current = null;
-      setLocalVoiceSpeaking(false);
-    };
-  }, []);
+  useEffect(() => () => stopLocalVoiceCapture(), []);
 
   useEffect(() => {
     if (!commandState?.voice_session?.joined) {
@@ -626,6 +647,7 @@ function App() {
     localAudioTracks(voiceCaptureRef.current).forEach((track) => {
       track.enabled = enabled;
     });
+    voiceMediaSessionRef.current?.setMuted(!enabled);
     if (!enabled) setLocalVoiceSpeaking(false);
   }, [commandState?.voice_session?.self_muted]);
 
@@ -866,9 +888,28 @@ function App() {
           volume: 82,
         }
       : null;
-  const participants = localVoiceParticipant
-    ? [localVoiceParticipant, ...backendVoiceParticipants]
-    : backendVoiceParticipants;
+  const remoteStreamParticipants: VoiceParticipant[] = Object.keys(
+    voiceRemoteStreams,
+  )
+    .filter(
+      (participantId) =>
+        !backendVoiceParticipants.some(
+          (participant) => participant.id === participantId,
+        ),
+    )
+    .map((participantId) => ({
+      id: participantId,
+      name: `Remote ${participantId}`,
+      role: "remote",
+      speaking: true,
+      muted: false,
+      volume: 82,
+    }));
+  const participants = [
+    ...(localVoiceParticipant ? [localVoiceParticipant] : []),
+    ...backendVoiceParticipants,
+    ...remoteStreamParticipants,
+  ];
   const activeTheme =
     discryptUiConfig.themes.find(
       (theme) => theme.id === appState.preferences.theme_id,
@@ -1186,6 +1227,7 @@ function App() {
     localAudioTracks(voiceCaptureRef.current).forEach((track) => {
       track.enabled = !checked;
     });
+    voiceMediaSessionRef.current?.setMuted(checked);
     void applyCommand(setSelfMute({ session_id: sessionId, muted: checked }));
   }
 
@@ -1280,6 +1322,46 @@ function App() {
               captured_at_ms: voiceAccess.activity_captured_at_ms,
             }),
           );
+        }
+        const voiceSession = joinedState.voice_session;
+        const voicePeers = textRuntimePeerDefaults(joinedState);
+        if (voiceSession) {
+          voiceMediaSessionRef.current = startWebViewVoiceMediaSession({
+            session: voiceSession,
+            localStream: voiceAccess.stream,
+            localPeerId: voicePeers.local,
+            remotePeerId: voicePeers.remote,
+            role: textRuntimeRole(joinedState),
+            connectivity: voiceConnectivityForState(joinedState),
+            onRemoteTrack: (track) => {
+              setVoiceRemoteStreams((current) => ({
+                ...current,
+                [track.participant_id]: track.stream,
+              }));
+            },
+            onRemoteMedia: (evidence) => {
+              setVoiceRemoteStreams((current) => ({
+                ...current,
+                [evidence.participant_id]: evidence.stream,
+              }));
+              void applyCommand(
+              attachVoiceRemoteMedia({
+                session_id: voiceSession.session_id,
+                participant_id: evidence.participant_id,
+                participant_name: evidence.participant_name,
+                remote_peer_id: evidence.remote_peer_id,
+                stream_id: evidence.stream_id,
+                audio_track_id: evidence.audio_track_id,
+                playback_element_id: evidence.playback_element_id,
+                local_audio_tracks_sent: evidence.local_audio_tracks_sent,
+                received_audio_frames: evidence.received_audio_frames,
+                speaking: evidence.speaking,
+                attached_at_ms: evidence.attached_at_ms,
+              }),
+            );
+            },
+            onStatus: (status) => setCommandError(status),
+          });
         }
       }
       return;
@@ -1553,6 +1635,7 @@ function App() {
               localUserId={appState.profile?.user_id ?? null}
               voiceSession={appState.voice_session}
               remoteAudio={appState.voice_session?.media_runtime.remote_audio ?? []}
+              remoteStreams={voiceRemoteStreams}
               voiceStates={appState.voice_states}
               voiceJoined={voiceJoined}
               selfMuted={selfMuted}
@@ -3624,6 +3707,7 @@ function VoicePanel({
   localUserId,
   voiceSession,
   remoteAudio,
+  remoteStreams,
   voiceStates,
   voiceJoined,
   selfMuted,
@@ -3639,6 +3723,7 @@ function VoicePanel({
   localUserId: string | null;
   voiceSession: VoiceSessionView | null;
   remoteAudio: VoiceRemoteAudioView[];
+  remoteStreams: Record<string, MediaStream>;
   voiceStates: VoiceStateView[];
   voiceJoined: boolean;
   selfMuted: boolean;
@@ -3649,16 +3734,22 @@ function VoicePanel({
 }) {
   const mediaRuntime = voiceSession?.media_runtime ?? inactiveVoiceMediaRuntime;
   const remoteTransportActive = Boolean(mediaRuntime.remote_transport_active);
-  const remoteParticipantCount = participants.filter(
-    (participant) => !isLocalVoiceParticipant(participant, localUserId),
-  ).length;
-  const suppressedRemoteCount =
-    voiceJoined && !remoteTransportActive ? remoteParticipantCount : 0;
+  const hasRemoteStream = (participant: VoiceParticipant) =>
+    Boolean(remoteStreams[participant.id]);
+  const suppressedRemoteCount = voiceJoined
+    ? participants.filter(
+        (participant) =>
+          !isLocalVoiceParticipant(participant, localUserId) &&
+          !remoteTransportActive &&
+          !hasRemoteStream(participant),
+      ).length
+    : 0;
   const visibleParticipants = voiceJoined
     ? participants.filter(
         (participant) =>
           isLocalVoiceParticipant(participant, localUserId) ||
-          remoteTransportActive,
+          remoteTransportActive ||
+          hasRemoteStream(participant),
       )
     : [];
   const permissionDenied = Boolean(voiceSession?.permission_denied_copy);
@@ -3718,6 +3809,9 @@ function VoicePanel({
             const audioSource = isLocalParticipant
               ? null
               : remoteAudioSource(participant, mediaRuntime);
+            const remoteStream = isLocalParticipant
+              ? null
+              : remoteStreams[participant.id];
             return (
               <div
                 key={participant.id}
@@ -3770,6 +3864,12 @@ function VoicePanel({
                       <RemoteAudioAttachment
                         participant={participant}
                         src={audioSource}
+                        stream={remoteStream}
+                      />
+                    ) : remoteStream ? (
+                      <RemoteAudioAttachment
+                        participant={participant}
+                        stream={remoteStream}
                       />
                     ) : (
                       <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
@@ -3813,6 +3913,14 @@ function VoicePanel({
                     data-stream-id={track.stream_id}
                     data-audio-track-id={track.audio_track_id}
                     autoPlay
+                    ref={(element) => {
+                      if (element) {
+                        element.srcObject =
+                          voiceSession?.joined && remoteStreams[track.participant_id]
+                            ? remoteStreams[track.participant_id]
+                            : null;
+                      }
+                    }}
                   />
                   <span>
                     Backend evidence: sent {track.local_audio_tracks_sent} local audio track(s), received {track.received_audio_frames} remote audio frame(s).
@@ -3891,9 +3999,11 @@ function VoicePanel({
 function RemoteAudioAttachment({
   participant,
   src,
+  stream,
 }: {
   participant: VoiceParticipant;
-  src: string;
+  src?: string | null;
+  stream?: MediaStream | null;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   useEffect(() => {
@@ -3904,6 +4014,16 @@ function RemoteAudioAttachment({
       );
     }
   }, [participant.volume]);
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.srcObject = stream ?? null;
+    return () => {
+      if (audio.srcObject === stream) {
+        audio.srcObject = null;
+      }
+    };
+  }, [stream]);
   return (
     <audio
       ref={audioRef}
@@ -3911,7 +4031,7 @@ function RemoteAudioAttachment({
       data-testid="voice-remote-audio"
       autoPlay
       playsInline
-      src={src}
+      src={stream ? undefined : (src ?? undefined)}
     />
   );
 }
