@@ -1934,56 +1934,21 @@ struct OpenMlsGroupHandleRecord {
     status_copy: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReceivedTextRender {
-    Pipeline(TextRenderState),
-    EnvelopeOnly { reason: String },
-    DecryptFailed,
+struct OpenMlsAdmissionKeyPackage {
+    group_id: String,
+    member_identity: String,
+    signer_public_key_hex: String,
+    package: OpenMlsMemberPackage,
 }
 
-impl ReceivedTextRender {
-    fn message_fields(&self, envelope: &TextMessageEnvelope) -> (String, String, String, String, String) {
-        let ciphertext_hash = hex::encode(envelope.ciphertext_hash());
-        match self {
-            Self::Pipeline(TextRenderState::Decrypted(plaintext)) => (
-                String::from_utf8_lossy(plaintext).into_owned(),
-                "signed encrypted peer envelope verified and decrypted through TextInboundPipeline using the persisted OpenMLS text exporter".to_owned(),
-                "received_plaintext".to_owned(),
-                "Plaintext received".to_owned(),
-                "plaintext rendered through TextInboundPipeline".to_owned(),
-            ),
-            Self::Pipeline(TextRenderState::Locked { reason }) => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
-                format!("signed encrypted peer envelope verified, but plaintext is locked: {reason}"),
-                "received_locked".to_owned(),
-                "Envelope locked".to_owned(),
-                format!("plaintext not rendered because {reason}"),
-            ),
-            Self::EnvelopeOnly { reason } => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
-                format!("signed encrypted peer envelope verified and persisted; plaintext render unavailable: {reason}"),
-                "received_envelope".to_owned(),
-                "Envelope received".to_owned(),
-                format!("plaintext not rendered because {reason}"),
-            ),
-            Self::DecryptFailed => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
-                "signed encrypted peer envelope verified, but TextInboundPipeline could not decrypt with the persisted OpenMLS exporter; plaintext was not rendered".to_owned(),
-                "received_decrypt_failed".to_owned(),
-                "Decrypt failed".to_owned(),
-                "plaintext not rendered because exporter-backed decryption failed".to_owned(),
-            ),
-        }
-    }
-
-    fn event_label(&self) -> &'static str {
-        match self {
-            Self::Pipeline(TextRenderState::Decrypted(_)) => "plaintext_rendered",
-            Self::Pipeline(TextRenderState::Locked { .. }) => "plaintext_locked",
-            Self::EnvelopeOnly { .. } => "envelope_only",
-            Self::DecryptFailed => "decrypt_failed",
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenMlsAdmissionWelcome {
+    group_id: String,
+    owner_signer_public_key_hex: String,
+    member_signer_public_key_hex: String,
+    welcome_bytes: Vec<u8>,
+    epoch: u64,
+    confirmation_tag_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2231,7 +2196,6 @@ impl TauriAppService {
                 redacted_observable_ref("group", group_id)
             ),
         );
-        self.persist();
         Ok(OpenMlsAdmissionKeyPackage {
             group_id: group_id.to_owned(),
             member_identity,
@@ -2291,7 +2255,6 @@ impl TauriAppService {
                 redacted_observable_ref("group", &key_package.group_id)
             ),
         );
-        self.persist();
         Ok(OpenMlsAdmissionWelcome {
             group_id: key_package.group_id.clone(),
             owner_signer_public_key_hex: owner_record.signer_public_key_hex,
@@ -2347,7 +2310,6 @@ impl TauriAppService {
                 redacted_observable_ref("group", &welcome.group_id)
             ),
         );
-        self.persist();
         Ok(())
     }
 
