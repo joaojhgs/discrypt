@@ -1427,6 +1427,7 @@ dependencies = [
  "tauri-build",
  "tokio",
  "uuid",
+ "webkit2gtk",
 ]
 
 [[package]]
