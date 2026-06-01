@@ -1888,6 +1888,23 @@ struct OpenMlsGroupHandleRecord {
     status_copy: String,
 }
 
+struct OpenMlsAdmissionKeyPackage {
+    group_id: String,
+    member_identity: String,
+    signer_public_key_hex: String,
+    package: OpenMlsMemberPackage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenMlsAdmissionWelcome {
+    group_id: String,
+    owner_signer_public_key_hex: String,
+    member_signer_public_key_hex: String,
+    welcome_bytes: Vec<u8>,
+    epoch: u64,
+    confirmation_tag_sha256: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -2104,6 +2121,150 @@ impl TauriAppService {
                 ),
             },
         }
+    }
+
+    fn openmls_store_path(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(path) = &self.state_path_override {
+            return openmls_store_path_for_app_state_path(path);
+        }
+        app_openmls_store_path()
+    }
+
+    fn request_openmls_admission_key_package(
+        &mut self,
+        group_id: &str,
+    ) -> Result<OpenMlsAdmissionKeyPackage, String> {
+        self.state.ensure_ready_profile();
+        let member_identity = self.state.local_user_id();
+        let mut engine = OpenMlsGroupEngine::open(self.openmls_store_path())
+            .map_err(|error| format!("OpenMLS joiner provider could not be opened: {error}"))?;
+        let package = engine
+            .generate_member_package(member_identity.as_bytes())
+            .map_err(|error| format!("OpenMLS key package could not be generated: {error}"))?;
+        let signer_public_key_hex = hex::encode(package.signer_public_key());
+        self.state.push_event(
+            "mls.admission_key_package_created",
+            format!(
+                "Created OpenMLS admission key package for {}",
+                redacted_observable_ref("group", group_id)
+            ),
+        );
+        Ok(OpenMlsAdmissionKeyPackage {
+            group_id: group_id.to_owned(),
+            member_identity,
+            signer_public_key_hex,
+            package,
+        })
+    }
+
+    fn issue_openmls_admission_welcome(
+        &mut self,
+        key_package: &OpenMlsAdmissionKeyPackage,
+    ) -> Result<OpenMlsAdmissionWelcome, String> {
+        let owner_record = self
+            .state
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == key_package.group_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "OpenMLS owner group handle for {} is not persisted",
+                    key_package.group_id
+                )
+            })?;
+        let owner_signer_public_key = hex::decode(&owner_record.signer_public_key_hex)
+            .map_err(|error| format!("OpenMLS owner signer handle is not hex: {error}"))?;
+        let mut engine = OpenMlsGroupEngine::open(self.openmls_store_path())
+            .map_err(|error| format!("OpenMLS owner provider could not be opened: {error}"))?;
+        engine
+            .load_group(&key_package.group_id, &owner_signer_public_key)
+            .map_err(|error| format!("OpenMLS owner group could not be loaded: {error}"))?;
+        let result = engine
+            .add_member_package(&key_package.group_id, &key_package.package)
+            .map_err(|error| format!("OpenMLS member package could not be added: {error}"))?;
+        let welcome_bytes = result.welcome.clone().ok_or_else(|| {
+            "OpenMLS add_member_package did not produce a Welcome for the joiner".to_owned()
+        })?;
+        let mut confirmation_hash = Sha256::new();
+        confirmation_hash.update(&result.state.confirmation_tag);
+        let confirmation_tag_sha256 = hex::encode(confirmation_hash.finalize());
+        if let Some(record) = self
+            .state
+            .openmls_groups
+            .iter_mut()
+            .find(|record| record.group_id == key_package.group_id)
+        {
+            record.epoch = result.state.epoch;
+            record.confirmation_tag_sha256 = confirmation_tag_sha256.clone();
+            record.status_copy =
+                "OpenMLS owner added a joiner key package and produced an authorized Welcome"
+                    .to_owned();
+        }
+        self.state.push_event(
+            "mls.admission_welcome_created",
+            format!(
+                "Created OpenMLS Welcome for {}",
+                redacted_observable_ref("group", &key_package.group_id)
+            ),
+        );
+        Ok(OpenMlsAdmissionWelcome {
+            group_id: key_package.group_id.clone(),
+            owner_signer_public_key_hex: owner_record.signer_public_key_hex,
+            member_signer_public_key_hex: key_package.signer_public_key_hex.clone(),
+            welcome_bytes,
+            epoch: result.state.epoch,
+            confirmation_tag_sha256,
+        })
+    }
+
+    fn join_openmls_group_from_welcome(
+        &mut self,
+        welcome: &OpenMlsAdmissionWelcome,
+    ) -> Result<(), String> {
+        self.state.ensure_ready_profile();
+        let signer_public_key = hex::decode(&welcome.member_signer_public_key_hex)
+            .map_err(|error| format!("OpenMLS member signer handle is not hex: {error}"))?;
+        let mut engine = OpenMlsGroupEngine::open(self.openmls_store_path())
+            .map_err(|error| format!("OpenMLS joiner provider could not be opened: {error}"))?;
+        let snapshot = engine
+            .join_from_welcome(&welcome.group_id, &signer_public_key, &welcome.welcome_bytes)
+            .map_err(|error| format!("OpenMLS Welcome could not be joined: {error}"))?;
+        let mut confirmation_hash = Sha256::new();
+        confirmation_hash.update(&snapshot.confirmation_tag);
+        let confirmation_tag_sha256 = hex::encode(confirmation_hash.finalize());
+        if confirmation_tag_sha256 != welcome.confirmation_tag_sha256 {
+            return Err("OpenMLS joined confirmation tag did not match owner Welcome state".to_owned());
+        }
+        upsert_openmls_group_handle(
+            &mut self.state,
+            OpenMlsGroupHandleRecord {
+                group_id: welcome.group_id.clone(),
+                signer_public_key_hex: welcome.member_signer_public_key_hex.clone(),
+                epoch: snapshot.epoch,
+                confirmation_tag_sha256,
+                status_copy:
+                    "OpenMLS member joined from an authorized Welcome and persisted signer handle"
+                        .to_owned(),
+            },
+        );
+        if let Some(group) = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == welcome.group_id)
+        {
+            group.role = "member".to_owned();
+        }
+        self.state.push_event(
+            "mls.admission_welcome_joined",
+            format!(
+                "Joined OpenMLS group from Welcome for {}",
+                redacted_observable_ref("group", &welcome.group_id)
+            ),
+        );
+        Ok(())
     }
 
     fn persist_candidate(&self, state: &PersistedAppState) -> Result<(), CommandErrorView> {
@@ -8425,6 +8586,8 @@ impl From<&TextControlOutboxRecord> for TextControlOutboxFrameView {
             frame_sha256: record.frame_sha256.clone(),
         }
     }
+
+
 }
 
 fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, String> {
