@@ -36,6 +36,7 @@ const ice = read("crates/transport/src/ice.rs");
 const desktop = read("apps/desktop/src-tauri/src/lib.rs");
 const storage = read("crates/storage/src/appdb.rs");
 const commands = read("apps/ui/src/commands.ts");
+const voiceMedia = read("apps/ui/src/voice-media.ts");
 const ci = read(".github/workflows/ci.yml");
 const releaseMatrix = read("docs/release/release-verification-matrix.md");
 const handoff = read("docs/release/handoff-2026-06-01.md");
@@ -95,6 +96,20 @@ for (const token of [
   "MemoryAppDbKeychain is restricted to tests/local/non-production builds",
   "encrypted_app_db_round_trips_without_plaintext_in_db_or_wal",
 ]) requireText("encrypted app db", storage, token);
+
+for (const token of [
+  "LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED",
+  "tauriVoiceSignalingAvailable",
+  "createLocalDevVoiceSignalBroadcast",
+  "postLocalDevVoiceSignal",
+  "Backend sealed voice signaling failed closed",
+]) requireText("voice media sealed signaling fallback", voiceMedia, token);
+if (/catch\(\([^)]*\)\s*=>\s*\{[\s\S]{0,240}broadcast\?\.postMessage\(signal\)/.test(voiceMedia)) {
+  failures.push("voice-media must not recover from backend sealed signaling failure by posting raw BroadcastChannel signals");
+}
+if (/if\s*\(\s*tauriVoiceSignalingAvailable\(\)\s*\)\s*\{[\s\S]{0,900}broadcast\?\.postMessage\(signal\)/.test(voiceMedia)) {
+  failures.push("voice-media must not post raw BroadcastChannel signals while Tauri IPC is available");
+}
 
 for (const token of [
   "fn redacted_observable_ref",

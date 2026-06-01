@@ -47,6 +47,10 @@ type VoiceSignalTransport = {
   close: () => void;
 };
 
+const LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED =
+  import.meta.env.DEV ||
+  import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
+
 type StartVoiceMediaSessionOptions = {
   session: VoiceSessionView;
   localStream: MediaStream;
@@ -120,6 +124,7 @@ export function startWebViewVoiceMediaSession(
     channelId: options.session.channel_id,
     groupId: options.session.group_id,
     localPeerId: options.localPeerId,
+    onStatus: options.onStatus,
     sessionId: options.session.session_id,
     senderInstanceId,
     onSignal: (signal) => {
@@ -254,6 +259,7 @@ function createVoiceSignalTransport({
   groupId,
   localPeerId,
   onSignal,
+  onStatus,
   senderInstanceId,
   sessionId,
 }: {
@@ -261,13 +267,11 @@ function createVoiceSignalTransport({
   groupId: string;
   localPeerId: string;
   onSignal: (signal: VoiceSignal) => void;
+  onStatus?: (status: string) => void;
   senderInstanceId: string;
   sessionId: string;
 }): VoiceSignalTransport {
-  const broadcast =
-    typeof BroadcastChannel === "undefined"
-      ? null
-      : new BroadcastChannel(`discrypt-voice:${groupId}:${channelId}`);
+  const broadcast = createLocalDevVoiceSignalBroadcast(groupId, channelId);
   let closed = false;
   let pollTimer: number | null = null;
 
@@ -291,7 +295,7 @@ function createVoiceSignalTransport({
   }
 
   const pollBackendSignals = () => {
-    if (closed || !window.__TAURI__?.core?.invoke) return;
+    if (closed || !tauriVoiceSignalingAvailable()) return;
     void takePendingVoiceSignalingMessages({ session_id: sessionId, limit: 50 })
       .then(async (response) => {
         for (const message of response.messages) {
@@ -313,7 +317,7 @@ function createVoiceSignalTransport({
 
   return {
     send: (signal) => {
-      if (window.__TAURI__?.core?.invoke) {
+      if (tauriVoiceSignalingAvailable()) {
         void sealVoiceSignalPayload(signal)
           .then((sealedPayload) =>
             publishVoiceSignalingMessage({
@@ -326,12 +330,20 @@ function createVoiceSignalTransport({
               created_at_ms: Date.now(),
             }),
           )
-          .catch(() => {
-            broadcast?.postMessage(signal);
+          .catch((error) => {
+            onStatus?.(
+              `Backend sealed voice signaling failed closed: ${
+                error instanceof Error ? error.message : "unknown error"
+              }`,
+            );
           });
         return;
       }
-      broadcast?.postMessage(signal);
+      if (!postLocalDevVoiceSignal(broadcast, signal)) {
+        onStatus?.(
+          "Voice signaling unavailable: Tauri IPC is absent and local-dev/test BroadcastChannel fallback is disabled",
+        );
+      }
     },
     close: () => {
       closed = true;
@@ -339,6 +351,39 @@ function createVoiceSignalTransport({
       broadcast?.close();
     },
   };
+}
+
+function tauriVoiceSignalingAvailable(): boolean {
+  return Boolean(window.__TAURI__?.core?.invoke);
+}
+
+function createLocalDevVoiceSignalBroadcast(
+  groupId: string,
+  channelId: string,
+): BroadcastChannel | null {
+  if (
+    tauriVoiceSignalingAvailable() ||
+    !LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED ||
+    typeof BroadcastChannel === "undefined"
+  ) {
+    return null;
+  }
+  return new BroadcastChannel(`discrypt-voice:${groupId}:${channelId}`);
+}
+
+function postLocalDevVoiceSignal(
+  broadcast: BroadcastChannel | null,
+  signal: VoiceSignal,
+): boolean {
+  if (
+    tauriVoiceSignalingAvailable() ||
+    !LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED ||
+    !broadcast
+  ) {
+    return false;
+  }
+  broadcast.postMessage(signal);
+  return true;
 }
 
 function sessionDescriptionToInit(
