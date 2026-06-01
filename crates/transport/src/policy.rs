@@ -952,9 +952,11 @@ mod tests {
             "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
         )?;
 
-        let error = profile
-            .validate()
-            .expect_err("DNS bootstrap is not an accepted production IPFS default");
+        let Err(error) = profile.validate() else {
+            return Err(TransportError::InvalidConnectivityPolicy(
+                "DNS bootstrap is not an accepted production IPFS default".to_owned(),
+            ));
+        };
         assert!(format!("{error}").contains("production endpoint scheme is invalid"));
         Ok(())
     }
