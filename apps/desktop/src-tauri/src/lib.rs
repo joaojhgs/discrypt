@@ -34,12 +34,15 @@ use discrypt_mls_core::{
     Identity, OpenMlsGroupEngine, OpenMlsMemberPackage, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    DeliveryError, InMemoryTextAuthorLog, InMemoryTextReceiveEvents, InMemoryTextRecipientStore,
-    InMemoryTextSendEvents, InMemoryTextTransport, TextDeliveryReceipt, TextDeliveryReceiptInput,
-    TextInboundPipeline, TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput,
-    TextOutboundPipeline, TextOutboundRequest, TextReceiveState, TextRenderState,
-    TextRetentionMetadata, TextSelectedRoute,
+    DeliveryError, InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextAuthorLogEnvelope,
+    TextAuthorLogStore, TextDeliveryReceipt, TextDeliveryReceiptInput, TextInboundPipeline,
+    TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
+    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextReceiveState,
+    TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEvent, TextSendEventSink,
 };
+#[cfg(test)]
+use discrypt_mls_delivery::{InMemoryTextAuthorLog, InMemoryTextSendEvents, InMemoryTextTransport};
+
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
 #[cfg(any(test, not(all(target_os = "linux", feature = "production-storage"))))]
@@ -1969,6 +1972,7 @@ struct OpenMlsAdmissionKeyPackage {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
     owner_signer_public_key_hex: String,
@@ -1976,6 +1980,63 @@ struct OpenMlsAdmissionWelcome {
     welcome_bytes: Vec<u8>,
     epoch: u64,
     confirmation_tag_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceivedTextRender {
+    Pipeline(TextRenderState),
+    EnvelopeOnly { reason: String },
+    DecryptFailed,
+}
+
+impl ReceivedTextRender {
+    fn message_fields(
+        &self,
+        envelope: &TextMessageEnvelope,
+    ) -> (String, String, String, String, String) {
+        let ciphertext_hash = hex::encode(envelope.ciphertext_hash());
+        match self {
+            Self::Pipeline(TextRenderState::Decrypted(plaintext)) => (
+                String::from_utf8_lossy(plaintext).into_owned(),
+                "signed encrypted peer envelope verified and decrypted through TextInboundPipeline using the persisted OpenMLS text exporter".to_owned(),
+                "received_plaintext".to_owned(),
+                "Plaintext received".to_owned(),
+                "plaintext rendered through TextInboundPipeline".to_owned(),
+            ),
+            Self::Pipeline(TextRenderState::Locked { reason }) => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("signed encrypted peer envelope verified, but plaintext is locked: {reason}"),
+                "received_locked".to_owned(),
+                "Envelope locked".to_owned(),
+                format!("plaintext not rendered because {reason}"),
+            ),
+            Self::EnvelopeOnly { reason } => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!(
+                    "signed encrypted peer envelope verified and persisted; plaintext render unavailable: {reason}"
+                ),
+                "received_envelope".to_owned(),
+                "Envelope received".to_owned(),
+                format!("plaintext not rendered because {reason}"),
+            ),
+            Self::DecryptFailed => (
+                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                "signed encrypted peer envelope verified, but TextInboundPipeline could not decrypt with the persisted OpenMLS exporter; plaintext was not rendered".to_owned(),
+                "received_decrypt_failed".to_owned(),
+                "Decrypt failed".to_owned(),
+                "plaintext not rendered because exporter-backed decryption failed".to_owned(),
+            ),
+        }
+    }
+
+    fn event_label(&self) -> &'static str {
+        match self {
+            Self::Pipeline(TextRenderState::Decrypted(_)) => "plaintext_rendered",
+            Self::Pipeline(TextRenderState::Locked { .. }) => "plaintext_locked",
+            Self::EnvelopeOnly { .. } => "envelope_only",
+            Self::DecryptFailed => "decrypt_failed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2197,6 +2258,7 @@ impl TauriAppService {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+
     fn openmls_store_path(&self) -> PathBuf {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
@@ -2206,6 +2268,7 @@ impl TauriAppService {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+
     fn request_openmls_admission_key_package(
         &mut self,
         group_id: &str,
@@ -2235,6 +2298,7 @@ impl TauriAppService {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+
     fn issue_openmls_admission_welcome(
         &mut self,
         key_package: &OpenMlsAdmissionKeyPackage,
@@ -2298,6 +2362,7 @@ impl TauriAppService {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+
     fn join_openmls_group_from_welcome(
         &mut self,
         welcome: &OpenMlsAdmissionWelcome,
@@ -7759,7 +7824,6 @@ impl PersistedAppState {
         result
     }
 
-    #[allow(dead_code)]
     fn receive_text_plaintext_render(
         &mut self,
         request: &ReceiveTextDeliveryEnvelopeRequest,
@@ -7810,11 +7874,10 @@ impl PersistedAppState {
         }
     }
 
-    #[allow(dead_code)]
     fn openmls_text_exporter_for_receive(
         &self,
         target: &MessageTargetView,
-        delivery_group_id: &str,
+        _delivery_group_id: &str,
     ) -> Result<(Vec<u8>, u64), String> {
         if target.kind != "channel" {
             return Err(
@@ -7846,15 +7909,14 @@ impl PersistedAppState {
         let exporter = engine
             .export_secret(
                 openmls_group_id,
-                "discrypt/text",
-                delivery_group_id.as_bytes(),
+                TEXT_EXPORTER_LABEL,
+                TEXT_EXPORTER_CONTEXT,
                 32,
             )
             .map_err(|error| format!("OpenMLS text exporter failed: {error}"))?;
         Ok((exporter, snapshot.epoch))
     }
 
-    #[allow(dead_code)]
     fn text_receive_state_for_delivery_group(&self, delivery_group_id: &str) -> TextReceiveState {
         let mut state = TextReceiveState::default();
         for record in self
@@ -15930,6 +15992,223 @@ mod tests {
             .find(|message| message.message_id == message_id)
             .ok_or_else(|| "message row missing".to_owned())?;
         assert_eq!(message.state_key, "peer_receipt");
+        Ok(())
+    }
+
+    fn openmls_text_envelope_for_test(
+        group_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        plaintext: &str,
+        text_exporter_secret: &[u8],
+        sender: &SigningKey,
+    ) -> Result<TextMessageEnvelope, String> {
+        let mut log = InMemoryTextAuthorLog::default();
+        let mut transport = InMemoryTextTransport::default();
+        let mut events = InMemoryTextSendEvents::default();
+        let delivery_group_id = text_delivery_group_id(&MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.to_owned()),
+            channel_id: Some(channel_id.to_owned()),
+        })?;
+        let receipt = TextOutboundPipeline::new(&mut log, &mut transport, &mut events)
+            .send(
+                TextOutboundRequest {
+                    group_id: delivery_group_id,
+                    channel_id: channel_id.to_owned(),
+                    epoch: 0,
+                    sender_leaf: 1,
+                    sender_device_id: "remote-device".to_owned(),
+                    sequence: 1,
+                    message_id: message_id.to_owned(),
+                    retention: TextRetentionMetadata {
+                        policy: "app-default".to_owned(),
+                        created_at_ms: 1,
+                        expires_at_ms: None,
+                        delete_after_read: false,
+                    },
+                    plaintext: plaintext.as_bytes().to_vec(),
+                    sent_at_ms: 1,
+                    now: Utc::now(),
+                },
+                TextSelectedRoute {
+                    session_id: "test-text-session".to_owned(),
+                    route_label: "direct".to_owned(),
+                    overlay_hops: 0,
+                    ciphertext_only: true,
+                },
+                text_exporter_secret,
+                sender,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(receipt.envelope)
+    }
+
+    #[test]
+    fn receiver_command_decrypts_openmls_exporter_text_plaintext() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("receive-openmls-plaintext");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "OpenMLS Receive Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .iter()
+            .find(|group| group.name == "OpenMLS Receive Lab")
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| matches!(channel.kind, ChannelKind::Text))
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let mut engine = OpenMlsGroupEngine::open(app_openmls_store_path())
+            .map_err(|error| error.to_string())?;
+        let handle = load_state()
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "OpenMLS handle missing".to_owned())?;
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("OpenMLS signer key should decode: {error}"))?;
+        engine
+            .load_group(&group_id, &signer_public_key)
+            .map_err(|error| error.to_string())?;
+        let text_exporter_secret = engine
+            .export_secret(&group_id, TEXT_EXPORTER_LABEL, TEXT_EXPORTER_CONTEXT, 32)
+            .map_err(|error| error.to_string())?;
+        let sender = SigningKey::generate(&mut OsRng);
+        let envelope = openmls_text_envelope_for_test(
+            &group_id,
+            &channel_id,
+            "msg-openmls-plaintext",
+            "hello from remote openmls",
+            &text_exporter_secret,
+            &sender,
+        )?;
+
+        let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id),
+                channel_id: Some(channel_id),
+            },
+            envelope,
+            sender_verifying_key_hex: hex::encode(sender.verifying_key().as_bytes()),
+            recipient_leaf: Some(2),
+        });
+
+        assert!(response.receipt.is_some(), "{response:?}");
+        assert!(response.state.last_command_error.is_none(), "{response:?}");
+        let message = response
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message_id == "msg-openmls-plaintext")
+            .ok_or_else(|| "received message row missing".to_owned())?;
+        assert_eq!(message.state_key, "received_plaintext");
+        assert_eq!(message.body, "hello from remote openmls");
+        assert!(message
+            .status
+            .contains("decrypted through TextInboundPipeline"));
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_command_does_not_render_plaintext_for_invalid_signer_or_exporter(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("receive-openmls-invalid");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "OpenMLS Invalid Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .iter()
+            .find(|group| group.name == "OpenMLS Invalid Lab")
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| matches!(channel.kind, ChannelKind::Text))
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let sender = SigningKey::generate(&mut OsRng);
+        let wrong_sender = SigningKey::generate(&mut OsRng);
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: Some(channel_id.clone()),
+        };
+        let invalid_signer_envelope = openmls_text_envelope_for_test(
+            &group_id,
+            &channel_id,
+            "msg-invalid-signer",
+            "must not render",
+            b"wrong-exporter-but-signature-valid",
+            &sender,
+        )?;
+        let invalid_signer = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target: target.clone(),
+            envelope: invalid_signer_envelope,
+            sender_verifying_key_hex: hex::encode(wrong_sender.verifying_key().as_bytes()),
+            recipient_leaf: Some(2),
+        });
+        assert!(invalid_signer.receipt.is_none(), "{invalid_signer:?}");
+        assert!(invalid_signer
+            .state
+            .messages
+            .iter()
+            .all(|message| message.body != "must not render"));
+
+        let invalid_exporter_envelope = openmls_text_envelope_for_test(
+            &group_id,
+            &channel_id,
+            "msg-invalid-exporter",
+            "must not render exporter mismatch",
+            b"wrong-exporter-material",
+            &sender,
+        )?;
+        let invalid_exporter = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target,
+            envelope: invalid_exporter_envelope,
+            sender_verifying_key_hex: hex::encode(sender.verifying_key().as_bytes()),
+            recipient_leaf: Some(2),
+        });
+        assert!(invalid_exporter.receipt.is_some(), "{invalid_exporter:?}");
+        let message = invalid_exporter
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message_id == "msg-invalid-exporter")
+            .ok_or_else(|| "invalid exporter row missing".to_owned())?;
+        assert_eq!(message.state_key, "received_decrypt_failed");
+        assert_ne!(message.body, "must not render exporter mismatch");
+        assert!(message.body.contains("Encrypted message envelope received"));
         Ok(())
     }
 
