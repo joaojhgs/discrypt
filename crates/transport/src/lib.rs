@@ -232,13 +232,16 @@ impl Default for ConnectivityConfig {
     fn default() -> Self {
         Self {
             default_stun: Endpoint::new("stun:stun.l.google.com:19302"),
-            default_turn: Endpoint::new("turn:unconfigured.discrypt.invalid"),
+            default_turn: Endpoint::new(Self::UNCONFIGURED_TURN_ENDPOINT),
             overrides: EndpointOverrides::new(None, None),
         }
     }
 }
 
 impl ConnectivityConfig {
+    /// Placeholder TURN endpoint used when no relay credentials have been configured.
+    pub const UNCONFIGURED_TURN_ENDPOINT: &'static str = "turn:unconfigured.discrypt.invalid";
+
     /// Effective STUN endpoint after owner/group overrides.
     #[must_use]
     pub fn stun_endpoint(&self) -> Endpoint {
@@ -255,6 +258,12 @@ impl ConnectivityConfig {
             .turn
             .clone()
             .unwrap_or_else(|| self.default_turn.clone())
+    }
+
+    /// True only when TURN relay metadata came from configured policy/credentials.
+    #[must_use]
+    pub fn turn_relay_configured(&self) -> bool {
+        self.overrides.turn.is_some() || self.default_turn.0 != Self::UNCONFIGURED_TURN_ENDPOINT
     }
 }
 
@@ -537,9 +546,9 @@ impl ConnectivityPlanner {
             endpoint: config.turn_endpoint(),
             carries_content: false,
             ciphertext_only: true,
-            succeeded: nat.turn_available,
+            succeeded: nat.turn_available && config.turn_relay_configured(),
         });
-        if nat.turn_available {
+        if nat.turn_available && config.turn_relay_configured() {
             let endpoint = attempts[2].endpoint.clone();
             return Ok(ConnectivityPlan {
                 attempts,
@@ -559,9 +568,16 @@ mod tests {
     #[test]
     fn fallback_uses_stun_overlay_turn_order() -> Result<(), TransportError> {
         let config = ConnectivityConfig::default();
+        let turn_config = ConnectivityConfig {
+            overrides: EndpointOverrides::new(
+                None,
+                Some(Endpoint::new("turns:relay.example:5349")),
+            ),
+            ..ConnectivityConfig::default()
+        };
         let direct = ConnectivityPlanner::plan(&config, SimulatedNat::direct())?;
         let overlay = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?;
-        let turn = ConnectivityPlanner::plan(&config, SimulatedNat::turn_only())?;
+        let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
 
         assert_eq!(direct.selected, FallbackLeg::Stun);
         assert_eq!(overlay.selected, FallbackLeg::RelayOverlay);
@@ -588,6 +604,16 @@ mod tests {
 
         assert_eq!(stun.endpoint, Endpoint::new("stun:owner.example:3478"));
         assert_eq!(turn.endpoint, Endpoint::new("turns:owner.example:5349"));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_only_without_configured_relay_fails_closed() -> Result<(), TransportError> {
+        let plan =
+            ConnectivityPlanner::plan(&ConnectivityConfig::default(), SimulatedNat::turn_only());
+
+        assert_eq!(plan, Err(TransportError::NoViablePath));
+        assert!(!ConnectivityConfig::default().turn_relay_configured());
         Ok(())
     }
 

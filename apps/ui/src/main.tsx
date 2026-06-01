@@ -526,6 +526,69 @@ function parseTurnEndpointList(value: string) {
   }));
 }
 
+
+function turnCredentialGateCopy(policy: ConnectivityPolicyView | null): string {
+  const turnServers = policy?.ice_turn_servers ?? [];
+  const configured = turnServers.length;
+  const credentialed = turnServers.filter((server) => server.credential_declared).length;
+  if (configured === 0) {
+    return "No TURN relay is configured. If backend route checks report TURN required, voice/text transport must fail closed instead of claiming a connection.";
+  }
+  if (credentialed === 0) {
+    return `${configured} redacted TURN endpoint${configured === 1 ? " is" : "s are"} configured without declared credentials; relay success remains blocked until credentialed backend route evidence exists.`;
+  }
+  const expiring = turnServers.filter((server) => server.credential_expires_at).length;
+  const expiryCopy = expiring
+    ? ` ${expiring} credential${expiring === 1 ? " has" : "s have"} an expiry marker.`
+    : " Credentials are declared but not displayed in UI.";
+  return `${credentialed}/${configured} redacted TURN endpoint${configured === 1 ? "" : "s"} credential-gated for relay fallback; relay success is shown only after backend route proof.${expiryCopy}`;
+}
+
+function providerFallbackCopy(
+  diagnostics: TransportDiagnosticsView | null | undefined,
+): string {
+  const attempts = diagnostics?.adapter_fallback_attempts ?? [];
+  if (!attempts.length) {
+    return "No provider fallback attempt has been reported by backend diagnostics; retry/backoff remains unclaimed in this UI state.";
+  }
+  const selected = attempts.find((attempt) => attempt.selected);
+  const attempted = attempts.filter((attempt) => attempt.attempted).length;
+  const failed = attempts.filter(
+    (attempt) =>
+      attempt.attempted &&
+      !attempt.selected &&
+      /fail|unavailable|error|timeout|denied/i.test(
+        `${attempt.readiness} ${attempt.failure_class}`,
+      ),
+  ).length;
+  return selected
+    ? `Provider fallback selected ${selected.kind} after ${attempted} backend attempt${attempted === 1 ? "" : "s"}; recovery is shown only from backend diagnostics.`
+    : `${attempted} provider fallback attempt${attempted === 1 ? "" : "s"} reported, ${failed} failed/unavailable; retry/backoff stays visible as degraded until backend selects a healthy adapter.`;
+}
+
+function turnRequiredCopy(
+  diagnostics: TransportDiagnosticsView | null | undefined,
+  policy: ConnectivityPolicyView | null,
+): string {
+  const turnState = diagnostics?.turn_required ?? "not-proven";
+  const normalized = turnState.toLowerCase();
+  const turnServers = policy?.ice_turn_servers ?? [];
+  const credentialed = turnServers.filter((server) => server.credential_declared).length;
+  const required =
+    /required|needed|must|relay-only/.test(normalized) &&
+    !/not|none|false|unproven/.test(normalized);
+  if (!required) {
+    return `TURN-required state: ${turnState}. ${turnCredentialGateCopy(policy)}`;
+  }
+  if (!turnServers.length) {
+    return `TURN-required state: ${turnState}; no TURN endpoint is configured, so the app must fail closed and avoid claiming remote connectivity.`;
+  }
+  if (!credentialed) {
+    return `TURN-required state: ${turnState}; configured TURN endpoints have no declared credentials, so relay use remains blocked until backend proves credentialed relay success.`;
+  }
+  return `TURN-required state: ${turnState}; ${credentialed} credentialed redacted TURN endpoint${credentialed === 1 ? "" : "s"} can be tried, but success still requires backend route proof.`;
+}
+
 function Icon({
   children,
   className,
@@ -1639,6 +1702,8 @@ function App() {
               voiceStates={appState.voice_states}
               voiceJoined={voiceJoined}
               selfMuted={selfMuted}
+              connectivity={voiceConnectivityForState(appState)}
+              transportDiagnostics={appState.transport_diagnostics}
               diagnosticsEnabled={diagnosticsUiEnabled}
               setVoiceJoined={toggleVoiceJoin}
               setSelfMuted={toggleSelfMute}
@@ -2443,6 +2508,9 @@ function TransportStatusStrip({
             <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
               {diagnostics.route_proof_detail}
             </p>
+            <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              {providerFallbackCopy(diagnostics)}
+            </p>
             <div className="mt-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-xs font-semibold uppercase tracking-[0.12em] text-[hsl(var(--muted-foreground))]">
@@ -2581,6 +2649,10 @@ function transportBadgeVariant(
       "provider-roundtrip-failed",
       "webrtc-datachannel-failed",
       "no-healthy-adapter",
+      "provider-failed",
+      "retrying-fallback",
+      "turn-required",
+      "credential-gated",
     ].includes(status)
   ) {
     return "warning";
@@ -3423,6 +3495,17 @@ function ConnectivitySettingsPanel({
           <p className="mt-3 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
             {policy.privacy_label}
           </p>
+          <div className="mt-3 grid gap-2 rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+            <p className="font-semibold text-[hsl(var(--foreground))]">
+              TURN credential gate
+            </p>
+            <p>{turnCredentialGateCopy(policy)}</p>
+            <p>
+              Provider failed/fallback states come from backend diagnostics;
+              this settings view does not claim retry success without a selected
+              adapter proof.
+            </p>
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -3711,6 +3794,8 @@ function VoicePanel({
   voiceStates,
   voiceJoined,
   selfMuted,
+  connectivity,
+  transportDiagnostics,
   diagnosticsEnabled,
   setVoiceJoined,
   setSelfMuted,
@@ -3727,6 +3812,8 @@ function VoicePanel({
   voiceStates: VoiceStateView[];
   voiceJoined: boolean;
   selfMuted: boolean;
+  connectivity: ConnectivityPolicyView | null;
+  transportDiagnostics: TransportDiagnosticsView | null;
   diagnosticsEnabled: boolean;
   setVoiceJoined: (joined: boolean) => void;
   setSelfMuted: (muted: boolean) => void;
@@ -3972,6 +4059,14 @@ function VoicePanel({
                 : (mediaRuntime.fail_closed_reason ||
                   "Remote playback is not claimed until backend media-route evidence confirms a remote audio route.")
             }
+          />
+          <InfoRow
+            title="TURN relay gate"
+            copy={turnRequiredCopy(transportDiagnostics, connectivity)}
+          />
+          <InfoRow
+            title="Provider fallback state"
+            copy={providerFallbackCopy(transportDiagnostics)}
           />
           {diagnosticsEnabled ? (
             <InfoRow

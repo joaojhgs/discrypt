@@ -1404,6 +1404,52 @@ function deriveJoinProgress(state: AppState): JoinProgressStepView[] {
   ];
 }
 
+
+function transportTurnRequiredStatus(turnRequired: string): boolean {
+  const normalized = turnRequired.toLowerCase();
+  return (
+    /required|needed|must|relay-only/.test(normalized) &&
+    !/not|none|false|unproven/.test(normalized)
+  );
+}
+
+function providerFallbackState(
+  attempts: SignalingAdapterFallbackAttemptView[],
+  selectedAdapter: string | null,
+): { status: string; detail: string } {
+  if (selectedAdapter) {
+    return {
+      status: "selected",
+      detail: `Selected provider ${selectedAdapter} from backend fallback diagnostics`,
+    };
+  }
+  if (!attempts.length) {
+    return {
+      status: "no-healthy-adapter",
+      detail: "No backend-selected provider adapter is available; no retry/backoff attempts have been reported yet",
+    };
+  }
+  const attempted = attempts.filter((attempt) => attempt.attempted).length;
+  const failed = attempts.filter(
+    (attempt) =>
+      attempt.attempted &&
+      !attempt.selected &&
+      /fail|unavailable|error|timeout|denied/i.test(
+        `${attempt.readiness} ${attempt.failure_class}`,
+      ),
+  ).length;
+  if (failed > 0 && failed === attempted) {
+    return {
+      status: "provider-failed",
+      detail: `${failed} provider fallback attempt${failed === 1 ? "" : "s"} failed or unavailable; retry/backoff must remain degraded until backend selects a healthy adapter`,
+    };
+  }
+  return {
+    status: "retrying-fallback",
+    detail: `${attempted} provider fallback attempt${attempted === 1 ? "" : "s"} reported; retry/backoff is in progress until backend diagnostics select an adapter`,
+  };
+}
+
 function deriveTransportStatus(state: AppState): TransportStatusView[] {
   const latestInvite = state.invites.at(-1) ?? null;
   const hasGroup = state.groups.length > 0;
@@ -1414,6 +1460,7 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
   const selectedAdapter = state.transport_diagnostics?.selected_adapter ?? null;
   const fallbackAttempts =
     state.transport_diagnostics?.adapter_fallback_attempts ?? [];
+  const fallbackState = providerFallbackState(fallbackAttempts, selectedAdapter);
   const fallbackAttemptCopy = fallbackAttempts.length
     ? fallbackAttempts
         .map(
@@ -1428,6 +1475,11 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
         )
         .join(", ")
     : "no backend fallback attempts available";
+  const turnRequired = state.transport_diagnostics?.turn_required ?? "not-proven";
+  const turnRequiredNow = transportTurnRequiredStatus(turnRequired);
+  const credentialedTurn = latestInvite?.ice_turn_servers.filter(
+    (server) => server.credential_declared,
+  ).length ?? 0;
   return [
     {
       label: "signaling",
@@ -1438,10 +1490,8 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
     },
     {
       label: "adapter",
-      status: selectedAdapter ? "selected" : "no-healthy-adapter",
-      detail: selectedAdapter
-        ? `Selected provider ${selectedAdapter} from backend fallback diagnostics; readiness/fallback attempts: ${fallbackAttemptCopy}`
-        : `No backend-selected provider adapter is available; readiness/fallback attempts: ${fallbackAttemptCopy}`,
+      status: fallbackState.status,
+      detail: `${fallbackState.detail}; readiness/fallback attempts: ${fallbackAttemptCopy}`,
     },
     {
       label: "ICE",
@@ -1464,9 +1514,20 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
     },
     {
       label: "TURN",
-      status: hasTurn ? "configured" : "not-configured",
-      detail:
-        "TURN endpoints are redacted from signed invite metadata and are not treated as active without backend route evidence",
+      status: turnRequiredNow
+        ? hasTurn
+          ? credentialedTurn > 0
+            ? "credential-gated"
+            : "turn-required"
+          : "turn-required"
+        : hasTurn
+          ? "credential-gated"
+          : "not-configured",
+      detail: turnRequiredNow
+        ? hasTurn
+          ? `${credentialedTurn}/${latestInvite?.ice_turn_servers.length ?? 0} TURN endpoint(s) declare credentials; TURN-required route remains blocked until backend proves relay success`
+          : "Backend diagnostics report TURN required but no TURN endpoint is configured; transport must fail closed"
+        : "TURN endpoints are redacted from signed invite metadata and are credential-gated; they are not treated as active without backend route evidence",
     },
     {
       label: "degraded",
@@ -1477,9 +1538,11 @@ function deriveTransportStatus(state: AppState): TransportStatusView[] {
     },
     {
       label: "reconnecting",
-      status: "idle",
+      status: fallbackState.status === "retrying-fallback" ? "retrying-fallback" : "idle",
       detail:
-        "Reconnect orchestration is displayed only when event state reports reconnect attempts",
+        fallbackState.status === "retrying-fallback"
+          ? fallbackState.detail
+          : "Reconnect orchestration is displayed only when event state reports reconnect attempts",
     },
     {
       label: "failed",

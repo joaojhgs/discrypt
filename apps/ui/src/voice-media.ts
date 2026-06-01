@@ -487,9 +487,11 @@ function iceServersFromConnectivity(
 ): RTCIceServer[] {
   if (!connectivity) return [];
   const stun = connectivity.ice_stun_servers.map((url) => ({ urls: url }));
-  const turn = connectivity.ice_turn_servers.map((server) => ({
-    urls: server.endpoint,
-  }));
+  // TURN endpoints in UI policy are redacted metadata only. The browser
+  // RTCPeerConnection API requires username/credential values for turn(s):
+  // URLs, so keep relay use fail-closed here until a backend-proved,
+  // credential-bearing RTCIceServer handoff exists.
+  const turn: RTCIceServer[] = [];
   return [...stun, ...turn];
 }
 

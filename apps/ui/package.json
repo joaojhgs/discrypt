@@ -63,7 +63,8 @@
     "test:final-e2e-g131": "node ../../scripts/check-final-e2e-g131.mjs",
     "test:stun-turn-provider-privacy-g132": "node ../../scripts/check-stun-turn-provider-privacy-g132.mjs",
     "test:signaling-e2e-matrix-g132": "node ../../scripts/check-signaling-e2e-matrix-g132.mjs",
-    "test:provider-metadata-capture-g133": "node ../../scripts/check-provider-metadata-capture-g133.mjs"
+    "test:provider-metadata-capture-g133": "node ../../scripts/check-provider-metadata-capture-g133.mjs",
+    "test:g008-stun-turn-fallback": "node ../../scripts/check-g008-stun-turn-fallback.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
