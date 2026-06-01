@@ -61,6 +61,45 @@ export type VoiceParticipantView = {
   speaking: boolean;
   muted: boolean;
   volume: number;
+  remote_audio_src?: string | null;
+  media_stream_url?: string | null;
+};
+
+export type VoiceRemoteAudioStreamView = {
+  participant_id: string;
+  src: string;
+};
+
+export type VoiceRemoteAudioView = {
+  participant_id: string;
+  remote_peer_id: string;
+  stream_id: string;
+  audio_track_id: string;
+  playback_element_id: string;
+  local_audio_tracks_sent: number;
+  received_audio_frames: number;
+  attached_at_ms: number;
+};
+
+export type VoiceMediaRuntimeView = {
+  runtime_id: string;
+  boundary: string;
+  local_capture_active: boolean;
+  remote_transport_active: boolean;
+  remote_audio: VoiceRemoteAudioView[];
+  fail_closed_reason: string;
+  status_copy: string;
+  remote_audio_streams?: VoiceRemoteAudioStreamView[];
+};
+
+const inactiveVoiceMediaRuntime: VoiceMediaRuntimeView = {
+  runtime_id: "voice-runtime:not-started",
+  boundary: "not-started",
+  local_capture_active: false,
+  remote_transport_active: false,
+  remote_audio: [],
+  fail_closed_reason: "No voice media runtime has been started",
+  status_copy: "Voice media runtime is not started; no capture or playback route is active",
 };
 
 export type VoiceDeviceKind = "audio_input" | "audio_output";
@@ -76,6 +115,7 @@ export type SnapshotVoiceSessionView = {
   microphone_permission: string;
   input_device: VoiceDeviceDescriptor | null;
   output_device: VoiceDeviceDescriptor | null;
+  media_runtime?: VoiceMediaRuntimeView;
   participants: VoiceParticipantView[];
   status_copy: string;
   route_copy: string;
@@ -427,6 +467,7 @@ export type VoiceSessionView = {
   microphone_permission: string;
   input_device: VoiceDeviceDescriptor | null;
   output_device: VoiceDeviceDescriptor | null;
+  media_runtime: VoiceMediaRuntimeView;
   participants: VoiceParticipantView[];
   route_copy: string;
   status_copy: string;
@@ -760,6 +801,20 @@ export type UpdateVoiceActivityRequest = {
   captured_at_ms: number;
 };
 
+export type AttachVoiceRemoteMediaRequest = {
+  session_id: string;
+  participant_id: string;
+  participant_name: string;
+  remote_peer_id: string;
+  stream_id: string;
+  audio_track_id: string;
+  playback_element_id: string;
+  local_audio_tracks_sent: number;
+  received_audio_frames: number;
+  speaking?: boolean;
+  attached_at_ms: number;
+};
+
 export type SpeakerVolumeRequest = {
   session_id: string;
   participant_id: string;
@@ -861,6 +916,7 @@ const fallbackSnapshot: AppSnapshot = {
     microphone_permission: "unknown",
     input_device: null,
     output_device: null,
+    media_runtime: inactiveVoiceMediaRuntime,
     participants: [],
     status_copy: "Not joined; backend voice controls are idle",
     route_copy:
@@ -942,6 +998,44 @@ const fallbackState: AppState = {
   snapshot: fallbackSnapshot,
 };
 
+
+function defaultVoiceMediaRuntime(
+  sessionId: string,
+  joined: boolean,
+): VoiceMediaRuntimeView {
+  return joined
+    ? {
+        runtime_id: `voice-runtime:${sessionId}`,
+        boundary: "webview-local-capture",
+        local_capture_active: true,
+        remote_transport_active: false,
+        remote_audio: [],
+        fail_closed_reason:
+          "Remote WebRTC audio transport is not attached; backend state proves playback claims remain gated until media-route evidence exists",
+        status_copy:
+          "Local microphone capture admitted through backend session boundary; remote playback remains disabled until a real media transport attaches",
+      }
+    : {
+        runtime_id: `voice-runtime:${sessionId}`,
+        boundary: "stopped",
+        local_capture_active: false,
+        remote_transport_active: false,
+        remote_audio: [],
+        fail_closed_reason: "",
+        status_copy:
+          "Voice media runtime stopped by leave; local tracks and remote playback are inactive",
+      };
+}
+
+function normalizeVoiceSessionRuntime(state: AppState): void {
+  if (!state.voice_session) return;
+  state.voice_session.media_runtime ??= defaultVoiceMediaRuntime(
+    state.voice_session.session_id,
+    state.voice_session.joined,
+  );
+  state.voice_session.media_runtime.remote_audio ??= [];
+}
+
 function cloneState(state: AppState): AppState {
   return structuredClone(state);
 }
@@ -980,6 +1074,7 @@ function persistFallbackState(): void {
 }
 
 function syncSnapshot(state: AppState): AppState {
+  normalizeVoiceSessionRuntime(state);
   state.snapshot.schema_version = state.schema_version;
   state.snapshot.preferences = state.preferences;
   state.snapshot.devices = state.devices;
@@ -1012,6 +1107,7 @@ function syncSnapshot(state: AppState): AppState {
         microphone_permission: state.voice_session.microphone_permission,
         input_device: state.voice_session.input_device,
         output_device: state.voice_session.output_device,
+        media_runtime: state.voice_session.media_runtime,
         participants: state.voice_session.participants,
         status_copy: state.voice_session.status_copy,
         route_copy: state.voice_session.route_copy,
@@ -1022,6 +1118,7 @@ function syncSnapshot(state: AppState): AppState {
         microphone_permission: "unknown",
         input_device: null,
         output_device: null,
+        media_runtime: inactiveVoiceMediaRuntime,
         participants: [],
         status_copy: "Not joined; backend voice controls are idle",
         route_copy:
@@ -3245,6 +3342,29 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
         microphone_permission: request.microphone_permission,
         input_device: inputDevice,
         output_device: outputDevice,
+        media_runtime: captureAllowed
+          ? {
+              runtime_id: `voice-runtime:${request.channel_id}`,
+              boundary: "webview-local-capture",
+              local_capture_active: true,
+              remote_transport_active: false,
+              remote_audio: [],
+              fail_closed_reason:
+                "Remote audio transport remains disabled until backend media-route evidence attaches",
+              status_copy:
+                "Local capture is active; remote playback remains disabled until backend media-route evidence attaches",
+            }
+          : {
+              runtime_id: `voice-runtime:${request.channel_id}:fail-closed`,
+              boundary: "fail-closed",
+              local_capture_active: false,
+              remote_transport_active: false,
+              remote_audio: [],
+              fail_closed_reason:
+                "Microphone permission/input device required before joining voice",
+              status_copy:
+                "No local capture or remote playback route is active because voice permission was denied",
+            },
         participants: [
           {
             id: localUserId(state),
@@ -3311,15 +3431,40 @@ export async function leaveVoice(
         return;
       }
       state.voice_session.joined = false;
+      state.voice_session.media_runtime = {
+        runtime_id: `voice-runtime:${request.session_id}:stopped`,
+        boundary: "stopped",
+        local_capture_active: false,
+        remote_transport_active: false,
+        remote_audio: [],
+        fail_closed_reason: "Voice media runtime stopped after leave",
+        status_copy:
+          "Voice media runtime stopped; no local capture or remote playback route is active",
+      };
+      state.voice_session.route_copy =
+        "Voice media runtime stopped; no local capture or remote playback route is active";
       state.voice_session.status_copy =
         "Not joined; backend voice controls are idle";
-      state.voice_session.participants = state.voice_session.participants.map(
-        (participant) => ({
+      state.voice_session.route_copy =
+        "Voice media runtime stopped; no local capture or remote playback route is active";
+      state.voice_session.media_runtime = {
+        runtime_id: `voice-runtime:${request.session_id}`,
+        boundary: "stopped",
+        local_capture_active: false,
+        remote_transport_active: false,
+        remote_audio: [],
+        fail_closed_reason: "",
+        status_copy:
+          "Voice media runtime stopped by leave; local tracks and remote playback are inactive",
+      };
+      const localId = localUserId(state);
+      state.voice_session.participants = state.voice_session.participants
+        .filter((participant) => participant.id === localId || participant.role === "you")
+        .map((participant) => ({
           ...participant,
           speaking: false,
-        }),
-      );
-      pushEvent(state, "voice.left", "Left backend voice session");
+        }));
+      pushEvent(state, "voice.left", "Left backend voice session and cleared remote media attachments");
     }),
   );
 }
@@ -3421,8 +3566,10 @@ export async function updateVoiceActivity(
           volume: 82,
         });
       }
-      state.voice_session.route_copy =
-        "Local capture permission, device selection, and microphone level evidence are active; remote media transport remains gated until backend media-route evidence exists";
+      if (!state.voice_session.media_runtime.remote_transport_active) {
+        state.voice_session.route_copy =
+          "Local capture permission, device selection, and microphone level evidence are active; remote media transport remains gated until backend media-route evidence exists";
+      }
       state.voice_session.status_copy = selfMuted
         ? `Local microphone level observed at ${request.captured_at_ms} ms (rms ${request.rms_i16}, peak ${request.peak_i16}) but self-mute suppresses speaking state`
         : speaking
@@ -3432,6 +3579,122 @@ export async function updateVoiceActivity(
         state,
         "voice.activity",
         `Local microphone activity ${speaking ? "speaking" : "silent"}`,
+      );
+    }),
+  );
+}
+
+export async function attachVoiceRemoteMedia(
+  request: AttachVoiceRemoteMediaRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("attach_voice_remote_media", { request }, () =>
+    mutateFallback((state) => {
+      if (
+        !state.voice_session ||
+        state.voice_session.session_id !== request.session_id
+      ) {
+        pushCommandError(
+          state,
+          "voice.remote_media_rejected",
+          "attach_voice_remote_media",
+          "voice_session_not_found",
+          state.voice_session
+            ? "Remote media evidence did not match the active voice session"
+            : "No active voice session for remote media evidence",
+          "Join voice before attaching remote playback",
+        );
+        return;
+      }
+      if (!state.voice_session.joined) {
+        pushCommandError(
+          state,
+          "voice.remote_media_rejected",
+          "attach_voice_remote_media",
+          "voice_not_joined",
+          "Remote media evidence was ignored because the voice session is not joined",
+          "Join voice before attaching remote playback",
+        );
+        return;
+      }
+      const fields = [
+        request.participant_id,
+        request.remote_peer_id,
+        request.stream_id,
+        request.audio_track_id,
+        request.playback_element_id,
+      ];
+      if (
+        request.participant_id === localUserId(state) ||
+        fields.some((field) => !field.trim()) ||
+        request.local_audio_tracks_sent <= 0 ||
+        request.received_audio_frames <= 0
+      ) {
+        pushCommandError(
+          state,
+          "voice.remote_media_rejected",
+          "attach_voice_remote_media",
+          "voice_remote_media_evidence_invalid",
+          "Remote audio requires a non-local peer, a sent local audio track, and received remote audio frame evidence",
+          "Attach only backend media-route evidence from a real WebRTC remote audio track",
+        );
+        return;
+      }
+      const existing = state.voice_session.participants.find(
+        (participant) => participant.id === request.participant_id,
+      );
+      if (existing) {
+        state.voice_session.participants = state.voice_session.participants.map(
+          (participant) =>
+            participant.id === request.participant_id
+              ? {
+                  ...participant,
+                  name: request.participant_name,
+                  role: "remote",
+                  speaking: Boolean(request.speaking),
+                  muted: false,
+                }
+              : participant,
+        );
+      } else {
+        state.voice_session.participants.push({
+          id: request.participant_id,
+          name: request.participant_name,
+          role: "remote",
+          speaking: Boolean(request.speaking),
+          muted: false,
+          volume: 82,
+        });
+      }
+      state.voice_session.media_runtime.remote_audio = [
+        ...state.voice_session.media_runtime.remote_audio.filter(
+          (track) => track.participant_id !== request.participant_id,
+        ),
+        {
+          participant_id: request.participant_id,
+          remote_peer_id: request.remote_peer_id,
+          stream_id: request.stream_id,
+          audio_track_id: request.audio_track_id,
+          playback_element_id: request.playback_element_id,
+          local_audio_tracks_sent: request.local_audio_tracks_sent,
+          received_audio_frames: request.received_audio_frames,
+          attached_at_ms: request.attached_at_ms,
+        },
+      ];
+      state.voice_session.media_runtime = {
+        ...state.voice_session.media_runtime,
+        boundary: "webview-backend-state-audio",
+        local_capture_active: true,
+        remote_transport_active: true,
+        fail_closed_reason: "",
+        status_copy: `Backend media-route evidence attached remote WebRTC audio for ${request.participant_name} after sending ${request.local_audio_tracks_sent} local audio track(s) and receiving ${request.received_audio_frames} audio frame(s)`,
+      };
+      state.voice_session.route_copy =
+        "Backend media-route evidence attached real WebRTC remote audio playback; remote participants and volume controls are shown only for admitted remote tracks";
+      state.voice_session.status_copy = state.voice_session.media_runtime.status_copy;
+      pushEvent(
+        state,
+        "voice.remote_media_attached",
+        `Remote audio route proof attached for ${request.participant_name} via ${request.remote_peer_id}`,
       );
     }),
   );
@@ -3460,10 +3723,10 @@ export async function setSpeakerVolume(
         );
         return;
       }
-      const participantExists = state.voice_session.participants.some(
+      const targetParticipant = state.voice_session.participants.find(
         (participant) => participant.id === request.participant_id,
       );
-      if (!participantExists) {
+      if (!targetParticipant) {
         pushCommandError(
           state,
           "voice.volume_rejected",
@@ -3471,6 +3734,17 @@ export async function setSpeakerVolume(
           "voice_participant_not_found",
           "No matching voice participant for speaker volume",
           "Choose a visible participant from the voice member list",
+        );
+        return;
+      }
+      if (targetParticipant.id === localUserId(state) || targetParticipant.role !== "remote") {
+        pushCommandError(
+          state,
+          "voice.volume_rejected",
+          "set_speaker_volume",
+          "voice_volume_local_participant",
+          "Speaker volume applies only to backend-admitted remote audio participants",
+          "Wait for remote media evidence before changing per-peer volume",
         );
         return;
       }

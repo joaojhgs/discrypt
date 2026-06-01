@@ -287,18 +287,10 @@ async function attemptVoice(page: Page) {
   await expect(page.getByRole("slider", { name: /speaker volume/i })).toHaveCount(0);
   await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(true);
   expect((await readVoiceTrackState(page)).stopCount).toBe(0);
-  await expect(
-    page.getByText(/Join creates backend voice state and records selected devices/i),
-  ).toBeVisible();
-  await expect(page.getByText(/waiting-route-proof/i)).toBeVisible();
-  await expect(page.getByText("policy-only", { exact: true })).toBeVisible();
-  await expect(
-    page
-      .getByText(
-        /encrypted media transport remains gated by media-frame E2E|remote media transport remains gated until backend media-route evidence exists/i,
-      )
-      .first(),
-  ).toBeVisible();
+  await expect(page.getByText(/remote audio is not connected yet/i).first()).toBeVisible();
+  await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(0);
+  await expect(page.getByText(/media runtime/i)).toHaveCount(0);
+  await expect(page.getByTestId("voice-remote-audio")).toHaveCount(0);
   await expect(
     page.getByRole("switch", { name: /mute my microphone/i }),
   ).toBeEnabled();
@@ -315,6 +307,7 @@ async function attemptVoice(page: Page) {
   expect((await readVoiceTrackState(page)).stopCount).toBeGreaterThan(0);
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
+  await expect(page.getByText(/manual pairing|QR pairing/i)).toHaveCount(0);
 }
 
 test("two independent profiles exercise DM, invite join, and voice attempts honestly", async ({
@@ -394,6 +387,8 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     ).toHaveCount(0);
     await attemptVoice(alice.page);
     await attemptVoice(bob.page);
+    await reloadAndRepeatVoiceWithoutProfileLeakage(alice.page);
+    await reloadAndRepeatVoiceWithoutProfileLeakage(bob.page);
 
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);

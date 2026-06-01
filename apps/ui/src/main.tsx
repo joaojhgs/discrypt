@@ -24,7 +24,9 @@ import {
   TextStateView,
   TransportDiagnosticsView,
   TransportStatusView,
+  VoiceMediaRuntimeView,
   VoiceParticipantView,
+  VoiceRemoteAudioView,
   VoiceSessionView,
   VoiceStateView,
   RESET_APP_CONFIRMATION_PHRASE,
@@ -108,6 +110,37 @@ type VoiceActivityReading = {
 };
 
 type StopVoiceActivityCapture = () => void;
+
+const inactiveVoiceMediaRuntime: VoiceMediaRuntimeView = {
+  runtime_id: "voice-runtime:not-started",
+  boundary: "not-started",
+  local_capture_active: false,
+  remote_transport_active: false,
+  remote_audio: [],
+  fail_closed_reason: "No backend media-runtime evidence has been returned.",
+  status_copy: "No capture or remote playback route is active.",
+};
+
+function isLocalVoiceParticipant(
+  participant: VoiceParticipant,
+  localUserId: string | null,
+): boolean {
+  return participant.id === localUserId || participant.role === "you";
+}
+
+function remoteAudioSource(
+  participant: VoiceParticipant,
+  mediaRuntime: VoiceMediaRuntimeView,
+): string | null {
+  return (
+    mediaRuntime.remote_audio_streams?.find(
+      (stream) => stream.participant_id === participant.id,
+    )?.src ??
+    participant.remote_audio_src ??
+    participant.media_stream_url ??
+    null
+  );
+}
 
 function asThemeId(value: string): ThemeId {
   return discryptUiConfig.themes.some((theme) => theme.id === value)
@@ -1519,9 +1552,11 @@ function App() {
               participants={participants}
               localUserId={appState.profile?.user_id ?? null}
               voiceSession={appState.voice_session}
+              remoteAudio={appState.voice_session?.media_runtime.remote_audio ?? []}
               voiceStates={appState.voice_states}
               voiceJoined={voiceJoined}
               selfMuted={selfMuted}
+              diagnosticsEnabled={diagnosticsUiEnabled}
               setVoiceJoined={toggleVoiceJoin}
               setSelfMuted={toggleSelfMute}
               setVolume={setVolume}
@@ -1652,8 +1687,9 @@ function FirstRunPanel({
               </CardTitle>
               <CardDescription className="max-w-md text-base leading-7">
                 Create a local identity for this device, or recover
-                account-continuity metadata. No cloud history restore, QR
-                pairing, or content-key recovery is claimed here.
+                account-continuity metadata. No cloud history restore,
+                cross-device enrollment, or content-key recovery is claimed
+                here.
               </CardDescription>
               <div className="grid gap-3 pt-3 text-sm text-[hsl(var(--muted-foreground))]">
                 <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
@@ -3587,9 +3623,11 @@ function VoicePanel({
   participants,
   localUserId,
   voiceSession,
+  remoteAudio,
   voiceStates,
   voiceJoined,
   selfMuted,
+  diagnosticsEnabled,
   setVoiceJoined,
   setSelfMuted,
   setVolume,
@@ -3600,14 +3638,29 @@ function VoicePanel({
   participants: VoiceParticipant[];
   localUserId: string | null;
   voiceSession: VoiceSessionView | null;
+  remoteAudio: VoiceRemoteAudioView[];
   voiceStates: VoiceStateView[];
   voiceJoined: boolean;
   selfMuted: boolean;
+  diagnosticsEnabled: boolean;
   setVoiceJoined: (joined: boolean) => void;
   setSelfMuted: (muted: boolean) => void;
   setVolume: (id: string, value: number[]) => void;
 }) {
-  const visibleParticipants = voiceJoined ? participants : [];
+  const mediaRuntime = voiceSession?.media_runtime ?? inactiveVoiceMediaRuntime;
+  const remoteTransportActive = Boolean(mediaRuntime.remote_transport_active);
+  const remoteParticipantCount = participants.filter(
+    (participant) => !isLocalVoiceParticipant(participant, localUserId),
+  ).length;
+  const suppressedRemoteCount =
+    voiceJoined && !remoteTransportActive ? remoteParticipantCount : 0;
+  const visibleParticipants = voiceJoined
+    ? participants.filter(
+        (participant) =>
+          isLocalVoiceParticipant(participant, localUserId) ||
+          remoteTransportActive,
+      )
+    : [];
   const permissionDenied = Boolean(voiceSession?.permission_denied_copy);
   const deviceCopy = voiceSession?.input_device
     ? `${voiceSession.input_device.label} → ${
@@ -3631,7 +3684,7 @@ function VoicePanel({
           </div>
         </CardHeader>
         <CardContent className="grid gap-3">
-          <VoiceStateGrid states={voiceStates} />
+          {diagnosticsEnabled ? <VoiceStateGrid states={voiceStates} /> : null}
           {!voiceJoined ? (
             <EmptyState
               title={permissionDenied ? "Microphone blocked" : "Not in voice"}
@@ -3649,9 +3702,22 @@ function VoicePanel({
               copy="The backend returned an empty participant list."
             />
           ) : null}
+          {suppressedRemoteCount > 0 ? (
+            <EmptyState
+              title="Remote audio unavailable"
+              copy={`${suppressedRemoteCount} backend participant${
+                suppressedRemoteCount === 1 ? "" : "s"
+              } hidden until the app confirms a real remote audio route.`}
+            />
+          ) : null}
           {visibleParticipants.map((participant) => {
-            const isLocalParticipant =
-              participant.id === localUserId || participant.role === "you";
+            const isLocalParticipant = isLocalVoiceParticipant(
+              participant,
+              localUserId,
+            );
+            const audioSource = isLocalParticipant
+              ? null
+              : remoteAudioSource(participant, mediaRuntime);
             return (
               <div
                 key={participant.id}
@@ -3699,24 +3765,62 @@ function VoicePanel({
                     analyser.
                   </p>
                 ) : (
-                  <div className="flex items-center gap-3">
-                    <Icon>vol</Icon>
-                    <Slider
-                      aria-label={`${participant.name} speaker volume`}
-                      data-testid="voice-remote-volume"
-                      value={[participant.volume]}
-                      min={0}
-                      max={100}
-                      step={1}
-                      onValueChange={(value) =>
-                        setVolume(participant.id, value)
-                      }
-                    />
+                  <div className="grid gap-2">
+                    {audioSource ? (
+                      <RemoteAudioAttachment
+                        participant={participant}
+                        src={audioSource}
+                      />
+                    ) : (
+                      <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                        Backend remote transport is active; waiting for an
+                        audio stream handle before attaching playback.
+                      </p>
+                    )}
+                    <div className="flex items-center gap-3">
+                      <Icon>vol</Icon>
+                      <Slider
+                        aria-label={`${participant.name} speaker volume`}
+                        data-testid="voice-remote-volume"
+                        value={[participant.volume]}
+                        min={0}
+                        max={100}
+                        step={1}
+                        onValueChange={(value) =>
+                          setVolume(participant.id, value)
+                        }
+                      />
+                    </div>
                   </div>
                 )}
               </div>
             );
           })}
+          {voiceJoined && remoteAudio.length > 0 ? (
+            <div className="grid gap-2 rounded-2xl border border-emerald-300/30 bg-emerald-300/10 p-4">
+              <p className="text-sm font-medium">Remote playback attachments</p>
+              {remoteAudio.map((track) => (
+                <div
+                  key={`${track.participant_id}:${track.audio_track_id}`}
+                  data-testid="voice-remote-audio-boundary"
+                  className="grid gap-2 text-xs text-[hsl(var(--muted-foreground))]"
+                >
+                  <audio
+                    id={track.playback_element_id}
+                    data-testid="voice-remote-audio"
+                    data-participant-id={track.participant_id}
+                    data-remote-peer-id={track.remote_peer_id}
+                    data-stream-id={track.stream_id}
+                    data-audio-track-id={track.audio_track_id}
+                    autoPlay
+                  />
+                  <span>
+                    Backend evidence: sent {track.local_audio_tracks_sent} local audio track(s), received {track.received_audio_frames} remote audio frame(s).
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
       <Card className="h-fit">
@@ -3743,17 +3847,34 @@ function VoicePanel({
           </Button>
           <InfoRow title="Selected devices" copy={deviceCopy} />
           <InfoRow
-            title="Media route proof"
+            title="Remote audio"
             copy={
               voiceJoined
-                ? route
-                : "No media route proof until microphone permission, device selection, and media-frame E2E are present."
+                ? remoteTransportActive
+                  ? route
+                  : "Remote audio is not connected yet. Remote speakers appear only after the app confirms a real audio route."
+                : "Join voice to check microphone access and audio-route status."
             }
           />
           <InfoRow
-            title="Remote audio blocker"
-            copy="Remote playback is not claimed until a two-profile media-frame E2E records audio frames over configured signaling/ICE."
+            title="Audio status"
+            copy={
+              remoteTransportActive
+                ? mediaRuntime.status_copy
+                : (mediaRuntime.fail_closed_reason ||
+                  "Remote playback is not claimed until backend media-route evidence confirms a remote audio route.")
+            }
           />
+          {diagnosticsEnabled ? (
+            <InfoRow
+              title="Media runtime"
+              copy={`${mediaRuntime.boundary} · local capture ${
+                mediaRuntime.local_capture_active ? "active" : "inactive"
+              } · remote transport ${
+                remoteTransportActive ? "active" : "fail-closed"
+              }`}
+            />
+          ) : null}
           <InfoRow
             title="Voice honesty"
             copy={
@@ -3764,6 +3885,34 @@ function VoicePanel({
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+function RemoteAudioAttachment({
+  participant,
+  src,
+}: {
+  participant: VoiceParticipant;
+  src: string;
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = Math.max(
+        0,
+        Math.min(1, participant.volume / 100),
+      );
+    }
+  }, [participant.volume]);
+  return (
+    <audio
+      ref={audioRef}
+      aria-label={`${participant.name} remote audio`}
+      data-testid="voice-remote-audio"
+      autoPlay
+      playsInline
+      src={src}
+    />
   );
 }
 
