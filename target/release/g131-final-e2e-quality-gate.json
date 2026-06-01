@@ -1,6 +1,6 @@
 {
   "schema_version": "discrypt.g131.final_e2e_quality_gate.v1",
-  "generated_at": "2026-06-01T14:10:39.038Z",
+  "generated_at": "2026-06-01T14:33:13.795Z",
   "status": "readiness-gate-passed",
   "gate": "G131-final-e2e-verification-acr",
   "serialized_playwright_e2e": true,
@@ -9,6 +9,7 @@
     "npm --prefix apps/ui run test:final-e2e-g131",
     "npm --prefix apps/ui run test:release-two-profile-harness-g010",
     "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
+    "npm --prefix apps/ui run test:g011-boundary",
     "npm --prefix apps/ui run test:e2e",
     "npm --prefix apps/ui run test:ui-integration-g130",
     "npm --prefix apps/ui run test:release-no-fallback-g129",
