@@ -29,6 +29,9 @@ for (const token of [
   "shared vite dev server",
   "profile_state_files",
   "screenshot_capability",
+  "launch_ready_timeout_ms",
+  "tauri-build-preflight.log",
+  "launch_readiness",
   "G012 is not complete until two launched Tauri profiles complete text plus voice UX proof",
 ]) requireText("G012 harness", harness, token);
 
