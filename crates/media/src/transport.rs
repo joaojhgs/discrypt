@@ -419,6 +419,8 @@ mod tests {
                 vec![
                     " turn:relay.example:3478 ".into(),
                     "stun:stun.example:3478".into(),
+                    "stun:stun.example:3478".into(),
+                    "  ".into(),
                 ],
                 VoiceDeviceSelection::new(
                     MicrophonePermissionState::Granted,
@@ -489,6 +491,40 @@ mod tests {
             decision.selected_path(),
             MediaTransportPath::WebviewEncodedTransform
         );
+    }
+
+    #[test]
+    fn desktop_never_builds_android_native_contingency_even_without_encoded_transform(
+    ) -> Result<(), NativeWebRtcRsContingencyError> {
+        let decision = AndroidVoiceContingency {
+            platform: "linux".into(),
+            encoded_transform_supported: false,
+        };
+        let selection = VoiceDeviceSelection::new(
+            MicrophonePermissionState::Granted,
+            Some(VoiceDeviceDescriptor::new(
+                "desktop-mic",
+                "Desktop microphone",
+                VoiceDeviceKind::AudioInput,
+            )),
+            Some(VoiceDeviceDescriptor::new(
+                "desktop-speaker",
+                "Desktop speaker",
+                VoiceDeviceKind::AudioOutput,
+            )),
+        );
+
+        assert_eq!(
+            decision.native_plan(vec!["turn:relay.example:3478".into()], selection)?,
+            None
+        );
+        let media_path = decision.media_path_decision();
+        assert_eq!(media_path.path, MediaTransportPath::WebviewEncodedTransform);
+        assert!(media_path.webview_rtc_peer_connection);
+        assert!(!media_path.native_webrtc_rs_contingency);
+        assert!(media_path.encoded_transform_required);
+        assert!(media_path.preserves_rust_sframe_boundary());
+        Ok(())
     }
 
     #[test]

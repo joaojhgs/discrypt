@@ -237,13 +237,14 @@ test("group invite join text channel and voice controls work without fake member
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
-  await expect(page.getByText(/Speaking/).first()).toBeVisible();
-  await expect(page.getByText(/active/).first()).toBeVisible();
   await expect(page.getByText(/speaking now/).first()).toBeVisible();
   await expect(
-    page.getByText(/remote media transport remains gated until backend media-route evidence exists/i).first(),
+    page.getByText(/remote audio is not connected yet/i).first(),
   ).toBeVisible();
   // Coverage token: Local microphone level comes from the active MediaStream analyser.
+  await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(0);
+  await expect(page.getByText(/media runtime/i)).toHaveCount(0);
+  await expect(page.getByTestId("voice-remote-audio")).toHaveCount(0);
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
@@ -331,6 +332,7 @@ test("production UX hides diagnostics and manual transport controls by default",
   await expect(
     page.getByText(/verify provider-signaled webrtc transport/i),
   ).toHaveCount(0);
+  await expect(page.getByText(/manual pairing|QR pairing/i)).toHaveCount(0);
 
   await page.getByRole("button", { name: "Create group" }).click();
   await page.getByLabel("Group name").fill("Policy Lab");
@@ -348,4 +350,12 @@ test("production UX hides diagnostics and manual transport controls by default",
     page.getByText(/invite ready: discrypt:\/\/join\/v1/i),
   ).toBeVisible();
   await expect(page.getByText(/Rendezvous link/i)).toBeVisible();
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await page.getByRole("button", { name: /join call/i }).click();
+  await expect(page.getByText(/remote audio is not connected yet/i).first()).toBeVisible();
+  await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(0);
+  await expect(page.getByText(/media runtime/i)).toHaveCount(0);
+  await expect(page.getByTestId("voice-remote-audio")).toHaveCount(0);
+  await expect(page.getByTestId("voice-remote-volume")).toHaveCount(0);
 });

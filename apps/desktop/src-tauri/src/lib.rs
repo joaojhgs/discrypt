@@ -547,8 +547,29 @@ pub struct VoiceParticipantView {
     pub speaking: bool,
     /// Whether the participant is muted.
     pub muted: bool,
-    /// Local speaker volume 0-100.
+    /// Per-peer remote speaker volume 0-100. Local participants keep the default value but cannot be volume-targeted.
     pub volume: u8,
+}
+
+/// Backend-state proof for one attached remote audio receiver.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceRemoteAudioView {
+    /// Remote participant represented by the received audio track.
+    pub participant_id: String,
+    /// Provider/runtime peer id that produced the track.
+    pub remote_peer_id: String,
+    /// Browser/native MediaStream id that owns the remote audio track.
+    pub stream_id: String,
+    /// Remote audio MediaStreamTrack id.
+    pub audio_track_id: String,
+    /// Stable DOM element id that should attach/play this remote stream.
+    pub playback_element_id: String,
+    /// Count of local audio tracks attached to the WebRTC sender side for this session.
+    pub local_audio_tracks_sent: u16,
+    /// Count of authenticated/received remote audio frames observed before surfacing playback.
+    pub received_audio_frames: u64,
+    /// Backend/browser capture timestamp associated with the evidence.
+    pub attached_at_ms: u64,
 }
 
 /// Backend-owned media runtime boundary recorded for a voice session.
@@ -562,6 +583,9 @@ pub struct VoiceMediaRuntimeView {
     pub local_capture_active: bool,
     /// Backend-state proof flag for whether remote WebRTC audio transport is attached and allowed to claim playback.
     pub remote_transport_active: bool,
+    /// Remote audio receivers admitted by backend media-route evidence.
+    #[serde(default)]
+    pub remote_audio: Vec<VoiceRemoteAudioView>,
     /// Empty when not fail-closed; otherwise explains the production gate.
     pub fail_closed_reason: String,
     /// Honest status copy for UI and audit surfaces.
@@ -575,6 +599,7 @@ impl Default for VoiceMediaRuntimeView {
             boundary: "not-started".to_owned(),
             local_capture_active: false,
             remote_transport_active: false,
+            remote_audio: Vec::new(),
             fail_closed_reason: "No voice media runtime has been started".to_owned(),
             status_copy:
                 "Voice media runtime is not started; no capture or playback route is active"
@@ -1313,6 +1338,34 @@ pub struct UpdateVoiceActivityRequest {
     pub peak_i16: u16,
     /// Browser/native capture timestamp in milliseconds for event correlation.
     pub captured_at_ms: u64,
+}
+
+/// Request carrying backend-state proof that a real remote audio track is attached.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachVoiceRemoteMediaRequest {
+    /// Session id.
+    pub session_id: String,
+    /// Remote participant identifier; must not be the local profile id.
+    pub participant_id: String,
+    /// Display name for the remote participant.
+    pub participant_name: String,
+    /// Provider/runtime peer id that produced the track.
+    pub remote_peer_id: String,
+    /// Browser/native MediaStream id that owns the remote audio track.
+    pub stream_id: String,
+    /// Remote audio MediaStreamTrack id.
+    pub audio_track_id: String,
+    /// Stable DOM element id that should attach/play this remote stream.
+    pub playback_element_id: String,
+    /// Count of local audio tracks attached to the sender side.
+    pub local_audio_tracks_sent: u16,
+    /// Count of remote audio frames observed before playback is surfaced.
+    pub received_audio_frames: u64,
+    /// Whether latest remote audio-level/VAD evidence marks this peer as speaking.
+    #[serde(default)]
+    pub speaking: bool,
+    /// Evidence timestamp in milliseconds.
+    pub attached_at_ms: u64,
 }
 
 /// Request to set a participant speaker volume.
@@ -3961,6 +4014,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
 /// Tauri command: leave a voice session.
 pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
+        let local_user_id = state.local_user_id();
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 session.joined = false;
@@ -3969,10 +4023,16 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
                     "Voice media runtime stopped; no local capture or remote playback route is active"
                         .to_owned();
                 session.status_copy = VOICE_SESSION_NOT_JOINED_COPY.to_owned();
+                session
+                    .participants
+                    .retain(|participant| participant.id == local_user_id);
                 for participant in &mut session.participants {
                     participant.speaking = false;
                 }
-                state.push_event("voice.left", "Left command-backed local voice session");
+                state.push_event(
+                    "voice.left",
+                    "Left command-backed local voice session and cleared remote media attachments",
+                );
             } else {
                 state.push_command_error(
                     "voice.leave_ignored",
@@ -4122,27 +4182,159 @@ pub fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateVie
     })
 }
 
+/// Tauri command: attach backend-state proof for one real remote audio track.
+pub fn attach_voice_remote_media(request: AttachVoiceRemoteMediaRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        let local_user_id = state.local_user_id();
+        if let Some(session) = &mut state.voice_session {
+            if session.session_id != request.session_id {
+                state.push_command_error(
+                    "voice.remote_media_rejected",
+                    "attach_voice_remote_media",
+                    "voice_session_not_found",
+                    "Remote media evidence did not match the active voice session",
+                    "Join the active voice session before attaching remote audio",
+                );
+                return;
+            }
+            if !session.joined {
+                state.push_command_error(
+                    "voice.remote_media_rejected",
+                    "attach_voice_remote_media",
+                    "voice_not_joined",
+                    "Remote media evidence was ignored because the voice session is not joined",
+                    "Join voice before attaching remote playback",
+                );
+                return;
+            }
+            let evidence_fields = [
+                request.participant_id.trim(),
+                request.remote_peer_id.trim(),
+                request.stream_id.trim(),
+                request.audio_track_id.trim(),
+                request.playback_element_id.trim(),
+            ];
+            if request.participant_id == local_user_id
+                || evidence_fields.iter().any(|field| field.is_empty())
+                || request.local_audio_tracks_sent == 0
+                || request.received_audio_frames == 0
+            {
+                state.push_command_error(
+                    "voice.remote_media_rejected",
+                    "attach_voice_remote_media",
+                    "voice_remote_media_evidence_invalid",
+                    "Remote audio requires a non-local peer, a sent local audio track, and received remote audio frame evidence",
+                    "Attach only backend media-route evidence from a real WebRTC remote audio track",
+                );
+                return;
+            }
+
+            let existing_volume = session
+                .participants
+                .iter()
+                .find(|participant| participant.id == request.participant_id)
+                .map(|participant| participant.volume)
+                .unwrap_or(82);
+            if let Some(participant) = session
+                .participants
+                .iter_mut()
+                .find(|participant| participant.id == request.participant_id)
+            {
+                participant.name = request.participant_name.clone();
+                participant.role = "remote".to_owned();
+                participant.speaking = request.speaking;
+                participant.muted = false;
+            } else {
+                session.participants.push(VoiceParticipantView {
+                    id: request.participant_id.clone(),
+                    name: request.participant_name.clone(),
+                    role: "remote".to_owned(),
+                    speaking: request.speaking,
+                    muted: false,
+                    volume: existing_volume,
+                });
+            }
+
+            let remote_audio = VoiceRemoteAudioView {
+                participant_id: request.participant_id.clone(),
+                remote_peer_id: request.remote_peer_id.clone(),
+                stream_id: request.stream_id.clone(),
+                audio_track_id: request.audio_track_id.clone(),
+                playback_element_id: request.playback_element_id.clone(),
+                local_audio_tracks_sent: request.local_audio_tracks_sent,
+                received_audio_frames: request.received_audio_frames,
+                attached_at_ms: request.attached_at_ms,
+            };
+            session
+                .media_runtime
+                .remote_audio
+                .retain(|track| track.participant_id != request.participant_id);
+            session.media_runtime.remote_audio.push(remote_audio);
+            session.media_runtime.boundary = "webview-backend-state-audio".to_owned();
+            session.media_runtime.local_capture_active = true;
+            session.media_runtime.remote_transport_active = true;
+            session.media_runtime.fail_closed_reason.clear();
+            session.media_runtime.status_copy = format!(
+                "Backend media-route evidence attached remote WebRTC audio for {} after sending {} local audio track(s) and receiving {} audio frame(s)",
+                request.participant_name, request.local_audio_tracks_sent, request.received_audio_frames
+            );
+            session.route_copy =
+                "Backend media-route evidence attached real WebRTC remote audio playback; remote participants and volume controls are shown only for admitted remote tracks"
+                    .to_owned();
+            session.status_copy = session.media_runtime.status_copy.clone();
+            state.push_event(
+                "voice.remote_media_attached",
+                format!(
+                    "Remote audio route proof attached for {} via {}",
+                    request.participant_name, request.remote_peer_id
+                ),
+            );
+        } else {
+            state.push_command_error(
+                "voice.remote_media_rejected",
+                "attach_voice_remote_media",
+                "voice_session_not_found",
+                "No active voice session for remote media evidence",
+                "Join voice before attaching remote playback",
+            );
+        }
+    })
+}
+
 /// Tauri command: persist a participant speaker volume.
 pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
     mutate_app_service(|state| {
+        let local_user_id = state.local_user_id();
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 let volume = request.volume.min(100);
-                if let Some(participant) = session
+                if let Some(participant_index) = session
                     .participants
-                    .iter_mut()
-                    .find(|participant| participant.id == request.participant_id)
+                    .iter()
+                    .position(|participant| participant.id == request.participant_id)
                 {
-                    participant.volume = volume;
-                    let name = participant.name.clone();
-                    state.push_event("voice.volume", format!("Set {name} volume to {volume}"));
+                    let participant = &session.participants[participant_index];
+                    if participant.id == local_user_id || participant.role != "remote" {
+                        state.push_command_error(
+                            "voice.volume_rejected",
+                            "set_speaker_volume",
+                            "voice_volume_local_participant",
+                            "Speaker volume applies only to backend-admitted remote audio participants",
+                            "Wait for remote media evidence before changing per-peer volume",
+                        );
+                    } else {
+                        let participant = &mut session.participants[participant_index];
+                        participant.volume = volume;
+                        let name = participant.name.clone();
+                        state.push_event("voice.volume", format!("Set {name} volume to {volume}"));
+                    }
                 } else {
                     state.push_command_error(
                         "voice.volume_rejected",
                         "set_speaker_volume",
                         "voice_participant_not_found",
                         "No matching voice participant for speaker volume",
-                        "Choose a visible participant from the voice member list",
+                        "Choose a visible remote participant from the voice member list",
                     );
                 }
             } else {
@@ -4615,6 +4807,16 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn attach_voice_remote_media(
+        app_handle: tauri::AppHandle,
+        request: AttachVoiceRemoteMediaRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::attach_voice_remote_media(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn set_speaker_volume(
         app_handle: tauri::AppHandle,
         request: SetSpeakerVolumeRequest,
@@ -4699,6 +4901,7 @@ pub fn run() {
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
             ipc_commands::update_voice_activity,
+            ipc_commands::attach_voice_remote_media,
             ipc_commands::set_speaker_volume,
             ipc_commands::poll_app_events,
             ipc_commands::deletion_warning,
@@ -7877,6 +8080,7 @@ fn voice_media_runtime_for_join(
             boundary: "webview-local-capture".to_owned(),
             local_capture_active: true,
             remote_transport_active: false,
+            remote_audio: Vec::new(),
             fail_closed_reason: "Remote WebRTC audio transport is not attached; backend state proves playback claims remain gated until media-route evidence exists".to_owned(),
             status_copy: format!(
                 "Local microphone capture admitted through backend session boundary using {}; remote playback remains disabled until a real media transport attaches",
@@ -7893,6 +8097,7 @@ fn voice_media_runtime_for_join(
             boundary: "fail-closed".to_owned(),
             local_capture_active: false,
             remote_transport_active: false,
+            remote_audio: Vec::new(),
             fail_closed_reason: selection.status_copy(),
             status_copy:
                 "Voice media runtime did not start because capture permission/device gates failed"
@@ -7907,6 +8112,7 @@ fn voice_media_runtime_for_leave(session_id: &str) -> VoiceMediaRuntimeView {
         boundary: "stopped".to_owned(),
         local_capture_active: false,
         remote_transport_active: false,
+        remote_audio: Vec::new(),
         fail_closed_reason: String::new(),
         status_copy:
             "Voice media runtime stopped by leave; local tracks and remote playback are inactive"
@@ -9686,6 +9892,22 @@ mod tests {
         path
     }
 
+    fn attach_test_remote_voice(session_id: &str, participant_id: &str) -> AppStateView {
+        attach_voice_remote_media(AttachVoiceRemoteMediaRequest {
+            session_id: session_id.to_owned(),
+            participant_id: participant_id.to_owned(),
+            participant_name: "Remote peer".to_owned(),
+            remote_peer_id: format!("peer-{participant_id}"),
+            stream_id: format!("stream-{participant_id}"),
+            audio_track_id: format!("track-{participant_id}"),
+            playback_element_id: format!("audio-{participant_id}"),
+            local_audio_tracks_sent: 1,
+            received_audio_frames: 3,
+            speaking: true,
+            attached_at_ms: 1_700_000_000_000,
+        })
+    }
+
     fn reload_global_app_service_from_path(path: &std::path::Path) {
         std::env::set_var("DISCRYPT_APP_STATE_PATH", path);
         let mut store = FileAppStore::new(path);
@@ -10104,9 +10326,28 @@ mod tests {
             .as_ref()
             .map(|session| session.self_muted)
             .unwrap_or(false));
-        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+        let local_volume_rejected = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id: voice_session_id.clone(),
             participant_id: alice_user_id.clone(),
+            volume: 55,
+        });
+        assert_eq!(
+            local_volume_rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("voice_volume_local_participant")
+        );
+        let remote_participant_id = "remote-alice-proof".to_owned();
+        let remote_attached = attach_test_remote_voice(&voice_session_id, &remote_participant_id);
+        assert!(remote_attached
+            .voice_session
+            .as_ref()
+            .map(|session| session.media_runtime.remote_transport_active)
+            .unwrap_or(false));
+        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: voice_session_id.clone(),
+            participant_id: remote_participant_id.clone(),
             volume: 55,
         });
         assert_eq!(
@@ -10116,7 +10357,7 @@ mod tests {
                 .and_then(|session| session
                     .participants
                     .iter()
-                    .find(|participant| participant.id == alice_user_id))
+                    .find(|participant| participant.id == remote_participant_id))
                 .map(|participant| participant.volume),
             Some(55)
         );
@@ -10551,16 +10792,33 @@ mod tests {
             .as_ref()
             .map(|session| session.self_muted)
             .unwrap_or(false));
+        let local_volume_rejected = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: voice_session_id.clone(),
+            participant_id: alice_profile_id.clone(),
+            volume: 37,
+        });
+        assert_eq!(
+            local_volume_rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("voice_volume_local_participant")
+        );
+        let remote_participant_id = "remote-volume-proof".to_owned();
+        attach_test_remote_voice(&voice_session_id, &remote_participant_id);
         let volume_voice = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id: voice_session_id,
-            participant_id: alice_profile_id.clone(),
+            participant_id: remote_participant_id.clone(),
             volume: 37,
         });
         assert_eq!(
             volume_voice
                 .voice_session
                 .as_ref()
-                .and_then(|session| session.participants.first())
+                .and_then(|session| session
+                    .participants
+                    .iter()
+                    .find(|participant| participant.id == remote_participant_id))
                 .map(|participant| participant.volume),
             Some(37)
         );
@@ -10634,12 +10892,20 @@ mod tests {
                         .output_device
                         .as_ref()
                         .map(|device| device.device_id.as_str()),
+                    session.media_runtime.remote_transport_active,
                     session
                         .participants
-                        .first()
+                        .iter()
+                        .find(|participant| participant.id == remote_participant_id)
                         .map(|participant| participant.volume)
                 )),
-            Some((true, Some("alice-mic"), Some("alice-speaker"), Some(37)))
+            Some((
+                true,
+                Some("alice-mic"),
+                Some("alice-speaker"),
+                true,
+                Some(37)
+            ))
         );
         assert_eq!(
             alice_reloaded_before_receipt
@@ -11856,9 +12122,34 @@ mod tests {
             .as_ref()
             .map(|profile| profile.user_id.clone())
             .unwrap_or_default();
-        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+        let local_volume_rejected = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id: session_id.clone(),
             participant_id: local_user_id.clone(),
+            volume: 55,
+        });
+        assert_eq!(
+            local_volume_rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("voice_volume_local_participant")
+        );
+        let remote_participant_id = "remote-call-proof".to_owned();
+        let remote_attached = attach_test_remote_voice(&session_id, &remote_participant_id);
+        assert!(remote_attached
+            .voice_session
+            .as_ref()
+            .map(|session| {
+                session.media_runtime.remote_transport_active
+                    && session.media_runtime.remote_audio.len() == 1
+                    && session.participants.iter().any(|participant| {
+                        participant.id == remote_participant_id && participant.role == "remote"
+                    })
+            })
+            .unwrap_or(false));
+        let volume = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: session_id.clone(),
+            participant_id: remote_participant_id.clone(),
             volume: 55,
         });
         assert_eq!(
@@ -11868,7 +12159,7 @@ mod tests {
                 .and_then(|session| session
                     .participants
                     .iter()
-                    .find(|participant| participant.id == local_user_id))
+                    .find(|participant| participant.id == remote_participant_id))
                 .map(|participant| participant.volume),
             Some(55)
         );
@@ -11881,12 +12172,120 @@ mod tests {
         assert_eq!(session.media_runtime.boundary, "stopped");
         assert!(!session.media_runtime.local_capture_active);
         assert!(!session.media_runtime.remote_transport_active);
+        assert!(session.media_runtime.remote_audio.is_empty());
+        assert!(session
+            .participants
+            .iter()
+            .all(|participant| participant.role == "you"));
         assert!(session
             .participants
             .iter()
             .all(|participant| !participant.speaking));
         assert!(!left.groups.is_empty());
         assert_eq!(left.lifecycle, AppLifecycle::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn voice_rejoin_preserves_self_mute_and_suppresses_speaking_until_unmuted() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("voice-rejoin-muted");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Mute Persistence Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "joined session".to_owned())?;
+        set_self_mute(SetSelfMuteRequest {
+            session_id: session_id.clone(),
+            muted: true,
+        });
+        leave_voice(LeaveVoiceRequest { session_id });
+
+        let rejoined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+        let rejoined_session = rejoined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "rejoined session".to_owned())?;
+        assert!(rejoined_session.joined);
+        assert!(rejoined_session.self_muted);
+        let rejoined_session_id = rejoined_session.session_id.clone();
+        let muted_activity = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: rejoined_session_id.clone(),
+            rms_i16: 8_000,
+            peak_i16: 16_000,
+            captured_at_ms: 2_000,
+        });
+        assert!(muted_activity
+            .voice_session
+            .as_ref()
+            .and_then(|session| session
+                .participants
+                .iter()
+                .find(|participant| participant.role == "you"))
+            .map(|participant| participant.muted && !participant.speaking)
+            .unwrap_or(false));
+        let unmuted = set_self_mute(SetSelfMuteRequest {
+            session_id: rejoined_session_id.clone(),
+            muted: false,
+        });
+        assert!(!unmuted
+            .voice_session
+            .as_ref()
+            .map(|session| session.self_muted)
+            .unwrap_or(true));
+        let unmuted_activity = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: rejoined_session_id,
+            rms_i16: 8_000,
+            peak_i16: 16_000,
+            captured_at_ms: 2_100,
+        });
+        assert!(unmuted_activity
+            .voice_session
+            .as_ref()
+            .and_then(|session| session
+                .participants
+                .iter()
+                .find(|participant| participant.role == "you"))
+            .map(|participant| !participant.muted && participant.speaking)
+            .unwrap_or(false));
         Ok(())
     }
 
@@ -14049,9 +14448,23 @@ mod tests {
             .and_then(|session| session.participants.first())
             .map(|participant| participant.id.clone())
             .ok_or_else(|| "voice participant id missing".to_owned())?;
+        let local_volume_rejected = set_speaker_volume(SetSpeakerVolumeRequest {
+            session_id: session_id.clone(),
+            participant_id: local_participant_id,
+            volume: 37,
+        });
+        assert_eq!(
+            local_volume_rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("voice_volume_local_participant")
+        );
+        let remote_participant_id = "remote-reload-proof".to_owned();
+        attach_test_remote_voice(&session_id, &remote_participant_id);
         let volume = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id,
-            participant_id: local_participant_id,
+            participant_id: remote_participant_id.clone(),
             volume: 37,
         });
         assert!(volume.last_command_error.is_none(), "{volume:?}");
@@ -14131,7 +14544,10 @@ mod tests {
         assert!(reloaded_voice
             .participants
             .iter()
-            .any(|participant| participant.muted && participant.volume == 37));
+            .any(|participant| participant.id == remote_participant_id
+                && participant.role == "remote"
+                && !participant.muted
+                && participant.volume == 37));
         assert_eq!(
             alice_reloaded
                 .active_context

@@ -132,6 +132,6 @@ export const setupChecklist = [
 export const activityFeed = [
   "Invite policy checked: expiry + max-use + revoke controls",
   "Android wake path is content-free",
-  "Voice relay is disabled until media/socket E2E gates pass",
+  "Remote voice audio stays unavailable until a real audio route is confirmed",
   "Deletion copy includes offline-device caveat",
 ];
