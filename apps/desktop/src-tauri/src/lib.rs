@@ -13997,19 +13997,94 @@ mod tests {
                 group_id: Some(group.group_id.clone()),
                 channel_id: Some(channel_id),
             },
-            body: "must not send without MLS".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let error = rejected
-            .last_command_error
-            .as_ref()
-            .ok_or_else(|| "missing OpenMLS send should fail closed".to_owned())?;
-        assert_eq!(error.command, "send_message");
-        assert_eq!(error.code, "text_delivery_envelope_failed");
-        assert!(error.message.contains("OpenMLS group state is missing"));
-        assert!(rejected.messages.is_empty());
-        assert!(load_state().text_control_outbox.is_empty());
+            false,
+        );
+        bob.persist();
+        let bob_package = bob.request_openmls_admission_key_package(&group_id)?;
+        assert_eq!(bob_package.group_id, group_id);
+        assert_eq!(bob_package.member_identity, bob.state.local_user_id());
+        assert!(!bob_package.signer_public_key_hex.is_empty());
+
+        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
+        let welcome = alice.issue_openmls_admission_welcome(&bob_package)?;
+        assert_eq!(welcome.group_id, group_id);
+        assert_eq!(welcome.epoch, 1);
+        assert_eq!(
+            welcome.member_signer_public_key_hex,
+            bob_package.signer_public_key_hex
+        );
+        assert!(!welcome.owner_signer_public_key_hex.is_empty());
+        assert!(!welcome.welcome_bytes.is_empty());
+
+        bob.join_openmls_group_from_welcome(&welcome)?;
+        let bob_handle = bob
+            .state
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "bob OpenMLS handle missing after Welcome join".to_owned())?;
+        assert_eq!(bob_handle.epoch, welcome.epoch);
+        assert_eq!(
+            bob_handle.signer_public_key_hex,
+            bob_package.signer_public_key_hex
+        );
+        assert_eq!(
+            bob_handle.confirmation_tag_sha256,
+            welcome.confirmation_tag_sha256
+        );
+
+        let alice_handle = alice
+            .state
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "alice OpenMLS handle missing after Welcome issue".to_owned())?;
+        assert_eq!(alice_handle.epoch, welcome.epoch);
+        assert_eq!(
+            alice_handle.confirmation_tag_sha256,
+            welcome.confirmation_tag_sha256
+        );
+
+        let mut alice_engine = OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(
+            &alice_path,
+        ))
+        .map_err(|error| format!("alice OpenMLS provider could not be reopened: {error}"))?;
+        alice_engine
+            .load_group(
+                &group_id,
+                &hex::decode(&alice_handle.signer_public_key_hex)
+                    .map_err(|error| format!("alice signer handle was not hex: {error}"))?,
+            )
+            .map_err(|error| format!("alice OpenMLS group could not be rehydrated: {error}"))?;
+        let mut bob_engine =
+            OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(&bob_path))
+                .map_err(|error| format!("bob OpenMLS provider could not be reopened: {error}"))?;
+        bob_engine
+            .load_group(
+                &group_id,
+                &hex::decode(&bob_handle.signer_public_key_hex)
+                    .map_err(|error| format!("bob signer handle was not hex: {error}"))?,
+            )
+            .map_err(|error| format!("bob OpenMLS group could not be rehydrated: {error}"))?;
+
+        let context = format!("g012-admission:{group_id}");
+        let alice_export = alice_engine
+            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
+            .map_err(|error| format!("alice exporter failed: {error}"))?;
+        let bob_export = bob_engine
+            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
+            .map_err(|error| format!("bob exporter failed: {error}"))?;
+        assert_eq!(alice_export, bob_export);
+        assert_eq!(alice_export.len(), 32);
+
+        let persisted_bob = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        assert!(persisted_bob.openmls_groups.iter().any(|handle| {
+            handle.group_id == group_id
+                && handle.signer_public_key_hex == bob_handle.signer_public_key_hex
+                && handle.epoch == welcome.epoch
+        }));
         Ok(())
     }
 
