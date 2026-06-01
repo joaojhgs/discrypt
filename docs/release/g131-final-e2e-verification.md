@@ -20,6 +20,7 @@ cargo fmt --all --check
 npm --prefix apps/ui run test:final-e2e-g131
 npm --prefix apps/ui run test:release-two-profile-harness-g010
 npm --prefix apps/ui run release:two-profile-harness-g010:dry-run
+npm --prefix apps/ui run test:g011-boundary
 npm --prefix apps/ui run test:e2e
 npm --prefix apps/ui run test:ui-integration-g130
 npm --prefix apps/ui run test:release-no-fallback-g129
