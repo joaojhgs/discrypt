@@ -32,8 +32,10 @@ use discrypt_mls_core::{
     Identity, OpenMlsGroupEngine, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    TextDeliveryReceipt, TextDeliveryReceiptInput, TextMessageEnvelope, TextMessageEnvelopeInput,
-    TextRetentionMetadata,
+    DeliveryError, TextAuthorLogEnvelope, TextAuthorLogStore, TextDeliveryReceipt,
+    TextDeliveryReceiptInput, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
+    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextRetentionMetadata,
+    TextSelectedRoute, TextSendEvent, TextSendEventSink,
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
@@ -88,6 +90,8 @@ const UI_THEME_IDS: &[&str] = &["midnight-steel", "graphite-calm", "ocean-contra
 const UI_TEMPLATE_IDS: &[&str] = &["command-center", "compact-ops"];
 const INVITE_CREATE_LIMIT: u32 = 5;
 const TEXT_SEND_LIMIT: u32 = 20;
+const TEXT_EXPORTER_LABEL: &str = "discrypt/text";
+const TEXT_EXPORTER_CONTEXT: &[u8] = b"discrypt-tauri-text-v1";
 const ADMISSION_HELPER_ATTEMPT_LIMIT: u32 = 5;
 const SIGNALING_ACTION_LIMIT: u32 = 60;
 const ABUSE_WINDOW_SECONDS: i64 = 60;
@@ -1845,6 +1849,49 @@ impl fmt::Debug for TextControlTransportRuntime {
             .field("owns_provider_runtime", &self.owned_runtime.is_some())
             .field("owns_executor", &self.executor.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+struct AppTextAuthorLog {
+    entries: Vec<TextAuthorLogEnvelope>,
+}
+
+impl TextAuthorLogStore for AppTextAuthorLog {
+    fn append_author_log(&mut self, entry: TextAuthorLogEnvelope) -> Result<(), DeliveryError> {
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct AppTextOutboxTransport {
+    frames: Vec<TextOutboundFrame>,
+}
+
+impl TextOutboundTransport for AppTextOutboxTransport {
+    fn send_text_frame(
+        &mut self,
+        route: &TextSelectedRoute,
+        frame: TextOutboundFrame,
+    ) -> Result<(), DeliveryError> {
+        if !route.ciphertext_only {
+            return Err(DeliveryError::TextOutboundRouteNotCiphertextOnly);
+        }
+        self.frames.push(frame);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct AppTextSendEvents {
+    events: Vec<TextSendEvent>,
+}
+
+impl TextSendEventSink for AppTextSendEvents {
+    fn emit_text_send_event(&mut self, event: TextSendEvent) -> Result<(), DeliveryError> {
+        self.events.push(event);
+        Ok(())
     }
 }
 
@@ -4325,16 +4372,30 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                 }
             }
         }
-        let mut outbox_error = None;
-        if let Ok(envelope_record) =
-            state.text_delivery_envelope_record(&request.target, &message_id, body, sequence)
-        {
-            state.text_delivery_envelopes.push(envelope_record.clone());
-            if let Err(error) =
-                state.enqueue_text_control_outbox(&request.target, &message_id, &envelope_record)
-            {
-                outbox_error = Some(error);
+        let envelope_record = match state.text_delivery_envelope_record(
+            &request.target,
+            &message_id,
+            body,
+            sequence,
+        ) {
+            Ok(envelope_record) => envelope_record,
+            Err(error) => {
+                state.push_command_error(
+                    "message.rejected",
+                    "send_message",
+                    "text_delivery_envelope_failed",
+                    error,
+                    "Create or join the conversation with persisted OpenMLS group state before sending encrypted text",
+                );
+                return;
             }
+        };
+        state.text_delivery_envelopes.push(envelope_record.clone());
+        let mut outbox_error = None;
+        if let Err(error) =
+            state.enqueue_text_control_outbox(&request.target, &message_id, &envelope_record)
+        {
+            outbox_error = Some(error);
         }
         if let Some(error) = outbox_error {
             state.push_command_error(
