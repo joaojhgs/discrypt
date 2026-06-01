@@ -192,7 +192,7 @@ const expectedCommands = [
   {
     command: "attach_text_control_transport_runtime",
     exportName: "attachTextControlTransportRuntime",
-    args: ["session_id", "runtime_role", "local_peer_id", "remote_peer_id"],
+    args: ["session_id", "runtime_role", "local_peer_id", "remote_peer_id", "derive_from_state"],
     returns: "AppState",
   },
   {
@@ -419,7 +419,7 @@ const requestTypes = [
   ["StopTextSessionRequest", ["session_id"]],
   [
     "AttachTextControlTransportRuntimeRequest",
-    ["session_id", "runtime_role", "local_peer_id", "remote_peer_id"],
+    ["session_id", "runtime_role", "local_peer_id", "remote_peer_id", "derive_from_state"],
   ],
   ["SendMessageRequest", ["target", "body"]],
   [
@@ -742,8 +742,15 @@ if (
     "text runtime attachment must derive peers from invite/connectivity state and start automatically",
   );
 }
-if (!main.includes("messageTransportProof || Boolean(window.__TAURI__?.core?.invoke)")) {
-  failures.push("native/Tauri text sends must request transport proof automatically without manual pairing controls");
+if (main.includes("messageTransportProof || Boolean(window.__TAURI__?.core?.invoke)")) {
+  failures.push(
+    "native/Tauri text sends must not auto-claim transport proof; backend runtime attach/drain must prove delivery separately",
+  );
+}
+if (!main.includes("const requestTransportProof = messageTransportProof")) {
+  failures.push(
+    "manual diagnostics transport proof toggle must remain explicit instead of native default",
+  );
 }
 if (!main.includes('tauriListen<AppEventStreamView>("app_event"')) {
   failures.push("native/Tauri UI must subscribe to app_event push events");

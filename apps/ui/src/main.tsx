@@ -639,16 +639,12 @@ function App() {
   async function attachTextRuntime(stateOverride?: AppState) {
     const runtimeState = stateOverride ?? commandState;
     if (!runtimeState) return;
-    // Runtime peers come from invite/connectivity state, not user-entered pairing fields.
-    const defaults = textRuntimePeerDefaults(runtimeState);
-    // Derived runtime peers are not user-entered pairing fields;
-    // ensureTextRuntimeForActiveScope starts the backend session first.
+    // Runtime role and peer ids are derived inside the Rust app-service from
+    // signed invite/connectivity state; the UI never supplies manual pairing ids.
     await applyCommand(
       attachTextControlTransportRuntime({
         session_id: null,
-        "runtime_role": textRuntimeRole(runtimeState),
-        "local_peer_id": defaults.local,
-        "remote_peer_id": defaults.remote,
+        derive_from_state: true,
       }),
     );
   }
@@ -659,7 +655,7 @@ function App() {
     const scopeLabel = activeScopeLabelForState(stateForScope);
     const started = await startTextSession({
       scope_label: scopeLabel,
-      data_channel_probe: true,
+      data_channel_probe: false,
       adapter_kind: null,
     });
     setCommandState(started);
@@ -862,7 +858,7 @@ function App() {
       (nextState) => {
         setWorkflow(targetWorkflow);
         if (targetWorkflow === "channel" && window.__TAURI__?.core?.invoke) {
-          void attachTextRuntime(nextState);
+          void ensureTextRuntimeForActiveScope(nextState);
         }
       },
     );
@@ -872,7 +868,7 @@ function App() {
     void applyCommand(setActiveDm({ dm_id: dmId }), (nextState) => {
       setWorkflow("dm");
       if (window.__TAURI__?.core?.invoke) {
-        void attachTextRuntime(nextState);
+        void ensureTextRuntimeForActiveScope(nextState);
       }
     });
   }
@@ -904,43 +900,55 @@ function App() {
       setCommandError("Create a group text channel before sending a message.");
       return;
     }
-    const requestTransportProof =
-      messageTransportProof || Boolean(window.__TAURI__?.core?.invoke);
-    void applyCommand(
-      sendMessage({
-        target: {
-          kind: "channel",
-          dm_id: null,
-          group_id: activeGroup.group_id,
-          channel_id: activeTextChannel.channel_id,
-        },
-        body,
-        transport_proof: requestTransportProof,
-        adapter_kind: null,
-      }),
-      () => setDraftMessage(""),
-    );
+    const runtimeState = commandState;
+    const target = {
+      kind: "channel" as const,
+      dm_id: null,
+      group_id: activeGroup.group_id,
+      channel_id: activeTextChannel.channel_id,
+    };
+    void (async () => {
+      if (runtimeState && window.__TAURI__?.core?.invoke) {
+        await ensureTextRuntimeForActiveScope(runtimeState);
+      }
+      const requestTransportProof = messageTransportProof;
+      await applyCommand(
+        sendMessage({
+          target,
+          body,
+          transport_proof: requestTransportProof,
+          adapter_kind: null,
+        }),
+        () => setDraftMessage(""),
+      );
+    })();
   }
 
   function sendCommandDm() {
     const body = draftMessage.trim();
     if (!body || !activeDm) return;
-    const requestTransportProof =
-      messageTransportProof || Boolean(window.__TAURI__?.core?.invoke);
-    void applyCommand(
-      sendMessage({
-        target: {
-          kind: "dm",
-          dm_id: activeDm.dm_id,
-          group_id: null,
-          channel_id: null,
-        },
-        body,
-        transport_proof: requestTransportProof,
-        adapter_kind: null,
-      }),
-      () => setDraftMessage(""),
-    );
+    const runtimeState = commandState;
+    const target = {
+      kind: "dm" as const,
+      dm_id: activeDm.dm_id,
+      group_id: null,
+      channel_id: null,
+    };
+    void (async () => {
+      if (runtimeState && window.__TAURI__?.core?.invoke) {
+        await ensureTextRuntimeForActiveScope(runtimeState);
+      }
+      const requestTransportProof = messageTransportProof;
+      await applyCommand(
+        sendMessage({
+          target,
+          body,
+          transport_proof: requestTransportProof,
+          adapter_kind: null,
+        }),
+        () => setDraftMessage(""),
+      );
+    })();
   }
 
   function createCommandInvite() {
