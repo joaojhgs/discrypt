@@ -57,6 +57,7 @@ import {
   startSignalingSession,
   startTextSession,
   attachTextControlTransportRuntime,
+  pumpTextControlTransportOnce,
   startDm,
   verifySafetyNumber,
 } from "./commands";
@@ -801,7 +802,7 @@ function App() {
   async function applyCommand(
     command: Promise<AppState>,
     success?: (state: AppState) => void,
-  ) {
+  ): Promise<AppState | null> {
     try {
       setCommandError(null);
       const nextState = await command;
@@ -815,10 +816,12 @@ function App() {
         );
       }
       success?.(nextState);
+      return nextState;
     } catch (error: unknown) {
       setCommandError(
         error instanceof Error ? error.message : "Command failed",
       );
+      return null;
     }
   }
 
@@ -865,12 +868,12 @@ function App() {
     );
   }
 
-  async function attachTextRuntime(stateOverride?: AppState) {
+  async function attachTextRuntime(stateOverride?: AppState): Promise<AppState | null> {
     const runtimeState = stateOverride ?? commandState;
-    if (!runtimeState) return;
+    if (!runtimeState) return null;
     // Runtime role and peer ids are derived inside the Rust app-service from
     // signed invite/connectivity state; the UI never supplies manual pairing ids.
-    await applyCommand(
+    return applyCommand(
       attachTextControlTransportRuntime({
         session_id: null,
         derive_from_state: true,
@@ -897,7 +900,13 @@ function App() {
       );
       return;
     }
-    await attachTextRuntime(started);
+    const attached = await attachTextRuntime(started);
+    if (attached?.last_command_error) return;
+    await pumpTextControlTransportOnce({
+      target: null,
+      limit: 8,
+      operation_timeout_ms: 5_000,
+    });
   }
 
   if (loadError) {
@@ -1103,6 +1112,9 @@ function App() {
         const group = getActiveGroup(state);
         setDraftJoinName(group?.name ?? draftJoinName);
         setWorkflow("channel");
+        if (window.__TAURI__?.core?.invoke) {
+          void ensureTextRuntimeForActiveScope(state);
+        }
       },
     );
   }
@@ -1238,6 +1250,9 @@ function App() {
         const invite = state.invites.at(-1);
         if (invite) setDraftInvite(invite.code);
         setWorkflow("join");
+        if (window.__TAURI__?.core?.invoke) {
+          void ensureTextRuntimeForActiveScope(state);
+        }
       },
     );
   }

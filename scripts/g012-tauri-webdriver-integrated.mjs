@@ -91,20 +91,22 @@ function textStateEvidence(profile, localMessage, remoteMessage) {
   const messages = Array.isArray(state?.messages) ? state.messages : [];
   const events = Array.isArray(state?.events) ? state.events : [];
   const receivedEnvelopes = messages.filter((message) => message?.state_key === "received_envelope");
+  const receivedPlaintexts = messages.filter((message) => message?.state_key === "received_plaintext");
   const peerReceipts = messages.filter((message) => message?.state_key === "peer_receipt");
+  const envelopeReceivedEvent = events.some((event) => event?.kind === "message.envelope_received");
   return {
     state_readable: Boolean(state && !state.parse_error),
     parse_error: state?.parse_error ?? null,
     local_plaintext_visible: messages.some((message) => String(message?.body ?? "").includes(localMessage)),
     remote_plaintext_visible: messages.some((message) => String(message?.body ?? "").includes(remoteMessage)),
-    remote_envelope_visible: receivedEnvelopes.length > 0,
-    remote_envelope_count: receivedEnvelopes.length,
+    remote_envelope_visible: receivedEnvelopes.length > 0 || receivedPlaintexts.length > 0 || envelopeReceivedEvent,
+    remote_envelope_count: receivedEnvelopes.length + receivedPlaintexts.length,
     sender_peer_receipt_visible: peerReceipts.length > 0,
     sender_peer_receipt_count: peerReceipts.length,
     transport_attach_started_count: events.filter((event) => event?.kind === "transport.text_runtime_attach_started").length,
     transport_attach_deduped_count: events.filter((event) => event?.kind === "transport.text_runtime_attach_deduped").length,
     transport_attached: events.some((event) => event?.kind === "transport.text_runtime_attached"),
-    envelope_received_event: events.some((event) => event?.kind === "message.envelope_received"),
+    envelope_received_event: envelopeReceivedEvent,
     receipt_verified_event: events.some((event) => event?.kind === "message.receipt_verified"),
     command_error: state?.last_command_error ?? null,
   };
@@ -231,6 +233,29 @@ async function screenshot(profile, label) {
   const path = resolve(screenshotDir, `${profile.display_name.toLowerCase()}-${label}.png`);
   writeFileSync(path, Buffer.from(b64, "base64"));
   return { path: rel(path), sha256: sha256IfExists(path) };
+}
+
+async function waitForProfileState(profile, label, predicate, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const state = readJsonIfExists(profile.state_path);
+    last = state?.parse_error ? state.parse_error : predicate(state);
+    if (last === true) return state;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  manifest[`${profile.display_name.toLowerCase()}_${label.replace(/\W+/g, '_')}_last`] = last;
+  throw new Error(`${profile.display_name} timed out waiting for ${label}; last=${JSON.stringify(last)}`);
+}
+
+function hasOpenMlsAdmission(state) {
+  const groups = Array.isArray(state?.groups) ? state.groups : [];
+  const handles = Array.isArray(state?.openmls_groups) ? state.openmls_groups : [];
+  const events = Array.isArray(state?.events) ? state.events : [];
+  const groupId = groups.find((group) => group?.name === "Two Profile WebDriver Lab")?.group_id;
+  if (!groupId) return { group_id: null, handles: handles.length, joined: false };
+  const handle = handles.find((entry) => entry?.group_id === groupId && Number(entry?.epoch ?? -1) >= 1);
+  return Boolean(handle) || { group_id: groupId, handles: handles.map((entry) => ({ group_id: entry?.group_id, epoch: entry?.epoch })), joined: events.some((event) => event?.kind === "mls.admission_welcome_joined") };
 }
 
 async function waitForMaybe(profile, label, script, args = [], timeoutMs = 90_000) {
@@ -444,6 +469,8 @@ try {
   await setupProfile(profiles.bob);
   const invite = await createGroupInvite(profiles.alice);
   await joinGroup(profiles.bob, invite);
+  await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
+  await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);
   const aliceMessage = "alice webdriver group text proof";
   const bobMessage = "bob webdriver group text proof";
   await sendGroupMessage(profiles.alice, aliceMessage);

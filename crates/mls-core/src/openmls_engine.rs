@@ -9,9 +9,11 @@
 use openmls::prelude::{
     tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait},
     BasicCredential, Ciphersuite, Credential, CredentialWithKey, Extensions,
-    GroupId as OpenMlsGroupId, KeyPackage, LeafNodeIndex, MlsGroup, MlsGroupCreateConfig,
-    MlsGroupJoinConfig, MlsMessageBodyOut, MlsMessageOut, StagedWelcome, Welcome,
+    GroupId as OpenMlsGroupId, KeyPackage, KeyPackageIn, LeafNodeIndex, MlsGroup,
+    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyOut, MlsMessageOut, StagedWelcome,
+    Welcome,
 };
+use openmls::versions::ProtocolVersion;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
@@ -173,6 +175,41 @@ impl OpenMlsMemberPackage {
     #[must_use]
     pub fn signer_public_key(&self) -> &[u8] {
         &self.signer_public_key
+    }
+
+    /// TLS-serialized OpenMLS key package bytes for transport over an admission channel.
+    ///
+    /// The signer handle is intentionally not embedded here; callers must carry
+    /// `signer_public_key()` alongside these bytes so the joiner can reload its
+    /// own private signer after receiving a Welcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when OpenMLS cannot serialize the key package.
+    pub fn key_package_bytes(&self) -> Result<Vec<u8>, OpenMlsGroupError> {
+        serialize_tls(&self.key_package)
+    }
+
+    /// Rehydrate a member package received over an authenticated admission channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key package bytes are not valid OpenMLS TLS
+    /// encoding.
+    pub fn from_key_package_bytes(
+        signer_public_key: Vec<u8>,
+        key_package_bytes: &[u8],
+    ) -> Result<Self, OpenMlsGroupError> {
+        let mut encoded = key_package_bytes;
+        let key_package_in = KeyPackageIn::tls_deserialize(&mut encoded).map_err(openmls_error)?;
+        let crypto = RustCrypto::default();
+        let key_package = key_package_in
+            .validate(&crypto, ProtocolVersion::default())
+            .map_err(openmls_error)?;
+        Ok(Self {
+            key_package,
+            signer_public_key,
+        })
     }
 }
 
