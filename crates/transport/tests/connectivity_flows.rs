@@ -6,14 +6,28 @@ use discrypt_transport::{
 #[test]
 fn valid_direct_overlay_and_turn_flows_select_expected_leg() -> Result<(), TransportError> {
     let config = ConnectivityConfig::default();
+    let turn_config = ConnectivityConfig {
+        default_turn: Endpoint::new("turns:transport-session-test.invalid:5349"),
+        ..ConnectivityConfig::default()
+    };
     let cases = [
-        (SimulatedNat::direct(), FallbackLeg::Stun, 1),
-        (SimulatedNat::overlay_only(), FallbackLeg::RelayOverlay, 2),
-        (SimulatedNat::turn_only(), FallbackLeg::Turn, 3),
+        (&config, SimulatedNat::direct(), FallbackLeg::Stun, 1),
+        (
+            &config,
+            SimulatedNat::overlay_only(),
+            FallbackLeg::RelayOverlay,
+            2,
+        ),
+        (
+            &turn_config,
+            SimulatedNat::turn_only(),
+            FallbackLeg::Turn,
+            3,
+        ),
     ];
 
-    for (nat, expected_leg, expected_attempts) in cases {
-        let plan = ConnectivityPlanner::plan(&config, nat)?;
+    for (config, nat, expected_leg, expected_attempts) in cases {
+        let plan = ConnectivityPlanner::plan(config, nat)?;
 
         assert_eq!(plan.selected, expected_leg);
         assert_eq!(plan.attempts.len(), expected_attempts);
@@ -95,7 +109,10 @@ fn disconnected_local_socket_flow_can_reconnect_with_ciphertext_only_delivery(
 #[test]
 fn plaintext_failure_does_not_prevent_later_reconnect() -> Result<(), TransportError> {
     let adapter = LocalProcessSocketAdapter::new(
-        ConnectivityConfig::default(),
+        ConnectivityConfig {
+            default_turn: Endpoint::new("turns:transport-session-test.invalid:5349"),
+            ..ConnectivityConfig::default()
+        },
         SimulatedNat::turn_only(),
         b"forbidden plaintext".to_vec(),
     );
@@ -117,8 +134,21 @@ fn plaintext_failure_does_not_prevent_later_reconnect() -> Result<(), TransportE
 }
 
 #[test]
-fn failure_flow_reports_no_viable_path_when_direct_overlay_and_turn_all_fail() {
+fn turn_required_without_configured_relay_fails_closed() {
     let config = ConnectivityConfig::default();
+
+    assert_eq!(
+        ConnectivityPlanner::plan(&config, SimulatedNat::turn_only()),
+        Err(TransportError::NoViablePath)
+    );
+}
+
+#[test]
+fn failure_flow_reports_no_viable_path_when_direct_overlay_and_turn_all_fail() {
+    let config = ConnectivityConfig {
+        default_turn: Endpoint::new("turns:transport-session-test.invalid:5349"),
+        ..ConnectivityConfig::default()
+    };
     let unreachable_nat = SimulatedNat {
         stun_available: false,
         overlay_available: false,

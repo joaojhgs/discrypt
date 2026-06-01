@@ -596,6 +596,10 @@ mod tests {
     #[test]
     fn overlay_and_turn_paths_follow_planner_selection() -> Result<(), Box<dyn std::error::Error>> {
         let config = ConnectivityConfig::default();
+        let turn_config = ConnectivityConfig {
+            default_turn: Endpoint::new("turns:relay.example:5349"),
+            ..ConnectivityConfig::default()
+        };
 
         let mut overlay = ready_session()?;
         let overlay_plan = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?;
@@ -613,7 +617,7 @@ mod tests {
         );
 
         let mut turn = ready_session()?;
-        let turn_plan = ConnectivityPlanner::plan(&config, SimulatedNat::turn_only())?;
+        let turn_plan = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
         let turn_snapshot = turn.select_connectivity_plan(turn_plan)?;
         assert_eq!(turn_snapshot.state, TransportSessionState::TurnRelay);
         assert_eq!(
@@ -623,6 +627,30 @@ mod tests {
             )),
             Some((TransportRoute::TurnRelay, Some(FallbackLeg::Turn)))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn active_route_rejects_duplicate_session_start_or_second_route(
+    ) -> Result<(), TransportSessionError> {
+        let mut session = ready_session()?;
+        session.select_direct(Endpoint::new("stun:direct.example:3478"))?;
+
+        assert_eq!(
+            session.begin_signaling(),
+            Err(TransportSessionError::InvalidTransition {
+                from: TransportSessionState::Direct,
+                event: TransportSessionEvent::StartSignaling,
+            })
+        );
+        assert_eq!(
+            session.select_turn_relay(Endpoint::new("turns:relay.example:5349")),
+            Err(TransportSessionError::InvalidTransition {
+                from: TransportSessionState::Direct,
+                event: TransportSessionEvent::SelectTurnRelay,
+            })
+        );
+        assert_eq!(session.state(), TransportSessionState::Direct);
         Ok(())
     }
 
@@ -723,7 +751,11 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(1), 100);
         assert_eq!(policy.delay_for_attempt(2), 200);
         assert_eq!(policy.delay_for_attempt(8), 1_000);
+        assert_eq!(policy.delay_for_attempt(u32::MAX), 1_000);
         assert!(ReconnectBackoffPolicy::new(0, 1_000, 2, 2).is_err());
+        assert!(ReconnectBackoffPolicy::new(1_000, 100, 2, 2).is_err());
+        assert!(ReconnectBackoffPolicy::new(100, 1_000, 0, 2).is_err());
+        assert!(ReconnectBackoffPolicy::new(100, 1_000, 2, 0).is_err());
 
         let mut session = ready_session()?;
         session.select_direct(Endpoint::new("stun:direct.example:3478"))?;
@@ -755,6 +787,13 @@ mod tests {
         exhausted.select_direct(Endpoint::new("stun:direct.example:3478"))?;
         exhausted.mark_disconnected("network changed")?;
         exhausted.schedule_reconnect(policy)?;
+        assert_eq!(
+            exhausted.schedule_reconnect(policy),
+            Err(TransportSessionError::InvalidTransition {
+                from: TransportSessionState::Reconnecting,
+                event: TransportSessionEvent::StartReconnecting,
+            })
+        );
         exhausted.begin_signaling()?;
         exhausted.begin_ice_gathering()?;
         exhausted.begin_checking()?;

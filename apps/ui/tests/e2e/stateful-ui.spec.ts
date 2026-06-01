@@ -184,6 +184,13 @@ test("group invite join text channel and voice controls work without fake member
     .last()
     .click();
   await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
+  await expect(page.getByText("TURN credential gate", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(/1\/1 redacted TURN endpoint credential-gated/i),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/does not claim retry success without a selected adapter proof/i),
+  ).toBeVisible();
 
   await page.getByRole("button", { name: "Join group" }).click();
   await page
@@ -354,6 +361,12 @@ test("production UX hides diagnostics and manual transport controls by default",
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/remote audio is not connected yet/i).first()).toBeVisible();
+  await expect(page.getByText("TURN relay gate", { exact: true })).toBeVisible();
+  await expect(page.getByText(/TURN-required state: not-proven/i)).toBeVisible();
+  await expect(page.getByText("Provider fallback state", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText(/retry\/backoff remains unclaimed in this UI state/i),
+  ).toBeVisible();
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(0);
   await expect(page.getByText(/media runtime/i)).toHaveCount(0);
   await expect(page.getByTestId("voice-remote-audio")).toHaveCount(0);
