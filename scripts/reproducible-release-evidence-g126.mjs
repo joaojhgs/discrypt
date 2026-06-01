@@ -15,6 +15,22 @@ function run(command, commandArgs) {
   return result.stdout.trim();
 }
 function sha256(path) { return createHash("sha256").update(readFileSync(resolve(repoRoot, path))).digest("hex"); }
+function readOptional(path) {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+function parseOsRelease(text) {
+  const entries = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
+    if (!match) continue;
+    entries[match[1]] = match[2].replace(/^"|"$/g, "");
+  }
+  return entries;
+}
 function walk(dir, predicate, output = []) {
   if (!existsSync(dir)) return output;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -26,6 +42,7 @@ function walk(dir, predicate, output = []) {
 }
 const rustToolchain = readFileSync(resolve(repoRoot, "rust-toolchain.toml"), "utf8");
 const nodeVersion = readFileSync(resolve(repoRoot, ".node-version"), "utf8").trim();
+const osRelease = parseOsRelease(readOptional("/etc/os-release"));
 const packageArtifacts = walk(resolve(repoRoot, "target/release/bundle"), (path) => /\.(deb|rpm|AppImage)$/i.test(path)).sort();
 const sboms = walk(resolve(repoRoot, "target/sbom"), (path) => /\.json$/i.test(path)).sort();
 const evidence = {
@@ -54,6 +71,13 @@ const evidence = {
     sourceDateEpoch: Number(process.env.SOURCE_DATE_EPOCH || run("git", ["log", "-1", "--format=%ct"])),
     tauriCliPackage: "@tauri-apps/cli@2.11.2",
     releaseFeatures: (process.env.DISCRYPT_RELEASE_FEATURES ?? "tauri-runtime,production-network,production-media,production-storage").split(","),
+    linuxBuildBaseline: {
+      prettyName: osRelease.PRETTY_NAME ?? "",
+      id: osRelease.ID ?? "",
+      versionId: osRelease.VERSION_ID ?? "",
+      imageDigest: process.env.DISCRYPT_LINUX_BUILD_IMAGE_DIGEST ?? process.env.GITHUB_ACTIONS_RUNNER_IMAGE_DIGEST ?? "",
+      runnerImage: process.env.ImageOS ?? process.env.RUNNER_OS ?? "",
+    },
   },
   artifacts: packageArtifacts.map((path) => ({ path: relative(repoRoot, path), size: statSync(path).size, sha256: createHash("sha256").update(readFileSync(path)).digest("hex") })),
   sboms: sboms.map((path) => ({ path: relative(repoRoot, path), size: statSync(path).size, sha256: createHash("sha256").update(readFileSync(path)).digest("hex") })),
