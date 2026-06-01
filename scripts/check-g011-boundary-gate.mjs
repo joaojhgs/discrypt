@@ -72,7 +72,7 @@ requirePattern(
 
 for (const token of [
   "not production-default yet",
-  "default public bootstrap is now disabled",
+  "defines an empty public default while the libp2p/Hickory DNS stack is audit-blocked",
   "production profiles must provide explicit direct `/ip4` or `/ip6` multiaddrs",
   "keep IPFS non-default until this passes on real public peers without DNS bootstrap",
   "full two-installed-app E2E over that route",
@@ -81,7 +81,7 @@ for (const token of [
 for (const token of [
   "native `quic://` transport still reserved; not production-ready",
   "Native `quic://` is still reserved",
-  "rejects reserved native QUIC scheme",
+  "quic_rendezvous_feature_gate_is_selectable_but_rejects_reserved_native_quic_scheme",
   "production readiness still requires staged service evidence",
 ]) requireText("QUIC adapter readiness", quicDoc, token);
 
@@ -111,7 +111,7 @@ for (const token of [
   "Adapter feature is not enabled in this build.",
   "fail-closed boundary when feature is disabled",
   "adapter is not enabled; compile with Cargo feature",
-  "feature is enabled but no audited production provider client is wired",
+  "is enabled but no audited production provider client is wired",
 ]) requireText("provider adapter fail-closed boundary", providerAdapters, token);
 
 const releaseDocs = {

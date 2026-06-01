@@ -142,7 +142,6 @@ function run() {
     "npm --prefix apps/ui run test:release-two-profile-harness-g010",
     "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
     "npm --prefix apps/ui run test:g011-boundary",
-  "npm --prefix apps/ui run test:g011-boundary",
   ]) requireText(failures, "G131 final verification doc", g131Doc, token);
 
   for (const token of [
