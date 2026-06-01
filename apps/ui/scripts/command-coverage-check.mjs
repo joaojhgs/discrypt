@@ -770,9 +770,17 @@ if (
 if (!main.includes("APP_EVENT_HEALTH_RESYNC_MS")) {
   failures.push("native app_event listener must retain a slow health-resync poll");
 }
-const voiceCleanupEffects = (
-  main.match(/return \(\) => \{\n      voiceCaptureRef\.current\?\.getTracks\(\)\.forEach/g) ?? []
-).length;
+const voiceCleanupEffects =
+  (
+    main.match(
+      /useEffect\(\(\) => \(\) => stopLocalVoiceCapture\(\), \[\]\);/g,
+    ) ?? []
+  ).length +
+  (
+    main.match(
+      /return \(\) => \{\n      voiceCaptureRef\.current\?\.getTracks\(\)\.forEach/g,
+    ) ?? []
+  ).length;
 if (voiceCleanupEffects !== 1) {
   failures.push(
     `voice media unmount cleanup must have exactly one effect, found ${voiceCleanupEffects}`,
@@ -825,7 +833,8 @@ for (const e2eToken of [
   "small-window navigation exposes topbar controls without overflow",
   "production UX hides diagnostics and manual transport controls by default",
   "mediaDevices",
-  'toHaveValue("61")',
+  'getByTestId("voice-remote-volume")).toHaveCount(0)',
+  "Local microphone level comes from the active MediaStream",
 ]) {
   if (!statefulE2e.includes(e2eToken)) {
     failures.push(`Playwright stateful UX coverage missing: ${e2eToken}`);

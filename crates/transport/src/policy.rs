@@ -847,7 +847,7 @@ mod tests {
         let invite = policy(
             invite_scope,
             SignalingAdapterKind::IpfsPubsub,
-            "/dns/bootstrap.example.invalid/tcp/4001/p2p/12D3KooWBootstrap",
+            "/ip4/203.0.113.10/tcp/4001/p2p/12D3KooWBootstrap",
             "invite",
         )?;
 

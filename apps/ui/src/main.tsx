@@ -82,7 +82,8 @@ type SetupStepView = { label: string; complete: boolean; detail: string };
 type VoiceParticipant = VoiceParticipantView;
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 60_000;
-const diagnosticsUiEnabled = import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
+const diagnosticsUiEnabled =
+  import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
 type VoiceDeviceAccess = {
   stream: MediaStream | null;
   microphone_permission: "granted" | "denied" | "prompt" | "unknown";
@@ -94,6 +95,19 @@ type VoiceDeviceAccess = {
   activity_peak_i16: number | null;
   activity_captured_at_ms: number | null;
 };
+
+type VoiceActivitySample = Pick<
+  VoiceDeviceAccess,
+  "activity_rms_i16" | "activity_peak_i16" | "activity_captured_at_ms"
+>;
+
+type VoiceActivityReading = {
+  activity_rms_i16: number;
+  activity_peak_i16: number;
+  activity_captured_at_ms: number;
+};
+
+type StopVoiceActivityCapture = () => void;
 
 function asThemeId(value: string): ThemeId {
   return discryptUiConfig.themes.some((theme) => theme.id === value)
@@ -223,8 +237,6 @@ function textRuntimePeerDefaults(state: AppState): {
   };
 }
 
-
-
 function activeScopeLabelForState(state: AppState): string {
   return (
     state.active_context?.dm_id ??
@@ -244,9 +256,13 @@ function textRuntimeRole(state: AppState): "offerer" | "answerer" {
   }
 
   const activeGroup = state.active_context?.group_id
-    ? state.groups.find((group) => group.group_id === state.active_context?.group_id)
+    ? state.groups.find(
+        (group) => group.group_id === state.active_context?.group_id,
+      )
     : state.groups[0];
-  const localGroupPeer = activeGroup?.runtime_peers?.find((peer) => peer.is_local);
+  const localGroupPeer = activeGroup?.runtime_peers?.find(
+    (peer) => peer.is_local,
+  );
   if (localGroupPeer) {
     return localGroupPeer.role === "member" ? "answerer" : "offerer";
   }
@@ -328,6 +344,66 @@ async function measureLocalVoiceActivity(
   }
 }
 
+function startLocalVoiceActivityCapture(
+  stream: MediaStream,
+  onSample: (sample: VoiceActivityReading) => void,
+): StopVoiceActivityCapture | null {
+  const audioWindow = window as Window &
+    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextCtor =
+    window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextCtor) return null;
+
+  const context = new AudioContextCtor();
+  const source = context.createMediaStreamSource(stream);
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 1024;
+  source.connect(analyser);
+
+  const buffer = new Uint8Array(analyser.fftSize);
+  let stopped = false;
+  let timer: number | null = null;
+
+  const sample = () => {
+    analyser.getByteTimeDomainData(buffer);
+    let squareSum = 0;
+    let peak = 0;
+    for (const frame of buffer) {
+      const centered = Math.abs(frame - 128) / 128;
+      squareSum += centered * centered;
+      peak = Math.max(peak, centered);
+    }
+    const rms = Math.sqrt(squareSum / buffer.length);
+    onSample({
+      activity_rms_i16: Math.round(Math.min(1, rms) * 32767),
+      activity_peak_i16: Math.round(Math.min(1, peak) * 32767),
+      activity_captured_at_ms: Date.now(),
+    });
+  };
+
+  const schedule = () => {
+    if (stopped) return;
+    timer = window.setTimeout(() => {
+      if (stopped) return;
+      sample();
+      schedule();
+    }, 750);
+  };
+
+  void context
+    .resume()
+    .catch(() => undefined)
+    .finally(schedule);
+
+  return () => {
+    stopped = true;
+    if (timer !== null) window.clearTimeout(timer);
+    source.disconnect?.();
+    analyser.disconnect?.();
+    void context.close().catch(() => undefined);
+  };
+}
+
 async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
   if (!navigator.mediaDevices?.getUserMedia) {
     return emptyVoiceDeviceAccess("denied");
@@ -379,7 +455,6 @@ function localAudioTracks(stream: MediaStream | null): MediaStreamTrack[] {
   }
   return stream.getTracks().filter((track) => track.kind === "audio");
 }
-
 
 function audioTracksFromStream(stream: MediaStream | null) {
   if (!stream) return [];
@@ -452,8 +527,20 @@ function App() {
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [messageTransportProof, setMessageTransportProof] = useState(false);
+  const [localVoiceSpeaking, setLocalVoiceSpeaking] = useState(false);
   const eventCursorRef = useRef(0);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
+  const stopVoiceActivityCaptureRef = useRef<StopVoiceActivityCapture | null>(
+    null,
+  );
+
+  function stopLocalVoiceCapture() {
+    stopVoiceActivityCaptureRef.current?.();
+    stopVoiceActivityCaptureRef.current = null;
+    stopMediaStream(voiceCaptureRef.current);
+    voiceCaptureRef.current = null;
+    setLocalVoiceSpeaking(false);
+  }
 
   function updateEventCursor(nextCursor: number) {
     const cursor = Math.max(eventCursorRef.current, nextCursor);
@@ -488,9 +575,26 @@ function App() {
   useEffect(() => {
     return () => {
       voiceCaptureRef.current?.getTracks().forEach((track) => track.stop());
+      stopVoiceActivityCaptureRef.current?.();
+      stopVoiceActivityCaptureRef.current = null;
       voiceCaptureRef.current = null;
+      setLocalVoiceSpeaking(false);
     };
   }, []);
+
+  useEffect(() => {
+    if (!commandState?.voice_session?.joined) {
+      stopLocalVoiceCapture();
+    }
+  }, [commandState?.voice_session?.joined]);
+
+  useEffect(() => {
+    const enabled = !Boolean(commandState?.voice_session?.self_muted);
+    localAudioTracks(voiceCaptureRef.current).forEach((track) => {
+      track.enabled = enabled;
+    });
+    if (!enabled) setLocalVoiceSpeaking(false);
+  }, [commandState?.voice_session?.self_muted]);
 
   useEffect(() => {
     if (!commandState || commandState.runtime_mode.mode !== "native") {
@@ -513,7 +617,9 @@ function App() {
         .then((refreshed) => {
           if (!cancelled) {
             setCommandState(refreshed);
-            updateEventCursor(Math.max(stream.next_cursor, refreshed.event_cursor));
+            updateEventCursor(
+              Math.max(stream.next_cursor, refreshed.event_cursor),
+            );
           }
         })
         .catch(() => undefined);
@@ -703,14 +809,33 @@ function App() {
     activeDm?.connectivity ??
     appState.connectivity_defaults;
   const groupLabel = activeGroup?.name ?? "Local profile";
-  const participants = appState.voice_session?.participants ?? [];
+  const backendVoiceParticipants = appState.voice_session?.participants ?? [];
   const voiceJoined = appState.voice_session?.joined ?? false;
   const selfMuted =
     appState.voice_session?.self_muted ??
-    participants.find(
+    backendVoiceParticipants.find(
       (participant) => participant.id === appState.profile?.user_id,
     )?.muted ??
     false;
+  const localVoiceParticipant: VoiceParticipant | null =
+    voiceJoined &&
+    appState.profile &&
+    voiceCaptureRef.current &&
+    !backendVoiceParticipants.some(
+      (participant) => participant.id === appState.profile?.user_id,
+    )
+      ? {
+          id: appState.profile.user_id,
+          name: "You",
+          role: "you",
+          speaking: localVoiceSpeaking && !selfMuted,
+          muted: selfMuted,
+          volume: 82,
+        }
+      : null;
+  const participants = localVoiceParticipant
+    ? [localVoiceParticipant, ...backendVoiceParticipants]
+    : backendVoiceParticipants;
   const activeTheme =
     discryptUiConfig.themes.find(
       (theme) => theme.id === appState.preferences.theme_id,
@@ -808,7 +933,9 @@ function App() {
     );
   }
 
-  function saveConnectivityPolicy(scopeKind: SetConnectivityPolicyRequest["scope_kind"]) {
+  function saveConnectivityPolicy(
+    scopeKind: SetConnectivityPolicyRequest["scope_kind"],
+  ) {
     const activeChannel = activeTextChannel ?? activeVoiceChannel ?? null;
     void applyCommand(
       setConnectivityPolicy({
@@ -854,7 +981,10 @@ function App() {
     if (!activeGroup) return;
     const targetWorkflow = kind === "Voice" ? "voice" : "channel";
     void applyCommand(
-      setActiveChannel({ group_id: activeGroup.group_id, channel_id: channelId }),
+      setActiveChannel({
+        group_id: activeGroup.group_id,
+        channel_id: channelId,
+      }),
       (nextState) => {
         setWorkflow(targetWorkflow);
         if (targetWorkflow === "channel" && window.__TAURI__?.core?.invoke) {
@@ -1052,8 +1182,7 @@ function App() {
         setCommandError("Voice channel creation did not return a channel.");
         return;
       }
-      stopMediaStream(voiceCaptureRef.current);
-      voiceCaptureRef.current = null;
+      stopLocalVoiceCapture();
       const voiceAccess = await requestVoiceDeviceAccess();
       const joinedState = await joinVoice({
         group_id: activeGroup.group_id,
@@ -1079,32 +1208,52 @@ function App() {
             ? `${joinedState.last_command_error.message} — ${action}`
             : joinedState.last_command_error.message,
         );
-        stopMediaStream(voiceCaptureRef.current);
-        voiceCaptureRef.current = null;
+        stopLocalVoiceCapture();
         return;
       }
       const sessionId = joinedState.voice_session?.session_id;
-      if (
-        sessionId &&
-        voiceAccess.activity_rms_i16 !== null &&
-        voiceAccess.activity_peak_i16 !== null &&
-        voiceAccess.activity_captured_at_ms !== null
-      ) {
-        void applyCommand(
-          updateVoiceActivity({
-            session_id: sessionId,
-            rms_i16: voiceAccess.activity_rms_i16,
-            peak_i16: voiceAccess.activity_peak_i16,
-            captured_at_ms: voiceAccess.activity_captured_at_ms,
-          }),
+      if (sessionId && voiceAccess.stream) {
+        stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
+          voiceAccess.stream,
+          (sample) => {
+            const trackEnabled = localAudioTracks(voiceAccess.stream).some(
+              (track) => track.enabled,
+            );
+            setLocalVoiceSpeaking(
+              trackEnabled &&
+                (sample.activity_rms_i16 >= 512 ||
+                  sample.activity_peak_i16 >= 2048),
+            );
+            void applyCommand(
+              updateVoiceActivity({
+                session_id: sessionId,
+                rms_i16: sample.activity_rms_i16,
+                peak_i16: sample.activity_peak_i16,
+                captured_at_ms: sample.activity_captured_at_ms,
+              }),
+            );
+          },
         );
+        if (
+          voiceAccess.activity_rms_i16 !== null &&
+          voiceAccess.activity_peak_i16 !== null &&
+          voiceAccess.activity_captured_at_ms !== null
+        ) {
+          void applyCommand(
+            updateVoiceActivity({
+              session_id: sessionId,
+              rms_i16: voiceAccess.activity_rms_i16,
+              peak_i16: voiceAccess.activity_peak_i16,
+              captured_at_ms: voiceAccess.activity_captured_at_ms,
+            }),
+          );
+        }
       }
       return;
     }
     const sessionId = appState.voice_session?.session_id;
     if (!sessionId) return;
-    stopMediaStream(voiceCaptureRef.current);
-    voiceCaptureRef.current = null;
+    stopLocalVoiceCapture();
     void applyCommand(leaveVoice({ session_id: sessionId }), () =>
       setWorkflow("voice"),
     );
@@ -1280,38 +1429,38 @@ function App() {
           {workflow === "create-group" ? (
             <>
               <CreateGroupPanel
-              snapshot={currentSnapshot}
-              groupName={draftGroup}
-              setGroupName={setDraftGroup}
-              signalingAdapter={draftSignalingAdapter}
-              setSignalingAdapter={(value) =>
-                setDraftSignalingAdapter(value as SignalingAdapterKind)
-              }
-              signalingEndpoint={draftSignalingEndpoint}
-              setSignalingEndpoint={setDraftSignalingEndpoint}
-              iceStunServers={draftIceStunServers}
-              setIceStunServers={setDraftIceStunServers}
-              iceTurnServers={draftIceTurnServers}
-              setIceTurnServers={setDraftIceTurnServers}
-              onCreate={createCommandGroup}
-            />
-            <ConnectivitySettingsPanel
-              policy={appState.connectivity_defaults}
-              signalingAdapter={draftSignalingAdapter}
-              setSignalingAdapter={(value) =>
-                setDraftSignalingAdapter(value as SignalingAdapterKind)
-              }
-              signalingEndpoint={draftSignalingEndpoint}
-              setSignalingEndpoint={setDraftSignalingEndpoint}
-              iceStunServers={draftIceStunServers}
-              setIceStunServers={setDraftIceStunServers}
-              iceTurnServers={draftIceTurnServers}
-              setIceTurnServers={setDraftIceTurnServers}
-              onSaveAppDefaults={() => saveConnectivityPolicy("app")}
-              onSaveGroup={null}
-              onSaveChannel={null}
-              onSaveDm={null}
-            />
+                snapshot={currentSnapshot}
+                groupName={draftGroup}
+                setGroupName={setDraftGroup}
+                signalingAdapter={draftSignalingAdapter}
+                setSignalingAdapter={(value) =>
+                  setDraftSignalingAdapter(value as SignalingAdapterKind)
+                }
+                signalingEndpoint={draftSignalingEndpoint}
+                setSignalingEndpoint={setDraftSignalingEndpoint}
+                iceStunServers={draftIceStunServers}
+                setIceStunServers={setDraftIceStunServers}
+                iceTurnServers={draftIceTurnServers}
+                setIceTurnServers={setDraftIceTurnServers}
+                onCreate={createCommandGroup}
+              />
+              <ConnectivitySettingsPanel
+                policy={appState.connectivity_defaults}
+                signalingAdapter={draftSignalingAdapter}
+                setSignalingAdapter={(value) =>
+                  setDraftSignalingAdapter(value as SignalingAdapterKind)
+                }
+                signalingEndpoint={draftSignalingEndpoint}
+                setSignalingEndpoint={setDraftSignalingEndpoint}
+                iceStunServers={draftIceStunServers}
+                setIceStunServers={setDraftIceStunServers}
+                iceTurnServers={draftIceTurnServers}
+                setIceTurnServers={setDraftIceTurnServers}
+                onSaveAppDefaults={() => saveConnectivityPolicy("app")}
+                onSaveGroup={null}
+                onSaveChannel={null}
+                onSaveDm={null}
+              />
             </>
           ) : null}
           {workflow === "channel" ? (
@@ -1347,7 +1496,9 @@ function App() {
                 iceTurnServers={draftIceTurnServers}
                 setIceTurnServers={setDraftIceTurnServers}
                 onSaveAppDefaults={() => saveConnectivityPolicy("app")}
-                onSaveGroup={activeGroup ? () => saveConnectivityPolicy("group") : null}
+                onSaveGroup={
+                  activeGroup ? () => saveConnectivityPolicy("group") : null
+                }
                 onSaveChannel={
                   activeTextChannel || activeVoiceChannel
                     ? () => saveConnectivityPolicy("channel")
@@ -1366,6 +1517,7 @@ function App() {
                 currentSnapshot.voice.route
               }
               participants={participants}
+              localUserId={appState.profile?.user_id ?? null}
               voiceSession={appState.voice_session}
               voiceStates={appState.voice_states}
               voiceJoined={voiceJoined}
@@ -3127,7 +3279,9 @@ function ConnectivitySettingsPanel({
           <dl className="mt-3 grid gap-2 text-xs text-[hsl(var(--muted-foreground))]">
             <div>
               <dt className="uppercase tracking-[0.14em]">Scope</dt>
-              <dd className="break-all font-mono">{policy.scope_id_commitment}</dd>
+              <dd className="break-all font-mono">
+                {policy.scope_id_commitment}
+              </dd>
             </div>
             <div>
               <dt className="uppercase tracking-[0.14em]">Adapter</dt>
@@ -3135,7 +3289,9 @@ function ConnectivitySettingsPanel({
             </div>
             <div>
               <dt className="uppercase tracking-[0.14em]">Endpoint</dt>
-              <dd className="break-all">{currentProfile?.endpoints[0] ?? "none"}</dd>
+              <dd className="break-all">
+                {currentProfile?.endpoints[0] ?? "none"}
+              </dd>
             </div>
             <div>
               <dt className="uppercase tracking-[0.14em]">ICE</dt>
@@ -3429,6 +3585,7 @@ function VoicePanel({
   activeVoiceChannel,
   route,
   participants,
+  localUserId,
   voiceSession,
   voiceStates,
   voiceJoined,
@@ -3441,6 +3598,7 @@ function VoicePanel({
   activeVoiceChannel: ChannelStateView | null;
   route: string;
   participants: VoiceParticipant[];
+  localUserId: string | null;
   voiceSession: VoiceSessionView | null;
   voiceStates: VoiceStateView[];
   voiceJoined: boolean;
@@ -3491,61 +3649,82 @@ function VoicePanel({
               copy="The backend returned an empty participant list."
             />
           ) : null}
-          {visibleParticipants.map((participant) => (
-            <div
-              key={participant.id}
-              className="grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4 md:grid-cols-[1fr_180px] md:items-center"
-            >
-              <div className="flex items-center gap-3">
-                <div
-                  className={cn(
-                    "rounded-2xl p-0.5",
-                    participant.speaking &&
-                      !participant.muted &&
-                      "bg-emerald-300/70",
-                  )}
-                >
-                  <Avatar>
-                    <AvatarFallback>
-                      {participant.name.slice(0, 2).toUpperCase()}
-                    </AvatarFallback>
-                  </Avatar>
+          {visibleParticipants.map((participant) => {
+            const isLocalParticipant =
+              participant.id === localUserId || participant.role === "you";
+            return (
+              <div
+                key={participant.id}
+                data-testid={
+                  isLocalParticipant
+                    ? "voice-local-participant"
+                    : "voice-remote-participant"
+                }
+                className="grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4 md:grid-cols-[1fr_180px] md:items-center"
+              >
+                <div className="flex items-center gap-3">
+                  <div
+                    className={cn(
+                      "rounded-2xl p-0.5",
+                      participant.speaking &&
+                        !participant.muted &&
+                        "bg-emerald-300/70",
+                    )}
+                  >
+                    <Avatar>
+                      <AvatarFallback>
+                        {participant.name.slice(0, 2).toUpperCase()}
+                      </AvatarFallback>
+                    </Avatar>
+                  </div>
+                  <div>
+                    <p className="font-medium">
+                      {participant.name}{" "}
+                      <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                        · {participant.role}
+                      </span>
+                    </p>
+                    <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                      {participant.muted
+                        ? "muted"
+                        : participant.speaking
+                          ? "speaking now"
+                          : "listening"}
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <p className="font-medium">
-                    {participant.name}{" "}
-                    <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                      · {participant.role}
-                    </span>
+                {isLocalParticipant ? (
+                  <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                    Local microphone level comes from the active MediaStream
+                    analyser.
                   </p>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                    {participant.muted
-                      ? "muted"
-                      : participant.speaking
-                        ? "speaking now"
-                        : "listening"}
-                  </p>
-                </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <Icon>vol</Icon>
+                    <Slider
+                      aria-label={`${participant.name} speaker volume`}
+                      data-testid="voice-remote-volume"
+                      value={[participant.volume]}
+                      min={0}
+                      max={100}
+                      step={1}
+                      onValueChange={(value) =>
+                        setVolume(participant.id, value)
+                      }
+                    />
+                  </div>
+                )}
               </div>
-              <div className="flex items-center gap-3">
-                <Icon>vol</Icon>
-                <Slider
-                  value={[participant.volume]}
-                  min={0}
-                  max={100}
-                  step={1}
-                  onValueChange={(value) => setVolume(participant.id, value)}
-                />
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </CardContent>
       </Card>
       <Card className="h-fit">
         <CardHeader>
           <CardTitle>Call controls</CardTitle>
           <CardDescription>
-            Controls dispatch backend voice state changes; remote media is not claimed until route evidence exists.
+            Controls dispatch backend voice state changes; remote media is not
+            claimed until route evidence exists.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-5">
@@ -3680,7 +3859,9 @@ function InspectorRail({
             <CardHeader>
               <CardTitle>Danger zone</CardTitle>
               <CardDescription>
-                Resetting local state erases this device&apos;s profile, groups, messages, invites, and voice preferences from the backend-persisted shell.
+                Resetting local state erases this device&apos;s profile, groups,
+                messages, invites, and voice preferences from the
+                backend-persisted shell.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3">
