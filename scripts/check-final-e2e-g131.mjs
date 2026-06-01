@@ -8,6 +8,8 @@ const qualityGatePath = resolve(repoRoot, "target/release/g131-final-e2e-quality
 const requiredCommandEvidence = [
   "cargo fmt --all --check",
   "npm --prefix apps/ui run test:final-e2e-g131",
+  "npm --prefix apps/ui run test:release-two-profile-harness-g010",
+  "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
   "npm --prefix apps/ui run test:e2e",
   "npm --prefix apps/ui run test:ui-integration-g130",
   "npm --prefix apps/ui run test:release-no-fallback-g129",
@@ -87,6 +89,9 @@ function run() {
 
   for (const script of [
     "test:e2e",
+    "test:release-two-profile-harness-g010",
+    "release:two-profile-harness-g010",
+    "release:two-profile-harness-g010:dry-run",
     "test:ui-integration-g130",
     "test:release-no-fallback-g129",
     "test:placeholder-allowlist-g128",
@@ -132,6 +137,8 @@ function run() {
     "two independent browser profiles",
     "multi-process/multi-host coverage is represented by maintained Rust/process\nharness gates",
     "cargo clippy --workspace --all-targets --quiet -- -D warnings",
+    "npm --prefix apps/ui run test:release-two-profile-harness-g010",
+    "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
   ]) requireText(failures, "G131 final verification doc", g131Doc, token);
 
   for (const token of [

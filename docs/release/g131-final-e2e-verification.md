@@ -18,6 +18,8 @@ Required command evidence:
 ```sh
 cargo fmt --all --check
 npm --prefix apps/ui run test:final-e2e-g131
+npm --prefix apps/ui run test:release-two-profile-harness-g010
+npm --prefix apps/ui run release:two-profile-harness-g010:dry-run
 npm --prefix apps/ui run test:e2e
 npm --prefix apps/ui run test:ui-integration-g130
 npm --prefix apps/ui run test:release-no-fallback-g129
@@ -75,6 +77,7 @@ above. The browser/UI portion reported **9 Chromium tests passed** across:
 - two independent browser profiles using isolated local stores for DM send
   attempts, invite join/open, and voice/media attempts without fabricated
   remote members or relay rows.
+- the G010 two-profile release harness dry-run now records the reproducible local/public adapter matrix, isolated `DISCRYPT_APP_STATE_PATH` profile plan, and credential-gated public-provider skip policy before release checkpointing.
 
 The multi-process/multi-host coverage is represented by maintained Rust/process
 harness gates rather than by the browser-only UI test: `test:pcap-suite-g096`,

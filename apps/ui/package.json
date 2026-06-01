@@ -12,6 +12,8 @@
     "test:production-copy": "node scripts/command-coverage-check.mjs",
     "test:e2e": "VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 vite build && playwright test --workers=1",
     "test:g007-voice-media": "node scripts/g007-voice-media-e2e.mjs",
+    "test:g010-native-command-e2e": "node scripts/g010-native-command-e2e.mjs",
+    "test:g010-adapter-public-matrix": "node ../../scripts/check-g010-adapter-public-matrix.mjs",
     "test:honesty": "node scripts/honesty-gates.mjs",
     "release:linux": "node ../../scripts/release-linux.mjs",
     "release:linux:dry-run": "node ../../scripts/release-linux.mjs --dry-run",
@@ -19,6 +21,9 @@
     "test:linux-runtime-docs": "node ../../scripts/check-linux-runtime-docs.mjs",
     "smoke:linux-packages": "node ../../scripts/smoke-linux-packages.mjs",
     "smoke:linux-packages:dry-run": "node ../../scripts/smoke-linux-packages.mjs --dry-run",
+    "release:two-profile-harness-g010": "node ../../scripts/release-two-profile-harness-g010.mjs",
+    "release:two-profile-harness-g010:dry-run": "node ../../scripts/release-two-profile-harness-g010.mjs --dry-run",
+    "test:release-two-profile-harness-g010": "node ../../scripts/check-release-two-profile-harness-g010.mjs",
     "test:linux-package-smoke": "node ../../scripts/check-linux-package-smoke.mjs",
     "test:desktop-package-ci": "node ../../scripts/check-desktop-package-ci.mjs",
     "test:android-gate": "node ../../scripts/check-android-gate.mjs",
@@ -68,7 +73,11 @@
     "test:provider-metadata-capture-g133": "node ../../scripts/check-provider-metadata-capture-g133.mjs",
     "test:g008-stun-turn-fallback": "node ../../scripts/check-g008-stun-turn-fallback.mjs",
     "test:g009-security-privacy": "npm run test:security-privacy-g009",
-    "test:security-privacy-g009": "node ../../scripts/check-security-privacy-g009.mjs"
+    "test:security-privacy-g009": "node ../../scripts/check-security-privacy-g009.mjs",
+    "test:g010-release-harness": "node ../../scripts/g010-release-harness.mjs --mode=local",
+    "test:g010-release-harness:public": "node ../../scripts/g010-release-harness.mjs --mode=public",
+    "test:g010-release-contract": "node ../../scripts/check-g010-release-harness.mjs",
+    "test:g010-tauri-launch-dry-run": "node ../../scripts/g010-tauri-two-profile-launch.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

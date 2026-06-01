@@ -28,6 +28,11 @@ function resolveSiblingRepoRoot(repoName) {
 for (const token of [
   "# Release verification matrix",
   "npm --prefix apps/ui run release:linux",
+  "npm --prefix apps/ui run release:two-profile-harness-g010",
+  "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
+  "target/release/g010-two-profile-harness/report.json",
+  "DISCRYPT_G010_PUBLIC_MATRIX=1",
+  "skipped_missing_external_credentials",
   "npm --prefix apps/ui run smoke:linux-packages",
   "npm --prefix apps/ui run test:desktop-package-ci",
   "npm --prefix apps/ui run test:android-gate",
@@ -49,6 +54,9 @@ for (const token of [
 }
 for (const scriptName of [
   "test:release-linux",
+  "release:two-profile-harness-g010",
+  "release:two-profile-harness-g010:dry-run",
+  "test:release-two-profile-harness-g010",
   "test:linux-package-smoke",
   "test:desktop-package-ci",
   "test:android-gate",
