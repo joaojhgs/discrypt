@@ -13,12 +13,14 @@ import {
   AppState,
   ChannelKind,
   ChannelStateView,
+  ConnectivityPolicyView,
   DirectConversationView,
   GroupView,
   InviteView,
   JoinProgressStepView,
   RuntimeModeView,
   SignalingAdapterKind,
+  SetConnectivityPolicyRequest,
   TextStateView,
   TransportDiagnosticsView,
   TransportStatusView,
@@ -42,6 +44,7 @@ import {
   resetAppState,
   savePreferences,
   sendMessage,
+  setConnectivityPolicy,
   setActiveGroup,
   setActiveChannel,
   setActiveDm,
@@ -697,6 +700,12 @@ function App() {
   const voiceChannels =
     activeGroup?.channels.filter((channel) => channel.kind === "Voice") ?? [];
   const activeDm = getActiveDm(appState);
+  const activeConnectivity =
+    activeTextChannel?.connectivity ??
+    activeVoiceChannel?.connectivity ??
+    activeGroup?.connectivity ??
+    activeDm?.connectivity ??
+    appState.connectivity_defaults;
   const groupLabel = activeGroup?.name ?? "Local profile";
   const participants = appState.voice_session?.participants ?? [];
   const voiceJoined = appState.voice_session?.joined ?? false;
@@ -800,6 +809,22 @@ function App() {
         setDraftGroup(group?.name ?? draftGroup);
         setWorkflow("channel");
       },
+    );
+  }
+
+  function saveConnectivityPolicy(scopeKind: SetConnectivityPolicyRequest["scope_kind"]) {
+    const activeChannel = activeTextChannel ?? activeVoiceChannel ?? null;
+    void applyCommand(
+      setConnectivityPolicy({
+        scope_kind: scopeKind,
+        group_id: activeGroup?.group_id ?? null,
+        channel_id: activeChannel?.channel_id ?? null,
+        dm_id: activeDm?.dm_id ?? null,
+        adapter_kind: draftSignalingAdapter,
+        signaling_endpoint: draftSignalingEndpoint,
+        ice_stun_servers: parseEndpointList(draftIceStunServers),
+        ice_turn_servers: parseTurnEndpointList(draftIceTurnServers),
+      }),
     );
   }
 
@@ -1193,20 +1218,39 @@ function App() {
             />
           ) : null}
           {workflow === "dm" ? (
-            <DmPanel
-              activeDm={activeDm}
-              messages={appState.messages}
-              textStateLegend={appState.text_state_legend}
-              draftDmName={draftDmName}
-              setDraftDmName={setDraftDmName}
-              draftMessage={draftMessage}
-              setDraftMessage={setDraftMessage}
-              onStartDm={startCommandDm}
-              onSendDm={sendCommandDm}
-              transportProof={messageTransportProof}
-              setTransportProof={setMessageTransportProof}
-              diagnosticsEnabled={diagnosticsUiEnabled}
-            />
+            <>
+              <DmPanel
+                activeDm={activeDm}
+                messages={appState.messages}
+                textStateLegend={appState.text_state_legend}
+                draftDmName={draftDmName}
+                setDraftDmName={setDraftDmName}
+                draftMessage={draftMessage}
+                setDraftMessage={setDraftMessage}
+                onStartDm={startCommandDm}
+                onSendDm={sendCommandDm}
+                transportProof={messageTransportProof}
+                setTransportProof={setMessageTransportProof}
+                diagnosticsEnabled={diagnosticsUiEnabled}
+              />
+              <ConnectivitySettingsPanel
+                policy={activeConnectivity}
+                signalingAdapter={draftSignalingAdapter}
+                setSignalingAdapter={(value) =>
+                  setDraftSignalingAdapter(value as SignalingAdapterKind)
+                }
+                signalingEndpoint={draftSignalingEndpoint}
+                setSignalingEndpoint={setDraftSignalingEndpoint}
+                iceStunServers={draftIceStunServers}
+                setIceStunServers={setDraftIceStunServers}
+                iceTurnServers={draftIceTurnServers}
+                setIceTurnServers={setDraftIceTurnServers}
+                onSaveAppDefaults={() => saveConnectivityPolicy("app")}
+                onSaveGroup={null}
+                onSaveChannel={null}
+                onSaveDm={activeDm ? () => saveConnectivityPolicy("dm") : null}
+              />
+            </>
           ) : null}
           {workflow === "join" ? (
             <JoinPanel
@@ -1226,7 +1270,8 @@ function App() {
             />
           ) : null}
           {workflow === "create-group" ? (
-            <CreateGroupPanel
+            <>
+              <CreateGroupPanel
               snapshot={currentSnapshot}
               groupName={draftGroup}
               setGroupName={setDraftGroup}
@@ -1242,26 +1287,67 @@ function App() {
               setIceTurnServers={setDraftIceTurnServers}
               onCreate={createCommandGroup}
             />
+            <ConnectivitySettingsPanel
+              policy={appState.connectivity_defaults}
+              signalingAdapter={draftSignalingAdapter}
+              setSignalingAdapter={(value) =>
+                setDraftSignalingAdapter(value as SignalingAdapterKind)
+              }
+              signalingEndpoint={draftSignalingEndpoint}
+              setSignalingEndpoint={setDraftSignalingEndpoint}
+              iceStunServers={draftIceStunServers}
+              setIceStunServers={setDraftIceStunServers}
+              iceTurnServers={draftIceTurnServers}
+              setIceTurnServers={setDraftIceTurnServers}
+              onSaveAppDefaults={() => saveConnectivityPolicy("app")}
+              onSaveGroup={null}
+              onSaveChannel={null}
+              onSaveDm={null}
+            />
+            </>
           ) : null}
           {workflow === "channel" ? (
-            <ChannelPanel
-              snapshot={currentSnapshot}
-              group={activeGroup}
-              activeChannel={activeTextChannel}
-              channels={textChannels}
-              messages={appState.messages}
-              textStateLegend={appState.text_state_legend}
-              draftChannel={draftChannel}
-              setDraftChannel={setDraftChannel}
-              draftMessage={draftMessage}
-              setDraftMessage={setDraftMessage}
-              onCreateTextChannel={() => createCommandChannel("Text")}
-              onCreateVoiceChannel={() => createCommandChannel("Voice")}
-              onSendMessage={sendCommandMessage}
-              transportProof={messageTransportProof}
-              setTransportProof={setMessageTransportProof}
-              diagnosticsEnabled={diagnosticsUiEnabled}
-            />
+            <>
+              <ChannelPanel
+                snapshot={currentSnapshot}
+                group={activeGroup}
+                activeChannel={activeTextChannel}
+                channels={textChannels}
+                messages={appState.messages}
+                textStateLegend={appState.text_state_legend}
+                draftChannel={draftChannel}
+                setDraftChannel={setDraftChannel}
+                draftMessage={draftMessage}
+                setDraftMessage={setDraftMessage}
+                onCreateTextChannel={() => createCommandChannel("Text")}
+                onCreateVoiceChannel={() => createCommandChannel("Voice")}
+                onSendMessage={sendCommandMessage}
+                transportProof={messageTransportProof}
+                setTransportProof={setMessageTransportProof}
+                diagnosticsEnabled={diagnosticsUiEnabled}
+              />
+              <ConnectivitySettingsPanel
+                policy={activeConnectivity}
+                signalingAdapter={draftSignalingAdapter}
+                setSignalingAdapter={(value) =>
+                  setDraftSignalingAdapter(value as SignalingAdapterKind)
+                }
+                signalingEndpoint={draftSignalingEndpoint}
+                setSignalingEndpoint={setDraftSignalingEndpoint}
+                iceStunServers={draftIceStunServers}
+                setIceStunServers={setDraftIceStunServers}
+                iceTurnServers={draftIceTurnServers}
+                setIceTurnServers={setDraftIceTurnServers}
+                onSaveAppDefaults={() => saveConnectivityPolicy("app")}
+                onSaveGroup={activeGroup ? () => saveConnectivityPolicy("group") : null}
+                onSaveChannel={
+                  activeTextChannel || activeVoiceChannel
+                    ? () => saveConnectivityPolicy("channel")
+                    : null
+                }
+                onSaveDm={null}
+              />
+            </>
           ) : null}
           {workflow === "voice" ? (
             <VoicePanel
@@ -2923,6 +3009,140 @@ function CreateGroupPanel({
         />
       </div>
     </div>
+  );
+}
+
+function ConnectivitySettingsPanel({
+  policy,
+  signalingAdapter,
+  setSignalingAdapter,
+  signalingEndpoint,
+  setSignalingEndpoint,
+  iceStunServers,
+  setIceStunServers,
+  iceTurnServers,
+  setIceTurnServers,
+  onSaveAppDefaults,
+  onSaveGroup,
+  onSaveChannel,
+  onSaveDm,
+}: {
+  policy: ConnectivityPolicyView;
+  signalingAdapter: SignalingAdapterKind;
+  setSignalingAdapter: (value: string) => void;
+  signalingEndpoint: string;
+  setSignalingEndpoint: (value: string) => void;
+  iceStunServers: string;
+  setIceStunServers: (value: string) => void;
+  iceTurnServers: string;
+  setIceTurnServers: (value: string) => void;
+  onSaveAppDefaults: () => void;
+  onSaveGroup: (() => void) | null;
+  onSaveChannel: (() => void) | null;
+  onSaveDm: (() => void) | null;
+}) {
+  const currentProfile = policy.signaling_profiles[0];
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle>Signaling and ICE settings</CardTitle>
+        <CardDescription>
+          Configure production provider discovery and NAT traversal without
+          exposing room names, raw SDP, ICE secrets, or manual peer pairing.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.8fr)]">
+        <div className="grid gap-3">
+          <Label className="grid gap-2">
+            Signaling adapter
+            <Select
+              aria-label="Provider adapter override"
+              value={signalingAdapter}
+              onValueChange={setSignalingAdapter}
+            >
+              <SelectItem value="nostr">Nostr relay</SelectItem>
+              <SelectItem value="mqtt">MQTT broker</SelectItem>
+              <SelectItem value="ipfs_pubsub">IPFS/libp2p pubsub</SelectItem>
+              <SelectItem value="discrypt_quic_rendezvous">
+                Discrypt QUIC rendezvous
+              </SelectItem>
+            </Select>
+          </Label>
+          <Label className="grid gap-2">
+            Signaling endpoint
+            <Input
+              aria-label="Provider endpoint override"
+              value={signalingEndpoint}
+              onChange={(event) => setSignalingEndpoint(event.target.value)}
+            />
+          </Label>
+          <Label className="grid gap-2">
+            STUN servers
+            <Input
+              aria-label="Provider STUN overrides"
+              value={iceStunServers}
+              onChange={(event) => setIceStunServers(event.target.value)}
+            />
+          </Label>
+          <Label className="grid gap-2">
+            TURN servers
+            <Input
+              aria-label="Provider TURN overrides"
+              value={iceTurnServers}
+              placeholder="turns:turn.example.com:5349"
+              onChange={(event) => setIceTurnServers(event.target.value)}
+            />
+          </Label>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" onClick={onSaveAppDefaults}>
+              Save as app defaults
+            </Button>
+            {onSaveGroup ? (
+              <Button size="sm" variant="outline" onClick={onSaveGroup}>
+                Save for group
+              </Button>
+            ) : null}
+            {onSaveChannel ? (
+              <Button size="sm" variant="outline" onClick={onSaveChannel}>
+                Save for channel
+              </Button>
+            ) : null}
+            {onSaveDm ? (
+              <Button size="sm" variant="outline" onClick={onSaveDm}>
+                Save for DM
+              </Button>
+            ) : null}
+          </div>
+        </div>
+        <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.32)] p-4 text-sm">
+          <p className="font-semibold">Active signed policy</p>
+          <dl className="mt-3 grid gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+            <div>
+              <dt className="uppercase tracking-[0.14em]">Scope</dt>
+              <dd className="break-all font-mono">{policy.scope_id_commitment}</dd>
+            </div>
+            <div>
+              <dt className="uppercase tracking-[0.14em]">Adapter</dt>
+              <dd>{currentProfile?.adapter_kind ?? "not configured"}</dd>
+            </div>
+            <div>
+              <dt className="uppercase tracking-[0.14em]">Endpoint</dt>
+              <dd className="break-all">{currentProfile?.endpoints[0] ?? "none"}</dd>
+            </div>
+            <div>
+              <dt className="uppercase tracking-[0.14em]">ICE</dt>
+              <dd>
+                {policy.ice_stun_servers.length} STUN /{" "}
+                {policy.ice_turn_servers.length} TURN endpoint(s)
+              </dd>
+            </div>
+          </dl>
+          <p className="mt-3 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+            {policy.privacy_label}
+          </p>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -212,6 +212,9 @@ pub struct ChannelStateView {
     pub kind: ChannelKind,
     /// Retention label.
     pub retention_status: String,
+    /// Optional channel-level connectivity override used for text/voice sessions.
+    #[serde(default)]
+    pub connectivity: Option<ConnectivityPolicyView>,
 }
 
 /// Signed runtime peer row for group text/control attachment.
@@ -724,6 +727,8 @@ pub struct AppStateView {
     pub dms: Vec<DirectConversationView>,
     /// Local-first groups.
     pub groups: Vec<GroupView>,
+    /// App-level signaling/ICE defaults used when new DM/group scopes do not override them.
+    pub connectivity_defaults: ConnectivityPolicyView,
     /// Active routed context.
     pub active_context: Option<ActiveContextView>,
     /// Message timelines for DMs and text channels.
@@ -847,6 +852,34 @@ pub struct SavePreferencesRequest {
 pub struct StartDmRequest {
     /// Participant display name.
     pub display_name: String,
+}
+
+/// Request to persist signaling/ICE policy for an app, DM, group, or channel scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetConnectivityPolicyRequest {
+    /// Scope to update: app, dm, group, or channel.
+    pub scope_kind: String,
+    /// Group id for group/channel updates. Uses active group when absent.
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Channel id for channel updates. Uses active channel when absent.
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// DM id for DM updates. Uses active DM when absent.
+    #[serde(default)]
+    pub dm_id: Option<String>,
+    /// Selected signaling adapter kind.
+    #[serde(default)]
+    pub adapter_kind: Option<String>,
+    /// Broker/relay/bootstrap/rendezvous endpoint for the selected adapter.
+    #[serde(default)]
+    pub signaling_endpoint: Option<String>,
+    /// STUN endpoints for this scope.
+    #[serde(default)]
+    pub ice_stun_servers: Option<Vec<String>>,
+    /// Redacted TURN endpoints for this scope.
+    #[serde(default)]
+    pub ice_turn_servers: Option<Vec<IceTurnServerView>>,
 }
 
 /// Request to create a local-first group/server.
@@ -1632,6 +1665,8 @@ struct PersistedAppState {
     preferences: UiPreferencesView,
     dms: Vec<DirectConversationView>,
     groups: Vec<GroupView>,
+    #[serde(default = "app_connectivity_defaults")]
+    connectivity_defaults: ConnectivityPolicyView,
     active_context: Option<ActiveContextView>,
     messages: Vec<MessageView>,
     #[serde(default)]
@@ -2658,6 +2693,138 @@ pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
     })
 }
 
+/// Tauri command: persist signaling and ICE policy for app, DM, group, or channel scope.
+pub fn set_connectivity_policy(request: SetConnectivityPolicyRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let scope_kind = request.scope_kind.trim().to_ascii_lowercase();
+        let result: Result<String, String> = (|| match scope_kind.as_str() {
+            "app" | "defaults" | "app_default" => {
+                let policy = normalize_connectivity_policy_override(
+                    state.connectivity_defaults.clone(),
+                    &request,
+                )?;
+                state.connectivity_defaults = policy;
+                Ok("Updated app signaling/ICE defaults".to_owned())
+            }
+            "dm" => {
+                let dm_id = request
+                    .dm_id
+                    .clone()
+                    .or_else(|| {
+                        state
+                            .active_context
+                            .as_ref()
+                            .and_then(|context| context.dm_id.clone())
+                    })
+                    .ok_or_else(|| "Select a DM before saving DM connectivity".to_owned())?;
+                let dm = state
+                    .dms
+                    .iter_mut()
+                    .find(|dm| dm.dm_id == dm_id)
+                    .ok_or_else(|| "Requested DM does not exist".to_owned())?;
+                let base = dm
+                    .connectivity
+                    .clone()
+                    .unwrap_or_else(|| dm_connectivity_policy(&dm.dm_id, &dm.participant_id));
+                let policy = normalize_connectivity_policy_override(base, &request)?;
+                dm.runtime_peers = dm_runtime_peers(Some(&policy), "inviter");
+                dm.connectivity = Some(policy);
+                Ok(format!("Updated connectivity for DM {}", dm.display_name))
+            }
+            "group" => {
+                let group_id = request
+                    .group_id
+                    .clone()
+                    .or_else(|| {
+                        state
+                            .active_context
+                            .as_ref()
+                            .and_then(|context| context.group_id.clone())
+                    })
+                    .ok_or_else(|| "Select a group before saving group connectivity".to_owned())?;
+                let group = state
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.group_id == group_id)
+                    .ok_or_else(|| "Requested group does not exist".to_owned())?;
+                let base = group
+                    .connectivity
+                    .clone()
+                    .unwrap_or_else(|| group_connectivity_policy(&group.group_id));
+                let policy = normalize_connectivity_policy_override(base, &request)?;
+                group.runtime_peers = group_runtime_peers(Some(&policy), &group.role);
+                group.connectivity = Some(policy);
+                Ok(format!("Updated connectivity for group {}", group.name))
+            }
+            "channel" => {
+                let group_id = request
+                    .group_id
+                    .clone()
+                    .or_else(|| {
+                        state
+                            .active_context
+                            .as_ref()
+                            .and_then(|context| context.group_id.clone())
+                    })
+                    .ok_or_else(|| {
+                        "Select a group before saving channel connectivity".to_owned()
+                    })?;
+                let channel_id = request
+                    .channel_id
+                    .clone()
+                    .or_else(|| {
+                        state
+                            .active_context
+                            .as_ref()
+                            .and_then(|context| context.channel_id.clone())
+                    })
+                    .ok_or_else(|| {
+                        "Select a text or voice channel before saving channel connectivity"
+                            .to_owned()
+                    })?;
+                let group = state
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.group_id == group_id)
+                    .ok_or_else(|| "Requested group does not exist".to_owned())?;
+                let group_base = group
+                    .connectivity
+                    .clone()
+                    .unwrap_or_else(|| group_connectivity_policy(&group.group_id));
+                let channel = group
+                    .channels
+                    .iter_mut()
+                    .find(|channel| channel.channel_id == channel_id)
+                    .ok_or_else(|| "Requested channel does not exist".to_owned())?;
+                let base = channel.connectivity.clone().unwrap_or_else(|| {
+                    let mut policy = group_base;
+                    policy.scope_id_commitment =
+                        hash_commitment("discrypt-channel-scope-commitment-v1", &[&channel.channel_id]);
+                    policy.privacy_label =
+                        "Channel signaling topics are derived commitments; channel names and room secrets are not exposed"
+                            .to_owned();
+                    policy
+                });
+                let policy = normalize_connectivity_policy_override(base, &request)?;
+                channel.connectivity = Some(policy);
+                Ok(format!("Updated connectivity for channel {}", channel.name))
+            }
+            _ => Err("Connectivity scope must be app, dm, group, or channel".to_owned()),
+        })();
+        match result {
+            Ok(summary) => state.push_event("connectivity.policy_saved", summary),
+            Err(error) => state.push_command_error(
+                "connectivity.rejected",
+                "set_connectivity_policy",
+                "invalid_connectivity_policy",
+                error,
+                "Pick a supported adapter and valid STUN/TURN endpoints before saving",
+            ),
+        }
+    })
+}
+
 /// Tauri command: start or focus a direct-message conversation.
 pub fn start_dm(request: StartDmRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -2667,7 +2834,10 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
         let dm_id = stable_id("dm", &display_name, state.next_sequence);
         if !state.dms.iter().any(|dm| dm.display_name == display_name) {
             let participant_id = stable_id("participant", &display_name, state.next_sequence);
-            let connectivity = dm_connectivity_policy(&dm_id, &participant_id);
+            let connectivity = apply_app_connectivity_defaults(
+                dm_connectivity_policy(&dm_id, &participant_id),
+                &state.connectivity_defaults,
+            );
             let runtime_peers = dm_runtime_peers(Some(&connectivity), "inviter");
             state.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
@@ -2703,7 +2873,11 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
         let name = normalize_label(&request.name, "private lab");
         let group_id = stable_id("group", &name, state.next_sequence);
         if !state.groups.iter().any(|group| group.name == name) {
-            let connectivity = group_connectivity_policy_from_request(&group_id, &request);
+            let mut connectivity = group_connectivity_policy_from_request(&group_id, &request);
+            if !request_has_connectivity_overrides(&request) {
+                connectivity =
+                    apply_app_connectivity_defaults(connectivity, &state.connectivity_defaults);
+            }
             let runtime_peers = group_runtime_peers(Some(&connectivity), "owner");
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
@@ -3439,6 +3613,7 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
             name: normalize_channel_name(&request.name, request.kind),
             kind: request.kind,
             retention_status: normalize_label(&request.retention_status, "7 days"),
+            connectivity: None,
         };
         if let Some(group) = state
             .groups
@@ -4194,6 +4369,16 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn set_connectivity_policy(
+        app_handle: tauri::AppHandle,
+        request: SetConnectivityPolicyRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::set_connectivity_policy(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn start_dm(app_handle: tauri::AppHandle, request: StartDmRequest) -> AppStateView {
         super::run_app_state_command_with_event_emit(&app_handle, || super::start_dm(request))
     }
@@ -4440,6 +4625,7 @@ pub fn run() {
             ipc_commands::create_device_pairing_payload,
             ipc_commands::accept_device_pairing_payload,
             ipc_commands::save_preferences,
+            ipc_commands::set_connectivity_policy,
             ipc_commands::start_dm,
             ipc_commands::create_group,
             ipc_commands::set_active_group,
@@ -4485,6 +4671,7 @@ impl PersistedAppState {
             },
             dms: Vec::new(),
             groups: Vec::new(),
+            connectivity_defaults: app_connectivity_defaults(),
             active_context: None,
             messages: Vec::new(),
             text_delivery_envelopes: Vec::new(),
@@ -4522,6 +4709,7 @@ impl PersistedAppState {
             preferences: self.preferences.clone(),
             dms: self.dms.clone(),
             groups: self.groups.clone(),
+            connectivity_defaults: self.connectivity_defaults.clone(),
             active_context: self.active_context.clone(),
             messages: self.messages.clone(),
             voice_session: self.voice_session.clone(),
@@ -6067,6 +6255,22 @@ impl PersistedAppState {
                 }
             }
             if let Some(group_id) = &context.group_id {
+                if let Some(channel_id) = &context.channel_id {
+                    if let Some(connectivity) = self
+                        .groups
+                        .iter()
+                        .find(|group| &group.group_id == group_id)
+                        .and_then(|group| {
+                            group
+                                .channels
+                                .iter()
+                                .find(|channel| &channel.channel_id == channel_id)
+                        })
+                        .and_then(|channel| channel.connectivity.clone())
+                    {
+                        return Some((ConnectivityScopeLevel::Channel, connectivity));
+                    }
+                }
                 if let Some(connectivity) = self
                     .groups
                     .iter()
@@ -6793,7 +6997,10 @@ impl PersistedAppState {
             let friend = core_app_snapshot().friend;
             let dm_id = stable_id("dm", &friend.friend_code, self.next_sequence);
             let participant_id = participant_id_from_friend_code(&friend.friend_code);
-            let connectivity = dm_connectivity_policy(&dm_id, &participant_id);
+            let connectivity = apply_app_connectivity_defaults(
+                dm_connectivity_policy(&dm_id, &participant_id),
+                &self.connectivity_defaults,
+            );
             let runtime_peers = dm_runtime_peers(Some(&connectivity), "inviter");
             self.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
@@ -6936,7 +7143,10 @@ impl PersistedAppState {
                 continue;
             }
             let group_id = stable_id("group", &room_name, self.next_sequence);
-            let connectivity = group_connectivity_policy(&group_id);
+            let connectivity = apply_app_connectivity_defaults(
+                group_connectivity_policy(&group_id),
+                &self.connectivity_defaults,
+            );
             let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
             self.groups.push(GroupView {
                 group_id: group_id.clone(),
@@ -7493,12 +7703,14 @@ fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
             name: "#general".to_owned(),
             kind: ChannelKind::Text,
             retention_status: "7 days".to_owned(),
+            connectivity: None,
         },
         ChannelStateView {
             channel_id: stable_id("channel", "Voice Lobby", sequence),
             name: "Voice Lobby".to_owned(),
             kind: ChannelKind::Voice,
             retention_status: "session".to_owned(),
+            connectivity: None,
         },
     ]
 }
@@ -8324,6 +8536,242 @@ fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
             ice_turn_servers: None,
         },
     )
+}
+
+fn app_connectivity_defaults() -> ConnectivityPolicyView {
+    let scope_id_commitment =
+        hash_commitment("discrypt-app-connectivity-defaults-v1", &["local-profile"]);
+    ConnectivityPolicyView {
+        connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
+        invite_kind: "app_default".to_owned(),
+        scope_id_commitment: scope_id_commitment.clone(),
+        signaling_profiles: default_signaling_profiles(&scope_id_commitment),
+        ice_stun_servers: default_ice_stun_servers(),
+        ice_turn_servers: default_redacted_turn_servers(),
+        privacy_label: "App defaults are copied into new DM/group/channel policies; invites retarget provider topics to the signed scope commitment".to_owned(),
+        dm_bootstrap: None,
+        group_bootstrap: None,
+    }
+}
+
+fn request_has_connectivity_overrides(request: &CreateGroupRequest) -> bool {
+    request
+        .adapter_kind
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || request
+            .signaling_endpoint
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || request
+            .ice_stun_servers
+            .as_ref()
+            .is_some_and(|servers| servers.iter().any(|server| !server.trim().is_empty()))
+        || request.ice_turn_servers.as_ref().is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| !server.endpoint.trim().is_empty())
+        })
+}
+
+fn retarget_signaling_profiles(
+    scope_commitment: &str,
+    profiles: &[SignalingProfileView],
+) -> Vec<SignalingProfileView> {
+    let retargeted = profiles
+        .iter()
+        .filter_map(|profile| {
+            let endpoint = profile
+                .endpoints
+                .iter()
+                .find(|endpoint| !endpoint.trim().is_empty())?;
+            Some(signaling_profile_for_endpoint(
+                scope_commitment,
+                profile_kind_from_name(&profile.adapter_kind),
+                endpoint.trim().to_owned(),
+                "default",
+            ))
+        })
+        .collect::<Vec<_>>();
+    if retargeted.is_empty() {
+        default_signaling_profiles(scope_commitment)
+    } else {
+        retargeted
+    }
+}
+
+fn apply_app_connectivity_defaults(
+    mut policy: ConnectivityPolicyView,
+    defaults: &ConnectivityPolicyView,
+) -> ConnectivityPolicyView {
+    policy.signaling_profiles =
+        retarget_signaling_profiles(&policy.scope_id_commitment, &defaults.signaling_profiles);
+    policy.ice_stun_servers = defaults.ice_stun_servers.clone();
+    policy.ice_turn_servers = defaults.ice_turn_servers.clone();
+    policy
+}
+
+fn normalize_endpoint_list(
+    endpoints: Option<&Vec<String>>,
+    fallback: Vec<String>,
+    validator: fn(&str) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
+    let Some(endpoints) = endpoints else {
+        return Ok(fallback);
+    };
+    let normalized = endpoints
+        .iter()
+        .map(|endpoint| endpoint.trim())
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(|endpoint| {
+            validator(endpoint)?;
+            Ok(endpoint.to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if normalized.is_empty() {
+        return Err(
+            "At least one endpoint is required when overriding an endpoint list".to_owned(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn validate_stun_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint.starts_with("stun:") || endpoint.starts_with("stuns:") {
+        Ok(())
+    } else {
+        Err(format!(
+            "STUN endpoint must start with stun: or stuns:, got {endpoint}"
+        ))
+    }
+}
+
+fn validate_turn_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint.starts_with("turn:") || endpoint.starts_with("turns:") {
+        Ok(())
+    } else {
+        Err(format!(
+            "TURN endpoint must start with turn: or turns:, got {endpoint}"
+        ))
+    }
+}
+
+fn validate_signaling_endpoint(adapter_kind: &str, endpoint: &str) -> Result<(), String> {
+    if endpoint.trim() != endpoint || endpoint.chars().any(char::is_whitespace) {
+        return Err("Signaling endpoint must be trimmed and contain no whitespace".to_owned());
+    }
+    let valid = match adapter_kind {
+        "nostr" => endpoint.starts_with("wss://") || endpoint.starts_with("ws://"),
+        "mqtt" => {
+            endpoint.starts_with("mqtts://")
+                || endpoint.starts_with("mqtt://")
+                || endpoint.starts_with("wss://")
+                || endpoint.starts_with("ws://")
+        }
+        "ipfs_pubsub" => {
+            endpoint.starts_with("/ip4/")
+                || endpoint.starts_with("/ip6/")
+                || endpoint.starts_with("/dns")
+                || endpoint.starts_with("ipfs://")
+        }
+        "discrypt_quic_rendezvous" => {
+            endpoint.starts_with("quic://")
+                || endpoint.starts_with("https://")
+                || endpoint.starts_with("wss://")
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unsupported endpoint {endpoint} for signaling adapter {adapter_kind}"
+        ))
+    }
+}
+
+fn normalize_connectivity_policy_override(
+    mut policy: ConnectivityPolicyView,
+    request: &SetConnectivityPolicyRequest,
+) -> Result<ConnectivityPolicyView, String> {
+    let adapter_kind = request
+        .adapter_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let endpoint = request
+        .signaling_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(kind) = adapter_kind.as_deref() {
+        transport_adapter_kind_from_name(kind)
+            .ok_or_else(|| format!("Unsupported signaling adapter kind {kind}"))?;
+    }
+    if adapter_kind.is_some() || endpoint.is_some() {
+        let kind = adapter_kind
+            .clone()
+            .or_else(|| {
+                policy
+                    .signaling_profiles
+                    .first()
+                    .map(|profile| profile.adapter_kind.clone())
+            })
+            .ok_or_else(|| "A signaling adapter is required".to_owned())?;
+        let endpoint = endpoint
+            .or_else(|| {
+                default_adapter_endpoint(&profile_kind_from_name(&kind)).or_else(|| {
+                    policy
+                        .signaling_profiles
+                        .first()
+                        .and_then(|profile| profile.endpoints.first().cloned())
+                })
+            })
+            .ok_or_else(|| format!("No default endpoint is configured for adapter {kind}"))?;
+        validate_signaling_endpoint(&kind, &endpoint)?;
+        policy.signaling_profiles = vec![signaling_profile_for_endpoint(
+            &policy.scope_id_commitment,
+            profile_kind_from_name(&kind),
+            endpoint,
+            "custom",
+        )];
+    }
+    policy.ice_stun_servers = normalize_endpoint_list(
+        request.ice_stun_servers.as_ref(),
+        policy.ice_stun_servers,
+        validate_stun_endpoint,
+    )?;
+    policy.ice_turn_servers = match request.ice_turn_servers.as_ref() {
+        Some(servers) => {
+            let normalized = servers
+                .iter()
+                .filter(|server| !server.endpoint.trim().is_empty())
+                .map(|server| {
+                    let endpoint = server.endpoint.trim();
+                    validate_turn_endpoint(endpoint)?;
+                    Ok(IceTurnServerView {
+                        endpoint: endpoint.to_owned(),
+                        credential_declared: server.credential_declared,
+                        credential_expires_at: server.credential_expires_at.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            normalized
+        }
+        None => policy.ice_turn_servers,
+    };
+    if policy.signaling_profiles.is_empty() {
+        return Err("At least one signaling profile is required".to_owned());
+    }
+    for profile in &policy.signaling_profiles {
+        transport_profile_from_view(profile)?;
+    }
+    let _ = ice_endpoint_policy_from_connectivity(&policy).map_err(|error| error.to_string())?;
+    Ok(policy)
 }
 
 fn dm_connectivity_policy(dm_id: &str, participant_id: &str) -> ConnectivityPolicyView {
@@ -9698,7 +10146,8 @@ mod tests {
             retention_status: "24 hours".to_owned(),
         });
         assert!(extra_channel_state.groups.iter().any(|group| {
-            group.channels
+            group
+                .channels
                 .iter()
                 .any(|channel| channel.name == "#field-notes")
         }));
@@ -9850,7 +10299,10 @@ mod tests {
             .connectivity
             .as_ref()
             .ok_or_else(|| "alice reloaded group connectivity missing".to_owned())?;
-        assert_eq!(reloaded_connectivity.signaling_profiles[0].adapter_kind, "mqtt");
+        assert_eq!(
+            reloaded_connectivity.signaling_profiles[0].adapter_kind,
+            "mqtt"
+        );
         assert_eq!(reloaded_connectivity.ice_stun_servers.len(), 2);
         assert_eq!(reloaded_connectivity.ice_turn_servers.len(), 1);
         assert!(reloaded_group
@@ -9867,9 +10319,18 @@ mod tests {
                 .as_ref()
                 .map(|session| (
                     session.self_muted,
-                    session.input_device.as_ref().map(|device| device.device_id.as_str()),
-                    session.output_device.as_ref().map(|device| device.device_id.as_str()),
-                    session.participants.first().map(|participant| participant.volume)
+                    session
+                        .input_device
+                        .as_ref()
+                        .map(|device| device.device_id.as_str()),
+                    session
+                        .output_device
+                        .as_ref()
+                        .map(|device| device.device_id.as_str()),
+                    session
+                        .participants
+                        .first()
+                        .map(|participant| participant.volume)
                 )),
             Some((true, Some("alice-mic"), Some("alice-speaker"), Some(37)))
         );
@@ -9933,7 +10394,10 @@ mod tests {
             invite_code: group_invite.code.clone(),
             group_name: Some("G004 Lab".to_owned()),
         });
-        assert!(joined_group.last_command_error.is_none(), "{joined_group:?}");
+        assert!(
+            joined_group.last_command_error.is_none(),
+            "{joined_group:?}"
+        );
         let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target: target.clone(),
             envelope: envelope_record.envelope.clone(),
@@ -9967,22 +10431,18 @@ mod tests {
         }));
         assert!(bob_reloaded.dms.iter().any(|dm| {
             dm.display_name == "Alice G004"
-                && dm
-                    .connectivity
-                    .as_ref()
-                    .is_some_and(|policy| policy.scope_id_commitment == dm_invite.scope_id_commitment)
+                && dm.connectivity.as_ref().is_some_and(|policy| {
+                    policy.scope_id_commitment == dm_invite.scope_id_commitment
+                })
         }));
         assert!(bob_reloaded.groups.iter().any(|group| {
             group.name == "G004 Lab"
                 && group.role == "member"
-                && group
-                    .connectivity
-                    .as_ref()
-                    .is_some_and(|policy| {
-                        policy.scope_id_commitment == group_invite.scope_id_commitment
-                            && policy.ice_stun_servers == group_invite.ice_stun_servers
-                            && policy.ice_turn_servers == group_invite.ice_turn_servers
-                    })
+                && group.connectivity.as_ref().is_some_and(|policy| {
+                    policy.scope_id_commitment == group_invite.scope_id_commitment
+                        && policy.ice_stun_servers == group_invite.ice_stun_servers
+                        && policy.ice_turn_servers == group_invite.ice_turn_servers
+                })
         }));
         assert!(bob_reloaded.invites.iter().any(|invite| {
             invite.invite_kind == "dm_contact" && invite.uses == 1 && !invite.revoked
@@ -10645,6 +11105,186 @@ mod tests {
         assert_eq!(invite.signaling_profiles, connectivity.signaling_profiles);
         assert_eq!(invite.ice_stun_servers, connectivity.ice_stun_servers);
         assert_eq!(invite.ice_turn_servers, connectivity.ice_turn_servers);
+        Ok(())
+    }
+
+    #[test]
+    fn g005_connectivity_policy_command_persists_scope_overrides_and_invites() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        reset_with_temp_state("g005-connectivity-policy-command");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+
+        let app_defaults = set_connectivity_policy(SetConnectivityPolicyRequest {
+            scope_kind: "app".to_owned(),
+            group_id: None,
+            channel_id: None,
+            dm_id: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.l.google.com:19302".to_owned()]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.invalid:5349".to_owned(),
+                credential_declared: true,
+                credential_expires_at: Some("2026-06-02T00:00:00Z".to_owned()),
+            }]),
+        });
+        assert!(
+            app_defaults.last_command_error.is_none(),
+            "{app_defaults:?}"
+        );
+        assert_eq!(
+            app_defaults.connectivity_defaults.signaling_profiles[0].adapter_kind,
+            "mqtt"
+        );
+
+        let created = create_group(CreateGroupRequest {
+            name: "G005 Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .iter()
+            .find(|group| group.name == "G005 Lab")
+            .ok_or_else(|| "group missing".to_owned())?;
+        let inherited = group
+            .connectivity
+            .as_ref()
+            .ok_or_else(|| "group connectivity missing".to_owned())?;
+        assert_eq!(inherited.signaling_profiles[0].adapter_kind, "mqtt");
+        assert_eq!(inherited.ice_turn_servers.len(), 1);
+
+        let updated_group = set_connectivity_policy(SetConnectivityPolicyRequest {
+            scope_kind: "group".to_owned(),
+            group_id: Some(group.group_id.clone()),
+            channel_id: None,
+            dm_id: None,
+            adapter_kind: Some("nostr".to_owned()),
+            signaling_endpoint: Some("wss://relay.damus.io".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.cloudflare.com:3478".to_owned()]),
+            ice_turn_servers: Some(Vec::new()),
+        });
+        assert!(
+            updated_group.last_command_error.is_none(),
+            "{updated_group:?}"
+        );
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group.group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "3".to_owned(),
+        });
+        let invite = invite_state
+            .invites
+            .last()
+            .ok_or_else(|| "invite missing".to_owned())?;
+        assert_eq!(invite.signaling_profiles[0].adapter_kind, "nostr");
+        assert_eq!(
+            invite.ice_stun_servers,
+            vec!["stun:stun.cloudflare.com:3478"]
+        );
+
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group.group_id.clone(),
+            name: "ops".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        let channel_id = channel_state
+            .active_context
+            .as_ref()
+            .and_then(|context| context.channel_id.clone())
+            .ok_or_else(|| "active channel missing".to_owned())?;
+        let channel_update = set_connectivity_policy(SetConnectivityPolicyRequest {
+            scope_kind: "channel".to_owned(),
+            group_id: Some(group.group_id.clone()),
+            channel_id: Some(channel_id.clone()),
+            dm_id: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtt://127.0.0.1:1883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.l.google.com:19302".to_owned()]),
+            ice_turn_servers: Some(Vec::new()),
+        });
+        assert!(
+            channel_update.last_command_error.is_none(),
+            "{channel_update:?}"
+        );
+        let persisted = load_state().to_view();
+        let persisted_channel = persisted
+            .groups
+            .iter()
+            .find(|persisted_group| persisted_group.group_id == group.group_id)
+            .and_then(|persisted_group| {
+                persisted_group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.channel_id == channel_id)
+            })
+            .ok_or_else(|| "persisted channel missing".to_owned())?;
+        assert_eq!(
+            persisted_channel
+                .connectivity
+                .as_ref()
+                .and_then(|policy| policy.signaling_profiles.first())
+                .map(|profile| profile.adapter_kind.as_str()),
+            Some("mqtt")
+        );
+
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm = dm_state
+            .dms
+            .iter()
+            .find(|dm| dm.display_name == "Bob")
+            .ok_or_else(|| "dm missing".to_owned())?;
+        let dm_update = set_connectivity_policy(SetConnectivityPolicyRequest {
+            scope_kind: "dm".to_owned(),
+            group_id: None,
+            channel_id: None,
+            dm_id: Some(dm.dm_id.clone()),
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.l.google.com:19302".to_owned()]),
+            ice_turn_servers: Some(Vec::new()),
+        });
+        assert!(dm_update.last_command_error.is_none(), "{dm_update:?}");
+        let dm_invite_state = create_dm_invite(CreateDmInviteRequest {
+            dm_id: Some(dm.dm_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "1".to_owned(),
+        });
+        let dm_invite = dm_invite_state
+            .invites
+            .last()
+            .ok_or_else(|| "dm invite missing".to_owned())?;
+        assert_eq!(dm_invite.invite_kind, "dm_contact");
+        assert_eq!(dm_invite.signaling_profiles[0].adapter_kind, "mqtt");
+
+        let rejected = set_connectivity_policy(SetConnectivityPolicyRequest {
+            scope_kind: "group".to_owned(),
+            group_id: Some(group.group_id.clone()),
+            channel_id: None,
+            dm_id: None,
+            adapter_kind: Some("nostr".to_owned()),
+            signaling_endpoint: Some("mqtts://wrong-for-nostr.example:8883".to_owned()),
+            ice_stun_servers: Some(vec!["https://not-stun.example".to_owned()]),
+            ice_turn_servers: Some(Vec::new()),
+        });
+        assert!(rejected.last_command_error.is_some());
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.command.as_str()),
+            Some("set_connectivity_policy")
+        );
         Ok(())
     }
 

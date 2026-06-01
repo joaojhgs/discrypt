@@ -154,6 +154,7 @@ export type ChannelStateView = {
   name: string;
   kind: ChannelKind;
   retention_status: string;
+  connectivity?: ConnectivityPolicyView | null;
 };
 
 export type GroupRuntimePeerView = {
@@ -466,6 +467,7 @@ export type AppState = {
   preferences: PreferencesView;
   dms: DirectConversationView[];
   groups: GroupView[];
+  connectivity_defaults: ConnectivityPolicyView;
   active_context: ActiveContextView | null;
   messages: AppMessageView[];
   voice_session: VoiceSessionView | null;
@@ -533,6 +535,17 @@ export type SignalingAdapterKind =
   | "mqtt"
   | "ipfs_pubsub"
   | "discrypt_quic_rendezvous";
+
+export type SetConnectivityPolicyRequest = {
+  scope_kind: "app" | "dm" | "group" | "channel" | string;
+  group_id?: string | null;
+  channel_id?: string | null;
+  dm_id?: string | null;
+  adapter_kind?: SignalingAdapterKind | string | null;
+  signaling_endpoint?: string | null;
+  ice_stun_servers?: string[] | null;
+  ice_turn_servers?: IceTurnServerView[] | null;
+};
 
 export type CreateGroupRequest = {
   name: string;
@@ -887,6 +900,7 @@ const fallbackState: AppState = {
   preferences: fallbackSnapshot.preferences,
   dms: [],
   groups: [],
+  connectivity_defaults: appConnectivityDefaults(),
   active_context: null,
   messages: [],
   voice_session: null,
@@ -1391,12 +1405,14 @@ function defaultGroupChannels(): ChannelStateView[] {
       name: "#general",
       kind: "Text",
       retention_status: "7 days",
+      connectivity: null,
     },
     {
       channel_id: "channel-voice-lobby",
       name: "Voice Lobby",
       kind: "Voice",
       retention_status: "session",
+      connectivity: null,
     },
   ];
 }
@@ -1817,6 +1833,123 @@ function dmConnectivityPolicy(
   };
 }
 
+function appConnectivityDefaults(): ConnectivityPolicyView {
+  const scope = hashCommitment("discrypt-app-connectivity-defaults-v1", [
+    "local-profile",
+  ]);
+  return {
+    connectivity_schema_version: 1,
+    invite_kind: "app_default",
+    scope_id_commitment: scope,
+    signaling_profiles: defaultSignalingProfiles(scope),
+    ice_stun_servers: defaultIceStunServers(),
+    ice_turn_servers: defaultRedactedTurnServers(),
+    privacy_label:
+      "App defaults are copied into new DM/group/channel policies; invites retarget provider topics to the signed scope commitment",
+    dm_bootstrap: null,
+    group_bootstrap: null,
+  };
+}
+
+function retargetSignalingProfiles(
+  scope: string,
+  profiles: SignalingProfileView[],
+): SignalingProfileView[] {
+  const retargeted = profiles
+    .map((profile) => {
+      const endpoint = profile.endpoints.find((item) => item.trim());
+      if (!endpoint) return null;
+      return signalingProfileForEndpoint(
+        scope,
+        profile.adapter_kind,
+        endpoint.trim(),
+        `${profile.adapter_kind}-default`,
+      );
+    })
+    .filter(Boolean) as SignalingProfileView[];
+  return retargeted.length ? retargeted : defaultSignalingProfiles(scope);
+}
+
+function applyAppConnectivityDefaults(
+  policy: ConnectivityPolicyView,
+  defaults: ConnectivityPolicyView,
+): ConnectivityPolicyView {
+  return {
+    ...policy,
+    signaling_profiles: retargetSignalingProfiles(
+      policy.scope_id_commitment,
+      defaults.signaling_profiles,
+    ),
+    ice_stun_servers: defaults.ice_stun_servers,
+    ice_turn_servers: defaults.ice_turn_servers,
+  };
+}
+
+function requestHasConnectivityOverrides(request: CreateGroupRequest): boolean {
+  return Boolean(
+    request.adapter_kind?.trim() ||
+      request.signaling_endpoint?.trim() ||
+      request.ice_stun_servers?.some((server) => server.trim()) ||
+      request.ice_turn_servers?.some((server) => server.endpoint.trim()),
+  );
+}
+
+function validateSignalingEndpoint(kind: string, endpoint: string): boolean {
+  if (endpoint.trim() !== endpoint || /\s/.test(endpoint)) return false;
+  if (kind === "nostr") return endpoint.startsWith("wss://") || endpoint.startsWith("ws://");
+  if (kind === "mqtt") return /^(mqtts|mqtt|wss|ws):\/\//.test(endpoint);
+  if (kind === "ipfs_pubsub") return /^(\/ip4\/|\/ip6\/|\/dns|ipfs:\/\/)/.test(endpoint);
+  if (kind === "discrypt_quic_rendezvous") return /^(quic|https|wss):\/\//.test(endpoint);
+  return false;
+}
+
+function normalizeConnectivityPolicyOverride(
+  base: ConnectivityPolicyView,
+  request: SetConnectivityPolicyRequest,
+): ConnectivityPolicyView {
+  const adapterKind =
+    request.adapter_kind?.trim() || base.signaling_profiles[0]?.adapter_kind || "nostr";
+  const endpoint =
+    request.signaling_endpoint?.trim() ||
+    base.signaling_profiles[0]?.endpoints[0] ||
+    defaultSignalingEndpoint(base);
+  if (!["nostr", "mqtt", "ipfs_pubsub", "discrypt_quic_rendezvous"].includes(adapterKind)) {
+    throw new Error(`Unsupported signaling adapter kind ${adapterKind}`);
+  }
+  if (!validateSignalingEndpoint(adapterKind, endpoint)) {
+    throw new Error(`Unsupported endpoint ${endpoint} for ${adapterKind}`);
+  }
+  const stun =
+    request.ice_stun_servers?.map((item) => item.trim()).filter(Boolean) ??
+    base.ice_stun_servers;
+  if (!stun.length || stun.some((item) => !/^stuns?:/.test(item))) {
+    throw new Error("STUN endpoints must start with stun: or stuns:");
+  }
+  const turn =
+    request.ice_turn_servers
+      ?.filter((server) => server.endpoint.trim())
+      .map((server) => {
+        const endpoint = server.endpoint.trim();
+        if (!/^turns?:/.test(endpoint)) {
+          throw new Error("TURN endpoints must start with turn: or turns:");
+        }
+        return { ...server, endpoint };
+      }) ?? base.ice_turn_servers;
+  return {
+    ...base,
+    signaling_profiles: [
+      signalingProfileForEndpoint(
+        base.scope_id_commitment,
+        adapterKind,
+        endpoint,
+        `${adapterKind}-custom`,
+      ),
+    ],
+    ice_stun_servers: stun,
+    ice_turn_servers: turn,
+  };
+}
+
 
 function productionInviteLink(metadata: ParsedInviteMetadata): string {
   const query = new URLSearchParams({
@@ -2021,9 +2154,12 @@ function ensureFallbackReady(
       display_name: fallbackState.snapshot.friend.alias,
       local_only_copy:
         "Local DM seeded from a generated friend-code/QR payload; no remote delivery is claimed",
-      connectivity: dmConnectivityPolicy(
-        dmId,
-        participantIdFromFriendCode(fallbackState.snapshot.friend.friend_code),
+      connectivity: applyAppConnectivityDefaults(
+        dmConnectivityPolicy(
+          dmId,
+          participantIdFromFriendCode(fallbackState.snapshot.friend.friend_code),
+        ),
+        fallbackState.connectivity_defaults,
       ),
     },
   ];
@@ -2078,7 +2214,10 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
   for (const room of rooms) {
     if (fallbackState.groups.some((group) => group.name === room)) continue;
     const groupId = `group-${slugify(room)}`;
-    const connectivity = groupConnectivityPolicy(groupId);
+    const connectivity = applyAppConnectivityDefaults(
+      groupConnectivityPolicy(groupId),
+      fallbackState.connectivity_defaults,
+    );
     fallbackState.groups.push({
       group_id: groupId,
       name: room,
@@ -2089,12 +2228,14 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
           name: "#general",
           kind: "Text",
           retention_status: "7 days",
+          connectivity: null,
         },
         {
           channel_id: `${groupId}-voice`,
           name: "Voice Lobby",
           kind: "Voice",
           retention_status: "session",
+          connectivity: null,
         },
       ],
       runtime_peers: groupRuntimePeers(connectivity, "member"),
@@ -2427,6 +2568,76 @@ function normalizePreferences(request: SavePreferencesRequest): SavePreferencesR
   };
 }
 
+export async function setConnectivityPolicy(
+  request: SetConnectivityPolicyRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_connectivity_policy", { request }, () =>
+    mutateFallback((state) => {
+      ensureFallbackReady();
+      try {
+        if (request.scope_kind === "app" || request.scope_kind === "defaults") {
+          state.connectivity_defaults = normalizeConnectivityPolicyOverride(
+            state.connectivity_defaults,
+            request,
+          );
+          pushEvent(state, "connectivity.policy_saved", "Updated app signaling/ICE defaults");
+          return;
+        }
+        if (request.scope_kind === "dm") {
+          const dmId = request.dm_id ?? state.active_context?.dm_id ?? null;
+          const dm = state.dms.find((item) => item.dm_id === dmId);
+          if (!dm) throw new Error("Requested DM does not exist");
+          const policy = normalizeConnectivityPolicyOverride(
+            dm.connectivity ?? dmConnectivityPolicy(dm.dm_id, dm.participant_id),
+            request,
+          );
+          dm.runtime_peers = dmRuntimePeers(policy, "inviter");
+          dm.connectivity = policy;
+          pushEvent(state, "connectivity.policy_saved", `Updated connectivity for DM ${dm.display_name}`);
+          return;
+        }
+        const groupId = request.group_id ?? state.active_context?.group_id ?? null;
+        const group = state.groups.find((item) => item.group_id === groupId);
+        if (!group) throw new Error("Requested group does not exist");
+        if (request.scope_kind === "channel") {
+          const channelId = request.channel_id ?? state.active_context?.channel_id ?? null;
+          const channel = group.channels.find((item) => item.channel_id === channelId);
+          if (!channel) throw new Error("Requested channel does not exist");
+          const base =
+            channel.connectivity ??
+            ({
+              ...(group.connectivity ?? groupConnectivityPolicy(group.group_id)),
+              scope_id_commitment: hashCommitment("discrypt-channel-scope-commitment-v1", [
+                channel.channel_id,
+              ]),
+              privacy_label:
+                "Channel signaling topics are derived commitments; channel names and room secrets are not exposed",
+            } satisfies ConnectivityPolicyView);
+          channel.connectivity = normalizeConnectivityPolicyOverride(base, request);
+          pushEvent(state, "connectivity.policy_saved", `Updated connectivity for channel ${channel.name}`);
+          return;
+        }
+        const policy = normalizeConnectivityPolicyOverride(
+          group.connectivity ?? groupConnectivityPolicy(group.group_id),
+          request,
+        );
+        group.runtime_peers = groupRuntimePeers(policy, group.role);
+        group.connectivity = policy;
+        pushEvent(state, "connectivity.policy_saved", `Updated connectivity for group ${group.name}`);
+      } catch (error) {
+        pushCommandError(
+          state,
+          "connectivity.rejected",
+          "set_connectivity_policy",
+          "invalid_connectivity_policy",
+          error instanceof Error ? error.message : "Invalid connectivity policy",
+          "Pick a supported adapter and valid STUN/TURN endpoints before saving",
+        );
+      }
+    }),
+  );
+}
+
 export async function startDm(request: StartDmRequest): Promise<AppState> {
   return invokeOrFallback<AppState>("start_dm", { request }, () =>
     mutateFallback((state) => {
@@ -2436,7 +2647,10 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
       const dmId = `dm-${slugify(displayName)}`;
       if (!state.dms.some((dm) => dm.dm_id === dmId)) {
         const participantId = slugify(displayName);
-        const connectivity = dmConnectivityPolicy(dmId, participantId);
+        const connectivity = applyAppConnectivityDefaults(
+          dmConnectivityPolicy(dmId, participantId),
+          state.connectivity_defaults,
+        );
         state.dms.push({
           dm_id: dmId,
           participant_id: participantId,
@@ -2467,7 +2681,13 @@ export async function createGroup(
       const name = request.name.trim() || "private lab";
       const groupId = `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
-        const connectivity = groupConnectivityPolicy(groupId, request);
+        let connectivity = groupConnectivityPolicy(groupId, request);
+        if (!requestHasConnectivityOverrides(request)) {
+          connectivity = applyAppConnectivityDefaults(
+            connectivity,
+            state.connectivity_defaults,
+          );
+        }
         state.groups.push({
           group_id: groupId,
           name,
@@ -2971,6 +3191,7 @@ export async function createChannel(
           name,
           kind: request.kind,
           retention_status: request.retention_status,
+          connectivity: null,
         });
       }
       const channel = group.channels.find((item) => item.name === name);
