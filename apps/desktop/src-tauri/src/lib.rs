@@ -3963,6 +3963,9 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
             .as_ref()
             .map(|profile| profile.display_name.clone())
             .unwrap_or_else(|| "Alice".to_owned());
+        // Message identifiers cross profile boundaries in text/control receipts. Include a
+        // non-secret author commitment so two isolated profiles with the same local sequence
+        // cannot collide and make a valid peer receipt verify against the wrong envelope.
         let author_id = state.local_user_id();
         let author_commitment = hash_commitment("discrypt-message-id-author-v1", &[&author_id]);
         let message_id = format!("msg-{}-{sequence}", &author_commitment[..16]);
@@ -6738,6 +6741,10 @@ impl PersistedAppState {
                 }
             };
             let receipt_response = matches!(inbound_frame, TextControlFrameView::Receipt { .. });
+            // Scope receipt validation to this response. The state may still contain an older
+            // setup/invite/admission command error; a stale error must not make a later peer
+            // receipt look invalid.
+            self.last_command_error = None;
             if self.handle_text_control_frame(inbound_frame).is_some() {
                 failures.push(format!(
                     "{}: response frame unexpectedly generated another response",
@@ -14901,7 +14908,8 @@ mod tests {
         });
         let alice_message_id = alice_sent
             .messages
-            .last()
+            .iter()
+            .find(|message| message.body == "g012 alice to bob encrypted group text")
             .map(|message| message.message_id.clone())
             .ok_or_else(|| "alice message missing".to_owned())?;
         let alice_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
@@ -14964,7 +14972,8 @@ mod tests {
         });
         let bob_message_id = bob_sent
             .messages
-            .last()
+            .iter()
+            .find(|message| message.body == "g012 bob to alice encrypted group text")
             .map(|message| message.message_id.clone())
             .ok_or_else(|| "bob message missing".to_owned())?;
         let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
