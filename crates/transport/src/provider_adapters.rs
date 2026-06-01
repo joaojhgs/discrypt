@@ -7403,9 +7403,9 @@ mod tests {
         let boundary = adapter_boundary_for_kind(SignalingAdapterKind::DiscryptQuicRendezvous);
         assert_eq!(
             boundary.readiness,
-            ProviderAdapterReadiness::ImplementationUnavailable
+            ProviderAdapterReadiness::FeatureDisabled
         );
-        assert_eq!(boundary.failure_class(), "implementation_unavailable");
+        assert_eq!(boundary.failure_class(), "feature_disabled");
         assert!(
             !SignalingAdapterFactory::for_kind(SignalingAdapterKind::DiscryptQuicRendezvous)
                 .selectable()
@@ -7420,7 +7420,7 @@ mod tests {
         assert_eq!(plan.attempts.len(), 1);
         assert_eq!(
             plan.attempts[0].readiness,
-            AdapterReadinessState::ImplementationUnavailable
+            AdapterReadinessState::FeatureDisabled
         );
         assert!(!plan.attempts[0].selected);
 
@@ -7435,7 +7435,8 @@ mod tests {
             .map(|error| error.to_string())
             .unwrap_or_default();
         assert!(message.contains("discrypt_quic_rendezvous"));
-        assert!(message.contains("no audited production provider client is wired"));
+        assert!(message.contains("not enabled"));
+        assert!(message.contains("discrypt-quic-rendezvous-adapter"));
         Ok(())
     }
 
@@ -8464,10 +8465,15 @@ mod tests {
             scope,
             b"runtime pair bootstrap secret with thirty two bytes",
             b"runtime pair entropy",
-            WebRtcNegotiationConfig::new(IceServerConfig::new(
-                vec![Endpoint::new("stun:127.0.0.1:3478")],
-                vec![],
-            )?),
+            WebRtcNegotiationConfig {
+                ice_servers: IceServerConfig {
+                    stun_servers: Vec::new(),
+                    turn_servers: Vec::new(),
+                },
+                udp_addrs: vec!["127.0.0.1:0".to_owned()],
+                data_channel_label: "discrypt-control".to_owned(),
+                ice_transport_policy: crate::WebRtcIceTransportPolicy::All,
+            },
             SignalingPeerId::new("alice-device")?,
             SignalingPeerId::new("bob-device")?,
             move |frame| {

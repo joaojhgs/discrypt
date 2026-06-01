@@ -9,18 +9,54 @@ async function expectNoManualRuntimeControls(...pages: Page[]) {
   }
 }
 
+type E2EVoiceTrackState = {
+  enabled: boolean;
+  stopped: boolean;
+  stopCount: number;
+};
+
+async function readVoiceTrackState(page: Page): Promise<E2EVoiceTrackState> {
+  const state = await page.evaluate(() => {
+    const e2eWindow = window as Window & {
+      __discryptE2eVoiceTrack?: E2EVoiceTrackState;
+    };
+    return e2eWindow.__discryptE2eVoiceTrack ?? null;
+  });
+  expect(state).not.toBeNull();
+  return state as E2EVoiceTrackState;
+}
+
 async function installVoiceDevices(page: Page, profile: string) {
   await page.addInitScript((profileName) => {
+    const voiceTrackState = {
+      enabled: true,
+      stopped: false,
+      stopCount: 0,
+    };
+    Object.defineProperty(window, "__discryptE2eVoiceTrack", {
+      configurable: true,
+      value: voiceTrackState,
+    });
     const audioTrack = {
       kind: "audio",
-      enabled: true,
-      stop: () => undefined,
+      get enabled() {
+        return voiceTrackState.enabled;
+      },
+      set enabled(value: boolean) {
+        voiceTrackState.enabled = Boolean(value);
+      },
+      stop: () => {
+        voiceTrackState.stopped = true;
+        voiceTrackState.stopCount += 1;
+        voiceTrackState.enabled = false;
+      },
     };
     Object.defineProperty(navigator, "mediaDevices", {
       configurable: true,
       value: {
         getUserMedia: async () => ({
           getTracks: () => [audioTrack],
+          getAudioTracks: () => [audioTrack],
         }),
         enumerateDevices: async () => [
           {
@@ -44,12 +80,13 @@ async function installVoiceDevices(page: Page, profile: string) {
     class E2EAudioContext {
       state = "running";
       createMediaStreamSource() {
-        return { connect: () => undefined };
+        return { connect: () => undefined, disconnect: () => undefined };
       }
       createAnalyser() {
         return {
           fftSize: 1024,
           getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
+          disconnect: () => undefined,
         };
       }
       resume() {
@@ -244,22 +281,38 @@ async function attemptVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
+  await expect(page.locator('[data-testid="voice-local-participant"]')).toHaveCount(1);
+  await expect(page.locator('[data-testid="voice-remote-participant"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="voice-remote-volume"]')).toHaveCount(0);
+  await expect(page.getByRole("slider", { name: /speaker volume/i })).toHaveCount(0);
+  await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(true);
+  expect((await readVoiceTrackState(page)).stopCount).toBe(0);
   await expect(
     page.getByText(/Join creates backend voice state and records selected devices/i),
   ).toBeVisible();
   await expect(page.getByText(/waiting-route-proof/i)).toBeVisible();
   await expect(page.getByText("policy-only", { exact: true })).toBeVisible();
   await expect(
-    page.getByText(/remote media transport remains gated until backend media-route evidence exists/i).first(),
+    page
+      .getByText(
+        /encrypted media transport remains gated by media-frame E2E|remote media transport remains gated until backend media-route evidence exists/i,
+      )
+      .first(),
   ).toBeVisible();
   await expect(
     page.getByRole("switch", { name: /mute my microphone/i }),
   ).toBeEnabled();
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
+  await expect(page.getByRole("switch", { name: /mute my microphone/i })).toHaveAttribute("aria-checked", "true");
   await expect(page.getByText(/muted/).first()).toBeVisible();
-  await expect(page.getByRole("slider").first()).toBeVisible();
+  await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(false);
+  await page.getByRole("switch", { name: /mute my microphone/i }).click();
+  await expect(page.getByRole("switch", { name: /mute my microphone/i })).toHaveAttribute("aria-checked", "false");
+  await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(true);
   await page.getByRole("button", { name: /leave call/i }).click();
   await expect(page.getByText(/not joined/i).first()).toBeVisible();
+  await expect.poll(async () => (await readVoiceTrackState(page)).stopped).toBe(true);
+  expect((await readVoiceTrackState(page)).stopCount).toBeGreaterThan(0);
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
 }

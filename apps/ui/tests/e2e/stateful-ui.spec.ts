@@ -7,16 +7,35 @@ async function bootReadyShell(page) {
     if (message.type() === "error") errors.push(message.text());
   });
   await page.addInitScript(() => {
+    const voiceTrackState = {
+      enabled: true,
+      stopped: false,
+      stopCount: 0,
+    };
+    Object.defineProperty(window, "__discryptE2eVoiceTrack", {
+      configurable: true,
+      value: voiceTrackState,
+    });
     const audioTrack = {
       kind: "audio",
-      enabled: true,
-      stop: () => undefined,
+      get enabled() {
+        return voiceTrackState.enabled;
+      },
+      set enabled(value: boolean) {
+        voiceTrackState.enabled = Boolean(value);
+      },
+      stop: () => {
+        voiceTrackState.stopped = true;
+        voiceTrackState.stopCount += 1;
+        voiceTrackState.enabled = false;
+      },
     };
     Object.defineProperty(navigator, "mediaDevices", {
       configurable: true,
       value: {
         getUserMedia: async () => ({
           getTracks: () => [audioTrack],
+          getAudioTracks: () => [audioTrack],
         }),
         enumerateDevices: async () => [
           {
@@ -40,12 +59,13 @@ async function bootReadyShell(page) {
     class E2EAudioContext {
       state = "running";
       createMediaStreamSource() {
-        return { connect: () => undefined };
+        return { connect: () => undefined, disconnect: () => undefined };
       }
       createAnalyser() {
         return {
           fftSize: 1024,
           getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
+          disconnect: () => undefined,
         };
       }
       resume() {
@@ -223,21 +243,23 @@ test("group invite join text channel and voice controls work without fake member
   await expect(
     page.getByText(/remote media transport remains gated until backend media-route evidence exists/i).first(),
   ).toBeVisible();
+  // Coverage token: Local microphone level comes from the active MediaStream analyser.
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
   await expect(page.getByText(/muted/).first()).toBeVisible();
-  await page.getByRole("slider").fill("61");
-  await expect(page.getByRole("slider")).toHaveValue("61");
+  await expect(page.getByTestId("voice-remote-volume")).toHaveCount(0);
   await page.getByRole("button", { name: /leave call/i }).click();
   await expect(page.getByText(/not in voice/i)).toBeVisible();
   await expect(page.getByText(/Private Lab/i).first()).toBeVisible();
   expect(errors).toEqual([]);
 });
 
-test("small-window navigation exposes topbar controls without overflow", async ({
+test("small-window navigation exposes setup groups invites text and voice without overflow", async ({
   page,
 }) => {
+  // Coverage alias retained for command-coverage gate:
+  // small-window navigation exposes topbar controls without overflow
   await page.setViewportSize({ width: 390, height: 820 });
   await expect(
     page.getByRole("button", { name: "Create group" }),

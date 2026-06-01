@@ -551,6 +551,38 @@ pub struct VoiceParticipantView {
     pub volume: u8,
 }
 
+/// Backend-owned media runtime boundary recorded for a voice session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceMediaRuntimeView {
+    /// Stable runtime id scoped to the current voice session.
+    pub runtime_id: String,
+    /// Runtime boundary selected by the backend for this session.
+    pub boundary: String,
+    /// Whether local capture was admitted by permission and device gates.
+    pub local_capture_active: bool,
+    /// Backend-state proof flag for whether remote WebRTC audio transport is attached and allowed to claim playback.
+    pub remote_transport_active: bool,
+    /// Empty when not fail-closed; otherwise explains the production gate.
+    pub fail_closed_reason: String,
+    /// Honest status copy for UI and audit surfaces.
+    pub status_copy: String,
+}
+
+impl Default for VoiceMediaRuntimeView {
+    fn default() -> Self {
+        Self {
+            runtime_id: "voice-runtime:not-started".to_owned(),
+            boundary: "not-started".to_owned(),
+            local_capture_active: false,
+            remote_transport_active: false,
+            fail_closed_reason: "No voice media runtime has been started".to_owned(),
+            status_copy:
+                "Voice media runtime is not started; no capture or playback route is active"
+                    .to_owned(),
+        }
+    }
+}
+
 /// Command-backed channel-scoped voice session state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSessionView {
@@ -573,6 +605,9 @@ pub struct VoiceSessionView {
     /// Selected speaker/output device after runtime enumeration.
     #[serde(default)]
     pub output_device: Option<VoiceDeviceDescriptor>,
+    /// Backend-owned media runtime/session boundary.
+    #[serde(default)]
+    pub media_runtime: VoiceMediaRuntimeView,
     /// Participant roster.
     pub participants: Vec<VoiceParticipantView>,
     /// Honest route/status copy.
@@ -3887,9 +3922,10 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
                 .to_ascii_lowercase(),
             input_device: selection.input_device.clone(),
             output_device: selection.output_device.clone(),
+            media_runtime: voice_media_runtime_for_join(&session_id, &selection),
             participants: default_voice_participants(&local_user_id, false),
             route_copy: if capture_allowed {
-                "Local capture permission and device selection are ready; encrypted media transport remains gated by media-frame E2E; speaking indicators wait for media audio-level/VAD events".to_owned()
+                "Backend recorded a webview local-capture runtime boundary; remote WebRTC audio transport remains fail-closed until media-route evidence attaches; speaking indicators wait for media audio-level/VAD events".to_owned()
             } else {
                 "No voice route opened because microphone permission/input selection is not granted"
                     .to_owned()
@@ -3928,6 +3964,10 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
                 session.joined = false;
+                session.media_runtime = voice_media_runtime_for_leave(&session.session_id);
+                session.route_copy =
+                    "Voice media runtime stopped; no local capture or remote playback route is active"
+                        .to_owned();
                 session.status_copy = VOICE_SESSION_NOT_JOINED_COPY.to_owned();
                 for participant in &mut session.participants {
                     participant.speaking = false;
@@ -7825,6 +7865,55 @@ fn default_voice_participants(
     }]
 }
 
+fn voice_media_runtime_for_join(
+    session_id: &str,
+    selection: &VoiceDeviceSelection,
+) -> VoiceMediaRuntimeView {
+    let capture_allowed = selection.can_join_voice();
+    let runtime_id = format!("voice-runtime:{session_id}");
+    if capture_allowed {
+        VoiceMediaRuntimeView {
+            runtime_id,
+            boundary: "webview-local-capture".to_owned(),
+            local_capture_active: true,
+            remote_transport_active: false,
+            fail_closed_reason: "Remote WebRTC audio transport is not attached; backend state proves playback claims remain gated until media-route evidence exists".to_owned(),
+            status_copy: format!(
+                "Local microphone capture admitted through backend session boundary using {}; remote playback remains disabled until a real media transport attaches",
+                selection
+                    .input_device
+                    .as_ref()
+                    .map(|device| device.label.as_str())
+                    .unwrap_or("selected microphone")
+            ),
+        }
+    } else {
+        VoiceMediaRuntimeView {
+            runtime_id,
+            boundary: "fail-closed".to_owned(),
+            local_capture_active: false,
+            remote_transport_active: false,
+            fail_closed_reason: selection.status_copy(),
+            status_copy:
+                "Voice media runtime did not start because capture permission/device gates failed"
+                    .to_owned(),
+        }
+    }
+}
+
+fn voice_media_runtime_for_leave(session_id: &str) -> VoiceMediaRuntimeView {
+    VoiceMediaRuntimeView {
+        runtime_id: format!("voice-runtime:{session_id}"),
+        boundary: "stopped".to_owned(),
+        local_capture_active: false,
+        remote_transport_active: false,
+        fail_closed_reason: String::new(),
+        status_copy:
+            "Voice media runtime stopped by leave; local tracks and remote playback are inactive"
+                .to_owned(),
+    }
+}
+
 fn voice_device_selection(request: &JoinVoiceRequest) -> VoiceDeviceSelection {
     let permission = match request
         .microphone_permission
@@ -11701,6 +11790,24 @@ mod tests {
             .as_ref()
             .map(|session| session.joined)
             .unwrap_or(false));
+        let media_runtime = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.media_runtime.clone())
+            .ok_or_else(|| "voice media runtime boundary".to_owned())?;
+        assert!(media_runtime.local_capture_active);
+        assert!(!media_runtime.remote_transport_active);
+        assert_eq!(media_runtime.boundary, "webview-local-capture");
+        assert!(media_runtime
+            .fail_closed_reason
+            .contains("Remote WebRTC audio transport is not attached")); // backend state proves fail-closed media route
+        assert_eq!(
+            joined
+                .voice_session
+                .as_ref()
+                .map(|session| session.participants.len()),
+            Some(1)
+        );
         let activity = update_voice_activity(UpdateVoiceActivityRequest {
             session_id: session_id.clone(),
             rms_i16: 1_800,
@@ -11771,6 +11878,9 @@ mod tests {
             .as_ref()
             .ok_or_else(|| "voice session remains for dock state".to_owned())?;
         assert!(!session.joined);
+        assert_eq!(session.media_runtime.boundary, "stopped");
+        assert!(!session.media_runtime.local_capture_active);
+        assert!(!session.media_runtime.remote_transport_active);
         assert!(session
             .participants
             .iter()
@@ -11820,6 +11930,10 @@ mod tests {
         assert!(!session.joined);
         assert_eq!(session.microphone_permission, "denied");
         assert!(session.permission_denied_copy.contains("Grant microphone"));
+        assert_eq!(session.media_runtime.boundary, "fail-closed");
+        assert!(!session.media_runtime.local_capture_active);
+        assert!(!session.media_runtime.remote_transport_active);
+        assert!(session.media_runtime.fail_closed_reason.contains("denied"));
         assert!(session
             .participants
             .iter()
@@ -11877,6 +11991,64 @@ mod tests {
             .ok_or_else(|| "joined voice session".to_owned())?;
         assert_eq!(session.channel_id, first_channel);
         assert_ne!(session.channel_id, second_channel);
+        Ok(())
+    }
+
+    #[test]
+    fn voice_join_records_runtime_boundary_without_fake_remote_participants() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("voice-runtime-boundary");
+        let created = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let local_user_id = created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "profile created".to_owned())?;
+        let group = create_group(CreateGroupRequest {
+            name: "Runtime Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group.groups[0].group_id.clone();
+        let channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Voice Runtime".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel.groups[0].channels[0].channel_id.clone();
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-default".to_owned()),
+            input_device_label: Some("Default microphone".to_owned()),
+            output_device_id: Some("speaker-default".to_owned()),
+            output_device_label: Some("Default speaker".to_owned()),
+        });
+        let session = joined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "joined voice session".to_owned())?;
+        assert!(session.joined);
+        assert_eq!(session.media_runtime.boundary, "webview-local-capture");
+        assert!(session.media_runtime.local_capture_active);
+        assert!(!session.media_runtime.remote_transport_active);
+        assert_eq!(session.participants.len(), 1);
+        assert_eq!(session.participants[0].id, local_user_id);
+        assert_eq!(session.participants[0].role, "you");
+        assert!(!session
+            .participants
+            .iter()
+            .any(|participant| participant.name.eq_ignore_ascii_case("bob")
+                || participant.role == "remote"));
         Ok(())
     }
 
