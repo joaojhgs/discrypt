@@ -484,8 +484,8 @@ pub struct ProviderTextControlRuntimeEvidence {
 /// owned runtimes for deterministic teardown.
 pub struct ProviderTextControlRuntimePair {
     evidence: ProviderTextControlRuntimeEvidence,
-    offerer: Option<Arc<WebRtcNegotiator>>,
-    answerer: Option<Arc<WebRtcNegotiator>>,
+    offerer: Arc<WebRtcNegotiator>,
+    answerer: Arc<WebRtcNegotiator>,
     answerer_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -499,10 +499,7 @@ impl ProviderTextControlRuntimePair {
     /// Offerer-side app-facing text/control DataChannel transport.
     #[must_use]
     pub fn transport(&self) -> Arc<dyn TextControlDataTransport> {
-        self.offerer
-            .as_ref()
-            .expect("provider runtime transport is present until close")
-            .clone()
+        self.offerer.clone()
     }
 
     /// Abort the receiver loop and close both WebRTC peer connections.
@@ -513,15 +510,11 @@ impl ProviderTextControlRuntimePair {
         }
 
         let mut first_error = None;
-        if let Some(offerer) = self.offerer.take() {
-            if let Err(error) = offerer.tear_down().await {
-                first_error.get_or_insert(error);
-            }
+        if let Err(error) = self.offerer.tear_down().await {
+            first_error.get_or_insert(error);
         }
-        if let Some(answerer) = self.answerer.take() {
-            if let Err(error) = answerer.tear_down().await {
-                first_error.get_or_insert(error);
-            }
+        if let Err(error) = self.answerer.tear_down().await {
+            first_error.get_or_insert(error);
         }
         match first_error {
             Some(error) => Err(error),
@@ -584,7 +577,7 @@ pub struct ProviderTextControlRuntimePeerEvidence {
 /// the selected adapter.
 pub struct ProviderTextControlRuntime {
     evidence: ProviderTextControlRuntimePeerEvidence,
-    peer: Option<Arc<WebRtcNegotiator>>,
+    peer: Arc<WebRtcNegotiator>,
     receiver_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -598,10 +591,7 @@ impl ProviderTextControlRuntime {
     /// App-facing text/control DataChannel transport for this installed peer.
     #[must_use]
     pub fn transport(&self) -> Arc<dyn TextControlDataTransport> {
-        self.peer
-            .as_ref()
-            .expect("provider runtime transport is present until close")
-            .clone()
+        self.peer.clone()
     }
 
     /// Abort any receive/respond loop and close this peer connection.
@@ -610,9 +600,7 @@ impl ProviderTextControlRuntime {
             task.abort();
             let _ = task.await;
         }
-        if let Some(peer) = self.peer.take() {
-            peer.tear_down().await?;
-        }
+        self.peer.tear_down().await?;
         Ok(())
     }
 }
@@ -829,7 +817,7 @@ pub fn resume_text_control_runtime_from_probe(
     let spec = attachment.runtime_spec.as_deref().ok_or_else(|| {
         TransportError::Unavailable(TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE.to_owned())
     })?;
-    resume_text_control_runtime_from_spec(&spec, &attachment, now_unix_seconds)
+    resume_text_control_runtime_from_spec(spec, &attachment, now_unix_seconds)
 }
 
 /// Build a live provider-backed text/control transport runtime from a persisted handoff spec.
@@ -1209,6 +1197,7 @@ where
 /// caller supplies stable, scoped local/remote peer ids instead of relying on
 /// test-harness defaults. This prevents unrelated app instances from colliding
 /// on provider-visible peer ids while still keeping payloads sealed and opaque.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer<F>(
     profile: SignalingAdapterProfile,
     scope: ConversationScope,
@@ -1289,6 +1278,7 @@ pub async fn start_provider_webrtc_text_control_offer_runtime(
 /// The returned handle owns only this peer's WebRTC connection. The optional
 /// receive/respond loop invokes `answerer` for each opaque inbound frame and
 /// sends any non-empty opaque response back over the same DataChannel.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_provider_webrtc_text_control_answer_runtime_with_answerer<F>(
     profile: SignalingAdapterProfile,
     scope: ConversationScope,
@@ -1344,6 +1334,7 @@ fn validate_runtime_peer_inputs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_provider_webrtc_text_control_runtime_pair_with_factory<F>(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
@@ -1486,6 +1477,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_provider_webrtc_text_control_offer_runtime_with_factory(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
@@ -1616,6 +1608,7 @@ async fn start_provider_webrtc_text_control_offer_runtime_with_factory(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_provider_webrtc_text_control_answer_runtime_with_factory<F>(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
@@ -1758,6 +1751,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn probe_provider_webrtc_datachannel_request_response_with_factory<F>(
     factory: SignalingAdapterFactory,
     profile: SignalingAdapterProfile,
@@ -1975,6 +1969,7 @@ where
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn start_provider_webrtc_text_control_runtime_pair_with_adapter<A, F>(
     adapter: A,
     profile: SignalingAdapterProfile,
@@ -2190,8 +2185,8 @@ where
 
     Ok(ProviderTextControlRuntimePair {
         evidence,
-        offerer: Some(alice_webrtc),
-        answerer: Some(bob_webrtc),
+        offerer: alice_webrtc,
+        answerer: bob_webrtc,
         answerer_task: Some(answerer_task),
     })
 }
@@ -2203,6 +2198,7 @@ where
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn start_provider_webrtc_text_control_offer_runtime_with_adapter<A>(
     adapter: A,
     profile: SignalingAdapterProfile,
@@ -2324,7 +2320,7 @@ where
     session.close().await?;
     Ok(ProviderTextControlRuntime {
         evidence,
-        peer: Some(webrtc),
+        peer: webrtc,
         receiver_task: None,
     })
 }
@@ -2336,6 +2332,7 @@ where
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn start_provider_webrtc_text_control_answer_runtime_with_adapter<A, F>(
     adapter: A,
     profile: SignalingAdapterProfile,
@@ -2481,7 +2478,7 @@ where
 
     Ok(ProviderTextControlRuntime {
         evidence,
-        peer: Some(webrtc),
+        peer: webrtc,
         receiver_task: Some(receiver_task),
     })
 }
@@ -7529,8 +7526,12 @@ mod tests {
             b"bootstrap secret with more than thirty two bytes",
             b"random entropy bytes",
         )
-        .await
-        .expect_err("QUIC provider probe must fail closed until sibling client is wired");
+        .await;
+        let Err(error) = error else {
+            return Err(TransportError::Unavailable(
+                "QUIC provider probe must fail closed until sibling client is wired".to_owned(),
+            ));
+        };
         assert!(error
             .to_string()
             .contains("discrypt_quic_rendezvous adapter"));
@@ -8100,7 +8101,8 @@ mod tests {
     }
 
     #[test]
-    fn text_control_runtime_attachment_seam_reports_missing_implementation() {
+    fn text_control_runtime_attachment_seam_reports_missing_implementation(
+    ) -> Result<(), TransportError> {
         let attach_request = ProviderTextControlRuntimeAttachment {
             adapter_kind: "mqtt".to_owned(),
             profile_id: "unit-test-profile".to_owned(),
@@ -8109,17 +8111,20 @@ mod tests {
             scope_commitment: "unit-test-scope".to_owned(),
             runtime_spec: None,
         };
-        let error = match resume_text_control_runtime_from_probe(attach_request) {
-            Ok(_) => panic!("runtime attachment path must remain unimplemented"),
-            Err(error) => error,
+        let Err(error) = resume_text_control_runtime_from_probe(attach_request) else {
+            return Err(TransportError::Unavailable(
+                "runtime attachment path must remain unimplemented".to_owned(),
+            ));
         };
         assert!(error
             .to_string()
             .contains(TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE));
+        Ok(())
     }
 
     #[test]
-    fn runtime_spec_from_probe_serializes_and_stays_fail_closed_without_handoff_material() {
+    fn runtime_spec_from_probe_serializes_and_stays_fail_closed_without_handoff_material(
+    ) -> Result<(), TransportError> {
         let probe = ProviderWebRtcDataChannelProbe {
             kind: SignalingAdapterKind::Mqtt,
             profile_id: "unit-test-profile".to_owned(),
@@ -8147,25 +8152,32 @@ mod tests {
         let spec = ProviderTextControlRuntimeSpec::from_probe_without_negotiation_material(
             &probe, 100, 60,
         );
-        let encoded = serde_json::to_string(&spec).expect("serialize runtime spec");
+        let encoded = serde_json::to_string(&spec).map_err(|error| {
+            TransportError::Unavailable(format!("serialize runtime spec: {error}"))
+        })?;
         assert!(encoded.contains("unit-test-profile"));
         assert!(!encoded.contains("text-sha"));
         let decoded: ProviderTextControlRuntimeSpec =
-            serde_json::from_str(&encoded).expect("decode runtime spec");
+            serde_json::from_str(&encoded).map_err(|error| {
+                TransportError::Unavailable(format!("decode runtime spec: {error}"))
+            })?;
         assert_eq!(
             decoded.schema_version,
             PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION
         );
         assert_eq!(decoded.attachment.adapter_kind, "mqtt");
         assert_eq!(decoded.expires_at_unix_seconds, 160);
-        let error = decoded
-            .validate_for_runtime_attach(120, &decoded.attachment)
-            .expect_err("missing offer/answer/ICE must fail closed");
+        let Err(error) = decoded.validate_for_runtime_attach(120, &decoded.attachment) else {
+            return Err(TransportError::Unavailable(
+                "missing offer/answer/ICE must fail closed".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("missing negotiated material"));
+        Ok(())
     }
 
     #[test]
-    fn runtime_spec_rejects_stale_handoff_before_runtime_attach() {
+    fn runtime_spec_rejects_stale_handoff_before_runtime_attach() -> Result<(), TransportError> {
         let spec = ProviderTextControlRuntimeSpec {
             schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
             attachment: ProviderTextControlRuntimeAttachment {
@@ -8183,14 +8195,17 @@ mod tests {
             sealed_ice_candidates: Vec::new(),
             missing_material: Vec::new(),
         };
-        let error = spec
-            .validate_for_runtime_attach(21, &spec.attachment)
-            .expect_err("expired spec must fail before runtime attach");
+        let Err(error) = spec.validate_for_runtime_attach(21, &spec.attachment) else {
+            return Err(TransportError::Unavailable(
+                "expired spec must fail before runtime attach".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("stale"));
+        Ok(())
     }
 
     #[test]
-    fn runtime_spec_rejects_incompatible_attachment() {
+    fn runtime_spec_rejects_incompatible_attachment() -> Result<(), TransportError> {
         let mut attachment = ProviderTextControlRuntimeAttachment {
             adapter_kind: "mqtt".to_owned(),
             profile_id: "unit-test-profile".to_owned(),
@@ -8221,16 +8236,20 @@ mod tests {
             missing_material: Vec::new(),
         };
         attachment.adapter_kind = "nostr".to_owned();
-        let error = spec
-            .validate_for_runtime_attach(150, &attachment)
-            .expect_err("incompatible adapter must fail before runtime attach");
+        let Err(error) = spec.validate_for_runtime_attach(150, &attachment) else {
+            return Err(TransportError::Unavailable(
+                "incompatible adapter must fail before runtime attach".to_owned(),
+            ));
+        };
         assert!(error
             .to_string()
             .contains(TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE));
+        Ok(())
     }
 
     #[test]
-    fn valid_runtime_spec_still_fails_closed_until_runtime_factory_exists() {
+    fn valid_runtime_spec_still_fails_closed_until_runtime_factory_exists(
+    ) -> Result<(), TransportError> {
         let attachment = ProviderTextControlRuntimeAttachment {
             adapter_kind: "mqtt".to_owned(),
             profile_id: "unit-test-profile".to_owned(),
@@ -8265,11 +8284,13 @@ mod tests {
             }],
             missing_material: Vec::new(),
         };
-        let error =
-            match resume_text_control_runtime_from_spec(&spec, &attachment, now_unix_seconds + 1) {
-                Ok(_) => panic!("validated handoff must not fake a live runtime"),
-                Err(error) => error,
-            };
+        let Err(error) =
+            resume_text_control_runtime_from_spec(&spec, &attachment, now_unix_seconds + 1)
+        else {
+            return Err(TransportError::Unavailable(
+                "validated handoff must not fake a live runtime".to_owned(),
+            ));
+        };
         assert!(error
             .to_string()
             .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));
@@ -8278,13 +8299,15 @@ mod tests {
             runtime_spec: Some(Box::new(spec)),
             ..attachment
         };
-        let error = match resume_text_control_runtime_from_probe(attachment_with_spec) {
-            Ok(_) => panic!("attachment seam must still fail closed without factory"),
-            Err(error) => error,
+        let Err(error) = resume_text_control_runtime_from_probe(attachment_with_spec) else {
+            return Err(TransportError::Unavailable(
+                "attachment seam must still fail closed without factory".to_owned(),
+            ));
         };
         assert!(error
             .to_string()
             .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));
+        Ok(())
     }
 
     #[tokio::test]
