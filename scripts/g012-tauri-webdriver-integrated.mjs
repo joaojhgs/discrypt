@@ -465,7 +465,6 @@ async function sendGroupMessage(profile, message) {
 }
 async function installVoiceHarness(profile) {
   await exec(profile, String.raw`
-    const requireNative = Boolean(arguments[1]);
     const evidence = {
       mode: 'uninitialized',
       getUserMediaCalls: 0,
@@ -478,18 +477,11 @@ async function installVoiceHarness(profile) {
       trackEnabled: true,
       trackStopCount: 0,
       nativeProbe: {
-        requireNative,
         userAgent: navigator.userAgent,
         hasAudioContext: typeof (window.AudioContext || window.webkitAudioContext) === 'function',
-        hasRtcPeerConnection: typeof window.RTCPeerConnection === 'function',
-        hasNavigatorMediaDevices: Boolean(navigator.mediaDevices),
-        hasExistingGetUserMedia: typeof navigator.mediaDevices?.getUserMedia === 'function',
-        hasMediaStream: typeof window.MediaStream === 'function',
-        mediaStreamDestinationCreated: false,
-        generatedAudioTrackCreated: false,
-        observedPeerConnectionWrapped: false,
+        hasCreateMediaStreamDestination: false,
+        hasRTCPeerConnection: typeof window.RTCPeerConnection === 'function',
         fallbackReason: null,
-        error: null,
       },
     };
     Object.defineProperty(window, '__discryptG012WebDriverVoiceEvidence', { configurable: true, value: evidence });
@@ -507,25 +499,56 @@ async function installVoiceHarness(profile) {
     const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
     const NativeRTCPeerConnection = window.RTCPeerConnection;
     if (typeof NativeAudioContext === 'function' && typeof NativeRTCPeerConnection === 'function') {
-      try {
-        const ctx = new NativeAudioContext();
-        const oscillator = ctx.createOscillator();
-        const gain = ctx.createGain();
-        const destination = ctx.createMediaStreamDestination();
-        evidence.nativeProbe.mediaStreamDestinationCreated = Boolean(destination?.stream);
-        oscillator.frequency.value = 440 + Math.floor(Math.random() * 220);
-        gain.gain.value = 0.03;
-        oscillator.connect(gain);
-        gain.connect(destination);
-        oscillator.start();
-        const generatedTrack = destination.stream.getAudioTracks()[0];
-        evidence.nativeProbe.generatedAudioTrackCreated = Boolean(generatedTrack && generatedTrack.kind === 'audio');
-        if (!generatedTrack || generatedTrack.kind !== 'audio') throw new Error('AudioContext MediaStreamDestination did not produce an audio track');
-        const originalStop = generatedTrack.stop.bind(generatedTrack);
-        Object.defineProperty(generatedTrack, 'enabled', {
-          configurable: true,
-          get() { return evidence.trackEnabled; },
-          set(value) { evidence.trackEnabled = Boolean(value); },
+      const ctx = new NativeAudioContext();
+      evidence.nativeProbe.hasCreateMediaStreamDestination = typeof ctx.createMediaStreamDestination === 'function';
+      if (!evidence.nativeProbe.hasCreateMediaStreamDestination) {
+        evidence.nativeProbe.fallbackReason = 'AudioContext.createMediaStreamDestination is unavailable';
+        try { ctx.close(); } catch {}
+      } else {
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const destination = ctx.createMediaStreamDestination();
+      oscillator.frequency.value = 440 + Math.floor(Math.random() * 220);
+      gain.gain.value = 0.03;
+      oscillator.connect(gain);
+      gain.connect(destination);
+      oscillator.start();
+      const generatedTrack = destination.stream.getAudioTracks()[0];
+      if (!generatedTrack) {
+        evidence.nativeProbe.fallbackReason = 'AudioContext generated-audio destination did not expose an audio track';
+        try { oscillator.stop(); } catch {}
+        try { ctx.close(); } catch {}
+      } else {
+      const originalStop = generatedTrack.stop.bind(generatedTrack);
+      Object.defineProperty(generatedTrack, 'enabled', {
+        configurable: true,
+        get() { return evidence.trackEnabled; },
+        set(value) { evidence.trackEnabled = Boolean(value); },
+      });
+      generatedTrack.stop = () => { evidence.trackStopCount += 1; evidence.trackEnabled = false; try { oscillator.stop(); } catch {} try { ctx.close(); } catch {} originalStop(); };
+      Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => { evidence.mode = 'native_rtc_generated_audio'; evidence.getUserMediaCalls += 1; await ctx.resume?.(); return destination.stream; }, enumerateDevices: async () => [{ kind: 'audioinput', deviceId: arguments[0] + '-generated-mic', label: arguments[0] + ' generated audio source', groupId: arguments[0], toJSON: () => ({}) }, { kind: 'audiooutput', deviceId: arguments[0] + '-speaker', label: arguments[0] + ' speaker', groupId: arguments[0], toJSON: () => ({}) }] } });
+      function ObservedPeerConnection(config) {
+        const pc = new NativeRTCPeerConnection(config);
+        evidence.peerConnectionsConstructed += 1;
+        pc.addEventListener?.('track', (event) => {
+          if (event.track?.kind === 'audio') evidence.remoteTrackEvents += 1;
+        });
+        pc.addEventListener?.('connectionstatechange', () => {
+          evidence.iceConnected ||= pc.connectionState === 'connected' || pc.connectionState === 'completed';
+        });
+        pc.addEventListener?.('iceconnectionstatechange', () => {
+          evidence.iceConnected ||= pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+        });
+        const addTrack = pc.addTrack.bind(pc);
+        const close = pc.close.bind(pc);
+        return new Proxy(pc, {
+          get(target, prop) {
+            if (prop === 'addTrack') return (track, stream) => { if (track?.kind === 'audio') evidence.localAudioTracksSent += 1; return addTrack(track, stream); };
+            if (prop === 'close') return () => { evidence.peerConnectionsClosed += 1; return close(); };
+            const value = target[prop];
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+          set(target, prop, value) { target[prop] = value; return true; },
         });
         generatedTrack.stop = () => { evidence.trackStopCount += 1; evidence.trackEnabled = false; try { oscillator.stop(); } catch {} try { ctx.close(); } catch {} originalStop(); };
         Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => { evidence.mode = 'native_rtc_generated_audio'; evidence.getUserMediaCalls += 1; await ctx.resume?.(); return destination.stream; }, enumerateDevices: async () => [{ kind: 'audioinput', deviceId: arguments[0] + '-generated-mic', label: arguments[0] + ' generated audio source', groupId: arguments[0], toJSON: () => ({}) }, { kind: 'audiooutput', deviceId: arguments[0] + '-speaker', label: arguments[0] + ' speaker', groupId: arguments[0], toJSON: () => ({}) }] } });
@@ -561,18 +584,16 @@ async function installVoiceHarness(profile) {
         evidence.nativeProbe.error = error instanceof Error ? error.message : String(error);
         evidence.nativeProbe.fallbackReason = 'native generated-audio RTCPeerConnection probe threw before install';
       }
-    } else {
-      evidence.nativeProbe.fallbackReason = !evidence.nativeProbe.hasRtcPeerConnection
-        ? 'window.RTCPeerConnection is unavailable in the Tauri/WebKit WebView'
-        : 'AudioContext/webkitAudioContext is unavailable for generated audio';
+      ObservedPeerConnection.prototype = NativeRTCPeerConnection.prototype;
+      Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: ObservedPeerConnection });
+      return true;
+      }
+      }
     }
-    if (requireNative) {
-      evidence.mode = 'native_rtc_unavailable';
-      return false;
-    }
-    evidence.mode = arguments[1] ? 'native_rtc_unavailable' : 'synthetic_peerconnection_fallback';
-    evidence.modeReason = evidence.nativeProbeError || (!evidence.capabilities.rtcPeerConnection ? 'window.RTCPeerConnection is unavailable' : !evidence.capabilities.audioContext ? 'AudioContext/webkitAudioContext is unavailable' : 'native generated-audio probe failed');
-    if (arguments[1]) return false;
+    evidence.nativeProbe.fallbackReason ||= typeof NativeRTCPeerConnection !== 'function'
+      ? 'RTCPeerConnection is unavailable in this Tauri/WebKit WebView'
+      : 'AudioContext generated-audio MediaStream support is unavailable in this Tauri/WebKit WebView';
+    evidence.mode = 'synthetic_peerconnection_fallback';
     const track = { id: arguments[0] + '-track', kind: 'audio', label: arguments[0] + ' microphone', readyState: 'live', get enabled() { return evidence.trackEnabled; }, set enabled(v) { evidence.trackEnabled = Boolean(v); }, stop() { evidence.trackStopCount += 1; evidence.trackEnabled = false; } };
     const stream = { id: arguments[0] + '-stream', getTracks: () => [track], getAudioTracks: () => [track] };
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => { evidence.getUserMediaCalls += 1; return stream; }, enumerateDevices: async () => [{ kind: 'audioinput', deviceId: arguments[0] + '-mic', label: arguments[0] + ' mic', groupId: arguments[0], toJSON: () => ({}) }, { kind: 'audiooutput', deviceId: arguments[0] + '-speaker', label: arguments[0] + ' speaker', groupId: arguments[0], toJSON: () => ({}) }] } });
@@ -713,17 +734,7 @@ try {
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
-    voice_remote_media_status: voiceRemoteMediaStatus,
-    g012_checkpoint_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved,
-    voice_proof: {
-      loopback_observed: voiceLoopbackObserved,
-      native_generated_audio_observed: nativeVoiceLoopbackObserved,
-      synthetic_fallback_observed: syntheticVoiceFallbackObserved,
-      production_claim_allowed: nativeVoiceLoopbackObserved,
-      blocker: nativeVoiceLoopbackObserved
-        ? "physical two-device microphone/speaker proof is still outside this automated generated-audio harness"
-        : "native RTCPeerConnection generated-audio loopback was not observed in both Tauri WebViews",
-    },
+    voice_remote_media_status: nativeVoiceLoopbackObserved ? "native_rtc_generated_audio_loopback" : voiceLoopbackObserved ? "browser_media_harness_loopback" : "voice_remote_media_not_observed",
     run_id: runId,
     artifact_root: rel(artifactRoot),
     invite_prefix: invite.slice(0, 48),

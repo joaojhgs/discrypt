@@ -73,6 +73,19 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "tauri-runtime")]
+use tauri::Manager;
+#[cfg(all(
+    feature = "tauri-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )
+))]
+use webkit2gtk::prelude::{SettingsExt, WebViewExt};
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use std::collections::BTreeMap;
 use std::fmt;
@@ -5632,6 +5645,7 @@ mod ipc_commands {
 pub fn run() {
     tauri::Builder::<tauri::Wry>::default()
         .setup(|app| {
+            enable_platform_webview_voice_features(app)?;
             let app_handle = app.handle().clone();
             let _ = TAURI_APP_HANDLE.set(app_handle.clone());
             start_text_control_transport_runtime_pump(app_handle);
@@ -5685,6 +5699,55 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running discrypt Tauri application");
+}
+
+#[cfg(all(
+    feature = "tauri-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )
+))]
+fn enable_platform_webview_voice_features(
+    app: &tauri::App<tauri::Wry>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(main_webview) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    main_webview.with_webview(|platform_webview| {
+        let webview = platform_webview.inner();
+        if let Some(settings) = webview.settings() {
+            // Wry enables WebAudio by default, but WebKitGTK keeps WebRTC and
+            // MediaStream behind explicit settings. Without this, the G012
+            // two-WebView proof can only exercise the synthetic harness and
+            // must not be counted as native voice media evidence.
+            settings.set_enable_webrtc(true);
+            settings.set_enable_media_stream(true);
+            if std::env::var_os("DISCRYPT_G012_WEBKIT_MOCK_CAPTURE").is_some() {
+                settings.set_enable_mock_capture_devices(true);
+            }
+        }
+    })?;
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "tauri-runtime",
+    not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+fn enable_platform_webview_voice_features(
+    _app: &tauri::App<tauri::Wry>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
 }
 
 impl PersistedAppState {
