@@ -88,7 +88,7 @@ type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 type SetupStepView = { label: string; complete: boolean; detail: string };
 type VoiceParticipant = VoiceParticipantView;
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
-const APP_EVENT_HEALTH_RESYNC_MS = 60_000;
+const APP_EVENT_HEALTH_RESYNC_MS = 10_000;
 const diagnosticsUiEnabled =
   import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
 type VoiceDeviceAccess = {
@@ -131,6 +131,10 @@ function isLocalVoiceParticipant(
   localUserId: string | null,
 ): boolean {
   return participant.id === localUserId || participant.role === "you";
+}
+
+function isUsableMediaStream(value: unknown): value is MediaStream {
+  return typeof MediaStream !== "undefined" && value instanceof MediaStream;
 }
 
 function remoteAudioSource(
@@ -621,9 +625,9 @@ function App() {
   );
   const [draftGroup, setDraftGroup] = useState("private lab");
   const [draftSignalingAdapter, setDraftSignalingAdapter] =
-    useState<SignalingAdapterKind>("nostr");
+    useState<SignalingAdapterKind>("mqtt");
   const [draftSignalingEndpoint, setDraftSignalingEndpoint] = useState(
-    "wss://relay.damus.io",
+    "mqtts://broker.emqx.io:8883",
   );
   const [draftIceStunServers, setDraftIceStunServers] = useState(
     "stun:stun.l.google.com:19302",
@@ -724,7 +728,7 @@ function App() {
     let eventFallbackPoll: number | null = null;
     let eventHealthResync: number | null = null;
     let unlistenAppEvent: (() => void) | null = null;
-    const fallbackPollMs = tauriListen ? 30000 : 5000;
+    const fallbackPollMs = tauriListen ? 2500 : 5000;
 
     const refreshCommandState = (stream: AppEventStreamView) => {
       if (stream.events.length === 0) {
@@ -773,6 +777,7 @@ function App() {
           unlistenAppEvent = unlisten;
         })
         .catch(startFallbackPolling);
+      startFallbackPolling();
       eventHealthResync = window.setInterval(
         pollAppEventFallback,
         APP_EVENT_HEALTH_RESYNC_MS,
@@ -1397,16 +1402,20 @@ function App() {
             role: textRuntimeRole(joinedState),
             connectivity: voiceConnectivityForState(joinedState),
             onRemoteTrack: (track) => {
-              setVoiceRemoteStreams((current) => ({
-                ...current,
-                [track.participant_id]: track.stream,
-              }));
+              if (isUsableMediaStream(track.stream)) {
+                setVoiceRemoteStreams((current) => ({
+                  ...current,
+                  [track.participant_id]: track.stream,
+                }));
+              }
             },
             onRemoteMedia: (evidence) => {
-              setVoiceRemoteStreams((current) => ({
-                ...current,
-                [evidence.participant_id]: evidence.stream,
-              }));
+              if (isUsableMediaStream(evidence.stream)) {
+                setVoiceRemoteStreams((current) => ({
+                  ...current,
+                  [evidence.participant_id]: evidence.stream,
+                }));
+              }
               void applyCommand(
               attachVoiceRemoteMedia({
                 session_id: voiceSession.session_id,
@@ -3996,16 +4005,18 @@ function VoicePanel({
                     id={track.playback_element_id}
                     data-testid="voice-remote-audio"
                     data-participant-id={track.participant_id}
-                    data-remote-peer-id={track.remote_peer_id}
                     data-stream-id={track.stream_id}
                     data-audio-track-id={track.audio_track_id}
                     autoPlay
                     ref={(element) => {
                       if (element) {
-                        element.srcObject =
-                          voiceSession?.joined && remoteStreams[track.participant_id]
+                        const playbackStream =
+                          voiceSession?.joined
                             ? remoteStreams[track.participant_id]
                             : null;
+                        element.srcObject = isUsableMediaStream(playbackStream)
+                          ? playbackStream
+                          : null;
                       }
                     }}
                   />
@@ -4120,9 +4131,10 @@ function RemoteAudioAttachment({
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    audio.srcObject = stream ?? null;
+    const playbackStream = isUsableMediaStream(stream) ? stream : null;
+    audio.srcObject = playbackStream;
     return () => {
-      if (audio.srcObject === stream) {
+      if (audio.srcObject === playbackStream) {
         audio.srcObject = null;
       }
     };
@@ -4134,7 +4146,7 @@ function RemoteAudioAttachment({
       data-testid="voice-remote-audio"
       autoPlay
       playsInline
-      src={stream ? undefined : (src ?? undefined)}
+      src={isUsableMediaStream(stream) ? undefined : (src ?? undefined)}
     />
   );
 }

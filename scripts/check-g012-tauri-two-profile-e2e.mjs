@@ -33,6 +33,11 @@ for (const token of [
   "tauri-build-preflight.log",
   "launch_readiness",
   "G012 is not complete until two launched Tauri profiles complete text plus voice UX proof",
+  "DISCRYPT_G012_DEV_SERVER_PORT",
+  "devServerPort",
+  "launch-smoke-passed",
+  "integrated_e2e_status",
+  "remaining_integrated_e2e_requirements",
 ]) requireText("G012 harness", harness, token);
 
 const dryRun = spawnSync(process.execPath, ["scripts/g012-tauri-two-profile-e2e.mjs"], {
@@ -53,6 +58,7 @@ try {
   if (!manifest.profiles?.alice?.state_path?.includes("alice") || !manifest.profiles?.bob?.state_path?.includes("bob")) failures.push("dry-run missing isolated Alice/Bob state paths");
   if (!manifest.planned_commands?.some((entry) => entry.label === "tauri alice" && entry.rendered.includes("cargo tauri dev"))) failures.push("dry-run missing planned tauri alice command");
   if (!manifest.planned_commands?.some((entry) => entry.label === "tauri bob" && entry.env?.DISCRYPT_APP_STATE_PATH?.includes("bob"))) failures.push("dry-run missing planned tauri bob isolated env");
+  if (!manifest.planned_commands?.some((entry) => entry.label === "shared vite dev server" && entry.rendered.includes("--port 1420"))) failures.push("dry-run missing managed Vite port in planned command");
 } catch (error) {
   failures.push(`could not read dry-run manifest ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`);
 }

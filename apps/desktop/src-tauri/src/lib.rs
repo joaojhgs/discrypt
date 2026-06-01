@@ -29,7 +29,7 @@ use discrypt_media::{
 };
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
-    Identity, SafetyNumber,
+    Identity, OpenMlsGroupEngine, SafetyNumber,
 };
 use discrypt_mls_delivery::{
     TextDeliveryReceipt, TextDeliveryReceiptInput, TextMessageEnvelope, TextMessageEnvelopeInput,
@@ -1786,7 +1786,7 @@ impl TransportSessionRecord {
     }
 
     fn connected_route(&self) -> Option<TransportRoute> {
-        self.snapshot().route.and_then(|route| Some(route.route))
+        self.snapshot().route.map(|route| route.route)
     }
 }
 
@@ -1879,6 +1879,15 @@ struct VoiceSignalingInboxRecord {
     signal: VoiceSignalingMessageView,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct OpenMlsGroupHandleRecord {
+    group_id: String,
+    signer_public_key_hex: String,
+    epoch: u64,
+    confirmation_tag_sha256: String,
+    status_copy: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     schema_version: u32,
@@ -1887,6 +1896,8 @@ struct PersistedAppState {
     preferences: UiPreferencesView,
     dms: Vec<DirectConversationView>,
     groups: Vec<GroupView>,
+    #[serde(default)]
+    openmls_groups: Vec<OpenMlsGroupHandleRecord>,
     #[serde(default = "app_connectivity_defaults")]
     connectivity_defaults: ConnectivityPolicyView,
     active_context: Option<ActiveContextView>,
@@ -1932,6 +1943,8 @@ static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 
 #[cfg(feature = "tauri-runtime")]
 static TEXT_CONTROL_RUNTIME_PUMP_STARTED: OnceLock<()> = OnceLock::new();
+#[cfg(feature = "tauri-runtime")]
+static TAURI_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 /// Shared command-facing app service used by Tauri IPC wrappers.
 #[derive(Debug)]
@@ -2132,17 +2145,26 @@ impl TauriAppService {
         executor: Arc<tokio::runtime::Runtime>,
         session_id: impl Into<String>,
     ) {
+        let session_id = session_id.into();
         let role = runtime.evidence().role;
         let local_peer_id = runtime.evidence().local_peer_id.0.clone();
         let remote_peer_id = runtime.evidence().remote_peer_id.0.clone();
         let owned_runtime = Arc::new(runtime);
         let transport = owned_runtime.transport();
+        #[cfg(feature = "tauri-runtime")]
+        if role == ProviderTextControlRuntimePeerRole::Offerer {
+            start_text_control_offer_receiver_loop(
+                transport.clone(),
+                executor.clone(),
+                session_id.clone(),
+            );
+        }
         self.pending_text_control_transport_runtime = None;
         self.text_control_transport_runtime = Some(TextControlTransportRuntime {
             transport,
             owned_runtime: Some(owned_runtime),
             executor: Some(executor),
-            session_id: session_id.into(),
+            session_id,
             role: Some(role),
             local_peer_id: Some(local_peer_id),
             remote_peer_id: Some(remote_peer_id),
@@ -2173,6 +2195,43 @@ impl TauriAppService {
             self.text_control_transport_runtime = None;
             self.pending_text_control_transport_runtime = None;
         }
+    }
+
+    fn text_control_runtime_attach_already_active(
+        &mut self,
+        command_name: &'static str,
+        active_session_id: &str,
+    ) -> bool {
+        if let Some(pending) = &self.pending_text_control_transport_runtime {
+            if pending.session_id == active_session_id {
+                self.state.push_event(
+                    "transport.text_runtime_attach_deduped",
+                    format!(
+                        "Text/control runtime attach for session {} is already pending as {} local_peer={} remote_peer={}; duplicate request was ignored",
+                        active_session_id,
+                        runtime_role_label(Some(pending.role)),
+                        pending.local_peer_id,
+                        pending.remote_peer_id
+                    ),
+                );
+                self.persist();
+                return true;
+            }
+        }
+        if let Some(runtime) = &self.text_control_transport_runtime {
+            if runtime.session_id == active_session_id {
+                self.state.push_event(
+                    "transport.text_runtime_attach_deduped",
+                    format!(
+                        "Text/control runtime session {} is already attached for {}; duplicate request was ignored",
+                        active_session_id, command_name
+                    ),
+                );
+                self.persist();
+                return true;
+            }
+        }
+        false
     }
 
     fn pump_text_control_transport_once(
@@ -2511,6 +2570,28 @@ pub fn attach_text_control_transport_runtime(
         }
     }
 
+    if guard.text_control_runtime_attach_already_active(
+        "attach_text_control_transport_runtime",
+        &active_session_id,
+    ) {
+        return guard.to_view();
+    }
+
+    let has_explicit_runtime_attachment = request.runtime_role.is_some()
+        || request.local_peer_id.is_some()
+        || request.remote_peer_id.is_some();
+    if has_explicit_runtime_attachment && !explicit_text_runtime_attachment_allowed() {
+        guard.state.push_command_error(
+            "transport.text_runtime_attach_rejected",
+            "attach_text_control_transport_runtime",
+            "text_runtime_explicit_attach_not_allowed",
+            "Production builds must derive text/control runtime role and peer ids from persisted DM/group invite state",
+            "Retry with derive_from_state=true after opening the signed DM or group context; explicit peer-id attachment is reserved for test/harness builds",
+        );
+        guard.persist();
+        return guard.to_view();
+    }
+
     let derived_attachment = if request.derive_from_state {
         match guard
             .state
@@ -2694,7 +2775,23 @@ pub fn attach_text_control_transport_runtime(
 }
 
 #[cfg(feature = "tauri-runtime")]
-fn start_text_control_transport_runtime_pump() {
+fn emit_background_app_events(state: &AppStateView, previous_cursor: u64) {
+    if previous_cursor == state.event_cursor {
+        return;
+    }
+    let Some(window_handle) = tauri_app_handle() else {
+        return;
+    };
+    emit_app_event_stream(&window_handle, state, previous_cursor);
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn tauri_app_handle() -> Option<tauri::AppHandle> {
+    TAURI_APP_HANDLE.get().cloned()
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn start_text_control_transport_runtime_pump(app_handle: tauri::AppHandle) {
     if TEXT_CONTROL_RUNTIME_PUMP_STARTED.set(()).is_err() {
         return;
     }
@@ -2715,7 +2812,55 @@ fn start_text_control_transport_runtime_pump() {
             if !guard.should_run_text_control_transport_pump(&request) {
                 continue;
             }
+            let previous_cursor = guard.state.latest_event_cursor();
             let _ = guard.pump_text_control_transport_once(request.clone());
+            let state = guard.to_view();
+            drop(guard);
+            emit_app_event_stream(&app_handle, &state, previous_cursor);
+        }
+    });
+}
+
+#[cfg(feature = "tauri-runtime")]
+fn start_text_control_offer_receiver_loop(
+    transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+    executor: Arc<tokio::runtime::Runtime>,
+    session_id: String,
+) {
+    executor.spawn(async move {
+        loop {
+            let received = match transport.recv_text_control_frame().await {
+                Ok(received) => received,
+                Err(_) => break,
+            };
+            let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&received) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            let service = app_service();
+            let (response_frame, state) = {
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let previous_cursor = guard.state.latest_event_cursor();
+                let response_frame = guard.state.handle_text_control_frame(inbound_frame);
+                guard.persist();
+                let state = guard.to_view();
+                emit_background_app_events(&state, previous_cursor);
+                (response_frame, state)
+            };
+            let Some(response_frame) = response_frame else {
+                let _ = state;
+                continue;
+            };
+            let response = match serde_json::to_vec(&response_frame) {
+                Ok(response) => response,
+                Err(_) => break,
+            };
+            if transport.send_text_control_frame(response).await.is_err() {
+                break;
+            }
+            let _ = &session_id;
         }
     });
 }
@@ -3127,6 +3272,16 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
             .find(|group| group.name == name)
             .map(|group| group.group_id.clone())
             .unwrap_or(group_id);
+        if let Err(error) = state.ensure_openmls_group(&active_group_id) {
+            state.push_command_error(
+                "mls.group_create_failed",
+                "create_group",
+                "openmls_group_create_failed",
+                error,
+                "Do not claim production text/voice encryption for this group until OpenMLS group state is created and persisted",
+            );
+            return;
+        }
         state.active_context = Some(ActiveContextView {
             kind: "group".to_owned(),
             group_id: Some(active_group_id),
@@ -4164,7 +4319,7 @@ pub fn take_pending_voice_signaling_messages(
 pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
-        let session_id = stable_id("voice", &request.channel_id, state.next_sequence);
+        let session_id = stable_voice_session_id(&request.group_id, &request.channel_id);
         let selection = voice_device_selection(&request);
         let capture_allowed = selection.can_join_voice();
         let self_muted = state
@@ -5133,10 +5288,13 @@ mod ipc_commands {
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(feature = "tauri-runtime")]
-    start_text_control_transport_runtime_pump();
-
     tauri::Builder::<tauri::Wry>::default()
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            let _ = TAURI_APP_HANDLE.set(app_handle.clone());
+            start_text_control_transport_runtime_pump(app_handle);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             ipc_commands::app_snapshot,
             ipc_commands::app_state,
@@ -5200,6 +5358,7 @@ impl PersistedAppState {
             },
             dms: Vec::new(),
             groups: Vec::new(),
+            openmls_groups: Vec::new(),
             connectivity_defaults: app_connectivity_defaults(),
             active_context: None,
             messages: Vec::new(),
@@ -5229,6 +5388,51 @@ impl PersistedAppState {
             friend_verified: false,
             next_sequence: 2,
         }
+    }
+
+    fn ensure_openmls_group(&mut self, group_id: &str) -> Result<(), String> {
+        if self
+            .openmls_groups
+            .iter()
+            .any(|record| record.group_id == group_id)
+        {
+            return Ok(());
+        }
+        let path = app_openmls_store_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!("OpenMLS provider directory could not be created: {error}")
+            })?;
+        }
+        let mut engine = OpenMlsGroupEngine::open(&path)
+            .map_err(|error| format!("OpenMLS provider could not be opened: {error}"))?;
+        let creator_identity = self.local_user_id();
+        let snapshot = engine
+            .create_group(group_id, creator_identity.as_bytes())
+            .map_err(|error| format!("OpenMLS group could not be created: {error}"))?;
+        let signer_public_key = engine
+            .signer_public_key(group_id)
+            .map_err(|error| format!("OpenMLS signer handle could not be read: {error}"))?;
+        let mut confirmation_hash = Sha256::new();
+        confirmation_hash.update(&snapshot.confirmation_tag);
+        let record = OpenMlsGroupHandleRecord {
+            group_id: group_id.to_owned(),
+            signer_public_key_hex: hex::encode(signer_public_key),
+            epoch: snapshot.epoch,
+            confirmation_tag_sha256: hex::encode(confirmation_hash.finalize()),
+            status_copy:
+                "OpenMLS group state was created in the Rust service boundary; exporter wiring for Tauri text receive remains a separate G012 gate"
+                    .to_owned(),
+        };
+        self.openmls_groups.push(record);
+        self.push_event(
+            "mls.group_created",
+            format!(
+                "Created OpenMLS state for {}",
+                redacted_observable_ref("group", group_id)
+            ),
+        );
+        Ok(())
     }
 
     fn to_view(&self) -> AppStateView {
@@ -5562,9 +5766,7 @@ impl PersistedAppState {
     ) -> Option<String> {
         let stopped_session_id = {
             let slot = self.transport_session_mut(mode);
-            let Some(record) = slot.as_mut() else {
-                return None;
-            };
+            let record = slot.as_mut()?;
             if session_id
                 .as_ref()
                 .is_some_and(|requested_id| requested_id != &record.session_id)
@@ -5632,10 +5834,9 @@ impl PersistedAppState {
             16,
         );
         let probe = run_provider_adapter_probe(profile, scope, bootstrap_secret, random_entropy)
-            .map_err(|error| {
+            .inspect_err(|error| {
                 self.latest_signaling_probe = None;
                 self.latest_signaling_probe_error = Some(error.clone());
-                error
             })?;
         let view = SignalingAdapterProbeView {
             kind: probe.kind.canonical_name().to_owned(),
@@ -5915,10 +6116,9 @@ impl PersistedAppState {
                 text_control_frame,
             )
         }
-        .map_err(|error| {
+        .inspect_err(|error| {
             self.latest_data_channel_probe = None;
             self.latest_data_channel_probe_error = Some(error.clone());
-            error
         })?;
         let view = ProviderWebRtcDataChannelProbeView {
             kind: probe.kind.canonical_name().to_owned(),
@@ -6466,6 +6666,26 @@ impl PersistedAppState {
     fn handle_voice_signal_frame(&mut self, signal: VoiceSignalingMessageView) {
         let result = self.validate_inbound_voice_signal(&signal);
         if let Err(error) = result {
+            if self.validate_prejoin_inbound_voice_signal(&signal).is_ok() {
+                if !self
+                    .voice_signaling_inbox
+                    .iter()
+                    .any(|record| record.signal.signal_id == signal.signal_id)
+                {
+                    self.voice_signaling_inbox.push(VoiceSignalingInboxRecord {
+                        signal: signal.clone(),
+                    });
+                }
+                self.push_event(
+                    "voice.signal_prejoin_queued",
+                    format!(
+                        "Queued pre-join voice {} for stable session {}",
+                        signal.signal_kind,
+                        redacted_observable_ref("voice_session", &signal.session_id)
+                    ),
+                );
+                return;
+            }
             self.push_command_error(
                 "voice.signal_rejected",
                 "handle_text_control_frame",
@@ -6536,6 +6756,54 @@ impl PersistedAppState {
         Ok(())
     }
 
+    fn validate_prejoin_inbound_voice_signal(
+        &self,
+        signal: &VoiceSignalingMessageView,
+    ) -> Result<(), String> {
+        normalize_voice_signal_kind(&signal.signal_kind)?;
+        validate_voice_signal_payload(&signal.signal_kind, &signal.sealed_payload)?;
+        let expected_session_id = stable_voice_session_id(&signal.group_id, &signal.channel_id);
+        if signal.session_id != expected_session_id {
+            return Err(
+                "Pre-join voice signal did not use the stable group/channel session id".to_owned(),
+            );
+        }
+        let local_user_id = self.local_user_id();
+        if signal.sender_participant_id == local_user_id || signal.sender_peer_id.is_empty() {
+            return Err(
+                "Pre-join voice signal must come from a non-local provider peer".to_owned(),
+            );
+        }
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == signal.group_id)
+            .ok_or_else(|| "Pre-join voice signal group is not installed".to_owned())?;
+        let channel = group
+            .channels
+            .iter()
+            .find(|channel| channel.channel_id == signal.channel_id)
+            .ok_or_else(|| "Pre-join voice signal channel is not installed".to_owned())?;
+        if channel.kind != ChannelKind::Voice {
+            return Err("Pre-join voice signal channel is not a voice channel".to_owned());
+        }
+        let local_peer_ok = group
+            .runtime_peers
+            .iter()
+            .any(|peer| peer.is_local && peer.peer_id == signal.recipient_peer_id);
+        let remote_peer_ok = group
+            .runtime_peers
+            .iter()
+            .any(|peer| !peer.is_local && peer.peer_id == signal.sender_peer_id);
+        if !local_peer_ok || !remote_peer_ok {
+            return Err(
+                "Pre-join voice signal peer ids did not match signed group runtime peers"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     fn take_pending_voice_signaling_messages(
         &mut self,
         request: TakePendingVoiceSignalingMessagesRequest,
@@ -6551,7 +6819,7 @@ impl PersistedAppState {
         for record in self.voice_signaling_inbox.drain(..) {
             let matches_session = session_id
                 .as_ref()
-                .map_or(true, |expected| &record.signal.session_id == expected);
+                .is_none_or(|expected| &record.signal.session_id == expected);
             if matches_session && taken.len() < limit {
                 taken.push(record.signal);
             } else {
@@ -6583,7 +6851,7 @@ impl PersistedAppState {
                 request
                     .target
                     .as_ref()
-                    .map_or(true, |target| &record.target == target)
+                    .is_none_or(|target| &record.target == target)
             })
             .take(limit)
             .map(TextControlOutboxFrameView::from)
@@ -6647,6 +6915,14 @@ impl PersistedAppState {
         Ok(())
     }
 
+    fn message_has_peer_receipt(&self, message_id: &str) -> bool {
+        self.messages.iter().any(|message| {
+            message.message_id == message_id
+                && message.state_key == "peer_receipt"
+                && message.peer_receipt.is_some()
+        })
+    }
+
     pub(crate) async fn pump_text_control_transport_once<T>(
         &mut self,
         transport: &T,
@@ -6706,63 +6982,106 @@ impl PersistedAppState {
                 ));
                 continue;
             }
-            let recv_result =
-                tokio::time::timeout(operation_timeout, transport.recv_text_control_frame()).await;
-            let inbound = match recv_result {
-                Ok(Ok(inbound)) => inbound,
-                Ok(Err(error)) => {
-                    failures.push(format!(
-                        "{}: receive text/control response failed: {error}",
-                        frame_ref
-                    ));
+            let response_deadline = tokio::time::Instant::now() + operation_timeout;
+            let mut receipt_applied_for_frame = false;
+            while !receipt_applied_for_frame {
+                let Some(remaining) =
+                    response_deadline.checked_duration_since(tokio::time::Instant::now())
+                else {
+                    if self.message_has_peer_receipt(&frame.message_id) {
+                        receipts_applied += 1;
+                    } else {
+                        failures.push(format!(
+                            "{}: receive text/control response failed: receive text/control response timed out after {} ms",
+                            frame_ref,
+                            operation_timeout.as_millis()
+                        ));
+                    }
+                    break;
+                };
+                let recv_result =
+                    tokio::time::timeout(remaining, transport.recv_text_control_frame()).await;
+                let inbound = match recv_result {
+                    Ok(Ok(inbound)) => inbound,
+                    Ok(Err(error)) => {
+                        if self.message_has_peer_receipt(&frame.message_id) {
+                            receipts_applied += 1;
+                        } else {
+                            failures.push(format!(
+                                "{}: receive text/control response failed: {error}",
+                                frame_ref
+                            ));
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        if self.message_has_peer_receipt(&frame.message_id) {
+                            receipts_applied += 1;
+                        } else {
+                            failures.push(format!(
+                                "{}: receive text/control response failed: receive text/control response timed out after {} ms",
+                                frame_ref,
+                                operation_timeout.as_millis()
+                            ));
+                        }
+                        break;
+                    }
+                };
+                response_frames_received += 1;
+                let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&inbound) {
+                    Ok(inbound_frame) => inbound_frame,
+                    Err(error) => {
+                        failures.push(format!(
+                            "{}: decode text/control response failed: {error}",
+                            frame_ref
+                        ));
+                        break;
+                    }
+                };
+                let receipt_response = matches!(
+                    &inbound_frame,
+                    TextControlFrameView::Receipt { message_id, .. } if message_id == &frame.message_id
+                );
+                // Scope receipt validation to this response. The state may still contain an older
+                // setup/invite/admission command error; a stale error must not make a later peer
+                // receipt look invalid.
+                self.last_command_error = None;
+                if let Some(response_frame) = self.handle_text_control_frame(inbound_frame) {
+                    let response = match serde_json::to_vec(&response_frame) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            failures.push(format!(
+                                "{}: encode text/control response failed: {error}",
+                                frame_ref
+                            ));
+                            break;
+                        }
+                    };
+                    if let Err(error) = transport.send_text_control_frame(response).await {
+                        failures.push(format!(
+                            "{}: send text/control response failed: {error}",
+                            frame_ref
+                        ));
+                        break;
+                    }
                     continue;
                 }
-                Err(_) => {
+                if let Some(error) = self.last_command_error.as_ref().filter(|error| {
+                    matches!(
+                        error.command.as_str(),
+                        "handle_text_control_frame" | "apply_text_delivery_receipt"
+                    )
+                }) {
                     failures.push(format!(
-                        "{}: receive text/control response failed: receive text/control response timed out after {} ms",
-                        frame_ref,
-                        operation_timeout.as_millis()
+                        "{}: text/control response verification failed: {} ({})",
+                        frame_ref, error.code, error.message
                     ));
-                    continue;
+                    break;
                 }
-            };
-            response_frames_received += 1;
-            let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&inbound) {
-                Ok(inbound_frame) => inbound_frame,
-                Err(error) => {
-                    failures.push(format!(
-                        "{}: decode text/control response failed: {error}",
-                        frame_ref
-                    ));
-                    continue;
+                if receipt_response {
+                    receipts_applied += 1;
+                    receipt_applied_for_frame = true;
                 }
-            };
-            let receipt_response = matches!(inbound_frame, TextControlFrameView::Receipt { .. });
-            // Scope receipt validation to this response. The state may still contain an older
-            // setup/invite/admission command error; a stale error must not make a later peer
-            // receipt look invalid.
-            self.last_command_error = None;
-            if self.handle_text_control_frame(inbound_frame).is_some() {
-                failures.push(format!(
-                    "{}: response frame unexpectedly generated another response",
-                    frame_ref
-                ));
-                continue;
-            }
-            if let Some(error) = self.last_command_error.as_ref().filter(|error| {
-                matches!(
-                    error.command.as_str(),
-                    "handle_text_control_frame" | "apply_text_delivery_receipt"
-                )
-            }) {
-                failures.push(format!(
-                    "{}: text/control response verification failed: {} ({})",
-                    frame_ref, error.code, error.message
-                ));
-                continue;
-            }
-            if receipt_response {
-                receipts_applied += 1;
             }
         }
 
@@ -8595,7 +8914,21 @@ fn app_store_path() -> PathBuf {
     app_store_path_with_env_override(env_app_state_override_allowed())
 }
 
+fn app_openmls_store_path() -> PathBuf {
+    let app_state_path = app_store_path();
+    let file_name = app_state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(APP_STATE_STORE_FILENAME);
+    app_state_path.with_file_name(format!("{file_name}.openmls.sqlite"))
+}
+
 fn env_app_state_override_allowed() -> bool {
+    cfg!(any(test, feature = "harness", feature = "local-dev"))
+}
+
+fn explicit_text_runtime_attachment_allowed() -> bool {
     cfg!(any(test, feature = "harness", feature = "local-dev"))
 }
 
@@ -10457,6 +10790,10 @@ fn stable_id(prefix: &str, label: &str, sequence: u64) -> String {
     format!("{prefix}-{}-{sequence}", slugify(label))
 }
 
+fn stable_voice_session_id(group_id: &str, channel_id: &str) -> String {
+    stable_id("voice", &format!("{group_id}:{channel_id}"), 0)
+}
+
 fn slugify(label: &str) -> String {
     let slug: String = label
         .trim()
@@ -10485,6 +10822,8 @@ fn slugify(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
     use super::*;
     use std::collections::VecDeque;
     use std::fs;
@@ -12696,6 +13035,56 @@ mod tests {
     }
 
     #[test]
+    fn create_group_persists_rehydratable_openmls_group_handle() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("openmls-group-handle");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+
+        let created = create_group(CreateGroupRequest {
+            name: "OpenMLS Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .iter()
+            .find(|group| group.name == "OpenMLS Lab")
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+
+        let persisted = load_state();
+        let handle = persisted
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .ok_or_else(|| "OpenMLS group handle was not persisted".to_owned())?;
+        assert_eq!(handle.epoch, 0);
+        assert!(!handle.signer_public_key_hex.is_empty());
+        assert_eq!(handle.confirmation_tag_sha256.len(), 64);
+
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("persisted OpenMLS signer key was not hex: {error}"))?;
+        let mut engine = OpenMlsGroupEngine::open(app_openmls_store_path())
+            .map_err(|error| format!("OpenMLS provider could not be reopened: {error}"))?;
+        let rehydrated = engine
+            .load_group(&group_id, &signer_public_key)
+            .map_err(|error| format!("OpenMLS group could not be rehydrated: {error}"))?;
+        assert_eq!(rehydrated.epoch, handle.epoch);
+        let exported = engine
+            .export_secret(&group_id, "discrypt/text", b"g012-openmls-foundation", 32)
+            .map_err(|error| format!("OpenMLS exporter failed after rehydrate: {error}"))?;
+        assert_eq!(exported.len(), 32);
+        Ok(())
+    }
+
+    #[test]
     fn g005_connectivity_policy_command_persists_scope_overrides_and_invites() -> Result<(), String>
     {
         let _guard = test_lock();
@@ -13089,6 +13478,97 @@ mod tests {
             .voice_session
             .as_ref()
             .is_some_and(|session| session.signaling.role == "stopped"));
+        Ok(())
+    }
+
+    #[test]
+    fn voice_signaling_prejoin_frames_are_queued_for_stable_group_channel_session(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("voice-signaling-prejoin");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .ok_or_else(|| "group missing".to_owned())?;
+        let local_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "local runtime peer missing".to_owned())?
+            .peer_id
+            .clone();
+        let remote_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "remote runtime peer missing".to_owned())?
+            .peer_id
+            .clone();
+        let voice_channel = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let stable_session_id = stable_voice_session_id(&group.group_id, &voice_channel.channel_id);
+
+        let handled = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: TextControlFrameView::VoiceSignal {
+                signal: VoiceSignalingMessageView {
+                    signal_id: "voice-signal-prejoin-offer-1".to_owned(),
+                    session_id: stable_session_id.clone(),
+                    group_id: group.group_id.clone(),
+                    channel_id: voice_channel.channel_id.clone(),
+                    sender_participant_id: "remote-member".to_owned(),
+                    sender_peer_id: remote_peer.clone(),
+                    recipient_peer_id: local_peer.clone(),
+                    signal_kind: "offer".to_owned(),
+                    sealed_payload: "voice-signal-sealed:v1:test-prejoin-offer-ciphertext-ref"
+                        .to_owned(),
+                    created_at_ms: 44,
+                },
+            },
+        });
+        assert!(handled.state.last_command_error.is_none(), "{handled:?}");
+        assert!(handled
+            .state
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.signal_prejoin_queued"));
+
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group.group_id.clone(),
+            channel_id: voice_channel.channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic".to_owned()),
+            input_device_label: Some("Mic".to_owned()),
+            output_device_id: Some("speaker".to_owned()),
+            output_device_label: Some("Speaker".to_owned()),
+        });
+        let joined_session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "joined voice session missing".to_owned())?;
+        assert_eq!(joined_session_id, stable_session_id);
+        let taken =
+            take_pending_voice_signaling_messages(TakePendingVoiceSignalingMessagesRequest {
+                session_id: Some(joined_session_id),
+                limit: Some(10),
+            });
+        assert_eq!(taken.messages.len(), 1);
+        assert_eq!(taken.messages[0].signal_kind, "offer");
         Ok(())
     }
 
@@ -15470,6 +15950,62 @@ mod tests {
             active_session_id, "stale-text-session",
             "test should use a stale session id"
         );
+    }
+
+    #[test]
+    fn attach_text_control_transport_runtime_is_idempotent_while_attach_is_pending() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-idempotent-pending");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("attach-idempotent-pending".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+
+        let service = app_service();
+        {
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.pending_text_control_transport_runtime =
+                Some(PendingTextControlTransportRuntime {
+                    session_id: active_session_id.clone(),
+                    role: ProviderTextControlRuntimePeerRole::Offerer,
+                    local_peer_id: "alice-runtime-peer".to_owned(),
+                    remote_peer_id: "bob-runtime-peer".to_owned(),
+                });
+        }
+
+        let state =
+            attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
+                session_id: Some(active_session_id.clone()),
+                ..Default::default()
+            });
+        assert!(state.last_command_error.is_none(), "{state:?}");
+        assert!(state.events.iter().any(|event| {
+            event.kind == "transport.text_runtime_attach_deduped"
+                && event.summary.contains(&active_session_id)
+        }));
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard
+            .pending_text_control_transport_runtime
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == active_session_id));
     }
 
     #[test]

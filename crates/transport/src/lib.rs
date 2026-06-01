@@ -358,10 +358,17 @@ impl RouteReport {
             FallbackLeg::RelayOverlay,
             FallbackLeg::Turn,
         ];
-        self.attempted_legs
-            .iter()
-            .enumerate()
-            .all(|(index, leg)| expected.get(index) == Some(leg))
+        !self.attempted_legs.is_empty()
+            && self.attempted_legs.len() <= expected.len()
+            && self
+                .attempted_legs
+                .last()
+                .is_some_and(|last_attempted| *last_attempted == self.selected)
+            && self
+                .attempted_legs
+                .iter()
+                .enumerate()
+                .all(|(index, leg)| expected.get(index) == Some(leg))
             && self.limitation.contains("local-process")
             && self.ciphertext_only_relay_legs
     }

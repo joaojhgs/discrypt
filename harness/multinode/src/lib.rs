@@ -914,7 +914,8 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
         VoiceCaptureSendOutcome, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
     };
     use discrypt_transport::{
-        ConnectivityConfig, FallbackLeg, LocalProcessSocketAdapter, SimulatedNat,
+        ConnectivityConfig, Endpoint, EndpointOverrides, FallbackLeg, LocalProcessSocketAdapter,
+        SimulatedNat,
     };
     use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
 
@@ -990,6 +991,20 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
         payload
     }
 
+    fn connectivity_for_voice_leg(expected_leg: FallbackLeg) -> ConnectivityConfig {
+        if expected_leg == FallbackLeg::Turn {
+            ConnectivityConfig {
+                overrides: EndpointOverrides::new(
+                    None,
+                    Some(Endpoint::new("turns:voice-e2e-turn.example:5349")),
+                ),
+                ..ConnectivityConfig::default()
+            }
+        } else {
+            ConnectivityConfig::default()
+        }
+    }
+
     fn verify_voice_route(
         route: VoiceRouteCase<'_>,
         capture_format: AudioCaptureFormat,
@@ -1036,7 +1051,7 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
             .ok_or_else(|| anyhow!("voice route {route_label} produced no protected frame"))?;
         let payload = transport_visible_payload(&protected_frame);
         let conformance = LocalProcessSocketAdapter::new(
-            ConnectivityConfig::default(),
+            connectivity_for_voice_leg(expected_leg),
             route.nat,
             raw_pcm_bytes.to_vec(),
         )
@@ -2021,7 +2036,8 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     use discrypt_relay_overlay::{GossipItem, GossipMesh};
     use discrypt_storage::{AuthorLogEntry, KeyState, LocalStore, RecipientCacheEntry};
     use discrypt_transport::{
-        ConnectivityConfig, FallbackLeg, LocalProcessSocketAdapter, SimulatedNat,
+        ConnectivityConfig, Endpoint, EndpointOverrides, FallbackLeg, LocalProcessSocketAdapter,
+        SimulatedNat,
     };
     use external_signaling::{AuditFixture, ContentExposure, InfrastructureComponent, PcapEvent};
     use std::collections::BTreeSet;
@@ -2142,6 +2158,20 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         b"content-key".as_slice(),
         b"mls-epoch-secret".as_slice(),
     ];
+    fn connectivity_for_text_leg(expected_leg: FallbackLeg) -> ConnectivityConfig {
+        if expected_leg == FallbackLeg::Turn {
+            ConnectivityConfig {
+                overrides: EndpointOverrides::new(
+                    None,
+                    Some(Endpoint::new("turns:text-e2e-turn.example:5349")),
+                ),
+                ..ConnectivityConfig::default()
+            }
+        } else {
+            ConnectivityConfig::default()
+        }
+    }
+
     let mut verify_text_route = |route_label: &str,
                                  nat: SimulatedNat,
                                  expected_leg: FallbackLeg,
@@ -2180,7 +2210,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         )?;
         let payload = receipt.envelope.canonical_signed_bytes();
         let conformance = LocalProcessSocketAdapter::new(
-            ConnectivityConfig::default(),
+            connectivity_for_text_leg(expected_leg),
             nat,
             text_plaintext.to_vec(),
         )
@@ -2998,7 +3028,10 @@ pub fn performance_soak_smoke() -> Result<PerformanceSoakSmoke, anyhow::Error> {
     use discrypt_relay_overlay::redelivery::{RedeliveryError, RedeliveryTracker};
     use discrypt_relay_overlay::{OverlayManager, OverlayRouteUse, RelayRuntimeObservation};
     use discrypt_storage::{AppStore, EncryptedAppDb, MemoryAppDbKeychain};
-    use discrypt_transport::{ConnectivityConfig, ConnectivityPlanner, FallbackLeg, SimulatedNat};
+    use discrypt_transport::{
+        ConnectivityConfig, ConnectivityPlanner, Endpoint, EndpointOverrides, FallbackLeg,
+        SimulatedNat,
+    };
     use std::collections::BTreeSet;
     use std::fs;
 
@@ -3126,9 +3159,16 @@ pub fn performance_soak_smoke() -> Result<PerformanceSoakSmoke, anyhow::Error> {
         && redelivery.accept(&packet_id("soak-media", 1)) == Err(RedeliveryError::Replay);
 
     let connectivity = ConnectivityConfig::default();
+    let turn_connectivity = ConnectivityConfig {
+        overrides: EndpointOverrides::new(
+            None,
+            Some(Endpoint::new("turns:phase-n-turn.example:5349")),
+        ),
+        ..ConnectivityConfig::default()
+    };
     let direct = ConnectivityPlanner::plan(&connectivity, SimulatedNat::direct())?;
     let overlay = ConnectivityPlanner::plan(&connectivity, SimulatedNat::overlay_only())?;
-    let turn = ConnectivityPlanner::plan(&connectivity, SimulatedNat::turn_only())?;
+    let turn = ConnectivityPlanner::plan(&turn_connectivity, SimulatedNat::turn_only())?;
     let nat_switching_fallbacks_covered = direct.selected == FallbackLeg::Stun
         && overlay.selected == FallbackLeg::RelayOverlay
         && turn.selected == FallbackLeg::Turn;

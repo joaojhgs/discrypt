@@ -23,7 +23,25 @@ for (const dir of [artifactRoot, logDir, profileDir, screenshotDir]) mkdirSync(d
 const durationMs = Number(valueAfter("--duration-ms") ?? process.env.DISCRYPT_G012_LAUNCH_DURATION_MS ?? 20_000);
 const launchReadyTimeoutMs = Number(valueAfter("--launch-ready-timeout-ms") ?? process.env.DISCRYPT_G012_LAUNCH_READY_TIMEOUT_MS ?? 120_000);
 const skipBuildPreflight = argv.includes("--skip-build-preflight") || process.env.DISCRYPT_G012_SKIP_BUILD_PREFLIGHT === "1";
-const viteUrl = process.env.DISCRYPT_G012_VITE_URL ?? "http://127.0.0.1:1420";
+const viteUrlInput = process.env.DISCRYPT_G012_VITE_URL ?? `http://127.0.0.1:${process.env.DISCRYPT_G012_DEV_SERVER_PORT ?? 1420}`;
+let viteUrlObject;
+try {
+  viteUrlObject = new URL(viteUrlInput);
+} catch (error) {
+  failCli(`DISCRYPT_G012_VITE_URL must be an absolute http(s) URL: ${error instanceof Error ? error.message : String(error)}`, 2);
+}
+if (!["http:", "https:"].includes(viteUrlObject.protocol)) failCli("DISCRYPT_G012_VITE_URL must use http or https.", 2);
+const explicitDevServerPort = process.env.DISCRYPT_G012_DEV_SERVER_PORT;
+if (explicitDevServerPort && viteUrlObject.port && Number(explicitDevServerPort) !== Number(viteUrlObject.port)) {
+  failCli("DISCRYPT_G012_DEV_SERVER_PORT conflicts with DISCRYPT_G012_VITE_URL port; use one matching port.", 2);
+}
+const devServerPort = Number(explicitDevServerPort ?? viteUrlObject.port ?? (viteUrlObject.protocol === "https:" ? 443 : 80));
+if (!Number.isInteger(devServerPort) || devServerPort <= 0 || devServerPort > 65_535) {
+  failCli("DISCRYPT_G012_DEV_SERVER_PORT or DISCRYPT_G012_VITE_URL port must be a valid TCP port.", 2);
+}
+if (!viteUrlObject.port && explicitDevServerPort) viteUrlObject.port = String(devServerPort);
+const devServerHost = viteUrlObject.hostname || "127.0.0.1";
+const viteUrl = viteUrlObject.toString().replace(/\/$/, "");
 const tauriFeatures = (process.env.DISCRYPT_G012_TAURI_FEATURES || "tauri-runtime,local-dev")
   .split(",")
   .map((feature) => feature.trim())
@@ -167,11 +185,11 @@ function planCommands() {
     manifest.planned_commands.push({
       label: "shared vite dev server",
       command: "npm",
-      args: ["run", "dev", "--", "--host", "127.0.0.1", "--port", "1420", "--strictPort"],
+      args: ["run", "dev", "--", "--host", devServerHost, "--port", String(devServerPort), "--strictPort"],
       cwd: resolve(repoRoot, "apps/ui"),
       log_path: manifest.shared_frontend.log_path,
       env_keys: [],
-      rendered: "npm run dev -- --host 127.0.0.1 --port 1420 --strictPort",
+      rendered: `npm run dev -- --host ${devServerHost} --port ${devServerPort} --strictPort`,
     });
   }
   for (const profile of Object.values(profiles)) {
@@ -335,7 +353,9 @@ function summarize(children, screenshots, launchReadiness) {
   const summary = {
     schema_version: "discrypt.g012.tauri_two_profile_launch_summary.v1",
     generated_at: new Date().toISOString(),
-    status: "passed",
+    status: "launch-smoke-passed",
+    integrated_e2e_status: "not_proven_by_launch_smoke",
+    production_claim: "none; this live runner proves two isolated Tauri WebViews launch and leaves text/voice UX proof to separately cited artifacts",
     run_id: runId,
     artifact_root: rel(artifactRoot),
     manifest: rel(manifestPath),
@@ -344,7 +364,7 @@ function summarize(children, screenshots, launchReadiness) {
     screenshots,
     launch_readiness: launchReadiness,
     processes: children.map((entry) => ({ label: entry.label, pid: entry.child.pid, exitCode: entry.child.exitCode, signalCode: entry.child.signalCode })),
-    next_g012_steps: [
+    remaining_integrated_e2e_requirements: [
       "Drive setup/recovery UX inside both launched Tauri windows.",
       "Capture invite acceptance, bidirectional encrypted text, persistence/reload, and voice media evidence into this artifact root.",
     ],
@@ -371,7 +391,7 @@ try {
   await runBuildPreflight();
 
   if (!noVite) {
-    children.push({ label: "shared vite dev server", child: spawnLogged("shared vite dev server", "npm", ["run", "dev", "--", "--host", "127.0.0.1", "--port", "1420", "--strictPort"], { cwd: resolve(repoRoot, "apps/ui"), env: {}, logPath: manifest.shared_frontend.log_path }) });
+    children.push({ label: "shared vite dev server", child: spawnLogged("shared vite dev server", "npm", ["run", "dev", "--", "--host", devServerHost, "--port", String(devServerPort), "--strictPort"], { cwd: resolve(repoRoot, "apps/ui"), env: {}, logPath: manifest.shared_frontend.log_path }) });
     await waitForHttp(viteUrl, Number(process.env.DISCRYPT_G012_VITE_WAIT_MS || 30_000));
   }
 
@@ -391,8 +411,8 @@ try {
 
   await terminateChildren(children);
   const summary = summarize(children, screenshots, launchReadiness);
-  writeManifest("passed", { summary: rel(summaryPath) });
-  console.log(`G012 Tauri two-profile launch artifact: ${summary.artifact_root}`);
+  writeManifest("launch-smoke-passed", { summary: rel(summaryPath) });
+  console.log(`G012 Tauri two-profile launch-smoke artifact: ${summary.artifact_root}`);
 } catch (error) {
   await terminateChildren(children);
   const message = error instanceof Error ? error.message : String(error);
