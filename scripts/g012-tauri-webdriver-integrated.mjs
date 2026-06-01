@@ -597,9 +597,16 @@ async function bodyText(profile) {
 async function visibleActions(profile) {
   try { return await exec(profile, `${domHelpers}; return debugVisibleActions();`); } catch { return []; }
 }
-async function click(profile, pattern, { last = false } = {}) {
-  const ok = await exec(profile, `${domHelpers}; return clickButton(arguments[0], 'i', arguments[1]) || clickText(arguments[0], 'i');`, [pattern, last]);
-  if (!ok) throw new Error(`${profile.display_name} could not click button matching ${pattern}; visible actions=${JSON.stringify(await visibleActions(profile))}`);
+async function click(profile, pattern, { last = false, timeoutMs = 5_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastActions = [];
+  while (Date.now() < deadline) {
+    const ok = await exec(profile, `${domHelpers}; return clickButton(arguments[0], 'i', arguments[1]) || clickText(arguments[0], 'i');`, [pattern, last]);
+    if (ok) return;
+    lastActions = await visibleActions(profile);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+  }
+  throw new Error(`${profile.display_name} could not click button matching ${pattern}; visible actions=${JSON.stringify(lastActions)}`);
 }
 async function clickText(profile, pattern) {
   const ok = await exec(profile, `${domHelpers}; return clickText(arguments[0], 'i');`, [pattern]);
