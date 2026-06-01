@@ -3611,9 +3611,16 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
         !external_signaling::contains_any_token(&fetched.visible_bytes(), &forbidden);
 
     let default_config = ConnectivityConfig::default();
+    let turn_config = ConnectivityConfig {
+        overrides: EndpointOverrides::new(
+            None,
+            Some(Endpoint::new("turns:phase6-owner.example:5349")),
+        ),
+        ..ConnectivityConfig::default()
+    };
     let direct = ConnectivityPlanner::plan(&default_config, SimulatedNat::direct())?;
     let overlay = ConnectivityPlanner::plan(&default_config, SimulatedNat::overlay_only())?;
-    let turn = ConnectivityPlanner::plan(&default_config, SimulatedNat::turn_only())?;
+    let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
     let fallback_chain_covered = direct.selected == FallbackLeg::Stun
         && overlay.selected == FallbackLeg::RelayOverlay
         && turn.selected == FallbackLeg::Turn

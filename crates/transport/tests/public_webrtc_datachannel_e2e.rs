@@ -299,15 +299,25 @@ fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportErr
             "set DISCRYPT_PUBLIC_TURN_ENDPOINT for public TURN relay-only E2E".to_owned(),
         )
     })?;
-    let username = std::env::var("DISCRYPT_PUBLIC_TURN_USERNAME").ok();
-    let credential = std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL").ok();
+    let username = std::env::var("DISCRYPT_PUBLIC_TURN_USERNAME").map_err(|_| {
+        TransportError::InvalidIcePolicy(
+            "set DISCRYPT_PUBLIC_TURN_USERNAME for credentialed public TURN relay-only E2E"
+                .to_owned(),
+        )
+    })?;
+    let credential = std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL").map_err(|_| {
+        TransportError::InvalidIcePolicy(
+            "set DISCRYPT_PUBLIC_TURN_CREDENTIAL for credentialed public TURN relay-only E2E"
+                .to_owned(),
+        )
+    })?;
     let credential_expires_at = std::env::var("DISCRYPT_PUBLIC_TURN_CREDENTIAL_EXPIRES_AT").ok();
     let ice = IceServerConfig::new(
         Vec::new(),
         vec![TurnServerConfig::new(
             Endpoint::new(endpoint),
-            username,
-            credential,
+            Some(username),
+            Some(credential),
             credential_expires_at,
         )],
     )?;

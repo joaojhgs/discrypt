@@ -293,9 +293,9 @@ function createVoiceSignalTransport({
   const pollBackendSignals = () => {
     if (closed || !window.__TAURI__?.core?.invoke) return;
     void takePendingVoiceSignalingMessages({ session_id: sessionId, limit: 50 })
-      .then((response) => {
+      .then(async (response) => {
         for (const message of response.messages) {
-          const signal = voiceSignalFromBackendMessage(
+          const signal = await voiceSignalFromBackendMessage(
             message,
             localPeerId,
             senderInstanceId,
@@ -314,20 +314,21 @@ function createVoiceSignalTransport({
   return {
     send: (signal) => {
       if (window.__TAURI__?.core?.invoke) {
-        void publishVoiceSignalingMessage({
-          session_id: sessionId,
-          signal_kind: signal.kind,
-          sdp: signal.description?.sdp ?? null,
-          candidate: signal.candidate?.candidate ?? null,
-          sdp_mid: signal.candidate?.sdpMid ?? null,
-          sdp_m_line_index: signal.candidate?.sdpMLineIndex ?? null,
-          signal_id: `${senderInstanceId}:${signal.kind}:${Date.now()}:${Math.random()
-            .toString(16)
-            .slice(2)}`,
-          created_at_ms: Date.now(),
-        }).catch(() => {
-          broadcast?.postMessage(signal);
-        });
+        void sealVoiceSignalPayload(signal)
+          .then((sealedPayload) =>
+            publishVoiceSignalingMessage({
+              session_id: sessionId,
+              signal_kind: signal.kind,
+              sealed_payload: sealedPayload,
+              signal_id: `${senderInstanceId}:${signal.kind}:${Date.now()}:${Math.random()
+                .toString(16)
+                .slice(2)}`,
+              created_at_ms: Date.now(),
+            }),
+          )
+          .catch(() => {
+            broadcast?.postMessage(signal);
+          });
         return;
       }
       broadcast?.postMessage(signal);
@@ -354,11 +355,11 @@ function sessionDescriptionToInit(
   };
 }
 
-function voiceSignalFromBackendMessage(
+async function voiceSignalFromBackendMessage(
   message: VoiceSignalingMessageView,
   localPeerId: string,
   senderInstanceId: string,
-): VoiceSignal | null {
+): Promise<VoiceSignal | null> {
   if (message.recipient_peer_id !== localPeerId) return null;
   const base = {
     schema_version: 1 as const,
@@ -369,29 +370,107 @@ function voiceSignalFromBackendMessage(
     to_peer_id: message.recipient_peer_id,
     sender_instance_id: `${senderInstanceId}:backend:${message.signal_id}`,
   };
+  const payload = await openVoiceSignalPayload(message).catch(() => null);
+  if (!payload) return null;
   if (message.signal_kind === "offer" || message.signal_kind === "answer") {
-    const sdp = message.sdp ?? "";
-    if (!sdp) return null;
+    if (!payload.description?.sdp) return null;
     return {
       ...base,
       kind: message.signal_kind,
-      description: { type: message.signal_kind, sdp },
+      description: payload.description,
     };
   }
   if (message.signal_kind === "candidate") {
-    const candidate = message.candidate ?? "";
-    if (!candidate) return null;
+    if (!payload.candidate?.candidate) return null;
     return {
       ...base,
       kind: "candidate",
-      candidate: {
-        candidate,
-        sdpMid: message.sdp_mid ?? undefined,
-        sdpMLineIndex: message.sdp_m_line_index ?? undefined,
-      },
+      candidate: payload.candidate,
     };
   }
   return null;
+}
+
+type VoiceSignalPayload = Pick<VoiceSignal, "description" | "candidate">;
+
+const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v1:";
+
+async function sealVoiceSignalPayload(signal: VoiceSignal): Promise<string> {
+  const crypto = globalThis.crypto;
+  if (!crypto?.subtle) throw new Error("Web Crypto is required for voice signaling sealing");
+  const nonce = new Uint8Array(12);
+  crypto.getRandomValues(nonce);
+  const key = await voiceSignalCryptoKey(
+    signal.session_id,
+    signal.group_id,
+    signal.channel_id,
+    signal.from_peer_id,
+    signal.to_peer_id,
+  );
+  const plaintext = new TextEncoder().encode(
+    JSON.stringify({ description: signal.description, candidate: signal.candidate }),
+  );
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plaintext);
+  return `${VOICE_SIGNAL_SEALED_PREFIX}${base64UrlEncode(nonce)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
+}
+
+async function openVoiceSignalPayload(
+  message: VoiceSignalingMessageView,
+): Promise<VoiceSignalPayload | null> {
+  const sealed = message.sealed_payload ?? "";
+  if (!sealed.startsWith(VOICE_SIGNAL_SEALED_PREFIX)) return null;
+  const [nonceText, ciphertextText] = sealed.slice(VOICE_SIGNAL_SEALED_PREFIX.length).split(".");
+  if (!nonceText || !ciphertextText) return null;
+  const key = await voiceSignalCryptoKey(
+    message.session_id,
+    message.group_id,
+    message.channel_id,
+    message.sender_peer_id,
+    message.recipient_peer_id,
+  );
+  const plaintext = await globalThis.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64UrlDecode(nonceText) },
+    key,
+    base64UrlDecode(ciphertextText),
+  );
+  return JSON.parse(new TextDecoder().decode(plaintext)) as VoiceSignalPayload;
+}
+
+async function voiceSignalCryptoKey(
+  sessionId: string,
+  groupId: string,
+  channelId: string,
+  peerA: string,
+  peerB: string,
+): Promise<CryptoKey> {
+  const [firstPeer, secondPeer] = [peerA, peerB].sort();
+  const material = new TextEncoder().encode(
+    `discrypt-voice-signal-seal-v1:${sessionId}:${groupId}:${channelId}:${firstPeer}:${secondPeer}`,
+  );
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", material);
+  return globalThis.crypto.subtle.importKey("raw", digest, "AES-GCM", false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecode(value: string): ArrayBuffer {
+  const padded = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
 }
 
 function observeRemoteAudioEvidence({

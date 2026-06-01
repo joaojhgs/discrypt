@@ -27,6 +27,7 @@ function run(label, command, args, options = {}) {
 const packageJson = JSON.parse(read("apps/ui/package.json"));
 const g008Tests = read("crates/transport/tests/g008_stun_turn_fallback.rs");
 const publicTurnTests = read("crates/transport/tests/public_webrtc_datachannel_e2e.rs");
+const releaseMatrix = read("docs/release/release-verification-matrix.md");
 
 for (const token of [
   "deterministic_direct_stun_turn_and_no_turn_fail_closed_matrix",
@@ -44,6 +45,10 @@ for (const token of [
   "DISCRYPT_PUBLIC_TURN_ENDPOINT",
   "DISCRYPT_PUBLIC_TURN_USERNAME",
   "DISCRYPT_PUBLIC_TURN_CREDENTIAL",
+  "set DISCRYPT_PUBLIC_TURN_USERNAME for credentialed public TURN relay-only E2E",
+  "set DISCRYPT_PUBLIC_TURN_CREDENTIAL for credentialed public TURN relay-only E2E",
+  "Some(username)",
+  "Some(credential)",
   "WebRtcIceTransportPolicy::RelayOnly",
 ]) {
   requireText("public-turn-e2e-tests", publicTurnTests, token);
@@ -51,6 +56,14 @@ for (const token of [
 
 if (!packageJson.scripts?.["test:g008-stun-turn-fallback"]) {
   failures.push("package.json missing test:g008-stun-turn-fallback");
+}
+for (const token of [
+  "G008 STUN/TURN/fallback hardening",
+  "npm --prefix apps/ui run test:g008-stun-turn-fallback",
+  "npm --prefix apps/ui run test:stun-turn-provider-privacy-g132",
+  "Credentialed TURN remains opt-in",
+]) {
+  requireText("release-matrix", releaseMatrix, token);
 }
 
 run("G008 deterministic STUN/TURN/fallback integration tests", "cargo", [
@@ -94,6 +107,20 @@ run("Existing reconnect/backoff session gate", "cargo", [
   "-p",
   "discrypt-transport",
   "reconnect_backoff_cancellation_and_teardown_are_stateful",
+]);
+
+run("UI honesty gate for TURN/provider failure copy", "npm", [
+  "--prefix",
+  "apps/ui",
+  "run",
+  "test:honesty",
+]);
+
+run("G132 STUN/TURN provider privacy gate", "npm", [
+  "--prefix",
+  "apps/ui",
+  "run",
+  "test:stun-turn-provider-privacy-g132",
 ]);
 
 if (process.env.DISCRYPT_PUBLIC_TURN_E2E === "1") {

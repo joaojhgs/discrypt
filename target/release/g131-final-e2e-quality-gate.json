@@ -1,8 +1,8 @@
 {
   "schema_version": "discrypt.g131.final_e2e_quality_gate.v1",
-  "generated_at": "2026-05-30T02:34:50.082Z",
+  "generated_at": "2026-06-01T13:37:37.903Z",
   "status": "readiness-gate-passed",
-  "gate": "G131-full-production-e2e-verification-acr",
+  "gate": "G131-final-e2e-verification-acr",
   "serialized_playwright_e2e": true,
   "required_command_evidence": [
     "cargo fmt --all --check",
@@ -23,6 +23,7 @@
     "npm --prefix apps/ui run test:malicious-member-g098",
     "npm --prefix apps/ui run test:retention-shred-g099",
     "npm --prefix apps/ui run test:performance-soak-g100",
+    "npm --prefix apps/ui run test:security-privacy-no-shim-g009",
     "npm --prefix apps/ui run test:presence-g115",
     "npm --prefix apps/ui run test:abuse-g120",
     "npm --prefix apps/ui run test:cargo-deny-g121",

@@ -1255,18 +1255,8 @@ pub struct VoiceSignalingMessageView {
     pub recipient_peer_id: String,
     /// `offer`, `answer`, or `candidate`.
     pub signal_kind: String,
-    /// Opaque SDP for offer/answer signals.
-    #[serde(default)]
-    pub sdp: Option<String>,
-    /// Opaque ICE candidate string for candidate signals.
-    #[serde(default)]
-    pub candidate: Option<String>,
-    /// ICE candidate SDP mid.
-    #[serde(default)]
-    pub sdp_mid: Option<String>,
-    /// ICE candidate media-line index.
-    #[serde(default)]
-    pub sdp_m_line_index: Option<u16>,
+    /// WebView-sealed voice signal payload. Raw SDP/ICE never crosses IPC or persisted state.
+    pub sealed_payload: String,
     /// Browser/native timestamp in milliseconds for correlation.
     pub created_at_ms: u64,
 }
@@ -1278,18 +1268,8 @@ pub struct PublishVoiceSignalingMessageRequest {
     pub session_id: String,
     /// `offer`, `answer`, or `candidate`.
     pub signal_kind: String,
-    /// Opaque SDP for offer/answer signals.
-    #[serde(default)]
-    pub sdp: Option<String>,
-    /// Opaque ICE candidate string for candidate signals.
-    #[serde(default)]
-    pub candidate: Option<String>,
-    /// ICE candidate SDP mid.
-    #[serde(default)]
-    pub sdp_mid: Option<String>,
-    /// ICE candidate media-line index.
-    #[serde(default)]
-    pub sdp_m_line_index: Option<u16>,
+    /// WebView-sealed voice signal payload. Raw SDP/ICE never crosses IPC or persisted state.
+    pub sealed_payload: String,
     /// Optional stable id supplied by the browser for idempotency.
     #[serde(default)]
     pub signal_id: Option<String>,
@@ -2795,7 +2775,10 @@ pub fn create_device_pairing_payload(
                     .unwrap_or_else(|_| current_epoch.saturating_add(valid_for_epochs));
                 state.push_event(
                     "device.pairing_payload_created",
-                    format!("Pairing payload created for {requested_label}"),
+                    format!(
+                        "Pairing payload created for {}",
+                        redacted_observable_ref("device_label", &requested_label)
+                    ),
                 );
                 DevicePairingPayloadView {
                     payload,
@@ -3096,7 +3079,13 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
             channel_id: None,
             dm_id: Some(active_dm_id),
         });
-        state.push_event("dm.started", format!("Opened local DM with {display_name}"));
+        state.push_event(
+            "dm.started",
+            format!(
+                "Opened local DM {}",
+                redacted_observable_ref("dm_contact", &display_name)
+            ),
+        );
     })
 }
 
@@ -3134,7 +3123,10 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
             channel_id: None,
             dm_id: None,
         });
-        state.push_event("group.created", format!("Created group {name}"));
+        state.push_event(
+            "group.created",
+            format!("Created group {}", redacted_observable_ref("group", &name)),
+        );
         let retention = normalize_label(&request.retention, "7 days");
         state.push_event(
             "retention.selected",
@@ -3158,7 +3150,13 @@ pub fn set_active_group(request: SetActiveGroupRequest) -> AppStateView {
                 channel_id: None,
                 dm_id: None,
             });
-            state.push_event("group.focused", format!("Focused group {}", group.name));
+            state.push_event(
+                "group.focused",
+                format!(
+                    "Focused group {}",
+                    redacted_observable_ref("group", &group.name)
+                ),
+            );
         } else {
             state.push_command_error(
                 "group.focus_missing",
@@ -3192,7 +3190,13 @@ pub fn set_active_channel(request: SetActiveChannelRequest) -> AppStateView {
                 channel_id: Some(request.channel_id.clone()),
                 dm_id: None,
             });
-            state.push_event("channel.focused", format!("Focused channel {}", ch.name));
+            state.push_event(
+                "channel.focused",
+                format!(
+                    "Focused channel {}",
+                    redacted_observable_ref("channel", &ch.name)
+                ),
+            );
         } else {
             state.push_command_error(
                 "channel.focus_missing",
@@ -3216,7 +3220,13 @@ pub fn set_active_dm(request: SetActiveDmRequest) -> AppStateView {
                 channel_id: None,
                 dm_id: Some(request.dm_id.clone()),
             });
-            state.push_event("dm.focused", format!("Focused DM {}", request.dm_id));
+            state.push_event(
+                "dm.focused",
+                format!(
+                    "Focused DM {}",
+                    redacted_observable_ref("dm", &request.dm_id)
+                ),
+            );
         } else {
             state.push_command_error(
                 "dm.focus_missing",
@@ -3281,7 +3291,10 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             });
             state.push_event(
                 "group.opened_from_invite",
-                format!("Opened {group_name} from local invite"),
+                format!(
+                    "Opened {} from local invite",
+                    redacted_observable_ref("group", &group_name)
+                ),
             );
             return;
         }
@@ -3360,7 +3373,14 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                         .to_owned(),
             });
         }
-        state.push_event("group.joined", format!("Joined {name} via {invite_code}"));
+        state.push_event(
+            "group.joined",
+            format!(
+                "Joined {} via {}",
+                redacted_observable_ref("group", &name),
+                redacted_observable_ref("invite", &invite_code)
+            ),
+        );
     })
 }
 
@@ -3551,7 +3571,13 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             return;
         }
         state.invites.push(invite);
-        state.push_event("invite.created", format!("Invite created for {group_name}"));
+        state.push_event(
+            "invite.created",
+            format!(
+                "Invite created for {}",
+                redacted_observable_ref("group", &group_name)
+            ),
+        );
     })
 }
 
@@ -3731,7 +3757,10 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
         state.invites.push(invite);
         state.push_event(
             "invite.dm_created",
-            format!("DM contact invite created for {}", dm.display_name),
+            format!(
+                "DM contact invite created for {}",
+                redacted_observable_ref("dm_contact", &dm.display_name)
+            ),
         );
     })
 }
@@ -3832,7 +3861,10 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
         });
         state.push_event(
             "dm.invite_accepted",
-            format!("Opened DM contact {display_name}"),
+            format!(
+                "Opened DM contact {}",
+                redacted_observable_ref("dm_contact", &display_name)
+            ),
         );
     })
 }
@@ -3872,7 +3904,10 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
             });
             state.push_event(
                 "channel.created",
-                format!("Created channel {}", channel.name),
+                format!(
+                    "Created channel {}",
+                    redacted_observable_ref("channel", &channel.name)
+                ),
             );
         } else {
             state.push_command_error(
@@ -4170,7 +4205,13 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             dm_id: None,
         });
         if capture_allowed {
-            state.push_event("voice.joined", format!("Joined voice session {session_id}"));
+            state.push_event(
+                "voice.joined",
+                format!(
+                    "Joined voice session {}",
+                    redacted_observable_ref("voice_session", &session_id)
+                ),
+            );
         } else {
             state.push_command_error(
                 "voice.permission_denied",
@@ -4478,7 +4519,8 @@ pub fn attach_voice_remote_media(request: AttachVoiceRemoteMediaRequest) -> AppS
                 "voice.remote_media_attached",
                 format!(
                     "Remote audio route proof attached for {} via {}",
-                    request.participant_name, request.remote_peer_id
+                    redacted_observable_ref("participant", &request.participant_name),
+                    redacted_observable_ref("remote_peer", &request.remote_peer_id)
                 ),
             );
         } else {
@@ -4518,7 +4560,13 @@ pub fn set_speaker_volume(request: SetSpeakerVolumeRequest) -> AppStateView {
                         let participant = &mut session.participants[participant_index];
                         participant.volume = volume;
                         let name = participant.name.clone();
-                        state.push_event("voice.volume", format!("Set {name} volume to {volume}"));
+                        state.push_event(
+                            "voice.volume",
+                            format!(
+                                "Set participant {} volume to {volume}",
+                                redacted_observable_ref("participant", &name)
+                            ),
+                        );
                     }
                 } else {
                     state.push_command_error(
@@ -5529,7 +5577,10 @@ impl PersistedAppState {
         if let Some(stopped_session_id) = &stopped_session_id {
             self.push_event(
                 format!("{mode}.session_stopped"),
-                format!("Stopped {mode} transport session {stopped_session_id}"),
+                format!(
+                    "Stopped {mode} transport session {}",
+                    redacted_observable_ref("transport_session", stopped_session_id)
+                ),
             );
         }
         stopped_session_id
@@ -6333,11 +6384,7 @@ impl PersistedAppState {
             return Err("Voice signaling requires a joined voice session".to_owned());
         }
         let signal_kind = normalize_voice_signal_kind(&request.signal_kind)?;
-        validate_voice_signal_payload(
-            &signal_kind,
-            request.sdp.as_deref(),
-            request.candidate.as_deref(),
-        )?;
+        validate_voice_signal_payload(&signal_kind, &request.sealed_payload)?;
         let attachment = self.active_runtime_peer_attachment_for_text_control()?;
         let local_user_id = self.local_user_id();
         let signal_id = request
@@ -6358,10 +6405,7 @@ impl PersistedAppState {
             sender_peer_id: attachment.local_peer_id.0.clone(),
             recipient_peer_id: attachment.remote_peer_id.0.clone(),
             signal_kind: signal_kind.clone(),
-            sdp: request.sdp,
-            candidate: request.candidate,
-            sdp_mid: request.sdp_mid,
-            sdp_m_line_index: request.sdp_m_line_index,
+            sealed_payload: request.sealed_payload,
             created_at_ms: request.created_at_ms,
         };
         let frame = TextControlFrameView::VoiceSignal { signal };
@@ -6457,11 +6501,7 @@ impl PersistedAppState {
         signal: &VoiceSignalingMessageView,
     ) -> Result<(), String> {
         normalize_voice_signal_kind(&signal.signal_kind)?;
-        validate_voice_signal_payload(
-            &signal.signal_kind,
-            signal.sdp.as_deref(),
-            signal.candidate.as_deref(),
-        )?;
+        validate_voice_signal_payload(&signal.signal_kind, &signal.sealed_payload)?;
         let session = self
             .voice_session
             .as_ref()
@@ -7777,7 +7817,11 @@ impl PersistedAppState {
         };
         self.push_event(
             kind,
-            format!("Profile ready for {display_name} on {device_name}"),
+            format!(
+                "Profile ready for {} on {}",
+                redacted_observable_ref("profile", &display_name),
+                redacted_observable_ref("device", &device_name)
+            ),
         );
     }
 
@@ -7908,7 +7952,7 @@ impl PersistedAppState {
         let event = AppEventView {
             sequence: self.next_sequence,
             kind: kind.into(),
-            summary: summary.into(),
+            summary: redact_sensitive_observable_copy(summary),
         };
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.events.push(event);
@@ -7928,8 +7972,8 @@ impl PersistedAppState {
         self.last_command_error = Some(CommandErrorView {
             code: code.into(),
             command: command.into(),
-            message: message.into(),
-            recovery_hint: recovery_hint.into(),
+            message: redact_sensitive_observable_copy(message),
+            recovery_hint: redact_sensitive_observable_copy(recovery_hint),
         });
     }
 
@@ -8097,6 +8141,49 @@ fn redacted_observable_token(kind: &str, value: &str) -> String {
 
 fn redacted_message_ref(message_id: &str) -> String {
     redacted_observable_ref("message", message_id)
+}
+
+fn redact_sensitive_observable_copy(value: impl Into<String>) -> String {
+    let value = value.into();
+    let classes = sensitive_observable_classes(&value);
+    if classes.is_empty() {
+        return value;
+    }
+    format!(
+        "redacted sensitive observable copy (classes={})",
+        classes.join(",")
+    )
+}
+
+fn sensitive_observable_classes(value: &str) -> Vec<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    let mut classes = Vec::new();
+    for (needle, class) in [
+        ("v=0", "raw_sdp"),
+        ("a=ice-ufrag", "ice_credentials"),
+        ("a=ice-pwd", "ice_credentials"),
+        ("candidate:", "ice_candidates"),
+        ("ice password", "ice_credentials"),
+        ("ice credential", "ice_credentials"),
+        ("turn credential", "turn_credentials"),
+        ("turn password", "turn_credentials"),
+        ("room-secret:", "room_seed"),
+        ("room seed", "room_seed"),
+        ("discrypt://join", "invite_link"),
+        ("plaintext message", "plaintext_message"),
+        ("audio plaintext", "audio_plaintext"),
+        ("sframe key", "sframe_key"),
+        ("content key", "content_key"),
+        ("mls epoch secret", "mls_key"),
+        ("mls exporter", "mls_key"),
+        ("production-ready", "fake_production_label"),
+        ("fake production", "fake_production_label"),
+    ] {
+        if lower.contains(needle) && !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
 }
 
 #[cfg(test)]
@@ -8499,28 +8586,32 @@ fn normalize_voice_signal_kind(kind: &str) -> Result<String, String> {
     }
 }
 
-fn validate_voice_signal_payload(
-    signal_kind: &str,
-    sdp: Option<&str>,
-    candidate: Option<&str>,
-) -> Result<(), String> {
+fn validate_voice_signal_payload(signal_kind: &str, sealed_payload: &str) -> Result<(), String> {
     match signal_kind {
-        "offer" | "answer" => {
-            let sdp = sdp.unwrap_or_default().trim();
-            if sdp.is_empty() || !sdp.contains("v=0") {
-                return Err(
-                    "voice offer/answer requires opaque SDP containing a session description"
-                        .to_owned(),
-                );
-            }
-        }
-        "candidate" => {
-            let candidate = candidate.unwrap_or_default().trim();
-            if candidate.is_empty() || !candidate.contains("candidate") {
-                return Err("voice ICE candidate signal requires a candidate string".to_owned());
-            }
-        }
+        "offer" | "answer" | "candidate" => {}
         _ => return Err("unsupported voice signal kind".to_owned()),
+    }
+    let payload = sealed_payload.trim();
+    if !payload.starts_with("voice-signal-sealed:v1:") || payload.len() < 48 {
+        return Err("voice signaling requires a WebView-sealed payload envelope".to_owned());
+    }
+    let lower = payload.to_ascii_lowercase();
+    for marker in [
+        "v=0",
+        "a=ice-ufrag",
+        "a=ice-pwd",
+        "candidate:",
+        "turn credential",
+        "turn password",
+        "ice password",
+        "plaintext",
+        "sframe key",
+        "content key",
+        "mls epoch secret",
+    ] {
+        if lower.contains(marker) {
+            return Err("voice signaling payload must be sealed before IPC/persistence".to_owned());
+        }
     }
     Ok(())
 }
@@ -10402,6 +10493,7 @@ mod tests {
         Ok((path.clone(), TauriAppService::load_for_test_path(path)))
     }
 
+    #[allow(dead_code)]
     fn join_group_invite_as_test_profile(
         profile_name: &str,
         display_name: &str,
@@ -12461,10 +12553,7 @@ mod tests {
         let queued = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
             session_id: session_id.clone(),
             signal_kind: "offer".to_owned(),
-            sdp: Some("v=0\r\na=sendrecv".to_owned()),
-            candidate: None,
-            sdp_mid: None,
-            sdp_m_line_index: None,
+            sealed_payload: "voice-signal-sealed:v1:test-offer-ciphertext-ref".to_owned(),
             signal_id: Some("voice-signal-offer-1".to_owned()),
             created_at_ms: 42,
         });
@@ -12502,10 +12591,7 @@ mod tests {
                     sender_peer_id: remote_peer.clone(),
                     recipient_peer_id: local_peer.clone(),
                     signal_kind: "answer".to_owned(),
-                    sdp: Some("v=0\r\na=recvonly".to_owned()),
-                    candidate: None,
-                    sdp_mid: None,
-                    sdp_m_line_index: None,
+                    sealed_payload: "voice-signal-sealed:v1:test-answer-ciphertext-ref".to_owned(),
                     created_at_ms: 43,
                 },
             },
@@ -12538,6 +12624,67 @@ mod tests {
             .voice_session
             .as_ref()
             .is_some_and(|session| session.signaling.role == "stopped"));
+        Ok(())
+    }
+
+    #[test]
+    fn g009_voice_signaling_rejects_raw_sdp_ice_before_ipc_persistence() -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("g009-voice-signaling-privacy");
+        create_user(CreateUserRequest {
+            display_name: "Profile A".to_owned(),
+            device_name: Some("Device A".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Private Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .ok_or_else(|| "group missing".to_owned())?;
+        let voice_channel = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group.group_id.clone(),
+            channel_id: voice_channel.channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic".to_owned()),
+            input_device_label: Some("Mic".to_owned()),
+            output_device_id: Some("speaker".to_owned()),
+            output_device_label: Some("Speaker".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        let rejected = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
+            session_id,
+            signal_kind: "offer".to_owned(),
+            sealed_payload: "voice-signal-sealed:v1:v=0\r\na=ice-pwd:g009\r\ncandidate:g009"
+                .to_owned(),
+            signal_id: Some("voice-signal-g009-raw".to_owned()),
+            created_at_ms: 42,
+        });
+        assert!(rejected
+            .last_command_error
+            .as_ref()
+            .is_some_and(|error| error.code == "voice_signal_queue_failed"));
+        let persisted = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        for forbidden in ["a=ice-pwd:g009", "candidate:g009", "voice-signal-g009-raw"] {
+            assert!(
+                !persisted.contains(forbidden),
+                "raw voice signaling marker leaked into persisted state: {forbidden}"
+            );
+        }
         Ok(())
     }
 
@@ -17844,6 +17991,110 @@ mod tests {
             observable.contains("message_ref=") && observable.contains("scope_ref="),
             "observable copy should expose redacted refs for support/debuggability: {observable}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn g009_observable_copy_redacts_sensitive_classes() {
+        for forbidden in [
+            "v=0\r\na=ice-pwd:g009",
+            "a=ice-ufrag:g009",
+            "candidate:g009",
+            "turn credential g009",
+            "turn password g009",
+            "room-secret:g009",
+            "plaintext message g009",
+            "audio plaintext g009",
+            "sframe key g009",
+            "content key g009",
+            "mls epoch secret g009",
+            "mls exporter g009",
+            "production-ready",
+            "fake production label",
+        ] {
+            let redacted = redact_sensitive_observable_copy(forbidden);
+            assert!(
+                redacted.contains("redacted sensitive observable copy"),
+                "sensitive class was not redacted: {forbidden} -> {redacted}"
+            );
+            assert!(
+                !redacted.contains(forbidden),
+                "sensitive observable copy leaked original value: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn g009_backend_event_summaries_commit_names_and_invites() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("g009-backend-event-redaction");
+        let created = create_user(CreateUserRequest {
+            display_name: "Alice Secret".to_owned(),
+            device_name: Some("Laptop Secret".to_owned()),
+        });
+        assert!(created
+            .events
+            .iter()
+            .any(|event| event.summary.contains("profile_ref=")));
+        let grouped = create_group(CreateGroupRequest {
+            name: "Secret Project".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = grouped
+            .groups
+            .iter()
+            .find(|group| group.name == "Secret Project")
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "private-plans".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        create_invite(CreateInviteRequest {
+            group_id: Some(group_id),
+            expires: "24 hours".to_owned(),
+            max_use: "single use".to_owned(),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob Secret".to_owned(),
+        });
+
+        let event_copy = load_state()
+            .events
+            .iter()
+            .map(|event| event.summary.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for raw in [
+            "Alice Secret",
+            "Laptop Secret",
+            "Secret Project",
+            "private-plans",
+            "Bob Secret",
+        ] {
+            assert!(
+                !event_copy.contains(raw),
+                "backend event summary leaked raw label {raw}: {event_copy}"
+            );
+        }
+        for redacted_ref in [
+            "profile_ref=",
+            "device_ref=",
+            "group_ref=",
+            "channel_ref=",
+            "dm_contact_ref=",
+        ] {
+            assert!(
+                event_copy.contains(redacted_ref),
+                "backend event summary missing redacted reference {redacted_ref}: {event_copy}"
+            );
+        }
         Ok(())
     }
 

@@ -14,7 +14,7 @@ G008 is **not production-closed**. The repository has strong deterministic and e
 | --- | --- | --- |
 | Direct/STUN route selection | `crates/transport/src/webrtc_negotiation.rs` records `direct_path_ready` only after WebRTC connected/completed metrics; `crates/transport/src/session.rs` selects direct routes only from checking state; `crates/transport/src/lib.rs` planner preserves STUN → overlay → TURN order. | Partial: deterministic/loopback proof exists; live STUN/NAT proof is not consolidated into a release matrix. |
 | No-TURN fail-closed | `WebRtcNegotiationConfig::validate` rejects `RelayOnly` without TURN; tests cover relay-only missing TURN and route selection without relay evidence; expired TURN credentials are rejected before offer generation. | Mostly implemented locally; planner-level placeholder TURN still means callers must enter through validated ICE/WebRTC config. |
-| Credentialed TURN relay success | TURN credentials are validated/redacted and passed into `RTCIceServer`; TURN route promotion requires connected WebRTC plus relay candidate evidence. `public_mqtt_relay_only_turn_fallback_roundtrip_when_configured` is env-gated by `DISCRYPT_PUBLIC_TURN_E2E`. | Runtime path exists; real credentialed TURN evidence remains opt-in/missing unless envs are supplied. |
+| Credentialed TURN relay success | TURN credentials are validated/redacted and passed into `RTCIceServer`; TURN route promotion requires connected WebRTC plus relay candidate evidence. `public_mqtt_relay_only_turn_fallback_roundtrip_when_configured` is env-gated by `DISCRYPT_PUBLIC_TURN_E2E` and now requires endpoint, username, and credential before it can run. | Runtime path exists; real credentialed TURN evidence remains opt-in/missing unless envs are supplied. |
 | Adapter fallback/outage behavior | `AdapterReadinessState`, `classify_provider_failure`, and `plan_signaling_adapter_fallback` model provider failures and selection; feature-gated adapters fail closed; degraded Nostr public-relay tests exist. | Planning/classification implemented; runtime outage/failover proof is not consolidated. |
 | Retry/backoff | `ReconnectBackoffPolicy` and `schedule_reconnect` are deterministic and tested for delays/exhaustion. | State-machine proof only; no runtime scheduler/outage UI gate. |
 | Duplicate sessions | Backend text transport `start_transport_session` reuses an active same-scope session id; UI voice signaling drops same-session/self-origin messages. | Partial; no explicit regression for duplicate start/join prevention across transport/voice/session surfaces. |
@@ -50,7 +50,13 @@ G008 is **not production-closed**. The repository has strong deterministic and e
 
 - **Task 2 backend/runtime:** add the network/ICE matrix helper/gate, duplicate-session regression, and retry/backoff runtime proof. Reuse existing `WebRtcNegotiationConfig`, `ReconnectBackoffPolicy`, and `start_transport_session` surfaces rather than adding a parallel policy layer.
 - **Task 3 frontend/UI:** add explicit TURN-required/provider-failed/fallback copy and UI tests. Preserve current no-fake-production-claims posture.
-- **Task 4 scripts/e2e:** wire a G008 matrix script that runs deterministic gates by default and only executes credentialed TURN when the required env vars exist.
+- **Task 4 scripts/e2e:** wire a G008 matrix script that runs deterministic gates by default, chains UI honesty and G132 provider-privacy checks, and only executes credentialed TURN when endpoint, username, and credential env vars exist.
+
+## Task 4 release script/docs audit update
+
+The G008 release row now lives in `docs/release/release-verification-matrix.md` and is guarded by `scripts/check-release-verification-matrix.mjs`. `scripts/check-g008-stun-turn-fallback.mjs` also checks that row before running its deterministic gates, so a future edit cannot leave G008 outside the release matrix while the dedicated npm alias stays green.
+
+Credentialed TURN is still **not** claimed by default. The optional relay-only test requires `DISCRYPT_PUBLIC_TURN_E2E=1` plus `DISCRYPT_PUBLIC_TURN_ENDPOINT`, `DISCRYPT_PUBLIC_TURN_USERNAME`, and `DISCRYPT_PUBLIC_TURN_CREDENTIAL`; otherwise the release evidence must report the honest skip.
 
 ## Subagent findings integrated
 

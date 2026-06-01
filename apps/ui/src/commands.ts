@@ -735,20 +735,14 @@ export type VoiceSignalingMessageView = {
   sender_peer_id: string;
   recipient_peer_id: string;
   signal_kind: "offer" | "answer" | "candidate" | string;
-  sdp?: string | null;
-  candidate?: string | null;
-  sdp_mid?: string | null;
-  sdp_m_line_index?: number | null;
+  sealed_payload: string;
   created_at_ms: number;
 };
 
 export type PublishVoiceSignalingMessageRequest = {
   session_id: string;
   signal_kind: "offer" | "answer" | "candidate" | string;
-  sdp?: string | null;
-  candidate?: string | null;
-  sdp_mid?: string | null;
-  sdp_m_line_index?: number | null;
+  sealed_payload: string;
   signal_id?: string | null;
   created_at_ms: number;
 };
@@ -3456,7 +3450,7 @@ export async function publishVoiceSignalingMessage(
           "voice.signal_rejected",
           "publish_voice_signaling_message",
           "voice_signal_queue_failed",
-          "Local fallback web runtime cannot persist provider-signaled voice SDP/ICE; native Rust/Tauri command path is required",
+          "Local fallback web runtime cannot persist provider-signaled sealed voice envelopes; native Rust/Tauri command path is required",
           "Run the native app with provider-derived runtime peers before queueing voice signaling",
         );
       }),
@@ -3477,7 +3471,7 @@ export async function takePendingVoiceSignalingMessages(
           "take_pending_voice_signaling_messages",
           "voice_signal_inbox_unavailable",
           "Local fallback web runtime cannot drain backend voice signaling; native Rust/Tauri command path is required",
-          "Run the native app and process provider-signaled SDP/ICE from backend state",
+          "Run the native app and process provider-signaled sealed voice envelopes from backend state",
         );
       });
       return { state, messages: [] };
