@@ -6978,18 +6978,6 @@ impl PersistedAppState {
                 .map_err(|error| error.to_string())?
             }
         };
-        let route = self.selected_text_route_for_outbox(message_id);
-        let mut author_log = AppTextAuthorLog::default();
-        let mut transport = AppTextOutboxTransport::default();
-        let mut events = AppTextSendEvents::default();
-        let receipt = TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
-            .send(request, route, &text_exporter_secret, &signing_key)
-            .map_err(|error| error.to_string())?;
-        if author_log.entries.len() != 1 || transport.frames.len() != 1 {
-            return Err(
-                "text outbound pipeline did not persist and queue exactly one envelope".to_owned(),
-            );
-        }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
             group_id,
