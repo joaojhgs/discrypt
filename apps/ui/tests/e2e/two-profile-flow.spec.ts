@@ -1,5 +1,14 @@
 import { Browser, expect, Page, test } from "playwright/test";
 
+async function expectNoManualRuntimeControls(...pages: Page[]) {
+  for (const page of pages) {
+    await expect(page.locator("#runtime-local-peer")).toHaveCount(0);
+    await expect(page.locator("#runtime-remote-peer")).toHaveCount(0);
+    await expect(page.getByText("Listen as answerer")).toHaveCount(0);
+    await expect(page.getByText("Connect as offerer")).toHaveCount(0);
+  }
+}
+
 async function installVoiceDevices(page: Page, profile: string) {
   await page.addInitScript((profileName) => {
     const audioTrack = {
