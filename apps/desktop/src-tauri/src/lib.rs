@@ -12618,10 +12618,15 @@ mod tests {
             transport_proof: false,
             adapter_kind: None,
         });
-        assert!(bob_sent.last_command_error.is_none(), "{bob_sent:?}");
-        assert!(bob_sent.messages.iter().any(|message| {
-            message.body == "g010 bob local text remains local" && message.state_key == "sent_local"
-        }));
+        let bob_send_error = bob_sent
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "joined profile without OpenMLS state should fail closed".to_owned())?;
+        assert_eq!(bob_send_error.code, "text_delivery_envelope_failed");
+        assert!(bob_send_error
+            .message
+            .contains("OpenMLS group state is missing"));
+        assert!(bob_sent.messages.is_empty());
 
         let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target: alice_target,
@@ -16462,50 +16467,24 @@ mod tests {
             transport_proof: false,
             adapter_kind: None,
         });
-        let bob_message_id = bob_sent
-            .messages
-            .last()
-            .map(|message| message.message_id.clone())
-            .ok_or_else(|| "bob message missing".to_owned())?;
-        let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
-            TauriAppService::load_for_test_path(alice_path.clone()),
-        ));
-        let bob_session = start_text_session(StartTextSessionRequest {
-            scope_label: Some("g012-bob-to-alice-group-text".to_owned()),
-            data_channel_probe: false,
-            adapter_kind: None,
-        });
-        assert!(bob_session.last_command_error.is_none(), "{bob_session:?}");
-        let bob_session_id = load_state()
-            .text_session
+        let bob_send_error = bob_sent
+            .last_command_error
             .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "bob text session missing".to_owned())?;
-        attach_text_control_transport_runtime_for_test(bob_receiver.clone(), bob_session_id);
-        let bob_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
-            target: Some(bob_target),
-            limit: Some(8),
-            operation_timeout_ms: Some(5_000),
-        });
-        assert!(bob_report.failures.is_empty(), "{:?}", bob_report.failures);
-        assert_eq!(bob_report.frames_sent, 1);
-        assert_eq!(bob_report.response_frames_received, 1);
-        assert_eq!(bob_report.receipts_applied, 1);
-        clear_text_control_transport_runtime_for_test();
-        let bob_after = load_state_from_store(&mut FileAppStore::new(&bob_path));
-        let bob_delivered = bob_after
+            .ok_or_else(|| "joined profile without OpenMLS state should fail closed".to_owned())?;
+        assert_eq!(bob_send_error.code, "text_delivery_envelope_failed");
+        assert!(bob_send_error
+            .message
+            .contains("OpenMLS group state is missing"));
+        assert!(!bob_sent
             .messages
             .iter()
-            .find(|message| message.message_id == bob_message_id)
-            .ok_or_else(|| "bob delivered message missing after reload".to_owned())?;
-        assert_eq!(bob_delivered.state_key, "peer_receipt");
-        assert!(bob_delivered.peer_receipt.is_some());
+            .any(|message| message.body == "g012 bob to alice encrypted group text"));
+        let bob_after = load_state_from_store(&mut FileAppStore::new(&bob_path));
         let alice_after_bob = load_state_from_store(&mut FileAppStore::new(&alice_path));
-        assert!(alice_after_bob.messages.iter().any(|message| {
-            message.message_id == bob_message_id
-                && message.state_key == "received_plaintext"
-                && message.body == "g012 bob to alice encrypted group text"
-        }));
+        assert!(!alice_after_bob
+            .messages
+            .iter()
+            .any(|message| { message.body == "g012 bob to alice encrypted group text" }));
 
         if let Ok(artifact_path) = std::env::var("DISCRYPT_G012_TEXT_PROOF_ARTIFACT") {
             if let Some(parent) = std::path::Path::new(&artifact_path).parent() {
@@ -16518,8 +16497,8 @@ mod tests {
                 Ok(hex::encode(hasher.finalize()))
             };
             let report = serde_json::json!({
-                "schema_version": "discrypt.g012.group_text_bidirectional.v1",
-                "status": "passed",
+                "schema_version": "discrypt.g012.group_text_outbound_openmls.v1",
+                "status": "owner_outbound_passed_joiner_outbound_blocked_until_openmls_admission",
                 "profiles": {
                     "alice": {
                         "state_path": alice_path,
@@ -16562,26 +16541,21 @@ mod tests {
                     },
                     {
                         "direction": "bob_to_alice",
-                        "message_id": bob_message_id,
-                        "sender_state_after_reload": bob_delivered.state_key,
-                        "sender_peer_receipt": bob_delivered.peer_receipt.is_some(),
-                        "receiver_state_after_reload": "received_plaintext",
-                        "receiver_plaintext_rendered": true,
-                        "frames_sent": bob_report.frames_sent,
-                        "response_frames_received": bob_report.response_frames_received,
-                        "receipts_applied": bob_report.receipts_applied,
-                        "transport_open": bob_report.metrics.open,
-                        "transport_bytes_sent": bob_report.metrics.bytes_sent,
-                        "transport_bytes_received": bob_report.metrics.bytes_received,
+                        "status": "blocked_missing_openmls_member_state",
+                        "command_error_code": bob_send_error.code,
+                        "command_error_message": bob_send_error.message,
+                        "frames_sent": 0,
+                        "receipts_applied": 0,
                     }
                 ],
                 "claims": [
                     "two isolated Tauri AppService profile stores",
                     "signed group invite accepted by second profile",
-                    "authorized OpenMLS Welcome admission installed matching text exporters",
-                    "text/control transport pump delivered opaque encrypted envelopes both directions",
-                    "receiver decrypted and persisted received_plaintext rows",
-                    "sender persisted signed peer_receipt state after reload"
+                    "owner channel send used OpenMLS exporter-backed text ciphertext",
+                    "text/control transport pump delivered the owner envelope",
+                    "receiver persisted received_envelope rows",
+                    "sender persisted signed peer_receipt state after reload",
+                    "joined profile channel send fails closed until persisted OpenMLS admission/member state exists"
                 ]
             });
             fs::write(
