@@ -187,7 +187,10 @@ function stableUiHash(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
-function runtimePeerIdFromCommitment(label: string, commitment: string): string {
+function runtimePeerIdFromCommitment(
+  label: string,
+  commitment: string,
+): string {
   return `peer-${stableUiHash(`${label}:${commitment}`)}`;
 }
 
@@ -281,33 +284,66 @@ async function attemptVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByText(/You · you/)).toBeVisible();
-  await expect(page.locator('[data-testid="voice-local-participant"]')).toHaveCount(1);
-  await expect(page.locator('[data-testid="voice-remote-participant"]')).toHaveCount(0);
-  await expect(page.locator('[data-testid="voice-remote-volume"]')).toHaveCount(0);
-  await expect(page.getByRole("slider", { name: /speaker volume/i })).toHaveCount(0);
-  await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(true);
+  await expect(
+    page.locator('[data-testid="voice-local-participant"]'),
+  ).toHaveCount(1);
+  await expect(
+    page.locator('[data-testid="voice-remote-participant"]'),
+  ).toHaveCount(0);
+  await expect(page.locator('[data-testid="voice-remote-volume"]')).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("slider", { name: /speaker volume/i }),
+  ).toHaveCount(0);
+  await expect
+    .poll(async () => (await readVoiceTrackState(page)).enabled)
+    .toBe(true);
   expect((await readVoiceTrackState(page)).stopCount).toBe(0);
-  await expect(page.getByText(/remote audio is not connected yet/i).first()).toBeVisible();
-  await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(0);
+  await expect(
+    page.getByText(/remote audio is not connected yet/i).first(),
+  ).toBeVisible();
+  await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
+    0,
+  );
   await expect(page.getByText(/media runtime/i)).toHaveCount(0);
   await expect(page.getByTestId("voice-remote-audio")).toHaveCount(0);
   await expect(
     page.getByRole("switch", { name: /mute my microphone/i }),
   ).toBeEnabled();
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
-  await expect(page.getByRole("switch", { name: /mute my microphone/i })).toHaveAttribute("aria-checked", "true");
+  await expect(
+    page.getByRole("switch", { name: /mute my microphone/i }),
+  ).toHaveAttribute("aria-checked", "true");
   await expect(page.getByText(/muted/).first()).toBeVisible();
-  await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(false);
+  await expect
+    .poll(async () => (await readVoiceTrackState(page)).enabled)
+    .toBe(false);
   await page.getByRole("switch", { name: /mute my microphone/i }).click();
-  await expect(page.getByRole("switch", { name: /mute my microphone/i })).toHaveAttribute("aria-checked", "false");
-  await expect.poll(async () => (await readVoiceTrackState(page)).enabled).toBe(true);
+  await expect(
+    page.getByRole("switch", { name: /mute my microphone/i }),
+  ).toHaveAttribute("aria-checked", "false");
+  await expect
+    .poll(async () => (await readVoiceTrackState(page)).enabled)
+    .toBe(true);
   await page.getByRole("button", { name: /leave call/i }).click();
   await expect(page.getByText(/not joined/i).first()).toBeVisible();
-  await expect.poll(async () => (await readVoiceTrackState(page)).stopped).toBe(true);
+  await expect
+    .poll(async () => (await readVoiceTrackState(page)).stopped)
+    .toBe(true);
   expect((await readVoiceTrackState(page)).stopCount).toBeGreaterThan(0);
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
   await expect(page.getByText(/manual pairing|QR pairing/i)).toHaveCount(0);
+}
+
+async function reloadAndRepeatVoiceWithoutProfileLeakage(page: Page) {
+  await page.reload();
+  await expect(page.getByRole("button", { name: /Voice Lobby/ })).toBeVisible();
+  await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
+  await expect(page.getByText(/Ops relay/)).toHaveCount(0);
+  await expect(page.getByText(/manual pairing|QR pairing/i)).toHaveCount(0);
+  await attemptVoice(page);
 }
 
 test("two independent profiles exercise DM, invite join, and voice attempts honestly", async ({

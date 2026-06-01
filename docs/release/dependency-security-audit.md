@@ -71,3 +71,11 @@ cargo audit --json > /tmp/discrypt-cargo-audit-libp2p-patched.json
 ```
 
 Latest audit result after these slices: **0 vulnerability hits remain**. `npm --prefix apps/ui run test:cargo-audit-g122` now passes only when strict `cargo audit` exits zero and the 16 unmaintained warnings plus 1 unsound warning exactly match the documented watchlist.
+
+## G009 audit coupling
+
+G009 security/privacy/no-shim closure relies on the same supply-chain gate family:
+`cargo audit` for Rust advisories, `cargo deny` for license/advisory/bans/source
+policy, `npm audit` for UI package advisories, and SBOM generation for release
+inventory. Privacy gates must not introduce new dependencies unless the audit,
+license, and security review docs are updated in the same change.

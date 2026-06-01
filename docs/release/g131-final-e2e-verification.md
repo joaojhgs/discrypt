@@ -34,6 +34,7 @@ npm --prefix apps/ui run test:malicious-relay-g097
 npm --prefix apps/ui run test:malicious-member-g098
 npm --prefix apps/ui run test:retention-shred-g099
 npm --prefix apps/ui run test:performance-soak-g100
+npm --prefix apps/ui run test:security-privacy-g009
 npm --prefix apps/ui run test:presence-g115
 npm --prefix apps/ui run test:abuse-g120
 npm --prefix apps/ui run test:cargo-deny-g121

@@ -104,8 +104,7 @@ Required gates for this decision:
    permits no vulnerability waivers, and fails if the current warning watchlist
    diverges from the documented owner/expiry/disposition table.
 2. `npm --prefix apps/ui run test:npm-audit-g123` runs production and full UI
-   `npm audit --audit-level=high` checks and permits only a documented
-   non-release waiver.
+   `npm audit --audit-level=high` checks and permits only a documented non-release waiver.
 3. `npm --prefix apps/ui run test:sbom-g124` runs `generate-sbom-g124` and
    verifies SBOM generated for Rust, npm, and packaged artifacts, including a
    manifest with lockfile hashes, SBOM hashes, Linux bundle targets, and package

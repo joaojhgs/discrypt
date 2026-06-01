@@ -2812,20 +2812,36 @@ where
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
 fn redacted_endpoint_label(endpoint: &str) -> String {
-    use sha2::Digest as _;
-
-    let mut digest = sha2::Sha256::new();
-    digest.update(endpoint.as_bytes());
-    let digest = digest.finalize();
-    let digest = digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let digest = redacted_observable_digest(endpoint);
     let scheme = endpoint
         .split_once(':')
         .map(|(scheme, _)| scheme)
         .unwrap_or("endpoint");
     format!("{scheme}#{digest}")
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn redacted_observable_label(kind: &str, value: &str) -> String {
+    format!("{kind}#{}", redacted_observable_digest(value))
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn redacted_observable_digest(value: &str) -> String {
+    use sha2::Digest as _;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(value.as_bytes());
+    let digest = digest.finalize();
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 /// Production readiness for a provider adapter boundary.
@@ -3484,12 +3500,31 @@ fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
         "alice display",
         "bob display",
         "family voice",
+        "room seed",
+        "room-secret:",
+        "group name",
+        "channel name",
+        "plaintext message",
+        "message plaintext",
+        "audio plaintext",
+        "raw audio",
         "raw sdp",
         "raw ice",
         "v=0",
         "a=ice-ufrag",
         "a=ice-pwd",
         "candidate:",
+        "turn:",
+        "turns:",
+        "turn credential",
+        "turn password",
+        "ice password",
+        "mls epoch secret",
+        "mls exporter",
+        "sframe key",
+        "content key",
+        "production-ready",
+        "fake production",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -5322,7 +5357,7 @@ impl MqttProviderRoom {
                 }
                 Ok(Some(MqttProviderEvent::Error(err))) => {
                     if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
-                        eprintln!("mqtt event error {err}");
+                        eprintln!("mqtt event error redacted");
                     }
                     return Err(mqtt_err("event loop", err));
                 }
@@ -5351,7 +5386,10 @@ impl MqttProviderRoom {
             match event {
                 Ok(Some(MqttProviderEvent::Publish { topic, payload })) => {
                     if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
-                        eprintln!("mqtt incoming publish {topic}");
+                        eprintln!(
+                            "mqtt incoming publish {}",
+                            redacted_observable_label("topic", &topic)
+                        );
                     }
                     self.record_publish(topic, payload).await?;
                 }
@@ -5362,7 +5400,7 @@ impl MqttProviderRoom {
                 }
                 Ok(Some(MqttProviderEvent::Error(err))) => {
                     if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
-                        eprintln!("mqtt event error {err}");
+                        eprintln!("mqtt event error redacted");
                     }
                     return Err(mqtt_err("event loop", err));
                 }
@@ -8445,6 +8483,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_conformance_adapter_rejects_g009_sensitive_marker_classes(
+    ) -> Result<(), TransportError> {
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus);
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"g009 sensitive marker rejection",
+                "test",
+            ),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Mqtt,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "local conformance")?,
+        )?;
+        let room = adapter
+            .connect(local_profile(SignalingAdapterKind::Mqtt)?)
+            .await?
+            .join(scope, capability, SignalingPeerId::new("alice-device")?)
+            .await?;
+
+        for marker in [
+            "room seed raw value",
+            "plaintext message body",
+            "audio plaintext frame",
+            "turn credential secret",
+            "mls epoch secret bytes",
+            "sframe key material",
+            "content key bytes",
+            "fake production-ready label",
+        ] {
+            assert!(
+                matches!(
+                    room.broadcast_control(OpaqueSignalingPayload::new(
+                        marker.as_bytes().to_vec()
+                    )?)
+                    .await,
+                    Err(TransportError::PlaintextLeak)
+                ),
+                "provider-visible control payload must reject {marker}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_provider_text_control_runtime_pair_carries_multiple_opaque_frames(
     ) -> Result<(), TransportError> {
         let bus = LocalConformanceProviderBus::default();
@@ -8689,12 +8779,29 @@ mod tests {
             "alice display",
             "bob display",
             "family voice",
+            "room seed",
+            "room-secret:",
+            "group name",
+            "channel name",
+            "plaintext message",
+            "message plaintext",
+            "audio plaintext",
+            "raw audio",
             "v=0",
             "a=ice-ufrag",
             "a=ice-pwd",
             "candidate:",
             "aliceraw",
             "bobraw",
+            "turn credential",
+            "turn password",
+            "ice password",
+            "mls epoch secret",
+            "mls exporter",
+            "sframe key",
+            "content key",
+            "production-ready",
+            "fake production",
         ] {
             assert!(
                 !lower.contains(marker),

@@ -33,6 +33,9 @@ for (const token of [
   "npm --prefix apps/ui run test:android-gate",
   "npm --prefix apps/ui run test:release-verification-matrix",
   "npm --prefix apps/ui run test:release-governance",
+  "G008 STUN/TURN/fallback hardening",
+  "npm --prefix apps/ui run test:g008-stun-turn-fallback",
+  "Credentialed TURN remains opt-in",
   "cargo test -q -p discrypt-desktop text_control_frame_roundtrip_persists_across_two_profile_state_files -- --nocapture",
   "cargo test -q -p discrypt-desktop text_control_session_pump_uses_data_transport_trait_and_persists_receipt -- --nocapture",
   "DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_two_profile_receipt_crosses_provider_webrtc_when_enabled -- --nocapture",
@@ -51,6 +54,8 @@ for (const scriptName of [
   "test:android-gate",
   "test:release-governance",
   "test:release-verification-matrix",
+  "test:g008-stun-turn-fallback",
+  "test:stun-turn-provider-privacy-g132",
 ]) {
   if (!packageJson.scripts?.[scriptName]) failures.push(`package script missing ${scriptName}`);
 }

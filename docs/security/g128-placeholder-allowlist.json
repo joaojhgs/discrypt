@@ -25,6 +25,12 @@
       "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
     },
     {
+      "path": ".github/workflows/ci.yml",
+      "pattern": "shim",
+      "expected": "- run: npm run test:security-privacy-g009",
+      "reason": "The G009 gate name intentionally includes no-shim as the reviewed release objective; it is a CI check name, not shim implementation code."
+    },
+    {
       "path": ".github/workflows/android.yml",
       "pattern": "emulat",
       "expected": "- uses: reactivecircus/android-emulator-runner@v2",
@@ -71,6 +77,12 @@
       "pattern": "emulat",
       "expected": "run_android_emulator:",
       "reason": "Android emulator runner is a real CI verification environment for mobile voice-path checks, not emulated production functionality."
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "pattern": "shim",
+      "expected": "- run: npm run test:security-privacy-g009",
+      "reason": "CI invokes the G009 no-shim aggregate gate by name; the wording is a gate label, not executable shim behavior."
     },
     {
       "path": "apps/desktop/src-tauri/src/lib.rs",
