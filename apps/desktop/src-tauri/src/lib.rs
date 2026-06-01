@@ -14801,6 +14801,282 @@ mod tests {
     }
 
     #[test]
+    fn g012_two_profile_group_text_delivery_bidirectional_persists() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("g012-group-text-alice");
+        let alice_created = create_user(CreateUserRequest {
+            display_name: "Alice G012".to_owned(),
+            device_name: Some("Alice Tauri profile".to_owned()),
+        });
+        assert!(
+            alice_created.last_command_error.is_none(),
+            "{alice_created:?}"
+        );
+        let created_group = create_group(CreateGroupRequest {
+            name: "G012 Text Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(
+            created_group.last_command_error.is_none(),
+            "{created_group:?}"
+        );
+        let alice_group = created_group
+            .groups
+            .iter()
+            .find(|group| group.name == "G012 Text Lab")
+            .cloned()
+            .ok_or_else(|| "alice group missing".to_owned())?;
+        let alice_group_id = alice_group.group_id.clone();
+        let alice_channel_id = alice_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "alice text channel missing".to_owned())?;
+        let alice_invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(alice_group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+        });
+        assert!(
+            alice_invite_state.last_command_error.is_none(),
+            "{alice_invite_state:?}"
+        );
+        let group_invite = alice_invite_state
+            .invites
+            .iter()
+            .find(|invite| invite.group_id == alice_group_id)
+            .cloned()
+            .ok_or_else(|| "group invite missing".to_owned())?;
+
+        let (bob_path, _) = join_group_invite_as_test_profile(
+            "g012-group-text-bob",
+            "Bob G012",
+            "Bob Tauri profile",
+            group_invite.code.clone(),
+            "G012 Text Lab",
+        )?;
+        let bob_loaded = TauriAppService::load_for_test_path(bob_path.clone());
+        let bob_group = bob_loaded
+            .state
+            .to_view()
+            .groups
+            .into_iter()
+            .find(|group| group.name == "G012 Text Lab")
+            .ok_or_else(|| "bob joined group missing".to_owned())?;
+        let bob_group_id = bob_group.group_id.clone();
+        let bob_channel_id = bob_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "bob text channel missing".to_owned())?;
+
+        reload_global_app_service_from_path(&alice_path);
+        let alice_target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(alice_group_id.clone()),
+            channel_id: Some(alice_channel_id.clone()),
+        };
+        let alice_sent = send_message(SendMessageRequest {
+            target: alice_target.clone(),
+            body: "g012 alice to bob encrypted group text".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let alice_message_id = alice_sent
+            .messages
+            .last()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "alice message missing".to_owned())?;
+        let alice_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(bob_path.clone()),
+        ));
+        let alice_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g012-alice-to-bob-group-text".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(
+            alice_session.last_command_error.is_none(),
+            "{alice_session:?}"
+        );
+        let alice_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "alice text session missing".to_owned())?;
+        attach_text_control_transport_runtime_for_test(alice_receiver.clone(), alice_session_id);
+        let alice_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(alice_target),
+            limit: Some(8),
+            operation_timeout_ms: Some(5_000),
+        });
+        assert!(
+            alice_report.failures.is_empty(),
+            "{:?}",
+            alice_report.failures
+        );
+        assert_eq!(alice_report.frames_sent, 1);
+        assert_eq!(alice_report.response_frames_received, 1);
+        assert_eq!(alice_report.receipts_applied, 1);
+        clear_text_control_transport_runtime_for_test();
+        let alice_after = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_delivered = alice_after
+            .messages
+            .iter()
+            .find(|message| message.message_id == alice_message_id)
+            .ok_or_else(|| "alice delivered message missing after reload".to_owned())?;
+        assert_eq!(alice_delivered.state_key, "peer_receipt");
+        assert!(alice_delivered.peer_receipt.is_some());
+        let bob_after_alice = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        assert!(bob_after_alice.messages.iter().any(|message| {
+            message.message_id == alice_message_id && message.state_key == "received_envelope"
+        }));
+
+        reload_global_app_service_from_path(&bob_path);
+        let bob_target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(bob_group_id.clone()),
+            channel_id: Some(bob_channel_id.clone()),
+        };
+        let bob_sent = send_message(SendMessageRequest {
+            target: bob_target.clone(),
+            body: "g012 bob to alice encrypted group text".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let bob_message_id = bob_sent
+            .messages
+            .last()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "bob message missing".to_owned())?;
+        let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(alice_path.clone()),
+        ));
+        let bob_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g012-bob-to-alice-group-text".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(bob_session.last_command_error.is_none(), "{bob_session:?}");
+        let bob_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "bob text session missing".to_owned())?;
+        attach_text_control_transport_runtime_for_test(bob_receiver.clone(), bob_session_id);
+        let bob_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(bob_target),
+            limit: Some(8),
+            operation_timeout_ms: Some(5_000),
+        });
+        assert!(bob_report.failures.is_empty(), "{:?}", bob_report.failures);
+        assert_eq!(bob_report.frames_sent, 1);
+        assert_eq!(bob_report.response_frames_received, 1);
+        assert_eq!(bob_report.receipts_applied, 1);
+        clear_text_control_transport_runtime_for_test();
+        let bob_after = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        let bob_delivered = bob_after
+            .messages
+            .iter()
+            .find(|message| message.message_id == bob_message_id)
+            .ok_or_else(|| "bob delivered message missing after reload".to_owned())?;
+        assert_eq!(bob_delivered.state_key, "peer_receipt");
+        assert!(bob_delivered.peer_receipt.is_some());
+        let alice_after_bob = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert!(alice_after_bob.messages.iter().any(|message| {
+            message.message_id == bob_message_id && message.state_key == "received_envelope"
+        }));
+
+        if let Ok(artifact_path) = std::env::var("DISCRYPT_G012_TEXT_PROOF_ARTIFACT") {
+            if let Some(parent) = std::path::Path::new(&artifact_path).parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let profile_sha256 = |path: &PathBuf| -> Result<String, String> {
+                let bytes = fs::read(path).map_err(|error| error.to_string())?;
+                let mut hasher = Sha256::new();
+                hasher.update(bytes);
+                Ok(hex::encode(hasher.finalize()))
+            };
+            let report = serde_json::json!({
+                "schema_version": "discrypt.g012.group_text_bidirectional.v1",
+                "status": "passed",
+                "profiles": {
+                    "alice": {
+                        "state_path": alice_path,
+                        "state_sha256": profile_sha256(&alice_path)?,
+                    },
+                    "bob": {
+                        "state_path": bob_path,
+                        "state_sha256": profile_sha256(&bob_path)?,
+                    }
+                },
+                "group": {
+                    "name": "G012 Text Lab",
+                    "alice_group_id": alice_group_id,
+                    "bob_group_id": bob_group_id,
+                    "alice_channel_id": alice_channel_id,
+                    "bob_channel_id": bob_channel_id,
+                    "invite_kind": group_invite.invite_kind,
+                    "invite_uses": bob_after.invites.iter().find(|invite| invite.invite_key == group_invite.invite_key).map(|invite| invite.uses).unwrap_or(0),
+                },
+                "deliveries": [
+                    {
+                        "direction": "alice_to_bob",
+                        "message_id": alice_message_id,
+                        "sender_state_after_reload": alice_delivered.state_key,
+                        "sender_peer_receipt": alice_delivered.peer_receipt.is_some(),
+                        "receiver_state_after_reload": "received_envelope",
+                        "frames_sent": alice_report.frames_sent,
+                        "response_frames_received": alice_report.response_frames_received,
+                        "receipts_applied": alice_report.receipts_applied,
+                        "transport_open": alice_report.metrics.open,
+                        "transport_bytes_sent": alice_report.metrics.bytes_sent,
+                        "transport_bytes_received": alice_report.metrics.bytes_received,
+                    },
+                    {
+                        "direction": "bob_to_alice",
+                        "message_id": bob_message_id,
+                        "sender_state_after_reload": bob_delivered.state_key,
+                        "sender_peer_receipt": bob_delivered.peer_receipt.is_some(),
+                        "receiver_state_after_reload": "received_envelope",
+                        "frames_sent": bob_report.frames_sent,
+                        "response_frames_received": bob_report.response_frames_received,
+                        "receipts_applied": bob_report.receipts_applied,
+                        "transport_open": bob_report.metrics.open,
+                        "transport_bytes_sent": bob_report.metrics.bytes_sent,
+                        "transport_bytes_received": bob_report.metrics.bytes_received,
+                    }
+                ],
+                "claims": [
+                    "two isolated Tauri AppService profile stores",
+                    "signed group invite accepted by second profile",
+                    "text/control transport pump delivered opaque encrypted envelopes both directions",
+                    "receiver persisted received_envelope rows",
+                    "sender persisted signed peer_receipt state after reload"
+                ]
+            });
+            fs::write(
+                artifact_path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn text_control_pump_reports_missing_runtime() {
         let _guard = test_lock();
         reset_with_temp_state("text-control-transport-pump-runtime-missing");
