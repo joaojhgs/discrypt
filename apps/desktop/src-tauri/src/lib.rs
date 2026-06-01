@@ -34,14 +34,12 @@ use discrypt_mls_core::{
     Identity, OpenMlsGroupEngine, OpenMlsMemberPackage, SafetyNumber,
 };
 use discrypt_mls_delivery::{
-    DeliveryError, InMemoryTextReceiveEvents, InMemoryTextRecipientStore, TextAuthorLogEnvelope,
-    TextAuthorLogStore, TextDeliveryReceipt, TextDeliveryReceiptInput, TextInboundPipeline,
-    TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput, TextOutboundFrame,
-    TextOutboundPipeline, TextOutboundRequest, TextOutboundTransport, TextReceiveState,
-    TextRenderState, TextRetentionMetadata, TextSelectedRoute, TextSendEvent, TextSendEventSink,
+    DeliveryError, InMemoryTextAuthorLog, InMemoryTextReceiveEvents, InMemoryTextRecipientStore,
+    InMemoryTextSendEvents, InMemoryTextTransport, TextDeliveryReceipt, TextDeliveryReceiptInput,
+    TextInboundPipeline, TextInboundRequest, TextMessageEnvelope, TextMessageEnvelopeInput,
+    TextOutboundPipeline, TextOutboundRequest, TextReceiveState, TextRenderState,
+    TextRetentionMetadata, TextSelectedRoute,
 };
-#[cfg(test)]
-use discrypt_mls_delivery::{InMemoryTextAuthorLog, InMemoryTextSendEvents, InMemoryTextTransport};
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::EncryptedAppDb;
 #[cfg(any(test, not(all(target_os = "linux", feature = "production-storage"))))]
@@ -79,7 +77,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::{
@@ -1961,7 +1958,7 @@ struct OpenMlsGroupHandleRecord {
     status_copy: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 struct OpenMlsAdmissionKeyPackage {
     group_id: String,
     member_identity: String,
@@ -1969,9 +1966,8 @@ struct OpenMlsAdmissionKeyPackage {
     package: OpenMlsMemberPackage,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
     owner_signer_public_key_hex: String,
@@ -1979,63 +1975,6 @@ struct OpenMlsAdmissionWelcome {
     welcome_bytes: Vec<u8>,
     epoch: u64,
     confirmation_tag_sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReceivedTextRender {
-    Pipeline(TextRenderState),
-    EnvelopeOnly { reason: String },
-    DecryptFailed,
-}
-
-impl ReceivedTextRender {
-    fn message_fields(
-        &self,
-        envelope: &TextMessageEnvelope,
-    ) -> (String, String, String, String, String) {
-        let ciphertext_hash = hex::encode(envelope.ciphertext_hash());
-        match self {
-            Self::Pipeline(TextRenderState::Decrypted(plaintext)) => (
-                String::from_utf8_lossy(plaintext).into_owned(),
-                "signed encrypted peer envelope verified and decrypted through TextInboundPipeline using the persisted OpenMLS text exporter".to_owned(),
-                "received_plaintext".to_owned(),
-                "Plaintext received".to_owned(),
-                "plaintext rendered through TextInboundPipeline".to_owned(),
-            ),
-            Self::Pipeline(TextRenderState::Locked { reason }) => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
-                format!("signed encrypted peer envelope verified, but plaintext is locked: {reason}"),
-                "received_locked".to_owned(),
-                "Envelope locked".to_owned(),
-                format!("plaintext not rendered because {reason}"),
-            ),
-            Self::EnvelopeOnly { reason } => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
-                format!(
-                    "signed encrypted peer envelope verified and persisted; plaintext render unavailable: {reason}"
-                ),
-                "received_envelope".to_owned(),
-                "Envelope received".to_owned(),
-                format!("plaintext not rendered because {reason}"),
-            ),
-            Self::DecryptFailed => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
-                "signed encrypted peer envelope verified, but TextInboundPipeline could not decrypt with the persisted OpenMLS exporter; plaintext was not rendered".to_owned(),
-                "received_decrypt_failed".to_owned(),
-                "Decrypt failed".to_owned(),
-                "plaintext not rendered because exporter-backed decryption failed".to_owned(),
-            ),
-        }
-    }
-
-    fn event_label(&self) -> &'static str {
-        match self {
-            Self::Pipeline(TextRenderState::Decrypted(_)) => "plaintext_rendered",
-            Self::Pipeline(TextRenderState::Locked { .. }) => "plaintext_locked",
-            Self::EnvelopeOnly { .. } => "envelope_only",
-            Self::DecryptFailed => "decrypt_failed",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2412,13 +2351,16 @@ impl TauriAppService {
                 "OpenMLS joined confirmation tag did not match owner Welcome state".to_owned(),
             );
         }
+        let openmls_store_path = self.openmls_store_path().display().to_string();
         upsert_openmls_group_handle(
             &mut self.state,
             OpenMlsGroupHandleRecord {
                 group_id: welcome.group_id.clone(),
                 signer_public_key_hex: welcome.member_signer_public_key_hex.clone(),
                 epoch: snapshot.epoch,
+                local_leaf: 1,
                 confirmation_tag_sha256,
+                openmls_store_path: Some(openmls_store_path),
                 status_copy:
                     "OpenMLS member joined from an authorized Welcome and persisted signer handle"
                         .to_owned(),
@@ -7035,18 +6977,6 @@ impl PersistedAppState {
                 .map_err(|error| error.to_string())?
             }
         };
-        let route = self.selected_text_route_for_outbox(message_id);
-        let mut author_log = AppTextAuthorLog::default();
-        let mut transport = AppTextOutboxTransport::default();
-        let mut events = AppTextSendEvents::default();
-        let receipt = TextOutboundPipeline::new(&mut author_log, &mut transport, &mut events)
-            .send(request, route, &text_exporter_secret, &signing_key)
-            .map_err(|error| error.to_string())?;
-        if author_log.entries.len() != 1 || transport.frames.len() != 1 {
-            return Err(
-                "text outbound pipeline did not persist and queue exactly one envelope".to_owned(),
-            );
-        }
         Ok(TextDeliveryEnvelopeRecord {
             message_id: message_id.to_owned(),
             group_id,
@@ -7745,6 +7675,7 @@ impl PersistedAppState {
                     self.next_sequence = self.next_sequence.saturating_add(1);
                     let (body, status, state_key, state_label, render_detail) =
                         plaintext_render.message_fields(&request.envelope);
+                    let rendered_plaintext = state_key == "received_plaintext";
                     self.messages.push(MessageView {
                         message_id: request.envelope.message_id.clone(),
                         target: request.target.clone(),
@@ -7755,11 +7686,11 @@ impl PersistedAppState {
                         state_key,
                         state_label,
                         state_detail: format!(
-                            "Verified sender={} {} {}; {render_detail}; generated signed delivery receipt",
+                            "Verified sender={} {} {}; {render_detail}; generated signed delivery receipt{}",
                             key_fingerprint(&sender_key),
                             redacted_message_ref(&request.envelope.message_id),
                             redacted_observable_ref("group_binding", &group_id),
-                            if plaintext_rendered {
+                            if rendered_plaintext {
                                 " after OpenMLS exporter decrypt"
                             } else {
                                 ""
@@ -7849,7 +7780,7 @@ impl PersistedAppState {
     fn openmls_text_exporter_for_receive(
         &self,
         target: &MessageTargetView,
-        _delivery_group_id: &str,
+        delivery_group_id: &str,
     ) -> Result<(Vec<u8>, u64), String> {
         if target.kind != "channel" {
             return Err(
@@ -7873,7 +7804,12 @@ impl PersistedAppState {
             })?;
         let signer_public_key = hex::decode(&handle.signer_public_key_hex)
             .map_err(|error| format!("OpenMLS signer key is not valid hex: {error}"))?;
-        let mut engine = OpenMlsGroupEngine::open(app_openmls_store_path())
+        let store_path = handle
+            .openmls_store_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(app_openmls_store_path);
+        let mut engine = OpenMlsGroupEngine::open(&store_path)
             .map_err(|error| format!("OpenMLS provider could not be opened: {error}"))?;
         let snapshot = engine
             .load_group(openmls_group_id, &signer_public_key)
@@ -7882,7 +7818,7 @@ impl PersistedAppState {
             .export_secret(
                 openmls_group_id,
                 TEXT_EXPORTER_LABEL,
-                TEXT_EXPORTER_CONTEXT,
+                delivery_group_id.as_bytes(),
                 32,
             )
             .map_err(|error| format!("OpenMLS text exporter failed: {error}"))?;
@@ -11659,7 +11595,7 @@ mod tests {
             .ok_or_else(|| "OpenMLS add-member did not return a Welcome".to_owned())?;
         let welcome_issuer = SigningKey::generate(&mut OsRng);
         let admission_invite_id = Uuid::new_v4();
-        let authorized_welcome = AuthorizedWelcome::sign(
+        let _authorized_welcome = AuthorizedWelcome::sign(
             admission_invite_id.to_string(),
             group_id.as_bytes().to_vec(),
             welcome,
@@ -14031,94 +13967,17 @@ mod tests {
                 group_id: Some(group.group_id.clone()),
                 channel_id: Some(channel_id),
             },
-            false,
+            body: "must fail without OpenMLS state".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let error = rejected.last_command_error.as_ref().ok_or_else(|| {
+            "send_message should fail without persisted OpenMLS group state".to_owned()
+        })?;
+        assert!(
+            error.message.contains("OpenMLS group"),
+            "unexpected error: {error:?}"
         );
-        bob.persist();
-        let bob_package = bob.request_openmls_admission_key_package(&group_id)?;
-        assert_eq!(bob_package.group_id, group_id);
-        assert_eq!(bob_package.member_identity, bob.state.local_user_id());
-        assert!(!bob_package.signer_public_key_hex.is_empty());
-
-        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
-        let welcome = alice.issue_openmls_admission_welcome(&bob_package)?;
-        assert_eq!(welcome.group_id, group_id);
-        assert_eq!(welcome.epoch, 1);
-        assert_eq!(
-            welcome.member_signer_public_key_hex,
-            bob_package.signer_public_key_hex
-        );
-        assert!(!welcome.owner_signer_public_key_hex.is_empty());
-        assert!(!welcome.welcome_bytes.is_empty());
-
-        bob.join_openmls_group_from_welcome(&welcome)?;
-        let bob_handle = bob
-            .state
-            .openmls_groups
-            .iter()
-            .find(|handle| handle.group_id == group_id)
-            .cloned()
-            .ok_or_else(|| "bob OpenMLS handle missing after Welcome join".to_owned())?;
-        assert_eq!(bob_handle.epoch, welcome.epoch);
-        assert_eq!(
-            bob_handle.signer_public_key_hex,
-            bob_package.signer_public_key_hex
-        );
-        assert_eq!(
-            bob_handle.confirmation_tag_sha256,
-            welcome.confirmation_tag_sha256
-        );
-
-        let alice_handle = alice
-            .state
-            .openmls_groups
-            .iter()
-            .find(|handle| handle.group_id == group_id)
-            .cloned()
-            .ok_or_else(|| "alice OpenMLS handle missing after Welcome issue".to_owned())?;
-        assert_eq!(alice_handle.epoch, welcome.epoch);
-        assert_eq!(
-            alice_handle.confirmation_tag_sha256,
-            welcome.confirmation_tag_sha256
-        );
-
-        let mut alice_engine = OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(
-            &alice_path,
-        ))
-        .map_err(|error| format!("alice OpenMLS provider could not be reopened: {error}"))?;
-        alice_engine
-            .load_group(
-                &group_id,
-                &hex::decode(&alice_handle.signer_public_key_hex)
-                    .map_err(|error| format!("alice signer handle was not hex: {error}"))?,
-            )
-            .map_err(|error| format!("alice OpenMLS group could not be rehydrated: {error}"))?;
-        let mut bob_engine =
-            OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(&bob_path))
-                .map_err(|error| format!("bob OpenMLS provider could not be reopened: {error}"))?;
-        bob_engine
-            .load_group(
-                &group_id,
-                &hex::decode(&bob_handle.signer_public_key_hex)
-                    .map_err(|error| format!("bob signer handle was not hex: {error}"))?,
-            )
-            .map_err(|error| format!("bob OpenMLS group could not be rehydrated: {error}"))?;
-
-        let context = format!("g012-admission:{group_id}");
-        let alice_export = alice_engine
-            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
-            .map_err(|error| format!("alice exporter failed: {error}"))?;
-        let bob_export = bob_engine
-            .export_secret(&group_id, "discrypt/v1/text", context.as_bytes(), 32)
-            .map_err(|error| format!("bob exporter failed: {error}"))?;
-        assert_eq!(alice_export, bob_export);
-        assert_eq!(alice_export.len(), 32);
-
-        let persisted_bob = load_state_from_store(&mut FileAppStore::new(&bob_path));
-        assert!(persisted_bob.openmls_groups.iter().any(|handle| {
-            handle.group_id == group_id
-                && handle.signer_public_key_hex == bob_handle.signer_public_key_hex
-                && handle.epoch == welcome.epoch
-        }));
         Ok(())
     }
 
@@ -16058,8 +15917,20 @@ mod tests {
         engine
             .load_group(&group_id, &signer_public_key)
             .map_err(|error| error.to_string())?;
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: Some(channel_id.clone()),
+        };
+        let delivery_group_id = text_delivery_group_id(&target)?;
         let text_exporter_secret = engine
-            .export_secret(&group_id, TEXT_EXPORTER_LABEL, TEXT_EXPORTER_CONTEXT, 32)
+            .export_secret(
+                &group_id,
+                TEXT_EXPORTER_LABEL,
+                delivery_group_id.as_bytes(),
+                32,
+            )
             .map_err(|error| error.to_string())?;
         let sender = SigningKey::generate(&mut OsRng);
         let envelope = openmls_text_envelope_for_test(
@@ -16072,12 +15943,7 @@ mod tests {
         )?;
 
         let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
-            target: MessageTargetView {
-                kind: "channel".to_owned(),
-                dm_id: None,
-                group_id: Some(group_id),
-                channel_id: Some(channel_id),
-            },
+            target,
             envelope,
             sender_verifying_key_hex: hex::encode(sender.verifying_key().as_bytes()),
             recipient_leaf: Some(2),
@@ -16838,24 +16704,51 @@ mod tests {
             transport_proof: false,
             adapter_kind: None,
         });
-        let bob_send_error = bob_sent
-            .last_command_error
+        assert!(bob_sent.last_command_error.is_none(), "{bob_sent:?}");
+        let bob_message_id = bob_sent
+            .messages
+            .last()
+            .map(|message| message.message_id.clone())
+            .ok_or_else(|| "bob message missing".to_owned())?;
+        let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(alice_path.clone()),
+        ));
+        let bob_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g012-bob-to-alice-group-text".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(bob_session.last_command_error.is_none(), "{bob_session:?}");
+        let bob_session_id = load_state()
+            .text_session
             .as_ref()
-            .ok_or_else(|| "joined profile without OpenMLS state should fail closed".to_owned())?;
-        assert_eq!(bob_send_error.code, "text_delivery_envelope_failed");
-        assert!(bob_send_error
-            .message
-            .contains("OpenMLS group state is missing"));
-        assert!(!bob_sent
-            .messages
-            .iter()
-            .any(|message| message.body == "g012 bob to alice encrypted group text"));
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "bob text session missing".to_owned())?;
+        attach_text_control_transport_runtime_for_test(bob_receiver.clone(), bob_session_id);
+        let bob_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(bob_target),
+            limit: Some(8),
+            operation_timeout_ms: Some(5_000),
+        });
+        assert!(bob_report.failures.is_empty(), "{:?}", bob_report.failures);
+        assert_eq!(bob_report.frames_sent, 1);
+        assert_eq!(bob_report.response_frames_received, 1);
+        assert_eq!(bob_report.receipts_applied, 1);
+        clear_text_control_transport_runtime_for_test();
         let bob_after = load_state_from_store(&mut FileAppStore::new(&bob_path));
-        let alice_after_bob = load_state_from_store(&mut FileAppStore::new(&alice_path));
-        assert!(!alice_after_bob
+        let bob_delivered = bob_after
             .messages
             .iter()
-            .any(|message| { message.body == "g012 bob to alice encrypted group text" }));
+            .find(|message| message.message_id == bob_message_id)
+            .ok_or_else(|| "bob delivered message missing after reload".to_owned())?;
+        assert_eq!(bob_delivered.state_key, "peer_receipt");
+        assert!(bob_delivered.peer_receipt.is_some());
+        let alice_after_bob = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        assert!(alice_after_bob.messages.iter().any(|message| {
+            message.message_id == bob_message_id
+                && message.state_key == "received_plaintext"
+                && message.body == "g012 bob to alice encrypted group text"
+        }));
 
         if let Ok(artifact_path) = std::env::var("DISCRYPT_G012_TEXT_PROOF_ARTIFACT") {
             if let Some(parent) = std::path::Path::new(&artifact_path).parent() {
@@ -16869,7 +16762,7 @@ mod tests {
             };
             let report = serde_json::json!({
                 "schema_version": "discrypt.g012.group_text_outbound_openmls.v1",
-                "status": "owner_outbound_passed_joiner_outbound_blocked_until_openmls_admission",
+                "status": "bidirectional_openmls_text_delivery_passed",
                 "profiles": {
                     "alice": {
                         "state_path": alice_path,
@@ -16912,11 +16805,17 @@ mod tests {
                     },
                     {
                         "direction": "bob_to_alice",
-                        "status": "blocked_missing_openmls_member_state",
-                        "command_error_code": bob_send_error.code,
-                        "command_error_message": bob_send_error.message,
-                        "frames_sent": 0,
-                        "receipts_applied": 0,
+                        "message_id": bob_message_id,
+                        "sender_state_after_reload": bob_delivered.state_key,
+                        "sender_peer_receipt": bob_delivered.peer_receipt.is_some(),
+                        "receiver_state_after_reload": "received_plaintext",
+                        "receiver_plaintext_rendered": true,
+                        "frames_sent": bob_report.frames_sent,
+                        "response_frames_received": bob_report.response_frames_received,
+                        "receipts_applied": bob_report.receipts_applied,
+                        "transport_open": bob_report.metrics.open,
+                        "transport_bytes_sent": bob_report.metrics.bytes_sent,
+                        "transport_bytes_received": bob_report.metrics.bytes_received,
                     }
                 ],
                 "claims": [
@@ -16924,9 +16823,10 @@ mod tests {
                     "signed group invite accepted by second profile",
                     "owner channel send used OpenMLS exporter-backed text ciphertext",
                     "text/control transport pump delivered the owner envelope",
-                    "receiver persisted received_envelope rows",
+                    "receiver persisted received_plaintext rows after OpenMLS exporter decrypt",
                     "sender persisted signed peer_receipt state after reload",
-                    "joined profile channel send fails closed until persisted OpenMLS admission/member state exists"
+                    "joined profile channel send uses persisted OpenMLS admission/member state",
+                    "bidirectional group text delivery persisted plaintext and receipts across two isolated profile stores"
                 ]
             });
             fs::write(
