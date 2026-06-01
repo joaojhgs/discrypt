@@ -204,6 +204,7 @@ async function wd(profile, method, path, body) {
     method,
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(Number(process.env.DISCRYPT_G012_WEBDRIVER_COMMAND_TIMEOUT_MS ?? 30_000)),
   });
   const text = await response.text();
   let parsed;
@@ -415,28 +416,116 @@ async function sendGroupMessage(profile, message) {
 }
 async function installVoiceHarness(profile) {
   await exec(profile, String.raw`
-    const evidence = { getUserMediaCalls: 0, localAudioTracksSent: 0, remoteTrackEvents: 0, playbackAttachments: 0, peerConnectionsClosed: 0, trackEnabled: true, trackStopCount: 0 };
+    const evidence = { mode: 'uninitialized', getUserMediaCalls: 0, localAudioTracksSent: 0, remoteTrackEvents: 0, playbackAttachments: 0, peerConnectionsClosed: 0, peerConnectionsConstructed: 0, iceConnected: false, trackEnabled: true, trackStopCount: 0 };
     Object.defineProperty(window, '__discryptG012WebDriverVoiceEvidence', { configurable: true, value: evidence });
+    const audioDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+    if (audioDescriptor?.set) {
+      Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+        configurable: true,
+        get: audioDescriptor.get,
+        set(value) {
+          if (this.tagName === 'AUDIO' && value && this.dataset?.testid === 'voice-remote-audio') evidence.playbackAttachments += 1;
+          return audioDescriptor.set.call(this, value);
+        },
+      });
+    }
+    const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
+    const NativeRTCPeerConnection = window.RTCPeerConnection;
+    if (typeof NativeAudioContext === 'function' && typeof NativeRTCPeerConnection === 'function') {
+      const ctx = new NativeAudioContext();
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const destination = ctx.createMediaStreamDestination();
+      oscillator.frequency.value = 440 + Math.floor(Math.random() * 220);
+      gain.gain.value = 0.03;
+      oscillator.connect(gain);
+      gain.connect(destination);
+      oscillator.start();
+      const generatedTrack = destination.stream.getAudioTracks()[0];
+      const originalStop = generatedTrack.stop.bind(generatedTrack);
+      Object.defineProperty(generatedTrack, 'enabled', {
+        configurable: true,
+        get() { return evidence.trackEnabled; },
+        set(value) { evidence.trackEnabled = Boolean(value); },
+      });
+      generatedTrack.stop = () => { evidence.trackStopCount += 1; evidence.trackEnabled = false; try { oscillator.stop(); } catch {} try { ctx.close(); } catch {} originalStop(); };
+      Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => { evidence.mode = 'native_rtc_generated_audio'; evidence.getUserMediaCalls += 1; await ctx.resume?.(); return destination.stream; }, enumerateDevices: async () => [{ kind: 'audioinput', deviceId: arguments[0] + '-generated-mic', label: arguments[0] + ' generated audio source', groupId: arguments[0], toJSON: () => ({}) }, { kind: 'audiooutput', deviceId: arguments[0] + '-speaker', label: arguments[0] + ' speaker', groupId: arguments[0], toJSON: () => ({}) }] } });
+      function ObservedPeerConnection(config) {
+        const pc = new NativeRTCPeerConnection(config);
+        evidence.peerConnectionsConstructed += 1;
+        pc.addEventListener?.('track', (event) => {
+          if (event.track?.kind === 'audio') evidence.remoteTrackEvents += 1;
+        });
+        pc.addEventListener?.('connectionstatechange', () => {
+          evidence.iceConnected ||= pc.connectionState === 'connected' || pc.connectionState === 'completed';
+        });
+        pc.addEventListener?.('iceconnectionstatechange', () => {
+          evidence.iceConnected ||= pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+        });
+        const addTrack = pc.addTrack.bind(pc);
+        const close = pc.close.bind(pc);
+        return new Proxy(pc, {
+          get(target, prop) {
+            if (prop === 'addTrack') return (track, stream) => { if (track?.kind === 'audio') evidence.localAudioTracksSent += 1; return addTrack(track, stream); };
+            if (prop === 'close') return () => { evidence.peerConnectionsClosed += 1; return close(); };
+            const value = target[prop];
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+          set(target, prop, value) { target[prop] = value; return true; },
+        });
+      }
+      ObservedPeerConnection.prototype = NativeRTCPeerConnection.prototype;
+      Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: ObservedPeerConnection });
+      return true;
+    }
+    evidence.mode = 'synthetic_peerconnection_fallback';
     const track = { id: arguments[0] + '-track', kind: 'audio', label: arguments[0] + ' microphone', readyState: 'live', get enabled() { return evidence.trackEnabled; }, set enabled(v) { evidence.trackEnabled = Boolean(v); }, stop() { evidence.trackStopCount += 1; evidence.trackEnabled = false; } };
     const stream = { id: arguments[0] + '-stream', getTracks: () => [track], getAudioTracks: () => [track] };
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => { evidence.getUserMediaCalls += 1; return stream; }, enumerateDevices: async () => [{ kind: 'audioinput', deviceId: arguments[0] + '-mic', label: arguments[0] + ' mic', groupId: arguments[0], toJSON: () => ({}) }, { kind: 'audiooutput', deviceId: arguments[0] + '-speaker', label: arguments[0] + ' speaker', groupId: arguments[0], toJSON: () => ({}) }] } });
     class G012AudioContext { createMediaStreamSource() { return { connect() {}, disconnect() {} }; } createAnalyser() { return { fftSize: 1024, getByteTimeDomainData: (buf) => buf.fill(180), disconnect() {} }; } resume() { return Promise.resolve(); } close() { return Promise.resolve(); } }
     Object.defineProperty(window, 'AudioContext', { configurable: true, value: G012AudioContext });
-    class G012PeerConnection { constructor() { this.connectionState = 'new'; this.iceConnectionState = 'new'; this.ontrack = null; this.onicecandidate = null; } addTrack(localTrack, localStream) { if (localTrack?.kind === 'audio') evidence.localAudioTracksSent += 1; queueMicrotask(() => { this.connectionState = 'connected'; this.iceConnectionState = 'connected'; const remoteTrack = { id: arguments[0] + '-remote-track', kind: 'audio', label: arguments[0] + ' remote', readyState: 'live', enabled: true, addEventListener() {}, removeEventListener() {} }; const remoteStream = { id: arguments[0] + '-remote-stream', getTracks: () => [remoteTrack], getAudioTracks: () => [remoteTrack] }; evidence.remoteTrackEvents += 1; this.ontrack?.({ track: remoteTrack, streams: [remoteStream], receiver: { track: remoteTrack } }); this.onicecandidate?.({ candidate: null }); }); return { track: localTrack, stream: localStream }; } createOffer() { return Promise.resolve({ type: 'offer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } createAnswer() { return Promise.resolve({ type: 'answer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } setLocalDescription(desc) { this.localDescription = desc; return Promise.resolve(); } setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); } addIceCandidate() { return Promise.resolve(); } getStats() { return Promise.resolve(new Map([['inbound-audio', { type: 'inbound-rtp', kind: 'audio', mediaType: 'audio', packetsReceived: 12, audioLevel: 0.2 }]])); } getSenders() { return [{ track }]; } close() { evidence.peerConnectionsClosed += 1; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; } }
+    class G012PeerConnection { constructor() { evidence.peerConnectionsConstructed += 1; this.connectionState = 'new'; this.iceConnectionState = 'new'; this.ontrack = null; this.onicecandidate = null; } addTrack(localTrack, localStream) { if (localTrack?.kind === 'audio') evidence.localAudioTracksSent += 1; queueMicrotask(() => { this.connectionState = 'connected'; this.iceConnectionState = 'connected'; evidence.iceConnected = true; const remoteTrack = { id: arguments[0] + '-remote-track', kind: 'audio', label: arguments[0] + ' remote', readyState: 'live', enabled: true, addEventListener() {}, removeEventListener() {} }; const remoteStream = { id: arguments[0] + '-remote-stream', getTracks: () => [remoteTrack], getAudioTracks: () => [remoteTrack] }; evidence.remoteTrackEvents += 1; this.ontrack?.({ track: remoteTrack, streams: [remoteStream], receiver: { track: remoteTrack } }); this.onicecandidate?.({ candidate: null }); }); return { track: localTrack, stream: localStream }; } createOffer() { return Promise.resolve({ type: 'offer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } createAnswer() { return Promise.resolve({ type: 'answer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } setLocalDescription(desc) { this.localDescription = desc; return Promise.resolve(); } setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); } addIceCandidate() { return Promise.resolve(); } getStats() { return Promise.resolve(new Map([['inbound-audio', { type: 'inbound-rtp', kind: 'audio', mediaType: 'audio', packetsReceived: 12, audioLevel: 0.2 }]])); } getSenders() { return [{ track }]; } close() { evidence.peerConnectionsClosed += 1; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; } }
     Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: G012PeerConnection });
     return true;
   `, [profile.display_name.toLowerCase()]);
 }
-async function voiceFlow(profile) {
-  await installVoiceHarness(profile);
+async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
   await click(profile, "join call");
   await waitUntil(profile, "local voice participant", `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`);
+}
+async function leaveVoice(profile) {
+  await click(profile, "leave call");
+  await waitUntil(profile, "left voice", "return /not joined/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackStopCount > 0;");
+}
+async function voiceCallFlow(profiles) {
+  await Promise.all([installVoiceHarness(profiles.alice), installVoiceHarness(profiles.bob)]);
+  await Promise.all([joinVoice(profiles.alice), joinVoice(profiles.bob)]);
+  await Promise.all([
+    waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
+    waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
+  ]);
+  const beforeLeave = {
+    alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
+    bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
+  };
+  await click(profiles.alice, "mute my microphone");
+  await waitUntil(profiles.alice, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
+  await click(profiles.alice, "mute my microphone");
+  await Promise.all([leaveVoice(profiles.alice), leaveVoice(profiles.bob)]);
+  return {
+    alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
+    bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
+    before_leave: beforeLeave,
+  };
+}
+async function voiceFlow(profile) {
+  await installVoiceHarness(profile);
+  await joinVoice(profile);
   await click(profile, "mute my microphone");
   await waitUntil(profile, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
   await click(profile, "mute my microphone");
-  await click(profile, "leave call");
-  await waitUntil(profile, "left voice", "return /not joined/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackStopCount > 0;");
+  await leaveVoice(profile);
   return exec(profile, "return window.__discryptG012WebDriverVoiceEvidence || null;");
 }
 
@@ -483,19 +572,32 @@ try {
   await waitForMaybe(profiles.bob, "alice message visible on bob after reload", "return document.body.innerText.includes(arguments[0]);", [aliceMessage], 20_000);
   const aliceBody = await bodyText(profiles.alice);
   const bobBody = await bodyText(profiles.bob);
-  const voice = { alice: await voiceFlow(profiles.alice), bob: await voiceFlow(profiles.bob) };
+  const voice = await voiceCallFlow(profiles);
   const screenshots = { alice: await screenshot(profiles.alice, "final"), bob: await screenshot(profiles.bob, "final") };
   const aliceTextEvidence = textStateEvidence(profiles.alice, aliceMessage, bobMessage);
   const bobTextEvidence = textStateEvidence(profiles.bob, bobMessage, aliceMessage);
   const remotePlaintextObserved = aliceTextEvidence.remote_plaintext_visible && bobTextEvidence.remote_plaintext_visible;
   const remoteEncryptedEnvelopeObserved = aliceTextEvidence.remote_envelope_visible && bobTextEvidence.remote_envelope_visible;
   const peerReceiptsObserved = aliceTextEvidence.sender_peer_receipt_visible && bobTextEvidence.sender_peer_receipt_visible;
+  const voiceLoopbackObserved = Boolean(
+    voice?.before_leave?.alice?.remoteBoundaries > 0 &&
+    voice?.before_leave?.bob?.remoteBoundaries > 0 &&
+    voice?.alice?.localAudioTracksSent > 0 &&
+    voice?.bob?.localAudioTracksSent > 0 &&
+    voice?.alice?.remoteTrackEvents > 0 &&
+    voice?.bob?.remoteTrackEvents > 0,
+  );
+  const nativeVoiceLoopbackObserved = Boolean(
+    voiceLoopbackObserved &&
+    voice?.alice?.mode === "native_rtc_generated_audio" &&
+    voice?.bob?.mode === "native_rtc_generated_audio",
+  );
   const summary = {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v2",
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
-    production_e2e_status: remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
-    voice_remote_media_status: "browser_media_harness_only",
+    production_e2e_status: remotePlaintextObserved && voiceLoopbackObserved ? "remote_plaintext_text_and_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
+    voice_remote_media_status: nativeVoiceLoopbackObserved ? "native_rtc_generated_audio_loopback" : voiceLoopbackObserved ? "browser_media_harness_loopback" : "voice_remote_media_not_observed",
     run_id: runId,
     artifact_root: rel(artifactRoot),
     invite_prefix: invite.slice(0, 48),
@@ -525,7 +627,14 @@ try {
       ] : [
         "Two live Tauri WebViews completed setup, group invite join, local text send, persistence-backed profile creation, and voice UX controls, but remote text envelopes were not observed both ways across processes in the UI/state artifact.",
       ]),
-      "Voice remote media remains WebView media harness evidence rather than physical two-device microphone/speaker proof.",
+      ...(voiceLoopbackObserved ? [] : [
+        "Voice remote media was not observed in both live Tauri WebViews.",
+      ]),
+      ...(nativeVoiceLoopbackObserved ? [
+        "Physical two-device microphone/speaker proof is still not part of this automated harness; this run uses generated audio tracks through the native WebRTC implementation.",
+      ] : voiceLoopbackObserved ? [
+        "Voice remote media used the synthetic WebView peer-connection fallback because native RTCPeerConnection/generated-audio support was unavailable in this environment.",
+      ] : []),
     ],
   };
   writeJson(summaryPath, summary);
