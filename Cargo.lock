@@ -1593,6 +1593,7 @@ dependencies = [
  "nostr-sdk",
  "rand 0.8.6",
  "rumqttc-next",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",

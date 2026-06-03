@@ -3542,6 +3542,16 @@ fn nostr_err(context: &str, err: impl std::fmt::Display) -> TransportError {
 }
 
 #[cfg(feature = "nostr-adapter")]
+fn ensure_rustls_crypto_provider_for_nostr_feature() {
+    // `nostr-sdk` uses rustls-backed websocket clients. In this workspace the
+    // dependency graph can include multiple rustls crypto providers, so install
+    // the provider deterministically before the relay client first touches
+    // rustls. This mirrors the MQTT/WebRTC setup guard and prevents runtime
+    // panics in split-machine Nostr signaling.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+#[cfg(feature = "nostr-adapter")]
 fn nostr_endpoints_for_profile(
     profile: &SignalingAdapterProfile,
 ) -> Result<Vec<String>, TransportError> {
@@ -5125,6 +5135,7 @@ impl SignalingAdapter for NostrProviderAdapter {
         &self,
         profile: SignalingAdapterProfile,
     ) -> Result<Self::Session, TransportError> {
+        ensure_rustls_crypto_provider_for_nostr_feature();
         profile.validate()?;
         if profile.kind != SignalingAdapterKind::Nostr {
             return Err(TransportError::InvalidConnectivityPolicy(format!(
