@@ -100,9 +100,15 @@ type VoiceDeviceAccess = {
   input_device_label: string | null;
   output_device_id: string | null;
   output_device_label: string | null;
+  available_input_devices: VoiceDeviceOption[];
   activity_rms_i16: number | null;
   activity_peak_i16: number | null;
   activity_captured_at_ms: number | null;
+};
+
+type VoiceDeviceOption = {
+  device_id: string;
+  label: string;
 };
 
 type VoiceActivitySample = Pick<
@@ -350,10 +356,45 @@ function emptyVoiceDeviceAccess(
     input_device_label: null,
     output_device_id: null,
     output_device_label: null,
+    available_input_devices: [],
     activity_rms_i16: null,
     activity_peak_i16: null,
     activity_captured_at_ms: null,
   };
+}
+
+function voiceInputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
+  const inputs = devices.filter((device) => device.kind === "audioinput");
+  const seen = new Set<string>();
+  return inputs
+    .map((device, index) => ({
+      device_id: device.deviceId || `audio-input-${index + 1}`,
+      label: device.label || `Microphone ${index + 1}`,
+    }))
+    .filter((device) => {
+      if (seen.has(device.device_id)) return false;
+      seen.add(device.device_id);
+      return true;
+    });
+}
+
+async function enumerateVoiceInputDevices(
+  requestPermission = false,
+): Promise<VoiceDeviceOption[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  let stream: MediaStream | null = null;
+  try {
+    if (requestPermission && navigator.mediaDevices.getUserMedia) {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return voiceInputDeviceOptions(devices);
+  } finally {
+    stopMediaStream(stream);
+  }
 }
 
 async function measureLocalVoiceActivity(
@@ -465,7 +506,9 @@ function startLocalVoiceActivityCapture(
   };
 }
 
-async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
+async function requestVoiceDeviceAccess(
+  selectedInputDeviceId?: string,
+): Promise<VoiceDeviceAccess> {
   if (!navigator.mediaDevices?.getUserMedia) {
     if (window.__TAURI__?.core?.invoke) {
       return {
@@ -475,6 +518,12 @@ async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
         input_device_label: "Native Rust capture source",
         output_device_id: "native-rust-default-playback",
         output_device_label: "Native Rust playback sink",
+        available_input_devices: [
+          {
+            device_id: "native-rust-default-capture",
+            label: "Native Rust capture source",
+          },
+        ],
         activity_rms_i16: null,
         activity_peak_i16: null,
         activity_captured_at_ms: null,
@@ -485,12 +534,25 @@ async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
 
   let stream: MediaStream | null = null;
   try {
+    const requestedDevice =
+      selectedInputDeviceId && selectedInputDeviceId !== "default"
+        ? selectedInputDeviceId
+        : null;
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
+      audio: requestedDevice
+        ? { deviceId: { exact: requestedDevice } }
+        : true,
       video: false,
     });
     const devices = await navigator.mediaDevices.enumerateDevices();
+    const availableInputs = voiceInputDeviceOptions(devices);
     const input =
+      (requestedDevice
+        ? devices.find(
+            (device) =>
+              device.kind === "audioinput" && device.deviceId === requestedDevice,
+          )
+        : null) ??
       devices.find(
         (device) => device.kind === "audioinput" && device.deviceId,
       ) ?? devices.find((device) => device.kind === "audioinput");
@@ -510,6 +572,7 @@ async function requestVoiceDeviceAccess(): Promise<VoiceDeviceAccess> {
       input_device_label: input?.label || "Default microphone",
       output_device_id: output?.deviceId || "default",
       output_device_label: output?.label || "Default speaker",
+      available_input_devices: availableInputs,
       ...activity,
     };
   } catch {
@@ -665,6 +728,13 @@ function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [messageTransportProof, setMessageTransportProof] = useState(false);
   const [localVoiceSpeaking, setLocalVoiceSpeaking] = useState(false);
+  const [voiceInputDevices, setVoiceInputDevices] = useState<VoiceDeviceOption[]>(
+    [],
+  );
+  const [selectedVoiceInputId, setSelectedVoiceInputId] = useState("default");
+  const [voiceDeviceStatus, setVoiceDeviceStatus] = useState<string | null>(
+    null,
+  );
   const [voiceRemoteStreams, setVoiceRemoteStreams] = useState<
     Record<string, MediaStream>
   >({});
@@ -723,6 +793,19 @@ function App() {
   }, []);
 
   useEffect(() => () => stopLocalVoiceCapture(), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void enumerateVoiceInputDevices(false)
+      .then((devices) => {
+        if (cancelled || devices.length === 0) return;
+        setVoiceInputDevices(devices);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!commandState?.voice_session?.joined) {
@@ -901,9 +984,40 @@ function App() {
     );
   }
 
-  async function ensureTextRuntimeForActiveScope(stateForScope: AppState) {
+  async function refreshVoiceInputDevices(requestPermission = true) {
+    try {
+      setVoiceDeviceStatus(
+        requestPermission
+          ? "Requesting microphone access and refreshing devices…"
+          : "Refreshing microphone devices…",
+      );
+      const devices = await enumerateVoiceInputDevices(requestPermission);
+      setVoiceInputDevices(devices);
+      setVoiceDeviceStatus(
+        devices.length > 0
+          ? `Found ${devices.length} microphone${devices.length === 1 ? "" : "s"}.`
+          : "No microphone devices were reported by the Linux audio stack.",
+      );
+      if (
+        selectedVoiceInputId !== "default" &&
+        !devices.some((device) => device.device_id === selectedVoiceInputId)
+      ) {
+        setSelectedVoiceInputId("default");
+      }
+    } catch (error) {
+      setVoiceDeviceStatus(
+        error instanceof Error
+          ? `Microphone refresh failed: ${error.message}`
+          : "Microphone refresh failed.",
+      );
+    }
+  }
+
+  async function ensureTextRuntimeForActiveScope(
+    stateForScope: AppState,
+  ): Promise<AppState | null> {
     // Backend-derived runtime peers come from invite/connectivity state, not user-entered pairing fields.
-    if (!window.__TAURI__?.core?.invoke) return;
+    if (!window.__TAURI__?.core?.invoke) return stateForScope;
     const scopeLabel = activeScopeLabelForState(stateForScope);
     const started = await startTextSession({
       scope_label: scopeLabel,
@@ -918,15 +1032,16 @@ function App() {
           ? `${started.last_command_error.message} — ${action}`
           : started.last_command_error.message,
       );
-      return;
+      return started;
     }
     const attached = await attachTextRuntime(started);
-    if (attached?.last_command_error) return;
+    if (attached?.last_command_error) return attached;
     await pumpTextControlTransportOnce({
       target: null,
       limit: 8,
       operation_timeout_ms: 5_000,
     });
+    return attached ?? started;
   }
 
   if (loadError) {
@@ -1361,7 +1476,18 @@ function App() {
         return;
       }
       stopLocalVoiceCapture();
-      const voiceAccess = await requestVoiceDeviceAccess();
+      const voiceAccess = await requestVoiceDeviceAccess(selectedVoiceInputId);
+      if (voiceAccess.available_input_devices.length > 0) {
+        setVoiceInputDevices(voiceAccess.available_input_devices);
+        const selectedStillAvailable =
+          selectedVoiceInputId === "default" ||
+          voiceAccess.available_input_devices.some(
+            (device) => device.device_id === selectedVoiceInputId,
+          );
+        if (!selectedStillAvailable) {
+          setSelectedVoiceInputId("default");
+        }
+      }
       const joinedState = await joinVoice({
         group_id: activeGroup.group_id,
         channel_id: voiceChannel.channel_id,
@@ -1430,10 +1556,13 @@ function App() {
         }
         let mediaState = joinedState;
         if (window.__TAURI__?.core?.invoke) {
-          await ensureTextRuntimeForActiveScope(joinedState);
-          mediaState = commandState ?? joinedState;
+          mediaState =
+            (await ensureTextRuntimeForActiveScope(joinedState)) ?? joinedState;
         }
-        const voiceSession = mediaState.voice_session ?? joinedState.voice_session;
+        const voiceSession =
+          mediaState.voice_session?.joined
+            ? mediaState.voice_session
+            : joinedState.voice_session;
         const voicePeers = textRuntimePeerDefaults(mediaState);
         if (voiceSession) {
           const forceNativeRustVoice = Boolean(
@@ -1788,6 +1917,11 @@ function App() {
               connectivity={voiceConnectivityForState(appState)}
               transportDiagnostics={appState.transport_diagnostics}
               diagnosticsEnabled={diagnosticsUiEnabled}
+              inputDevices={voiceInputDevices}
+              selectedInputDeviceId={selectedVoiceInputId}
+              voiceDeviceStatus={voiceDeviceStatus}
+              onSelectInputDevice={setSelectedVoiceInputId}
+              onRefreshInputDevices={() => void refreshVoiceInputDevices(true)}
               setVoiceJoined={toggleVoiceJoin}
               setSelfMuted={toggleSelfMute}
               setVolume={setVolume}
@@ -3880,6 +4014,11 @@ function VoicePanel({
   connectivity,
   transportDiagnostics,
   diagnosticsEnabled,
+  inputDevices,
+  selectedInputDeviceId,
+  voiceDeviceStatus,
+  onSelectInputDevice,
+  onRefreshInputDevices,
   setVoiceJoined,
   setSelfMuted,
   setVolume,
@@ -3898,6 +4037,11 @@ function VoicePanel({
   connectivity: ConnectivityPolicyView | null;
   transportDiagnostics: TransportDiagnosticsView | null;
   diagnosticsEnabled: boolean;
+  inputDevices: VoiceDeviceOption[];
+  selectedInputDeviceId: string;
+  voiceDeviceStatus: string | null;
+  onSelectInputDevice: (deviceId: string) => void;
+  onRefreshInputDevices: () => void;
   setVoiceJoined: (joined: boolean) => void;
   setSelfMuted: (muted: boolean) => void;
   setVolume: (id: string, value: number[]) => void;
@@ -4112,6 +4256,36 @@ function VoicePanel({
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-5">
+          <div className="grid gap-2">
+            <Label htmlFor="voice-input-device">Microphone</Label>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <Select
+                id="voice-input-device"
+                value={selectedInputDeviceId}
+                disabled={voiceJoined || !group}
+                onValueChange={onSelectInputDevice}
+              >
+                <SelectItem value="default">System default microphone</SelectItem>
+                {inputDevices.map((device) => (
+                  <SelectItem key={device.device_id} value={device.device_id}>
+                    {device.label}
+                  </SelectItem>
+                ))}
+              </Select>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={voiceJoined || !group}
+                onClick={onRefreshInputDevices}
+              >
+                Refresh
+              </Button>
+            </div>
+            <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              {voiceDeviceStatus ??
+                "Choose a microphone before joining. Refresh may ask Linux/WebKitGTK for microphone access so device names can be listed."}
+            </p>
+          </div>
           <ControlRow
             label="Mute my microphone"
             checked={selfMuted}

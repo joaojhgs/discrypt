@@ -100,7 +100,9 @@ use uuid::Uuid;
         target_os = "netbsd"
     )
 ))]
-use webkit2gtk::{SettingsExt, WebViewExt};
+use webkit2gtk::{
+    glib::ObjectExt, PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt,
+};
 
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
 const APP_STATE_STORE_FILENAME: &str = "app-state.discrypt-store";
@@ -5963,6 +5965,13 @@ fn enable_platform_webview_voice_features(
                 settings.set_enable_mock_capture_devices(true);
             }
         }
+        webview.connect_permission_request(|_, request| {
+            if request.is::<UserMediaPermissionRequest>() {
+                request.allow();
+                return true;
+            }
+            false
+        });
     })?;
     Ok(())
 }
