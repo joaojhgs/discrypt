@@ -259,6 +259,17 @@ async function readLatestInvite(page: Page) {
   return matches.at(-1) ?? "";
 }
 
+async function closeInviteSheetIfOpen(page: Page) {
+  const closeButton = page.getByRole("button", { name: "Close Invite sheet" });
+  if ((await closeButton.count()) === 0) {
+    return;
+  }
+  await closeButton.click();
+  await expect(page.getByRole("dialog", { name: "Invite sheet" })).toHaveCount(
+    0,
+  );
+}
+
 async function createInvite(page: Page) {
   await page.getByRole("button", { name: "Create group" }).first().click();
   await page.getByLabel("Group name").fill("G007 Voice Media Lab");
@@ -267,13 +278,17 @@ async function createInvite(page: Page) {
     .last()
     .click();
   await page.getByRole("button", { name: "Create invite" }).click();
-  return readLatestInvite(page);
+  const invite = await readLatestInvite(page);
+  await closeInviteSheetIfOpen(page);
+  return invite;
 }
 
 async function joinInvite(page: Page, invite: string) {
   await page.getByRole("button", { name: "Join group" }).click();
   await page.getByLabel("Invite URL or code").fill(invite);
-  await page.getByLabel("Joined group/contact label").fill("G007 Voice Media Lab");
+  await page
+    .getByLabel("Joined group/contact label")
+    .fill("G007 Voice Media Lab");
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByText(/G007 Voice Media Lab/i).first()).toBeVisible();
 }
@@ -287,7 +302,7 @@ async function joinVoice(page: Page) {
 test("two profiles attach local microphone tracks and surface remote audio playback", async ({
   browser,
 }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(180_000);
   const alice = await openProfile(browser, "Alice", "Alice Desktop");
   const bob = await openProfile(browser, "Bob", "Bob Laptop");
   try {
@@ -298,21 +313,48 @@ test("two profiles attach local microphone tracks and surface remote audio playb
     await joinVoice(bob.page);
 
     for (const page of [alice.page, bob.page]) {
-      await expect.poll(async () => (await readEvidence(page)).getUserMediaCalls).toBeGreaterThan(0);
-      await expect.poll(async () => (await readEvidence(page)).localAudioTracksSent).toBeGreaterThan(0);
-      await expect.poll(async () => (await readEvidence(page)).remoteTrackEvents).toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await readEvidence(page)).getUserMediaCalls)
+        .toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await readEvidence(page)).localAudioTracksSent)
+        .toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await readEvidence(page)).remoteTrackEvents)
+        .toBeGreaterThan(0);
+      await expect(page.getByTestId("voice-dock")).toBeVisible();
+      await expect(page.getByTestId("voice-mic-selector")).toBeDisabled();
       await expect(page.getByTestId("voice-remote-participant")).toHaveCount(1);
-      await expect(page.getByTestId("voice-remote-audio").first()).toHaveCount(1);
-      await expect.poll(async () => (await readEvidence(page)).playbackAttachments).toBeGreaterThan(0);
+      await expect(page.getByTestId("voice-remote-audio").first()).toHaveCount(
+        1,
+      );
+      await expect
+        .poll(async () => (await readEvidence(page)).playbackAttachments)
+        .toBeGreaterThan(0);
+
+      const remoteVolume = page.getByRole("slider", {
+        name: /speaker volume/i,
+      });
+      await expect(remoteVolume).toBeVisible();
+      await remoteVolume.fill("37");
+      await expect(remoteVolume).toHaveValue("37");
 
       await page.getByRole("switch", { name: /mute my microphone/i }).click();
-      await expect.poll(async () => (await readEvidence(page)).trackEnabled).toBe(false);
+      await expect
+        .poll(async () => (await readEvidence(page)).trackEnabled)
+        .toBe(false);
       await page.getByRole("switch", { name: /mute my microphone/i }).click();
-      await expect.poll(async () => (await readEvidence(page)).trackEnabled).toBe(true);
+      await expect
+        .poll(async () => (await readEvidence(page)).trackEnabled)
+        .toBe(true);
 
       await page.getByRole("button", { name: /leave call/i }).click();
-      await expect.poll(async () => (await readEvidence(page)).trackStopCount).toBeGreaterThan(0);
-      await expect.poll(async () => (await readEvidence(page)).peerConnectionsClosed).toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await readEvidence(page)).trackStopCount)
+        .toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await readEvidence(page)).peerConnectionsClosed)
+        .toBeGreaterThan(0);
     }
 
     expect(alice.errors).toEqual([]);

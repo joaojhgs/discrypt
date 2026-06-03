@@ -1,11 +1,20 @@
 export type ThemeId = "midnight-steel" | "graphite-calm" | "ocean-contrast";
 export type TemplateId = "command-center" | "compact-ops";
+export type CssVariableMap = Record<`--${string}`, string>;
+
+export type ShadcnComponentInventoryItem = {
+  name: string;
+  path: `src/components/ui/${string}.tsx`;
+  exports: readonly string[];
+  role: string;
+};
+
 
 export type ThemeDefinition = {
   id: ThemeId;
   label: string;
   description: string;
-  cssVars: Record<string, string>;
+  cssVars: CssVariableMap;
 };
 
 export type TemplateDefinition = {
@@ -14,7 +23,124 @@ export type TemplateDefinition = {
   density: "comfortable" | "compact";
   radius: "soft" | "crisp";
   showRightRail: boolean;
+  cssVars: CssVariableMap;
 };
+
+export const shadcnComponentInventory = [
+  {
+    name: "Avatar",
+    path: "src/components/ui/avatar.tsx",
+    exports: ["Avatar", "AvatarImage", "AvatarFallback"],
+    role: "identity and participant presence marks",
+  },
+  {
+    name: "Badge",
+    path: "src/components/ui/badge.tsx",
+    exports: ["Badge", "badgeVariants"],
+    role: "status, runtime, and safety evidence labels",
+  },
+  {
+    name: "Button",
+    path: "src/components/ui/button.tsx",
+    exports: ["Button", "buttonVariants"],
+    role: "command-backed actions and shell navigation controls",
+  },
+  {
+    name: "Card",
+    path: "src/components/ui/card.tsx",
+    exports: [
+      "Card",
+      "CardHeader",
+      "CardFooter",
+      "CardTitle",
+      "CardDescription",
+      "CardContent",
+    ],
+    role: "content panels, setup sections, and inspector surfaces",
+  },
+  {
+    name: "Dialog",
+    path: "src/components/ui/dialog.tsx",
+    exports: [
+      "Dialog",
+      "DialogPortal",
+      "DialogOverlay",
+      "DialogTrigger",
+      "DialogClose",
+      "DialogContent",
+      "DialogHeader",
+      "DialogFooter",
+      "DialogTitle",
+      "DialogDescription",
+    ],
+    role: "modal-compatible primitives retained for flows that need focusable overlays",
+  },
+  {
+    name: "Input",
+    path: "src/components/ui/input.tsx",
+    exports: ["Input"],
+    role: "profile, invite, message, recovery, and connectivity form fields",
+  },
+  {
+    name: "Label",
+    path: "src/components/ui/label.tsx",
+    exports: ["Label"],
+    role: "accessible form labels for command inputs",
+  },
+  {
+    name: "ScrollArea",
+    path: "src/components/ui/scroll-area.tsx",
+    exports: ["ScrollArea", "ScrollBar"],
+    role: "channel, message, activity, and diagnostics scrolling regions",
+  },
+  {
+    name: "Select",
+    path: "src/components/ui/select.tsx",
+    exports: [
+      "Select",
+      "SelectGroup",
+      "SelectValue",
+      "SelectTrigger",
+      "SelectContent",
+      "SelectLabel",
+      "SelectItem",
+      "SelectSeparator",
+      "SelectScrollUpButton",
+      "SelectScrollDownButton",
+    ],
+    role: "theme/template and policy selection controls",
+  },
+  {
+    name: "Separator",
+    path: "src/components/ui/separator.tsx",
+    exports: ["Separator"],
+    role: "sidebar and panel boundary rules",
+  },
+  {
+    name: "Slider",
+    path: "src/components/ui/slider.tsx",
+    exports: ["Slider"],
+    role: "voice activity and speaker controls",
+  },
+  {
+    name: "Switch",
+    path: "src/components/ui/switch.tsx",
+    exports: ["Switch"],
+    role: "boolean privacy, mute, and transport toggles",
+  },
+  {
+    name: "Tabs",
+    path: "src/components/ui/tabs.tsx",
+    exports: ["Tabs", "TabsList", "TabsTrigger", "TabsContent"],
+    role: "tab-compatible workspace grouping primitive",
+  },
+  {
+    name: "Tooltip",
+    path: "src/components/ui/tooltip.tsx",
+    exports: ["Tooltip", "TooltipTrigger", "TooltipContent", "TooltipProvider"],
+    role: "screen-reader-safe explanatory hints",
+  },
+] as const satisfies readonly ShadcnComponentInventoryItem[];
 
 export const discryptUiConfig = {
   activeTheme: "graphite-calm" as ThemeId,
@@ -111,6 +237,12 @@ export const discryptUiConfig = {
       density: "comfortable",
       radius: "soft",
       showRightRail: true,
+      cssVars: {
+        "--template-shell-grid": "72px 300px minmax(0,1fr)",
+        "--template-shell-grid-inspector": "72px 300px minmax(0,1fr) 280px",
+        "--template-font-size": "16px",
+        "--template-panel-radius": "1rem",
+      },
     },
     {
       id: "compact-ops",
@@ -118,8 +250,15 @@ export const discryptUiConfig = {
       density: "compact",
       radius: "crisp",
       showRightRail: true,
+      cssVars: {
+        "--template-shell-grid": "64px 272px minmax(0,1fr)",
+        "--template-shell-grid-inspector": "64px 272px minmax(0,1fr) 260px",
+        "--template-font-size": "14px",
+        "--template-panel-radius": "0.9rem",
+      },
     },
   ] satisfies TemplateDefinition[],
+  shadcnComponentInventory,
 };
 
 export const setupChecklist = [

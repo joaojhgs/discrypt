@@ -295,6 +295,24 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "start_native_voice_media_session",
+    exportName: "startNativeVoiceMediaSession",
+    args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
+    returns: "StartNativeVoiceMediaSessionResponse",
+  },
+  {
+    command: "accept_native_voice_media_frame",
+    exportName: "acceptNativeVoiceMediaFrame",
+    args: ["session_id", "native_media", "attached_at_ms"],
+    returns: "AppState",
+  },
+  {
+    command: "accept_native_voice_media_signal",
+    exportName: "acceptNativeVoiceMediaSignal",
+    args: ["signal", "attached_at_ms"],
+    returns: "AppState",
+  },
+  {
     command: "poll_app_events",
     exportName: "pollAppEvents",
     args: ["after", "kinds", "limit"],
@@ -485,6 +503,15 @@ const requestTypes = [
   ["LeaveVoiceRequest", ["session_id"]],
   ["SelfMuteRequest", ["session_id", "muted"]],
   ["SpeakerVolumeRequest", ["session_id", "participant_id", "volume"]],
+  [
+    "StartNativeVoiceMediaSessionRequest",
+    ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
+  ],
+  [
+    "AcceptNativeVoiceMediaFrameRequest",
+    ["session_id", "native_media", "attached_at_ms"],
+  ],
+  ["AcceptNativeVoiceMediaSignalRequest", ["signal", "attached_at_ms"]],
 ];
 for (const [typeName, fields] of requestTypes) {
   const match = commands.match(
