@@ -91,6 +91,8 @@ async function bootReadyShell(page) {
   await expect(
     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
   ).toBeVisible();
+  await page.getByLabel("Display name").first().fill("E2E User");
+  await page.getByLabel("Device name").first().fill("E2E Device");
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
     page.getByRole("heading", { name: /finish the local trust setup/i }),
@@ -108,7 +110,7 @@ test("first run creates user and empty shell does not blank", async ({
 }) => {
   await page.getByRole("button", { name: "New message" }).click();
   await expect(
-    page.getByRole("heading", { name: /direct messages/i }),
+    page.getByRole("heading", { name: /New contact/i }).first(),
   ).toBeVisible();
   await expect(
     page.getByText(/Local DM seeded from a generated friend-code\/QR payload/i).first(),
@@ -153,16 +155,14 @@ test("direct message send stays command-backed", async ({ page }) => {
   });
 
   await page.getByRole("button", { name: "New message" }).click();
-  await expect(page.getByLabel("Contact name")).toBeVisible();
-  await page.getByRole("button", { name: /start\/open dm/i }).click();
+  await expect(
+    page.getByRole("heading", { name: /New contact/i }).first(),
+  ).toBeVisible();
   await page
     .getByRole("textbox", { name: "Message" })
     .fill("DM ping from the local harness");
   await page.getByRole("button", { name: /send dm message/i }).click();
   await expect(page.getByText(/DM ping from the local harness/i)).toBeVisible();
-  await expect(
-    page.getByText(/remote delivery\/read receipts not claimed/i).first(),
-  ).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -193,7 +193,7 @@ test("group invite join text channel and voice controls work without fake member
     .last()
     .click();
   await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
-  await expect(page.getByText("2 STUN / 1 TURN endpoint(s)")).toBeVisible();
+  await expect(page.getByText("2 STUN / 1 TURN endpoint(s)")).toHaveCount(0);
   await expect(
     page.getByText("TURN credential gate", { exact: true }),
   ).toHaveCount(0);
@@ -202,7 +202,7 @@ test("group invite join text channel and voice controls work without fake member
   await page
     .getByRole("button", { name: /create invite for active group/i })
     .click();
-  const inviteSheet = page.getByRole("dialog", { name: "Invite sheet" });
+  const inviteSheet = page.getByRole("dialog", { name: "Invites" });
   await expect(inviteSheet.getByText(/discrypt:\/\/join\/v1/i).first()).toBeVisible();
   await expect(
     inviteSheet.getByText("Signaling endpoint", { exact: true }),
@@ -233,6 +233,7 @@ test("group invite join text channel and voice controls work without fake member
   await inviteSheet.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
 
+  await page.getByRole("button", { name: /create channel/i }).click();
   await page.getByLabel("Channel name").fill("ops-room");
   await page.getByRole("button", { name: "Text" }).last().click();
   await expect(page.getByText("#ops-room").first()).toBeVisible();
@@ -272,9 +273,7 @@ test("group invite join text channel and voice controls work without fake member
   ).toBeVisible();
   await expect(page.getByText(/You · you/)).toBeVisible();
   await expect(page.getByText(/speaking now/).first()).toBeVisible();
-  await expect(
-    page.getByText(/Waiting for a verified media route/i),
-  ).toBeVisible();
+  await expect(page.getByText(/Call status/i)).toBeVisible();
   // Coverage token: Local microphone level comes from the active MediaStream analyser.
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
     0,
@@ -307,7 +306,7 @@ test("small-window navigation exposes setup groups invites text and voice withou
   await expect(page.getByRole("button", { name: "Join group" })).toBeVisible();
   await page.getByRole("button", { name: "Create group" }).click();
   await expect(page.getByLabel("Group name")).toBeVisible();
-  await page.getByRole("button", { name: /Close Create group dialog/i }).click();
+  await page.getByRole("button", { name: /Close Create group/i }).click();
   await page.getByRole("button", { name: "Join group" }).click();
   await expect(
     page.getByRole("button", { name: /join\/open group/i }),
@@ -394,28 +393,20 @@ test("production UX hides diagnostics and manual transport controls by default",
   await page
     .getByRole("button", { name: /create invite for active group/i })
     .click();
-  const inviteSheet = page.getByRole("dialog", { name: "Invite sheet" });
+  const inviteSheet = page.getByRole("dialog", { name: "Invites" });
   await expect(inviteSheet.getByText(/discrypt:\/\/join\/v1/i).first()).toBeVisible();
   await expect(inviteSheet.getByText(/Rendezvous link/i)).toBeVisible();
-  await page.getByRole("button", { name: /Close Invite sheet/i }).click();
+  await page.getByRole("button", { name: /Close Invites/i }).click();
 
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await page.getByRole("button", { name: /join call/i }).click();
-  await expect(
-    page.getByText(/Waiting for a verified media route/i),
-  ).toBeVisible();
+  await expect(page.getByText(/Call status/i)).toBeVisible();
   await expect(
     page.getByText("TURN relay gate", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText(/TURN-required state: not-proven/i),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(
     page.getByText("Provider fallback state", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByText(/retry\/backoff remains unclaimed in this UI state/i),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
     0,
   );

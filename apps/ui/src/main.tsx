@@ -858,8 +858,8 @@ function App() {
   const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
   const [workflow, setWorkflow] = useState<Workflow>("setup");
   const [draftChannel, setDraftChannel] = useState("general");
-  const [draftMessage, setDraftMessage] = useState("Hello from discrypt");
-  const [draftGroup, setDraftGroup] = useState("private lab");
+  const [draftMessage, setDraftMessage] = useState("");
+  const [draftGroup, setDraftGroup] = useState("");
   const [draftSignalingAdapter, setDraftSignalingAdapter] =
     useState<SignalingAdapterKind>("mqtt");
   const [draftSignalingEndpoint, setDraftSignalingEndpoint] = useState(
@@ -869,16 +869,18 @@ function App() {
     "stun:stun.l.google.com:19302",
   );
   const [draftIceTurnServers, setDraftIceTurnServers] = useState("");
-  const [draftInvite, setDraftInvite] = useState("invite:joined-enclave");
-  const [draftJoinName, setDraftJoinName] = useState("joined enclave");
-  const [draftDisplayName, setDraftDisplayName] = useState("Alice");
-  const [draftDeviceName, setDraftDeviceName] = useState("Desktop");
-  const [draftRecoveryCode, setDraftRecoveryCode] =
-    useState("paper-coral-falcon");
-  const [draftDmName, setDraftDmName] = useState("New contact");
+  const [draftInvite, setDraftInvite] = useState("");
+  const [draftJoinName, setDraftJoinName] = useState("");
+  const [draftDisplayName, setDraftDisplayName] = useState("");
+  const [draftDeviceName, setDraftDeviceName] = useState("");
+  const [draftRecoveryCode, setDraftRecoveryCode] = useState("");
+  const [draftDmName, setDraftDmName] = useState("");
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeOverlay, setActiveOverlay] = useState<OverlayKind | null>(null);
+  const [lastTextChannelId, setLastTextChannelId] = useState<string | null>(
+    null,
+  );
   const [messageTransportProof, setMessageTransportProof] = useState(false);
   const [localVoiceSpeaking, setLocalVoiceSpeaking] = useState(false);
   const [voiceInputDevices, setVoiceInputDevices] = useState<
@@ -1217,7 +1219,11 @@ function App() {
   const appState = commandState;
   const currentSnapshot = appState.snapshot;
   const activeGroup = getActiveGroup(appState);
-  const activeTextChannel = getActiveTextChannel(appState, activeGroup);
+  const activeTextChannel = getActiveTextChannel(
+    appState,
+    activeGroup,
+    workflow === "voice" ? lastTextChannelId : null,
+  );
   const activeVoiceChannel = getActiveVoiceChannel(appState, activeGroup);
   const textChannels =
     activeGroup?.channels.filter((channel) => channel.kind === "Text") ?? [];
@@ -1436,6 +1442,7 @@ function App() {
   function focusCommandChannel(channelId: string, kind: ChannelKind) {
     if (!activeGroup) return;
     const targetWorkflow = kind === "Voice" ? "voice" : "channel";
+    if (kind === "Text") setLastTextChannelId(channelId);
     void applyCommand(
       setActiveChannel({
         group_id: activeGroup.group_id,
@@ -1475,7 +1482,12 @@ function App() {
         retention_status:
           kind === "Voice" ? "session" : currentSnapshot.retention.selected,
       }),
-      () => {
+      (nextState) => {
+        if (kind === "Text") {
+          const nextGroup = getActiveGroup(nextState);
+          const nextText = getActiveTextChannel(nextState, nextGroup, null);
+          setLastTextChannelId(nextText?.channel_id ?? null);
+        }
         setWorkflow(kind === "Voice" ? "voice" : "channel");
         setActiveOverlay(null);
       },
@@ -1898,9 +1910,9 @@ function App() {
         activeChannelId={activeTextChannel?.channel_id ?? null}
         activeVoiceChannelId={activeVoiceChannel?.channel_id ?? null}
         selectedWorkflow={workflow}
-        onSelectWorkflow={setWorkflow}
         onOpenCreateGroup={() => setActiveOverlay("create-group")}
         onOpenJoin={() => setActiveOverlay("invite")}
+        onOpenCreateChannel={() => setActiveOverlay("create-channel")}
         onSelectTextChannel={(channelId) =>
           focusCommandChannel(channelId, "Text")
         }
@@ -1911,8 +1923,6 @@ function App() {
         onOpenNewDm={() => setWorkflow("dm")}
         voiceJoined={voiceJoined}
         participants={participants}
-        setupSteps={setupSteps}
-        completedSteps={completedSteps}
       />
       <section
         aria-label="Main chat pane"
@@ -1943,7 +1953,7 @@ function App() {
             role="alert"
             className="mx-4 mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 md:mx-6"
           >
-            Command note: {commandError}
+            Action failed: {commandError}
           </p>
         ) : null}
         {appState.invites.at(-1) ? (
@@ -1955,17 +1965,16 @@ function App() {
           </p>
         ) : null}
         <ScrollArea className="min-h-0 flex-1 px-4 pb-28 md:px-6 md:pb-6">
-          {workflow === "setup" ? (
-            <SetupPanel
-              snapshot={currentSnapshot}
-              setupSteps={setupSteps}
-              completedSteps={completedSteps}
-              verifyMessage={verifyMessage}
-              onVerify={confirmSafetyNumber}
-            />
-          ) : null}
-          {workflow === "dm" ? (
-            <>
+          <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-4 py-5">
+            {workflow === "setup" ? (
+              <SetupPanel
+                snapshot={currentSnapshot}
+                setupSteps={setupSteps}
+                completedSteps={completedSteps}
+                verifyMessage={verifyMessage}
+                onVerify={confirmSafetyNumber}
+              />
+            ) : workflow === "dm" ? (
               <DmPanel
                 activeDm={activeDm}
                 messages={appState.messages}
@@ -1980,159 +1989,53 @@ function App() {
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
               />
-              <ConnectivitySettingsPanel
-                policy={activeConnectivity}
-                signalingAdapter={draftSignalingAdapter}
-                setSignalingAdapter={(value) =>
-                  setDraftSignalingAdapter(value as SignalingAdapterKind)
-                }
-                signalingEndpoint={draftSignalingEndpoint}
-                setSignalingEndpoint={setDraftSignalingEndpoint}
-                iceStunServers={draftIceStunServers}
-                setIceStunServers={setDraftIceStunServers}
-                iceTurnServers={draftIceTurnServers}
-                setIceTurnServers={setDraftIceTurnServers}
-                onSaveAppDefaults={() => saveConnectivityPolicy("app")}
-                onSaveGroup={null}
-                onSaveChannel={null}
-                onSaveDm={activeDm ? () => saveConnectivityPolicy("dm") : null}
-                showAdvancedStatus={diagnosticsUiEnabled}
-              />
-            </>
-          ) : null}
-          {workflow === "join" ? (
-            <JoinPanel
-              snapshot={currentSnapshot}
-              inviteValue={draftInvite}
-              setInviteValue={setDraftInvite}
-              groupName={draftJoinName}
-              setGroupName={setDraftJoinName}
-              latestInvite={appState.invites.at(-1) ?? null}
-              joinProgress={appState.join_progress}
-              onJoin={joinCommandGroup}
-              onAcceptDmInvite={acceptCommandDmInvite}
-              onCreateInvite={createCommandInvite}
-              onCreateDmInvite={createCommandDmInvite}
-              canCreateInvite={Boolean(activeGroup)}
-              canCreateDmInvite={Boolean(activeDm)}
-            />
-          ) : null}
-          {workflow === "create-group" ? (
-            <>
-              <CreateGroupPanel
-                snapshot={currentSnapshot}
-                groupName={draftGroup}
-                setGroupName={setDraftGroup}
-                signalingAdapter={draftSignalingAdapter}
-                setSignalingAdapter={(value) =>
-                  setDraftSignalingAdapter(value as SignalingAdapterKind)
-                }
-                signalingEndpoint={draftSignalingEndpoint}
-                setSignalingEndpoint={setDraftSignalingEndpoint}
-                iceStunServers={draftIceStunServers}
-                setIceStunServers={setDraftIceStunServers}
-                iceTurnServers={draftIceTurnServers}
-                setIceTurnServers={setDraftIceTurnServers}
-                onCreate={createCommandGroup}
-              />
-              <ConnectivitySettingsPanel
-                policy={appState.connectivity_defaults}
-                signalingAdapter={draftSignalingAdapter}
-                setSignalingAdapter={(value) =>
-                  setDraftSignalingAdapter(value as SignalingAdapterKind)
-                }
-                signalingEndpoint={draftSignalingEndpoint}
-                setSignalingEndpoint={setDraftSignalingEndpoint}
-                iceStunServers={draftIceStunServers}
-                setIceStunServers={setDraftIceStunServers}
-                iceTurnServers={draftIceTurnServers}
-                setIceTurnServers={setDraftIceTurnServers}
-                onSaveAppDefaults={() => saveConnectivityPolicy("app")}
-                onSaveGroup={null}
-                onSaveChannel={null}
-                onSaveDm={null}
-                showAdvancedStatus={diagnosticsUiEnabled}
-              />
-            </>
-          ) : null}
-          {workflow === "channel" ? (
-            <>
+            ) : (
               <ChannelPanel
-                snapshot={currentSnapshot}
                 group={activeGroup}
                 activeChannel={activeTextChannel}
-                channels={textChannels}
                 messages={appState.messages}
                 textStateLegend={appState.text_state_legend}
-                draftChannel={draftChannel}
-                setDraftChannel={setDraftChannel}
                 draftMessage={draftMessage}
                 setDraftMessage={setDraftMessage}
-                onCreateTextChannel={() => createCommandChannel("Text")}
-                onCreateVoiceChannel={() => createCommandChannel("Voice")}
                 onOpenCreateChannel={() => setActiveOverlay("create-channel")}
                 onSendMessage={sendCommandMessage}
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
               />
-              <ConnectivitySettingsPanel
-                policy={activeConnectivity}
-                signalingAdapter={draftSignalingAdapter}
-                setSignalingAdapter={(value) =>
-                  setDraftSignalingAdapter(value as SignalingAdapterKind)
+            )}
+            {workflow === "voice" || voiceJoined ? (
+              <VoicePanel
+                group={activeGroup}
+                activeVoiceChannel={activeVoiceChannel}
+                route={
+                  appState.voice_session?.route_copy ??
+                  currentSnapshot.voice.route
                 }
-                signalingEndpoint={draftSignalingEndpoint}
-                setSignalingEndpoint={setDraftSignalingEndpoint}
-                iceStunServers={draftIceStunServers}
-                setIceStunServers={setDraftIceStunServers}
-                iceTurnServers={draftIceTurnServers}
-                setIceTurnServers={setDraftIceTurnServers}
-                onSaveAppDefaults={() => saveConnectivityPolicy("app")}
-                onSaveGroup={
-                  activeGroup ? () => saveConnectivityPolicy("group") : null
+                participants={participants}
+                localUserId={appState.profile?.user_id ?? null}
+                voiceSession={appState.voice_session}
+                remoteAudio={
+                  appState.voice_session?.media_runtime.remote_audio ?? []
                 }
-                onSaveChannel={
-                  activeTextChannel || activeVoiceChannel
-                    ? () => saveConnectivityPolicy("channel")
-                    : null
-                }
-                onSaveDm={null}
-                showAdvancedStatus={diagnosticsUiEnabled}
+                remoteStreams={voiceRemoteStreams}
+                voiceStates={appState.voice_states}
+                voiceJoined={voiceJoined}
+                selfMuted={selfMuted}
+                connectivity={voiceConnectivityForState(appState)}
+                transportDiagnostics={appState.transport_diagnostics}
+                diagnosticsEnabled={diagnosticsUiEnabled}
+                inputDevices={voiceInputDevices}
+                selectedInputDeviceId={selectedVoiceInputId}
+                voiceDeviceStatus={voiceDeviceStatus}
+                onSelectInputDevice={setSelectedVoiceInputId}
+                onRefreshInputDevices={() => void refreshVoiceInputDevices(true)}
+                setVoiceJoined={toggleVoiceJoin}
+                setSelfMuted={toggleSelfMute}
+                setVolume={setVolume}
               />
-            </>
-          ) : null}
-          {workflow === "voice" ? (
-            <VoicePanel
-              group={activeGroup}
-              activeVoiceChannel={activeVoiceChannel}
-              route={
-                appState.voice_session?.route_copy ??
-                currentSnapshot.voice.route
-              }
-              participants={participants}
-              localUserId={appState.profile?.user_id ?? null}
-              voiceSession={appState.voice_session}
-              remoteAudio={
-                appState.voice_session?.media_runtime.remote_audio ?? []
-              }
-              remoteStreams={voiceRemoteStreams}
-              voiceStates={appState.voice_states}
-              voiceJoined={voiceJoined}
-              selfMuted={selfMuted}
-              connectivity={voiceConnectivityForState(appState)}
-              transportDiagnostics={appState.transport_diagnostics}
-              diagnosticsEnabled={diagnosticsUiEnabled}
-              inputDevices={voiceInputDevices}
-              selectedInputDeviceId={selectedVoiceInputId}
-              voiceDeviceStatus={voiceDeviceStatus}
-              onSelectInputDevice={setSelectedVoiceInputId}
-              onRefreshInputDevices={() => void refreshVoiceInputDevices(true)}
-              setVoiceJoined={toggleVoiceJoin}
-              setSelfMuted={toggleSelfMute}
-              setVolume={setVolume}
-            />
-          ) : null}
+            ) : null}
+          </div>
         </ScrollArea>
       </section>
       <MobileWorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
@@ -2205,29 +2108,37 @@ function App() {
           />
         ) : null}
         {activeOverlay === "settings" ? (
-          <ConnectivitySettingsPanel
-            policy={activeConnectivity}
-            signalingAdapter={draftSignalingAdapter}
-            setSignalingAdapter={(value) =>
-              setDraftSignalingAdapter(value as SignalingAdapterKind)
-            }
-            signalingEndpoint={draftSignalingEndpoint}
-            setSignalingEndpoint={setDraftSignalingEndpoint}
-            iceStunServers={draftIceStunServers}
-            setIceStunServers={setDraftIceStunServers}
-            iceTurnServers={draftIceTurnServers}
-            setIceTurnServers={setDraftIceTurnServers}
-            onSaveAppDefaults={() => saveConnectivityPolicy("app")}
-            onSaveGroup={
-              activeGroup ? () => saveConnectivityPolicy("group") : null
-            }
-            onSaveChannel={
-              activeTextChannel || activeVoiceChannel
-                ? () => saveConnectivityPolicy("channel")
-                : null
-            }
-            onSaveDm={activeDm ? () => saveConnectivityPolicy("dm") : null}
-          />
+          <div className="grid gap-4">
+            <AppearanceSettings
+              themeId={asThemeId(activeTheme.id)}
+              templateId={asTemplateId(activeTemplate.id)}
+              onThemeChange={chooseTheme}
+              onTemplateChange={chooseTemplate}
+            />
+            <ConnectivitySettingsPanel
+              policy={activeConnectivity}
+              signalingAdapter={draftSignalingAdapter}
+              setSignalingAdapter={(value) =>
+                setDraftSignalingAdapter(value as SignalingAdapterKind)
+              }
+              signalingEndpoint={draftSignalingEndpoint}
+              setSignalingEndpoint={setDraftSignalingEndpoint}
+              iceStunServers={draftIceStunServers}
+              setIceStunServers={setDraftIceStunServers}
+              iceTurnServers={draftIceTurnServers}
+              setIceTurnServers={setDraftIceTurnServers}
+              onSaveAppDefaults={() => saveConnectivityPolicy("app")}
+              onSaveGroup={
+                activeGroup ? () => saveConnectivityPolicy("group") : null
+              }
+              onSaveChannel={
+                activeTextChannel || activeVoiceChannel
+                  ? () => saveConnectivityPolicy("channel")
+                  : null
+              }
+              onSaveDm={activeDm ? () => saveConnectivityPolicy("dm") : null}
+            />
+          </div>
         ) : null}
         {activeOverlay === "diagnostics" ? (
           <DiagnosticsSheet
@@ -2268,7 +2179,7 @@ function activePaneSummary(
         title: activeDm?.display_name ?? "Direct messages",
         subtitle:
           activeDm?.local_only_copy ??
-          "Start or select a backend-persisted local DM.",
+          "Start or select a private conversation.",
       };
     case "channel":
       return {
@@ -2283,7 +2194,7 @@ function activePaneSummary(
       return {
         title: activeVoiceChannel?.name ?? "Voice rooms",
         subtitle: activeVoiceChannel
-          ? `${groupLabel} · backend voice state`
+          ? `${groupLabel} · voice room`
           : "Create or select a voice room.",
       };
     case "join":
@@ -2308,6 +2219,7 @@ function activePaneSummary(
 function getActiveTextChannel(
   state: AppState,
   group: GroupView | null,
+  preferredChannelId: string | null = null,
 ): ChannelStateView | null {
   if (!group) return null;
   const activeId =
@@ -2315,6 +2227,13 @@ function getActiveTextChannel(
       ? state.active_context.channel_id
       : null;
   return (
+    (preferredChannelId
+      ? group.channels.find(
+          (channel) =>
+            channel.channel_id === preferredChannelId &&
+            channel.kind === "Text",
+        )
+      : null) ??
     (activeId
       ? group.channels.find(
           (channel) =>
@@ -2393,10 +2312,8 @@ function FirstRunPanel({
                 Set up your local discrypt profile
               </CardTitle>
               <CardDescription className="max-w-md text-base leading-7">
-                Create a local identity for this device, or recover
-                account-continuity metadata. No cloud history restore,
-                cross-device enrollment, or content-key recovery is shown
-                here.
+                Create a local identity for this device, or recover an
+                existing profile.
               </CardDescription>
               <div className="grid gap-3 pt-3 text-sm text-[hsl(var(--muted-foreground))]">
                 <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
@@ -2414,7 +2331,7 @@ function FirstRunPanel({
             <CardContent className="grid gap-4 p-6 md:grid-cols-2 lg:p-8">
               {commandError ? (
                 <p className="rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 md:col-span-2">
-                  Command note: {commandError}
+                  Action failed: {commandError}
                 </p>
               ) : null}
               <div className="flex min-h-72 flex-col rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
@@ -2428,6 +2345,7 @@ function FirstRunPanel({
                   Display name
                   <Input
                     value={displayName}
+                    placeholder="Display name"
                     onChange={(event) => setDisplayName(event.target.value)}
                   />
                 </Label>
@@ -2435,10 +2353,15 @@ function FirstRunPanel({
                   Device name
                   <Input
                     value={deviceName}
+                    placeholder="This device"
                     onChange={(event) => setDeviceName(event.target.value)}
                   />
                 </Label>
-                <Button className="mt-auto w-full" onClick={onCreate}>
+                <Button
+                  className="mt-auto w-full"
+                  onClick={onCreate}
+                  disabled={!displayName.trim() || !deviceName.trim()}
+                >
                   Create new user
                 </Button>
               </div>
@@ -2446,25 +2369,46 @@ function FirstRunPanel({
                 <div className="mb-4">
                   <h2 className="text-lg font-semibold">Existing user</h2>
                   <p className="text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                    Account-continuity recovery for this local build.
+                    Recover profile continuity on this device.
                   </p>
                 </div>
                 <Label className="grid gap-2">
+                  Display name
+                  <Input
+                    value={displayName}
+                    placeholder="Display name"
+                    onChange={(event) => setDisplayName(event.target.value)}
+                  />
+                </Label>
+                <Label className="mt-4 grid gap-2">
+                  Device name
+                  <Input
+                    value={deviceName}
+                    placeholder="This device"
+                    onChange={(event) => setDeviceName(event.target.value)}
+                  />
+                </Label>
+                <Label className="mt-4 grid gap-2">
                   Recovery phrase/code
                   <Input
                     value={recoveryCode}
+                    placeholder="Recovery phrase or code"
                     onChange={(event) => setRecoveryCode(event.target.value)}
                   />
                 </Label>
                 <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                  Restores profile, device count, and room membership metadata
-                  for continuity checks; message history and content keys are
-                  not restored.
+                  Use the recovery material generated for your existing
+                  profile.
                 </p>
                 <Button
                   variant="outline"
                   className="mt-auto w-full"
                   onClick={onRecover}
+                  disabled={
+                    !displayName.trim() ||
+                    !deviceName.trim() ||
+                    !recoveryCode.trim()
+                  }
                 >
                   Recover existing user
                 </Button>
@@ -2551,17 +2495,15 @@ function ChannelSidebar({
   activeChannelId,
   activeVoiceChannelId,
   selectedWorkflow,
-  onSelectWorkflow,
   onOpenCreateGroup,
   onOpenJoin,
+  onOpenCreateChannel,
   onSelectTextChannel,
   onSelectVoiceChannel,
   onSelectDm,
   onOpenNewDm,
   voiceJoined,
   participants,
-  setupSteps,
-  completedSteps,
 }: {
   groupLabel: string;
   role: string;
@@ -2572,21 +2514,16 @@ function ChannelSidebar({
   activeChannelId: string | null;
   activeVoiceChannelId: string | null;
   selectedWorkflow: Workflow;
-  onSelectWorkflow: (workflow: Workflow) => void;
   onOpenCreateGroup: () => void;
   onOpenJoin: () => void;
+  onOpenCreateChannel: () => void;
   onSelectTextChannel: (channelId: string) => void;
   onSelectVoiceChannel: (channelId: string) => void;
   onSelectDm: (dmId: string) => void;
   onOpenNewDm: () => void;
   voiceJoined: boolean;
   participants: VoiceParticipant[];
-  setupSteps: SetupStepView[];
-  completedSteps: number;
 }) {
-  const setupTotal = setupSteps.length;
-  const setupProgress =
-    setupTotal > 0 ? (completedSteps / setupTotal) * 100 : 0;
   const speaking = participants.filter(
     (participant) => participant.speaking && !participant.muted,
   ).length;
@@ -2620,31 +2557,6 @@ function ChannelSidebar({
           </div>
         </div>
         <ScrollArea className="min-h-0 flex-1 p-3">
-          <Card className="mb-5 bg-[hsl(var(--secondary)/0.34)] shadow-none">
-            <CardHeader className="p-4 pb-2">
-              <div className="flex items-center justify-between">
-                <CardTitle>Setup</CardTitle>
-                <Badge variant="secondary">
-                  {completedSteps} of {setupTotal}
-                </Badge>
-              </div>
-              <div className="mt-2 h-1.5 rounded-full bg-[hsl(var(--muted))]">
-                <div
-                  className="h-full rounded-full bg-[hsl(var(--primary))]"
-                  style={{ width: `${setupProgress}%` }}
-                />
-              </div>
-            </CardHeader>
-            <CardContent className="p-3 pt-1">
-              <SidebarButton
-                active={selectedWorkflow === "setup"}
-                onClick={() => onSelectWorkflow("setup")}
-                meta="profile readiness"
-              >
-                Setup checklist
-              </SidebarButton>
-            </CardContent>
-          </Card>
           <SectionLabel>Direct messages</SectionLabel>
           {dms.length === 0 ? (
             <p className="px-2 text-xs text-[hsl(var(--muted-foreground))]">
@@ -2692,7 +2604,7 @@ function ChannelSidebar({
             variant="ghost"
             size="sm"
             className="mt-1 w-full justify-start"
-            onClick={() => onSelectWorkflow("channel")}
+            onClick={onOpenCreateChannel}
           >
             <Icon>+</Icon>Create channel
           </Button>
@@ -2842,14 +2754,14 @@ function TopBar({
   return (
     <header
       aria-label="Workspace topbar"
-      className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/0.86)] p-4 backdrop-blur-xl md:p-6"
+      className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/0.88)] p-3 backdrop-blur-xl md:p-4"
     >
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline">{groupLabel}</Badge>
             <span className="text-xs text-[hsl(var(--muted-foreground))]">
-              local-first workspace
+              encrypted workspace
             </span>
           </div>
           <h2 className="mt-1 truncate text-xl font-semibold tracking-tight">
@@ -2860,41 +2772,43 @@ function TopBar({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" onClick={onOpenCreateGroup}>
-            <Icon>+</Icon>Create group
-          </Button>
-          <Button variant="outline" size="sm" onClick={onOpenJoin}>
-            Join group
-          </Button>
           <Button
             variant="secondary"
             size="sm"
             onClick={onCreateInvite}
             disabled={!canCreateInvite}
           >
-            Create invite
+            Invite
+          </Button>
+          <Button variant="outline" size="sm" onClick={onOpenJoin}>
+            Join group
+          </Button>
+          <Button variant="outline" size="sm" onClick={onOpenCreateGroup}>
+            <Icon>+</Icon>Create group
           </Button>
           <Button variant="outline" size="sm" onClick={onOpenSettings}>
             Settings
           </Button>
-          <ConfigSelect
-            label="Theme"
-            value={themeId}
-            onChange={(value) => onThemeChange(value as ThemeId)}
-            options={discryptUiConfig.themes.map((theme) => ({
-              value: theme.id,
-              label: theme.label,
-            }))}
-          />
-          <ConfigSelect
-            label="Template"
-            value={templateId}
-            onChange={(value) => onTemplateChange(value as TemplateId)}
-            options={discryptUiConfig.templates.map((template) => ({
-              value: template.id,
-              label: template.label,
-            }))}
-          />
+          <div className="hidden items-center gap-2 xl:flex">
+            <ConfigSelect
+              label="Theme"
+              value={themeId}
+              onChange={(value) => onThemeChange(value as ThemeId)}
+              options={discryptUiConfig.themes.map((theme) => ({
+                value: theme.id,
+                label: theme.label,
+              }))}
+            />
+            <ConfigSelect
+              label="Template"
+              value={templateId}
+              onChange={(value) => onTemplateChange(value as TemplateId)}
+              options={discryptUiConfig.templates.map((template) => ({
+                value: template.id,
+                label: template.label,
+              }))}
+            />
+          </div>
           {diagnosticsEnabled ? (
             <Button
               variant={inspectorOpen ? "secondary" : "outline"}
@@ -2919,35 +2833,35 @@ function overlayCopy(overlay: OverlayKind | null): {
   switch (overlay) {
     case "create-group":
       return {
-        title: "Create group dialog",
+        title: "Create group",
         description:
-          "Persist a new workspace and its default text and voice rooms.",
+          "Start a workspace with a default text channel and voice room.",
         align: "center",
       };
     case "create-channel":
       return {
-        title: "Create channel sheet",
+        title: "Create channel",
         description:
-          "Add a text channel or voice room to the active backend group.",
+          "Add a text channel or voice room to the active group.",
         align: "side",
       };
     case "invite":
       return {
-        title: "Invite sheet",
+        title: "Invites",
         description:
           "Create group/contact invites or open signed invite descriptors.",
         align: "side",
       };
     case "settings":
       return {
-        title: "Workspace settings sheet",
+        title: "Workspace settings",
         description:
           "Adjust signaling and ICE policy for app, group, channel, or DM scope.",
         align: "side",
       };
     case "diagnostics":
       return {
-        title: "Diagnostics sheet",
+        title: "Diagnostics",
         description:
           "Review runtime, transport, and workspace evidence without changing chat context.",
         align: "side",
@@ -3018,6 +2932,60 @@ function WorkspaceOverlay({
         </div>
       </DialogPortal>
     </Dialog>
+  );
+}
+
+function AppearanceSettings({
+  themeId,
+  templateId,
+  onThemeChange,
+  onTemplateChange,
+}: {
+  themeId: ThemeId;
+  templateId: TemplateId;
+  onThemeChange: (id: ThemeId) => void;
+  onTemplateChange: (id: TemplateId) => void;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Appearance</CardTitle>
+        <CardDescription>
+          Pick a theme and layout template. These options are saved through the
+          app preference service and reuse the same shadcn token system.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-2">
+        <Label className="grid gap-2">
+          Theme
+          <Select
+            aria-label="Theme"
+            value={themeId}
+            onValueChange={(value) => onThemeChange(value as ThemeId)}
+          >
+            {discryptUiConfig.themes.map((theme) => (
+              <SelectItem key={theme.id} value={theme.id}>
+                {theme.label}
+              </SelectItem>
+            ))}
+          </Select>
+        </Label>
+        <Label className="grid gap-2">
+          Layout
+          <Select
+            aria-label="Layout template"
+            value={templateId}
+            onValueChange={(value) => onTemplateChange(value as TemplateId)}
+          >
+            {discryptUiConfig.templates.map((template) => (
+              <SelectItem key={template.id} value={template.id}>
+                {template.label}
+              </SelectItem>
+            ))}
+          </Select>
+        </Label>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -3382,8 +3350,6 @@ function MobileWorkflowNav({
     { id: "dm", label: "DMs" },
     { id: "channel", label: "Text" },
     { id: "voice", label: "Voice" },
-    { id: "join", label: "Invites" },
-    { id: "create-group", label: "Groups" },
   ];
   return (
     <nav
@@ -3608,32 +3574,43 @@ function DmPanel({
   const visibleMessages = activeDm
     ? messages.filter((message) => message.target.dm_id === activeDm.dm_id)
     : [];
-  return (
-    <div className="grid min-h-[70dvh] gap-4 py-5 xl:grid-cols-[320px_minmax(0,1fr)]">
-      <Card>
-        <CardHeader>
+  if (!activeDm) {
+    return (
+      <Card className="flex min-h-[70dvh] flex-col">
+        <CardHeader className="border-b border-[hsl(var(--border))]">
           <CardTitle>Direct messages</CardTitle>
-          <CardDescription>Private conversations for this profile.</CardDescription>
+          <CardDescription>
+            Start a private conversation, then use this space as the message
+            timeline.
+          </CardDescription>
         </CardHeader>
-        <CardContent>
-          <Label className="grid gap-2">
-            Contact name
-            <Input
-              value={draftDmName}
-              onChange={(event) => setDraftDmName(event.target.value)}
-            />
-          </Label>
-          <Button className="mt-4 w-full" onClick={onStartDm}>
-            <Icon>+</Icon>Start/open DM
-          </Button>
+        <CardContent className="grid flex-1 place-items-center p-6">
+          <div className="w-full max-w-md rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.32)] p-5">
+            <Label className="grid gap-2">
+              Contact name
+              <Input
+                value={draftDmName}
+                placeholder="Display name"
+                onChange={(event) => setDraftDmName(event.target.value)}
+              />
+            </Label>
+            <Button
+              className="mt-4 w-full"
+              onClick={onStartDm}
+              disabled={!draftDmName.trim()}
+            >
+              <Icon>+</Icon>Start DM
+            </Button>
+          </div>
         </CardContent>
       </Card>
+    );
+  }
+  return (
+    <div className="min-h-[70dvh]">
       <Timeline
-        title={activeDm ? activeDm.display_name : "No DM yet"}
-        description={
-          activeDm?.local_only_copy ??
-          "Start a DM to create a local conversation."
-        }
+        title={activeDm.display_name}
+        description="Private conversation"
         messages={visibleMessages}
         textStateLegend={textStateLegend}
         draftMessage={draftMessage}
@@ -3693,6 +3670,7 @@ function JoinPanel({
             Invite URL or code
             <Input
               value={inviteValue}
+              placeholder="Paste invite URL or code"
               onChange={(event) => setInviteValue(event.target.value)}
             />
           </Label>
@@ -3700,12 +3678,19 @@ function JoinPanel({
             Joined group/contact label
             <Input
               value={groupName}
+              placeholder="Group name"
               onChange={(event) => setGroupName(event.target.value)}
             />
           </Label>
           <div className="flex flex-wrap gap-2">
-            <Button onClick={onJoin}>Join/open group</Button>
-            <Button variant="secondary" onClick={onAcceptDmInvite}>
+            <Button onClick={onJoin} disabled={!inviteValue.trim()}>
+              Join/open group
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={onAcceptDmInvite}
+              disabled={!inviteValue.trim()}
+            >
               Accept/open DM invite
             </Button>
             <Button
@@ -3778,7 +3763,7 @@ function JoinProgressCard({ steps }: { steps: JoinProgressStepView[] }) {
         <CardTitle className="text-base">Group join progress</CardTitle>
         <CardDescription>
           Invite parsing, rendezvous, authorization, Welcome, MLS, and route
-          stages update from command state; diagnostics remain evidence-gated by command state.
+          stages update automatically and remain evidence-gated by command state.
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
@@ -4047,7 +4032,11 @@ function CreateGroupPanel({
               />
             </Label>
           </div>
-          <Button className="mt-5 w-full" onClick={onCreate}>
+          <Button
+            className="mt-5 w-full"
+            onClick={onCreate}
+            disabled={!groupName.trim()}
+          >
             Create group
           </Button>
         </CardContent>
@@ -4223,36 +4212,24 @@ function ConnectivitySettingsPanel({
 }
 
 function ChannelPanel({
-  snapshot,
   group,
   activeChannel,
-  channels,
   messages,
   textStateLegend,
-  draftChannel,
-  setDraftChannel,
   draftMessage,
   setDraftMessage,
-  onCreateTextChannel,
-  onCreateVoiceChannel,
   onOpenCreateChannel,
   onSendMessage,
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
 }: {
-  snapshot: AppSnapshot;
   group: GroupView | null;
   activeChannel: ChannelStateView | null;
-  channels: ChannelStateView[];
   messages: AppMessageView[];
   textStateLegend: TextStateView[];
-  draftChannel: string;
-  setDraftChannel: (value: string) => void;
   draftMessage: string;
   setDraftMessage: (value: string) => void;
-  onCreateTextChannel: () => void;
-  onCreateVoiceChannel: () => void;
   onOpenCreateChannel: () => void;
   onSendMessage: () => void;
   transportProof: boolean;
@@ -4264,83 +4241,55 @@ function ChannelPanel({
         (message) => message.target.channel_id === activeChannel.channel_id,
       )
     : [];
+  if (!activeChannel) {
+    return (
+      <Card className="flex min-h-[70dvh] flex-col">
+        <CardHeader className="border-b border-[hsl(var(--border))]">
+          <CardTitle>{group ? "No text channel selected" : "Choose a group"}</CardTitle>
+          <CardDescription>
+            {group
+              ? "Create a text channel or pick one from the sidebar to start messaging."
+              : "Create or join a group to start a private workspace."}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid flex-1 place-items-center p-6">
+          <EmptyState
+            title={group ? "Create a channel" : "No active group"}
+            copy={
+              group
+                ? "Channel creation opens as a focused flow and keeps the main chat uncluttered."
+                : "Use the sidebar actions to create or join a group."
+            }
+          />
+          {group ? (
+            <Button className="mt-4" onClick={onOpenCreateChannel}>
+              <Icon>+</Icon>Create channel
+            </Button>
+          ) : null}
+        </CardContent>
+      </Card>
+    );
+  }
   return (
-    <div className="grid min-h-[72dvh] gap-4 py-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+    <div className="min-h-[72dvh]">
       <Timeline
-        title={activeChannel?.name ?? "No text channel"}
-        description={
-          group
-            ? `Group: ${group.name}`
-            : "Create or join a group before sending messages."
+        title={
+          activeChannel.name.startsWith("#")
+            ? activeChannel.name
+            : `# ${activeChannel.name}`
         }
+        description={group ? group.name : "Private workspace"}
         messages={visibleMessages}
         textStateLegend={textStateLegend}
         draftMessage={draftMessage}
         setDraftMessage={setDraftMessage}
         sendLabel="Send message"
         onSend={onSendMessage}
-        disabled={!activeChannel}
+        disabled={false}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
         diagnosticsEnabled={diagnosticsEnabled}
       />
-      <Card className="h-fit">
-        <CardHeader>
-          <CardTitle>Channel controls</CardTitle>
-          <CardDescription>
-            Channels are persisted through the Rust/Tauri command service. Use
-            the channel sheet for the full create flow, or the quick controls
-            below for keyboard-friendly tests and local operation.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <Button variant="secondary" onClick={onOpenCreateChannel} disabled={!group}>
-            Open channel sheet
-          </Button>
-          <Label className="grid gap-2">
-            Channel name
-            <Input
-              value={draftChannel}
-              onChange={(event) => setDraftChannel(event.target.value)}
-            />
-          </Label>
-          <div className="grid grid-cols-2 gap-2">
-            <Button onClick={onCreateTextChannel} disabled={!group}>
-              <Icon>+</Icon>Text
-            </Button>
-            <Button
-              variant="outline"
-              onClick={onCreateVoiceChannel}
-              disabled={!group}
-            >
-              <Icon>+</Icon>Voice
-            </Button>
-          </div>
-          <Separator />
-          <InfoRow
-            title="Residual presence risk"
-            copy={snapshot.security_copy.malicious_member}
-          />
-          <InfoRow
-            title="Sybil-resistance posture"
-            copy={snapshot.security_copy.sybil_resistance}
-          />
-          <Separator />
-          {channels.length === 0 ? (
-            <p className="text-sm text-[hsl(var(--muted-foreground))]">
-              No text channels yet.
-            </p>
-          ) : (
-            channels.map((channel) => (
-              <InfoRow
-                key={channel.channel_id}
-                title={channel.name}
-                copy={channel.retention_status}
-              />
-            ))
-          )}
-        </CardContent>
-      </Card>
     </div>
   );
 }
@@ -4367,8 +4316,7 @@ function CreateChannelSheet({
           <CardTitle>Create a channel</CardTitle>
           <CardDescription>
             Add a text channel or voice room to{" "}
-            {group?.name ?? "an active group first"}. The command service owns
-            persistence and active-channel selection.
+            {group?.name ?? "an active group first"}.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
@@ -4376,14 +4324,22 @@ function CreateChannelSheet({
             Channel name
             <Input
               value={draftChannel}
+              placeholder="Channel name"
               onChange={(event) => setDraftChannel(event.target.value)}
             />
           </Label>
           <div className="grid grid-cols-2 gap-2">
-            <Button onClick={onCreateTextChannel} disabled={!group}>
+            <Button
+              onClick={onCreateTextChannel}
+              disabled={!group || !draftChannel.trim()}
+            >
               <Icon>+</Icon>Text
             </Button>
-            <Button variant="outline" onClick={onCreateVoiceChannel} disabled={!group}>
+            <Button
+              variant="outline"
+              onClick={onCreateVoiceChannel}
+              disabled={!group || !draftChannel.trim()}
+            >
               <Icon>+</Icon>Voice
             </Button>
           </div>
@@ -4469,7 +4425,8 @@ function Timeline({
         <div className="mt-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div className="space-y-2">
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              Local encrypted timeline. command-backed delivery receipts appear when signed receipts arrive.
+              Messages are command-backed, saved locally, and delivery state
+              updates automatically.
             </p>
             {diagnosticsEnabled ? (
               <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
@@ -4653,14 +4610,14 @@ function VoicePanel({
         ? "Speaking"
         : "Listening";
   return (
-    <div className="grid gap-4 py-5 xl:grid-cols-[minmax(0,1fr)_340px]">
+    <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between gap-3">
             <div>
               <CardTitle>{activeVoiceChannel?.name ?? "Voice Lobby"}</CardTitle>
               <CardDescription>
-                {group ? route : "Create or join a group before voice."}
+                {group ? "Voice stays available while text remains open." : "Create or join a group before voice."}
               </CardDescription>
             </div>
             <Badge variant={voiceJoined ? "success" : "secondary"}>
@@ -4766,8 +4723,7 @@ function VoicePanel({
                       />
                     ) : (
                       <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                        Backend remote transport is active; waiting for an audio
-                        stream handle before attaching playback.
+                        Connecting audio…
                       </p>
                     )}
                     <div className="flex items-center gap-3">
@@ -4790,7 +4746,7 @@ function VoicePanel({
               </div>
             );
           })}
-          {voiceJoined && remoteAudio.length > 0 ? (
+          {diagnosticsEnabled && voiceJoined && remoteAudio.length > 0 ? (
             <div className="grid gap-2 rounded-2xl border border-emerald-300/30 bg-emerald-300/10 p-4">
               <p className="text-sm font-medium">Remote playback attachments</p>
               {remoteAudio.map((track) => (
@@ -4837,9 +4793,8 @@ function VoicePanel({
             <div>
               <CardTitle>Voice dock</CardTitle>
               <CardDescription>
-                Focused on {focusedRoomLabel}. Controls dispatch backend voice
-                state changes; remote media is not claimed until route evidence
-                exists.
+                Focused on {focusedRoomLabel}. Choose your microphone, mute
+                yourself, and adjust participant volume.
               </CardDescription>
             </div>
             <Badge variant={voiceJoined ? "success" : "secondary"}>
@@ -4897,50 +4852,33 @@ function VoicePanel({
             {voiceJoined ? "Leave call" : "Join call"}
           </Button>
           <InfoRow title="Selected devices" copy={deviceCopy} />
-          <InfoRow
-            title="Media route proof"
-            copy={
-              remoteTransportActive
-                ? mediaRuntime.status_copy
-                : "Waiting for a verified media route before enabling remote playback; backend media-route evidence appears in diagnostics."
-            }
-          />
-          <InfoRow
-            title="Remote audio blocker"
-            copy={
-              voiceJoined
-                ? remoteTransportActive
-                  ? route
-                  : "Remote audio will appear after the app confirms an audio route."
-                : "Join voice to check microphone access and audio-route status."
-            }
-          />
-          <InfoRow
-            title="Media route proof"
-            copy={
-              remoteTransportActive
-                ? mediaRuntime.status_copy
-                : mediaRuntime.fail_closed_reason ||
-                  "Remote playback is not claimed until backend media-route evidence confirms a remote audio route."
-            }
-          />
-          <InfoRow
-            title="TURN relay gate"
-            copy={turnRequiredCopy(transportDiagnostics, connectivity)}
-          />
-          <InfoRow
-            title="Provider fallback state"
-            copy={providerFallbackCopy(transportDiagnostics)}
-          />
           {diagnosticsEnabled ? (
-            <InfoRow
-              title="Media runtime"
-              copy={`${mediaRuntime.boundary} · local capture ${
-                mediaRuntime.local_capture_active ? "active" : "inactive"
-              } · remote transport ${
-                remoteTransportActive ? "active" : "fail-closed"
-              }`}
-            />
+            <>
+              <InfoRow
+                title="Media route"
+                copy={
+                  remoteTransportActive
+                    ? `${route} · ${mediaRuntime.status_copy}`
+                    : mediaRuntime.fail_closed_reason
+                }
+              />
+              <InfoRow
+                title="TURN relay gate"
+                copy={turnRequiredCopy(transportDiagnostics, connectivity)}
+              />
+              <InfoRow
+                title="Provider fallback state"
+                copy={providerFallbackCopy(transportDiagnostics)}
+              />
+              <InfoRow
+                title="Media runtime"
+                copy={`${mediaRuntime.boundary} · local capture ${
+                  mediaRuntime.local_capture_active ? "active" : "inactive"
+                } · remote transport ${
+                  remoteTransportActive ? "active" : "fail-closed"
+                }`}
+              />
+            </>
           ) : null}
           <InfoRow
             title="Call status"
