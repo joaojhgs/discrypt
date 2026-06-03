@@ -13908,8 +13908,7 @@ mod tests {
             ))
         );
 
-        let alice_reloaded_before_receipt =
-            load_state_from_path(&alice_path).to_view();
+        let alice_reloaded_before_receipt = load_state_from_path(&alice_path).to_view();
         assert_eq!(
             alice_reloaded_before_receipt
                 .profile
@@ -14103,8 +14102,7 @@ mod tests {
             recipient_verifying_key_hex: recipient_verifying_key_hex.clone(),
         });
         assert!(receipted.last_command_error.is_none(), "{receipted:?}");
-        let alice_reloaded_after_receipt =
-            load_state_from_path(&alice_path).to_view();
+        let alice_reloaded_after_receipt = load_state_from_path(&alice_path).to_view();
         let reloaded_message = alice_reloaded_after_receipt
             .messages
             .iter()

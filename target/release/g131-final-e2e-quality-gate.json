@@ -1,6 +1,6 @@
 {
   "schema_version": "discrypt.g131.final_e2e_quality_gate.v1",
-  "generated_at": "2026-06-01T18:20:23.764Z",
+  "generated_at": "2026-06-03T04:02:23.279Z",
   "status": "readiness-gate-passed",
   "gate": "G131-final-e2e-verification-acr",
   "serialized_playwright_e2e": true,

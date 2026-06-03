@@ -1,7 +1,15 @@
 # Discrypt UI — Production Gap Analysis
 
 **Date:** 2026-05-30  
-**Status:** Implementation in progress
+**Status:** Historical / superseded by the current release matrices
+
+This document is retained as the pre-cleanup UI gap analysis. It is **not** the
+current production-readiness contract and should not be used as a live checklist.
+Use [`production-gap-matrix-2026-06-01.md`](production-gap-matrix-2026-06-01.md),
+[`g011-production-readiness-matrix.md`](g011-production-readiness-matrix.md),
+and [`g131-final-e2e-verification.md`](g131-final-e2e-verification.md) for the
+current G011/G012/G131 release boundary, evidence requirements, and final UI
+status.
 
 ## Executive Summary
 

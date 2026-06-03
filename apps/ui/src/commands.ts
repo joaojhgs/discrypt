@@ -3712,18 +3712,6 @@ export async function leaveVoice(
         return;
       }
       state.voice_session.joined = false;
-      state.voice_session.media_runtime = {
-        runtime_id: `voice-runtime:${request.session_id}:stopped`,
-        boundary: "stopped",
-        local_capture_active: false,
-        remote_transport_active: false,
-        remote_audio: [],
-        fail_closed_reason: "Voice media runtime stopped after leave",
-        status_copy:
-          "Voice media runtime stopped; no local capture or remote playback route is active",
-      };
-      state.voice_session.route_copy =
-        "Voice media runtime stopped; no local capture or remote playback route is active";
       state.voice_session.status_copy =
         "Not joined; backend voice controls are idle";
       state.voice_session.route_copy =

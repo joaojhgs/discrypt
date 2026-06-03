@@ -1791,8 +1791,6 @@ function App() {
           groupLabel={groupLabel}
           activeTitle={activePane.title}
           activeSubtitle={activePane.subtitle}
-          workflow={workflow}
-          onSelectWorkflow={setWorkflow}
           themeId={asThemeId(activeTheme.id)}
           templateId={asTemplateId(activeTemplate.id)}
           onThemeChange={chooseTheme}
@@ -2108,12 +2106,6 @@ function App() {
             participants={participants}
             themeLabel={activeTheme.label}
             templateLabel={activeTemplate.label}
-            runtimePeers={textRuntimePeerDefaults(appState)}
-            runtimeRole={textRuntimeRole(appState)}
-            onProbeAdapter={probeSelectedAdapter}
-            onProbeDataChannel={probeSelectedDataChannel}
-            onStartTextTransport={startTextTransportProof}
-            onAttachRuntime={attachTextRuntime}
           />
         ) : null}
       </WorkspaceOverlay>
@@ -2687,8 +2679,6 @@ function TopBar({
   groupLabel,
   activeTitle,
   activeSubtitle,
-  workflow,
-  onSelectWorkflow,
   themeId,
   templateId,
   onThemeChange,
@@ -2705,8 +2695,6 @@ function TopBar({
   groupLabel: string;
   activeTitle: string;
   activeSubtitle: string;
-  workflow: Workflow;
-  onSelectWorkflow: (workflow: Workflow) => void;
   themeId: ThemeId;
   templateId: TemplateId;
   onThemeChange: (id: ThemeId) => void;
@@ -2787,7 +2775,6 @@ function TopBar({
           ) : null}
         </div>
       </div>
-      <MobileWorkflowNav workflow={workflow} setWorkflow={onSelectWorkflow} />
     </header>
   );
 }
@@ -4885,12 +4872,6 @@ function DiagnosticsSheet({
   completedSteps,
   themeLabel,
   templateLabel,
-  runtimePeers,
-  runtimeRole,
-  onProbeAdapter,
-  onProbeDataChannel,
-  onStartTextTransport,
-  onAttachRuntime,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
@@ -4898,12 +4879,6 @@ function DiagnosticsSheet({
   completedSteps: number;
   themeLabel: string;
   templateLabel: string;
-  runtimePeers: { local: string; remote: string };
-  runtimeRole: "offerer" | "answerer";
-  onProbeAdapter: () => void;
-  onProbeDataChannel: () => void;
-  onStartTextTransport: () => void;
-  onAttachRuntime: () => void;
 }) {
   const latestEvents = appState.events.slice(-6).reverse();
   const speaking = participants.filter(
@@ -4911,17 +4886,6 @@ function DiagnosticsSheet({
   ).length;
   return (
     <div className="grid gap-4">
-      <RuntimeModeBanner runtimeMode={appState.runtime_mode} />
-      <TransportStatusStrip
-        statuses={appState.transport_status}
-        diagnostics={appState.transport_diagnostics}
-        runtimePeers={runtimePeers}
-        runtimeRole={runtimeRole}
-        onProbeAdapter={onProbeAdapter}
-        onProbeDataChannel={onProbeDataChannel}
-        onStartTextTransport={onStartTextTransport}
-        onAttachRuntime={onAttachRuntime}
-      />
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>

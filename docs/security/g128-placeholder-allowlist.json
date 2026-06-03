@@ -109,6 +109,12 @@
       "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
     },
     {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "cfg!(any(test, feature = \"harness\", feature = \"local-dev\"))",
+      "reason": "The second local-dev cfg guard covers explicit text-runtime attachment gating; it is disabled in production builds and reviewed separately from app-state path overrides."
+    },
+    {
       "path": "apps/desktop/src-tauri/src/production_status.rs",
       "pattern": "local-dev",
       "expected": "//! static checks can distinguish production paths from harness/local-dev paths",
