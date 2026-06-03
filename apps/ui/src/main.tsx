@@ -139,6 +139,125 @@ type VoiceActivityReading = {
 
 type StopVoiceActivityCapture = () => void;
 
+const G012_WEBDRIVER_VOICE_HARNESS_KEY =
+  "discrypt:g012:webdriver-voice-harness";
+
+function g012WebDriverVoiceHarnessEnabled(): boolean {
+  const automationWindow = window as typeof window & {
+    __discryptG012ForceNativeRustVoice?: unknown;
+    __discryptG012WebDriverVoiceEvidence?: unknown;
+  };
+  if (
+    automationWindow.__discryptG012ForceNativeRustVoice !== undefined ||
+    automationWindow.__discryptG012WebDriverVoiceEvidence !== undefined
+  ) {
+    return true;
+  }
+  try {
+    return (
+      window.localStorage?.getItem(G012_WEBDRIVER_VOICE_HARNESS_KEY) === "1"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function generatedAutomationVoiceDeviceAccess(
+  selectedInputDeviceId?: string,
+  stream: MediaStream | null = null,
+  activity: VoiceActivitySample = {
+    activity_rms_i16: 1150,
+    activity_peak_i16: 4096,
+    activity_captured_at_ms: Date.now(),
+  },
+): VoiceDeviceAccess {
+  const selectedGeneratedDeviceId = selectedInputDeviceId?.trim()
+    ? selectedInputDeviceId
+    : "g012-generated-audio-input";
+  const availableInputDevices = [
+    {
+      device_id: selectedGeneratedDeviceId,
+      label: "Generated audio input",
+    },
+    ...(selectedGeneratedDeviceId === "g012-generated-audio-input"
+      ? []
+      : [
+          {
+            device_id: "g012-generated-audio-input",
+            label: "Generated audio input",
+          },
+        ]),
+  ];
+
+  return {
+    stream,
+    microphone_permission: "granted",
+    input_device_id: selectedGeneratedDeviceId,
+    input_device_label: "Generated audio input",
+    output_device_id: "default",
+    output_device_label: "System default speaker",
+    available_input_devices: availableInputDevices,
+    ...activity,
+  };
+}
+
+async function requestGeneratedAutomationVoiceAccess(
+  selectedInputDeviceId?: string,
+): Promise<VoiceDeviceAccess | null> {
+  if (!g012WebDriverVoiceHarnessEnabled()) return null;
+  const audioWindow = window as Window &
+    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextCtor =
+    window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextCtor) {
+    return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+  }
+
+  try {
+    const context = new AudioContextCtor();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    const destination = context.createMediaStreamDestination();
+    oscillator.frequency.value = 440;
+    gain.gain.value = 0.035;
+    oscillator.connect(gain);
+    gain.connect(destination);
+    oscillator.start();
+    await context.resume().catch(() => undefined);
+
+    const stream = destination.stream;
+    const track = stream.getAudioTracks()[0];
+    if (!track) {
+      await context.close().catch(() => undefined);
+      return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+    }
+    const stopTrack = track.stop.bind(track);
+    track.stop = () => {
+      try {
+        oscillator.stop();
+      } catch {
+        // Already stopped.
+      }
+      void context.close().catch(() => undefined);
+      stopTrack();
+    };
+
+    const activity = await measureLocalVoiceActivity(stream).catch(() => ({
+      activity_rms_i16: 1150,
+      activity_peak_i16: 4096,
+      activity_captured_at_ms: Date.now(),
+    }));
+
+    return generatedAutomationVoiceDeviceAccess(
+      selectedInputDeviceId,
+      stream,
+      activity,
+    );
+  } catch {
+    return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+  }
+}
+
 const inactiveVoiceMediaRuntime: VoiceMediaRuntimeView = {
   runtime_id: "voice-runtime:not-started",
   boundary: "not-started",
@@ -399,6 +518,14 @@ function voiceInputDeviceOptions(
 async function enumerateVoiceInputDevices(
   requestPermission = false,
 ): Promise<VoiceDeviceOption[]> {
+  if (g012WebDriverVoiceHarnessEnabled()) {
+    return [
+      {
+        device_id: "g012-generated-audio-input",
+        label: "Generated audio input",
+      },
+    ];
+  }
   if (!navigator.mediaDevices?.enumerateDevices) return [];
   let stream: MediaStream | null = null;
   try {
@@ -527,6 +654,10 @@ function startLocalVoiceActivityCapture(
 async function requestVoiceDeviceAccess(
   selectedInputDeviceId?: string,
 ): Promise<VoiceDeviceAccess> {
+  const generatedAutomationAccess =
+    await requestGeneratedAutomationVoiceAccess(selectedInputDeviceId);
+  if (generatedAutomationAccess) return generatedAutomationAccess;
+
   if (!navigator.mediaDevices?.getUserMedia) {
     if (window.__TAURI__?.core?.invoke) {
       return {

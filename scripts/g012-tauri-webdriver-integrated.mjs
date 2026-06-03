@@ -650,7 +650,10 @@ async function installVoiceHarness(profile) {
     const profileName = arguments[0];
     const forceNativeRustVoice = Boolean(arguments[1]);
     Object.defineProperty(window, '__discryptG012ForceNativeRustVoice', { configurable: true, value: forceNativeRustVoice });
-    try { window.localStorage?.setItem('discrypt:g012:force-native-rust-voice', forceNativeRustVoice ? '1' : '0'); } catch {}
+    try {
+      window.localStorage?.setItem('discrypt:g012:force-native-rust-voice', forceNativeRustVoice ? '1' : '0');
+      window.localStorage?.setItem('discrypt:g012:webdriver-voice-harness', '1');
+    } catch {}
     const evidence = {
       mode: 'uninitialized',
       getUserMediaCalls: 0,
