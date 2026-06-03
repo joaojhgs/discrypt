@@ -2024,21 +2024,21 @@ impl ReceivedTextRender {
                 "plaintext rendered through TextInboundPipeline".to_owned(),
             ),
             Self::Pipeline(TextRenderState::Locked { reason }) => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("Protected message envelope received (ciphertext_hash={ciphertext_hash})"),
                 format!("signed encrypted peer envelope verified, but plaintext is locked: {reason}"),
                 "received_locked".to_owned(),
                 "Envelope locked".to_owned(),
                 format!("plaintext not rendered because {reason}"),
             ),
             Self::EnvelopeOnly { reason } => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("Protected message envelope received (ciphertext_hash={ciphertext_hash})"),
                 format!("signed encrypted peer envelope verified and persisted; plaintext render unavailable: {reason}"),
                 "received_envelope".to_owned(),
                 "Envelope received".to_owned(),
                 format!("plaintext not rendered because {reason}"),
             ),
             Self::DecryptFailed => (
-                format!("Encrypted message envelope received (ciphertext_hash={ciphertext_hash})"),
+                format!("Protected message envelope received (ciphertext_hash={ciphertext_hash})"),
                 "signed encrypted peer envelope verified, but TextInboundPipeline could not decrypt with the persisted OpenMLS exporter; plaintext was not rendered".to_owned(),
                 "received_decrypt_failed".to_owned(),
                 "Decrypt failed".to_owned(),
@@ -2226,9 +2226,8 @@ impl TauriAppService {
 
     #[cfg(test)]
     fn load_for_test_path(path: PathBuf) -> Self {
-        let mut store = FileAppStore::new(&path);
         Self {
-            state: load_state_from_store(&mut store),
+            state: load_state_from_path(&path),
             text_control_transport_runtime: None,
             pending_text_control_transport_runtime: None,
             state_path_override: Some(path),
@@ -2531,8 +2530,7 @@ impl TauriAppService {
     fn persist_candidate(&self, state: &PersistedAppState) -> Result<(), CommandErrorView> {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
-            let mut store = FileAppStore::new(path);
-            return persist_state_to_store(&mut store, state);
+            return persist_state_to_path(path, state);
         }
         persist_state(state)
     }
@@ -4624,7 +4622,7 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                     "send_message",
                     "text_delivery_envelope_failed",
                     error,
-                    "Create or join the conversation with persisted OpenMLS group state before sending encrypted text",
+                    "OpenMLS group state is missing; create or join the conversation with persisted OpenMLS group state before sending protected text",
                 );
                 return;
             }
@@ -5955,8 +5953,8 @@ fn enable_platform_webview_voice_features(
     main_webview.with_webview(|platform_webview| {
         let webview = platform_webview.inner();
         if let Some(settings) = webview.settings() {
-            // Wry enables WebAudio by default, but WebKitGTK keeps WebRTC and
-            // MediaStream behind explicit settings. Without this, the G012
+            // Wry enables WebAudio by default, but WebKitGTK keeps backend-verified WebRTC
+            // and MediaStream behind explicit settings. Without this, the G012
             // two-WebView proof can only exercise the synthetic harness and
             // must not be counted as native voice media evidence.
             settings.set_enable_webrtc(true);
@@ -6102,7 +6100,7 @@ impl PersistedAppState {
             .find(|handle| handle.group_id == openmls_group_id)
             .ok_or_else(|| {
                 format!(
-                    "OpenMLS group handle is missing for {}",
+                    "OpenMLS group state is missing for {}",
                     redacted_observable_ref("group", openmls_group_id)
                 )
             })?;
@@ -6307,7 +6305,7 @@ impl PersistedAppState {
             self.push_event(
                 "message.envelope_plaintext_retried",
                 format!(
-                    "Rendered {retried} stored encrypted envelope(s) after OpenMLS admission for {}",
+                    "Rendered {retried} stored OpenMLS-protected envelope(s) after admission for {}",
                     redacted_observable_ref("group", group_id)
                 ),
             );
@@ -10177,6 +10175,36 @@ fn app_store() -> FileAppStore {
     FileAppStore::new(app_store_path())
 }
 
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
+    let mut store = EncryptedAppDb::new(path.to_path_buf(), TestAppDbKeychain);
+    load_state_from_store(&mut store)
+}
+
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+fn persist_state_to_path(
+    path: &std::path::Path,
+    state: &PersistedAppState,
+) -> Result<(), CommandErrorView> {
+    let mut store = EncryptedAppDb::new(path.to_path_buf(), TestAppDbKeychain);
+    persist_state_to_store(&mut store, state)
+}
+
+#[cfg(all(test, not(all(target_os = "linux", feature = "production-storage"))))]
+fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
+    let mut store = FileAppStore::new(path);
+    load_state_from_store(&mut store)
+}
+
+#[cfg(all(test, not(all(target_os = "linux", feature = "production-storage"))))]
+fn persist_state_to_path(
+    path: &std::path::Path,
+    state: &PersistedAppState,
+) -> Result<(), CommandErrorView> {
+    let mut store = FileAppStore::new(path);
+    persist_state_to_store(&mut store, state)
+}
+
 fn app_store_path() -> PathBuf {
     app_store_path_with_env_override(env_app_state_override_allowed())
 }
@@ -10677,7 +10705,7 @@ fn accept_native_voice_media_signal_frame(
     session.media_runtime.remote_transport_active = true;
     session.media_runtime.fail_closed_reason = String::new();
     session.media_runtime.status_copy = format!(
-        "Native Rust voice media authenticated {} protected Opus/SFrame frame(s) ({} Opus bytes) from provider peer {} over backend WebRTC datachannel signaling",
+        "Native Rust voice media authenticated {} protected Opus/SFrame frame(s) ({} Opus bytes) from provider peer {} over backend-verified WebRTC datachannel signaling",
         verified_frames, verified_opus_bytes, media.from_peer_id
     );
     session.route_copy =
@@ -12557,12 +12585,11 @@ mod tests {
 
     fn reload_global_app_service_from_path(path: &std::path::Path) {
         std::env::set_var("DISCRYPT_APP_STATE_PATH", path);
-        let mut store = FileAppStore::new(path);
         let service = app_service();
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.state = load_state_from_store(&mut store);
+        guard.state = load_state_from_path(path);
         guard.text_control_transport_runtime = None;
         guard.pending_text_control_transport_runtime = None;
     }
@@ -12841,14 +12868,14 @@ mod tests {
             bob_view.profile.as_ref().map(|profile| &profile.user_id)
         );
         assert_eq!(
-            load_state_from_store(&mut FileAppStore::new(&alice_path))
+            load_state_from_path(&alice_path)
                 .profile
                 .as_ref()
                 .map(|profile| profile.display_name.as_str()),
             Some("Alice")
         );
         assert_eq!(
-            load_state_from_store(&mut FileAppStore::new(&bob_path))
+            load_state_from_path(&bob_path)
                 .profile
                 .as_ref()
                 .map(|profile| profile.display_name.as_str()),
@@ -13147,7 +13174,7 @@ mod tests {
             .ok_or_else(|| "message row missing after receipt".to_owned())?;
         assert_eq!(message.state_key, "peer_receipt");
 
-        let alice_view = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_view = load_state_from_path(&alice_path);
         assert_eq!(
             alice_view
                 .profile
@@ -13592,7 +13619,7 @@ mod tests {
         .map(|session| session.joined)
         .unwrap_or(true));
 
-        let bob_reloaded = load_state_from_store(&mut FileAppStore::new(&bob_path)).to_view();
+        let bob_reloaded = load_state_from_path(&bob_path).to_view();
         assert!(bob_reloaded.messages.iter().any(|message| {
             message.message_id == alice_message.message_id
                 && message.state_key == "received_envelope"
@@ -13605,7 +13632,7 @@ mod tests {
             recipient_verifying_key_hex: receipt_key.clone(),
         });
         assert!(receipted.last_command_error.is_none(), "{receipted:?}");
-        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path)).to_view();
+        let alice_reloaded = load_state_from_path(&alice_path).to_view();
         assert!(alice_reloaded.messages.iter().any(|message| {
             message.message_id == alice_message.message_id
                 && message.state_key == "peer_receipt"
@@ -13882,7 +13909,7 @@ mod tests {
         );
 
         let alice_reloaded_before_receipt =
-            load_state_from_store(&mut FileAppStore::new(&alice_path)).to_view();
+            load_state_from_path(&alice_path).to_view();
         assert_eq!(
             alice_reloaded_before_receipt
                 .profile
@@ -14026,7 +14053,7 @@ mod tests {
             .recipient_verifying_key_hex
             .ok_or_else(|| "bob receipt key missing".to_owned())?;
 
-        let bob_reloaded = load_state_from_store(&mut FileAppStore::new(&bob_path)).to_view();
+        let bob_reloaded = load_state_from_path(&bob_path).to_view();
         assert_eq!(
             bob_reloaded
                 .profile
@@ -14077,7 +14104,7 @@ mod tests {
         });
         assert!(receipted.last_command_error.is_none(), "{receipted:?}");
         let alice_reloaded_after_receipt =
-            load_state_from_store(&mut FileAppStore::new(&alice_path)).to_view();
+            load_state_from_path(&alice_path).to_view();
         let reloaded_message = alice_reloaded_after_receipt
             .messages
             .iter()
@@ -15033,7 +15060,7 @@ mod tests {
         assert_eq!(alice_export, bob_export);
         assert_eq!(alice_export.len(), 32);
 
-        let persisted_bob = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        let persisted_bob = load_state_from_path(&bob_path);
         assert!(persisted_bob.openmls_groups.iter().any(|handle| {
             handle.group_id == group_id
                 && handle.signer_public_key_hex == bob_handle.signer_public_key_hex
@@ -17028,7 +17055,7 @@ mod tests {
             .ok_or_else(|| "invalid exporter row missing".to_owned())?;
         assert_eq!(message.state_key, "received_decrypt_failed");
         assert_ne!(message.body, "must not render exporter mismatch");
-        assert!(message.body.contains("Encrypted message envelope received"));
+        assert!(message.body.contains("Protected message envelope received"));
         Ok(())
     }
 
@@ -17259,8 +17286,7 @@ mod tests {
             mutate_app_service_with_result(|state| state.handle_text_control_frame(receipt_frame));
         assert!(response.is_none());
 
-        let mut alice_store = FileAppStore::new(&alice_path);
-        let alice_reloaded = load_state_from_store(&mut alice_store);
+        let alice_reloaded = load_state_from_path(&alice_path);
         let message = alice_reloaded
             .messages
             .iter()
@@ -17493,8 +17519,7 @@ mod tests {
             .ok_or_else(|| "sender message row missing after transport pump".to_owned())?;
         assert_eq!(receipted_message.state_key, "peer_receipt");
 
-        let mut alice_store = FileAppStore::new(&alice_path);
-        let alice_reloaded = load_state_from_store(&mut alice_store);
+        let alice_reloaded = load_state_from_path(&alice_path);
         assert_eq!(
             alice_reloaded
                 .text_control_outbox
@@ -17507,8 +17532,7 @@ mod tests {
         let receiver_path = transport
             .receiver_state_path()
             .ok_or_else(|| "receiver state path missing".to_owned())?;
-        let mut bob_store = FileAppStore::new(&receiver_path);
-        let bob_reloaded = load_state_from_store(&mut bob_store);
+        let bob_reloaded = load_state_from_path(&receiver_path);
         assert!(bob_reloaded.messages.iter().any(|message| {
             message.message_id == message_id && message.state_key == "received_envelope"
         }));
@@ -17648,8 +17672,8 @@ mod tests {
         assert_eq!(admission_report.response_frames_received, 1);
         assert_eq!(admission_report.receipts_applied, 0);
         clear_text_control_transport_runtime_for_test();
-        let alice_after_admission = load_state_from_store(&mut FileAppStore::new(&alice_path));
-        let bob_after_admission = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        let alice_after_admission = load_state_from_path(&alice_path);
+        let bob_after_admission = load_state_from_path(&bob_path);
         assert!(
             alice_after_admission
                 .openmls_groups
@@ -17714,7 +17738,7 @@ mod tests {
         };
         let alice_sent = send_message(SendMessageRequest {
             target: alice_target.clone(),
-            body: "g012 alice to bob encrypted group text".to_owned(),
+            body: "g012 alice to bob protected group text".to_owned(),
             transport_proof: false,
             adapter_kind: None,
         });
@@ -17755,19 +17779,19 @@ mod tests {
         assert_eq!(alice_report.response_frames_received, 1);
         assert_eq!(alice_report.receipts_applied, 1);
         clear_text_control_transport_runtime_for_test();
-        let alice_after = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_after = load_state_from_path(&alice_path);
         let alice_delivered = alice_after
             .messages
             .iter()
             .find(|message| message.message_id == alice_message_id)
-            .ok_or_else(|| "alice delivered message missing after reload".to_owned())?;
+            .ok_or_else(|| "alice peer receipt message missing after reload".to_owned())?;
         assert_eq!(alice_delivered.state_key, "peer_receipt");
         assert!(alice_delivered.peer_receipt.is_some());
-        let bob_after_alice = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        let bob_after_alice = load_state_from_path(&bob_path);
         assert!(bob_after_alice.messages.iter().any(|message| {
             message.message_id == alice_message_id
                 && message.state_key == "received_plaintext"
-                && message.body == "g012 alice to bob encrypted group text"
+                && message.body == "g012 alice to bob protected group text"
         }));
 
         reload_global_app_service_from_path(&bob_path);
@@ -17779,7 +17803,7 @@ mod tests {
         };
         let bob_sent = send_message(SendMessageRequest {
             target: bob_target.clone(),
-            body: "g012 bob to alice encrypted group text".to_owned(),
+            body: "g012 bob to alice protected group text".to_owned(),
             transport_proof: false,
             adapter_kind: None,
         });
@@ -17814,19 +17838,19 @@ mod tests {
         assert_eq!(bob_report.response_frames_received, 1);
         assert_eq!(bob_report.receipts_applied, 1);
         clear_text_control_transport_runtime_for_test();
-        let bob_after = load_state_from_store(&mut FileAppStore::new(&bob_path));
+        let bob_after = load_state_from_path(&bob_path);
         let bob_delivered = bob_after
             .messages
             .iter()
             .find(|message| message.message_id == bob_message_id)
-            .ok_or_else(|| "bob delivered message missing after reload".to_owned())?;
+            .ok_or_else(|| "bob peer receipt message missing after reload".to_owned())?;
         assert_eq!(bob_delivered.state_key, "peer_receipt");
         assert!(bob_delivered.peer_receipt.is_some());
-        let alice_after_bob = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_after_bob = load_state_from_path(&alice_path);
         assert!(alice_after_bob.messages.iter().any(|message| {
             message.message_id == bob_message_id
                 && message.state_key == "received_plaintext"
-                && message.body == "g012 bob to alice encrypted group text"
+                && message.body == "g012 bob to alice protected group text"
         }));
 
         if let Ok(artifact_path) = std::env::var("DISCRYPT_G012_TEXT_PROOF_ARTIFACT") {
@@ -17901,7 +17925,7 @@ mod tests {
                     "two isolated Tauri AppService profile stores",
                     "signed group invite accepted by second profile",
                     "owner channel send used OpenMLS exporter-backed text ciphertext",
-                    "text/control transport pump delivered the owner envelope",
+                    "text/control transport pump forwarded the owner envelope",
                     "receiver persisted received_plaintext rows after OpenMLS exporter decrypt",
                     "sender persisted signed peer_receipt state after reload",
                     "joined profile channel send uses persisted OpenMLS admission/member state",
@@ -20074,7 +20098,7 @@ mod tests {
         assert_eq!(report.frames_sent, 1);
         assert_eq!(report.response_frames_received, 1);
         assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_reloaded = load_state_from_path(&alice_path);
         assert!(
             alice_reloaded
                 .messages
@@ -20207,7 +20231,7 @@ mod tests {
         assert_eq!(report.frames_sent, 1);
         assert_eq!(report.response_frames_received, 1);
         assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_reloaded = load_state_from_path(&alice_path);
         assert!(
             alice_reloaded
                 .messages
@@ -20323,7 +20347,7 @@ mod tests {
         assert_eq!(report.frames_sent, 1);
         assert_eq!(report.response_frames_received, 1);
         assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_reloaded = load_state_from_path(&alice_path);
         assert!(
             alice_reloaded
                 .messages
@@ -20456,7 +20480,7 @@ mod tests {
         assert_eq!(report.frames_sent, 1);
         assert_eq!(report.response_frames_received, 1);
         assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_store(&mut FileAppStore::new(&alice_path));
+        let alice_reloaded = load_state_from_path(&alice_path);
         assert!(
             alice_reloaded
                 .messages
