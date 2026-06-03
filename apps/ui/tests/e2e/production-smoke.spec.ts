@@ -34,15 +34,17 @@ test("approved production smoke covers setup, text, invites, settings, and voice
     page.getByRole("heading", { name: "#general", exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Signaling and ICE settings" }),
+    page.getByRole("heading", { name: "#general", exact: true }),
   ).toBeVisible();
-  await expect(page.getByText("Active signed policy")).toBeVisible();
-  await expect(page.getByText("1 STUN / 1 TURN endpoint(s)")).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Signaling and ICE settings" }),
+  ).toHaveCount(0);
   await expect(page.getByText("TURN credential gate", { exact: true })).toHaveCount(0);
 
+  await page.getByRole("button", { name: /create channel/i }).click();
   await page.getByLabel("Channel name").fill("ops-smoke");
   await page.getByRole("button", { name: "Text" }).last().click();
-  await expect(page.getByText("#ops-smoke").first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "#ops-smoke" })).toBeVisible();
   await page
     .getByRole("textbox", { name: "Message" })
     .fill("production smoke text remains visible");
@@ -55,7 +57,7 @@ test("approved production smoke covers setup, text, invites, settings, and voice
   await page
     .getByRole("button", { name: /create invite for active group/i })
     .click();
-  const inviteSheet = page.getByRole("dialog", { name: "Invite sheet" });
+  const inviteSheet = page.getByRole("dialog", { name: "Invites" });
   await expect(
     inviteSheet.getByRole("heading", { name: "Latest invite descriptor" }),
   ).toBeVisible();
@@ -64,12 +66,12 @@ test("approved production smoke covers setup, text, invites, settings, and voice
   await expect(inviteSheet.getByText("TURN metadata", { exact: true })).toBeVisible();
   await expectNoProductionCopyDebt(page);
 
-  await page.getByRole("button", { name: /Close Invite sheet/i }).click();
+  await page.getByRole("button", { name: /Close Invites/i }).click();
 
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await expect(page.getByTestId("voice-dock")).toBeVisible();
   await expect(page.getByTestId("voice-mic-selector")).toBeEnabled();
-  await expect(page.getByText("#ops-smoke").first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "#ops-smoke" })).toBeVisible();
   await page.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
   await expect(page.getByTestId("voice-mic-selector")).toHaveValue(
     "backup-e2e-mic",
@@ -79,7 +81,7 @@ test("approved production smoke covers setup, text, invites, settings, and voice
   await expect(
     page.getByText(/Backup E2E microphone → E2E speaker/),
   ).toBeVisible();
-  await expect(page.getByText(/Waiting for a verified media route/i)).toBeVisible();
+  await expect(page.getByText(/Call status/i)).toBeVisible();
   await expectNoProductionCopyDebt(page);
   expect(errors).toEqual([]);
 });

@@ -95,6 +95,8 @@ export async function bootReadyShell(page: Page) {
   await expect(
     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
   ).toBeVisible();
+  await page.getByLabel("Display name").first().fill("E2E User");
+  await page.getByLabel("Device name").first().fill("E2E Device");
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
     page.getByRole("heading", { name: /finish the local trust setup/i }),
