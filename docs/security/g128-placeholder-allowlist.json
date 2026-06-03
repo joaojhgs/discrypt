@@ -112,7 +112,7 @@
       "path": "apps/desktop/src-tauri/src/lib.rs",
       "pattern": "local-dev",
       "expected": "cfg!(any(test, feature = \"harness\", feature = \"local-dev\"))",
-      "reason": "The second local-dev cfg guard covers explicit text-runtime attachment gating; it is disabled in production builds and reviewed separately from app-state path overrides."
+      "reason": "Desktop has two audited local-dev feature gates: one for app-state env override and one for explicit text runtime attachment; both are disabled in production builds."
     },
     {
       "path": "apps/desktop/src-tauri/src/production_status.rs",
