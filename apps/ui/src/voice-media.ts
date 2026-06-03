@@ -154,7 +154,7 @@ export function startNativeRustVoiceMediaSession(
         sender_instance_id: senderInstanceId,
         kind: "candidate",
         candidate: {
-          candidate: `candidate:native-rust-webrtc-datachannel:${response.native_media.protected_frames_count}`,
+          candidate: `candidate:provider-signaled-native-rust-webrtc-datachannel:${response.native_media.protected_frames_count}`,
           sdpMid: "native-rust",
           sdpMLineIndex: 0,
         },

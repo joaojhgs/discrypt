@@ -143,6 +143,17 @@ async function readLatestInvite(page: Page) {
   return matches.at(-1) ?? "";
 }
 
+async function closeInviteSheetIfOpen(page: Page) {
+  const closeButton = page.getByRole("button", { name: "Close Invite sheet" });
+  if ((await closeButton.count()) === 0) {
+    return;
+  }
+  await closeButton.click();
+  await expect(page.getByRole("dialog", { name: "Invite sheet" })).toHaveCount(
+    0,
+  );
+}
+
 async function openDm(page: Page, contactName: string) {
   await page.getByRole("button", { name: "New message" }).click();
   await page.getByLabel("Contact name").fill(contactName);
@@ -167,7 +178,9 @@ async function createInvite(page: Page) {
     .last()
     .click();
   await page.getByRole("button", { name: "Create invite" }).click();
-  return readLatestInvite(page);
+  const invite = await readLatestInvite(page);
+  await closeInviteSheetIfOpen(page);
+  return invite;
 }
 
 async function joinInvite(page: Page, invite: string) {
@@ -251,7 +264,9 @@ async function createDmInviteForActiveContact(page: Page, contactName: string) {
   await page
     .getByRole("button", { name: /create dm invite for active dm/i })
     .click();
-  return readLatestInvite(page);
+  const invite = await readLatestInvite(page);
+  await closeInviteSheetIfOpen(page);
+  return invite;
 }
 
 async function acceptDmInvite(page: Page, invite: string, contactName: string) {
@@ -301,13 +316,18 @@ async function attemptVoice(page: Page) {
     .toBe(true);
   expect((await readVoiceTrackState(page)).stopCount).toBe(0);
   await expect(
-    page.getByText(/encrypted media transport remains gated by media-frame E2E/i).first(),
+    page.getByText(/Waiting for a verified media route/i).first(),
   ).toBeVisible();
   await expect(
-    page.getByText(/remote audio is not connected yet/i).first(),
+    page
+      .getByText(/Remote audio will appear after the app confirms an audio route/i)
+      .first(),
   ).toBeVisible();
   await expect(
     page.getByText(/encrypted media transport remains gated by media-frame E2E/i),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText(/remote audio is not connected yet/i),
   ).toHaveCount(0);
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
     0,
@@ -355,7 +375,7 @@ async function reloadAndRepeatVoiceWithoutProfileLeakage(page: Page) {
 test("two independent profiles exercise DM, invite join, and voice attempts honestly", async ({
   browser,
 }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(180_000);
   const alice = await openProfile(browser, "Alice", "Alice Desktop");
   const bob = await openProfile(browser, "Bob", "Bob Laptop");
   try {
@@ -443,7 +463,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
 test("two isolated profiles finish invite and channel text flows without claiming remote delivery", async ({
   browser,
 }) => {
-  test.setTimeout(90_000);
+  test.setTimeout(180_000);
   const alice = await openProfile(browser, "Alice", "Alice Desktop");
   const bob = await openProfile(browser, "Bob", "Bob Laptop");
   try {

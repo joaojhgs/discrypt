@@ -770,7 +770,7 @@ export type NativeVoiceMediaSignalPayload = {
   channel_id: string;
   from_peer_id: string;
   to_peer_id: string;
-  media_path: "native_rust_webrtc_datachannel" | string;
+  media_path: string;
   boundary: string;
   capture_source: string;
   rms_i16: number;
@@ -800,6 +800,11 @@ export type StartNativeVoiceMediaSessionResponse = {
 export type AcceptNativeVoiceMediaFrameRequest = {
   session_id: string;
   native_media: NativeVoiceMediaSignalPayload;
+  attached_at_ms: number;
+};
+
+export type AcceptNativeVoiceMediaSignalRequest = {
+  signal: VoiceSignalingMessageView;
   attached_at_ms: number;
 };
 
@@ -3558,6 +3563,23 @@ export async function acceptNativeVoiceMediaFrame(
         "accept_native_voice_media_frame",
         "native_voice_media_unavailable",
         "Local fallback web runtime cannot accept native Rust voice media; Tauri backend is required",
+        "Run the native Tauri app before claiming native Rust voice media proof",
+      );
+    }),
+  );
+}
+
+export async function acceptNativeVoiceMediaSignal(
+  request: AcceptNativeVoiceMediaSignalRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("accept_native_voice_media_signal", { request }, () =>
+    mutateFallback((state) => {
+      pushCommandError(
+        state,
+        "voice.native_media_rejected",
+        "accept_native_voice_media_signal",
+        "native_voice_media_unavailable",
+        "Local fallback web runtime cannot accept native Rust voice media signals; Tauri backend is required",
         "Run the native Tauri app before claiming native Rust voice media proof",
       );
     }),

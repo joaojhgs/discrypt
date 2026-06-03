@@ -73,12 +73,12 @@ code {
   background: hsl(var(--primary) / 0.25);
 }
 
-[data-template="compact-ops"] {
-  font-size: 14px;
+[data-template] {
+  font-size: var(--template-font-size, 16px);
 }
 
-[data-template="compact-ops"] .rounded-2xl {
-  border-radius: 0.9rem;
+[data-template] .rounded-2xl {
+  border-radius: var(--template-panel-radius, 1rem);
 }
 
 @media (max-width: 1279px) {

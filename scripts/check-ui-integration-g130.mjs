@@ -14,6 +14,7 @@ const files = {
   recoveryE2e: read("apps/ui/tests/e2e/recovery.spec.ts"),
   packageJson: read("apps/ui/package.json"),
   workflow: read(".github/workflows/ci.yml"),
+  styles: read("apps/ui/src/styles.css"),
 };
 const failures = [];
 
@@ -88,7 +89,22 @@ for (const token of [
   "compact-ops",
   "accentIntent",
   "no neon/purple gradients",
+  "shadcnComponentInventory",
+  "src/components/ui/button.tsx",
+  "src/components/ui/select.tsx",
+  "--template-shell-grid",
+  "--template-shell-grid-inspector",
+  "--template-panel-radius",
 ]) requireText("config", token);
+
+for (const token of [
+  "var(--template-shell-grid)",
+  "var(--template-shell-grid-inspector)",
+]) requireText("main", token);
+for (const token of [
+  "--template-font-size",
+  "--template-panel-radius",
+]) requireText("styles", token);
 
 for (const token of [
   "group invite join text channel and voice controls work without fake members",
