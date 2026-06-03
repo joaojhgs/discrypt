@@ -298,6 +298,9 @@ test("small-window navigation exposes setup groups invites text and voice withou
   // Coverage alias retained for command-coverage gate:
   // small-window navigation exposes topbar controls without overflow
   await page.setViewportSize({ width: 390, height: 820 });
+  await expect(page.locator('nav[aria-label="Workspace sections"]')).toHaveCount(
+    1,
+  );
   await expect(
     page.getByRole("button", { name: "Create group" }),
   ).toBeVisible();

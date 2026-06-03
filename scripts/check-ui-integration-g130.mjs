@@ -24,6 +24,12 @@ function requireText(file, token) {
 function forbidRegex(file, regex, label) {
   if (regex.test(files[file])) failures.push(`${file} must not contain ${label}`);
 }
+function requireCount(file, regex, expected, label) {
+  const observed = files[file].match(regex)?.length ?? 0;
+  if (observed !== expected) {
+    failures.push(`${file} must contain exactly ${expected} ${label}; observed ${observed}`);
+  }
+}
 
 for (const token of [
   '@/components/ui/avatar',
@@ -101,6 +107,9 @@ for (const token of [
   "var(--template-shell-grid)",
   "var(--template-shell-grid-inspector)",
 ]) requireText("main", token);
+requireCount("main", /<MobileWorkflowNav\b/g, 1, "mobile workflow navigation render");
+requireCount("main", /<RuntimeModeBanner\b/g, 1, "runtime mode banner render");
+requireCount("main", /<TransportStatusStrip\b/g, 1, "transport diagnostics strip render");
 for (const token of [
   "--template-font-size",
   "--template-panel-radius",
