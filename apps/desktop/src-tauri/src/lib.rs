@@ -125,6 +125,8 @@ const ABUSE_WINDOW_SECONDS: i64 = 60;
 const APP_EVENT_TAURI_TOPIC: &str = "app_event";
 const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
     "Provider-backed long-lived attachment is intentionally disabled while this app-service only owns short-lived transport probes; add persisted negotiated offer/answer/ICE bootstrap handoff and a persistent installed-app receiver loop for peer routing before attaching";
+const GROUP_PRESENCE_DEFAULT_TTL_SECONDS: i64 = 90;
+const GROUP_PRESENCE_MAX_TTL_SECONDS: i64 = 300;
 
 /// Desktop/Tauri wrapper around the Rust signaling protocol client.
 pub struct DesktopSignalingClient<T> {
@@ -309,6 +311,142 @@ pub struct GroupRuntimePeerView {
     pub source: String,
 }
 
+/// Backend-authorized group role. UI labels must be derived from this state, not local-only strings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRoleView {
+    Owner,
+    Staff,
+    Member,
+}
+
+impl Default for GroupRoleView {
+    fn default() -> Self {
+        Self::Member
+    }
+}
+
+impl GroupRoleView {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Staff => "staff",
+            Self::Member => "member",
+        }
+    }
+
+    fn can_manage_members(&self) -> bool {
+        matches!(self, Self::Owner | Self::Staff)
+    }
+}
+
+/// Group invite admission policy persisted with the roster/governance state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupAdmissionModeView {
+    /// Preserve existing invite behavior unless an owner/staff peer switches to manual approval.
+    AutomaticWhenAuthorizedOnline,
+    ManualApproval,
+}
+
+impl Default for GroupAdmissionModeView {
+    fn default() -> Self {
+        Self::AutomaticWhenAuthorizedOnline
+    }
+}
+
+/// Persisted group member roster row used by role checks, presence, and member-panel UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupMemberView {
+    pub member_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub role: GroupRoleView,
+    /// `online`, `offline`, `unknown`, or `revoked`; online requires a backend TTL heartbeat.
+    pub status: String,
+    #[serde(default)]
+    pub signer_public_key_hex: Option<String>,
+    pub joined_at: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub presence_expires_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub revoked_by: Option<String>,
+}
+
+/// Current group-wide role/admission policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupRolePolicyView {
+    pub admission_mode: GroupAdmissionModeView,
+    pub policy_epoch: u64,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+impl Default for GroupRolePolicyView {
+    fn default() -> Self {
+        Self {
+            admission_mode: GroupAdmissionModeView::default(),
+            policy_epoch: 1,
+            updated_by: "migration".to_owned(),
+            updated_at: "1970-01-01T00:00:00+00:00".to_owned(),
+        }
+    }
+}
+
+fn default_group_role_policy_view() -> GroupRolePolicyView {
+    GroupRolePolicyView::default()
+}
+
+/// Durable pre-admission request row. Approval/refusal logic is implemented by admission commands.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupAdmissionRequestView {
+    pub request_id: String,
+    pub group_id: String,
+    #[serde(default)]
+    pub invite_id: Option<String>,
+    pub display_name: String,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    pub member_identity: String,
+    pub signer_public_key_hex: String,
+    pub key_package: Vec<u8>,
+    pub status: String,
+    pub requested_at: String,
+    #[serde(default)]
+    pub decided_by: Option<String>,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub decision_reason: Option<String>,
+    pub policy_epoch_at_request: u64,
+    #[serde(default)]
+    pub admission_mode_at_request: Option<GroupAdmissionModeView>,
+}
+
+/// Append-only governance event summary for audit/reconciliation surfaces.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupGovernanceLogEntryView {
+    pub event_id: String,
+    pub group_id: String,
+    pub event_kind: String,
+    pub actor_member_id: String,
+    #[serde(default)]
+    pub target_member_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub role_before: Option<GroupRoleView>,
+    #[serde(default)]
+    pub role_after: Option<GroupRoleView>,
+    pub created_at: String,
+    pub summary: String,
+}
+
 /// Group/server row with stable identifiers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GroupView {
@@ -316,10 +454,22 @@ pub struct GroupView {
     pub group_id: String,
     /// Display name.
     pub name: String,
-    /// Local role label.
+    /// Legacy/current-member role label retained for compatibility; derive policy from `members`.
     pub role: String,
     /// Channels in this group.
     pub channels: Vec<ChannelStateView>,
+    /// Persisted roster containing backend-authorized group roles.
+    #[serde(default)]
+    pub members: Vec<GroupMemberView>,
+    /// Persisted admission/role policy for this group.
+    #[serde(default = "default_group_role_policy_view")]
+    pub role_policy: GroupRolePolicyView,
+    /// Durable pending/decided invite admission requests.
+    #[serde(default)]
+    pub admission_requests: Vec<GroupAdmissionRequestView>,
+    /// Append-only governance log used for reconciliation and audit UI.
+    #[serde(default)]
+    pub governance_log: Vec<GroupGovernanceLogEntryView>,
     /// Backend-returned local/remote runtime peers for attaching text/control DataChannels.
     #[serde(default)]
     pub runtime_peers: Vec<GroupRuntimePeerView>,
@@ -1071,6 +1221,9 @@ pub struct CreateGroupRequest {
     pub name: String,
     /// Default retention label for new text channels.
     pub retention: String,
+    /// Optional initial invite admission mode; omitted keeps existing automatic admission behavior.
+    #[serde(default)]
+    pub admission_mode: Option<GroupAdmissionModeView>,
     /// Optional production signaling adapter override for this group/invite scope.
     #[serde(default)]
     pub adapter_kind: Option<String>,
@@ -1112,6 +1265,69 @@ pub struct JoinGroupRequest {
     pub invite_code: String,
     /// Display label assigned to the joined group.
     pub group_name: Option<String>,
+}
+
+/// Request to change the invite admission mode for a group.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetGroupAdmissionModeRequest {
+    /// Group id whose invite admission mode should change.
+    pub group_id: String,
+    /// New admission mode.
+    pub admission_mode: GroupAdmissionModeView,
+}
+
+/// Request to approve a pending invite admission request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApproveGroupAdmissionRequest {
+    /// Group id containing the pending request.
+    pub group_id: String,
+    /// Request id to approve.
+    pub request_id: String,
+}
+
+/// Request to refuse a pending invite admission request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RefuseGroupAdmissionRequest {
+    /// Group id containing the pending request.
+    pub group_id: String,
+    /// Request id to refuse.
+    pub request_id: String,
+    /// Optional owner/staff visible reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Request to promote a group member to staff.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PromoteGroupMemberRequest {
+    pub group_id: String,
+    pub member_id: String,
+}
+
+/// Request to demote a staff member back to member.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DemoteGroupStaffRequest {
+    pub group_id: String,
+    pub member_id: String,
+}
+
+/// Request to revoke/kick a group member from app-level access.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevokeGroupMemberAccessRequest {
+    pub group_id: String,
+    pub member_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Request to publish a TTL-backed group presence heartbeat.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishGroupPresenceRequest {
+    pub group_id: String,
+    #[serde(default)]
+    pub member_id: Option<String>,
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
 }
 
 /// Request to create an invite for a group.
@@ -1231,6 +1447,22 @@ pub enum TextControlFrameView {
         /// TLS-serialized OpenMLS KeyPackage bytes.
         key_package: Vec<u8>,
     },
+    /// Owner/staff replicated admission decision for a pending request.
+    GroupAdmissionDecision {
+        /// Target group id from the signed invite.
+        group_id: String,
+        /// Durable request id produced from the joiner's key package identity.
+        request_id: String,
+        /// Whether the request was approved.
+        approved: bool,
+        /// Optional refusal reason.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Owner/staff actor member id.
+        decided_by: String,
+        /// RFC3339 decision timestamp.
+        decided_at: String,
+    },
     /// Owner response carrying an authorized OpenMLS Welcome for the joiner.
     OpenMlsAdmissionWelcome {
         /// Target group id from the signed invite.
@@ -1257,6 +1489,34 @@ pub enum TextControlFrameView {
         /// Recipient leaf/device slot that persisted the envelope.
         #[serde(default)]
         recipient_leaf: Option<u32>,
+    },
+    /// MLS-protected governance event indicating an owner changed a member role.
+    GroupMemberRoleChanged {
+        group_id: String,
+        event_id: String,
+        actor_member_id: String,
+        target_member_id: String,
+        role_before: GroupRoleView,
+        role_after: GroupRoleView,
+        created_at: String,
+    },
+    /// MLS-protected governance event indicating a member was fail-closed revoked.
+    GroupMemberRevoked {
+        group_id: String,
+        event_id: String,
+        actor_member_id: String,
+        target_member_id: String,
+        reason: Option<String>,
+        created_at: String,
+        crypto_removal_status: String,
+    },
+    /// MLS-protected signed presence heartbeat with backend TTL semantics.
+    GroupPresenceHeartbeat {
+        group_id: String,
+        event_id: String,
+        member_id: String,
+        last_seen_at: String,
+        presence_expires_at: String,
     },
     /// Backend-state-only browser media offer/answer/candidate message for the browser media runtime; this struct alone does not claim remote audio.
     VoiceSignal {
@@ -2577,6 +2837,7 @@ impl TauriAppService {
         {
             group.role = "member".to_owned();
         }
+        self.state.ensure_group_governance_defaults();
         self.state.push_event(
             "mls.admission_welcome_joined",
             format!(
@@ -3911,11 +4172,44 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
                     apply_app_connectivity_defaults(connectivity, &state.connectivity_defaults);
             }
             let runtime_peers = group_runtime_peers(Some(&connectivity), "owner");
+            let created_at = Utc::now().to_rfc3339();
+            let local_member_id = state.local_user_id();
+            let display_name = state
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| "Owner".to_owned());
+            let device_id = state
+                .devices
+                .iter()
+                .find(|device| device.local)
+                .map(|device| device.device_id.clone());
+            let role = GroupRoleView::Owner;
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "owner".to_owned(),
                 channels: default_group_channels(state.next_sequence),
+                members: vec![initial_group_member(
+                    &local_member_id,
+                    &display_name,
+                    device_id,
+                    role.clone(),
+                    &created_at,
+                )],
+                role_policy: initial_group_role_policy(
+                    request.admission_mode.clone().unwrap_or_default(),
+                    &local_member_id,
+                    &created_at,
+                ),
+                admission_requests: Vec::new(),
+                governance_log: initial_group_governance_log(
+                    &group_id,
+                    &local_member_id,
+                    role,
+                    &created_at,
+                    state.next_sequence,
+                ),
                 runtime_peers,
                 connectivity: Some(connectivity),
             });
@@ -4132,11 +4426,44 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 .map(|parsed| parsed.connectivity.clone())
                 .unwrap_or_else(|| group_connectivity_policy(&group_id));
             let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
+            let created_at = Utc::now().to_rfc3339();
+            let local_member_id = state.local_user_id();
+            let display_name = state
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| "Joining member".to_owned());
+            let device_id = state
+                .devices
+                .iter()
+                .find(|device| device.local)
+                .map(|device| device.device_id.clone());
+            let role = GroupRoleView::Member;
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "member".to_owned(),
                 channels: default_group_channels(state.next_sequence),
+                members: vec![initial_group_member(
+                    &local_member_id,
+                    &display_name,
+                    device_id,
+                    role.clone(),
+                    &created_at,
+                )],
+                role_policy: initial_group_role_policy(
+                    GroupAdmissionModeView::default(),
+                    &local_member_id,
+                    &created_at,
+                ),
+                admission_requests: Vec::new(),
+                governance_log: initial_group_governance_log(
+                    &group_id,
+                    &local_member_id,
+                    role,
+                    &created_at,
+                    state.next_sequence,
+                ),
                 runtime_peers,
                 connectivity: Some(connectivity),
             });
@@ -4148,6 +4475,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 existing_group.connectivity = Some(parsed.connectivity.clone());
             }
         }
+        state.ensure_group_governance_defaults();
         let active_group_id = state
             .groups
             .iter()
@@ -4217,6 +4545,693 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 "Joined {} via {}",
                 redacted_observable_ref("group", &name),
                 redacted_observable_ref("invite", &invite_code)
+            ),
+        );
+    })
+}
+
+/// Tauri command: update the invite admission mode for a group.
+pub fn set_group_admission_mode(request: SetGroupAdmissionModeRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        if let Err(error) = state.local_actor_can_decide_group_admission(&request.group_id) {
+            state.push_command_error(
+                "group.admission_mode_rejected",
+                "set_group_admission_mode",
+                "admission_mode_unauthorized",
+                error,
+                "Only owner or staff can change invite admission mode",
+            );
+            return;
+        }
+        let local_member_id = state.local_user_id();
+        let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+        else {
+            state.push_command_error(
+                "group.admission_mode_rejected",
+                "set_group_admission_mode",
+                "group_not_found",
+                "Requested group does not exist",
+                "Select an existing group before changing admission mode",
+            );
+            return;
+        };
+        if group.role_policy.admission_mode != request.admission_mode {
+            group.role_policy.admission_mode = request.admission_mode.clone();
+            group.role_policy.policy_epoch = group.role_policy.policy_epoch.saturating_add(1);
+            group.role_policy.updated_by = local_member_id.clone();
+            group.role_policy.updated_at = Utc::now().to_rfc3339();
+            group.governance_log.push(GroupGovernanceLogEntryView {
+                event_id: stable_id(
+                    "governance",
+                    &format!("{}:{}:admission_mode", request.group_id, local_member_id),
+                    state.next_sequence,
+                ),
+                group_id: request.group_id.clone(),
+                event_kind: "admission_mode_updated".to_owned(),
+                actor_member_id: local_member_id,
+                target_member_id: None,
+                request_id: None,
+                role_before: None,
+                role_after: None,
+                created_at: group.role_policy.updated_at.clone(),
+                summary: format!("Admission mode changed to {:?}", request.admission_mode),
+            });
+        }
+        state.push_event(
+            "group.admission_mode_updated",
+            format!(
+                "Admission mode for {} is now {:?}",
+                redacted_observable_ref("group", &request.group_id),
+                request.admission_mode
+            ),
+        );
+    })
+}
+
+/// Tauri command: approve a pending invite admission request and generate an OpenMLS Welcome.
+pub fn approve_group_admission_request(request: ApproveGroupAdmissionRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        if let Err(error) = state.local_actor_can_decide_group_admission(&request.group_id) {
+            state.push_command_error(
+                "group.admission_decision_rejected",
+                "approve_group_admission_request",
+                "admission_decision_unauthorized",
+                error,
+                "Only owner or staff can approve pending admission requests",
+            );
+            return;
+        }
+        let pending = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == request.group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|item| item.request_id == request.request_id && item.status == "pending")
+                    .cloned()
+            });
+        let Some(pending) = pending else {
+            state.push_command_error(
+                "group.admission_decision_rejected",
+                "approve_group_admission_request",
+                "admission_request_not_pending",
+                "Admission request is missing or already decided",
+                "Refresh pending requests before approving",
+            );
+            return;
+        };
+        let welcome = match state.openmls_admission_welcome_from_frame(
+            &pending.group_id,
+            &pending.member_identity,
+            &pending.signer_public_key_hex,
+            &pending.key_package,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                state.push_command_error(
+                    "group.admission_decision_rejected",
+                    "approve_group_admission_request",
+                    "openmls_admission_welcome_failed",
+                    error,
+                    "Only mark admission approved after OpenMLS Welcome generation succeeds",
+                );
+                return;
+            }
+        };
+        let decided_by = state.local_user_id();
+        let decided_at = Utc::now().to_rfc3339();
+        if let Err(error) = state.mark_group_admission_decision(
+            &request.group_id,
+            &request.request_id,
+            true,
+            &decided_by,
+            &decided_at,
+            None,
+        ) {
+            state.push_command_error(
+                "group.admission_decision_rejected",
+                "approve_group_admission_request",
+                "admission_request_update_failed",
+                error,
+                "Retry approval after refreshing pending requests",
+            );
+            return;
+        }
+        for (suffix, frame) in [
+            (
+                "decision",
+                TextControlFrameView::GroupAdmissionDecision {
+                    group_id: request.group_id.clone(),
+                    request_id: request.request_id.clone(),
+                    approved: true,
+                    reason: None,
+                    decided_by,
+                    decided_at,
+                },
+            ),
+            ("welcome", welcome),
+        ] {
+            match text_control_frame_sha256(&frame) {
+                Ok(frame_sha256) => state.text_control_outbox.push(TextControlOutboxRecord {
+                    message_id: stable_id(
+                        &format!("group-admission-approval-{suffix}"),
+                        &format!("{}:{}", request.group_id, request.request_id),
+                        state.next_sequence,
+                    ),
+                    target: MessageTargetView {
+                        kind: "channel".to_owned(),
+                        dm_id: None,
+                        group_id: Some(request.group_id.clone()),
+                        channel_id: None,
+                    },
+                    frame,
+                    frame_sha256,
+                    attempts: 0,
+                    state_key: "pending".to_owned(),
+                    last_transport_session_id: None,
+                }),
+                Err(error) => state.push_command_error(
+                    "group.admission_decision_rejected",
+                    "approve_group_admission_request",
+                    "admission_frame_hash_failed",
+                    error,
+                    "Retry approval after the decision frame can be serialized",
+                ),
+            }
+        }
+        state.push_event(
+            "group.admission_request_approved",
+            format!(
+                "Approved admission request {}",
+                redacted_observable_ref("request", &request.request_id)
+            ),
+        );
+    })
+}
+
+/// Tauri command: refuse a pending invite admission request without deleting it.
+pub fn refuse_group_admission_request(request: RefuseGroupAdmissionRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        if let Err(error) = state.local_actor_can_decide_group_admission(&request.group_id) {
+            state.push_command_error(
+                "group.admission_decision_rejected",
+                "refuse_group_admission_request",
+                "admission_decision_unauthorized",
+                error,
+                "Only owner or staff can refuse pending admission requests",
+            );
+            return;
+        }
+        let decided_by = state.local_user_id();
+        let decided_at = Utc::now().to_rfc3339();
+        let reason = request
+            .reason
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        if let Err(error) = state.mark_group_admission_decision(
+            &request.group_id,
+            &request.request_id,
+            false,
+            &decided_by,
+            &decided_at,
+            reason.clone(),
+        ) {
+            state.push_command_error(
+                "group.admission_decision_rejected",
+                "refuse_group_admission_request",
+                "admission_request_update_failed",
+                error,
+                "Refresh pending requests before refusing",
+            );
+            return;
+        }
+        let frame = TextControlFrameView::GroupAdmissionDecision {
+            group_id: request.group_id.clone(),
+            request_id: request.request_id.clone(),
+            approved: false,
+            reason,
+            decided_by,
+            decided_at,
+        };
+        match text_control_frame_sha256(&frame) {
+            Ok(frame_sha256) => state.text_control_outbox.push(TextControlOutboxRecord {
+                message_id: stable_id(
+                    "group-admission-refusal",
+                    &format!("{}:{}", request.group_id, request.request_id),
+                    state.next_sequence,
+                ),
+                target: MessageTargetView {
+                    kind: "channel".to_owned(),
+                    dm_id: None,
+                    group_id: Some(request.group_id.clone()),
+                    channel_id: None,
+                },
+                frame,
+                frame_sha256,
+                attempts: 0,
+                state_key: "pending".to_owned(),
+                last_transport_session_id: None,
+            }),
+            Err(error) => state.push_command_error(
+                "group.admission_decision_rejected",
+                "refuse_group_admission_request",
+                "admission_frame_hash_failed",
+                error,
+                "Retry refusal after the decision frame can be serialized",
+            ),
+        }
+        state.push_event(
+            "group.admission_request_refused",
+            format!(
+                "Refused admission request {}",
+                redacted_observable_ref("request", &request.request_id)
+            ),
+        );
+    })
+}
+
+/// Tauri command: promote a member to staff.
+pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let actor = state.local_user_id();
+        let now = Utc::now().to_rfc3339();
+        let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+        else {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "group_not_found",
+                "Requested group does not exist",
+                "Select an existing group before changing member roles",
+            );
+            return;
+        };
+        let actor_role = group
+            .members
+            .iter()
+            .find(|member| member.member_id == actor && member.status != "revoked")
+            .map(|member| member.role.clone());
+        if actor_role != Some(GroupRoleView::Owner) {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "owner_required",
+                "Only the group owner can promote staff",
+                "Ask the owner to promote this member",
+            );
+            return;
+        }
+        let Some(member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == request.member_id)
+        else {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "member_not_found",
+                "Requested member is not in this group",
+                "Refresh the member list before changing roles",
+            );
+            return;
+        };
+        if member.status == "revoked" {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "member_revoked",
+                "Revoked members cannot be promoted",
+                "Re-add the member through the admission flow first",
+            );
+            return;
+        }
+        if member.role == GroupRoleView::Owner {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "owner_immutable",
+                "The group owner role cannot be promoted",
+                "Owner transfer is a future governance flow",
+            );
+            return;
+        }
+        let before = member.role.clone();
+        if before != GroupRoleView::Staff {
+            member.role = GroupRoleView::Staff;
+        }
+        let id = governance_event_id(
+            &request.group_id,
+            "member.promoted",
+            &request.member_id,
+            state.next_sequence,
+        );
+        group.governance_log.push(governance_log_entry(
+            &id,
+            &request.group_id,
+            "member.promoted",
+            &actor,
+            Some(&request.member_id),
+            Some(before.clone()),
+            Some(GroupRoleView::Staff),
+            &now,
+            "Promoted member to staff",
+        ));
+        let frame = TextControlFrameView::GroupMemberRoleChanged {
+            group_id: request.group_id.clone(),
+            event_id: id.clone(),
+            actor_member_id: actor.clone(),
+            target_member_id: request.member_id.clone(),
+            role_before: before,
+            role_after: GroupRoleView::Staff,
+            created_at: now,
+        };
+        if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "governance_frame_queue_failed",
+                error,
+                "Retry after text/control governance serialization is available",
+            );
+            return;
+        }
+        state.push_event(
+            "group.member_promoted",
+            format!(
+                "Promoted {} to staff",
+                redacted_observable_ref("member", &request.member_id)
+            ),
+        );
+    })
+}
+
+/// Tauri command: demote a staff member to member.
+pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let actor = state.local_user_id();
+        let now = Utc::now().to_rfc3339();
+        let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+        else {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "group_not_found",
+                "Requested group does not exist",
+                "Select an existing group before changing member roles",
+            );
+            return;
+        };
+        let actor_role = group
+            .members
+            .iter()
+            .find(|member| member.member_id == actor && member.status != "revoked")
+            .map(|member| member.role.clone());
+        if actor_role != Some(GroupRoleView::Owner) {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "owner_required",
+                "Only the group owner can demote staff",
+                "Ask the owner to demote this staff member",
+            );
+            return;
+        }
+        let Some(member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == request.member_id)
+        else {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "member_not_found",
+                "Requested member is not in this group",
+                "Refresh the member list before changing roles",
+            );
+            return;
+        };
+        if member.role != GroupRoleView::Staff {
+            return;
+        }
+        let before = member.role.clone();
+        member.role = GroupRoleView::Member;
+        let id = governance_event_id(
+            &request.group_id,
+            "member.demoted",
+            &request.member_id,
+            state.next_sequence,
+        );
+        group.governance_log.push(governance_log_entry(
+            &id,
+            &request.group_id,
+            "member.demoted",
+            &actor,
+            Some(&request.member_id),
+            Some(before.clone()),
+            Some(GroupRoleView::Member),
+            &now,
+            "Demoted staff to member",
+        ));
+        let frame = TextControlFrameView::GroupMemberRoleChanged {
+            group_id: request.group_id.clone(),
+            event_id: id.clone(),
+            actor_member_id: actor.clone(),
+            target_member_id: request.member_id.clone(),
+            role_before: before,
+            role_after: GroupRoleView::Member,
+            created_at: now,
+        };
+        if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "governance_frame_queue_failed",
+                error,
+                "Retry after text/control governance serialization is available",
+            );
+            return;
+        }
+        state.push_event(
+            "group.member_demoted",
+            format!(
+                "Demoted {} to member",
+                redacted_observable_ref("member", &request.member_id)
+            ),
+        );
+    })
+}
+
+/// Tauri command: revoke/kick a group member from app-level access.
+pub fn revoke_group_member_access(request: RevokeGroupMemberAccessRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let actor = state.local_user_id();
+        let now = Utc::now().to_rfc3339();
+        let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+        else {
+            state.push_command_error(
+                "group.member_revoke_rejected",
+                "revoke_group_member_access",
+                "group_not_found",
+                "Requested group does not exist",
+                "Select an existing group before revoking access",
+            );
+            return;
+        };
+        let actor_role = group
+            .members
+            .iter()
+            .find(|member| member.member_id == actor && member.status != "revoked")
+            .map(|member| member.role.clone());
+        let Some(member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == request.member_id)
+        else {
+            state.push_command_error(
+                "group.member_revoke_rejected",
+                "revoke_group_member_access",
+                "member_not_found",
+                "Requested member is not in this group",
+                "Refresh the member list before revoking access",
+            );
+            return;
+        };
+        let allowed = match actor_role {
+            Some(GroupRoleView::Owner) => {
+                member.role != GroupRoleView::Owner && member.member_id != actor
+            }
+            Some(GroupRoleView::Staff) => {
+                member.role == GroupRoleView::Member && member.member_id != actor
+            }
+            _ => false,
+        };
+        if !allowed {
+            state.push_command_error(
+                "group.member_revoke_rejected",
+                "revoke_group_member_access",
+                "unauthorized_revoke",
+                "This role cannot revoke the selected member",
+                "Owners can revoke staff or members; staff can revoke members only",
+            );
+            return;
+        }
+        let before = member.role.clone();
+        member.status = "revoked".to_owned();
+        member.revoked_at = Some(now.clone());
+        member.revoked_by = Some(actor.clone());
+        member.last_seen_at = None;
+        member.presence_expires_at = None;
+        let id = governance_event_id(
+            &request.group_id,
+            "member.revoked",
+            &request.member_id,
+            state.next_sequence,
+        );
+        group.governance_log.push(governance_log_entry(&id, &request.group_id, "member.revoked", &actor, Some(&request.member_id), Some(before), None, &now, "Revoked member access fail-closed at app state; MLS removal is a documented crypto gap"));
+        let frame = TextControlFrameView::GroupMemberRevoked {
+            group_id: request.group_id.clone(),
+            event_id: id.clone(),
+            actor_member_id: actor.clone(),
+            target_member_id: request.member_id.clone(),
+            reason: request.reason.clone(),
+            created_at: now.clone(),
+            crypto_removal_status: "fail_closed_app_state_only_openmls_remove_member_not_available"
+                .to_owned(),
+        };
+        if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
+            state.push_command_error(
+                "group.member_revoke_rejected",
+                "revoke_group_member_access",
+                "governance_frame_queue_failed",
+                error,
+                "Retry after text/control governance serialization is available",
+            );
+            return;
+        }
+        state.push_event(
+            "group.member_revoked",
+            "Revoked member access fail-closed; MLS removal is a documented crypto gap",
+        );
+    })
+}
+
+/// Tauri command: publish a TTL-backed group presence heartbeat.
+pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateView {
+    mutate_app_service(|state| {
+        state.ensure_ready_profile();
+        let member_id = request
+            .member_id
+            .clone()
+            .unwrap_or_else(|| state.local_user_id());
+        let now = Utc::now();
+        let ttl = request
+            .ttl_seconds
+            .unwrap_or(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)
+            .clamp(30, GROUP_PRESENCE_MAX_TTL_SECONDS);
+        let expires = now + chrono::Duration::seconds(ttl);
+        let now_string = now.to_rfc3339();
+        let expires_string = expires.to_rfc3339();
+        let event_id = governance_event_id(
+            &request.group_id,
+            "presence.heartbeat",
+            &member_id,
+            state.next_sequence,
+        );
+        let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+        else {
+            state.push_command_error(
+                "group.presence_rejected",
+                "publish_group_presence",
+                "group_not_found",
+                "Requested group does not exist",
+                "Select an existing group before publishing presence",
+            );
+            return;
+        };
+        let Some(member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == member_id)
+        else {
+            state.push_command_error(
+                "group.presence_rejected",
+                "publish_group_presence",
+                "member_not_found",
+                "Presence member is not in this group",
+                "Refresh group membership before publishing presence",
+            );
+            return;
+        };
+        if member.status == "revoked" {
+            state.push_command_error(
+                "group.presence_rejected",
+                "publish_group_presence",
+                "member_revoked",
+                "Revoked members cannot publish presence",
+                "Ask an owner/staff member to re-admit this profile",
+            );
+            return;
+        }
+        member.status = "online".to_owned();
+        member.last_seen_at = Some(now_string.clone());
+        member.presence_expires_at = Some(expires_string.clone());
+        group.governance_log.push(governance_log_entry(
+            &event_id,
+            &request.group_id,
+            "presence.heartbeat",
+            &member_id,
+            Some(&member_id),
+            None,
+            None,
+            &now_string,
+            "Published TTL-backed group presence heartbeat",
+        ));
+        let frame = TextControlFrameView::GroupPresenceHeartbeat {
+            group_id: request.group_id.clone(),
+            event_id: event_id.clone(),
+            member_id: member_id.clone(),
+            last_seen_at: now_string.clone(),
+            presence_expires_at: expires_string,
+        };
+        if let Err(error) = queue_group_governance_frame(state, &request.group_id, &event_id, frame)
+        {
+            state.push_command_error(
+                "group.presence_rejected",
+                "publish_group_presence",
+                "governance_frame_queue_failed",
+                error,
+                "Retry after text/control governance serialization is available",
+            );
+            return;
+        }
+        state.push_event(
+            "group.presence",
+            format!(
+                "Published presence for {}",
+                redacted_observable_ref("member", &member_id)
             ),
         );
     })
@@ -4711,6 +5726,27 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
 pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
+        let local_member_id = state.local_user_id();
+        let local_display = profile_display_name(state);
+        ensure_group_governance_defaults(state, &request.group_id, &local_member_id, local_display);
+        if let Some(group) = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == request.group_id)
+        {
+            let allowed = local_role_for_group(group, &local_member_id)
+                .is_some_and(GroupRoleView::can_manage_members);
+            if !allowed {
+                state.push_command_error(
+                    "channel.rejected",
+                    "create_channel",
+                    "staff_required",
+                    "Only owner or staff can create group channels",
+                    "Ask an owner/staff member to create the channel",
+                );
+                return;
+            }
+        }
         let channel_id = stable_id("channel", &request.name, state.next_sequence);
         let channel = ChannelStateView {
             channel_id: channel_id.clone(),
@@ -4771,6 +5807,16 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                 "message_empty",
                 "Empty message was not sent",
                 "Type a non-empty message before sending",
+            );
+            return;
+        }
+        if let Err(error) = ensure_text_target_not_revoked(state, &request.target) {
+            state.push_command_error(
+                "message.rejected",
+                "send_message",
+                "member_revoked",
+                error,
+                "Ask an owner/staff member to restore access in a future MLS add flow before sending group text",
             );
             return;
         }
@@ -5103,6 +6149,16 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
         let session_id = stable_voice_session_id(&request.group_id, &request.channel_id);
+        if let Err(error) = ensure_group_sender_not_revoked(state, &request.group_id) {
+            state.push_command_error(
+                "voice.rejected",
+                "join_voice",
+                "member_revoked",
+                error,
+                "Ask an owner/staff member to restore access in a future MLS add flow before joining voice",
+            );
+            return;
+        }
         let selection = voice_device_selection(&request);
         let capture_allowed = selection.can_join_voice();
         let self_muted = state
@@ -5882,6 +6938,76 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn set_group_admission_mode(
+        app_handle: tauri::AppHandle,
+        request: SetGroupAdmissionModeRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::set_group_admission_mode(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn approve_group_admission_request(
+        app_handle: tauri::AppHandle,
+        request: ApproveGroupAdmissionRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::approve_group_admission_request(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn refuse_group_admission_request(
+        app_handle: tauri::AppHandle,
+        request: RefuseGroupAdmissionRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::refuse_group_admission_request(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn promote_group_member_to_staff(
+        app_handle: tauri::AppHandle,
+        request: PromoteGroupMemberRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::promote_group_member_to_staff(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn demote_group_staff_to_member(
+        app_handle: tauri::AppHandle,
+        request: DemoteGroupStaffRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::demote_group_staff_to_member(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn revoke_group_member_access(
+        app_handle: tauri::AppHandle,
+        request: RevokeGroupMemberAccessRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::revoke_group_member_access(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn publish_group_presence(
+        app_handle: tauri::AppHandle,
+        request: PublishGroupPresenceRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::publish_group_presence(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn create_invite(
         app_handle: tauri::AppHandle,
         request: CreateInviteRequest,
@@ -6152,6 +7278,13 @@ pub fn run() {
             ipc_commands::set_active_channel,
             ipc_commands::set_active_dm,
             ipc_commands::join_group,
+            ipc_commands::set_group_admission_mode,
+            ipc_commands::approve_group_admission_request,
+            ipc_commands::refuse_group_admission_request,
+            ipc_commands::promote_group_member_to_staff,
+            ipc_commands::demote_group_staff_to_member,
+            ipc_commands::revoke_group_member_access,
+            ipc_commands::publish_group_presence,
             ipc_commands::create_invite,
             ipc_commands::create_dm_invite,
             ipc_commands::accept_dm_invite,
@@ -6285,6 +7418,80 @@ impl PersistedAppState {
         }
     }
 
+    fn ensure_group_governance_defaults(&mut self) {
+        let migrated_at = Utc::now().to_rfc3339();
+        let local_member_id = self.local_user_id();
+        let local_display_name = self
+            .profile
+            .as_ref()
+            .map(|profile| profile.display_name.clone())
+            .unwrap_or_else(|| "Local member".to_owned());
+        let local_device_id = self
+            .devices
+            .iter()
+            .find(|device| device.local)
+            .map(|device| device.device_id.clone());
+        let sequence = self.next_sequence;
+
+        for group in &mut self.groups {
+            if group.role_policy.updated_by == "migration"
+                || group.role_policy.updated_at == "1970-01-01T00:00:00+00:00"
+            {
+                group.role_policy.updated_by = local_member_id.clone();
+                group.role_policy.updated_at = migrated_at.clone();
+            }
+            if group.role_policy.policy_epoch == 0 {
+                group.role_policy.policy_epoch = 1;
+            }
+            if group.members.is_empty() {
+                group.members.push(GroupMemberView {
+                    member_id: local_member_id.clone(),
+                    display_name: local_display_name.clone(),
+                    device_id: local_device_id.clone(),
+                    role: group_role_from_legacy_label(&group.role),
+                    status: "unknown".to_owned(),
+                    signer_public_key_hex: None,
+                    joined_at: migrated_at.clone(),
+                    last_seen_at: None,
+                    presence_expires_at: None,
+                    revoked_at: None,
+                    revoked_by: None,
+                });
+            }
+            if let Some(local_member) = group
+                .members
+                .iter()
+                .find(|member| member.member_id == local_member_id && member.revoked_at.is_none())
+            {
+                group.role = group_role_label(&local_member.role).to_owned();
+            }
+            if group.governance_log.is_empty() {
+                group.governance_log.push(GroupGovernanceLogEntryView {
+                    event_id: stable_id(
+                        "governance",
+                        &format!("{}:initialized", group.group_id),
+                        sequence,
+                    ),
+                    group_id: group.group_id.clone(),
+                    event_kind: "group_governance_initialized".to_owned(),
+                    actor_member_id: local_member_id.clone(),
+                    target_member_id: Some(local_member_id.clone()),
+                    request_id: None,
+                    role_before: None,
+                    role_after: group
+                        .members
+                        .iter()
+                        .find(|member| member.member_id == local_member_id)
+                        .map(|member| member.role.clone()),
+                    created_at: migrated_at.clone(),
+                    summary:
+                        "Initialized persisted governance defaults for an existing local group"
+                            .to_owned(),
+                });
+            }
+        }
+    }
+
     fn ensure_openmls_group(&mut self, group_id: &str) -> Result<(), String> {
         if self
             .openmls_groups
@@ -6375,6 +7582,171 @@ impl PersistedAppState {
             )
             .map_err(|error| format!("OpenMLS text exporter failed: {error}"))?;
         Ok((exporter, snapshot.epoch, handle.local_leaf))
+    }
+
+    fn admission_request_id(
+        group_id: &str,
+        member_identity: &str,
+        signer_public_key_hex: &str,
+    ) -> String {
+        stable_id(
+            "group-admission-request",
+            &format!("{group_id}:{member_identity}:{signer_public_key_hex}"),
+            0,
+        )
+    }
+
+    fn local_actor_can_decide_group_admission(&self, group_id: &str) -> Result<(), String> {
+        let local_member_id = self.local_user_id();
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "Group does not exist".to_owned())?;
+        let role = group
+            .members
+            .iter()
+            .find(|member| member.member_id == local_member_id && member.status != "revoked")
+            .map(|member| member.role.clone())
+            .unwrap_or_else(|| group_role_from_legacy_label(&group.role));
+        match role {
+            GroupRoleView::Owner | GroupRoleView::Staff => Ok(()),
+            GroupRoleView::Member => {
+                Err("Only owner or staff can decide admission requests".to_owned())
+            }
+        }
+    }
+
+    fn upsert_pending_group_admission_request(
+        &mut self,
+        group_id: &str,
+        member_identity: &str,
+        signer_public_key_hex: &str,
+        key_package: &[u8],
+    ) -> Result<String, String> {
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| format!("Group {group_id} does not exist for admission request"))?;
+        let request_id =
+            Self::admission_request_id(group_id, member_identity, signer_public_key_hex);
+        if let Some(existing) = group
+            .admission_requests
+            .iter_mut()
+            .find(|request| request.request_id == request_id)
+        {
+            if existing.status == "pending" {
+                existing.key_package = key_package.to_vec();
+            }
+            return Ok(request_id);
+        }
+        let requested_at = Utc::now().to_rfc3339();
+        group.admission_requests.push(GroupAdmissionRequestView {
+            request_id: request_id.clone(),
+            group_id: group_id.to_owned(),
+            invite_id: None,
+            display_name: member_identity.to_owned(),
+            device_name: None,
+            member_identity: member_identity.to_owned(),
+            signer_public_key_hex: signer_public_key_hex.to_owned(),
+            key_package: key_package.to_vec(),
+            status: "pending".to_owned(),
+            requested_at: requested_at.clone(),
+            decided_by: None,
+            decided_at: None,
+            decision_reason: None,
+            policy_epoch_at_request: group.role_policy.policy_epoch,
+            admission_mode_at_request: Some(group.role_policy.admission_mode.clone()),
+        });
+        group.governance_log.push(GroupGovernanceLogEntryView {
+            event_id: stable_id(
+                "governance",
+                &format!("{group_id}:{request_id}:pending"),
+                self.next_sequence,
+            ),
+            group_id: group_id.to_owned(),
+            event_kind: "admission_request_pending".to_owned(),
+            actor_member_id: member_identity.to_owned(),
+            target_member_id: None,
+            request_id: Some(request_id.clone()),
+            role_before: None,
+            role_after: None,
+            created_at: requested_at,
+            summary: "Persisted invite-derived admission request awaiting owner/staff decision"
+                .to_owned(),
+        });
+        self.push_event(
+            "group.admission_request_pending",
+            format!(
+                "Queued pending admission request for {}",
+                redacted_observable_ref("group", group_id)
+            ),
+        );
+        Ok(request_id)
+    }
+
+    fn mark_group_admission_decision(
+        &mut self,
+        group_id: &str,
+        request_id: &str,
+        approved: bool,
+        decided_by: &str,
+        decided_at: &str,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "Group does not exist for admission decision".to_owned())?;
+        let request = group
+            .admission_requests
+            .iter_mut()
+            .find(|request| request.request_id == request_id)
+            .ok_or_else(|| "Admission request does not exist".to_owned())?;
+        if request.status != "pending" {
+            return Err(format!(
+                "Admission request {request_id} is already {}",
+                request.status
+            ));
+        }
+        request.status = if approved { "approved" } else { "refused" }.to_owned();
+        request.decided_by = Some(decided_by.to_owned());
+        request.decided_at = Some(decided_at.to_owned());
+        request.decision_reason = reason.clone();
+        group.governance_log.push(GroupGovernanceLogEntryView {
+            event_id: stable_id(
+                "governance",
+                &format!("{group_id}:{request_id}:decision"),
+                self.next_sequence,
+            ),
+            group_id: group_id.to_owned(),
+            event_kind: if approved {
+                "admission_request_approved"
+            } else {
+                "admission_request_refused"
+            }
+            .to_owned(),
+            actor_member_id: decided_by.to_owned(),
+            target_member_id: None,
+            request_id: Some(request_id.to_owned()),
+            role_before: None,
+            role_after: if approved {
+                Some(GroupRoleView::Member)
+            } else {
+                None
+            },
+            created_at: decided_at.to_owned(),
+            summary: reason.unwrap_or_else(|| {
+                if approved {
+                    "Approved pending invite admission request".to_owned()
+                } else {
+                    "Refused pending invite admission request".to_owned()
+                }
+            }),
+        });
+        Ok(())
     }
 
     fn queue_openmls_admission_key_package(&mut self, group_id: &str) -> Result<(), String> {
@@ -6628,7 +8000,12 @@ impl PersistedAppState {
             profile: self.profile.clone(),
             preferences: self.preferences.clone(),
             dms: self.dms.clone(),
-            groups: self.groups.clone(),
+            groups: self
+                .groups
+                .iter()
+                .cloned()
+                .map(group_with_effective_presence)
+                .collect(),
             connectivity_defaults: self.connectivity_defaults.clone(),
             active_context: self.active_context.clone(),
             messages: self.messages.clone(),
@@ -8747,24 +10124,76 @@ impl PersistedAppState {
                 member_identity,
                 signer_public_key_hex,
                 key_package,
-            } => match self.openmls_admission_welcome_from_frame(
-                &group_id,
-                &member_identity,
-                &signer_public_key_hex,
-                &key_package,
-            ) {
-                Ok(frame) => Some(frame),
-                Err(error) => {
-                    self.push_command_error(
-                        "mls.admission_rejected",
-                        "handle_text_control_frame",
-                        "openmls_admission_welcome_failed",
-                        error,
-                        "Only admit joiners when the owner has persisted OpenMLS group state",
-                    );
+            } => {
+                let admission_mode = self
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == group_id)
+                    .map(|group| group.role_policy.admission_mode.clone())
+                    .unwrap_or_default();
+                if admission_mode == GroupAdmissionModeView::ManualApproval {
+                    if let Err(error) = self.upsert_pending_group_admission_request(
+                        &group_id,
+                        &member_identity,
+                        &signer_public_key_hex,
+                        &key_package,
+                    ) {
+                        self.push_command_error(
+                            "group.admission_request_rejected",
+                            "handle_text_control_frame",
+                            "admission_request_persist_failed",
+                            error,
+                            "Persist the pending request before any owner/staff approval can issue a Welcome",
+                        );
+                    }
                     None
+                } else {
+                    match self.openmls_admission_welcome_from_frame(
+                        &group_id,
+                        &member_identity,
+                        &signer_public_key_hex,
+                        &key_package,
+                    ) {
+                        Ok(frame) => Some(frame),
+                        Err(error) => {
+                            self.push_command_error(
+                                "mls.admission_rejected",
+                                "handle_text_control_frame",
+                                "openmls_admission_welcome_failed",
+                                error,
+                                "Only admit joiners when the owner has persisted OpenMLS group state",
+                            );
+                            None
+                        }
+                    }
                 }
-            },
+            }
+            TextControlFrameView::GroupAdmissionDecision {
+                group_id,
+                request_id,
+                approved,
+                reason,
+                decided_by,
+                decided_at,
+            } => {
+                if let Err(error) = self.mark_group_admission_decision(
+                    &group_id,
+                    &request_id,
+                    approved,
+                    &decided_by,
+                    &decided_at,
+                    reason,
+                ) {
+                    self.push_command_error(
+                        "group.admission_decision_rejected",
+                        "handle_text_control_frame",
+                        "admission_decision_apply_failed",
+                        error,
+                        "Refresh pending admission state before applying duplicate decisions",
+                    );
+                }
+                None
+            }
             TextControlFrameView::OpenMlsAdmissionWelcome {
                 group_id,
                 owner_signer_public_key_hex: _,
@@ -8812,6 +10241,63 @@ impl PersistedAppState {
                     }
                     Err(_) => None,
                 }
+            }
+            TextControlFrameView::GroupMemberRoleChanged {
+                group_id,
+                event_id,
+                actor_member_id,
+                target_member_id,
+                role_before,
+                role_after,
+                created_at,
+            } => {
+                apply_group_member_role_changed(
+                    self,
+                    &group_id,
+                    &event_id,
+                    &actor_member_id,
+                    &target_member_id,
+                    role_before,
+                    role_after,
+                    &created_at,
+                );
+                None
+            }
+            TextControlFrameView::GroupMemberRevoked {
+                group_id,
+                event_id,
+                actor_member_id,
+                target_member_id,
+                reason: _,
+                created_at,
+                crypto_removal_status: _,
+            } => {
+                apply_group_member_revoked(
+                    self,
+                    &group_id,
+                    &event_id,
+                    &actor_member_id,
+                    &target_member_id,
+                    &created_at,
+                );
+                None
+            }
+            TextControlFrameView::GroupPresenceHeartbeat {
+                group_id,
+                event_id,
+                member_id,
+                last_seen_at,
+                presence_expires_at,
+            } => {
+                apply_group_presence_heartbeat(
+                    self,
+                    &group_id,
+                    &event_id,
+                    &member_id,
+                    &last_seen_at,
+                    &presence_expires_at,
+                );
+                None
             }
             TextControlFrameView::VoiceSignal { signal } => {
                 self.handle_voice_signal_frame(signal);
@@ -9787,11 +11273,44 @@ impl PersistedAppState {
                 &self.connectivity_defaults,
             );
             let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
+            let created_at = Utc::now().to_rfc3339();
+            let local_member_id = self.local_user_id();
+            let display_name = self
+                .profile
+                .as_ref()
+                .map(|profile| profile.display_name.clone())
+                .unwrap_or_else(|| "Recovered member".to_owned());
+            let device_id = self
+                .devices
+                .iter()
+                .find(|device| device.local)
+                .map(|device| device.device_id.clone());
+            let role = GroupRoleView::Member;
             self.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: room_name,
                 role: "member".to_owned(),
                 channels: default_group_channels(self.next_sequence),
+                members: vec![initial_group_member(
+                    &local_member_id,
+                    &display_name,
+                    device_id,
+                    role.clone(),
+                    &created_at,
+                )],
+                role_policy: initial_group_role_policy(
+                    GroupAdmissionModeView::default(),
+                    &local_member_id,
+                    &created_at,
+                ),
+                admission_requests: Vec::new(),
+                governance_log: initial_group_governance_log(
+                    &group_id,
+                    &local_member_id,
+                    role,
+                    &created_at,
+                    self.next_sequence,
+                ),
                 runtime_peers,
                 connectivity: Some(connectivity),
             });
@@ -10233,6 +11752,7 @@ fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
         Ok(Some(bytes)) => match serde_json::from_slice::<PersistedAppState>(&bytes) {
             Ok(mut state) if state.schema_version == APP_STATE_SCHEMA_VERSION => {
                 state.clear_non_persistent_voice_runtime();
+                state.ensure_group_governance_defaults();
                 state
             }
             Ok(_) => initial_state_with_persistence_error(
@@ -10886,6 +12406,82 @@ fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
             connectivity: None,
         },
     ]
+}
+
+fn group_role_from_legacy_label(role: &str) -> GroupRoleView {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "owner" => GroupRoleView::Owner,
+        "staff" => GroupRoleView::Staff,
+        _ => GroupRoleView::Member,
+    }
+}
+
+fn group_role_label(role: &GroupRoleView) -> &'static str {
+    match role {
+        GroupRoleView::Owner => "owner",
+        GroupRoleView::Staff => "staff",
+        GroupRoleView::Member => "member",
+    }
+}
+
+fn initial_group_role_policy(
+    admission_mode: GroupAdmissionModeView,
+    actor_member_id: &str,
+    created_at: &str,
+) -> GroupRolePolicyView {
+    GroupRolePolicyView {
+        admission_mode,
+        policy_epoch: 1,
+        updated_by: actor_member_id.to_owned(),
+        updated_at: created_at.to_owned(),
+    }
+}
+
+fn initial_group_member(
+    member_id: &str,
+    display_name: &str,
+    device_id: Option<String>,
+    role: GroupRoleView,
+    joined_at: &str,
+) -> GroupMemberView {
+    GroupMemberView {
+        member_id: member_id.to_owned(),
+        display_name: display_name.to_owned(),
+        device_id,
+        role,
+        status: "unknown".to_owned(),
+        signer_public_key_hex: None,
+        joined_at: joined_at.to_owned(),
+        last_seen_at: None,
+        presence_expires_at: None,
+        revoked_at: None,
+        revoked_by: None,
+    }
+}
+
+fn initial_group_governance_log(
+    group_id: &str,
+    actor_member_id: &str,
+    role_after: GroupRoleView,
+    created_at: &str,
+    sequence: u64,
+) -> Vec<GroupGovernanceLogEntryView> {
+    vec![GroupGovernanceLogEntryView {
+        event_id: stable_id(
+            "governance",
+            &format!("{group_id}:{actor_member_id}:created"),
+            sequence,
+        ),
+        group_id: group_id.to_owned(),
+        event_kind: "group_created".to_owned(),
+        actor_member_id: actor_member_id.to_owned(),
+        target_member_id: Some(actor_member_id.to_owned()),
+        request_id: None,
+        role_before: None,
+        role_after: Some(role_after),
+        created_at: created_at.to_owned(),
+        summary: "Initialized group owner/staff/member governance roster".to_owned(),
+    }]
 }
 
 fn default_voice_participants(
@@ -12312,6 +13908,416 @@ fn group_runtime_peers(
     ]
 }
 
+fn profile_display_name(state: &PersistedAppState) -> String {
+    state
+        .profile
+        .as_ref()
+        .map(|profile| profile.display_name.clone())
+        .unwrap_or_else(|| "Local member".to_owned())
+}
+
+fn initial_group_members(
+    group_id: &str,
+    local_member_id: &str,
+    display_name: String,
+    role: GroupRoleView,
+) -> Vec<GroupMemberView> {
+    let now = Utc::now().to_rfc3339();
+    vec![GroupMemberView {
+        member_id: local_member_id.to_owned(),
+        display_name,
+        device_id: None,
+        role,
+        status: "offline".to_owned(),
+        signer_public_key_hex: None,
+        joined_at: now,
+        last_seen_at: None,
+        presence_expires_at: None,
+        revoked_at: None,
+        revoked_by: None,
+    }]
+    .into_iter()
+    .map(|mut member| {
+        if member.display_name.trim().is_empty() {
+            member.display_name = redacted_observable_ref("member", group_id);
+        }
+        member
+    })
+    .collect()
+}
+
+fn initial_governance_log_entry(
+    group_id: &str,
+    actor_member_id: &str,
+    event_kind: &str,
+    summary: &str,
+) -> GroupGovernanceLogEntryView {
+    let now = Utc::now().to_rfc3339();
+    let event_id = format!(
+        "gov-{}",
+        &hash_commitment(
+            "discrypt-governance-initial-event-v1",
+            &[group_id, actor_member_id, event_kind]
+        )[..16]
+    );
+    governance_log_entry(
+        &event_id,
+        group_id,
+        event_kind,
+        actor_member_id,
+        None,
+        None,
+        None,
+        &now,
+        summary,
+    )
+}
+
+fn governance_event_id(
+    group_id: &str,
+    event_kind: &str,
+    target_member_id: &str,
+    sequence: u64,
+) -> String {
+    stable_id(
+        "governance",
+        &format!("{group_id}:{event_kind}:{target_member_id}"),
+        sequence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn governance_log_entry(
+    event_id: &str,
+    group_id: &str,
+    event_kind: &str,
+    actor_member_id: &str,
+    target_member_id: Option<&str>,
+    role_before: Option<GroupRoleView>,
+    role_after: Option<GroupRoleView>,
+    created_at: &str,
+    summary: &str,
+) -> GroupGovernanceLogEntryView {
+    GroupGovernanceLogEntryView {
+        event_id: event_id.to_owned(),
+        group_id: group_id.to_owned(),
+        event_kind: event_kind.to_owned(),
+        actor_member_id: actor_member_id.to_owned(),
+        target_member_id: target_member_id.map(ToOwned::to_owned),
+        request_id: None,
+        role_before,
+        role_after,
+        created_at: created_at.to_owned(),
+        summary: summary.to_owned(),
+    }
+}
+
+fn ensure_group_governance_defaults(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    local_member_id: &str,
+    display_name: String,
+) {
+    let Some(group) = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id == group_id)
+    else {
+        return;
+    };
+    if group.members.is_empty() {
+        let role = match group.role.as_str() {
+            "owner" => GroupRoleView::Owner,
+            "staff" => GroupRoleView::Staff,
+            _ => GroupRoleView::Member,
+        };
+        group.members =
+            initial_group_members(group_id, local_member_id, display_name.clone(), role);
+    }
+    if !group
+        .members
+        .iter()
+        .any(|member| member.member_id == local_member_id)
+    {
+        let role = match group.role.as_str() {
+            "owner" => GroupRoleView::Owner,
+            "staff" => GroupRoleView::Staff,
+            _ => GroupRoleView::Member,
+        };
+        group.members.push(GroupMemberView {
+            member_id: local_member_id.to_owned(),
+            display_name,
+            device_id: None,
+            role,
+            status: "offline".to_owned(),
+            signer_public_key_hex: None,
+            joined_at: Utc::now().to_rfc3339(),
+            last_seen_at: None,
+            presence_expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+        });
+    }
+    if group.governance_log.is_empty() {
+        group.governance_log.push(initial_governance_log_entry(
+            group_id,
+            local_member_id,
+            "governance.defaults_restored",
+            "Restored governance roster defaults for legacy persisted group",
+        ));
+    }
+}
+
+fn local_role_for_group<'a>(
+    group: &'a GroupView,
+    local_member_id: &str,
+) -> Option<&'a GroupRoleView> {
+    group
+        .members
+        .iter()
+        .find(|member| member.member_id == local_member_id && member.status != "revoked")
+        .map(|member| &member.role)
+}
+
+fn local_member_is_revoked(group: &GroupView, local_member_id: &str) -> bool {
+    group
+        .members
+        .iter()
+        .any(|member| member.member_id == local_member_id && member.status == "revoked")
+}
+
+fn queue_group_governance_frame(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    event_id: &str,
+    frame: TextControlFrameView,
+) -> Result<(), String> {
+    let frame_sha256 = text_control_frame_sha256(&frame)?;
+    if state
+        .text_control_outbox
+        .iter()
+        .any(|record| record.message_id == event_id || record.frame_sha256 == frame_sha256)
+    {
+        return Ok(());
+    }
+    state.text_control_outbox.push(TextControlOutboxRecord {
+        message_id: event_id.to_owned(),
+        target: MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.to_owned()),
+            channel_id: None,
+        },
+        frame,
+        frame_sha256,
+        attempts: 0,
+        state_key: "pending".to_owned(),
+        last_transport_session_id: None,
+    });
+    Ok(())
+}
+
+fn ensure_group_sender_not_revoked(
+    state: &PersistedAppState,
+    group_id: &str,
+) -> Result<(), String> {
+    let local_member_id = state.local_user_id();
+    if state
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .is_some_and(|group| local_member_is_revoked(group, &local_member_id))
+    {
+        return Err("Local member is revoked in backend governance state; access is fail-closed and no cryptographic MLS removal is claimed yet".to_owned());
+    }
+    Ok(())
+}
+
+fn ensure_text_target_not_revoked(
+    state: &PersistedAppState,
+    target: &MessageTargetView,
+) -> Result<(), String> {
+    if target.kind == "channel" {
+        if let Some(group_id) = target.group_id.as_deref() {
+            ensure_group_sender_not_revoked(state, group_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn group_with_effective_presence(mut group: GroupView) -> GroupView {
+    let now = Utc::now();
+    for member in &mut group.members {
+        if member.status == "online" {
+            let expired = member
+                .presence_expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|expires| expires.with_timezone(&Utc) <= now)
+                .unwrap_or(true);
+            if expired {
+                member.status = "offline".to_owned();
+            }
+        }
+    }
+    group
+}
+
+fn apply_group_member_role_changed(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    event_id: &str,
+    actor_member_id: &str,
+    target_member_id: &str,
+    role_before: GroupRoleView,
+    role_after: GroupRoleView,
+    created_at: &str,
+) {
+    let local_member_id = state.local_user_id();
+    let local_display = profile_display_name(state);
+    ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
+    let Some(group) = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id == group_id)
+    else {
+        return;
+    };
+    if group
+        .governance_log
+        .iter()
+        .any(|entry| entry.event_id == event_id)
+    {
+        return;
+    }
+    if let Some(member) = group
+        .members
+        .iter_mut()
+        .find(|member| member.member_id == target_member_id)
+    {
+        if member.status != "revoked" {
+            member.role = role_after.clone();
+            if target_member_id == local_member_id {
+                group.role = role_after.as_str().to_owned();
+            }
+        }
+    }
+    group.governance_log.push(governance_log_entry(
+        event_id,
+        group_id,
+        "member.role_changed",
+        actor_member_id,
+        Some(target_member_id),
+        Some(role_before),
+        Some(role_after),
+        created_at,
+        "Applied replicated group member role change",
+    ));
+}
+
+fn apply_group_member_revoked(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    event_id: &str,
+    actor_member_id: &str,
+    target_member_id: &str,
+    created_at: &str,
+) {
+    let local_member_id = state.local_user_id();
+    let local_display = profile_display_name(state);
+    ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
+    let Some(group) = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id == group_id)
+    else {
+        return;
+    };
+    if group
+        .governance_log
+        .iter()
+        .any(|entry| entry.event_id == event_id)
+    {
+        return;
+    }
+    let mut role_before = None;
+    if let Some(member) = group
+        .members
+        .iter_mut()
+        .find(|member| member.member_id == target_member_id)
+    {
+        role_before = Some(member.role.clone());
+        member.status = "revoked".to_owned();
+        member.revoked_at = Some(created_at.to_owned());
+        member.revoked_by = Some(actor_member_id.to_owned());
+        member.last_seen_at = None;
+        member.presence_expires_at = None;
+        if target_member_id == local_member_id {
+            group.role = "revoked".to_owned();
+        }
+    }
+    group.governance_log.push(governance_log_entry(
+        event_id,
+        group_id,
+        "member.revoked",
+        actor_member_id,
+        Some(target_member_id),
+        role_before,
+        None,
+        created_at,
+        "Applied replicated fail-closed member revocation; MLS removal is not claimed",
+    ));
+}
+
+fn apply_group_presence_heartbeat(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    event_id: &str,
+    member_id: &str,
+    last_seen_at: &str,
+    presence_expires_at: &str,
+) {
+    let local_member_id = state.local_user_id();
+    let local_display = profile_display_name(state);
+    ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
+    let Some(group) = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id == group_id)
+    else {
+        return;
+    };
+    if group
+        .governance_log
+        .iter()
+        .any(|entry| entry.event_id == event_id)
+    {
+        return;
+    }
+    if let Some(member) = group
+        .members
+        .iter_mut()
+        .find(|member| member.member_id == member_id)
+    {
+        if member.status != "revoked" {
+            member.status = "online".to_owned();
+            member.last_seen_at = Some(last_seen_at.to_owned());
+            member.presence_expires_at = Some(presence_expires_at.to_owned());
+        }
+    }
+    group.governance_log.push(governance_log_entry(
+        event_id,
+        group_id,
+        "presence.heartbeat",
+        member_id,
+        Some(member_id),
+        None,
+        None,
+        last_seen_at,
+        "Applied replicated TTL-backed presence heartbeat",
+    ));
+}
+
 fn group_connectivity_policy_from_request(
     group_id: &str,
     request: &CreateGroupRequest,
@@ -12385,6 +14391,7 @@ fn group_connectivity_policy(group_id: &str) -> ConnectivityPolicyView {
         &CreateGroupRequest {
             name: String::new(),
             retention: String::new(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -13344,6 +15351,222 @@ mod tests {
         guard.clear_text_control_transport_runtime();
     }
 
+    fn add_test_member(group_id: &str, member_id: &str, role: GroupRoleView) {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let group = guard
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .expect("test group exists");
+        group.members.push(GroupMemberView {
+            member_id: member_id.to_owned(),
+            display_name: member_id.to_owned(),
+            device_id: None,
+            role,
+            status: "offline".to_owned(),
+            signer_public_key_hex: None,
+            joined_at: Utc::now().to_rfc3339(),
+            last_seen_at: None,
+            presence_expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+        });
+    }
+
+    #[test]
+    fn g005_owner_promotes_and_demotes_staff_with_governance_outbox() {
+        let _lock = test_lock();
+        let _path = reset_with_temp_state("g005-role-actions");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Governance Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+
+        let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(promoted.last_command_error, None);
+        let bob = promoted.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == "member-bob")
+            .expect("bob member present");
+        assert_eq!(bob.role, GroupRoleView::Staff);
+        assert!(promoted.groups[0]
+            .governance_log
+            .iter()
+            .any(|entry| entry.event_kind == "member.promoted"));
+
+        let demoted = demote_group_staff_to_member(DemoteGroupStaffRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(demoted.last_command_error, None);
+        let bob = demoted.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == "member-bob")
+            .expect("bob member present");
+        assert_eq!(bob.role, GroupRoleView::Member);
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.state.text_control_outbox.iter().any(|record| {
+            matches!(
+                record.frame,
+                TextControlFrameView::GroupMemberRoleChanged { .. }
+            )
+        }));
+    }
+
+    #[test]
+    fn g005_revocation_is_fail_closed_without_claiming_mls_removal() {
+        let _lock = test_lock();
+        let _path = reset_with_temp_state("g005-revocation");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Revocation Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+
+        let revoked = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+            reason: Some("policy".to_owned()),
+        });
+        assert_eq!(revoked.last_command_error, None);
+        let bob = revoked.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == "member-bob")
+            .expect("bob member present");
+        assert_eq!(bob.status, "revoked");
+        assert!(revoked.events.iter().any(|event| {
+            event
+                .summary
+                .contains("MLS removal is a documented crypto gap")
+        }));
+
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.state.text_control_outbox.iter().any(|record| {
+            matches!(
+                &record.frame,
+                TextControlFrameView::GroupMemberRevoked {
+                    crypto_removal_status,
+                    ..
+                } if crypto_removal_status == "fail_closed_app_state_only_openmls_remove_member_not_available"
+            )
+        }));
+    }
+
+    #[test]
+    fn g005_presence_uses_ttl_and_revoked_local_member_cannot_send() {
+        let _lock = test_lock();
+        let _path = reset_with_temp_state("g005-presence-revoked");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Presence Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        let channel_id = created.groups[0].channels[0].channel_id.clone();
+        let present = publish_group_presence(PublishGroupPresenceRequest {
+            group_id: group_id.clone(),
+            member_id: None,
+            ttl_seconds: Some(5),
+        });
+        assert_eq!(present.last_command_error, None);
+        assert_eq!(present.groups[0].members[0].status, "online");
+        assert!(present.groups[0].members[0].presence_expires_at.is_some());
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .expect("group exists");
+            group.members[0].status = "online".to_owned();
+            group.members[0].presence_expires_at = Some("2000-01-01T00:00:00Z".to_owned());
+        }
+        let expired = app_state();
+        assert_eq!(expired.groups[0].members[0].status, "offline");
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .expect("group exists");
+            group.members[0].status = "revoked".to_owned();
+        }
+        let rejected = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id),
+                channel_id: Some(channel_id),
+            },
+            body: "hello".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("member_revoked")
+        );
+    }
+
     #[derive(Debug)]
     struct ReceiverBackedTextControlTransport {
         receiver: Mutex<TauriAppService>,
@@ -13612,6 +15835,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: Some("mqtt".to_owned()),
             signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
             ice_stun_servers: Some(vec![
@@ -13993,6 +16217,7 @@ mod tests {
         let alice_group_state = create_group(CreateGroupRequest {
             name: "G010 Native Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: Some("mqtt".to_owned()),
             signaling_endpoint: Some("mqtts://broker.example.invalid:8883".to_owned()),
             ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
@@ -14379,6 +16604,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "G004 Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: Some("mqtt".to_owned()),
             signaling_endpoint: Some("mqtts://broker.example.invalid:8883".to_owned()),
             ice_stun_servers: Some(vec![
@@ -14595,34 +16821,9 @@ mod tests {
             .channels
             .iter()
             .any(|channel| channel.channel_id == voice_channel_id));
-        assert_eq!(
-            alice_reloaded_before_receipt
-                .voice_session
-                .as_ref()
-                .map(|session| (
-                    session.self_muted,
-                    session
-                        .input_device
-                        .as_ref()
-                        .map(|device| device.device_id.as_str()),
-                    session
-                        .output_device
-                        .as_ref()
-                        .map(|device| device.device_id.as_str()),
-                    session.media_runtime.remote_transport_active,
-                    session
-                        .participants
-                        .iter()
-                        .find(|participant| participant.id == remote_participant_id)
-                        .map(|participant| participant.volume)
-                )),
-            Some((
-                true,
-                Some("alice-mic"),
-                Some("alice-speaker"),
-                true,
-                Some(37)
-            ))
+        assert!(
+            alice_reloaded_before_receipt.voice_session.is_none(),
+            "voice channel membership is runtime backend state and must not be restored as joined after restart"
         );
         assert_eq!(
             alice_reloaded_before_receipt
@@ -15035,6 +17236,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15056,9 +17258,17 @@ mod tests {
             invite_state.invites[0].endpoint_policy,
             "production_tls".to_owned()
         );
-        assert!(invite_state.invites[0]
-            .signaling_endpoint
-            .starts_with("https://"));
+        let invite_endpoint = &invite_state.invites[0].signaling_endpoint;
+        assert!(
+            invite_endpoint.starts_with("wss://")
+                || invite_endpoint.starts_with("mqtts://")
+                || invite_endpoint.starts_with("https://"),
+            "invite endpoint should use a production provider scheme, got {invite_endpoint}"
+        );
+        assert!(
+            !invite_endpoint.contains(".invalid"),
+            "invite endpoint must not leak placeholder rendezvous URLs"
+        );
         assert_eq!(
             invite_state.invites[0].signaling_trust_fingerprint.len(),
             64
@@ -15129,6 +17339,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "ICE Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15165,6 +17376,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15353,6 +17565,7 @@ mod tests {
         let state = create_group(CreateGroupRequest {
             name: "Custom Voice Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: Some("mqtt".to_owned()),
             signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
             ice_stun_servers: Some(vec![
@@ -15402,6 +17615,59 @@ mod tests {
     }
 
     #[test]
+    fn create_group_persists_governance_roster_policy_and_log() -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-governance-model");
+        create_user(CreateUserRequest {
+            display_name: "Alice Admin".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+
+        let state = create_group(CreateGroupRequest {
+            name: "Governance Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.name == "Governance Lab")
+            .ok_or_else(|| "created governance group missing".to_owned())?;
+        assert_eq!(group.role, "owner");
+        assert_eq!(
+            group.role_policy.admission_mode,
+            GroupAdmissionModeView::ManualApproval
+        );
+        assert_eq!(group.role_policy.policy_epoch, 1);
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].role, GroupRoleView::Owner);
+        assert_eq!(group.members[0].status, "unknown");
+        assert!(group.admission_requests.is_empty());
+        assert_eq!(group.governance_log.len(), 1);
+        assert_eq!(group.governance_log[0].event_kind, "group_created");
+        assert_eq!(
+            group.governance_log[0].role_after,
+            Some(GroupRoleView::Owner)
+        );
+
+        let reloaded = load_state_from_path(&path).to_view();
+        let persisted = reloaded
+            .groups
+            .iter()
+            .find(|group| group.name == "Governance Lab")
+            .ok_or_else(|| "persisted governance group missing".to_owned())?;
+        assert_eq!(persisted.members, group.members);
+        assert_eq!(persisted.role_policy, group.role_policy);
+        assert_eq!(persisted.governance_log, group.governance_log);
+        Ok(())
+    }
+
+    #[test]
     fn create_group_persists_rehydratable_openmls_group_handle() -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("openmls-group-handle");
@@ -15413,6 +17679,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "OpenMLS Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15462,6 +17729,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "OpenMLS Text Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15551,6 +17819,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Missing MLS Text Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15608,6 +17877,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Admission Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15756,6 +18026,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "G005 Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -15913,6 +18184,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16001,6 +18273,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16132,6 +18405,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16222,6 +18496,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16314,6 +18589,7 @@ mod tests {
         let alpha = create_group(CreateGroupRequest {
             name: "Alpha Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16322,6 +18598,7 @@ mod tests {
         create_group(CreateGroupRequest {
             name: "Beta Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16348,6 +18625,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16526,6 +18804,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16600,6 +18879,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Mute Persistence Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16702,6 +18982,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Native Voice Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16816,6 +19097,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16871,6 +19153,7 @@ mod tests {
         let group_state = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -16926,6 +19209,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Runtime Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -17084,6 +19368,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Status Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -17137,6 +19422,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Join Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -17211,6 +19497,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Voice State Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -17552,6 +19839,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "OpenMLS Receive Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -17642,6 +19930,7 @@ mod tests {
         let created = create_group(CreateGroupRequest {
             name: "OpenMLS Invalid Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -18215,6 +20504,7 @@ mod tests {
         let created_group = create_group(CreateGroupRequest {
             name: "G012 Text Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -19485,6 +21775,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "G004 Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: Some("mqtt".to_owned()),
             signaling_endpoint: Some("mqtts://broker.example.test:8883".to_owned()),
             ice_stun_servers: Some(vec!["stun:stun.example.test:3478".to_owned()]),
@@ -20204,6 +22495,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Integration Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -20774,6 +23066,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -21024,6 +23317,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Private Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -21490,6 +23784,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Abuse Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -21689,6 +23984,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Error Lab".to_owned(),
             retention: "7 days".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -21809,6 +24105,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Cursor Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -21947,6 +24244,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Stream Lab".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -22133,6 +24431,7 @@ mod tests {
         let group = create_group(CreateGroupRequest {
             name: "Voice Lab".to_owned(),
             retention: "session".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,
@@ -22431,6 +24730,7 @@ mod tests {
         let grouped = create_group(CreateGroupRequest {
             name: "Secret Project".to_owned(),
             retention: "24 hours".to_owned(),
+            admission_mode: None,
             adapter_kind: None,
             signaling_endpoint: None,
             ice_stun_servers: None,

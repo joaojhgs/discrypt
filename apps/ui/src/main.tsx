@@ -13,6 +13,10 @@ import {
   ChannelStateView,
   ConnectivityPolicyView,
   DirectConversationView,
+  GroupAdmissionModeView,
+  GroupAdmissionRequestView,
+  GroupMemberView,
+  GroupRoleView,
   GroupView,
   InviteView,
   JoinProgressStepView,
@@ -36,17 +40,22 @@ import {
   createInvite,
   createDmInvite,
   createUser,
+  demoteGroupStaffToMember,
   joinGroup,
   acceptDmInvite,
   joinVoice,
   leaveVoice,
   loadAppState,
   pollAppEvents,
+  promoteGroupMemberToStaff,
   recoverUser,
+  refuseGroupAdmissionRequest,
   resetAppState,
+  revokeGroupMemberAccess,
   savePreferences,
   sendMessage,
   setConnectivityPolicy,
+  setGroupAdmissionMode,
   setActiveGroup,
   setActiveChannel,
   setActiveDm,
@@ -58,6 +67,7 @@ import {
   attachTextControlTransportRuntime,
   pumpTextControlTransportOnce,
   startDm,
+  approveGroupAdmissionRequest,
   verifySafetyNumber,
   unlockStorageSecurity,
 } from "./commands";
@@ -95,7 +105,14 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import "./styles.css";
 
-type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
+type Workflow =
+  | "setup"
+  | "dm"
+  | "join"
+  | "create-group"
+  | "channel"
+  | "voice"
+  | "admission_requests";
 type OverlayKind =
   | "launcher"
   | "create-group"
@@ -922,6 +939,12 @@ function App() {
   const [draftChannel, setDraftChannel] = useState("general");
   const [draftMessage, setDraftMessage] = useState("");
   const [draftGroup, setDraftGroup] = useState("");
+  const [draftAdmissionMode, setDraftAdmissionMode] =
+    useState<GroupAdmissionModeView>("manual_approval");
+  const [draftConfigAdmissionMode, setDraftConfigAdmissionMode] =
+    useState<GroupAdmissionModeView>("manual_approval");
+  const [membersPanelOpen, setMembersPanelOpen] = useState(true);
+  const [memberActionInFlight, setMemberActionInFlight] = useState<string | null>(null);
   const [draftSignalingAdapter, setDraftSignalingAdapter] =
     useState<SignalingAdapterKind>("mqtt");
   const [draftSignalingEndpoint, setDraftSignalingEndpoint] = useState(
@@ -1095,6 +1118,7 @@ function App() {
     setOverlayClosing(false);
     setOverlayGroupId(groupId);
     hydrateConnectivityDrafts(group?.connectivity ?? commandState?.connectivity_defaults ?? null);
+    setDraftConfigAdmissionMode(group?.role_policy?.admission_mode ?? "manual_approval");
     setActiveOverlay("group-config");
   }
 
@@ -1482,6 +1506,12 @@ function App() {
     activeVoiceChannel,
     activeDm,
   );
+  const groupMembers = normalizedGroupMembers(activeGroup, appState);
+  const localGroupRole = localGroupRoleForUi(activeGroup, appState);
+  const canReviewAdmissions = ["owner", "staff"].includes(localGroupRole);
+  const pendingAdmissionRequests = (activeGroup?.admission_requests ?? []).filter(
+    (request) => request.status === "pending",
+  );
   const backendVoiceParticipants = appState.voice_session?.participants ?? [];
   const voiceJoined = appState.voice_session?.joined ?? false;
   const selfMuted =
@@ -1535,7 +1565,11 @@ function App() {
   const themeStyle = {
     ...activeTheme.cssVars,
     "--shell-grid":
-      workflow === "dm" ? "72px minmax(0,1fr)" : "72px 300px minmax(0,1fr)",
+      workflow === "dm"
+        ? "72px minmax(0,1fr)"
+        : membersPanelOpen
+          ? "72px 300px minmax(0,1fr) 320px"
+          : "72px 300px minmax(0,1fr)",
     "--shell-grid-inspector":
       workflow === "dm"
         ? "72px minmax(0,1fr) 280px"
@@ -1642,6 +1676,7 @@ function App() {
       createGroup({
         name: draftGroup,
         retention: currentSnapshot.retention.selected,
+        admission_mode: draftAdmissionMode,
         adapter_kind: draftSignalingAdapter,
         signaling_endpoint: draftSignalingEndpoint,
         ice_stun_servers: parseEndpointList(draftIceStunServers),
@@ -1650,6 +1685,7 @@ function App() {
       (state) => {
         const group = getActiveGroup(state);
         setDraftGroup(group?.name ?? draftGroup);
+        setDraftConfigAdmissionMode(group?.role_policy?.admission_mode ?? draftAdmissionMode);
         setWorkflow("channel");
         setActiveOverlay(null);
       },
@@ -1674,8 +1710,8 @@ function App() {
     );
   }
 
-  function saveGroupConnectivityPolicy(groupId: string) {
-    void applyCommand(
+  async function saveGroupConfiguration(groupId: string) {
+    const connectivityState = await applyCommand(
       setConnectivityPolicy({
         scope_kind: "group",
         group_id: groupId,
@@ -1686,7 +1722,84 @@ function App() {
         ice_stun_servers: parseEndpointList(draftIceStunServers),
         ice_turn_servers: parseTurnEndpointList(draftIceTurnServers),
       }),
-      () => setActiveOverlay(null),
+    );
+    if (!connectivityState?.last_command_error) {
+      void applyCommand(
+        setGroupAdmissionMode({
+          group_id: groupId,
+          admission_mode: draftConfigAdmissionMode,
+        }),
+        () => setActiveOverlay(null),
+      );
+    }
+  }
+
+  function reviewPendingAdmissions() {
+    setWorkflow("admission_requests");
+  }
+
+  function runMemberAction(actionId: string, command: Promise<AppState>) {
+    setMemberActionInFlight(actionId);
+    void applyCommand(command, () => setMemberActionInFlight(null)).finally(() =>
+      setMemberActionInFlight(null),
+    );
+  }
+
+  function approveAdmission(request: GroupAdmissionRequestView) {
+    if (!activeGroup) return;
+    runMemberAction(
+      `approve:${request.request_id}`,
+      approveGroupAdmissionRequest({
+        group_id: activeGroup.group_id,
+        request_id: request.request_id,
+      }),
+    );
+  }
+
+  function refuseAdmission(request: GroupAdmissionRequestView) {
+    if (!activeGroup) return;
+    runMemberAction(
+      `refuse:${request.request_id}`,
+      refuseGroupAdmissionRequest({
+        group_id: activeGroup.group_id,
+        request_id: request.request_id,
+        reason: "Refused from member panel review",
+      }),
+    );
+  }
+
+  function promoteMember(member: GroupMemberView) {
+    if (!activeGroup) return;
+    runMemberAction(
+      `promote:${member.member_id}`,
+      promoteGroupMemberToStaff({
+        group_id: activeGroup.group_id,
+        member_id: member.member_id,
+      }),
+    );
+  }
+
+  function demoteMember(member: GroupMemberView) {
+    if (!activeGroup) return;
+    runMemberAction(
+      `demote:${member.member_id}`,
+      demoteGroupStaffToMember({
+        group_id: activeGroup.group_id,
+        member_id: member.member_id,
+      }),
+    );
+  }
+
+  function revokeMember(member: GroupMemberView) {
+    if (!activeGroup) return;
+    if (!window.confirm(`Revoke ${member.display_name} access to ${activeGroup.name}?`)) return;
+    runMemberAction(
+      `revoke:${member.member_id}`,
+      revokeGroupMemberAccess({
+        group_id: activeGroup.group_id,
+        member_id: member.member_id,
+        reason: "Revoked from member panel",
+      }),
     );
   }
 
@@ -2324,7 +2437,8 @@ function App() {
       {showDesktopSidebar && workflow !== "dm" ? (
         <ChannelSidebar
           groupLabel={groupLabel}
-          role={activeGroup?.role ?? "local profile"}
+          role={localGroupRole || activeGroup?.role || "local profile"}
+          pendingAdmissionCount={canReviewAdmissions ? pendingAdmissionRequests.length : 0}
           textChannels={textChannels}
           voiceChannels={voiceChannels}
           activeChannelId={activeTextChannel?.channel_id ?? null}
@@ -2341,6 +2455,7 @@ function App() {
           onSelectVoiceChannel={(channelId) =>
             focusCommandChannel(channelId, "Voice")
           }
+          onReviewPendingAdmissions={reviewPendingAdmissions}
           voiceJoined={voiceJoined}
           participants={participants}
           localUserId={appState.profile?.user_id ?? null}
@@ -2366,7 +2481,8 @@ function App() {
           groupLabel={groupLabel}
           activeTitle={activePane.title}
           activeSubtitle={activePane.subtitle}
-          onOpenSettings={() => setActiveOverlay("settings")}
+          membersPanelOpen={membersPanelOpen}
+          onToggleMembers={() => setMembersPanelOpen((open) => !open)}
           onOpenDiagnostics={() => {
             setInspectorOpen(true);
             setActiveOverlay("diagnostics");
@@ -2426,6 +2542,15 @@ function App() {
                   void toggleVoiceJoin(false, null, null, "voice")
                 }
               />
+            ) : workflow === "admission_requests" ? (
+              <AdmissionRequestsPanel
+                group={activeGroup}
+                localRole={localGroupRole}
+                requests={activeGroup?.admission_requests ?? []}
+                onApprove={approveAdmission}
+                onRefuse={refuseAdmission}
+                actionInFlight={memberActionInFlight}
+              />
             ) : (
               <ChannelPanel
                 group={activeGroup}
@@ -2444,6 +2569,20 @@ function App() {
           </div>
         </div>
       </section>
+      {workflow !== "dm" && membersPanelOpen ? (
+        <MemberPanel
+          group={activeGroup}
+          members={groupMembers}
+          localRole={localGroupRole}
+          open={membersPanelOpen}
+          pendingCount={pendingAdmissionRequests.length}
+          onReviewPendingAdmissions={reviewPendingAdmissions}
+          onPromote={promoteMember}
+          onDemote={demoteMember}
+          onRevoke={revokeMember}
+          actionInFlight={memberActionInFlight}
+        />
+      ) : null}
       <MobileWorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
       <Button
         type="button"
@@ -2503,6 +2642,8 @@ function App() {
             setIceStunServers={setDraftIceStunServers}
             iceTurnServers={draftIceTurnServers}
             setIceTurnServers={setDraftIceTurnServers}
+            admissionMode={draftAdmissionMode}
+            setAdmissionMode={setDraftAdmissionMode}
             onCreate={createCommandGroup}
           />
         ) : null}
@@ -2567,8 +2708,10 @@ function App() {
             setIceStunServers={setDraftIceStunServers}
             iceTurnServers={draftIceTurnServers}
             setIceTurnServers={setDraftIceTurnServers}
+            admissionMode={draftConfigAdmissionMode}
+            setAdmissionMode={setDraftConfigAdmissionMode}
             onSave={() => {
-              if (overlayGroup) saveGroupConnectivityPolicy(overlayGroup.group_id);
+              if (overlayGroup) void saveGroupConfiguration(overlayGroup.group_id);
             }}
           />
         ) : null}
@@ -2667,6 +2810,11 @@ function activePaneSummary(
           ? `${groupLabel} · ${activeTextChannel.retention_status}`
           : "Create or select a text channel.",
       };
+    case "admission_requests":
+      return {
+        title: "Pending admission requests",
+        subtitle: `${groupLabel} · owner/staff review queue`,
+      };
     case "voice":
       return {
         title: activeVoiceChannel?.name ?? "Voice rooms",
@@ -2691,6 +2839,69 @@ function activePaneSummary(
         subtitle: "Create a group or open an invite to begin.",
       };
   }
+}
+
+function isPresenceOnline(member: GroupMemberView): boolean {
+  if (member.status === "revoked") return false;
+  if (member.status === "offline" || member.status === "unknown") return false;
+  if (!member.presence_expires_at) return member.status === "online";
+  return Date.parse(member.presence_expires_at) > Date.now();
+}
+
+function normalizedGroupMembers(
+  group: GroupView | null,
+  state: AppState,
+): GroupMemberView[] {
+  if (!group) return [];
+  const members = group.members ?? [];
+  if (members.length > 0) return members;
+  const now = new Date().toISOString();
+  return [
+    {
+      member_id: state.profile?.user_id ?? "local-profile-pending",
+      display_name: state.profile?.display_name ?? "You",
+      device_id: state.profile?.device_name ?? null,
+      role: (group.role as GroupRoleView) || "member",
+      status: "online",
+      signer_public_key_hex: null,
+      joined_at: now,
+      last_seen_at: now,
+      presence_expires_at: new Date(Date.now() + 300_000).toISOString(),
+      revoked_at: null,
+      revoked_by: null,
+    },
+  ];
+}
+
+function localGroupRoleForUi(
+  group: GroupView | null,
+  state: AppState,
+): string {
+  if (!group) return "local profile";
+  const localMember = (group.members ?? []).find(
+    (member) => member.member_id === state.profile?.user_id,
+  );
+  return localMember?.role ?? group.role ?? "member";
+}
+
+function roleRank(role: string): number {
+  if (role === "owner") return 0;
+  if (role === "staff") return 1;
+  return 2;
+}
+
+function canPromoteFromUi(localRole: string, member: GroupMemberView): boolean {
+  return localRole === "owner" && member.role === "member" && member.status !== "revoked";
+}
+
+function canDemoteFromUi(localRole: string, member: GroupMemberView): boolean {
+  return localRole === "owner" && member.role === "staff" && member.status !== "revoked";
+}
+
+function canRevokeFromUi(localRole: string, member: GroupMemberView): boolean {
+  if (member.status === "revoked" || member.role === "owner") return false;
+  if (localRole === "owner") return true;
+  return localRole === "staff" && member.role === "member";
 }
 
 function getActiveTextChannel(
@@ -3545,6 +3756,7 @@ function MobileVoicePanel({
 function ChannelSidebar({
   groupLabel,
   role,
+  pendingAdmissionCount,
   textChannels,
   voiceChannels,
   activeChannelId,
@@ -3557,6 +3769,7 @@ function ChannelSidebar({
   onCommitInlineChannel,
   onSelectTextChannel,
   onSelectVoiceChannel,
+  onReviewPendingAdmissions,
   voiceJoined,
   participants,
   localUserId,
@@ -3575,6 +3788,7 @@ function ChannelSidebar({
 }: {
   groupLabel: string;
   role: string;
+  pendingAdmissionCount: number;
   textChannels: ChannelStateView[];
   voiceChannels: ChannelStateView[];
   activeChannelId: string | null;
@@ -3587,6 +3801,7 @@ function ChannelSidebar({
   onCommitInlineChannel: (kind: ChannelKind, rawName: string) => void;
   onSelectTextChannel: (channelId: string) => void;
   onSelectVoiceChannel: (channelId: string) => void;
+  onReviewPendingAdmissions: () => void;
   voiceJoined: boolean;
   participants: VoiceParticipant[];
   localUserId: string | null;
@@ -3628,6 +3843,15 @@ function ChannelSidebar({
           </div>
         </div>
         <ScrollArea className="min-h-0 flex-1 p-3">
+          {pendingAdmissionCount > 0 ? (
+            <SidebarButton
+              active={selectedWorkflow === "admission_requests"}
+              meta={`${pendingAdmissionCount} waiting for owner/staff review`}
+              onClick={onReviewPendingAdmissions}
+            >
+              Pending requests · {pendingAdmissionCount}
+            </SidebarButton>
+          ) : null}
           <SectionLabel
             actionLabel="Add text channel"
             onAction={() => setInlineTextDraft("")}
@@ -4122,7 +4346,8 @@ function TopBar({
   groupLabel,
   activeTitle,
   activeSubtitle,
-  onOpenSettings,
+  membersPanelOpen,
+  onToggleMembers,
   onOpenDiagnostics,
   inspectorOpen,
   diagnosticsEnabled,
@@ -4130,7 +4355,8 @@ function TopBar({
   groupLabel: string;
   activeTitle: string;
   activeSubtitle: string;
-  onOpenSettings: () => void;
+  membersPanelOpen: boolean;
+  onToggleMembers: () => void;
   onOpenDiagnostics: () => void;
   inspectorOpen: boolean;
   diagnosticsEnabled: boolean;
@@ -4160,12 +4386,12 @@ function TopBar({
             type="button"
             variant="outline"
             size="icon"
-            aria-label="Open app configuration"
-            title="Configuration"
-            onClick={onOpenSettings}
+            aria-label={membersPanelOpen ? "Close member panel" : "Open member panel"}
+            title="Members"
+            onClick={onToggleMembers}
             className="h-9 w-9"
           >
-            <Icon>⚙</Icon>
+            <Icon>👥</Icon>
           </Button>
           {diagnosticsEnabled ? (
             <Button
@@ -4768,6 +4994,7 @@ function MobileWorkflowNav({
     { id: "dm", label: "DMs" },
     { id: "channel", label: "Text" },
     { id: "voice", label: "Voice" },
+    { id: "admission_requests", label: "Requests" },
   ];
   return (
     <nav
@@ -4993,6 +5220,410 @@ function GroupContextMenu({
         <Icon>⚙</Icon>
         Group configuration
       </Button>
+    </div>
+  );
+}
+
+function MemberPanel({
+  group,
+  members,
+  localRole,
+  open,
+  pendingCount,
+  onReviewPendingAdmissions,
+  onPromote,
+  onDemote,
+  onRevoke,
+  actionInFlight,
+}: {
+  group: GroupView | null;
+  members: GroupMemberView[];
+  localRole: string;
+  open: boolean;
+  pendingCount: number;
+  onReviewPendingAdmissions: () => void;
+  onPromote: (member: GroupMemberView) => void;
+  onDemote: (member: GroupMemberView) => void;
+  onRevoke: (member: GroupMemberView) => void;
+  actionInFlight: string | null;
+}) {
+  const [menu, setMenu] = useState<{
+    member: GroupMemberView;
+    x: number;
+    y: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenu(null);
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menu]);
+
+  const sortedMembers = [...members].sort((left, right) => {
+    const roleDelta = roleRank(left.role) - roleRank(right.role);
+    if (roleDelta !== 0) return roleDelta;
+    const onlineDelta = Number(isPresenceOnline(right)) - Number(isPresenceOnline(left));
+    if (onlineDelta !== 0) return onlineDelta;
+    return left.display_name.localeCompare(right.display_name);
+  });
+  const section = (role: "owner" | "staff" | "member", title: string) =>
+    sortedMembers.filter((member) => member.role === role && member.status !== "revoked");
+  const revoked = sortedMembers.filter((member) => member.status === "revoked");
+
+  return (
+    <aside
+      aria-label="Member panel"
+      className={cn(
+        "hidden h-dvh border-l border-[hsl(var(--border))] bg-[hsl(var(--card)/0.68)] backdrop-blur-xl transition-[opacity,transform] duration-200 lg:block",
+        open ? "translate-x-0 opacity-100" : "pointer-events-none translate-x-full opacity-0",
+      )}
+    >
+      <ScrollArea className="h-full">
+        <div className="grid gap-4 p-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+              Members
+            </p>
+            <h2 className="mt-1 text-lg font-semibold">{group?.name ?? "No group"}</h2>
+            <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              Role and presence are read from backend governance state with TTL-backed online status.
+            </p>
+          </div>
+          {pendingCount > 0 && ["owner", "staff"].includes(localRole) ? (
+            <Button
+              type="button"
+              variant="secondary"
+              className="justify-between rounded-xl"
+              onClick={onReviewPendingAdmissions}
+            >
+              Pending requests
+              <Badge variant="warning">{pendingCount}</Badge>
+            </Button>
+          ) : null}
+          <MemberSection
+            title="Owner"
+            members={section("owner", "Owner")}
+            localRole={localRole}
+            onContextMenu={setMenu}
+          />
+          <MemberSection
+            title="Staff"
+            members={section("staff", "Staff")}
+            localRole={localRole}
+            onContextMenu={setMenu}
+          />
+          <MemberSection
+            title="Members"
+            members={section("member", "Members")}
+            localRole={localRole}
+            onContextMenu={setMenu}
+          />
+          {revoked.length > 0 ? (
+            <MemberSection
+              title="Revoked"
+              members={revoked}
+              localRole={localRole}
+              onContextMenu={setMenu}
+            />
+          ) : null}
+        </div>
+      </ScrollArea>
+      <MemberContextMenu
+        menu={menu}
+        localRole={localRole}
+        actionInFlight={actionInFlight}
+        onClose={() => setMenu(null)}
+        onPromote={onPromote}
+        onDemote={onDemote}
+        onRevoke={onRevoke}
+      />
+    </aside>
+  );
+}
+
+function MemberSection({
+  title,
+  members,
+  localRole,
+  onContextMenu,
+}: {
+  title: string;
+  members: GroupMemberView[];
+  localRole: string;
+  onContextMenu: (menu: { member: GroupMemberView; x: number; y: number }) => void;
+}) {
+  return (
+    <section className="grid gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+          {title}
+        </p>
+        <Badge variant="outline">{members.length}</Badge>
+      </div>
+      {members.length === 0 ? (
+        <p className="rounded-xl border border-dashed border-[hsl(var(--border))] p-3 text-xs text-[hsl(var(--muted-foreground))]">
+          No {title.toLowerCase()} yet.
+        </p>
+      ) : (
+        members.map((member) => (
+          <MemberRow
+            key={member.member_id}
+            member={member}
+            actionable={
+              canPromoteFromUi(localRole, member) ||
+              canDemoteFromUi(localRole, member) ||
+              canRevokeFromUi(localRole, member)
+            }
+            onContextMenu={onContextMenu}
+          />
+        ))
+      )}
+    </section>
+  );
+}
+
+function MemberRow({
+  member,
+  actionable,
+  onContextMenu,
+}: {
+  member: GroupMemberView;
+  actionable: boolean;
+  onContextMenu: (menu: { member: GroupMemberView; x: number; y: number }) => void;
+}) {
+  const online = isPresenceOnline(member);
+  const status = member.status === "revoked" ? "revoked" : online ? "online" : "offline";
+  return (
+    <div
+      className="group flex min-w-0 items-center gap-3 rounded-xl px-2 py-2 text-sm hover:bg-[hsl(var(--accent)/0.58)]"
+      onContextMenu={(event) => {
+        event.preventDefault();
+        if (actionable) onContextMenu({ member, x: event.clientX, y: event.clientY });
+      }}
+      title={actionable ? "Right-click for member actions" : `${member.role} · ${status}`}
+    >
+      <Avatar className="h-8 w-8">
+        <AvatarFallback>{member.display_name.slice(0, 2).toUpperCase()}</AvatarFallback>
+      </Avatar>
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-medium">{member.display_name}</p>
+        <p className="truncate text-[11px] text-[hsl(var(--muted-foreground))]">
+          {member.role} · {status}
+        </p>
+      </div>
+      <span
+        aria-label={status}
+        className={cn(
+          "h-2.5 w-2.5 rounded-full",
+          status === "online" && "bg-emerald-300 shadow-[0_0_0_3px_hsl(142_76%_36%/0.20)]",
+          status === "offline" && "bg-[hsl(var(--muted-foreground)/0.45)]",
+          status === "revoked" && "bg-red-300",
+        )}
+      />
+    </div>
+  );
+}
+
+function MemberContextMenu({
+  menu,
+  localRole,
+  actionInFlight,
+  onClose,
+  onPromote,
+  onDemote,
+  onRevoke,
+}: {
+  menu: { member: GroupMemberView; x: number; y: number } | null;
+  localRole: string;
+  actionInFlight: string | null;
+  onClose: () => void;
+  onPromote: (member: GroupMemberView) => void;
+  onDemote: (member: GroupMemberView) => void;
+  onRevoke: (member: GroupMemberView) => void;
+}) {
+  if (!menu) return null;
+  const { member } = menu;
+  const actions = [
+    canPromoteFromUi(localRole, member)
+      ? { id: `promote:${member.member_id}`, label: "Make staff", run: () => onPromote(member) }
+      : null,
+    canDemoteFromUi(localRole, member)
+      ? { id: `demote:${member.member_id}`, label: "Demote to member", run: () => onDemote(member) }
+      : null,
+    canRevokeFromUi(localRole, member)
+      ? { id: `revoke:${member.member_id}`, label: "Revoke access", run: () => onRevoke(member), danger: true }
+      : null,
+  ].filter(Boolean) as Array<{ id: string; label: string; run: () => void; danger?: boolean }>;
+  if (actions.length === 0) return null;
+  return (
+    <div
+      role="menu"
+      aria-label={`${member.display_name} member actions`}
+      className="fixed z-[60] min-w-56 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--popover)/0.98)] p-1 text-sm text-[hsl(var(--popover-foreground))] shadow-2xl shadow-black/40 animate-[discrypt-scale-in_120ms_ease-out]"
+      style={{ left: menu.x, top: menu.y }}
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      {actions.map((action) => (
+        <Button
+          key={action.id}
+          type="button"
+          variant="ghost"
+          role="menuitem"
+          disabled={actionInFlight === action.id}
+          className={cn(
+            "flex h-auto w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]",
+            action.danger && "text-red-200 hover:text-red-100",
+          )}
+          onClick={() => {
+            onClose();
+            action.run();
+          }}
+        >
+          {action.label}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+function AdmissionRequestsPanel({
+  group,
+  localRole,
+  requests,
+  onApprove,
+  onRefuse,
+  actionInFlight,
+}: {
+  group: GroupView | null;
+  localRole: string;
+  requests: GroupAdmissionRequestView[];
+  onApprove: (request: GroupAdmissionRequestView) => void;
+  onRefuse: (request: GroupAdmissionRequestView) => void;
+  actionInFlight: string | null;
+}) {
+  const canReview = ["owner", "staff"].includes(localRole);
+  const pending = requests.filter((request) => request.status === "pending");
+  const history = requests.filter((request) => request.status !== "pending");
+  return (
+    <Card className="flex h-full min-h-0 flex-col overflow-hidden">
+      <CardHeader className="border-b border-[hsl(var(--border))]">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle>Pending admission requests</CardTitle>
+            <CardDescription>
+              {group?.name ?? "Group"} · valid approvals create an OpenMLS Welcome before a request is marked approved.
+            </CardDescription>
+          </div>
+          <Badge variant={pending.length ? "warning" : "secondary"}>
+            {pending.length} pending
+          </Badge>
+        </div>
+      </CardHeader>
+      <ScrollArea className="min-h-0 flex-1">
+        <CardContent className="grid gap-4 p-4">
+          {!canReview ? (
+            <EmptyState
+              title="Owner/staff review required"
+              copy="Members can see their own channels, but admission decisions are hidden unless backend role state authorizes review."
+            />
+          ) : pending.length === 0 ? (
+            <EmptyState
+              title="No pending requests"
+              copy="Manual requests remain here until an owner or staff member approves or refuses them."
+            />
+          ) : (
+            pending.map((request) => (
+              <AdmissionRequestCard
+                key={request.request_id}
+                request={request}
+                onApprove={onApprove}
+                onRefuse={onRefuse}
+                actionInFlight={actionInFlight}
+              />
+            ))
+          )}
+          {history.length > 0 ? (
+            <section className="grid gap-2">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+                Decision history
+              </p>
+              {history.map((request) => (
+                <div
+                  key={request.request_id}
+                  className="rounded-xl border border-[hsl(var(--border))] bg-black/10 p-3 text-sm"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-medium">{request.display_name}</span>
+                    <Badge variant={request.status === "approved" ? "success" : "secondary"}>
+                      {request.status}
+                    </Badge>
+                  </div>
+                  <p className="mt-1 text-xs text-[hsl(var(--muted-foreground))]">
+                    decided {request.decided_at ?? "not recorded"} by {request.decided_by ?? "unknown"}
+                  </p>
+                </div>
+              ))}
+            </section>
+          ) : null}
+        </CardContent>
+      </ScrollArea>
+    </Card>
+  );
+}
+
+function AdmissionRequestCard({
+  request,
+  onApprove,
+  onRefuse,
+  actionInFlight,
+}: {
+  request: GroupAdmissionRequestView;
+  onApprove: (request: GroupAdmissionRequestView) => void;
+  onRefuse: (request: GroupAdmissionRequestView) => void;
+  actionInFlight: string | null;
+}) {
+  return (
+    <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-base font-semibold">{request.display_name}</p>
+          <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+            {request.device_name ?? "Unknown device"} · requested {request.requested_at}
+          </p>
+        </div>
+        <Badge variant="warning">{request.status}</Badge>
+      </div>
+      <div className="mt-3 grid gap-2 text-xs text-[hsl(var(--muted-foreground))] md:grid-cols-2">
+        <InfoRow title="Invite" copy={request.invite_id ?? "invite fingerprint unavailable"} />
+        <InfoRow title="Policy epoch" copy={String(request.policy_epoch_at_request)} />
+        <InfoRow title="Admission mode at request" copy={request.admission_mode_at_request ?? "not recorded"} />
+        <InfoRow title="Key package bytes" copy={`${request.key_package.length} byte(s) stored`} />
+      </div>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button
+          type="button"
+          onClick={() => onApprove(request)}
+          disabled={actionInFlight === `approve:${request.request_id}`}
+        >
+          Approve
+        </Button>
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={() => onRefuse(request)}
+          disabled={actionInFlight === `refuse:${request.request_id}`}
+        >
+          Refuse
+        </Button>
+      </div>
     </div>
   );
 }
@@ -5248,6 +5879,8 @@ function GroupConfigPanel({
   setIceStunServers,
   iceTurnServers,
   setIceTurnServers,
+  admissionMode,
+  setAdmissionMode,
   onSave,
 }: {
   group: GroupView | null;
@@ -5259,6 +5892,8 @@ function GroupConfigPanel({
   setIceStunServers: (value: string) => void;
   iceTurnServers: string;
   setIceTurnServers: (value: string) => void;
+  admissionMode: GroupAdmissionModeView;
+  setAdmissionMode: (value: GroupAdmissionModeView) => void;
   onSave: () => void;
 }) {
   return (
@@ -5311,6 +5946,24 @@ function GroupConfigPanel({
                 onChange={(event) => setIceTurnServers(event.target.value)}
               />
             </Label>
+          </div>
+          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-4">
+            <Label className="grid gap-2">
+              Invite admission
+              <Select
+                aria-label="Group admission mode"
+                value={admissionMode}
+                onValueChange={(value) => setAdmissionMode(value as GroupAdmissionModeView)}
+              >
+                <SelectItem value="manual_approval">Manual approval</SelectItem>
+                <SelectItem value="automatic_when_authorized_online">
+                  Automatic when owner/staff is online
+                </SelectItem>
+              </Select>
+            </Label>
+            <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              Existing manual pending requests stay pending after switching to automatic mode.
+            </p>
           </div>
           <Button onClick={onSave} disabled={!group}>
             Save group configuration
@@ -5517,6 +6170,8 @@ function CreateGroupPanel({
   setIceStunServers,
   iceTurnServers,
   setIceTurnServers,
+  admissionMode,
+  setAdmissionMode,
   onCreate,
 }: {
   snapshot: AppSnapshot;
@@ -5530,6 +6185,8 @@ function CreateGroupPanel({
   setIceStunServers: (value: string) => void;
   iceTurnServers: string;
   setIceTurnServers: (value: string) => void;
+  admissionMode: GroupAdmissionModeView;
+  setAdmissionMode: (value: GroupAdmissionModeView) => void;
   onCreate: () => void;
 }) {
   return (
@@ -5550,6 +6207,24 @@ function CreateGroupPanel({
               onChange={(event) => setGroupName(event.target.value)}
             />
           </Label>
+          <div className="mt-4 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4">
+            <Label className="grid gap-2">
+              Invite admission
+              <Select
+                aria-label="Invite admission mode"
+                value={admissionMode}
+                onValueChange={(value) => setAdmissionMode(value as GroupAdmissionModeView)}
+              >
+                <SelectItem value="manual_approval">Manual approval</SelectItem>
+                <SelectItem value="automatic_when_authorized_online">
+                  Automatic when owner/staff is online
+                </SelectItem>
+              </Select>
+            </Label>
+            <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+              Manual is safest for private groups. Switching modes later will not retroactively approve pending manual requests.
+            </p>
+          </div>
           <div className="mt-4 grid gap-3">
             <Label className="grid gap-2">
               Signaling adapter
