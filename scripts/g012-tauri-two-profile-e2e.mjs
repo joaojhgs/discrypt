@@ -42,7 +42,7 @@ if (!Number.isInteger(devServerPort) || devServerPort <= 0 || devServerPort > 65
 if (!viteUrlObject.port && explicitDevServerPort) viteUrlObject.port = String(devServerPort);
 const devServerHost = viteUrlObject.hostname || "127.0.0.1";
 const viteUrl = viteUrlObject.toString().replace(/\/$/, "");
-const tauriFeatures = (process.env.DISCRYPT_G012_TAURI_FEATURES || "tauri-runtime,local-dev")
+const tauriFeatures = (process.env.DISCRYPT_G012_TAURI_FEATURES || "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter")
   .split(",")
   .map((feature) => feature.trim())
   .filter(Boolean);

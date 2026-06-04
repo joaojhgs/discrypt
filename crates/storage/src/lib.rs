@@ -21,6 +21,8 @@ pub use appdb::{
     sqlite_wal_path, storage_keychain_decision, AppDbKeychain, EncryptedAppDb,
     StorageKeychainDecision,
 };
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+pub use appdb::{PassphraseVaultKeychain, ProductionAppDbKeychain};
 pub use content_keys::KeyState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -5,13 +5,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const tauriConfigPath = resolve(repoRoot, "apps/desktop/src-tauri/tauri.conf.json");
+const tauriConfigPath = resolve(repoRoot, process.env.DISCRYPT_TAURI_RELEASE_CONFIG ?? "apps/desktop/src-tauri/tauri.release.conf.json");
 const uiPackageDir = resolve(repoRoot, "apps/ui");
 const targetDir = resolve(repoRoot, "target/release/bundle");
 const tauriCli = process.env.DISCRYPT_TAURI_CLI ?? "@tauri-apps/cli@2.11.2";
 const releaseFeatures = (
   process.env.DISCRYPT_RELEASE_FEATURES ??
-  "tauri-runtime,production-network,production-media,production-storage"
+  "tauri-runtime,production-network,production-media,production-storage,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter"
 )
   .split(",")
   .map((feature) => feature.trim())
@@ -23,7 +23,7 @@ const bundles = (process.env.DISCRYPT_LINUX_BUNDLES ?? "deb,rpm,appimage")
 const dryRun =
   process.argv.includes("--dry-run") ||
   process.env.DISCRYPT_RELEASE_DRY_RUN === "1";
-const forbiddenReleaseFeatures = releaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
+let forbiddenReleaseFeatures = releaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
 
 function fail(message) {
   console.error(`release-linux: ${message}`);
@@ -61,6 +61,11 @@ if (!existsSync(resolve(uiPackageDir, "package.json"))) {
 }
 
 const tauriConfig = JSON.parse(readFileSync(tauriConfigPath, "utf8"));
+const tauriBuildFeatures = Array.isArray(tauriConfig.build?.features)
+  ? tauriConfig.build.features.map((feature) => String(feature).trim()).filter(Boolean)
+  : [];
+const effectiveReleaseFeatures = [...new Set([...tauriBuildFeatures, ...releaseFeatures])];
+forbiddenReleaseFeatures = effectiveReleaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
 const configuredTargets = tauriConfig.bundle?.targets;
 const configuredTargetList = Array.isArray(configuredTargets)
   ? configuredTargets.map((target) => String(target).toLowerCase())
@@ -80,6 +85,18 @@ if (forbiddenReleaseFeatures.length > 0) {
 }
 if (!releaseFeatures.includes("tauri-runtime")) {
   fail("DISCRYPT_RELEASE_FEATURES must include tauri-runtime for desktop packaging");
+}
+const linuxRuntimeDependencies = {
+  deb: tauriConfig.bundle?.linux?.deb?.depends ?? [],
+  rpm: tauriConfig.bundle?.linux?.rpm?.depends ?? [],
+};
+for (const dep of ["gnome-keyring", "dbus-user-session", "libpam-gnome-keyring"]) {
+  if (!linuxRuntimeDependencies.deb.includes(dep)) {
+    fail(`Tauri Debian bundle must declare ${dep} because production-storage uses Linux Secret Service`);
+  }
+}
+if (!linuxRuntimeDependencies.rpm.includes("gnome-keyring")) {
+  fail("Tauri RPM bundle must declare gnome-keyring because production-storage uses Linux Secret Service");
 }
 const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH ?? capture("git", ["log", "-1", "--format=%ct"]);
 const releaseEnv = { ...process.env, SOURCE_DATE_EPOCH: sourceDateEpoch };
@@ -132,6 +149,9 @@ const plan = {
   identifier: tauriConfig.identifier,
   bundles,
   releaseFeatures,
+  tauriBuildFeatures,
+  effectiveReleaseFeatures,
+  linuxRuntimeDependencies,
   tauriConfigPath,
   targetDir,
   dryRun,

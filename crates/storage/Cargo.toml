@@ -18,6 +18,7 @@ production-storage = [
   "content_keys/production-storage",
   "mls_core/production-storage",
   "dep:keyring",
+  "dep:argon2",
   "keyring/sync-secret-service",
   "keyring/crypto-rust",
 ]
@@ -30,6 +31,7 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 keyring = { version = "3.6.3", default-features = false, optional = true }
+argon2 = { version = "0.5", optional = true }
 zeroize = { workspace = true }
 content_keys = { package = "discrypt-content-keys", path = "../content-keys", version = "0.1.0" }
 mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }

@@ -6,8 +6,9 @@
   "build": {
     "features": [
       "tauri-runtime",
-      "local-dev",
+      "production-network",
       "production-media",
+      "production-storage",
       "mqtt-adapter",
       "nostr-adapter",
       "ipfs-pubsub-adapter",

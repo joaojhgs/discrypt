@@ -12,6 +12,7 @@ const files = {
   desktop: read("apps/desktop/src-tauri/src/lib.rs"),
   releaseLinux: read("scripts/release-linux.mjs"),
   releaseCheck: read("scripts/check-release-linux.mjs"),
+  tauriReleaseConfig: read("apps/desktop/src-tauri/tauri.release.conf.json"),
   packageJson: read("apps/ui/package.json"),
 };
 const failures = [];
@@ -41,12 +42,16 @@ for (const token of [
   "forbiddenReleaseFeatures",
   '"harness", "local-dev"',
   "release builds must not include non-production features",
+  "effectiveReleaseFeatures",
+  "tauri.release.conf.json",
   "delete releaseEnv.VITE_DISCRYPT_SHOW_DIAGNOSTICS",
   'run("npm", ["--prefix", "apps/ui", "run", "build"], { env: releaseEnv })',
   '"test:release-no-fallback-g129"',
 ]) requireText("releaseLinux", token);
-for (const token of ["test:release-no-fallback-g129", "harness/local-dev"]) requireText("releaseCheck", token);
+for (const token of ["test:release-no-fallback-g129", "harness/local-dev", "effective release features", "tauri.release.conf.json"]) requireText("releaseCheck", token);
 requireText("packageJson", "test:release-no-fallback-g129");
+for (const token of ["production-storage", "production-network", "tauri-runtime"]) requireText("tauriReleaseConfig", token);
+for (const token of ["local-dev", "harness"]) rejectText("tauriReleaseConfig", token);
 
 for (const token of [
   "Demo fallback active",
@@ -80,14 +85,14 @@ if (planResult.status !== 0) {
   if (rendered.includes("VITE_DISCRYPT_SHOW_DIAGNOSTICS=1")) {
     failures.push("release dry-run must not enable VITE_DISCRYPT_SHOW_DIAGNOSTICS");
   }
-  const forbidden = plan.releaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
-  if (forbidden.length > 0) failures.push(`release dry-run includes forbidden features: ${forbidden.join(",")}`);
+  const forbidden = plan.effectiveReleaseFeatures.filter((feature) => ["harness", "local-dev"].includes(feature));
+  if (forbidden.length > 0) failures.push(`release dry-run includes forbidden effective features: ${forbidden.join(",")}`);
 }
 
 for (const feature of ["local-dev", "harness"]) {
   const negative = runNode(`release dry-run rejects ${feature}`, ["scripts/release-linux.mjs", "--dry-run"], {
     DISCRYPT_RELEASE_DRY_RUN: "1",
-    DISCRYPT_RELEASE_FEATURES: `tauri-runtime,production-network,production-media,production-storage,${feature}`,
+    DISCRYPT_RELEASE_FEATURES: `tauri-runtime,production-network,production-media,production-storage,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter,${feature}`,
   });
   if (negative.status === 0) {
     failures.push(`release dry-run must fail when ${feature} is requested`);

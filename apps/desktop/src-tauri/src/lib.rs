@@ -49,13 +49,15 @@ use discrypt_storage::EncryptedAppDb;
 #[cfg(any(test, not(all(target_os = "linux", feature = "production-storage"))))]
 use discrypt_storage::FileAppStore;
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
-use discrypt_storage::LinuxOsKeychain;
+use discrypt_storage::PassphraseVaultKeychain;
 use discrypt_storage::{
     recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
     RecoveryCodeVerifier, RecoveryMaterial,
 };
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{AppDbKeychain, AppStoreError};
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+use discrypt_storage::{AppDbKeychain as _, LinuxOsKeychain, ProductionAppDbKeychain};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
 #[cfg(test)]
@@ -172,6 +174,56 @@ pub enum AppLifecycle {
     FirstRun,
     /// Local profile exists and the main shell can render.
     Ready,
+}
+
+/// User-visible local storage security state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageSecurityView {
+    /// Status key consumed by first-run UI routing.
+    pub status: String,
+    /// Configured storage mode, or `unconfigured` before first choice.
+    pub mode: String,
+    /// Short title for the storage wizard.
+    pub title: String,
+    /// Human-readable security/UX explanation.
+    pub detail: String,
+    /// Next safe action.
+    pub recovery_hint: String,
+    /// Whether the UI must request a password before account setup can continue.
+    pub password_required: bool,
+    /// Whether the OS keyring path appears usable without writing Discrypt state.
+    #[serde(default)]
+    pub keyring_available: bool,
+    /// Human-readable keyring availability/preflight detail.
+    #[serde(default)]
+    pub keyring_detail: String,
+}
+
+/// Storage setup/unlock mode selected before account setup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageSecurityMode {
+    /// Use the platform keyring/Secret Service as the wrapping-key store.
+    Keyring,
+    /// Use a user-entered password for the production vault wrapping-key store.
+    PassphraseVault,
+}
+
+/// Request to configure storage security before first account setup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConfigureStorageSecurityRequest {
+    /// Selected storage mode.
+    pub mode: StorageSecurityMode,
+    /// Required for passphrase-vault mode.
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+/// Request to unlock an existing password-backed vault on startup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UnlockStorageSecurityRequest {
+    /// User-entered vault password.
+    pub passphrase: String,
 }
 
 /// Persisted UI preference model shared with the React command client.
@@ -847,6 +899,8 @@ pub struct AppStateView {
     pub schema_version: u32,
     /// First-run vs ready lifecycle.
     pub lifecycle: AppLifecycle,
+    /// Local storage security setup/unlock state.
+    pub storage_security: StorageSecurityView,
     /// Local profile, if setup/recovery has completed.
     pub profile: Option<UserProfileView>,
     /// Persisted UI preferences.
@@ -1069,6 +1123,10 @@ pub struct CreateInviteRequest {
     pub expires: String,
     /// Maximum-use label selected by the user/admin.
     pub max_use: String,
+    /// Optional user-visible password admission label/request. The password is
+    /// not embedded into the offline invite descriptor.
+    #[serde(default)]
+    pub password_gate: Option<String>,
 }
 
 /// Request to create a first-contact DM invite.
@@ -2173,6 +2231,9 @@ struct PersistedAppState {
 
 static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+static STORAGE_UNLOCK: OnceLock<Mutex<ProductionStorageUnlockState>> = OnceLock::new();
+
 #[cfg(feature = "tauri-runtime")]
 static TEXT_CONTROL_RUNTIME_PUMP_STARTED: OnceLock<()> = OnceLock::new();
 #[cfg(feature = "tauri-runtime")]
@@ -2790,6 +2851,179 @@ pub fn app_state() -> AppStateView {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.to_view()
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn storage_security_error_state(
+    code: &str,
+    message: impl Into<String>,
+    recovery_hint: impl Into<String>,
+) -> AppStateView {
+    let mut state = PersistedAppState::initial();
+    state.last_command_error = Some(CommandErrorView {
+        code: code.to_owned(),
+        command: "storage_security".to_owned(),
+        message: redact_sensitive_observable_copy(message.into()),
+        recovery_hint: recovery_hint.into(),
+    });
+    state.to_view()
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn reload_app_service_after_storage_change() -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state = load_state();
+    let candidate = guard.state.clone();
+    if candidate.last_command_error.is_none() {
+        if let Err(error) = guard.persist_candidate(&candidate) {
+            guard.state.last_command_error = Some(error);
+        }
+    }
+    guard.to_view()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "production-storage", not(test))))]
+pub fn configure_storage_security(_request: ConfigureStorageSecurityRequest) -> AppStateView {
+    app_state()
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+pub fn configure_storage_security(request: ConfigureStorageSecurityRequest) -> AppStateView {
+    let existing = match read_production_storage_config() {
+        Ok(existing) => existing,
+        Err(error) => {
+            return storage_security_error_state(
+                "storage_security_config_failed",
+                error,
+                "Fix the storage security config before changing storage mode.",
+            )
+        }
+    };
+    let had_existing_store = app_store_path().exists();
+    let new_config = ProductionStorageConfig {
+        mode: request.mode.clone(),
+    };
+    if app_store_path().exists() {
+        match existing.as_ref() {
+            Some(existing) if existing.mode != new_config.mode => {
+                if let Err(error) = quarantine_existing_app_store_for_storage_mode_switch() {
+                    return storage_security_error_state(
+                        "storage_security_mode_switch_preserve_failed",
+                        error,
+                        "Discrypt could not preserve the existing local store, so it refused to switch storage mode.",
+                    );
+                }
+            }
+            None => {
+                if let Err(error) = quarantine_existing_app_store_for_storage_mode_switch() {
+                    return storage_security_error_state(
+                        "storage_security_unconfigured_store_preserve_failed",
+                        error,
+                        "Discrypt found an unconfigured existing local store and refused to continue until it could preserve that store.",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match request.mode {
+        StorageSecurityMode::Keyring => {
+            production_storage_unlock_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .passphrase = None;
+        }
+        StorageSecurityMode::PassphraseVault => {
+            let passphrase = request.passphrase.unwrap_or_default();
+            if passphrase.len() < 12 {
+                return storage_security_error_state(
+                    "storage_security_password_too_short",
+                    "Discrypt storage password must be at least 12 characters.",
+                    "Choose a longer password. If you lose it, this local app data cannot be decrypted.",
+                );
+            }
+            production_storage_unlock_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .passphrase = Some(passphrase);
+        }
+    }
+
+    if let Err(error) = write_production_storage_config(&new_config) {
+        return storage_security_error_state(
+            "storage_security_config_save_failed",
+            error,
+            "Check disk permissions for the Discrypt app data directory before continuing.",
+        );
+    }
+    let view = reload_app_service_after_storage_change();
+    if existing.is_none() {
+        if let Some(error) = view.last_command_error.as_ref() {
+            // Do not let a failed first mode selection become durable for an existing
+            // production store. This keeps migrated/previous-release data recoverable
+            // by trying the other configured storage mode instead of pinning the UI
+            // to the wrong keyring/vault choice. The data store itself is preserved.
+            let _ = std::fs::remove_file(production_storage_config_path());
+            if had_existing_store {
+                production_storage_unlock_state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .passphrase = None;
+            }
+            return storage_security_error_state(
+                "storage_security_unlock_failed",
+                format!(
+                    "The selected storage mode could not open Discrypt storage: {}",
+                    error.message
+                ),
+                "Existing local state was preserved. Try the other storage mode if this is a migrated install; recovery and migration flows are tracked in the roadmap.",
+            );
+        }
+    }
+    view
+}
+
+#[cfg(not(all(target_os = "linux", feature = "production-storage", not(test))))]
+pub fn unlock_storage_security(_request: UnlockStorageSecurityRequest) -> AppStateView {
+    app_state()
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+pub fn unlock_storage_security(request: UnlockStorageSecurityRequest) -> AppStateView {
+    match read_production_storage_config() {
+        Ok(Some(config)) if config.mode == StorageSecurityMode::PassphraseVault => {}
+        Ok(Some(_)) => return app_state(),
+        Ok(None) => {
+            return storage_security_error_state(
+                "storage_security_unconfigured",
+                "Storage security has not been configured yet.",
+                "Choose OS keyring or password vault before account setup.",
+            )
+        }
+        Err(error) => {
+            return storage_security_error_state(
+                "storage_security_config_failed",
+                error,
+                "Fix the storage security config before unlocking.",
+            )
+        }
+    }
+    if request.passphrase.len() < 12 {
+        return storage_security_error_state(
+            "storage_security_password_too_short",
+            "Discrypt storage password must be at least 12 characters.",
+            "Enter the password originally used for this vault.",
+        );
+    }
+    production_storage_unlock_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .passphrase = Some(request.passphrase);
+    reload_app_service_after_storage_change()
 }
 
 /// Tauri command: start the backend signaling control-plane transport session.
@@ -4058,42 +4292,40 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         };
         let expires = normalize_label(&request.expires, "Invite expires and can be revoked");
         let max_use = normalize_label(&request.max_use, "Max-use is enforced before MLS admission");
+        let password_gate_requested = request
+            .password_gate
+            .as_deref()
+            .map(str::trim)
+            .filter(|password| !password.is_empty())
+            .is_some();
         let expires_at = invite_expiration_horizon(&expires);
         let descriptor_expires_at = Utc::now() + invite_expiration_duration(&expires);
         let max_uses = parse_max_uses(&max_use);
         let invite_key = Uuid::new_v4().to_string();
         let room_secret = format!("room-secret:{}:{}:{}", group_id, invite_key, sequence);
-        let signaling_endpoint = default_signaling_endpoint();
-        let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
-        let mut signaling_metadata = InviteSignalingMetadata::new(
-            signaling_endpoint.clone(),
-            InviteEndpointPolicy::ProductionTls,
-            InviteTrustMetadata::new(
-                signaling_trust_fingerprint.clone(),
-                "signed endpoint fingerprint; verify before MLS Welcome",
-            )
-            .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
-        )
-        .and_then(
-            |metadata| match signed_ice_endpoint_policy_from_connectivity(&connectivity) {
-                Some(policy) => metadata.with_ice_endpoint_policy(policy),
-                None => Ok(metadata),
-            },
-        )
-        .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
-        if let Ok(ice_config) = ice_config_from_connectivity(&connectivity) {
-            if let Ok(ice_policy) = discrypt_transport::IceEndpointPolicy::new(
-                ice_config.stun_servers.clone(),
-                ice_config.turn_servers.clone(),
-            ) {
-                if let Ok(with_ice_policy) = signaling_metadata
-                    .clone()
-                    .with_ice_endpoint_policy(ice_policy)
-                {
-                    signaling_metadata = with_ice_policy;
-                }
+        let signaling_metadata = match invite_signaling_metadata_from_connectivity(
+            &connectivity,
+            "signed endpoint fingerprint; verify before MLS Welcome",
+        ) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_signaling_metadata_invalid",
+                    error,
+                    "Save a valid group signaling profile before issuing an invite",
+                );
+                return;
             }
-        }
+        };
+        let signaling_endpoint = signaling_metadata.signaling_endpoint.clone();
+        let signaling_trust_fingerprint = signaling_metadata.trust.signaling_fingerprint.clone();
+        let signaling_trust_status = signaling_metadata.trust.trust_status.clone();
+        let endpoint_policy = signaling_metadata
+            .endpoint_policy
+            .canonical_name()
+            .to_owned();
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = invite_store
@@ -4148,9 +4380,8 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             room_secret_hash,
             signaling_endpoint,
             signaling_trust_fingerprint,
-            signaling_trust_status: "signed endpoint fingerprint; verify before MLS Welcome"
-                .to_owned(),
-            endpoint_policy: "production_tls".to_owned(),
+            signaling_trust_status,
+            endpoint_policy,
             ice_stun_servers: connectivity.ice_stun_servers.clone(),
             ice_turn_servers: connectivity.ice_turn_servers.clone(),
             expires,
@@ -4158,8 +4389,13 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             max_use,
             uses: 0,
             revoked: false,
-            admission_copy: "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient"
-                .to_owned(),
+            admission_copy: if password_gate_requested {
+                "Password-gated admission requested; final admission still requires an authorized MLS Welcome/add and no password verifier is embedded in the invite"
+                    .to_owned()
+            } else {
+                "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient"
+                    .to_owned()
+            },
         };
         let signaling_key = format!(
             "signaling:{}:{}",
@@ -4272,37 +4508,29 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
         let max_uses = parse_max_uses(&max_use);
         let invite_key = Uuid::new_v4().to_string();
         let room_secret = format!("dm-contact-secret:{}:{}:{}", dm.dm_id, invite_key, sequence);
-        let signaling_endpoint = default_signaling_endpoint();
-        let signaling_trust_fingerprint = signaling_fingerprint_for_endpoint(&signaling_endpoint);
-        let mut signaling_metadata = InviteSignalingMetadata::new(
-            signaling_endpoint.clone(),
-            InviteEndpointPolicy::ProductionTls,
-            InviteTrustMetadata::new(
-                signaling_trust_fingerprint.clone(),
-                "signed endpoint fingerprint; verify before DM accept",
-            )
-            .unwrap_or_else(|_| InviteSignalingMetadata::default_production().trust),
-        )
-        .and_then(
-            |metadata| match signed_ice_endpoint_policy_from_connectivity(&connectivity) {
-                Some(policy) => metadata.with_ice_endpoint_policy(policy),
-                None => Ok(metadata),
-            },
-        )
-        .unwrap_or_else(|_| InviteSignalingMetadata::default_production());
-        if let Ok(ice_config) = ice_config_from_connectivity(&connectivity) {
-            if let Ok(ice_policy) = discrypt_transport::IceEndpointPolicy::new(
-                ice_config.stun_servers.clone(),
-                ice_config.turn_servers.clone(),
-            ) {
-                if let Ok(with_ice_policy) = signaling_metadata
-                    .clone()
-                    .with_ice_endpoint_policy(ice_policy)
-                {
-                    signaling_metadata = with_ice_policy;
-                }
+        let signaling_metadata = match invite_signaling_metadata_from_connectivity(
+            &connectivity,
+            "signed endpoint fingerprint; verify before DM accept",
+        ) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_dm_invite",
+                    "invite_signaling_metadata_invalid",
+                    error,
+                    "Save a valid DM signaling profile before issuing an invite",
+                );
+                return;
             }
-        }
+        };
+        let signaling_endpoint = signaling_metadata.signaling_endpoint.clone();
+        let signaling_trust_fingerprint = signaling_metadata.trust.signaling_fingerprint.clone();
+        let signaling_trust_status = signaling_metadata.trust.trust_status.clone();
+        let endpoint_policy = signaling_metadata
+            .endpoint_policy
+            .canonical_name()
+            .to_owned();
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = invite_store
@@ -4353,8 +4581,8 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
             room_secret_hash,
             signaling_endpoint,
             signaling_trust_fingerprint,
-            signaling_trust_status: "signed endpoint fingerprint; verify before DM accept".to_owned(),
-            endpoint_policy: "production_tls".to_owned(),
+            signaling_trust_status,
+            endpoint_policy,
             ice_stun_servers: connectivity.ice_stun_servers.clone(),
             ice_turn_servers: connectivity.ice_turn_servers.clone(),
             expires,
@@ -5471,6 +5699,26 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn configure_storage_security(
+        app_handle: tauri::AppHandle,
+        request: ConfigureStorageSecurityRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::configure_storage_security(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn unlock_storage_security(
+        app_handle: tauri::AppHandle,
+        request: UnlockStorageSecurityRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::unlock_storage_security(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn start_signaling_session(
         app_handle: tauri::AppHandle,
         request: StartSignalingSessionRequest,
@@ -5884,6 +6132,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc_commands::app_snapshot,
             ipc_commands::app_state,
+            ipc_commands::configure_storage_security,
+            ipc_commands::unlock_storage_security,
             ipc_commands::start_signaling_session,
             ipc_commands::stop_signaling_session,
             ipc_commands::start_text_session,
@@ -6374,6 +6624,7 @@ impl PersistedAppState {
         AppStateView {
             schema_version: self.schema_version,
             lifecycle: self.lifecycle.clone(),
+            storage_security: storage_security_view(self.last_command_error.as_ref()),
             profile: self.profile.clone(),
             preferences: self.preferences.clone(),
             dms: self.dms.clone(),
@@ -6395,6 +6646,18 @@ impl PersistedAppState {
             voice_states: self.voice_states(),
             runtime_mode: runtime_mode_view(),
             snapshot: self.to_snapshot(),
+        }
+    }
+
+    fn clear_non_persistent_voice_runtime(&mut self) {
+        self.voice_session = None;
+        if self
+            .active_context
+            .as_ref()
+            .map(|context| context.kind == "voice_channel")
+            .unwrap_or(false)
+        {
+            self.active_context = None;
         }
     }
 
@@ -9957,6 +10220,10 @@ fn event_kind_topic(kind: &str) -> &str {
 }
 
 fn load_state() -> PersistedAppState {
+    #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+    if let Some(state) = production_storage_gate_state() {
+        return state;
+    }
     let mut store = app_store();
     load_state_from_store(&mut store)
 }
@@ -9964,7 +10231,10 @@ fn load_state() -> PersistedAppState {
 fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
     match store.load_app_state() {
         Ok(Some(bytes)) => match serde_json::from_slice::<PersistedAppState>(&bytes) {
-            Ok(state) if state.schema_version == APP_STATE_SCHEMA_VERSION => state,
+            Ok(mut state) if state.schema_version == APP_STATE_SCHEMA_VERSION => {
+                state.clear_non_persistent_voice_runtime();
+                state
+            }
             Ok(_) => initial_state_with_persistence_error(
                 "state_schema_mismatch",
                 "Stored app state uses an unsupported schema version.",
@@ -9994,7 +10264,9 @@ fn persist_state_to_store(
     store: &mut impl AppStore,
     state: &PersistedAppState,
 ) -> Result<(), CommandErrorView> {
-    let encoded = serde_json::to_vec_pretty(state).map_err(|error| {
+    let mut persisted = state.clone();
+    persisted.clear_non_persistent_voice_runtime();
+    let encoded = serde_json::to_vec_pretty(&persisted).map_err(|error| {
         persistence_command_error(
             "state_encode_failed",
             format!("App state could not be encoded for persistence: {error}"),
@@ -10008,6 +10280,318 @@ fn persist_state_to_store(
             "Check disk/keychain availability before continuing; the app did not confirm persistence.",
         )
     })
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ProductionStorageConfig {
+    mode: StorageSecurityMode,
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+#[derive(Clone, Debug, Default)]
+struct ProductionStorageUnlockState {
+    passphrase: Option<String>,
+    last_status: Option<StorageSecurityView>,
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn production_storage_unlock_state() -> &'static Mutex<ProductionStorageUnlockState> {
+    STORAGE_UNLOCK.get_or_init(|| Mutex::new(ProductionStorageUnlockState::default()))
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn production_storage_config_path() -> PathBuf {
+    app_store_path().with_extension("storage-security.json")
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn read_production_storage_config() -> Result<Option<ProductionStorageConfig>, String> {
+    let path = production_storage_config_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read storage security config at {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        format!(
+            "could not decode storage security config at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn write_production_storage_config(config: &ProductionStorageConfig) -> Result<(), String> {
+    let path = production_storage_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create storage security config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("could not encode storage security config: {error}"))?;
+    std::fs::write(&path, bytes).map_err(|error| {
+        format!(
+            "could not write storage security config at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn quarantine_existing_app_store_for_storage_mode_switch() -> Result<(), String> {
+    let path = app_store_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let timestamp = Utc::now().timestamp_millis();
+    let target = path.with_extension(format!("discrypt-store.mode-switch-quarantine-{timestamp}"));
+    std::fs::rename(&path, &target).map_err(|error| {
+        format!(
+            "could not preserve existing app store before storage-mode switch from {} to {}: {error}",
+            path.display(),
+            target.display()
+        )
+    })?;
+    let openmls_path = app_openmls_store_path();
+    if openmls_path.exists() {
+        let openmls_target =
+            openmls_path.with_extension(format!("sqlite.mode-switch-quarantine-{timestamp}"));
+        std::fs::rename(&openmls_path, &openmls_target).map_err(|error| {
+            format!(
+                "could not preserve existing OpenMLS store before storage-mode switch from {} to {}: {error}",
+                openmls_path.display(),
+                openmls_target.display()
+            )
+        })?;
+    }
+    eprintln!(
+        "[Discrypt persistence] preserved existing production store before storage-mode switch at {}",
+        target.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn set_storage_status(status: StorageSecurityView) {
+    production_storage_unlock_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .last_status = Some(status);
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn storage_status(
+    status: &str,
+    mode: &str,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    recovery_hint: impl Into<String>,
+    password_required: bool,
+) -> StorageSecurityView {
+    let (keyring_available, keyring_detail) = keyring_preflight_status();
+    StorageSecurityView {
+        status: status.to_owned(),
+        mode: mode.to_owned(),
+        title: title.into(),
+        detail: detail.into(),
+        recovery_hint: recovery_hint.into(),
+        password_required,
+        keyring_available,
+        keyring_detail,
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn keyring_preflight_status() -> (bool, String) {
+    let mut keychain = LinuxOsKeychain::discrypt_app_db();
+    let key_id = "__discrypt_keyring_preflight_v1__";
+    let test_key = [0x42_u8; 32];
+    let result = keychain
+        .store_wrapping_key(key_id, test_key)
+        .and_then(|()| match keychain.load_wrapping_key(key_id) {
+            Ok(Some(loaded)) if loaded == test_key => Ok(()),
+            Ok(Some(_)) => Err(discrypt_storage::AppStoreError::Crypto(
+                "OS keyring preflight returned a different wrapping key",
+            )),
+            Ok(None) => Err(discrypt_storage::AppStoreError::KeychainMissing(
+                key_id.to_owned(),
+            )),
+            Err(error) => Err(error),
+        });
+    let _ = keychain.delete_wrapping_key(key_id);
+    match result {
+        Ok(()) => (
+            true,
+            "OS keyring passed a Discrypt write/read/delete preflight.".to_owned(),
+        ),
+        Err(error) => (
+            false,
+            format!(
+                "OS keyring did not pass write/read preflight: {}",
+                redact_sensitive_observable_copy(error.to_string())
+            ),
+        ),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn production_storage_gate_state() -> Option<PersistedAppState> {
+    if std::env::var("DISCRYPT_APPDB_VAULT_PASSPHRASE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        set_storage_status(storage_status(
+            "ready",
+            "passphrase_vault",
+            "Password vault unlocked by environment",
+            "A deployment-provided passphrase is active for this process.",
+            "Continue to account setup.",
+            false,
+        ));
+        return None;
+    }
+
+    match read_production_storage_config() {
+        Ok(None) => {
+            set_storage_status(storage_status(
+                "setup_required",
+                "unconfigured",
+                "Choose how Discrypt protects this device",
+                "Before account setup, choose the OS keyring for convenience or a Discrypt password vault for stronger app-level separation.",
+                "Pick OS keyring if you trust the logged-in desktop keychain; pick password vault if you want to type a password every time Discrypt starts.",
+                false,
+            ));
+            Some(PersistedAppState::initial())
+        }
+        Ok(Some(config)) if config.mode == StorageSecurityMode::PassphraseVault => {
+            let unlocked = production_storage_unlock_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .passphrase
+                .is_some();
+            if unlocked {
+                set_storage_status(storage_status(
+                    "ready",
+                    "passphrase_vault",
+                    "Password vault unlocked",
+                    "Local app data is encrypted by a key derived from the password entered for this launch.",
+                    "Continue.",
+                    false,
+                ));
+                None
+            } else {
+                set_storage_status(storage_status(
+                    "locked",
+                    "passphrase_vault",
+                    "Unlock Discrypt storage",
+                    "This profile uses a Discrypt password vault instead of the OS keyring. The password is required on every app start.",
+                    "Enter the vault password. Discrypt will not replace the existing vault if unlock fails.",
+                    true,
+                ));
+                Some(PersistedAppState::initial())
+            }
+        }
+        Ok(Some(_)) => {
+            set_storage_status(storage_status(
+                "ready",
+                "keyring",
+                "Using OS keyring",
+                "Discrypt will ask the operating system keyring to protect local app data.",
+                "Continue.",
+                false,
+            ));
+            None
+        }
+        Err(error) => {
+            let mut state = PersistedAppState::initial();
+            let status = storage_status(
+                "error",
+                "unknown",
+                "Storage security config error",
+                redact_sensitive_observable_copy(error.clone()),
+                "Fix the storage security config before creating or unlocking an account. Discrypt will not create a replacement vault/keyring entry over an unknown state.",
+                false,
+            );
+            set_storage_status(status);
+            state.last_command_error = Some(persistence_command_error(
+                "storage_security_config_failed",
+                error,
+                "Fix the storage security config before continuing.",
+            ));
+            Some(state)
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "production-storage", not(test))))]
+fn storage_security_view(last_error: Option<&CommandErrorView>) -> StorageSecurityView {
+    StorageSecurityView {
+        status: if last_error.is_some() {
+            "error"
+        } else {
+            "ready"
+        }
+        .to_owned(),
+        mode: "development_store".to_owned(),
+        title: "Development storage".to_owned(),
+        detail: "This build uses the non-production local development storage path.".to_owned(),
+        recovery_hint: last_error
+            .map(|error| error.recovery_hint.clone())
+            .unwrap_or_else(|| "Continue.".to_owned()),
+        password_required: false,
+        keyring_available: true,
+        keyring_detail: "Development builds do not require OS-keyring preflight.".to_owned(),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn storage_security_view(last_error: Option<&CommandErrorView>) -> StorageSecurityView {
+    if let Some(error) = last_error {
+        if error.command == "app_persistence" || error.command == "storage_security" {
+            let config_mode = read_production_storage_config()
+                .ok()
+                .flatten()
+                .map(|config| match config.mode {
+                    StorageSecurityMode::Keyring => "keyring",
+                    StorageSecurityMode::PassphraseVault => "passphrase_vault",
+                })
+                .unwrap_or("unknown");
+            return storage_status(
+                "error",
+                config_mode,
+                "Storage unlock failed",
+                error.message.clone(),
+                error.recovery_hint.clone(),
+                config_mode == "passphrase_vault",
+            );
+        }
+    }
+    production_storage_unlock_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .last_status
+        .clone()
+        .unwrap_or_else(|| {
+            storage_status(
+                "ready",
+                "keyring",
+                "Storage ready",
+                "Storage is ready for this session.",
+                "Continue.",
+                false,
+            )
+        })
 }
 
 fn initial_state_with_persistence_error(
@@ -10026,13 +10610,13 @@ fn persistence_command_error(
     recovery_hint: impl Into<String>,
 ) -> CommandErrorView {
     let code = code.into();
-    let _redacted_detail = redact_sensitive_observable_copy(message);
+    let message = message.into();
+    let redacted_detail = redact_sensitive_observable_copy(&message);
+    eprintln!("[Discrypt persistence] {code}: {redacted_detail}");
     CommandErrorView {
         code: code.clone(),
         command: "app_persistence".to_owned(),
-        message: format!(
-            "Persistence/security error {code}; detailed storage failure copy is redacted from observable state."
-        ),
+        message: format!("Persistence/security error {code}: {redacted_detail}"),
         recovery_hint: redact_sensitive_observable_copy(recovery_hint),
     }
 }
@@ -10161,8 +10745,42 @@ impl AppDbKeychain for TestAppDbKeychain {
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
-fn app_store() -> EncryptedAppDb<LinuxOsKeychain> {
-    EncryptedAppDb::new(app_store_path(), LinuxOsKeychain::discrypt_app_db())
+fn app_store() -> EncryptedAppDb<ProductionAppDbKeychain> {
+    let path = app_store_path();
+    EncryptedAppDb::new(path.clone(), production_storage_keychain(&path))
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
+fn production_storage_keychain(app_state_path: &std::path::Path) -> ProductionAppDbKeychain {
+    let vault_path = app_state_path.with_extension("vault");
+    if let Some(passphrase) = std::env::var("DISCRYPT_APPDB_VAULT_PASSPHRASE")
+        .ok()
+        .filter(|passphrase| !passphrase.is_empty())
+    {
+        return ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+            vault_path, passphrase,
+        ));
+    }
+
+    match read_production_storage_config() {
+        Ok(Some(config)) if config.mode == StorageSecurityMode::PassphraseVault => {
+            let passphrase = production_storage_unlock_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .passphrase
+                .clone();
+            match passphrase {
+                Some(passphrase) => ProductionAppDbKeychain::vault_only(
+                    PassphraseVaultKeychain::new(vault_path, passphrase),
+                ),
+                None => ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+                    vault_path,
+                    String::new(),
+                )),
+            }
+        }
+        _ => ProductionAppDbKeychain::discrypt_app_db(None),
+    }
 }
 
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
@@ -10898,6 +11516,68 @@ fn default_signaling_endpoint() -> String {
             .is_ok()
         });
     configured.unwrap_or_else(|| InviteSignalingMetadata::default_production().signaling_endpoint)
+}
+
+fn invite_endpoint_policy_for_endpoint(endpoint: &str) -> InviteEndpointPolicy {
+    match endpoint_security_for_probe(endpoint) {
+        SignalingEndpointSecurity::LocalDevLoopback => InviteEndpointPolicy::LocalDevLoopback,
+        SignalingEndpointSecurity::ProductionTls
+        | SignalingEndpointSecurity::SelfHostedExplicit => InviteEndpointPolicy::ProductionTls,
+    }
+}
+
+fn invite_signaling_metadata_from_connectivity(
+    connectivity: &ConnectivityPolicyView,
+    trust_status: &str,
+) -> Result<InviteSignalingMetadata, String> {
+    let mut candidates = connectivity
+        .signaling_profiles
+        .iter()
+        .flat_map(|profile| {
+            profile.endpoints.iter().map(move |endpoint| {
+                let fingerprint = if profile.trust_fingerprint.trim().is_empty() {
+                    signaling_fingerprint_for_endpoint(endpoint)
+                } else {
+                    profile.trust_fingerprint.clone()
+                };
+                (endpoint.clone(), fingerprint)
+            })
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        let endpoint = default_signaling_endpoint();
+        candidates.push((
+            endpoint.clone(),
+            signaling_fingerprint_for_endpoint(&endpoint),
+        ));
+    }
+
+    let mut last_error = None;
+    for (endpoint, fingerprint) in candidates {
+        let policy = invite_endpoint_policy_for_endpoint(&endpoint);
+        let trust = match InviteTrustMetadata::new(fingerprint, trust_status) {
+            Ok(trust) => trust,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        let metadata = InviteSignalingMetadata::new(endpoint, policy, trust).and_then(|metadata| {
+            match signed_ice_endpoint_policy_from_connectivity(connectivity) {
+                Some(policy) => metadata.with_ice_endpoint_policy(policy),
+                None => Ok(metadata),
+            }
+        });
+        match metadata {
+            Ok(metadata) => return Ok(metadata),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        "No configured signaling profile endpoint can be signed into an invite descriptor"
+            .to_owned()
+    }))
 }
 
 fn hash_commitment(domain: &str, parts: &[&str]) -> String {
@@ -13051,6 +13731,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "4".to_owned(),
+            password_gate: None,
         });
         let group_invite = group_invite_state
             .invites
@@ -13224,43 +13905,9 @@ mod tests {
                 .and_then(|context| context.channel_id.as_deref()),
             Some(group_channel_id.as_str())
         );
-        let reloaded_voice = alice_view
-            .voice_session
-            .as_ref()
-            .ok_or_else(|| "voice session missing after reload".to_owned())?;
-        assert_eq!(reloaded_voice.session_id, voice_session_id);
-        assert_eq!(reloaded_voice.channel_id, voice_channel_id);
-        assert!(reloaded_voice.joined);
-        assert!(reloaded_voice.self_muted);
-        assert_eq!(
-            reloaded_voice
-                .input_device
-                .as_ref()
-                .map(|device| device.device_id.as_str()),
-            Some("mic-alice")
-        );
-        assert_eq!(
-            reloaded_voice
-                .output_device
-                .as_ref()
-                .map(|device| device.device_id.as_str()),
-            Some("speaker-alice")
-        );
-        assert_eq!(
-            reloaded_voice
-                .participants
-                .iter()
-                .find(|participant| participant.id == alice_user_id)
-                .map(|participant| (participant.muted, participant.volume)),
-            Some((true, 82))
-        );
-        assert_eq!(
-            reloaded_voice
-                .participants
-                .iter()
-                .find(|participant| participant.id == remote_participant_id)
-                .map(|participant| (participant.muted, participant.volume)),
-            Some((false, 55))
+        assert!(
+            alice_view.voice_session.is_none(),
+            "voice sessions are runtime-only and must not be restored as joined after reload"
         );
         assert!(alice_view.invites.iter().any(|invite| {
             invite.invite_key == dm_invite.invite_key
@@ -13386,6 +14033,7 @@ mod tests {
             group_id: Some(alice_group_id.clone()),
             expires: "24 hours".to_owned(),
             max_use: "2 uses".to_owned(),
+            password_gate: None,
         });
         assert!(
             group_invite_state.last_command_error.is_none(),
@@ -13790,6 +14438,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "2".to_owned(),
+            password_gate: None,
         });
         let group_invite = group_invite_state
             .invites
@@ -14396,6 +15045,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
+            password_gate: None,
         });
         assert!(invite_state.invites[0]
             .code
@@ -14488,6 +15138,7 @@ mod tests {
             group_id: Some(group_state.groups[0].group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "2".to_owned(),
+            password_gate: None,
         });
         let parsed = parse_invite_metadata(&invite_state.invites[0].code);
         assert!(parsed.is_some());
@@ -14524,6 +15175,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
+            password_gate: None,
         });
         let group_invite = invite_state
             .invites
@@ -14737,6 +15389,7 @@ mod tests {
             group_id: state.groups.first().map(|group| group.group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
+            password_gate: None,
         });
         let invite = invite_state
             .invites
@@ -15138,12 +15791,14 @@ mod tests {
             group_id: Some(group.group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "3".to_owned(),
+            password_gate: None,
         });
         let invite = invite_state
             .invites
             .last()
             .ok_or_else(|| "invite missing".to_owned())?;
         assert_eq!(invite.signaling_profiles[0].adapter_kind, "nostr");
+        assert_eq!(invite.signaling_endpoint, "wss://relay.damus.io");
         assert_eq!(
             invite.ice_stun_servers,
             vec!["stun:stun.cloudflare.com:3478"]
@@ -15287,6 +15942,7 @@ mod tests {
             group_id: Some(owner_group.group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
+            password_gate: None,
         });
         assert!(invited.last_command_error.is_none(), "{invited:?}");
         let invite_code = invited
@@ -16438,6 +17094,7 @@ mod tests {
             group_id: Some(group_id),
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
+            password_gate: None,
         });
         let labels: Vec<_> = state
             .transport_status
@@ -16489,6 +17146,7 @@ mod tests {
             group_id: Some(group.groups[0].group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "5".to_owned(),
+            password_gate: None,
         });
         let keys: Vec<_> = state
             .join_progress
@@ -17583,6 +18241,7 @@ mod tests {
             group_id: Some(alice_group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "2".to_owned(),
+            password_gate: None,
         });
         assert!(
             alice_invite_state.last_command_error.is_none(),
@@ -18903,6 +19562,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "2 days".to_owned(),
             max_use: "2 uses".to_owned(),
+            password_gate: None,
         });
         assert!(
             group_invite.last_command_error.is_none(),
@@ -19081,39 +19741,13 @@ mod tests {
             .ok_or_else(|| "reloaded message missing".to_owned())?;
         assert_eq!(reloaded_message.state_key, "peer_receipt");
         assert!(reloaded_message.peer_receipt.is_some());
-        let reloaded_voice = alice_reloaded
-            .voice_session
-            .as_ref()
-            .ok_or_else(|| "reloaded voice session missing".to_owned())?;
-        assert!(reloaded_voice.joined);
-        assert!(reloaded_voice.self_muted);
-        assert_eq!(
-            reloaded_voice
-                .input_device
-                .as_ref()
-                .map(|device| device.device_id.as_str()),
-            Some("mic-alice")
+        assert!(
+            alice_reloaded.voice_session.is_none(),
+            "voice sessions are runtime-only and must not be restored as joined after reload"
         );
-        assert_eq!(
-            reloaded_voice
-                .output_device
-                .as_ref()
-                .map(|device| device.device_id.as_str()),
-            Some("speaker-alice")
-        );
-        assert!(reloaded_voice
-            .participants
-            .iter()
-            .any(|participant| participant.id == remote_participant_id
-                && participant.role == "remote"
-                && !participant.muted
-                && participant.volume == 37));
-        assert_eq!(
-            alice_reloaded
-                .active_context
-                .as_ref()
-                .and_then(|context| context.channel_id.as_deref()),
-            Some(voice_channel_id.as_str())
+        assert!(
+            alice_reloaded.active_context.is_none(),
+            "a persisted voice-channel context must not reopen as an active joined channel"
         );
 
         let bob_path = reset_with_temp_state("g004-persistent-state-bob");
@@ -20166,6 +20800,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "24 hours".to_owned(),
             max_use: "1 use".to_owned(),
+            password_gate: None,
         });
         assert!(invite.last_command_error.is_none(), "{invite:?}");
         let invite_code = invite
@@ -20415,6 +21050,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "24 hours".to_owned(),
             max_use: "1 use".to_owned(),
+            password_gate: None,
         });
         assert!(invite.last_command_error.is_none(), "{invite:?}");
         let invite_code = invite
@@ -20865,6 +21501,7 @@ mod tests {
                 group_id: Some(group_id.clone()),
                 expires: "1 day".to_owned(),
                 max_use: "1".to_owned(),
+                password_gate: None,
             });
             assert!(
                 state.last_command_error.is_none(),
@@ -20875,6 +21512,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "1".to_owned(),
+            password_gate: None,
         });
         assert_eq!(
             limited_invite
@@ -21192,6 +21830,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "2".to_owned(),
+            password_gate: None,
         });
         cursor = assert_cursor_advanced(cursor, &invite);
 
@@ -21322,6 +21961,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "2".to_owned(),
+            password_gate: None,
         });
         create_device_pairing_payload(CreateDevicePairingPayloadRequest {
             requested_label: "Phone".to_owned(),
@@ -21554,7 +22194,12 @@ mod tests {
                 panic!("missing Tauri command wrapper for {command}");
             });
             let rest = &source[start..];
-            let end = rest.find("\n    #[tauri::command]").unwrap_or(rest.len());
+            let end = rest
+                .find(
+                    "
+    #[tauri::command]",
+                )
+                .unwrap_or(rest.len());
             &rest[..end]
         }
 
@@ -21591,7 +22236,12 @@ mod tests {
                 .find(&format!("pub(super) fn {command}("))
                 .unwrap_or_else(|| panic!("missing {command} wrapper"));
             let rest = &source[start..];
-            let end = rest.find("\n    #[tauri::command]").unwrap_or(rest.len());
+            let end = rest
+                .find(
+                    "
+    #[tauri::command]",
+                )
+                .unwrap_or(rest.len());
             let wrapper = &rest[..end];
             assert!(
                 wrapper.contains("app_handle: tauri::AppHandle"),
@@ -21802,6 +22452,7 @@ mod tests {
             group_id: Some(group_id),
             expires: "24 hours".to_owned(),
             max_use: "single use".to_owned(),
+            password_gate: None,
         });
         start_dm(StartDmRequest {
             display_name: "Bob Secret".to_owned(),

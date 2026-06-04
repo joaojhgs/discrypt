@@ -8,6 +8,7 @@ type VoiceMediaEvidence = {
   peerConnectionsClosed: number;
   trackEnabled: boolean;
   trackStopCount: number;
+  sinkIds: string[];
 };
 
 async function installVoiceMediaHarness(page: Page, profile: string) {
@@ -20,6 +21,7 @@ async function installVoiceMediaHarness(page: Page, profile: string) {
       peerConnectionsClosed: 0,
       trackEnabled: true,
       trackStopCount: 0,
+      sinkIds: [],
     };
     Object.defineProperty(window, "__discryptVoiceMediaEvidence", {
       configurable: true,
@@ -202,6 +204,14 @@ async function installVoiceMediaHarness(page: Page, profile: string) {
         this.iceConnectionState = "closed";
       }
     }
+    Object.defineProperty(HTMLMediaElement.prototype, "setSinkId", {
+      configurable: true,
+      value(sinkId: string) {
+        evidence.sinkIds.push(sinkId);
+        return Promise.resolve();
+      },
+    });
+
     Object.defineProperty(window, "RTCPeerConnection", {
       configurable: true,
       value: E2ERtcPeerConnection,
@@ -240,8 +250,8 @@ async function openProfile(
   await expect(
     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
   ).toBeVisible();
-  await page.getByLabel("Display name").fill(displayName);
-  await page.getByLabel("Device name").fill(deviceName);
+  await page.getByLabel("Display name").first().fill(displayName);
+  await page.getByLabel("Device name").first().fill(deviceName);
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
     page.getByRole("heading", { name: /finish the local trust setup/i }),
@@ -259,35 +269,53 @@ async function readLatestInvite(page: Page) {
   return matches.at(-1) ?? "";
 }
 
+
+async function openLauncher(page: Page) {
+  await page.getByRole("button", { name: "Add group or direct message", exact: true }).click();
+}
+
+async function openCreateGroupModal(page: Page) {
+  await openLauncher(page);
+  await page.getByRole("button", { name: /create a new group/i }).click();
+}
+
+async function openGroupInviteModal(page: Page, groupName = "G007 Voice Media Lab") {
+  await page.getByRole("button", { name: new RegExp(`Open ${groupName} group`, "i") }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: /create invite/i }).click();
+}
+
 async function closeInviteSheetIfOpen(page: Page) {
-  const closeButton = page.getByRole("button", { name: "Close Invite sheet" });
+  const closeButton = page.getByRole("button", {
+    name: /Close (Create group invite|Add group or direct message|Invite sheet)/i,
+  });
   if ((await closeButton.count()) === 0) {
     return;
   }
   await closeButton.click();
-  await expect(page.getByRole("dialog", { name: "Invite sheet" })).toHaveCount(
-    0,
-  );
+  await expect(page.getByRole("dialog")).toHaveCount(0);
 }
 
 async function createInvite(page: Page) {
-  await page.getByRole("button", { name: "Create group" }).first().click();
+  await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill("G007 Voice Media Lab");
   await page
     .getByRole("button", { name: /^Create group$/ })
     .last()
     .click();
-  await page.getByRole("button", { name: "Create invite" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "#general" })).toBeVisible();
+  await openGroupInviteModal(page);
+  await page.getByRole("button", { name: /create invite for/i }).click();
   const invite = await readLatestInvite(page);
   await closeInviteSheetIfOpen(page);
   return invite;
 }
 
 async function joinInvite(page: Page, invite: string) {
-  await page.getByRole("button", { name: "Join group" }).click();
+  await openLauncher(page);
   await page.getByLabel("Invite URL or code").fill(invite);
   await page
-    .getByLabel("Joined group/contact label")
+    .getByLabel("Local label")
     .fill("G007 Voice Media Lab");
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByText(/G007 Voice Media Lab/i).first()).toBeVisible();
@@ -295,7 +323,6 @@ async function joinInvite(page: Page, invite: string) {
 
 async function joinVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await page.getByRole("button", { name: /join call/i }).click();
   await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
 }
 
@@ -322,8 +349,7 @@ test("two profiles attach local microphone tracks and surface remote audio playb
       await expect
         .poll(async () => (await readEvidence(page)).remoteTrackEvents)
         .toBeGreaterThan(0);
-      await expect(page.getByTestId("voice-dock")).toBeVisible();
-      await expect(page.getByTestId("voice-mic-selector")).toBeDisabled();
+      await expect(page.getByTestId("voice-sidebar-status")).toBeVisible();
       await expect(page.getByTestId("voice-remote-participant")).toHaveCount(1);
       await expect(page.getByTestId("voice-remote-audio").first()).toHaveCount(
         1,
@@ -332,23 +358,37 @@ test("two profiles attach local microphone tracks and surface remote audio playb
         .poll(async () => (await readEvidence(page)).playbackAttachments)
         .toBeGreaterThan(0);
 
-      const remoteVolume = page.getByRole("slider", {
-        name: /speaker volume/i,
+      const appOutputVolume = page.getByRole("slider", {
+        name: /App output volume/i,
       });
-      await expect(remoteVolume).toBeVisible();
-      await remoteVolume.fill("37");
-      await expect(remoteVolume).toHaveValue("37");
+      await expect(appOutputVolume).toBeVisible();
+      await appOutputVolume.fill("37");
+      await expect(appOutputVolume).toHaveValue("37");
 
-      await page.getByRole("switch", { name: /mute my microphone/i }).click();
+      await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+      const outputDevice = page.getByTestId("voice-output-selector");
+      await expect(outputDevice).toBeVisible();
+      await outputDevice.selectOption({ index: 1 });
+      await expect
+        .poll(async () => (await readEvidence(page)).sinkIds.at(-1) ?? null)
+        .toMatch(/-speaker$/);
+      await outputDevice.selectOption("default");
+      await expect
+        .poll(async () => (await readEvidence(page)).sinkIds.at(-1) ?? null)
+        .toBe("");
+      await page.getByRole("button", { name: /Close Config/i }).click();
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+
+      await page.getByRole("button", { name: /^Mute$/i }).click();
       await expect
         .poll(async () => (await readEvidence(page)).trackEnabled)
         .toBe(false);
-      await page.getByRole("switch", { name: /mute my microphone/i }).click();
+      await page.getByRole("button", { name: /^Unmute$/i }).click();
       await expect
         .poll(async () => (await readEvidence(page)).trackEnabled)
         .toBe(true);
 
-      await page.getByRole("button", { name: /leave call/i }).click();
+      await page.getByRole("button", { name: /Leave voice call/i }).click();
       await expect
         .poll(async () => (await readEvidence(page)).trackStopCount)
         .toBeGreaterThan(0);

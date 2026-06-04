@@ -72,7 +72,7 @@ const evidence = {
   deterministicInputs: {
     sourceDateEpoch: Number(process.env.SOURCE_DATE_EPOCH || run("git", ["log", "-1", "--format=%ct"])),
     tauriCliPackage: "@tauri-apps/cli@2.11.2",
-    releaseFeatures: (process.env.DISCRYPT_RELEASE_FEATURES ?? "tauri-runtime,production-network,production-media,production-storage").split(","),
+    releaseFeatures: (process.env.DISCRYPT_RELEASE_FEATURES ?? "tauri-runtime,production-network,production-media,production-storage,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter").split(","),
     linuxBuildBaseline: {
       prettyName: osRelease.PRETTY_NAME ?? "",
       id: osRelease.ID ?? "",

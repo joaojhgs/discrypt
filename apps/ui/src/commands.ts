@@ -527,6 +527,7 @@ export type AppEventStreamView = {
 export type AppState = {
   schema_version: number;
   lifecycle: AppLifecycle;
+  storage_security: StorageSecurityView;
   profile: UserProfileView | null;
   preferences: PreferencesView;
   dms: DirectConversationView[];
@@ -548,6 +549,39 @@ export type AppState = {
   voice_states: VoiceStateView[];
   runtime_mode: RuntimeModeView;
   snapshot: AppSnapshot;
+};
+
+export type StorageSecurityStatus =
+  | "setup_required"
+  | "locked"
+  | "ready"
+  | "error";
+
+export type StorageSecurityMode =
+  | "unconfigured"
+  | "keyring"
+  | "passphrase_vault"
+  | "development_store"
+  | "unknown";
+
+export type StorageSecurityView = {
+  status: StorageSecurityStatus | string;
+  mode: StorageSecurityMode | string;
+  title: string;
+  detail: string;
+  recovery_hint: string;
+  password_required: boolean;
+  keyring_available: boolean;
+  keyring_detail: string;
+};
+
+export type ConfigureStorageSecurityRequest = {
+  mode: "keyring" | "passphrase_vault";
+  passphrase?: string | null;
+};
+
+export type UnlockStorageSecurityRequest = {
+  passphrase: string;
 };
 
 export type SafetyVerificationRequest = {
@@ -642,6 +676,7 @@ export type CreateInviteRequest = {
   group_id?: string | null;
   expires: string;
   max_use: string;
+  password_gate?: string | null;
 };
 
 export type CreateDmInviteRequest = {
@@ -1062,6 +1097,16 @@ const fallbackSnapshot: AppSnapshot = {
 const fallbackState: AppState = {
   schema_version: 1,
   lifecycle: "first_run",
+  storage_security: {
+    status: "ready",
+    mode: "development_store",
+    title: "Development storage",
+    detail: "Local-dev fallback storage is active for this browser harness.",
+    recovery_hint: "Run the packaged Tauri app to configure production keyring or password-vault storage.",
+    password_required: false,
+    keyring_available: true,
+    keyring_detail: "Development builds do not require OS-keyring preflight.",
+  },
   profile: null,
   preferences: fallbackSnapshot.preferences,
   dms: [],
@@ -1107,6 +1152,7 @@ const fallbackState: AppState = {
   snapshot: fallbackSnapshot,
 };
 
+let fallbackHydrated = false;
 
 function defaultVoiceMediaRuntime(
   sessionId: string,
@@ -1149,6 +1195,13 @@ function normalizeVoiceSessionRuntime(state: AppState): void {
   };
 }
 
+function clearNonPersistentVoiceRuntime(state: AppState): void {
+  if (state.active_context?.kind === "voice_channel") {
+    state.active_context = null;
+  }
+  state.voice_session = null;
+}
+
 function cloneState(state: AppState): AppState {
   return structuredClone(state);
 }
@@ -1167,8 +1220,11 @@ function readStoredFallbackState(): AppState | null {
 }
 
 function hydrateFallbackState(): void {
+  if (fallbackHydrated) return;
+  fallbackHydrated = true;
   const stored = readStoredFallbackState();
   if (!stored) return;
+  clearNonPersistentVoiceRuntime(stored);
   Object.assign(fallbackState, stored);
   syncSnapshot(fallbackState);
 }
@@ -1176,9 +1232,11 @@ function hydrateFallbackState(): void {
 function persistFallbackState(): void {
   if (typeof window === "undefined") return;
   try {
+    const persisted = cloneState(syncSnapshot(fallbackState));
+    clearNonPersistentVoiceRuntime(persisted);
     window.localStorage.setItem(
       FALLBACK_STORAGE_KEY,
-      JSON.stringify(syncSnapshot(fallbackState)),
+      JSON.stringify(syncSnapshot(persisted)),
     );
   } catch {
     // Local-dev fallback persistence is best-effort; Tauri IPC-backed builds use
@@ -1857,10 +1915,42 @@ type ParsedInviteMetadata = {
   maxUses: number;
 };
 
-function defaultSignalingEndpoint(connectivity?: ConnectivityPolicyView): string {
-  return connectivity?.signaling_profiles[0]?.endpoints[0] ??
-    import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
+export function defaultSignalingEndpointForAdapter(
+  adapterKind: SignalingAdapterKind | string,
+  connectivity?: ConnectivityPolicyView,
+): string {
+  const matchingEndpoint = connectivity?.signaling_profiles.find(
+    (profile) => profile.adapter_kind === adapterKind,
+  )?.endpoints[0];
+  if (matchingEndpoint) return matchingEndpoint;
+  if (adapterKind === "mqtt") {
+    return import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
+      "mqtts://broker.emqx.io:8883";
+  }
+  if (adapterKind === "nostr") {
+    return import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
+      "wss://relay.damus.io";
+  }
+  if (adapterKind === "ipfs_pubsub") {
+    const configured =
+      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT ??
+      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS ??
+      "";
+    return String(configured)
+      .split(",")
+      .map((endpoint: string) => endpoint.trim())
+      .find(Boolean) ?? "";
+  }
+  if (adapterKind === "discrypt_quic_rendezvous") {
+    return import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT ?? "";
+  }
+  return import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
     "wss://relay.damus.io";
+}
+
+function defaultSignalingEndpoint(connectivity?: ConnectivityPolicyView): string {
+  const adapterKind = connectivity?.signaling_profiles[0]?.adapter_kind ?? "nostr";
+  return defaultSignalingEndpointForAdapter(adapterKind, connectivity);
 }
 
 function endpointPolicyForSignalingEndpoint(endpoint: string): string {
@@ -2193,8 +2283,7 @@ function normalizeConnectivityPolicyOverride(
     request.adapter_kind?.trim() || base.signaling_profiles[0]?.adapter_kind || "nostr";
   const endpoint =
     request.signaling_endpoint?.trim() ||
-    base.signaling_profiles[0]?.endpoints[0] ||
-    defaultSignalingEndpoint(base);
+    defaultSignalingEndpointForAdapter(adapterKind, base);
   if (!["nostr", "mqtt", "ipfs_pubsub", "discrypt_quic_rendezvous"].includes(adapterKind)) {
     throw new Error(`Unsupported signaling adapter kind ${adapterKind}`);
   }
@@ -2538,6 +2627,57 @@ export async function loadCompatibilityAppSnapshot(): Promise<AppSnapshot> {
     "app_snapshot",
     undefined,
     () => cloneState(syncSnapshot(fallbackState)).snapshot,
+  );
+}
+
+export async function configureStorageSecurity(
+  request: ConfigureStorageSecurityRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "configure_storage_security",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        state.storage_security = {
+          status: "ready",
+          mode: request.mode,
+          title:
+            request.mode === "passphrase_vault"
+              ? "Password vault selected"
+              : "OS keyring selected",
+          detail:
+            request.mode === "passphrase_vault"
+              ? "The browser fallback cannot enforce production vault unlock; packaged Tauri builds require the password on startup."
+              : "The browser fallback cannot access the OS keyring; packaged Tauri builds use the platform keyring.",
+          recovery_hint: "Continue to account setup.",
+          password_required: false,
+          keyring_available: true,
+          keyring_detail: "Development builds do not require OS-keyring preflight.",
+        };
+      }),
+  );
+}
+
+export async function unlockStorageSecurity(
+  request: UnlockStorageSecurityRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "unlock_storage_security",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        state.storage_security = {
+          ...state.storage_security,
+          status: "ready",
+          title: "Storage unlocked",
+          detail:
+            "The browser fallback accepted the password; packaged Tauri builds decrypt the production vault.",
+          recovery_hint: "Continue.",
+          password_required: false,
+          keyring_available: true,
+          keyring_detail: "Development builds do not require OS-keyring preflight.",
+        };
+      }),
   );
 }
 
@@ -3196,6 +3336,7 @@ export async function createInvite(
       );
       const expires = request.expires || fallbackState.snapshot.invite.expires;
       const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
+      const passwordGate = request.password_gate?.trim();
       const expiresAt = inviteExpirationHorizon(expires);
       const signalingEndpoint = defaultSignalingEndpoint(connectivity);
       const signalingTrustFingerprint = stableHash(
@@ -3242,8 +3383,9 @@ export async function createInvite(
         max_use: maxUse,
         uses: 0,
         revoked: false,
-        admission_copy:
-          "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient",
+        admission_copy: passwordGate
+          ? "Password-gated admission requested; final admission still requires an authorized MLS Welcome/add and no password verifier is embedded in the invite"
+          : "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient",
       });
       pushEvent(
         state,

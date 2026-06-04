@@ -81,6 +81,43 @@ export async function installVoiceDeviceHarness(page: Page) {
       configurable: true,
       value: E2EAudioContext,
     });
+    class E2ERtcPeerConnection {
+      onicecandidate: ((event: unknown) => void) | null = null;
+      ontrack: ((event: unknown) => void) | null = null;
+      connectionState = "new";
+      iceConnectionState = "new";
+      addTrack(track: unknown, stream: unknown) {
+        window.queueMicrotask(() => {
+          this.connectionState = "connected";
+          this.iceConnectionState = "connected";
+          this.onicecandidate?.({ candidate: null });
+        });
+        return { track, stream };
+      }
+      createOffer() {
+        return Promise.resolve({ type: "offer", sdp: "v=0\r\na=mid:audio\r\n" });
+      }
+      createAnswer() {
+        return Promise.resolve({ type: "answer", sdp: "v=0\r\na=mid:audio\r\n" });
+      }
+      setLocalDescription() {
+        return Promise.resolve();
+      }
+      setRemoteDescription() {
+        return Promise.resolve();
+      }
+      addIceCandidate() {
+        return Promise.resolve();
+      }
+      close() {
+        this.connectionState = "closed";
+        this.iceConnectionState = "closed";
+      }
+    }
+    Object.defineProperty(window, "RTCPeerConnection", {
+      configurable: true,
+      value: E2ERtcPeerConnection,
+    });
   });
 }
 

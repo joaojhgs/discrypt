@@ -2,9 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   discryptUiConfig,
-  setupChecklist,
   ThemeId,
-  TemplateId,
 } from "./app-config";
 import {
   AppEventStreamView,
@@ -31,6 +29,8 @@ import {
   VoiceStateView,
   RESET_APP_CONFIRMATION_PHRASE,
   commandErrorToAction,
+  configureStorageSecurity,
+  defaultSignalingEndpointForAdapter,
   createChannel as createChannelCommand,
   createGroup,
   createInvite,
@@ -51,7 +51,6 @@ import {
   setActiveChannel,
   setActiveDm,
   setSelfMute,
-  setSpeakerVolume,
   updateVoiceActivity,
   attachVoiceRemoteMedia,
   startSignalingSession,
@@ -60,6 +59,7 @@ import {
   pumpTextControlTransportOnce,
   startDm,
   verifySafetyNumber,
+  unlockStorageSecurity,
 } from "./commands";
 import {
   startNativeRustVoiceMediaSession,
@@ -97,13 +97,20 @@ import "./styles.css";
 
 type Workflow = "setup" | "dm" | "join" | "create-group" | "channel" | "voice";
 type OverlayKind =
+  | "launcher"
   | "create-group"
-  | "create-channel"
-  | "invite"
+  | "group-invite"
+  | "group-config"
   | "settings"
   | "diagnostics";
-type SetupStepView = { label: string; complete: boolean; detail: string };
 type VoiceParticipant = VoiceParticipantView;
+type StorageSetupChoice = "keyring" | "passphrase_vault";
+type CommandNotification = {
+  id: string;
+  title: string;
+  message: string;
+  createdAt: string;
+};
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 10_000;
 const diagnosticsUiEnabled =
@@ -116,6 +123,7 @@ type VoiceDeviceAccess = {
   output_device_id: string | null;
   output_device_label: string | null;
   available_input_devices: VoiceDeviceOption[];
+  available_output_devices: VoiceDeviceOption[];
   activity_rms_i16: number | null;
   activity_peak_i16: number | null;
   activity_captured_at_ms: number | null;
@@ -197,6 +205,12 @@ function generatedAutomationVoiceDeviceAccess(
     output_device_id: "default",
     output_device_label: "System default speaker",
     available_input_devices: availableInputDevices,
+    available_output_devices: [
+      {
+        device_id: "default",
+        label: "System default speaker",
+      },
+    ],
     ...activity,
   };
 }
@@ -304,12 +318,6 @@ function asThemeId(value: string): ThemeId {
   return discryptUiConfig.themes.some((theme) => theme.id === value)
     ? (value as ThemeId)
     : discryptUiConfig.activeTheme;
-}
-
-function asTemplateId(value: string): TemplateId {
-  return discryptUiConfig.templates.some((template) => template.id === value)
-    ? (value as TemplateId)
-    : discryptUiConfig.activeTemplate;
 }
 
 function stableUiHash(input: string): string {
@@ -492,27 +500,38 @@ function emptyVoiceDeviceAccess(
     output_device_id: null,
     output_device_label: null,
     available_input_devices: [],
+    available_output_devices: [],
     activity_rms_i16: null,
     activity_peak_i16: null,
     activity_captured_at_ms: null,
   };
 }
 
-function voiceInputDeviceOptions(
+function voiceDeviceOptions(
   devices: MediaDeviceInfo[],
+  kind: MediaDeviceKind,
+  fallbackLabel: string,
 ): VoiceDeviceOption[] {
-  const inputs = devices.filter((device) => device.kind === "audioinput");
+  const inputs = devices.filter((device) => device.kind === kind);
   const seen = new Set<string>();
   return inputs
     .map((device, index) => ({
-      device_id: device.deviceId || `audio-input-${index + 1}`,
-      label: device.label || `Microphone ${index + 1}`,
+      device_id: device.deviceId || `${kind}-${index + 1}`,
+      label: device.label || `${fallbackLabel} ${index + 1}`,
     }))
     .filter((device) => {
       if (seen.has(device.device_id)) return false;
       seen.add(device.device_id);
       return true;
     });
+}
+
+function voiceInputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
+  return voiceDeviceOptions(devices, "audioinput", "Microphone");
+}
+
+function voiceOutputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
+  return voiceDeviceOptions(devices, "audiooutput", "Speaker");
 }
 
 async function enumerateVoiceInputDevices(
@@ -653,6 +672,7 @@ function startLocalVoiceActivityCapture(
 
 async function requestVoiceDeviceAccess(
   selectedInputDeviceId?: string,
+  selectedOutputDeviceId?: string,
 ): Promise<VoiceDeviceAccess> {
   const generatedAutomationAccess =
     await requestGeneratedAutomationVoiceAccess(selectedInputDeviceId);
@@ -671,6 +691,12 @@ async function requestVoiceDeviceAccess(
           {
             device_id: "native-rust-default-capture",
             label: "Native Rust capture source",
+          },
+        ],
+        available_output_devices: [
+          {
+            device_id: "native-rust-default-playback",
+            label: "Native Rust playback sink",
           },
         ],
         activity_rms_i16: null,
@@ -693,6 +719,7 @@ async function requestVoiceDeviceAccess(
     });
     const devices = await navigator.mediaDevices.enumerateDevices();
     const availableInputs = voiceInputDeviceOptions(devices);
+    const availableOutputs = voiceOutputDeviceOptions(devices);
     const input =
       (requestedDevice
         ? devices.find(
@@ -705,10 +732,22 @@ async function requestVoiceDeviceAccess(
         (device) => device.kind === "audioinput" && device.deviceId,
       ) ??
       devices.find((device) => device.kind === "audioinput");
+    const requestedOutput =
+      selectedOutputDeviceId && selectedOutputDeviceId !== "default"
+        ? selectedOutputDeviceId
+        : null;
     const output =
+      (requestedOutput
+        ? devices.find(
+            (device) =>
+              device.kind === "audiooutput" &&
+              device.deviceId === requestedOutput,
+          )
+        : null) ??
       devices.find(
         (device) => device.kind === "audiooutput" && device.deviceId,
-      ) ?? devices.find((device) => device.kind === "audiooutput");
+      ) ??
+      devices.find((device) => device.kind === "audiooutput");
     const activity = await measureLocalVoiceActivity(stream).catch(() => ({
       activity_rms_i16: null,
       activity_peak_i16: null,
@@ -722,6 +761,7 @@ async function requestVoiceDeviceAccess(
       output_device_id: output?.deviceId || "default",
       output_device_label: output?.label || "Default speaker",
       available_input_devices: availableInputs,
+      available_output_devices: availableOutputs,
       ...activity,
     };
   } catch {
@@ -851,6 +891,28 @@ function Icon({
   );
 }
 
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof window !== "undefined" && "matchMedia" in window
+      ? window.matchMedia(query).matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("matchMedia" in window)) {
+      setMatches(false);
+      return;
+    }
+    const mediaQuery = window.matchMedia(query);
+    const update = () => setMatches(mediaQuery.matches);
+    update();
+    mediaQuery.addEventListener?.("change", update);
+    return () => mediaQuery.removeEventListener?.("change", update);
+  }, [query]);
+
+  return matches;
+}
+
 function App() {
   const [commandState, setCommandState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -871,13 +933,35 @@ function App() {
   const [draftIceTurnServers, setDraftIceTurnServers] = useState("");
   const [draftInvite, setDraftInvite] = useState("");
   const [draftJoinName, setDraftJoinName] = useState("");
+  const [inviteExpiryDays, setInviteExpiryDays] = useState("7");
+  const [inviteMaxUses, setInviteMaxUses] = useState("5");
+  const [invitePasswordEnabled, setInvitePasswordEnabled] = useState(false);
+  const [invitePassword, setInvitePassword] = useState("");
   const [draftDisplayName, setDraftDisplayName] = useState("");
   const [draftDeviceName, setDraftDeviceName] = useState("");
   const [draftRecoveryCode, setDraftRecoveryCode] = useState("");
+  const [storagePassword, setStoragePassword] = useState("");
+  const [storagePasswordConfirm, setStoragePasswordConfirm] = useState("");
+  const [selectedStorageMode, setSelectedStorageMode] =
+    useState<StorageSetupChoice | null>(null);
   const [draftDmName, setDraftDmName] = useState("");
   const [resetPhrase, setResetPhrase] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const showDesktopSidebar = useMediaQuery("(min-width: 1024px)");
   const [activeOverlay, setActiveOverlay] = useState<OverlayKind | null>(null);
+  const [overlayClosing, setOverlayClosing] = useState(false);
+  const [overlayGroupId, setOverlayGroupId] = useState<string | null>(null);
+  const [visibleInviteId, setVisibleInviteId] = useState<string | null>(null);
+  const [inlineTextDraft, setInlineTextDraft] = useState<string | null>(null);
+  const [inlineVoiceDraft, setInlineVoiceDraft] = useState<string | null>(null);
+  const [groupContextMenu, setGroupContextMenu] = useState<{
+    groupId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [commandNotifications, setCommandNotifications] = useState<
+    CommandNotification[]
+  >([]);
   const [lastTextChannelId, setLastTextChannelId] = useState<string | null>(
     null,
   );
@@ -887,9 +971,15 @@ function App() {
     VoiceDeviceOption[]
   >([]);
   const [selectedVoiceInputId, setSelectedVoiceInputId] = useState("default");
+  const [voiceOutputDevices, setVoiceOutputDevices] = useState<
+    VoiceDeviceOption[]
+  >([]);
+  const [selectedVoiceOutputId, setSelectedVoiceOutputId] = useState("default");
   const [voiceDeviceStatus, setVoiceDeviceStatus] = useState<string | null>(
     null,
   );
+  const [localMicGain, setLocalMicGain] = useState(100);
+  const [appOutputVolume, setAppOutputVolume] = useState(100);
   const [voiceRemoteStreams, setVoiceRemoteStreams] = useState<
     Record<string, MediaStream>
   >({});
@@ -917,19 +1007,132 @@ function App() {
     setLocalVoiceSpeaking(false);
   }
 
+  useEffect(() => {
+    voiceMediaSessionRef.current?.setInputGain?.(localMicGain);
+  }, [localMicGain]);
+
   function updateEventCursor(nextCursor: number) {
     const cursor = Math.max(eventCursorRef.current, nextCursor);
     eventCursorRef.current = cursor;
   }
 
+  function reportCommandError(message: string, title = "Command error") {
+    const notification: CommandNotification = {
+      id: `command-error-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      title,
+      message,
+      createdAt: new Date().toLocaleTimeString(),
+    };
+    console.error(`[Discrypt] ${title}: ${message}`);
+    setCommandError(message);
+    setCommandNotifications((current) => [notification, ...current].slice(0, 6));
+  }
+
+  function dismissCommandNotification(id: string) {
+    setCommandNotifications((current) =>
+      current.filter((notification) => notification.id !== id),
+    );
+  }
+
+  function finishClosingOverlay(closedOverlay: OverlayKind | null) {
+    if (closedOverlay === "group-invite" || closedOverlay === "launcher") {
+      setVisibleInviteId(null);
+      setDraftInvite("");
+    }
+    if (closedOverlay === "group-config" || closedOverlay === "group-invite") {
+      setOverlayGroupId(null);
+    }
+    setActiveOverlay(null);
+    setOverlayClosing(false);
+  }
+
+  function closeOverlay() {
+    if (!activeOverlay || overlayClosing) return;
+    const closing = activeOverlay;
+    setOverlayClosing(true);
+    window.setTimeout(() => finishClosingOverlay(closing), 160);
+  }
+
+  function openLauncherOverlay() {
+    setOverlayClosing(false);
+    setVisibleInviteId(null);
+    setDraftInvite("");
+    setActiveOverlay("launcher");
+  }
+
+  function hydrateConnectivityDrafts(policy: ConnectivityPolicyView | null) {
+    const profile = policy?.signaling_profiles[0];
+    if (profile?.adapter_kind) {
+      setDraftSignalingAdapter(profile.adapter_kind as SignalingAdapterKind);
+    }
+    if (profile?.endpoints?.[0]) {
+      setDraftSignalingEndpoint(profile.endpoints[0]);
+    }
+    setDraftIceStunServers((policy?.ice_stun_servers ?? []).join(", "));
+    setDraftIceTurnServers(
+      (policy?.ice_turn_servers ?? [])
+        .map((server) => server.endpoint)
+        .join(", "),
+    );
+  }
+
+  function chooseSignalingAdapter(value: string) {
+    const adapter = value as SignalingAdapterKind;
+    setDraftSignalingAdapter(adapter);
+    setDraftSignalingEndpoint(defaultSignalingEndpointForAdapter(adapter));
+  }
+
+  function openGroupInviteOverlay(groupId: string) {
+    setOverlayClosing(false);
+    setOverlayGroupId(groupId);
+    setVisibleInviteId(null);
+    setDraftInvite("");
+    setActiveOverlay("group-invite");
+  }
+
+  function openGroupConfigOverlay(groupId: string) {
+    const group = commandState?.groups.find((candidate) => candidate.group_id === groupId);
+    setOverlayClosing(false);
+    setOverlayGroupId(groupId);
+    hydrateConnectivityDrafts(group?.connectivity ?? commandState?.connectivity_defaults ?? null);
+    setActiveOverlay("group-config");
+  }
+
   useEffect(() => {
     let mounted = true;
     loadAppState()
-      .then((loaded) => {
+      .then(async (loaded) => {
         if (!mounted) return;
-        setCommandState(loaded);
-        updateEventCursor(loaded.event_cursor);
-        if (loaded.groups.length > 0 && loaded.lifecycle !== "first_run") {
+        let initialState = loaded;
+        if (loaded.voice_session?.joined) {
+          stopLocalVoiceCapture();
+          const sessionId = loaded.voice_session.session_id;
+          try {
+            initialState = await leaveVoice({ session_id: sessionId });
+          } catch (error) {
+            reportCommandError(
+              error instanceof Error
+                ? error.message
+                : "Unable to clear stale voice session on startup.",
+              "Voice state",
+            );
+            initialState = {
+              ...loaded,
+              active_context:
+                loaded.active_context?.kind === "voice_channel"
+                  ? null
+                  : loaded.active_context,
+              voice_session: null,
+            };
+          }
+          if (!mounted) return;
+        }
+        setCommandState(initialState);
+        updateEventCursor(initialState.event_cursor);
+        if (
+          initialState.groups.length > 0 &&
+          initialState.lifecycle !== "first_run"
+        ) {
           setWorkflow("channel");
         }
       })
@@ -1067,17 +1270,19 @@ function App() {
       setCommandState(nextState);
       if (nextState.last_command_error) {
         const action = commandErrorToAction(nextState.last_command_error);
-        setCommandError(
+        reportCommandError(
           action
             ? `${nextState.last_command_error.message} — ${action}`
             : nextState.last_command_error.message,
+          nextState.last_command_error.command,
         );
       }
       success?.(nextState);
       return nextState;
     } catch (error: unknown) {
-      setCommandError(
+      reportCommandError(
         error instanceof Error ? error.message : "Command failed",
+        "Command failed",
       );
       return null;
     }
@@ -1150,6 +1355,19 @@ function App() {
       );
       const devices = await enumerateVoiceInputDevices(requestPermission);
       setVoiceInputDevices(devices);
+      if (navigator.mediaDevices?.enumerateDevices) {
+        const allDevices = await navigator.mediaDevices.enumerateDevices();
+        const outputDevices = voiceOutputDeviceOptions(allDevices);
+        setVoiceOutputDevices(outputDevices);
+        if (
+          selectedVoiceOutputId !== "default" &&
+          !outputDevices.some(
+            (device) => device.device_id === selectedVoiceOutputId,
+          )
+        ) {
+          setSelectedVoiceOutputId("default");
+        }
+      }
       setVoiceDeviceStatus(
         devices.length > 0
           ? `Found ${devices.length} microphone${devices.length === 1 ? "" : "s"}.`
@@ -1176,22 +1394,39 @@ function App() {
     // Backend-derived runtime peers come from invite/connectivity state, not user-entered pairing fields.
     if (!window.__TAURI__?.core?.invoke) return stateForScope;
     const scopeLabel = activeScopeLabelForState(stateForScope);
-    const started = await startTextSession({
-      scope_label: scopeLabel,
-      data_channel_probe: false,
-      adapter_kind: null,
-    });
+    let started: AppState;
+    try {
+      started = await startTextSession({
+        scope_label: scopeLabel,
+        data_channel_probe: false,
+        adapter_kind: null,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error ?? "");
+      reportCommandError(message || "Text runtime did not start.", "start_text_session");
+      return stateForScope;
+    }
     setCommandState(started);
     if (started.last_command_error) {
       const action = commandErrorToAction(started.last_command_error);
-      setCommandError(
+      reportCommandError(
         action
           ? `${started.last_command_error.message} — ${action}`
           : started.last_command_error.message,
+        started.last_command_error.command,
       );
       return started;
     }
-    const attached = await attachTextRuntime(started);
+    const attached = await attachTextRuntime(started).catch((error: unknown) => {
+      const message =
+        error instanceof Error ? error.message : String(error ?? "");
+      reportCommandError(
+        message || "Text runtime did not attach.",
+        "attach_text_control_transport_runtime",
+      );
+      return null;
+    });
     if (attached?.last_command_error) return attached;
     await pumpTextControlTransportOnce({
       target: null,
@@ -1219,10 +1454,13 @@ function App() {
   const appState = commandState;
   const currentSnapshot = appState.snapshot;
   const activeGroup = getActiveGroup(appState);
+  const overlayGroup =
+    appState.groups.find((group) => group.group_id === overlayGroupId) ??
+    activeGroup;
   const activeTextChannel = getActiveTextChannel(
     appState,
     activeGroup,
-    workflow === "voice" ? lastTextChannelId : null,
+    lastTextChannelId,
   );
   const activeVoiceChannel = getActiveVoiceChannel(appState, activeGroup);
   const textChannels =
@@ -1294,44 +1532,19 @@ function App() {
     discryptUiConfig.themes.find(
       (theme) => theme.id === appState.preferences.theme_id,
     ) ?? discryptUiConfig.themes[0];
-  const activeTemplate =
-    discryptUiConfig.templates.find(
-      (template) => template.id === appState.preferences.template_id,
-    ) ?? discryptUiConfig.templates[0];
   const themeStyle = {
     ...activeTheme.cssVars,
-    ...activeTemplate.cssVars,
-  } as React.CSSProperties;
-  const setupSteps: SetupStepView[] = [
-    {
-      label: setupChecklist[0],
-      complete: currentSnapshot.friend.verified,
-      detail: currentSnapshot.friend.verified
-        ? "Safety number verified"
-        : "Compare the number before trusting the DM",
-    },
-    {
-      label: setupChecklist[1],
-      complete: appState.devices.length >= 1,
-      detail: `${appState.devices.length} authorized local device${appState.devices.length === 1 ? "" : "s"}`,
-    },
-    {
-      label: setupChecklist[2],
-      complete: currentSnapshot.invite.welcome_required.length > 0,
-      detail: "Invite admission copy is present",
-    },
-    {
-      label: setupChecklist[3],
-      complete: currentSnapshot.retention.selected.length > 0,
-      detail: `Retention preset: ${currentSnapshot.retention.selected}`,
-    },
-  ];
-  const completedSteps = setupSteps.filter((step) => step.complete).length;
+    "--shell-grid":
+      workflow === "dm" ? "72px minmax(0,1fr)" : "72px 300px minmax(0,1fr)",
+    "--shell-grid-inspector":
+      workflow === "dm"
+        ? "72px minmax(0,1fr) 280px"
+        : "72px 300px minmax(0,1fr) 280px",
+    "--shell-font-size": "16px",
+    "--shell-panel-radius": "1rem",
+  } as React.CSSProperties & Record<`--${string}`, string>;
   const showInspector =
-    diagnosticsUiEnabled &&
-    activeTemplate.showRightRail &&
-    inspectorOpen &&
-    workflow !== "setup";
+    diagnosticsUiEnabled && inspectorOpen && workflow !== "setup";
 
   async function confirmSafetyNumber() {
     try {
@@ -1348,17 +1561,65 @@ function App() {
     }
   }
 
-  function createCommandUser() {
+  async function configureFirstRunStorage(): Promise<boolean> {
+    if (appState.storage_security.status === "ready") return true;
+    if (!selectedStorageMode) {
+      reportCommandError(
+        "Choose OS keyring or Discrypt password vault before account setup.",
+        "configure_storage_security",
+      );
+      return false;
+    }
+    if (selectedStorageMode === "passphrase_vault") {
+      if (storagePassword.length < 12) {
+        reportCommandError(
+          "Discrypt storage password must be at least 12 characters.",
+          "configure_storage_security",
+        );
+        return false;
+      }
+      if (storagePassword !== storagePasswordConfirm) {
+        reportCommandError(
+          "Storage passwords do not match.",
+          "configure_storage_security",
+        );
+        return false;
+      }
+    }
+    const configured = await applyCommand(
+      configureStorageSecurity({
+        mode: selectedStorageMode,
+        passphrase:
+          selectedStorageMode === "passphrase_vault" ? storagePassword : null,
+      }),
+    );
+    if (
+      !configured ||
+      configured.last_command_error ||
+      configured.storage_security.status !== "ready"
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  async function createCommandUser() {
+    if (!(await configureFirstRunStorage())) return;
     void applyCommand(
       createUser({
         display_name: draftDisplayName,
         device_name: draftDeviceName,
       }),
-      () => setWorkflow("setup"),
+      () => {
+        setStoragePassword("");
+        setStoragePasswordConfirm("");
+        setWorkflow("setup");
+      },
     );
   }
 
-  function recoverCommandUser() {
+  async function recoverCommandUser() {
+    if (!(await configureFirstRunStorage())) return;
     void applyCommand(
       recoverUser({
         display_name: draftDisplayName,
@@ -1368,7 +1629,11 @@ function App() {
         recovered_device_count: 2,
         use_sealed_account_backup: true,
       }),
-      () => setWorkflow("setup"),
+      () => {
+        setStoragePassword("");
+        setStoragePasswordConfirm("");
+        setWorkflow("setup");
+      },
     );
   }
 
@@ -1409,6 +1674,22 @@ function App() {
     );
   }
 
+  function saveGroupConnectivityPolicy(groupId: string) {
+    void applyCommand(
+      setConnectivityPolicy({
+        scope_kind: "group",
+        group_id: groupId,
+        channel_id: null,
+        dm_id: null,
+        adapter_kind: draftSignalingAdapter,
+        signaling_endpoint: draftSignalingEndpoint,
+        ice_stun_servers: parseEndpointList(draftIceStunServers),
+        ice_turn_servers: parseTurnEndpointList(draftIceTurnServers),
+      }),
+      () => setActiveOverlay(null),
+    );
+  }
+
   function joinCommandGroup() {
     void applyCommand(
       joinGroup({
@@ -1418,19 +1699,19 @@ function App() {
       (state) => {
         const group = getActiveGroup(state);
         setDraftJoinName(group?.name ?? draftJoinName);
+        setDraftInvite("");
+        setVisibleInviteId(null);
         setWorkflow("channel");
         setActiveOverlay(null);
-        if (window.__TAURI__?.core?.invoke) {
-          void ensureTextRuntimeForActiveScope(state);
-        }
       },
     );
   }
 
   function startCommandDm() {
-    void applyCommand(startDm({ display_name: draftDmName }), () =>
-      setWorkflow("dm"),
-    );
+    void applyCommand(startDm({ display_name: draftDmName }), () => {
+      setWorkflow("dm");
+      setActiveOverlay(null);
+    });
   }
 
   function focusCommandGroup(groupId: string) {
@@ -1441,7 +1722,8 @@ function App() {
 
   function focusCommandChannel(channelId: string, kind: ChannelKind) {
     if (!activeGroup) return;
-    const targetWorkflow = kind === "Voice" ? "voice" : "channel";
+    const targetWorkflow: Workflow =
+      kind === "Voice" && !showDesktopSidebar ? "voice" : "channel";
     if (kind === "Text") setLastTextChannelId(channelId);
     void applyCommand(
       setActiveChannel({
@@ -1450,25 +1732,31 @@ function App() {
       }),
       (nextState) => {
         setWorkflow(targetWorkflow);
-        if (targetWorkflow === "channel" && window.__TAURI__?.core?.invoke) {
-          void ensureTextRuntimeForActiveScope(nextState);
+        if (kind === "Voice") {
+          const nextGroup =
+            nextState.groups.find(
+              (group) => group.group_id === activeGroup.group_id,
+            ) ?? activeGroup;
+          const voiceChannel =
+            nextGroup.channels.find(
+              (channel) =>
+                channel.channel_id === channelId && channel.kind === "Voice",
+            ) ?? null;
+          void toggleVoiceJoin(true, voiceChannel, nextState, targetWorkflow);
         }
       },
     );
   }
 
   function focusCommandDm(dmId: string) {
-    void applyCommand(setActiveDm({ dm_id: dmId }), (nextState) => {
+    void applyCommand(setActiveDm({ dm_id: dmId }), () => {
       setWorkflow("dm");
-      if (window.__TAURI__?.core?.invoke) {
-        void ensureTextRuntimeForActiveScope(nextState);
-      }
     });
   }
 
   function createCommandChannel(kind: ChannelKind = "Text") {
     if (!activeGroup) {
-      setCommandError("Create or join a group before adding a channel.");
+      reportCommandError("Create or join a group before adding a channel.");
       return;
     }
     const name =
@@ -1488,8 +1776,42 @@ function App() {
           const nextText = getActiveTextChannel(nextState, nextGroup, null);
           setLastTextChannelId(nextText?.channel_id ?? null);
         }
-        setWorkflow(kind === "Voice" ? "voice" : "channel");
+        setWorkflow(kind === "Voice" && !showDesktopSidebar ? "voice" : "channel");
         setActiveOverlay(null);
+      },
+    );
+  }
+
+  function commitInlineChannel(kind: ChannelKind, rawName: string) {
+    const name = rawName.trim().replace(/^#/, "");
+    if (!name) {
+      if (kind === "Text") setInlineTextDraft(null);
+      if (kind === "Voice") setInlineVoiceDraft(null);
+      return;
+    }
+    if (!activeGroup) {
+      reportCommandError("Create or join a group before adding a channel.");
+      return;
+    }
+    void applyCommand(
+      createChannelCommand({
+        group_id: activeGroup.group_id,
+        name,
+        kind,
+        retention_status:
+          kind === "Voice" ? "session" : currentSnapshot.retention.selected,
+      }),
+      (nextState) => {
+        if (kind === "Text") {
+          const nextGroup = getActiveGroup(nextState);
+          const nextText = getActiveTextChannel(nextState, nextGroup, null);
+          setLastTextChannelId(nextText?.channel_id ?? null);
+          setInlineTextDraft(null);
+          setWorkflow("channel");
+        } else {
+          setInlineVoiceDraft(null);
+          setWorkflow(showDesktopSidebar ? "channel" : "voice");
+        }
       },
     );
   }
@@ -1498,7 +1820,7 @@ function App() {
     const body = draftMessage.trim();
     if (!body) return;
     if (!activeGroup || !activeTextChannel) {
-      setCommandError("Create a group text channel before sending a message.");
+      reportCommandError("Create a group text channel before sending a message.");
       return;
     }
     const runtimeState = commandState;
@@ -1508,11 +1830,11 @@ function App() {
       group_id: activeGroup.group_id,
       channel_id: activeTextChannel.channel_id,
     };
+    const requestTransportProof = messageTransportProof;
     void (async () => {
-      if (runtimeState && window.__TAURI__?.core?.invoke) {
+      if (requestTransportProof && runtimeState && window.__TAURI__?.core?.invoke) {
         await ensureTextRuntimeForActiveScope(runtimeState);
       }
-      const requestTransportProof = messageTransportProof;
       await applyCommand(
         sendMessage({
           target,
@@ -1535,11 +1857,11 @@ function App() {
       group_id: null,
       channel_id: null,
     };
+    const requestTransportProof = messageTransportProof;
     void (async () => {
-      if (runtimeState && window.__TAURI__?.core?.invoke) {
+      if (requestTransportProof && runtimeState && window.__TAURI__?.core?.invoke) {
         await ensureTextRuntimeForActiveScope(runtimeState);
       }
-      const requestTransportProof = messageTransportProof;
       await applyCommand(
         sendMessage({
           target,
@@ -1554,30 +1876,37 @@ function App() {
 
   function createCommandInvite() {
     if (!activeGroup) {
-      setCommandError("Create or join a group before creating an invite.");
+      reportCommandError("Create or join a group before creating an invite.");
       return;
     }
+    createCommandInviteForGroup(activeGroup.group_id);
+  }
+
+  function createCommandInviteForGroup(groupId: string) {
+    const expiresLabel = `${inviteExpiryDays.trim() || "7"} days`;
+    const maxUseLabel = `${inviteMaxUses.trim() || "5"} uses`;
     void applyCommand(
       createInvite({
-        group_id: activeGroup.group_id,
-        expires: currentSnapshot.invite.expires,
-        max_use: currentSnapshot.invite.max_use,
+        group_id: groupId,
+        expires: expiresLabel,
+        max_use: maxUseLabel,
+        password_gate: invitePasswordEnabled ? invitePassword : null,
       }),
       (state) => {
         const invite = state.invites.at(-1);
-        if (invite) setDraftInvite(invite.code);
-        setWorkflow("join");
-        setActiveOverlay("invite");
-        if (window.__TAURI__?.core?.invoke) {
-          void ensureTextRuntimeForActiveScope(state);
+        if (invite) {
+          setDraftInvite(invite.code);
+          setVisibleInviteId(invite.invite_id);
         }
+        setOverlayGroupId(groupId);
+        setActiveOverlay("group-invite");
       },
     );
   }
 
   function createCommandDmInvite() {
     if (!activeDm) {
-      setCommandError("Start or select a DM before creating a contact invite.");
+      reportCommandError("Start or select a DM before creating a contact invite.");
       return;
     }
     void applyCommand(
@@ -1588,9 +1917,11 @@ function App() {
       }),
       (state) => {
         const invite = state.invites.at(-1);
-        if (invite) setDraftInvite(invite.code);
-        setWorkflow("join");
-        setActiveOverlay("invite");
+        if (invite) {
+          setDraftInvite(invite.code);
+          setVisibleInviteId(invite.invite_id);
+        }
+        setActiveOverlay("launcher");
       },
     );
   }
@@ -1602,41 +1933,19 @@ function App() {
         display_name: draftJoinName || null,
       }),
       () => {
+        setDraftInvite("");
+        setVisibleInviteId(null);
         setWorkflow("dm");
         setActiveOverlay(null);
       },
     );
   }
 
-  function setVolume(id: string, value: number[]) {
-    const sessionId = appState.voice_session?.session_id;
-    if (!sessionId) {
-      setCommandError("Join a voice channel before changing volume.");
-      return;
-    }
-    const participant = participants.find((candidate) => candidate.id === id);
-    if (
-      !participant ||
-      isLocalVoiceParticipant(participant, appState.profile?.user_id ?? null)
-    ) {
-      setCommandError(
-        "Remote participant audio is required before changing volume.",
-      );
-      return;
-    }
-    void applyCommand(
-      setSpeakerVolume({
-        session_id: sessionId,
-        participant_id: id,
-        volume: value[0] ?? 0,
-      }),
-    );
-  }
 
   function toggleSelfMute(checked: boolean) {
     const sessionId = appState.voice_session?.session_id;
     if (!sessionId) {
-      setCommandError("Join a voice channel before muting.");
+      reportCommandError("Join a voice channel before muting.");
       return;
     }
     localAudioTracks(voiceCaptureRef.current).forEach((track) => {
@@ -1646,16 +1955,29 @@ function App() {
     void applyCommand(setSelfMute({ session_id: sessionId, muted: checked }));
   }
 
-  async function toggleVoiceJoin(joined: boolean) {
+  async function toggleVoiceJoin(
+    joined: boolean,
+    voiceChannelOverride: ChannelStateView | null = null,
+    stateOverride: AppState | null = null,
+    workflowAfterUpdate: Workflow = "channel",
+  ) {
+    const runtimeState = stateOverride ?? appState;
+    const runtimeGroup =
+      (activeGroup
+        ? (runtimeState.groups.find(
+            (group) => group.group_id === activeGroup.group_id,
+          ) ?? activeGroup)
+        : getActiveGroup(runtimeState)) ?? null;
     if (joined) {
-      if (!activeGroup) {
-        setCommandError("Create or join a group before joining voice.");
+      if (!runtimeGroup) {
+        reportCommandError("Create or join a group before joining voice.");
         return;
       }
-      let voiceChannel = activeVoiceChannel;
+      let voiceChannel =
+        voiceChannelOverride ?? getActiveVoiceChannel(runtimeState, runtimeGroup);
       if (!voiceChannel) {
         const withVoice = await createChannelCommand({
-          group_id: activeGroup.group_id,
+          group_id: runtimeGroup.group_id,
           name: "Voice Lobby",
           kind: "Voice",
           retention_status: "session",
@@ -1664,16 +1986,19 @@ function App() {
         voiceChannel = getActiveVoiceChannel(
           withVoice,
           withVoice.groups.find(
-            (group) => group.group_id === activeGroup.group_id,
+            (group) => group.group_id === runtimeGroup.group_id,
           ) ?? null,
         );
       }
       if (!voiceChannel) {
-        setCommandError("Voice channel creation did not return a channel.");
+        reportCommandError("Voice channel creation did not return a channel.");
         return;
       }
       stopLocalVoiceCapture();
-      const voiceAccess = await requestVoiceDeviceAccess(selectedVoiceInputId);
+      const voiceAccess = await requestVoiceDeviceAccess(
+        selectedVoiceInputId,
+        selectedVoiceOutputId,
+      );
       if (voiceAccess.available_input_devices.length > 0) {
         setVoiceInputDevices(voiceAccess.available_input_devices);
         const selectedStillAvailable =
@@ -1685,8 +2010,19 @@ function App() {
           setSelectedVoiceInputId("default");
         }
       }
+      if (voiceAccess.available_output_devices.length > 0) {
+        setVoiceOutputDevices(voiceAccess.available_output_devices);
+        const selectedOutputStillAvailable =
+          selectedVoiceOutputId === "default" ||
+          voiceAccess.available_output_devices.some(
+            (device) => device.device_id === selectedVoiceOutputId,
+          );
+        if (!selectedOutputStillAvailable) {
+          setSelectedVoiceOutputId("default");
+        }
+      }
       const joinedState = await joinVoice({
-        group_id: activeGroup.group_id,
+        group_id: runtimeGroup.group_id,
         channel_id: voiceChannel.channel_id,
         microphone_permission: voiceAccess.microphone_permission,
         input_device_id: voiceAccess.input_device_id,
@@ -1695,7 +2031,7 @@ function App() {
         output_device_label: voiceAccess.output_device_label,
       });
       setCommandState(joinedState);
-      setWorkflow("voice");
+      setWorkflow(workflowAfterUpdate);
       voiceCaptureRef.current = voiceAccess.stream;
       if (joinedState.voice_session?.self_muted) {
         localAudioTracks(voiceCaptureRef.current).forEach((track) => {
@@ -1704,10 +2040,11 @@ function App() {
       }
       if (joinedState.last_command_error) {
         const action = commandErrorToAction(joinedState.last_command_error);
-        setCommandError(
+        reportCommandError(
           action
             ? `${joinedState.last_command_error.message} — ${action}`
             : joinedState.last_command_error.message,
+          joinedState.last_command_error.command,
         );
         stopLocalVoiceCapture();
         return;
@@ -1751,11 +2088,7 @@ function App() {
             );
           }
         }
-        let mediaState = joinedState;
-        if (window.__TAURI__?.core?.invoke) {
-          mediaState =
-            (await ensureTextRuntimeForActiveScope(joinedState)) ?? joinedState;
-        }
+        const mediaState = joinedState;
         const voiceSession = mediaState.voice_session?.joined
           ? mediaState.voice_session
           : joinedState.voice_session;
@@ -1781,6 +2114,7 @@ function App() {
             voiceMediaSessionRef.current = startWebViewVoiceMediaSession({
               session: voiceSession,
               localStream: voiceAccess.stream,
+              inputGain: localMicGain,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
@@ -1816,7 +2150,7 @@ function App() {
                   }),
                 );
               },
-              onStatus: (status) => setCommandError(status),
+              onStatus: (status) => reportCommandError(status, "Voice media"),
             });
           } else {
             voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
@@ -1828,7 +2162,7 @@ function App() {
               onState: (state) => setCommandState(state as AppState),
               onStatus: (status) => {
                 if (!/proof generated|proof received/i.test(status)) {
-                  setCommandError(status);
+                  reportCommandError(status, "Voice media");
                 }
               },
             });
@@ -1841,19 +2175,16 @@ function App() {
     if (!sessionId) return;
     stopLocalVoiceCapture();
     void applyCommand(leaveVoice({ session_id: sessionId }), () =>
-      setWorkflow("voice"),
+      setWorkflow(workflowAfterUpdate),
     );
   }
 
   function chooseTheme(nextTheme: ThemeId) {
     void applyCommand(
-      savePreferences({ theme_id: nextTheme, template_id: activeTemplate.id }),
-    );
-  }
-
-  function chooseTemplate(nextTemplate: TemplateId) {
-    void applyCommand(
-      savePreferences({ theme_id: activeTheme.id, template_id: nextTemplate }),
+      savePreferences({
+        theme_id: nextTheme,
+        template_id: discryptUiConfig.activeTemplate,
+      }),
     );
   }
 
@@ -1866,17 +2197,100 @@ function App() {
     });
   }
 
+  function chooseKeyringStorage() {
+    void applyCommand(configureStorageSecurity({ mode: "keyring" }), (state) => {
+      if (!state.last_command_error && state.storage_security.status === "ready") {
+        setStoragePassword("");
+        setStoragePasswordConfirm("");
+      }
+    });
+  }
+
+  function setupPasswordStorage() {
+    if (storagePassword !== storagePasswordConfirm) {
+      reportCommandError(
+        "Storage passwords do not match.",
+        "configure_storage_security",
+      );
+      return;
+    }
+    void applyCommand(
+      configureStorageSecurity({
+        mode: "passphrase_vault",
+        passphrase: storagePassword,
+      }),
+      (state) => {
+        if (!state.last_command_error && state.storage_security.status === "ready") {
+          setStoragePassword("");
+          setStoragePasswordConfirm("");
+        }
+      },
+    );
+  }
+
+  function unlockPasswordStorage() {
+    void applyCommand(
+      unlockStorageSecurity({ passphrase: storagePassword }),
+      (state) => {
+        if (!state.last_command_error && state.storage_security.status === "ready") {
+          setStoragePassword("");
+          setStoragePasswordConfirm("");
+        }
+      },
+    );
+  }
+
+  const storageCommandError =
+    commandError ??
+    (appState.last_command_error
+      ? `${appState.last_command_error.message} — ${appState.last_command_error.recovery_hint}`
+      : null);
+  const existingVaultNeedsUnlock =
+    appState.storage_security.status === "locked" ||
+    (appState.storage_security.status === "error" &&
+      appState.storage_security.mode === "passphrase_vault");
+  if (
+    existingVaultNeedsUnlock ||
+    (appState.lifecycle !== "first_run" &&
+      appState.storage_security.status !== "ready")
+  ) {
+    return (
+      <StorageSecurityPanel
+        themeStyle={themeStyle}
+        storage={appState.storage_security}
+        password={storagePassword}
+        setPassword={setStoragePassword}
+        passwordConfirm={storagePasswordConfirm}
+        setPasswordConfirm={setStoragePasswordConfirm}
+        commandError={storageCommandError}
+        onUseKeyring={chooseKeyringStorage}
+        onSetupPassword={setupPasswordStorage}
+        onUnlockPassword={unlockPasswordStorage}
+      />
+    );
+  }
+
   if (appState.lifecycle === "first_run") {
     return (
       <FirstRunPanel
         themeStyle={themeStyle}
+        storage={appState.storage_security}
+        selectedStorageMode={selectedStorageMode}
+        setSelectedStorageMode={(mode) => {
+          setSelectedStorageMode(mode);
+          setCommandError(null);
+        }}
+        storagePassword={storagePassword}
+        setStoragePassword={setStoragePassword}
+        storagePasswordConfirm={storagePasswordConfirm}
+        setStoragePasswordConfirm={setStoragePasswordConfirm}
         displayName={draftDisplayName}
         setDisplayName={setDraftDisplayName}
         deviceName={draftDeviceName}
         setDeviceName={setDraftDeviceName}
         recoveryCode={draftRecoveryCode}
         setRecoveryCode={setDraftRecoveryCode}
-        commandError={commandError}
+        commandError={storageCommandError}
         onCreate={createCommandUser}
         onRecover={recoverCommandUser}
       />
@@ -1885,45 +2299,65 @@ function App() {
 
   return (
     <main
-      data-template={activeTemplate.id}
       style={themeStyle}
       className={cn(
         "grid min-h-dvh overflow-hidden bg-[hsl(var(--background))] text-[hsl(var(--foreground))]",
         showInspector
-          ? "grid-cols-1 lg:grid-cols-[var(--template-shell-grid-inspector)]"
-          : "grid-cols-1 lg:grid-cols-[var(--template-shell-grid)]",
+          ? "grid-cols-1 lg:grid-cols-[var(--shell-grid-inspector)]"
+          : "grid-cols-1 lg:grid-cols-[var(--shell-grid)]",
       )}
     >
       <ServerRail
         groups={appState.groups}
+        dms={appState.dms}
         activeGroup={activeGroup}
+        activeDm={activeDm}
         themeLabel={activeTheme.label}
         onSelectGroup={focusCommandGroup}
-      />
-      <ChannelSidebar
-        groupLabel={groupLabel}
-        role={activeGroup?.role ?? "local profile"}
-        textChannels={textChannels}
-        voiceChannels={voiceChannels}
-        dms={appState.dms}
-        activeDmId={activeDm?.dm_id ?? null}
-        activeChannelId={activeTextChannel?.channel_id ?? null}
-        activeVoiceChannelId={activeVoiceChannel?.channel_id ?? null}
-        selectedWorkflow={workflow}
-        onOpenCreateGroup={() => setActiveOverlay("create-group")}
-        onOpenJoin={() => setActiveOverlay("invite")}
-        onOpenCreateChannel={() => setActiveOverlay("create-channel")}
-        onSelectTextChannel={(channelId) =>
-          focusCommandChannel(channelId, "Text")
-        }
-        onSelectVoiceChannel={(channelId) =>
-          focusCommandChannel(channelId, "Voice")
-        }
         onSelectDm={focusCommandDm}
-        onOpenNewDm={() => setWorkflow("dm")}
-        voiceJoined={voiceJoined}
-        participants={participants}
+        onOpenLauncher={openLauncherOverlay}
+        onOpenSettings={() => setActiveOverlay("settings")}
+        onGroupContextMenu={(groupId, x, y) =>
+          setGroupContextMenu({ groupId, x, y })
+        }
       />
+      {showDesktopSidebar && workflow !== "dm" ? (
+        <ChannelSidebar
+          groupLabel={groupLabel}
+          role={activeGroup?.role ?? "local profile"}
+          textChannels={textChannels}
+          voiceChannels={voiceChannels}
+          activeChannelId={activeTextChannel?.channel_id ?? null}
+          activeVoiceChannelId={activeVoiceChannel?.channel_id ?? null}
+          selectedWorkflow={workflow}
+          inlineTextDraft={inlineTextDraft}
+          setInlineTextDraft={setInlineTextDraft}
+          inlineVoiceDraft={inlineVoiceDraft}
+          setInlineVoiceDraft={setInlineVoiceDraft}
+          onCommitInlineChannel={commitInlineChannel}
+          onSelectTextChannel={(channelId) =>
+            focusCommandChannel(channelId, "Text")
+          }
+          onSelectVoiceChannel={(channelId) =>
+            focusCommandChannel(channelId, "Voice")
+          }
+          voiceJoined={voiceJoined}
+          participants={participants}
+          localUserId={appState.profile?.user_id ?? null}
+          selfMuted={selfMuted}
+          connectivity={voiceConnectivityForState(appState)}
+          voiceSession={appState.voice_session}
+          remoteAudio={appState.voice_session?.media_runtime.remote_audio ?? []}
+          remoteStreams={voiceRemoteStreams}
+          appOutputVolume={appOutputVolume}
+          selectedOutputDeviceId={selectedVoiceOutputId}
+          localMicGain={localMicGain}
+          onAppOutputVolumeChange={setAppOutputVolume}
+          onLocalMicGainChange={setLocalMicGain}
+          onToggleSelfMute={toggleSelfMute}
+          onLeaveVoice={() => void toggleVoiceJoin(false)}
+        />
+      ) : null}
       <section
         aria-label="Main chat pane"
         className="flex h-dvh min-w-0 flex-col bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)]"
@@ -1932,13 +2366,6 @@ function App() {
           groupLabel={groupLabel}
           activeTitle={activePane.title}
           activeSubtitle={activePane.subtitle}
-          themeId={asThemeId(activeTheme.id)}
-          templateId={asTemplateId(activeTemplate.id)}
-          onThemeChange={chooseTheme}
-          onTemplateChange={chooseTemplate}
-          onOpenCreateGroup={() => setActiveOverlay("create-group")}
-          onOpenJoin={() => setActiveOverlay("invite")}
-          onCreateInvite={createCommandInvite}
           onOpenSettings={() => setActiveOverlay("settings")}
           onOpenDiagnostics={() => {
             setInspectorOpen(true);
@@ -1946,31 +2373,12 @@ function App() {
           }}
           inspectorOpen={diagnosticsUiEnabled && inspectorOpen}
           diagnosticsEnabled={diagnosticsUiEnabled}
-          canCreateInvite={Boolean(activeGroup)}
         />
-        {commandError ? (
-          <p
-            role="alert"
-            className="mx-4 mt-3 rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 md:mx-6"
-          >
-            Action failed: {commandError}
-          </p>
-        ) : null}
-        {appState.invites.at(-1) ? (
-          <p
-            aria-live="polite"
-            className="mx-4 mt-3 rounded-xl border border-emerald-300/30 bg-emerald-300/10 p-3 text-sm text-emerald-100 md:mx-6"
-          >
-            Invite ready: {appState.invites.at(-1)?.code}
-          </p>
-        ) : null}
-        <ScrollArea className="min-h-0 flex-1 px-4 pb-28 md:px-6 md:pb-6">
-          <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-4 py-5">
+        <div className="min-h-0 flex-1 overflow-hidden px-4 py-4 md:px-6">
+          <div className="flex h-full w-full flex-col">
             {workflow === "setup" ? (
               <SetupPanel
                 snapshot={currentSnapshot}
-                setupSteps={setupSteps}
-                completedSteps={completedSteps}
                 verifyMessage={verifyMessage}
                 onVerify={confirmSafetyNumber}
               />
@@ -1989,6 +2397,35 @@ function App() {
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
               />
+            ) : workflow === "voice" && !showDesktopSidebar ? (
+              <MobileVoicePanel
+                group={activeGroup}
+                voiceChannels={voiceChannels}
+                activeVoiceChannelId={activeVoiceChannel?.channel_id ?? null}
+                voiceJoined={voiceJoined}
+                participants={participants}
+                localUserId={appState.profile?.user_id ?? null}
+                selfMuted={selfMuted}
+                connectivity={voiceConnectivityForState(appState)}
+                voiceSession={appState.voice_session}
+                remoteAudio={
+                  appState.voice_session?.media_runtime.remote_audio ?? []
+                }
+                remoteStreams={voiceRemoteStreams}
+                appOutputVolume={appOutputVolume}
+                selectedOutputDeviceId={selectedVoiceOutputId}
+                localMicGain={localMicGain}
+                onSelectVoiceChannel={(channelId) =>
+                  focusCommandChannel(channelId, "Voice")
+                }
+                onOpenCreateChannel={() => setInlineVoiceDraft("")}
+                onAppOutputVolumeChange={setAppOutputVolume}
+                onLocalMicGainChange={setLocalMicGain}
+                onToggleSelfMute={toggleSelfMute}
+                onLeaveVoice={() =>
+                  void toggleVoiceJoin(false, null, null, "voice")
+                }
+              />
             ) : (
               <ChannelPanel
                 group={activeGroup}
@@ -1997,56 +2434,33 @@ function App() {
                 textStateLegend={appState.text_state_legend}
                 draftMessage={draftMessage}
                 setDraftMessage={setDraftMessage}
-                onOpenCreateChannel={() => setActiveOverlay("create-channel")}
+                onOpenCreateChannel={() => setInlineTextDraft("")}
                 onSendMessage={sendCommandMessage}
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
               />
             )}
-            {workflow === "voice" || voiceJoined ? (
-              <VoicePanel
-                group={activeGroup}
-                activeVoiceChannel={activeVoiceChannel}
-                route={
-                  appState.voice_session?.route_copy ??
-                  currentSnapshot.voice.route
-                }
-                participants={participants}
-                localUserId={appState.profile?.user_id ?? null}
-                voiceSession={appState.voice_session}
-                remoteAudio={
-                  appState.voice_session?.media_runtime.remote_audio ?? []
-                }
-                remoteStreams={voiceRemoteStreams}
-                voiceStates={appState.voice_states}
-                voiceJoined={voiceJoined}
-                selfMuted={selfMuted}
-                connectivity={voiceConnectivityForState(appState)}
-                transportDiagnostics={appState.transport_diagnostics}
-                diagnosticsEnabled={diagnosticsUiEnabled}
-                inputDevices={voiceInputDevices}
-                selectedInputDeviceId={selectedVoiceInputId}
-                voiceDeviceStatus={voiceDeviceStatus}
-                onSelectInputDevice={setSelectedVoiceInputId}
-                onRefreshInputDevices={() => void refreshVoiceInputDevices(true)}
-                setVoiceJoined={toggleVoiceJoin}
-                setSelfMuted={toggleSelfMute}
-                setVolume={setVolume}
-              />
-            ) : null}
           </div>
-        </ScrollArea>
+        </div>
       </section>
       <MobileWorkflowNav workflow={workflow} setWorkflow={setWorkflow} />
+      <Button
+        type="button"
+        variant="outline"
+        aria-label="Add group or direct message"
+        title="Add group or direct message"
+        onClick={openLauncherOverlay}
+        className="fixed bottom-24 left-4 z-40 grid h-12 w-12 place-items-center rounded-2xl border-emerald-300/35 bg-emerald-400/14 text-xl font-semibold text-emerald-100 shadow-2xl shadow-black/35 md:hidden"
+      >
+        <Icon>+</Icon>
+      </Button>
       {showInspector ? (
         <InspectorRail
           snapshot={currentSnapshot}
           appState={appState}
           participants={participants}
-          completedSteps={completedSteps}
           themeLabel={activeTheme.label}
-          templateLabel={activeTemplate.label}
           resetPhrase={resetPhrase}
           setResetPhrase={setResetPhrase}
           onResetState={resetCommandState}
@@ -2058,9 +2472,23 @@ function App() {
           onAttachRuntime={attachTextRuntime}
         />
       ) : null}
+      <GroupContextMenu
+        menu={groupContextMenu}
+        groups={appState.groups}
+        onClose={() => setGroupContextMenu(null)}
+        onCreateInvite={(groupId) => {
+          setGroupContextMenu(null);
+          openGroupInviteOverlay(groupId);
+        }}
+        onOpenConfig={(groupId) => {
+          setGroupContextMenu(null);
+          openGroupConfigOverlay(groupId);
+        }}
+      />
       <WorkspaceOverlay
         overlay={activeOverlay}
-        onClose={() => setActiveOverlay(null)}
+        closing={overlayClosing}
+        onClose={closeOverlay}
       >
         {activeOverlay === "create-group" ? (
           <CreateGroupPanel
@@ -2068,9 +2496,7 @@ function App() {
             groupName={draftGroup}
             setGroupName={setDraftGroup}
             signalingAdapter={draftSignalingAdapter}
-            setSignalingAdapter={(value) =>
-              setDraftSignalingAdapter(value as SignalingAdapterKind)
-            }
+            setSignalingAdapter={chooseSignalingAdapter}
             signalingEndpoint={draftSignalingEndpoint}
             setSignalingEndpoint={setDraftSignalingEndpoint}
             iceStunServers={draftIceStunServers}
@@ -2080,47 +2506,96 @@ function App() {
             onCreate={createCommandGroup}
           />
         ) : null}
-        {activeOverlay === "create-channel" ? (
-          <CreateChannelSheet
-            group={activeGroup}
-            snapshot={currentSnapshot}
-            draftChannel={draftChannel}
-            setDraftChannel={setDraftChannel}
-            onCreateTextChannel={() => createCommandChannel("Text")}
-            onCreateVoiceChannel={() => createCommandChannel("Voice")}
-          />
-        ) : null}
-        {activeOverlay === "invite" ? (
-          <JoinPanel
-            snapshot={currentSnapshot}
+        {activeOverlay === "launcher" ? (
+          <LauncherPanel
             inviteValue={draftInvite}
             setInviteValue={setDraftInvite}
             groupName={draftJoinName}
             setGroupName={setDraftJoinName}
-            latestInvite={appState.invites.at(-1) ?? null}
+            contactName={draftDmName}
+            setContactName={setDraftDmName}
+            latestInvite={
+              visibleInviteId
+                ? (appState.invites.find(
+                    (invite) => invite.invite_id === visibleInviteId,
+                  ) ?? null)
+                : null
+            }
             joinProgress={appState.join_progress}
             onJoin={joinCommandGroup}
             onAcceptDmInvite={acceptCommandDmInvite}
-            onCreateInvite={createCommandInvite}
+            onStartDm={startCommandDm}
             onCreateDmInvite={createCommandDmInvite}
-            canCreateInvite={Boolean(activeGroup)}
             canCreateDmInvite={Boolean(activeDm)}
+            onCreateGroup={() => {
+              setOverlayClosing(false);
+              setActiveOverlay("create-group");
+            }}
+          />
+        ) : null}
+        {activeOverlay === "group-invite" ? (
+          <GroupInvitePanel
+            group={overlayGroup}
+            latestInvite={
+              visibleInviteId
+                ? (appState.invites.find(
+                    (invite) => invite.invite_id === visibleInviteId,
+                  ) ?? null)
+                : null
+            }
+            expiryDays={inviteExpiryDays}
+            setExpiryDays={setInviteExpiryDays}
+            maxUses={inviteMaxUses}
+            setMaxUses={setInviteMaxUses}
+            passwordEnabled={invitePasswordEnabled}
+            setPasswordEnabled={setInvitePasswordEnabled}
+            password={invitePassword}
+            setPassword={setInvitePassword}
+            onCreateInvite={() => {
+              if (overlayGroup) createCommandInviteForGroup(overlayGroup.group_id);
+            }}
+          />
+        ) : null}
+        {activeOverlay === "group-config" ? (
+          <GroupConfigPanel
+            group={overlayGroup}
+            signalingAdapter={draftSignalingAdapter}
+            setSignalingAdapter={chooseSignalingAdapter}
+            signalingEndpoint={draftSignalingEndpoint}
+            setSignalingEndpoint={setDraftSignalingEndpoint}
+            iceStunServers={draftIceStunServers}
+            setIceStunServers={setDraftIceStunServers}
+            iceTurnServers={draftIceTurnServers}
+            setIceTurnServers={setDraftIceTurnServers}
+            onSave={() => {
+              if (overlayGroup) saveGroupConnectivityPolicy(overlayGroup.group_id);
+            }}
           />
         ) : null}
         {activeOverlay === "settings" ? (
           <div className="grid gap-4">
             <AppearanceSettings
               themeId={asThemeId(activeTheme.id)}
-              templateId={asTemplateId(activeTemplate.id)}
               onThemeChange={chooseTheme}
-              onTemplateChange={chooseTemplate}
+            />
+            <AudioSettingsPanel
+              inputDevices={voiceInputDevices}
+              outputDevices={voiceOutputDevices}
+              selectedInputDeviceId={selectedVoiceInputId}
+              selectedOutputDeviceId={selectedVoiceOutputId}
+              voiceDeviceStatus={voiceDeviceStatus}
+              localMicGain={localMicGain}
+              appOutputVolume={appOutputVolume}
+              onSelectInputDevice={setSelectedVoiceInputId}
+              onSelectOutputDevice={setSelectedVoiceOutputId}
+              onRefreshDevices={() => void refreshVoiceInputDevices(true)}
+              onLocalMicGainChange={setLocalMicGain}
+              onAppOutputVolumeChange={setAppOutputVolume}
             />
             <ConnectivitySettingsPanel
               policy={activeConnectivity}
               signalingAdapter={draftSignalingAdapter}
-              setSignalingAdapter={(value) =>
-                setDraftSignalingAdapter(value as SignalingAdapterKind)
-              }
+              setSignalingAdapter={chooseSignalingAdapter}
               signalingEndpoint={draftSignalingEndpoint}
               setSignalingEndpoint={setDraftSignalingEndpoint}
               iceStunServers={draftIceStunServers}
@@ -2144,13 +2619,15 @@ function App() {
           <DiagnosticsSheet
             snapshot={currentSnapshot}
             appState={appState}
-            completedSteps={completedSteps}
-            participants={participants}
+              participants={participants}
             themeLabel={activeTheme.label}
-            templateLabel={activeTemplate.label}
-          />
+            />
         ) : null}
       </WorkspaceOverlay>
+      <CommandNotificationStack
+        notifications={commandNotifications}
+        onDismiss={dismissCommandNotification}
+      />
     </main>
   );
 }
@@ -2210,8 +2687,8 @@ function activePaneSummary(
     case "setup":
     default:
       return {
-        title: "Setup checklist",
-        subtitle: "Verify local trust before using chat and voice.",
+        title: "Getting started",
+        subtitle: "Create a group or open an invite to begin.",
       };
   }
 }
@@ -2273,8 +2750,226 @@ function getActiveDm(state: AppState): DirectConversationView | null {
     : (state.dms[0] ?? null);
 }
 
+function StorageSecurityPanel({
+  themeStyle,
+  storage,
+  password,
+  setPassword,
+  passwordConfirm,
+  setPasswordConfirm,
+  commandError,
+  onUseKeyring,
+  onSetupPassword,
+  onUnlockPassword,
+}: {
+  themeStyle: React.CSSProperties;
+  storage: AppState["storage_security"];
+  password: string;
+  setPassword: (value: string) => void;
+  passwordConfirm: string;
+  setPasswordConfirm: (value: string) => void;
+  commandError: string | null;
+  onUseKeyring: () => void;
+  onSetupPassword: () => void;
+  onUnlockPassword: () => void;
+}) {
+  const locked = storage.status === "locked" || storage.password_required;
+  const error = storage.status === "error";
+  return (
+    <main
+      style={themeStyle}
+      className="min-h-dvh bg-[radial-gradient(circle_at_20%_10%,hsl(var(--primary)/0.12),transparent_24rem),hsl(var(--background))] p-4 text-[hsl(var(--foreground))] md:p-8"
+    >
+      <div className="mx-auto grid min-h-[calc(100dvh-2rem)] w-full max-w-5xl place-items-center md:min-h-[calc(100dvh-4rem)]">
+        <Card className="w-full overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.94)] shadow-2xl shadow-black/30">
+          <CardHeader className="border-b border-[hsl(var(--border))] bg-[linear-gradient(135deg,hsl(var(--secondary)/0.48),transparent)] p-6 lg:p-8">
+            <Badge variant={error ? "warning" : "secondary"} className="w-fit">
+              local storage security
+            </Badge>
+            <CardTitle className="max-w-3xl text-3xl leading-tight md:text-4xl">
+              {storage.title}
+            </CardTitle>
+            <CardDescription className="max-w-3xl text-base leading-7">
+              {storage.detail}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-5 p-6 lg:grid-cols-[0.95fr_1.05fr] lg:p-8">
+            {commandError ? (
+              <p className="rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 lg:col-span-2">
+                Action failed: {commandError}
+              </p>
+            ) : null}
+            <div className="grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-4 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+              <h2 className="text-base font-semibold text-[hsl(var(--foreground))]">
+                Why this happens before account setup
+              </h2>
+              <p>
+                Discrypt encrypts local state before it stores your identity,
+                groups, message envelopes, and voice preferences. If the app
+                cannot unlock that storage, it must stop instead of creating a
+                replacement vault or keyring entry over existing data.
+              </p>
+              <p>
+                OS keyrings are smoother, but trust the logged-in operating
+                system session. A Discrypt password vault is worse UX because
+                you must type the password on every startup, but it provides a
+                separate app-level secret.
+              </p>
+              <p className="rounded-xl border border-amber-300/25 bg-amber-300/10 p-3 text-amber-100">
+                No recovery flow exists yet for a lost password, broken
+                keyring, or migrated vault. That roadmap is tracked in docs.
+              </p>
+            </div>
+            {locked || storage.mode === "passphrase_vault" ? (
+              <div className="flex flex-col gap-4 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4">
+                <div>
+                  <h2 className="text-lg font-semibold">
+                    Unlock password vault
+                  </h2>
+                  <p className="text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                    Enter the password used for this local Discrypt vault.
+                  </p>
+                </div>
+                <Label className="grid gap-2">
+                  Storage password
+                  <Input
+                    type="password"
+                    value={password}
+                    autoComplete="current-password"
+                    onChange={(event) => setPassword(event.target.value)}
+                  />
+                </Label>
+                <Button
+                  className="mt-auto"
+                  disabled={password.length < 12}
+                  onClick={onUnlockPassword}
+                >
+                  Unlock storage
+                </Button>
+              </div>
+            ) : (
+              <div className="grid gap-4">
+                <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4">
+                  <h2 className="text-lg font-semibold">Use OS keyring</h2>
+                  <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                    Best UX. The desktop keyring protects Discrypt's wrapping
+                    key and may unlock with your login session.
+                  </p>
+                  <Button className="mt-4 w-full" onClick={onUseKeyring}>
+                    Use keyring if available
+                  </Button>
+                </div>
+                <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4">
+                  <h2 className="text-lg font-semibold">
+                    Use Discrypt password vault
+                  </h2>
+                  <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                    Stronger separation from the OS keyring. Discrypt will ask
+                    for this password on every startup.
+                  </p>
+                  <div className="mt-4 grid gap-3">
+                    <Label className="grid gap-2">
+                      Storage password
+                      <Input
+                        type="password"
+                        value={password}
+                        autoComplete="new-password"
+                        onChange={(event) => setPassword(event.target.value)}
+                      />
+                    </Label>
+                    <Label className="grid gap-2">
+                      Confirm password
+                      <Input
+                        type="password"
+                        value={passwordConfirm}
+                        autoComplete="new-password"
+                        onChange={(event) =>
+                          setPasswordConfirm(event.target.value)
+                        }
+                      />
+                    </Label>
+                    <Button
+                      variant="outline"
+                      disabled={
+                        password.length < 12 || password !== passwordConfirm
+                      }
+                      onClick={onSetupPassword}
+                    >
+                      Set password vault
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+            <p className="text-sm text-[hsl(var(--muted-foreground))] lg:col-span-2">
+              {storage.recovery_hint}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    </main>
+  );
+}
+
+function PasswordInput({
+  value,
+  onChange,
+  placeholder,
+  autoComplete,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  autoComplete: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative">
+      <Input
+        className="pr-12"
+        type={visible ? "text" : "password"}
+        value={value}
+        placeholder={placeholder}
+        autoComplete={autoComplete}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        aria-label={visible ? "Hide password" : "Show password"}
+        className="absolute right-2 top-1/2 h-8 w-8 -translate-y-1/2 rounded-md"
+        onClick={() => setVisible((current) => !current)}
+      >
+        {visible ? (
+          <svg viewBox="0 0 24 24" aria-hidden="true" className="h-4 w-4">
+            <path
+              fill="currentColor"
+              d="M2.7 3.3 1.3 4.7l4 4C4 9.7 2.9 10.9 2 12c2.5 3.3 5.8 5 10 5 1.6 0 3.1-.3 4.4-.9l2.9 2.9 1.4-1.4-18-18ZM12 15c-1.7 0-3-1.3-3-3 0-.4.1-.8.2-1.1l3.9 3.9c-.3.1-.7.2-1.1.2Zm0-8c1.7 0 3 1.3 3 3 0 .4-.1.8-.2 1.1l3.5 3.5c1.4-.8 2.6-1.9 3.7-3.3C19.5 8 16.2 6.3 12 6.3c-.9 0-1.8.1-2.6.3l2 2c.2 0 .4-.1.6-.1Z"
+            />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" aria-hidden="true" className="h-4 w-4">
+            <path
+              fill="currentColor"
+              d="M12 5c4.2 0 7.5 2.3 10 7-2.5 4.7-5.8 7-10 7S4.5 16.7 2 12c2.5-4.7 5.8-7 10-7Zm0 2C9 7 6.5 8.4 4.4 12 6.5 15.6 9 17 12 17s5.5-1.4 7.6-5C17.5 8.4 15 7 12 7Zm0 2.5A2.5 2.5 0 1 1 12 14.5 2.5 2.5 0 0 1 12 9.5Z"
+            />
+          </svg>
+        )}
+      </Button>
+    </div>
+  );
+}
+
 function FirstRunPanel({
   themeStyle,
+  storage,
+  selectedStorageMode,
+  setSelectedStorageMode,
+  storagePassword,
+  setStoragePassword,
+  storagePasswordConfirm,
+  setStoragePasswordConfirm,
   displayName,
   setDisplayName,
   deviceName,
@@ -2286,6 +2981,13 @@ function FirstRunPanel({
   onRecover,
 }: {
   themeStyle: React.CSSProperties;
+  storage: AppState["storage_security"];
+  selectedStorageMode: StorageSetupChoice | null;
+  setSelectedStorageMode: (value: StorageSetupChoice) => void;
+  storagePassword: string;
+  setStoragePassword: (value: string) => void;
+  storagePasswordConfirm: string;
+  setStoragePasswordConfirm: (value: string) => void;
   displayName: string;
   setDisplayName: (value: string) => void;
   deviceName: string;
@@ -2293,9 +2995,24 @@ function FirstRunPanel({
   recoveryCode: string;
   setRecoveryCode: (value: string) => void;
   commandError: string | null;
-  onCreate: () => void;
-  onRecover: () => void;
+  onCreate: () => void | Promise<void>;
+  onRecover: () => void | Promise<void>;
 }) {
+  const storageSetupRequired = storage.status !== "ready";
+  const vaultSelected = selectedStorageMode === "passphrase_vault";
+  const passwordLongEnough = storagePassword.length >= 12;
+  const passwordsMatch = storagePassword === storagePasswordConfirm;
+  const storageReadyForSubmit =
+    !storageSetupRequired ||
+    selectedStorageMode === "keyring" ||
+    (vaultSelected && passwordLongEnough && passwordsMatch);
+  const passwordMessage = !vaultSelected
+    ? null
+    : !passwordLongEnough
+      ? `Use at least 12 characters (${storagePassword.length}/12).`
+      : !passwordsMatch
+        ? "Passwords do not match yet."
+        : "Password vault will be created when you create or recover the account.";
   return (
     <main
       style={themeStyle}
@@ -2303,37 +3020,102 @@ function FirstRunPanel({
     >
       <div className="mx-auto grid min-h-[calc(100dvh-2rem)] w-full max-w-5xl place-items-center md:min-h-[calc(100dvh-4rem)]">
         <Card className="w-full overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.9)] shadow-2xl shadow-black/30">
-          <div className="grid lg:grid-cols-[0.9fr_1.1fr]">
-            <CardHeader className="border-b border-[hsl(var(--border))] bg-[linear-gradient(135deg,hsl(var(--secondary)/0.48),transparent)] p-6 lg:border-b-0 lg:border-r lg:p-8">
-              <Badge variant="secondary" className="w-fit">
-                first run
-              </Badge>
-              <CardTitle className="max-w-md text-3xl leading-tight md:text-4xl">
-                Set up your local discrypt profile
-              </CardTitle>
-              <CardDescription className="max-w-md text-base leading-7">
-                Create a local identity for this device, or recover an
-                existing profile.
-              </CardDescription>
-              <div className="grid gap-3 pt-3 text-sm text-[hsl(var(--muted-foreground))]">
-                <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
-                  1. Choose a display name and device label.
+          <CardHeader className="border-b border-[hsl(var(--border))] bg-[linear-gradient(135deg,hsl(var(--secondary)/0.48),transparent)] p-6 lg:p-8">
+            <Badge variant="secondary" className="w-fit">
+              first run
+            </Badge>
+            <CardTitle className="max-w-3xl text-3xl leading-tight md:text-4xl">
+              Set up your local discrypt profile
+            </CardTitle>
+            <CardDescription className="max-w-3xl text-base leading-7">
+              Choose how this device protects local data, then create or recover
+              your profile.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-5 p-6 lg:p-8">
+            {commandError ? (
+              <p className="rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100">
+                Action failed: {commandError}
+              </p>
+            ) : null}
+            {storageSetupRequired ? (
+              <section className="grid gap-4 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-semibold">
+                      Local storage protection
+                    </h2>
+                    <p className="mt-1 max-w-3xl text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                      Discrypt will not create your account until local storage
+                      can be protected. Existing unreadable state is preserved;
+                      choosing a mode here stays reversible until you submit the
+                      account form.
+                    </p>
+                  </div>
+                  <Badge
+                    variant={storage.keyring_available ? "secondary" : "warning"}
+                    className="w-fit"
+                  >
+                    {storage.keyring_available
+                      ? "keyring preflight passed"
+                      : "keyring needs attention"}
+                  </Badge>
                 </div>
-                <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
-                  2. Enter the app shell with local state ready.
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className={cn(
+                      "h-auto min-h-36 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
+                      selectedStorageMode === "keyring"
+                        ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
+                        : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
+                    )}
+                    onClick={() => setSelectedStorageMode("keyring")}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <h3 className="font-semibold">Use OS keyring</h3>
+                      <Badge variant="secondary">best UX</Badge>
+                    </div>
+                    <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                      The desktop keyring protects Discrypt's storage key and may
+                      unlock with your login session. It trusts your OS keyring
+                      boundary.
+                    </p>
+                    <p className="mt-3 rounded-xl border border-[hsl(var(--border))] bg-black/10 p-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                      {storage.keyring_detail}
+                    </p>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className={cn(
+                      "h-auto min-h-36 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
+                      selectedStorageMode === "passphrase_vault"
+                        ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
+                        : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
+                    )}
+                    onClick={() => setSelectedStorageMode("passphrase_vault")}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <h3 className="font-semibold">
+                        Use Discrypt password vault
+                      </h3>
+                      <Badge variant="secondary">stronger separation</Badge>
+                    </div>
+                    <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                      A password-derived vault protects local storage without
+                      relying on the OS keyring. You must enter it every time the
+                      app starts.
+                    </p>
+                    <p className="mt-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs leading-5 text-amber-100">
+                      No recovery exists yet for a lost storage password.
+                    </p>
+                  </Button>
                 </div>
-                <div className="rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
-                  3. Verify safety, groups, chat, and voice from the setup
-                  checklist.
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="grid gap-4 p-6 md:grid-cols-2 lg:p-8">
-              {commandError ? (
-                <p className="rounded-xl border border-red-300/30 bg-red-300/10 p-3 text-sm text-red-100 md:col-span-2">
-                  Action failed: {commandError}
-                </p>
-              ) : null}
+              </section>
+            ) : null}
+            <section className="grid gap-4 md:grid-cols-2">
               <div className="flex min-h-72 flex-col rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
                 <div className="mb-4">
                   <h2 className="text-lg font-semibold">New local user</h2>
@@ -2357,10 +3139,46 @@ function FirstRunPanel({
                     onChange={(event) => setDeviceName(event.target.value)}
                   />
                 </Label>
+                {vaultSelected ? (
+                  <div className="mt-4 grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
+                    <Label className="grid gap-2">
+                      Storage password
+                      <PasswordInput
+                        value={storagePassword}
+                        autoComplete="new-password"
+                        placeholder="At least 12 characters"
+                        onChange={setStoragePassword}
+                      />
+                    </Label>
+                    <Label className="grid gap-2">
+                      Confirm storage password
+                      <PasswordInput
+                        value={storagePasswordConfirm}
+                        autoComplete="new-password"
+                        placeholder="Repeat storage password"
+                        onChange={setStoragePasswordConfirm}
+                      />
+                    </Label>
+                    <p
+                      className={cn(
+                        "text-sm",
+                        passwordLongEnough && passwordsMatch
+                          ? "text-emerald-200"
+                          : "text-amber-100",
+                      )}
+                    >
+                      {passwordMessage}
+                    </p>
+                  </div>
+                ) : null}
                 <Button
                   className="mt-auto w-full"
                   onClick={onCreate}
-                  disabled={!displayName.trim() || !deviceName.trim()}
+                  disabled={
+                    !displayName.trim() ||
+                    !deviceName.trim() ||
+                    !storageReadyForSubmit
+                  }
                 >
                   Create new user
                 </Button>
@@ -2388,6 +3206,38 @@ function FirstRunPanel({
                     onChange={(event) => setDeviceName(event.target.value)}
                   />
                 </Label>
+                {vaultSelected ? (
+                  <div className="mt-4 grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
+                    <Label className="grid gap-2">
+                      Storage password
+                      <PasswordInput
+                        value={storagePassword}
+                        autoComplete="new-password"
+                        placeholder="At least 12 characters"
+                        onChange={setStoragePassword}
+                      />
+                    </Label>
+                    <Label className="grid gap-2">
+                      Confirm storage password
+                      <PasswordInput
+                        value={storagePasswordConfirm}
+                        autoComplete="new-password"
+                        placeholder="Repeat storage password"
+                        onChange={setStoragePasswordConfirm}
+                      />
+                    </Label>
+                    <p
+                      className={cn(
+                        "text-sm",
+                        passwordLongEnough && passwordsMatch
+                          ? "text-emerald-200"
+                          : "text-amber-100",
+                      )}
+                    >
+                      {passwordMessage}
+                    </p>
+                  </div>
+                ) : null}
                 <Label className="mt-4 grid gap-2">
                   Recovery phrase/code
                   <Input
@@ -2397,8 +3247,7 @@ function FirstRunPanel({
                   />
                 </Label>
                 <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                  Use the recovery material generated for your existing
-                  profile.
+                  Use the recovery material generated for your existing profile.
                 </p>
                 <Button
                   variant="outline"
@@ -2407,14 +3256,15 @@ function FirstRunPanel({
                   disabled={
                     !displayName.trim() ||
                     !deviceName.trim() ||
-                    !recoveryCode.trim()
+                    !recoveryCode.trim() ||
+                    !storageReadyForSubmit
                   }
                 >
                   Recover existing user
                 </Button>
               </div>
-            </CardContent>
-          </div>
+            </section>
+          </CardContent>
         </Card>
       </div>
     </main>
@@ -2423,19 +3273,31 @@ function FirstRunPanel({
 
 function ServerRail({
   groups,
+  dms,
   activeGroup,
+  activeDm,
   themeLabel,
   onSelectGroup,
+  onSelectDm,
+  onOpenLauncher,
+  onOpenSettings,
+  onGroupContextMenu,
 }: {
   groups: GroupView[];
+  dms: DirectConversationView[];
   activeGroup: GroupView | null;
+  activeDm: DirectConversationView | null;
   themeLabel: string;
   onSelectGroup: (groupId: string) => void;
+  onSelectDm: (dmId: string) => void;
+  onOpenLauncher: () => void;
+  onOpenSettings: () => void;
+  onGroupContextMenu: (groupId: string, x: number, y: number) => void;
 }) {
   return (
     <aside
       aria-label="Server rail"
-      className="hidden border-r border-[hsl(var(--border))] bg-black/25 p-3 md:flex md:flex-col md:items-center md:gap-3"
+      className="hidden h-dvh border-r border-[hsl(var(--border))] bg-black/25 p-3 md:flex md:flex-col md:items-center md:gap-3"
     >
       <div
         className="grid h-11 w-11 place-items-center rounded-2xl bg-[hsl(var(--primary))] font-black text-[hsl(var(--primary-foreground))] shadow-sm shadow-black/30"
@@ -2444,29 +3306,38 @@ function ServerRail({
         d
       </div>
       <div className="h-px w-9 rounded-full bg-[hsl(var(--border))]" />
-      {(groups.length
-        ? groups
-        : [
-            {
-              group_id: "local",
-              name: "Local",
-              role: "local profile",
-              channels: [],
-            },
-          ]
-      )
-        .slice(0, 6)
-        .map((group) => (
+      <div className="flex min-h-0 flex-1 flex-col items-center gap-3 overflow-y-auto pb-2">
+        {(groups.length
+          ? groups
+          : [
+              {
+                group_id: "local",
+                name: "Local",
+                role: "local profile",
+                channels: [],
+              },
+            ]
+        ).map((group) => (
           <Button
             key={group.group_id}
             variant="outline"
             size="icon"
-            title={group.name}
+            title={`${group.name} · right-click for group actions`}
             aria-label={`Open ${group.name} group`}
             onClick={() => onSelectGroup(group.group_id)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              if (group.group_id !== "local") {
+                onGroupContextMenu(
+                  group.group_id,
+                  event.clientX,
+                  event.clientY,
+                );
+              }
+            }}
             disabled={group.group_id === "local"}
             className={cn(
-              "h-11 w-11 rounded-2xl text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5 disabled:cursor-default disabled:opacity-70 disabled:hover:translate-y-0",
+              "h-11 w-11 shrink-0 rounded-2xl text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5 disabled:cursor-default disabled:opacity-70 disabled:hover:translate-y-0",
               group.group_id === activeGroup?.group_id
                 ? "border-[hsl(var(--primary)/0.65)] bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]"
                 : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
@@ -2475,13 +3346,199 @@ function ServerRail({
             {group.name.slice(0, 2).toUpperCase()}
           </Button>
         ))}
-      <div
-        className="mt-auto grid h-10 w-10 place-items-center rounded-xl border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
+        {dms.length ? <div className="h-px w-9 rounded-full bg-[hsl(var(--border))]" /> : null}
+        {dms.map((dm) => (
+          <Button
+            key={dm.dm_id}
+            variant="outline"
+            size="icon"
+            title={dm.display_name}
+            aria-label={`Open ${dm.display_name} direct message`}
+            onClick={() => onSelectDm(dm.dm_id)}
+            className={cn(
+              "h-11 w-11 shrink-0 rounded-full text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5",
+              dm.dm_id === activeDm?.dm_id
+                ? "border-[hsl(var(--primary)/0.65)] bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]"
+                : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
+            )}
+          >
+            {dm.display_name.slice(0, 2).toUpperCase()}
+          </Button>
+        ))}
+      </div>
+      <Button
+        type="button"
+        variant="outline"
+        onClick={onOpenLauncher}
+        aria-label="Add group or direct message"
+        className="grid h-11 w-11 place-items-center rounded-2xl border-emerald-300/35 bg-emerald-400/12 text-xl font-semibold text-emerald-100 shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5 hover:bg-emerald-400/18"
+        title="Add group or direct message"
+      >
+        <Icon>+</Icon>
+      </Button>
+      <Button
+        type="button"
+        variant="outline"
+        onClick={onOpenSettings}
+        aria-label="Open rail configuration"
+        className="grid h-10 w-10 place-items-center rounded-xl border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
         title={themeLabel}
       >
-        cfg
-      </div>
+        <Icon>⚙</Icon>
+      </Button>
     </aside>
+  );
+}
+
+function MobileVoicePanel({
+  group,
+  voiceChannels,
+  activeVoiceChannelId,
+  voiceJoined,
+  participants,
+  localUserId,
+  selfMuted,
+  connectivity,
+  voiceSession,
+  remoteAudio,
+  remoteStreams,
+  appOutputVolume,
+  selectedOutputDeviceId,
+  localMicGain,
+  onSelectVoiceChannel,
+  onOpenCreateChannel,
+  onAppOutputVolumeChange,
+  onLocalMicGainChange,
+  onToggleSelfMute,
+  onLeaveVoice,
+}: {
+  group: GroupView | null;
+  voiceChannels: ChannelStateView[];
+  activeVoiceChannelId: string | null;
+  voiceJoined: boolean;
+  participants: VoiceParticipant[];
+  localUserId: string | null;
+  selfMuted: boolean;
+  connectivity: ConnectivityPolicyView | null;
+  voiceSession: VoiceSessionView | null;
+  remoteAudio: VoiceRemoteAudioView[];
+  remoteStreams: Record<string, MediaStream>;
+  appOutputVolume: number;
+  selectedOutputDeviceId: string;
+  localMicGain: number;
+  onSelectVoiceChannel: (channelId: string) => void;
+  onOpenCreateChannel: () => void;
+  onAppOutputVolumeChange: (value: number) => void;
+  onLocalMicGainChange: (value: number) => void;
+  onToggleSelfMute: (muted: boolean) => void;
+  onLeaveVoice: () => void;
+}) {
+  const activeVoiceChannel =
+    voiceChannels.find((channel) => channel.channel_id === activeVoiceChannelId) ??
+    voiceChannels[0] ??
+    null;
+  const speaking = participants.filter(
+    (participant) => participant.speaking && !participant.muted,
+  ).length;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl border border-[hsl(var(--border)/0.74)] bg-[hsl(var(--card)/0.62)] shadow-none">
+      <div className="border-b border-[hsl(var(--border))] px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+              {group?.name ?? "No active group"}
+            </p>
+            <h2 className="mt-1 text-lg font-semibold tracking-tight">
+              Voice rooms
+            </h2>
+            <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+              Tap a room to join. Text stays available from the Text tab.
+            </p>
+          </div>
+          <Badge variant={voiceJoined ? "success" : "secondary"}>
+            {voiceJoined ? "joined" : "idle"}
+          </Badge>
+        </div>
+      </div>
+      <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 pb-28 lg:pb-4">
+        <section className="grid gap-2">
+          {voiceChannels.length === 0 ? (
+            <div className="rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4">
+              <p className="font-medium">No voice rooms yet</p>
+              <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+                Create a voice room for this group, then tap it to join.
+              </p>
+            </div>
+          ) : null}
+          {voiceChannels.map((channel) => {
+            const active = activeVoiceChannel?.channel_id === channel.channel_id;
+            return (
+              <Button
+                key={channel.channel_id}
+                variant={active ? "secondary" : "ghost"}
+                aria-current={active ? "page" : undefined}
+                className="h-auto justify-start rounded-xl px-3 py-3 text-left"
+                onClick={() => onSelectVoiceChannel(channel.channel_id)}
+              >
+                <span className="grid gap-1">
+                  <span className="font-medium">{channel.name}</span>
+                  <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                    {voiceJoined && active
+                      ? `${participants.length} participant${participants.length === 1 ? "" : "s"} · ${speaking} speaking`
+                      : "Tap to join voice"}
+                  </span>
+                </span>
+              </Button>
+            );
+          })}
+          <Button
+            variant="outline"
+            size="icon"
+            className="mt-1"
+            aria-label="Add voice channel"
+            title="Add voice channel"
+            onClick={onOpenCreateChannel}
+            disabled={!group}
+          >
+            <Icon>+</Icon>
+          </Button>
+        </section>
+
+        {voiceJoined && activeVoiceChannel ? (
+          <section
+            aria-label={`${activeVoiceChannel.name} participants`}
+            className="rounded-xl border border-[hsl(var(--border))] bg-black/15 p-3"
+          >
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-sm font-semibold">{activeVoiceChannel.name}</p>
+              <Badge variant="success">{speaking} speaking</Badge>
+            </div>
+            <VoiceParticipantList
+              participants={participants}
+              localUserId={localUserId}
+              remoteAudio={remoteAudio}
+              remoteStreams={remoteStreams}
+              outputVolume={appOutputVolume}
+              outputDeviceId={selectedOutputDeviceId}
+            />
+          </section>
+        ) : null}
+      </div>
+      <SidebarVoiceStatus
+        joined={voiceJoined}
+        channelName={activeVoiceChannel?.name ?? null}
+        connectivity={connectivity}
+        voiceSession={voiceSession}
+        selfMuted={selfMuted}
+        localMicGain={localMicGain}
+        appOutputVolume={appOutputVolume}
+        onLocalMicGainChange={onLocalMicGainChange}
+        onAppOutputVolumeChange={onAppOutputVolumeChange}
+        onToggleSelfMute={onToggleSelfMute}
+        onLeaveVoice={onLeaveVoice}
+      />
+    </div>
   );
 }
 
@@ -2490,39 +3547,61 @@ function ChannelSidebar({
   role,
   textChannels,
   voiceChannels,
-  dms,
-  activeDmId,
   activeChannelId,
   activeVoiceChannelId,
   selectedWorkflow,
-  onOpenCreateGroup,
-  onOpenJoin,
-  onOpenCreateChannel,
+  inlineTextDraft,
+  setInlineTextDraft,
+  inlineVoiceDraft,
+  setInlineVoiceDraft,
+  onCommitInlineChannel,
   onSelectTextChannel,
   onSelectVoiceChannel,
-  onSelectDm,
-  onOpenNewDm,
   voiceJoined,
   participants,
+  localUserId,
+  selfMuted,
+  connectivity,
+  voiceSession,
+  remoteAudio,
+  remoteStreams,
+  appOutputVolume,
+  selectedOutputDeviceId,
+  localMicGain,
+  onAppOutputVolumeChange,
+  onLocalMicGainChange,
+  onToggleSelfMute,
+  onLeaveVoice,
 }: {
   groupLabel: string;
   role: string;
   textChannels: ChannelStateView[];
   voiceChannels: ChannelStateView[];
-  dms: DirectConversationView[];
-  activeDmId: string | null;
   activeChannelId: string | null;
   activeVoiceChannelId: string | null;
   selectedWorkflow: Workflow;
-  onOpenCreateGroup: () => void;
-  onOpenJoin: () => void;
-  onOpenCreateChannel: () => void;
+  inlineTextDraft: string | null;
+  setInlineTextDraft: (value: string | null) => void;
+  inlineVoiceDraft: string | null;
+  setInlineVoiceDraft: (value: string | null) => void;
+  onCommitInlineChannel: (kind: ChannelKind, rawName: string) => void;
   onSelectTextChannel: (channelId: string) => void;
   onSelectVoiceChannel: (channelId: string) => void;
-  onSelectDm: (dmId: string) => void;
-  onOpenNewDm: () => void;
   voiceJoined: boolean;
   participants: VoiceParticipant[];
+  localUserId: string | null;
+  selfMuted: boolean;
+  connectivity: ConnectivityPolicyView | null;
+  voiceSession: VoiceSessionView | null;
+  remoteAudio: VoiceRemoteAudioView[];
+  remoteStreams: Record<string, MediaStream>;
+  appOutputVolume: number;
+  selectedOutputDeviceId: string;
+  localMicGain: number;
+  onAppOutputVolumeChange: (value: number) => void;
+  onLocalMicGainChange: (value: number) => void;
+  onToggleSelfMute: (muted: boolean) => void;
+  onLeaveVoice: () => void;
 }) {
   const speaking = participants.filter(
     (participant) => participant.speaking && !participant.muted,
@@ -2535,11 +3614,11 @@ function ChannelSidebar({
       <div className="flex h-full flex-col">
         <div className="border-b border-[hsl(var(--border))] p-4">
           <div className="flex items-center justify-between gap-3">
-            <div>
-              <h1 className="text-lg font-semibold tracking-tight">
+            <div className="min-w-0">
+              <h1 className="truncate text-lg font-semibold tracking-tight">
                 {groupLabel}
               </h1>
-              <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              <p className="truncate text-xs text-[hsl(var(--muted-foreground))]">
                 {role} · workspace
               </p>
             </div>
@@ -2547,44 +3626,17 @@ function ChannelSidebar({
               {voiceJoined ? "voice" : "ready"}
             </Badge>
           </div>
-          <div className="mt-4 grid grid-cols-2 gap-2">
-            <Button variant="secondary" size="sm" onClick={onOpenCreateGroup}>
-              <Icon>+</Icon>Create
-            </Button>
-            <Button variant="outline" size="sm" onClick={onOpenJoin}>
-              Join
-            </Button>
-          </div>
         </div>
         <ScrollArea className="min-h-0 flex-1 p-3">
-          <SectionLabel>Direct messages</SectionLabel>
-          {dms.length === 0 ? (
-            <p className="px-2 text-xs text-[hsl(var(--muted-foreground))]">
-              No direct messages yet.
-            </p>
-          ) : null}
-          {dms.map((dm) => (
-            <SidebarButton
-              key={dm.dm_id}
-              active={selectedWorkflow === "dm" && activeDmId === dm.dm_id}
-              onClick={() => onSelectDm(dm.dm_id)}
-              meta="direct message"
-            >
-              {dm.display_name}
-            </SidebarButton>
-          ))}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="mt-1 w-full justify-start"
-            onClick={onOpenNewDm}
+          <SectionLabel
+            actionLabel="Add text channel"
+            onAction={() => setInlineTextDraft("")}
           >
-            <Icon>+</Icon>New message
-          </Button>
-          <SectionLabel>Text channels</SectionLabel>
-          {textChannels.length === 0 ? (
+            Text channels
+          </SectionLabel>
+          {textChannels.length === 0 && inlineTextDraft === null ? (
             <p className="px-2 text-xs text-[hsl(var(--muted-foreground))]">
-              No text channel yet.
+              Use + to add the first text channel.
             </p>
           ) : null}
           {textChannels.map((channel) => (
@@ -2597,52 +3649,400 @@ function ChannelSidebar({
               onClick={() => onSelectTextChannel(channel.channel_id)}
               meta={channel.retention_status}
             >
-              {channel.name}
+              # {channel.name}
             </SidebarButton>
           ))}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="mt-1 w-full justify-start"
-            onClick={onOpenCreateChannel}
+          {inlineTextDraft !== null ? (
+            <InlineChannelDraft
+              kind="Text"
+              value={inlineTextDraft}
+              onChange={setInlineTextDraft}
+              onCancel={() => setInlineTextDraft(null)}
+              onCommit={(value) => onCommitInlineChannel("Text", value)}
+            />
+          ) : null}
+          <SectionLabel
+            actionLabel="Add voice channel"
+            onAction={() => setInlineVoiceDraft("")}
           >
-            <Icon>+</Icon>Create channel
-          </Button>
-          <SectionLabel>Voice rooms</SectionLabel>
-          {voiceChannels.length === 0 ? (
+            Voice rooms
+          </SectionLabel>
+          {voiceChannels.length === 0 && inlineVoiceDraft === null ? (
             <p className="px-2 text-xs text-[hsl(var(--muted-foreground))]">
-              No voice room yet.
+              Use + to add the first voice room.
             </p>
           ) : null}
           {voiceChannels.map((channel) => {
             const focusedVoiceRoom =
-              selectedWorkflow === "voice" &&
-              activeVoiceChannelId === channel.channel_id;
+              voiceJoined && activeVoiceChannelId === channel.channel_id;
             return (
-              <SidebarButton
-                key={channel.channel_id}
-                active={focusedVoiceRoom}
-                ariaCurrent={focusedVoiceRoom ? "page" : undefined}
-                onClick={() => onSelectVoiceChannel(channel.channel_id)}
-                meta={voiceJoined ? `${speaking} speaking` : "not joined"}
-              >
-                {channel.name}
-              </SidebarButton>
+              <div key={channel.channel_id} className="mb-1">
+                <SidebarButton
+                  active={focusedVoiceRoom}
+                  ariaCurrent={focusedVoiceRoom ? "page" : undefined}
+                  onClick={() => onSelectVoiceChannel(channel.channel_id)}
+                  meta={
+                    voiceJoined && focusedVoiceRoom
+                      ? `${speaking} speaking`
+                      : "click to join"
+                  }
+                >
+                  🔊 {channel.name}
+                </SidebarButton>
+                {voiceJoined && focusedVoiceRoom ? (
+                  <VoiceParticipantList
+                    participants={participants}
+                    localUserId={localUserId}
+                    remoteAudio={remoteAudio}
+                    remoteStreams={remoteStreams}
+                    outputVolume={appOutputVolume}
+                    outputDeviceId={selectedOutputDeviceId}
+                  />
+                ) : null}
+              </div>
             );
           })}
+          {inlineVoiceDraft !== null ? (
+            <InlineChannelDraft
+              kind="Voice"
+              value={inlineVoiceDraft}
+              onChange={setInlineVoiceDraft}
+              onCancel={() => setInlineVoiceDraft(null)}
+              onCommit={(value) => onCommitInlineChannel("Voice", value)}
+            />
+          ) : null}
         </ScrollArea>
+        <SidebarVoiceStatus
+          joined={voiceJoined}
+          channelName={
+            voiceChannels.find(
+              (channel) => channel.channel_id === activeVoiceChannelId,
+            )?.name ?? null
+          }
+          connectivity={connectivity}
+          voiceSession={voiceSession}
+          selfMuted={selfMuted}
+          localMicGain={localMicGain}
+          appOutputVolume={appOutputVolume}
+          onLocalMicGainChange={onLocalMicGainChange}
+          onAppOutputVolumeChange={onAppOutputVolumeChange}
+          onToggleSelfMute={onToggleSelfMute}
+          onLeaveVoice={onLeaveVoice}
+        />
       </div>
     </aside>
   );
 }
 
-function SectionLabel({ children }: { children: React.ReactNode }) {
+function SectionLabel({
+  children,
+  actionLabel,
+  onAction,
+}: {
+  children: React.ReactNode;
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
   return (
-    <p className="mb-2 mt-5 px-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
-      {children}
-    </p>
+    <div className="mb-2 mt-5 flex items-center justify-between gap-2 px-2">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+        {children}
+      </p>
+      {onAction ? (
+        <Button
+          type="button"
+          variant="ghost"
+          aria-label={actionLabel}
+          title={actionLabel}
+          className="grid h-6 w-6 place-items-center rounded-md p-0 text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--foreground))]"
+          onClick={onAction}
+        >
+          <Icon>+</Icon>
+        </Button>
+      ) : null}
+    </div>
   );
 }
+
+function InlineChannelDraft({
+  kind,
+  value,
+  onChange,
+  onCancel,
+  onCommit,
+}: {
+  kind: ChannelKind;
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onCommit: (value: string) => void;
+}) {
+  const committedRef = useRef(false);
+  const commit = () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCommit(value);
+  };
+  return (
+    <div className="mb-1 rounded-xl border border-[hsl(var(--border))] bg-black/15 p-2">
+      <Input
+        autoFocus
+        aria-label={`${kind} channel name`}
+        value={value}
+        placeholder={kind === "Text" ? "text-channel-name" : "voice-room-name"}
+        onChange={(event) => onChange(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            commit();
+          }
+          if (event.key === "Escape") {
+            committedRef.current = true;
+            onCancel();
+          }
+        }}
+        className="h-9"
+      />
+    </div>
+  );
+}
+
+function VoiceParticipantList({
+  participants,
+  localUserId,
+  remoteAudio,
+  remoteStreams,
+  outputVolume,
+  outputDeviceId,
+}: {
+  participants: VoiceParticipant[];
+  localUserId: string | null;
+  remoteAudio: VoiceRemoteAudioView[];
+  remoteStreams: Record<string, MediaStream>;
+  outputVolume: number;
+  outputDeviceId: string;
+}) {
+  if (participants.length === 0) {
+    return (
+      <p className="mb-2 ml-5 px-2 text-xs text-[hsl(var(--muted-foreground))]">
+        Waiting for audio activity…
+      </p>
+    );
+  }
+  return (
+    <div className="mb-2 ml-4 grid gap-1 border-l border-[hsl(var(--border))] pl-2">
+      {participants.map((participant) => {
+        const local = isLocalVoiceParticipant(participant, localUserId);
+        const remoteTrack = remoteAudio.find(
+          (track) => track.participant_id === participant.id,
+        );
+        const remoteStream = local ? null : remoteStreams[participant.id];
+        return (
+          <div
+            key={participant.id}
+            data-testid={
+              local ? "voice-local-participant" : "voice-remote-participant"
+            }
+            className={cn(
+              "group flex min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-sm text-[hsl(var(--muted-foreground))]",
+              participant.speaking &&
+                !participant.muted &&
+                "bg-emerald-400/10 text-emerald-100",
+            )}
+            title={
+              participant.muted
+                ? "Muted"
+                : participant.speaking
+                  ? "Speaking"
+                  : "Listening"
+            }
+          >
+            <span
+              className={cn(
+                "h-2 w-2 rounded-full bg-[hsl(var(--muted-foreground)/0.45)]",
+                participant.speaking &&
+                  !participant.muted &&
+                  "bg-emerald-300 shadow-[0_0_0_3px_hsl(142_76%_36%/0.24)]",
+              )}
+              aria-hidden="true"
+            />
+            <span className="truncate">{participant.name}</span>
+            {participant.muted ? (
+              <span className="ml-auto text-[10px]" aria-label="muted">
+                mute
+              </span>
+            ) : null}
+            {!local && (remoteTrack || remoteStream) ? (
+              <RemoteAudioAttachment
+                participant={participant}
+                src={remoteTrack?.playback_element_id ? null : participant.remote_audio_src}
+                stream={remoteStream}
+                volumePercent={outputVolume}
+                outputDeviceId={outputDeviceId}
+              />
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SidebarVoiceStatus({
+  joined,
+  channelName,
+  connectivity,
+  voiceSession,
+  selfMuted,
+  localMicGain,
+  appOutputVolume,
+  onLocalMicGainChange,
+  onAppOutputVolumeChange,
+  onToggleSelfMute,
+  onLeaveVoice,
+}: {
+  joined: boolean;
+  channelName: string | null;
+  connectivity: ConnectivityPolicyView | null;
+  voiceSession: VoiceSessionView | null;
+  selfMuted: boolean;
+  localMicGain: number;
+  appOutputVolume: number;
+  onLocalMicGainChange: (value: number) => void;
+  onAppOutputVolumeChange: (value: number) => void;
+  onToggleSelfMute: (muted: boolean) => void;
+  onLeaveVoice: () => void;
+}) {
+  const adapter = connectivity?.signaling_profiles[0]?.adapter_kind ?? "provider";
+  return (
+    <div
+      data-testid="voice-sidebar-status"
+      className="border-t border-[hsl(var(--border))] bg-black/20 p-3"
+    >
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold">
+            {joined ? (channelName ?? "Voice") : "Voice idle"}
+          </p>
+          <p className="truncate text-xs text-[hsl(var(--muted-foreground))]">
+            {joined
+              ? `${adapter} · ${voiceSession?.status_copy ?? "joined"}`
+              : "Click a voice channel to join"}
+          </p>
+        </div>
+        {joined ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label="Leave voice call"
+            title="Leave voice call"
+            onClick={onLeaveVoice}
+            className="h-8 w-8 text-red-200 hover:bg-red-400/10 hover:text-red-100"
+          >
+            <Icon>🚪</Icon>
+          </Button>
+        ) : null}
+      </div>
+      <div className="grid gap-3">
+        <label className="grid gap-1 text-xs text-[hsl(var(--muted-foreground))]">
+          <span className="flex items-center justify-between gap-2">
+            <span>Mic gain</span>
+            <span>{localMicGain}%</span>
+          </span>
+          <Slider
+            aria-label="Microphone input volume"
+            value={[localMicGain]}
+            min={0}
+            max={200}
+            step={1}
+            disabled={!joined}
+            onValueChange={(value) => onLocalMicGainChange(value[0] ?? 100)}
+          />
+        </label>
+        <label className="grid gap-1 text-xs text-[hsl(var(--muted-foreground))]">
+          <span className="flex items-center justify-between gap-2">
+            <span>App output</span>
+            <span>{appOutputVolume}%</span>
+          </span>
+          <Slider
+            aria-label="App output volume"
+            value={[appOutputVolume]}
+            min={0}
+            max={100}
+            step={1}
+            onValueChange={(value) => onAppOutputVolumeChange(value[0] ?? 100)}
+          />
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            type="button"
+            variant={selfMuted ? "secondary" : "outline"}
+            size="sm"
+            disabled={!joined}
+            onClick={() => onToggleSelfMute(!selfMuted)}
+          >
+            {selfMuted ? "Unmute" : "Mute"}
+          </Button>
+          <Badge variant={joined ? "success" : "secondary"} className="justify-center">
+            {joined ? "joined" : "idle"}
+          </Badge>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CommandNotificationStack({
+  notifications,
+  onDismiss,
+}: {
+  notifications: CommandNotification[];
+  onDismiss: (id: string) => void;
+}) {
+  if (notifications.length === 0) return null;
+  return (
+    <div
+      role="region"
+      aria-label="Command notifications"
+      className="fixed right-4 top-16 z-50 grid w-[min(24rem,calc(100vw-2rem))] gap-3"
+    >
+      {notifications.map((notification) => (
+        <div
+          key={notification.id}
+          role="alert"
+          className="rounded-2xl border border-red-300/35 bg-[hsl(var(--card)/0.96)] p-4 text-[hsl(var(--foreground))] shadow-2xl shadow-black/40 backdrop-blur-xl"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-red-100">
+                {notification.title}
+              </p>
+              <p className="mt-1 text-sm leading-5 text-[hsl(var(--muted-foreground))]">
+                {notification.message}
+              </p>
+              <p className="mt-2 text-[11px] uppercase tracking-[0.14em] text-[hsl(var(--muted-foreground))]">
+                Logged to console · {notification.createdAt}
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Dismiss command notification"
+              className="h-8 w-8 shrink-0"
+              onClick={() => onDismiss(notification.id)}
+            >
+              <Icon>×</Icon>
+            </Button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SidebarButton({
   children,
   active,
@@ -2722,100 +4122,62 @@ function TopBar({
   groupLabel,
   activeTitle,
   activeSubtitle,
-  themeId,
-  templateId,
-  onThemeChange,
-  onTemplateChange,
-  onOpenCreateGroup,
-  onOpenJoin,
-  onCreateInvite,
   onOpenSettings,
   onOpenDiagnostics,
   inspectorOpen,
   diagnosticsEnabled,
-  canCreateInvite,
 }: {
   groupLabel: string;
   activeTitle: string;
   activeSubtitle: string;
-  themeId: ThemeId;
-  templateId: TemplateId;
-  onThemeChange: (id: ThemeId) => void;
-  onTemplateChange: (id: TemplateId) => void;
-  onOpenCreateGroup: () => void;
-  onOpenJoin: () => void;
-  onCreateInvite: () => void;
   onOpenSettings: () => void;
   onOpenDiagnostics: () => void;
   inspectorOpen: boolean;
   diagnosticsEnabled: boolean;
-  canCreateInvite: boolean;
 }) {
   return (
     <header
       aria-label="Workspace topbar"
       className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/0.88)] p-3 backdrop-blur-xl md:p-4"
     >
-      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+      <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline">{groupLabel}</Badge>
             <span className="text-xs text-[hsl(var(--muted-foreground))]">
-              encrypted workspace
+              private workspace
             </span>
           </div>
           <h2 className="mt-1 truncate text-xl font-semibold tracking-tight">
             {activeTitle}
           </h2>
-          <p className="line-clamp-2 text-xs text-[hsl(var(--muted-foreground))]">
+          <p className="line-clamp-1 text-xs text-[hsl(var(--muted-foreground))]">
             {activeSubtitle}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex shrink-0 items-center justify-end gap-2">
           <Button
-            variant="secondary"
-            size="sm"
-            onClick={onCreateInvite}
-            disabled={!canCreateInvite}
+            type="button"
+            variant="outline"
+            size="icon"
+            aria-label="Open app configuration"
+            title="Configuration"
+            onClick={onOpenSettings}
+            className="h-9 w-9"
           >
-            Invite
+            <Icon>⚙</Icon>
           </Button>
-          <Button variant="outline" size="sm" onClick={onOpenJoin}>
-            Join group
-          </Button>
-          <Button variant="outline" size="sm" onClick={onOpenCreateGroup}>
-            <Icon>+</Icon>Create group
-          </Button>
-          <Button variant="outline" size="sm" onClick={onOpenSettings}>
-            Settings
-          </Button>
-          <div className="hidden items-center gap-2 xl:flex">
-            <ConfigSelect
-              label="Theme"
-              value={themeId}
-              onChange={(value) => onThemeChange(value as ThemeId)}
-              options={discryptUiConfig.themes.map((theme) => ({
-                value: theme.id,
-                label: theme.label,
-              }))}
-            />
-            <ConfigSelect
-              label="Template"
-              value={templateId}
-              onChange={(value) => onTemplateChange(value as TemplateId)}
-              options={discryptUiConfig.templates.map((template) => ({
-                value: template.id,
-                label: template.label,
-              }))}
-            />
-          </div>
           {diagnosticsEnabled ? (
             <Button
+              type="button"
               variant={inspectorOpen ? "secondary" : "outline"}
-              size="sm"
+              size="icon"
+              aria-label="Open diagnostics"
+              title="Diagnostics"
               onClick={onOpenDiagnostics}
+              className="h-9 w-9"
             >
-              Diagnostics
+              <Icon>⌁</Icon>
             </Button>
           ) : null}
         </div>
@@ -2823,7 +4185,6 @@ function TopBar({
     </header>
   );
 }
-
 
 function overlayCopy(overlay: OverlayKind | null): {
   title: string;
@@ -2838,25 +4199,32 @@ function overlayCopy(overlay: OverlayKind | null): {
           "Start a workspace with a default text channel and voice room.",
         align: "center",
       };
-    case "create-channel":
+    case "launcher":
       return {
-        title: "Create channel",
+        title: "Add group or direct message",
         description:
-          "Add a text channel or voice room to the active group.",
+          "Paste an invite for a group or DM, or start a new group.",
+        align: "center",
+      };
+    case "group-invite":
+      return {
+        title: "Create group invite",
+        description:
+          "Generate a signed invite descriptor for this group.",
         align: "side",
       };
-    case "invite":
+    case "group-config":
       return {
-        title: "Invites",
+        title: "Group configuration",
         description:
-          "Create group/contact invites or open signed invite descriptors.",
+          "Configure this group's signaling profile and ICE policy.",
         align: "side",
       };
     case "settings":
       return {
-        title: "Workspace settings",
+        title: "Config",
         description:
-          "Adjust signaling and ICE policy for app, group, channel, or DM scope.",
+          "Manage theme, audio devices, volume, signaling, and ICE policy.",
         align: "side",
       };
     case "diagnostics":
@@ -2877,10 +4245,12 @@ function overlayCopy(overlay: OverlayKind | null): {
 
 function WorkspaceOverlay({
   overlay,
+  closing,
   onClose,
   children,
 }: {
   overlay: OverlayKind | null;
+  closing: boolean;
   onClose: () => void;
   children: React.ReactNode;
 }) {
@@ -2891,7 +4261,14 @@ function WorkspaceOverlay({
   return (
     <Dialog>
       <DialogPortal>
-        <div className="fixed inset-0 z-50 grid bg-black/55 p-3 backdrop-blur-sm md:p-6">
+        <div
+          className={cn(
+            "fixed inset-0 z-50 grid bg-black/55 p-3 backdrop-blur-sm md:p-6",
+            closing
+              ? "animate-[discrypt-fade-out_140ms_ease-in_forwards]"
+              : "animate-[discrypt-fade-in_160ms_ease-out]",
+          )}
+        >
           <DialogOverlay
             className="fixed inset-0"
             aria-hidden="true"
@@ -2905,8 +4282,18 @@ function WorkspaceOverlay({
             className={cn(
               "relative z-10 max-h-[calc(100dvh-1.5rem)] w-full overflow-y-auto border-[hsl(var(--border)/0.9)] bg-[hsl(var(--popover)/0.96)] p-0 shadow-2xl shadow-black/45 md:max-h-[calc(100dvh-3rem)]",
               copy.align === "side"
-                ? "ml-auto max-w-3xl self-stretch"
-                : "max-w-5xl place-self-center",
+                ? cn(
+                    "ml-auto max-w-3xl self-stretch",
+                    closing
+                      ? "animate-[discrypt-slide-out-right_140ms_ease-in_forwards]"
+                      : "animate-[discrypt-slide-in-right_180ms_ease-out]",
+                  )
+                : cn(
+                    "max-w-5xl place-self-center",
+                    closing
+                      ? "animate-[discrypt-scale-out_140ms_ease-in_forwards]"
+                      : "animate-[discrypt-scale-in_160ms_ease-out]",
+                  ),
             )}
           >
             <DialogHeader className="sticky top-0 z-10 border-b border-[hsl(var(--border))] bg-[hsl(var(--popover)/0.96)] p-4 backdrop-blur md:p-5">
@@ -2937,49 +4324,26 @@ function WorkspaceOverlay({
 
 function AppearanceSettings({
   themeId,
-  templateId,
   onThemeChange,
-  onTemplateChange,
 }: {
   themeId: ThemeId;
-  templateId: TemplateId;
   onThemeChange: (id: ThemeId) => void;
-  onTemplateChange: (id: TemplateId) => void;
 }) {
   return (
     <Card>
       <CardHeader>
         <CardTitle>Appearance</CardTitle>
         <CardDescription>
-          Pick a theme and layout template. These options are saved through the
-          app preference service and reuse the same shadcn token system.
+          Choose the app theme. Theme tokens drive the shadcn component system so future themes can extend the interface without changing screens.
         </CardDescription>
       </CardHeader>
-      <CardContent className="grid gap-3 md:grid-cols-2">
+      <CardContent className="grid gap-3">
         <Label className="grid gap-2">
           Theme
-          <Select
-            aria-label="Theme"
-            value={themeId}
-            onValueChange={(value) => onThemeChange(value as ThemeId)}
-          >
+          <Select aria-label="Theme" value={themeId} onValueChange={(value) => onThemeChange(value as ThemeId)}>
             {discryptUiConfig.themes.map((theme) => (
               <SelectItem key={theme.id} value={theme.id}>
                 {theme.label}
-              </SelectItem>
-            ))}
-          </Select>
-        </Label>
-        <Label className="grid gap-2">
-          Layout
-          <Select
-            aria-label="Layout template"
-            value={templateId}
-            onValueChange={(value) => onTemplateChange(value as TemplateId)}
-          >
-            {discryptUiConfig.templates.map((template) => (
-              <SelectItem key={template.id} value={template.id}>
-                {template.label}
               </SelectItem>
             ))}
           </Select>
@@ -2989,36 +4353,90 @@ function AppearanceSettings({
   );
 }
 
-function ConfigSelect({
-  label,
-  value,
-  options,
-  onChange,
+function AudioSettingsPanel({
+  inputDevices,
+  outputDevices,
+  selectedInputDeviceId,
+  selectedOutputDeviceId,
+  voiceDeviceStatus,
+  localMicGain,
+  appOutputVolume,
+  onSelectInputDevice,
+  onSelectOutputDevice,
+  onRefreshDevices,
+  onLocalMicGainChange,
+  onAppOutputVolumeChange,
 }: {
-  label: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (value: string) => void;
+  inputDevices: VoiceDeviceOption[];
+  outputDevices: VoiceDeviceOption[];
+  selectedInputDeviceId: string;
+  selectedOutputDeviceId: string;
+  voiceDeviceStatus: string | null;
+  localMicGain: number;
+  appOutputVolume: number;
+  onSelectInputDevice: (deviceId: string) => void;
+  onSelectOutputDevice: (deviceId: string) => void;
+  onRefreshDevices: () => void;
+  onLocalMicGainChange: (value: number) => void;
+  onAppOutputVolumeChange: (value: number) => void;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.35)] px-2 py-1 text-xs text-[hsl(var(--muted-foreground))]">
-      <Label className="px-1 text-xs" htmlFor={`config-${label.toLowerCase()}`}>
-        {label}
-      </Label>
-      <Select
-        id={`config-${label.toLowerCase()}`}
-        aria-label={label}
-        value={value}
-        onValueChange={onChange}
-        className="h-8 min-w-36 border-0 bg-transparent px-2 text-xs"
-      >
-        {options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
-            {option.label}
-          </SelectItem>
-        ))}
-      </Select>
-    </div>
+    <Card>
+      <CardHeader>
+        <CardTitle>Audio</CardTitle>
+        <CardDescription>
+          Select capture and playback devices, then tune app-wide microphone and output levels used by voice and future app sounds.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-5">
+        <div className="grid gap-4 md:grid-cols-2">
+          <Label className="grid gap-2">
+            Microphone input
+            <Select aria-label="Microphone input" data-testid="voice-mic-selector" value={selectedInputDeviceId} onValueChange={onSelectInputDevice}>
+              <SelectItem value="default">System default microphone</SelectItem>
+              {inputDevices.map((device) => (
+                <SelectItem key={device.device_id} value={device.device_id}>
+                  {device.label}
+                </SelectItem>
+              ))}
+            </Select>
+          </Label>
+          <Label className="grid gap-2">
+            App output device
+            <Select aria-label="App output device" data-testid="voice-output-selector" value={selectedOutputDeviceId} onValueChange={onSelectOutputDevice}>
+              <SelectItem value="default">System default output</SelectItem>
+              {outputDevices.map((device) => (
+                <SelectItem key={device.device_id} value={device.device_id}>
+                  {device.label}
+                </SelectItem>
+              ))}
+            </Select>
+          </Label>
+        </div>
+        <Button type="button" variant="outline" aria-label="Refresh audio devices" onClick={onRefreshDevices} className="w-fit">
+          Refresh audio devices
+        </Button>
+        <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+          {voiceDeviceStatus ?? "Refresh may request microphone access so Linux and browser backends can reveal device names."}
+        </p>
+        <div className="grid gap-4 md:grid-cols-2">
+          <label className="grid gap-2 text-sm">
+            <span className="flex items-center justify-between gap-2">
+              <span>Microphone input volume</span>
+              <span className="text-xs text-[hsl(var(--muted-foreground))]">{localMicGain}%</span>
+            </span>
+            <Slider aria-label="Microphone input volume" value={[localMicGain]} min={0} max={200} step={1} onValueChange={(value) => onLocalMicGainChange(value[0] ?? 100)} />
+          </label>
+          <label className="grid gap-2 text-sm">
+            <span className="flex items-center justify-between gap-2">
+              <span>App output volume</span>
+              <span className="text-xs text-[hsl(var(--muted-foreground))]">{appOutputVolume}%</span>
+            </span>
+            <Slider aria-label="App output volume" value={[appOutputVolume]} min={0} max={100} step={1} onValueChange={(value) => onAppOutputVolumeChange(value[0] ?? 100)} />
+          </label>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -3373,173 +4791,64 @@ function MobileWorkflowNav({
 
 function SetupPanel({
   snapshot,
-  setupSteps,
-  completedSteps,
   verifyMessage,
   onVerify,
 }: {
   snapshot: AppSnapshot;
-  setupSteps: SetupStepView[];
-  completedSteps: number;
   verifyMessage: string | null;
   onVerify: () => void;
 }) {
-  const setupTotal = setupSteps.length;
-  const nextStep =
-    setupSteps.find((step) => !step.complete) ??
-    setupSteps[setupSteps.length - 1];
-  const progress = setupTotal > 0 ? (completedSteps / setupTotal) * 100 : 0;
   return (
-    <div className="mx-auto grid max-w-6xl gap-5 py-5">
+    <div className="mx-auto grid max-w-4xl gap-5 py-8">
       <Card className="overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-xl shadow-black/20">
-        <CardContent className="grid gap-5 p-5 lg:grid-cols-[1fr_auto] lg:items-center lg:p-6">
-          <div className="flex min-w-0 gap-4">
-            <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl border border-[hsl(var(--primary)/0.35)] bg-[hsl(var(--primary)/0.12)] text-[hsl(var(--primary))]">
-              <Icon>□</Icon>
-            </div>
-            <div className="min-w-0">
-              <Badge variant="secondary" className="mb-3 w-fit">
-                setup workflow
-              </Badge>
-              <h2 className="text-2xl font-semibold tracking-tight md:text-3xl">
-                Finish the local trust setup
-              </h2>
-              <p className="mt-2 max-w-3xl text-sm leading-6 text-[hsl(var(--muted-foreground))] md:text-base">
-                Verify the current local profile before using chat and voice.
-              </p>
-            </div>
-          </div>
-          <div className="min-w-64 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4">
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-sm font-medium">Progress</span>
-              <Badge
-                variant={completedSteps === setupTotal ? "success" : "warning"}
-              >
-                {completedSteps}/{setupTotal}
-              </Badge>
-            </div>
-            <div className="mt-3 h-2 rounded-full bg-[hsl(var(--muted))]">
-              <div
-                className="h-full rounded-full bg-[hsl(var(--primary))] transition-[width]"
-                style={{ width: `${progress}%` }}
-              />
-            </div>
-            <p className="mt-3 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              Next: {nextStep?.label ?? "Ready"}
+        <CardContent className="grid gap-5 p-6 md:grid-cols-[1fr_auto] md:items-center">
+          <div className="min-w-0">
+            <Badge variant="secondary" className="mb-3 w-fit">
+              Local profile
+            </Badge>
+            <h2 className="text-2xl font-semibold tracking-tight md:text-3xl">
+              Ready to start using Discrypt
+            </h2>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-[hsl(var(--muted-foreground))] md:text-base">
+              Create a group or use an invite from the + button in the server rail.
+              This screen stays minimal until you add a conversation.
             </p>
+          </div>
+          <div className="grid gap-2 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4 text-sm">
+            <span className="font-medium">Local identity</span>
+            <span className="text-[hsl(var(--muted-foreground))]">
+              {snapshot.friend.alias}
+            </span>
           </div>
         </CardContent>
       </Card>
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)]">
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-2xl">Verify safety numbers</CardTitle>
-            <CardDescription>
-              Compare this number with {snapshot.friend.alias} in person or over
-              a trusted call.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
-            <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.42)] p-4">
-              <div className="flex items-center gap-3">
-                <Avatar className="h-12 w-12">
-                  <AvatarFallback>
-                    {snapshot.friend.alias.slice(0, 2).toUpperCase()}
-                  </AvatarFallback>
-                </Avatar>
-                <div>
-                  <p className="text-lg font-semibold">
-                    {snapshot.friend.alias}
-                  </p>
-                  <p
-                    className={cn(
-                      "text-sm",
-                      snapshot.friend.verified
-                        ? "text-emerald-200"
-                        : "text-amber-200",
-                    )}
-                  >
-                    {snapshot.friend.verified ? "Verified" : "Unverified"}
-                  </p>
-                </div>
-              </div>
-              <div className="mt-4 rounded-xl border border-[hsl(var(--border))] bg-black/20 p-4">
-                <p className="break-words font-mono text-lg font-semibold tracking-[0.12em]">
-                  {snapshot.friend.safety_number}
-                </p>
-                <Button className="mt-4 w-full" onClick={onVerify}>
-                  {snapshot.friend.verified ? <Icon>✓</Icon> : <Icon>□</Icon>}{" "}
-                  Mark as verified
-                </Button>
-              </div>
-              {verifyMessage ? (
-                <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                  {verifyMessage}
-                </p>
-              ) : null}
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1 2xl:grid-cols-2">
-              <InfoRow
-                title="Device review"
-                copy={`${snapshot.devices.length} authorized local device${snapshot.devices.length === 1 ? "" : "s"} available.`}
-              />
-              <InfoRow
-                title="Invite admission"
-                copy={snapshot.invite.welcome_required}
-              />
-              <InfoRow
-                title="Residual presence risk"
-                copy={snapshot.security_copy.malicious_member}
-              />
-              <InfoRow
-                title="Sybil-resistance posture"
-                copy={snapshot.security_copy.sybil_resistance}
-              />
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Setup checklist</CardTitle>
-            <CardDescription>
-              {completedSteps}/{setupTotal} checks complete for this local
-              profile.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-3">
-            {setupSteps.map((step, index) => (
-              <div
-                key={step.label}
-                className={cn(
-                  "grid gap-1 rounded-2xl border p-4",
-                  step.complete
-                    ? "border-emerald-300/25 bg-emerald-300/7"
-                    : "border-[hsl(var(--primary)/0.45)] bg-[hsl(var(--primary)/0.08)]",
-                )}
-              >
-                <div className="flex items-center gap-3">
-                  <div
-                    className={cn(
-                      "grid h-9 w-9 shrink-0 place-items-center rounded-xl border text-sm font-semibold",
-                      step.complete
-                        ? "border-emerald-300/40 bg-emerald-300/10 text-emerald-200"
-                        : "border-[hsl(var(--primary)/0.6)] bg-[hsl(var(--primary)/0.12)] text-[hsl(var(--primary))]",
-                    )}
-                  >
-                    {step.complete ? <Icon>✓</Icon> : index + 1}
-                  </div>
-                  <div className="min-w-0">
-                    <p className="font-medium">{step.label}</p>
-                    <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                      {step.detail}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Verify trusted contacts when you add them</CardTitle>
+          <CardDescription>
+            Safety numbers appear here only when there is a contact to verify.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-[1fr_auto] md:items-center">
+          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.42)] p-4">
+            <p className="text-sm text-[hsl(var(--muted-foreground))]">
+              Current safety number
+            </p>
+            <p className="mt-2 break-words font-mono text-lg font-semibold tracking-[0.12em]">
+              {snapshot.friend.safety_number}
+            </p>
+            {verifyMessage ? (
+              <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                {verifyMessage}
+              </p>
+            ) : null}
+          </div>
+          <Button onClick={onVerify} variant="secondary">
+            {snapshot.friend.verified ? <Icon>✓</Icon> : <Icon>□</Icon>} Mark verified
+          </Button>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -3576,7 +4885,7 @@ function DmPanel({
     : [];
   if (!activeDm) {
     return (
-      <Card className="flex min-h-[70dvh] flex-col">
+      <Card className="flex h-full min-h-0 flex-col">
         <CardHeader className="border-b border-[hsl(var(--border))]">
           <CardTitle>Direct messages</CardTitle>
           <CardDescription>
@@ -3626,43 +4935,107 @@ function DmPanel({
   );
 }
 
-function JoinPanel({
-  snapshot,
+function GroupContextMenu({
+  menu,
+  groups,
+  onClose,
+  onCreateInvite,
+  onOpenConfig,
+}: {
+  menu: { groupId: string; x: number; y: number } | null;
+  groups: GroupView[];
+  onClose: () => void;
+  onCreateInvite: (groupId: string) => void;
+  onOpenConfig: (groupId: string) => void;
+}) {
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => onClose();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menu, onClose]);
+
+  if (!menu) return null;
+  const group = groups.find((candidate) => candidate.group_id === menu.groupId);
+  return (
+    <div
+      role="menu"
+      aria-label={`${group?.name ?? "Group"} actions`}
+      className="fixed z-[60] min-w-56 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--popover)/0.98)] p-1 text-sm text-[hsl(var(--popover-foreground))] shadow-2xl shadow-black/40 animate-[discrypt-scale-in_120ms_ease-out]"
+      style={{ left: menu.x, top: menu.y }}
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <Button
+        type="button"
+        variant="ghost"
+        role="menuitem"
+        className="flex h-auto w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]"
+        onClick={() => onCreateInvite(menu.groupId)}
+      >
+        <Icon>🔗</Icon>
+        Create invite
+      </Button>
+      <Button
+        type="button"
+        variant="ghost"
+        role="menuitem"
+        className="flex h-auto w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]"
+        onClick={() => onOpenConfig(menu.groupId)}
+      >
+        <Icon>⚙</Icon>
+        Group configuration
+      </Button>
+    </div>
+  );
+}
+
+function LauncherPanel({
   inviteValue,
   setInviteValue,
   groupName,
   setGroupName,
+  contactName,
+  setContactName,
   latestInvite,
   joinProgress,
   onJoin,
   onAcceptDmInvite,
-  onCreateInvite,
+  onStartDm,
   onCreateDmInvite,
-  canCreateInvite,
   canCreateDmInvite,
+  onCreateGroup,
 }: {
-  snapshot: AppSnapshot;
   inviteValue: string;
   setInviteValue: (value: string) => void;
   groupName: string;
   setGroupName: (value: string) => void;
+  contactName: string;
+  setContactName: (value: string) => void;
   latestInvite: InviteView | null;
   joinProgress: JoinProgressStepView[];
   onJoin: () => void;
   onAcceptDmInvite: () => void;
-  onCreateInvite: () => void;
+  onStartDm: () => void;
   onCreateDmInvite: () => void;
-  canCreateInvite: boolean;
   canCreateDmInvite: boolean;
+  onCreateGroup: () => void;
 }) {
   return (
-    <div className="grid gap-4 py-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+    <div className="grid gap-4 py-5">
       <Card>
         <CardHeader>
-          <CardTitle>Invites and joining</CardTitle>
+          <CardTitle>Join a group or direct message</CardTitle>
           <CardDescription>
-            Create invites for active groups or DM contacts, then paste signed
-            invite descriptors to open the correct group or contact flow.
+            Paste the invite URL or code you received, name it locally, then
+            open the group or DM.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
@@ -3675,10 +5048,10 @@ function JoinPanel({
             />
           </Label>
           <Label className="grid gap-2">
-            Joined group/contact label
+            Local label
             <Input
               value={groupName}
-              placeholder="Group name"
+              placeholder="Group or contact name"
               onChange={(event) => setGroupName(event.target.value)}
             />
           </Label>
@@ -3693,46 +5066,255 @@ function JoinPanel({
             >
               Accept/open DM invite
             </Button>
-            <Button
-              variant="outline"
-              onClick={onCreateInvite}
-              disabled={!canCreateInvite}
-            >
-              Create invite for active group
-            </Button>
-            <Button
-              variant="outline"
-              onClick={onCreateDmInvite}
-              disabled={!canCreateDmInvite}
-            >
-              Create DM invite for active DM
-            </Button>
-            {latestInvite ? (
-              <Button
-                variant="ghost"
-                onClick={() => setInviteValue(latestInvite.code)}
-              >
-                Use latest invite
-              </Button>
-            ) : null}
           </div>
           <JoinProgressCard steps={joinProgress} />
-          {latestInvite ? (
-            <InviteDetailCard invite={latestInvite} snapshot={snapshot} />
-          ) : null}
         </CardContent>
       </Card>
       <Card>
         <CardHeader>
-          <CardTitle>Admission rules</CardTitle>
+          <CardTitle>Start a direct message</CardTitle>
+          <CardDescription>
+            Open a private conversation with one person.
+          </CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3">
-          <InfoRow title="Expiry" copy={snapshot.invite.expires} />
-          <InfoRow title="Max use" copy={snapshot.invite.max_use} />
-          <InfoRow
-            title="MLS admission"
-            copy={snapshot.invite.welcome_required}
-          />
+        <CardContent className="grid gap-4">
+          <Label className="grid gap-2">
+            Contact name
+            <Input
+              value={contactName}
+              placeholder="Contact name"
+              onChange={(event) => setContactName(event.target.value)}
+            />
+          </Label>
+          <Button
+            variant="outline"
+            onClick={onStartDm}
+            disabled={!contactName.trim()}
+          >
+            <Icon>+</Icon>Start direct message
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={onCreateDmInvite}
+            disabled={!canCreateDmInvite}
+          >
+            Create DM invite for current direct message
+          </Button>
+          {latestInvite ? (
+            <InviteDetailCard invite={latestInvite} />
+          ) : null}
+        </CardContent>
+      </Card>
+      <Card className="border-[hsl(var(--primary)/0.28)] bg-[hsl(var(--primary)/0.08)]">
+        <CardHeader>
+          <CardTitle>Create a new group</CardTitle>
+          <CardDescription>
+            Start a private workspace with its own channels, signaling policy,
+            invites, and voice rooms.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button className="w-full justify-center" onClick={onCreateGroup}>
+            <Icon>+</Icon>Create a new group
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function GroupInvitePanel({
+  group,
+  latestInvite,
+  expiryDays,
+  setExpiryDays,
+  maxUses,
+  setMaxUses,
+  passwordEnabled,
+  setPasswordEnabled,
+  password,
+  setPassword,
+  onCreateInvite,
+}: {
+  group: GroupView | null;
+  latestInvite: InviteView | null;
+  expiryDays: string;
+  setExpiryDays: (value: string) => void;
+  maxUses: string;
+  setMaxUses: (value: string) => void;
+  passwordEnabled: boolean;
+  setPasswordEnabled: (value: boolean) => void;
+  password: string;
+  setPassword: (value: string) => void;
+  onCreateInvite: () => void;
+}) {
+  const selectedProfile = group?.connectivity?.signaling_profiles[0] ?? null;
+  const passwordReady = !passwordEnabled || password.trim().length >= 8;
+  return (
+    <div className="grid gap-4 py-5">
+      <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold">{group?.name ?? "No group selected"}</p>
+            <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
+              {selectedProfile
+                ? `${selectedProfile.adapter_kind} · ${selectedProfile.endpoints[0] ?? "endpoint missing"}`
+                : "Select a group with a configured signaling profile."}
+            </p>
+          </div>
+          <Badge variant={selectedProfile ? "success" : "warning"}>
+            {selectedProfile ? "signaling configured" : "not ready"}
+          </Badge>
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Create invite</CardTitle>
+          <CardDescription>
+            Configure expiry, max uses, and admission options before generating the share link.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-4 md:grid-cols-2">
+            <Label className="grid gap-2">
+              Expires after
+              <Select value={expiryDays} onValueChange={setExpiryDays} aria-label="Invite expiry">
+                <SelectItem value="1">1 day</SelectItem>
+                <SelectItem value="7">7 days</SelectItem>
+                <SelectItem value="30">30 days</SelectItem>
+                <SelectItem value="90">90 days</SelectItem>
+              </Select>
+            </Label>
+            <Label className="grid gap-2">
+              Maximum uses
+              <Input
+                inputMode="numeric"
+                min={1}
+                max={100}
+                value={maxUses}
+                onChange={(event) => setMaxUses(event.target.value.replace(/[^0-9]/g, ""))}
+                placeholder="5"
+              />
+            </Label>
+          </div>
+
+          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.18)] p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium">Password admission</p>
+                <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                  Optional admission password. The raw password is never embedded in the pasted invite.
+                </p>
+              </div>
+              <Switch checked={passwordEnabled} onCheckedChange={setPasswordEnabled} />
+            </div>
+            {passwordEnabled ? (
+              <Label className="mt-4 grid gap-2">
+                Invite password
+                <Input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="At least 8 characters"
+                />
+              </Label>
+            ) : null}
+          </div>
+
+          <Button onClick={onCreateInvite} disabled={!group || !passwordReady || !maxUses.trim()}>
+            Create invite for {group?.name ?? "selected group"}
+          </Button>
+          {latestInvite ? (
+            <InviteDetailCard invite={latestInvite} />
+          ) : (
+            <div className="rounded-2xl border border-dashed border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-5 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+              No invite generated in this modal yet.
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function GroupConfigPanel({
+  group,
+  signalingAdapter,
+  setSignalingAdapter,
+  signalingEndpoint,
+  setSignalingEndpoint,
+  iceStunServers,
+  setIceStunServers,
+  iceTurnServers,
+  setIceTurnServers,
+  onSave,
+}: {
+  group: GroupView | null;
+  signalingAdapter: SignalingAdapterKind;
+  setSignalingAdapter: (value: string) => void;
+  signalingEndpoint: string;
+  setSignalingEndpoint: (value: string) => void;
+  iceStunServers: string;
+  setIceStunServers: (value: string) => void;
+  iceTurnServers: string;
+  setIceTurnServers: (value: string) => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="grid gap-4 py-5">
+      <Card>
+        <CardHeader>
+          <CardTitle>{group?.name ?? "Group"} connectivity</CardTitle>
+          <CardDescription>
+            Group-level defaults are used for text, voice, and invites until a
+            narrower channel policy overrides them.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <Label className="grid gap-2">
+            Signaling adapter
+            <Select
+              value={signalingAdapter}
+              onValueChange={setSignalingAdapter}
+            >
+              <SelectItem value="nostr">Nostr relay</SelectItem>
+              <SelectItem value="mqtt">MQTT broker</SelectItem>
+              <SelectItem value="ipfs_pubsub">IPFS/libp2p pubsub</SelectItem>
+              <SelectItem value="discrypt_quic_rendezvous">
+                Discrypt QUIC rendezvous
+              </SelectItem>
+            </Select>
+          </Label>
+          <Label className="grid gap-2">
+            Signaling endpoint
+            <Input
+              value={signalingEndpoint}
+              placeholder="wss://relay.example or mqtt://broker.example"
+              onChange={(event) => setSignalingEndpoint(event.target.value)}
+            />
+          </Label>
+          <div className="grid gap-4 md:grid-cols-2">
+            <Label className="grid gap-2">
+              STUN servers
+              <Input
+                value={iceStunServers}
+                placeholder="stun:stun.l.google.com:19302"
+                onChange={(event) => setIceStunServers(event.target.value)}
+              />
+            </Label>
+            <Label className="grid gap-2">
+              TURN servers
+              <Input
+                value={iceTurnServers}
+                placeholder="turn:host?user=name&credential=secret"
+                onChange={(event) => setIceTurnServers(event.target.value)}
+              />
+            </Label>
+          </div>
+          <Button onClick={onSave} disabled={!group}>
+            Save group configuration
+          </Button>
         </CardContent>
       </Card>
     </div>
@@ -3747,7 +5329,7 @@ function JoinProgressCard({ steps }: { steps: JoinProgressStepView[] }) {
           key: "invite_parsed",
           label: "Invite parsed",
           status: "waiting-for-invite",
-          detail: "Paste or create an invite before join progress can start",
+          detail: "Paste an invite before receiver-side join progress can start",
         },
         {
           key: "rendezvous",
@@ -3758,12 +5340,12 @@ function JoinProgressCard({ steps }: { steps: JoinProgressStepView[] }) {
         },
       ];
   return (
-    <Card className="border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.26)]">
+    <Card className="border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] shadow-none">
       <CardHeader className="pb-3">
         <CardTitle className="text-base">Group join progress</CardTitle>
         <CardDescription>
-          Invite parsing, rendezvous, authorization, Welcome, MLS, and route
-          stages update automatically and remain evidence-gated by command state.
+          Receiver-side invite parsing, authorization, Welcome, MLS, and route
+          stages are evidence-gated by command state.
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
@@ -3810,108 +5392,86 @@ function joinProgressBadgeVariant(
   return "secondary";
 }
 
-function InviteDetailCard({
-  invite,
-  snapshot,
-}: {
-  invite: InviteView;
-  snapshot: AppSnapshot;
-}) {
+function InviteDetailCard({ invite }: { invite: InviteView }) {
+  const [copied, setCopied] = useState(false);
   const maxUsesNumber = Number(invite.max_use.match(/\d+/)?.[0] ?? 0);
   const remainingUses = maxUsesNumber
     ? Math.max(0, maxUsesNumber - invite.uses)
     : null;
-  const revocationStatus = invite.revoked
-    ? "revoked locally"
-    : "usable while expiry and max-use checks pass";
-  const passwordGateStatus = snapshot.invite.password_gate;
-  const mlsAdmissionState =
-    invite.admission_copy || snapshot.invite.welcome_required;
+  const selectedProfile = invite.signaling_profiles[0] ?? null;
+  const copyInvite = async () => {
+    await navigator.clipboard?.writeText(invite.code);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
   return (
     <Card className="border-emerald-300/25 bg-emerald-300/8 text-emerald-50">
       <CardHeader className="gap-3 pb-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <CardTitle className="text-base text-emerald-50">
-              Latest invite descriptor
+              Invite ready
             </CardTitle>
             <CardDescription className="text-emerald-50/75">
-              Signaling, limits, revocation, and admission details are ready to share.
+              Share this link with the person joining this group.
             </CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
             <Badge variant={invite.revoked ? "warning" : "success"}>
-              {invite.revoked ? "revoked" : "not revoked"}
+              {invite.revoked ? "revoked" : "usable"}
             </Badge>
             <Badge variant="secondary">uses {invite.uses}</Badge>
           </div>
         </div>
-        <p className="break-all rounded-xl border border-emerald-300/20 bg-black/20 p-3 font-mono text-xs text-emerald-50/90">
-          {invite.code}
-        </p>
+        <div className="grid gap-2 rounded-xl border border-emerald-300/20 bg-black/20 p-3">
+          <textarea
+            readOnly
+            value={invite.code}
+            onFocus={(event) => event.currentTarget.select()}
+            onClick={(event) => event.currentTarget.select()}
+            aria-label="Invite link"
+            className="h-20 resize-none overflow-auto bg-transparent font-mono text-xs leading-5 text-emerald-50/90 outline-none"
+          />
+          <div className="flex items-center justify-between gap-3">
+            <span className="truncate text-xs text-emerald-50/70">
+              Click the field to select the full invite.
+            </span>
+            <Button type="button" size="sm" variant="secondary" onClick={copyInvite}>
+              {copied ? "Copied" : "Copy invite"}
+            </Button>
+          </div>
+        </div>
       </CardHeader>
       <CardContent className="grid gap-3">
         <div className="grid gap-3 md:grid-cols-2">
           <InviteFact
+            label="Adapter"
+            value={selectedProfile?.adapter_kind ?? invite.invite_kind}
+          />
+          <InviteFact
             label="Signaling endpoint"
-            value={invite.signaling_endpoint || "not provided"}
+            value={invite.signaling_endpoint || selectedProfile?.endpoints[0] || "not provided"}
           />
           <InviteFact
             label="Endpoint policy"
             value={invite.endpoint_policy || "unknown"}
           />
-          <InviteFact label="Expiry label" value={invite.expires} />
           <InviteFact
-            label="Expires at"
-            value={invite.expires_at || "not provided"}
+            label="Expires"
+            value={invite.expires_at || invite.expires || "not provided"}
           />
-          <InviteFact label="Max-use limit" value={invite.max_use} />
+          <InviteFact label="Max uses" value={invite.max_use} />
           <InviteFact
             label="Remaining local uses"
-            value={
-              remainingUses === null ? "not parsed" : String(remainingUses)
-            }
-          />
-          <InviteFact label="Revocation status" value={revocationStatus} />
-          <InviteFact label="Password-gate status" value={passwordGateStatus} />
-        </div>
-        <div className="grid gap-3 lg:grid-cols-2">
-          <InviteFact label="MLS admission state" value={mlsAdmissionState} />
-          <InviteFact
-            label="Signaling trust"
-            value={invite.signaling_trust_status || "not provided"}
+            value={remainingUses === null ? "not parsed" : String(remainingUses)}
           />
           <InviteFact
-            label="Trust fingerprint"
-            value={invite.signaling_trust_fingerprint || "not provided"}
-            mono
+            label="Admission"
+            value={invite.admission_copy || "Authorized MLS welcome required"}
           />
           <InviteFact
-            label="Room secret commitment"
-            value={invite.room_secret_hash || "not provided"}
-            mono
-          />
-        </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          <InviteFact
-            label="ICE/STUN metadata"
-            value={
-              invite.ice_stun_servers.length
-                ? invite.ice_stun_servers.join(", ")
-                : "not provided"
-            }
-          />
-          <InviteFact
-            label="TURN metadata"
-            value={
-              invite.ice_turn_servers.length
-                ? `${invite.ice_turn_servers.length} redacted TURN endpoint${
-                    invite.ice_turn_servers.length === 1 ? "" : "s"
-                  }: ${invite.ice_turn_servers
-                    .map((server) => server.endpoint)
-                    .join(", ")}`
-                : "not provided"
-            }
+            label="STUN/TURN"
+            value={`${invite.ice_stun_servers.length} STUN · ${invite.ice_turn_servers.length} TURN`}
           />
         </div>
       </CardContent>
@@ -4243,12 +5803,12 @@ function ChannelPanel({
     : [];
   if (!activeChannel) {
     return (
-      <Card className="flex min-h-[70dvh] flex-col">
+      <Card className="flex h-full min-h-0 flex-col">
         <CardHeader className="border-b border-[hsl(var(--border))]">
           <CardTitle>{group ? "No text channel selected" : "Choose a group"}</CardTitle>
           <CardDescription>
             {group
-              ? "Create a text channel or pick one from the sidebar to start messaging."
+              ? "Use the + next to Text channels in the sidebar, or pick an existing channel."
               : "Create or join a group to start a private workspace."}
           </CardDescription>
         </CardHeader>
@@ -4257,21 +5817,16 @@ function ChannelPanel({
             title={group ? "Create a channel" : "No active group"}
             copy={
               group
-                ? "Channel creation opens as a focused flow and keeps the main chat uncluttered."
-                : "Use the sidebar actions to create or join a group."
+                ? "The main chat stays reserved for conversation; channel setup lives in the sidebar."
+                : "Use the server rail + button to create or join a group."
             }
           />
-          {group ? (
-            <Button className="mt-4" onClick={onOpenCreateChannel}>
-              <Icon>+</Icon>Create channel
-            </Button>
-          ) : null}
         </CardContent>
       </Card>
     );
   }
   return (
-    <div className="min-h-[72dvh]">
+    <div className="h-full min-h-0">
       <Timeline
         title={
           activeChannel.name.startsWith("#")
@@ -4290,71 +5845,6 @@ function ChannelPanel({
         setTransportProof={setTransportProof}
         diagnosticsEnabled={diagnosticsEnabled}
       />
-    </div>
-  );
-}
-
-function CreateChannelSheet({
-  group,
-  snapshot,
-  draftChannel,
-  setDraftChannel,
-  onCreateTextChannel,
-  onCreateVoiceChannel,
-}: {
-  group: GroupView | null;
-  snapshot: AppSnapshot;
-  draftChannel: string;
-  setDraftChannel: (value: string) => void;
-  onCreateTextChannel: () => void;
-  onCreateVoiceChannel: () => void;
-}) {
-  return (
-    <div className="grid gap-4">
-      <Card>
-        <CardHeader>
-          <CardTitle>Create a channel</CardTitle>
-          <CardDescription>
-            Add a text channel or voice room to{" "}
-            {group?.name ?? "an active group first"}.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <Label className="grid gap-2">
-            Channel name
-            <Input
-              value={draftChannel}
-              placeholder="Channel name"
-              onChange={(event) => setDraftChannel(event.target.value)}
-            />
-          </Label>
-          <div className="grid grid-cols-2 gap-2">
-            <Button
-              onClick={onCreateTextChannel}
-              disabled={!group || !draftChannel.trim()}
-            >
-              <Icon>+</Icon>Text
-            </Button>
-            <Button
-              variant="outline"
-              onClick={onCreateVoiceChannel}
-              disabled={!group || !draftChannel.trim()}
-            >
-              <Icon>+</Icon>Voice
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-      <div className="grid gap-3 md:grid-cols-2">
-        <InfoRow
-          title="Retention posture"
-          copy={snapshot.retention.transition_copy}
-        />
-        <InfoRow
-          title="Presence warning"
-          copy={snapshot.security_copy.malicious_member}
-        />
-      </div>
     </div>
   );
 }
@@ -4387,62 +5877,54 @@ function Timeline({
   diagnosticsEnabled: boolean;
 }) {
   return (
-    <Card className="flex min-h-[72dvh] flex-col overflow-hidden">
-      <CardHeader className="border-b border-[hsl(var(--border))]">
-        <CardTitle className="text-xl">{title}</CardTitle>
-        <CardDescription>{description}</CardDescription>
+    <Card className="flex h-full min-h-0 flex-col overflow-hidden border-[hsl(var(--border)/0.74)] bg-[hsl(var(--card)/0.54)] shadow-none">
+      <CardHeader className="border-b border-[hsl(var(--border))] px-4 py-3">
+        <CardTitle className="text-lg">{title}</CardTitle>
+        <CardDescription className="line-clamp-1">{description}</CardDescription>
       </CardHeader>
       {diagnosticsEnabled ? <TextStateLegend states={textStateLegend} /> : null}
-      <ScrollArea className="min-h-0 flex-1 p-4">
-        <div className="grid gap-3">
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="py-3">
           {messages.length === 0 ? (
-            <EmptyState
-              title="No messages yet"
-              copy="Send the first local message. It will persist through reloads."
-            />
+            <div className="px-4">
+              <EmptyState title="No messages yet" copy="Send the first local message. It will persist through reloads." />
+            </div>
           ) : (
             messages.map((message) => (
-              <MessageBubble
-                key={message.message_id}
-                message={message}
-                diagnosticsEnabled={diagnosticsEnabled}
-              />
+              <MessageRow key={message.message_id} message={message} diagnosticsEnabled={diagnosticsEnabled} />
             ))
           )}
         </div>
       </ScrollArea>
-      <div className="border-t border-[hsl(var(--border))] p-4">
-        <Label className="grid gap-2">
-          <span className="sr-only">Message</span>
+      <div className="border-t border-[hsl(var(--border))] p-3">
+        <div className="flex items-center gap-2 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] px-3 py-2">
+          <Icon>+</Icon>
           <Input
             aria-label="Message"
             value={draftMessage}
             onChange={(event) => setDraftMessage(event.target.value)}
-            placeholder="Write a message"
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && draftMessage.trim()) {
+                event.preventDefault();
+                onSend();
+              }
+            }}
+            placeholder="Send a message"
             disabled={disabled}
+            className="border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
           />
-        </Label>
-        <div className="mt-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div className="space-y-2">
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              Messages are command-backed, saved locally, and delivery state
-              updates automatically.
-            </p>
-            {diagnosticsEnabled ? (
-              <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
-                <Switch
-                  checked={transportProof}
-                  onCheckedChange={setTransportProof}
-                  disabled={disabled}
-                />
-                Verify provider-signaled WebRTC transport for this send
-              </Label>
-            ) : null}
-          </div>
-          <Button onClick={onSend} disabled={disabled || !draftMessage.trim()}>
-            {sendLabel}
+          <Button type="button" size="icon" aria-label={sendLabel} title={sendLabel} onClick={onSend} disabled={disabled || !draftMessage.trim()} className="h-9 w-9 rounded-xl">
+            <Icon>➤</Icon>
           </Button>
         </div>
+        {diagnosticsEnabled ? (
+          <div className="mt-2 flex justify-end">
+            <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+              <Switch checked={transportProof} onCheckedChange={setTransportProof} disabled={disabled} />
+              Verify backend-state provider-signaled WebRTC transport for this send
+            </Label>
+          </div>
+        ) : null}
       </div>
     </Card>
   );
@@ -4496,400 +5978,43 @@ function messageStateBadgeVariant(
   return "outline";
 }
 
-function MessageBubble({
+function messageStateIcon(stateKey: string): string {
+  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey)) return "!";
+  if (["pending", "locked", "peer_receipt", "transport_probe_unavailable"].includes(stateKey)) return "…";
+  return "✓";
+}
+
+function MessageRow({
   message,
   diagnosticsEnabled,
 }: {
   message: AppMessageView;
   diagnosticsEnabled: boolean;
 }) {
+  const statusTitle = `${message.state_label}: ${message.state_detail || message.status}`;
   return (
-    <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.34)] p-3">
-      <div className="flex items-center justify-between gap-3 text-xs text-[hsl(var(--muted-foreground))]">
-        <span>{message.author}</span>
-        <span>{message.sent_at}</span>
+    <article className="group grid grid-cols-[2.25rem_minmax(0,1fr)_auto] gap-3 px-4 py-2.5 hover:bg-[hsl(var(--secondary)/0.32)]">
+      <Avatar className="mt-0.5 h-9 w-9">
+        <AvatarFallback>{message.author.slice(0, 2).toUpperCase()}</AvatarFallback>
+      </Avatar>
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-baseline gap-2">
+          <span className="font-medium text-[hsl(var(--foreground))]">{message.author}</span>
+          <time className="text-[11px] text-[hsl(var(--muted-foreground))]">{message.sent_at}</time>
+        </div>
+        <p className="whitespace-pre-wrap break-words text-sm leading-6 text-[hsl(var(--foreground)/0.92)]">{message.body}</p>
+        {diagnosticsEnabled ? (
+          <p className="mt-1 text-[11px] leading-5 text-[hsl(var(--muted-foreground))]">{message.state_detail}</p>
+        ) : null}
       </div>
-      <p className="mt-1 text-sm leading-6">{message.body}</p>
-      <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-[hsl(var(--muted-foreground))]">
-        <Badge variant={messageStateBadgeVariant(message.state_key)}>
-          {message.state_label}
-        </Badge>
-        <span>{message.status}</span>
-      </div>
-      {diagnosticsEnabled ? (
-        <p className="mt-1 text-[11px] leading-5 text-[hsl(var(--muted-foreground))]">
-          {message.state_detail}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-function VoicePanel({
-  group,
-  activeVoiceChannel,
-  route,
-  participants,
-  localUserId,
-  voiceSession,
-  remoteAudio,
-  remoteStreams,
-  voiceStates,
-  voiceJoined,
-  selfMuted,
-  connectivity,
-  transportDiagnostics,
-  diagnosticsEnabled,
-  inputDevices,
-  selectedInputDeviceId,
-  voiceDeviceStatus,
-  onSelectInputDevice,
-  onRefreshInputDevices,
-  setVoiceJoined,
-  setSelfMuted,
-  setVolume,
-}: {
-  group: GroupView | null;
-  activeVoiceChannel: ChannelStateView | null;
-  route: string;
-  participants: VoiceParticipant[];
-  localUserId: string | null;
-  voiceSession: VoiceSessionView | null;
-  remoteAudio: VoiceRemoteAudioView[];
-  remoteStreams: Record<string, MediaStream>;
-  voiceStates: VoiceStateView[];
-  voiceJoined: boolean;
-  selfMuted: boolean;
-  connectivity: ConnectivityPolicyView | null;
-  transportDiagnostics: TransportDiagnosticsView | null;
-  diagnosticsEnabled: boolean;
-  inputDevices: VoiceDeviceOption[];
-  selectedInputDeviceId: string;
-  voiceDeviceStatus: string | null;
-  onSelectInputDevice: (deviceId: string) => void;
-  onRefreshInputDevices: () => void;
-  setVoiceJoined: (joined: boolean) => void;
-  setSelfMuted: (muted: boolean) => void;
-  setVolume: (id: string, value: number[]) => void;
-}) {
-  const mediaRuntime = voiceSession?.media_runtime ?? inactiveVoiceMediaRuntime;
-  const remoteTransportActive = Boolean(mediaRuntime.remote_transport_active);
-  const hasRemoteStream = (participant: VoiceParticipant) =>
-    Boolean(remoteStreams[participant.id]);
-  const suppressedRemoteCount = voiceJoined
-    ? participants.filter(
-        (participant) =>
-          !isLocalVoiceParticipant(participant, localUserId) &&
-          !remoteTransportActive &&
-          !hasRemoteStream(participant),
-      ).length
-    : 0;
-  const visibleParticipants = voiceJoined
-    ? participants.filter(
-        (participant) =>
-          isLocalVoiceParticipant(participant, localUserId) ||
-          remoteTransportActive ||
-          hasRemoteStream(participant),
-      )
-    : [];
-  const permissionDenied = Boolean(voiceSession?.permission_denied_copy);
-  const deviceCopy = voiceSession?.input_device
-    ? `${voiceSession.input_device.label} → ${
-        voiceSession.output_device?.label ?? "System default speaker"
-      }`
-    : "Microphone and speaker will be selected before joining.";
-  const focusedRoomLabel = activeVoiceChannel?.name ?? "Voice Lobby";
-  const localParticipant = participants.find((participant) =>
-    isLocalVoiceParticipant(participant, localUserId),
-  );
-  const localVoiceStatus = !voiceJoined
-    ? "Ready to join"
-    : selfMuted
-      ? "Muted"
-      : localParticipant?.speaking
-        ? "Speaking"
-        : "Listening";
-  return (
-    <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <CardTitle>{activeVoiceChannel?.name ?? "Voice Lobby"}</CardTitle>
-              <CardDescription>
-                {group ? "Voice stays available while text remains open." : "Create or join a group before voice."}
-              </CardDescription>
-            </div>
-            <Badge variant={voiceJoined ? "success" : "secondary"}>
-              {voiceJoined ? "joined" : "not joined"}
-            </Badge>
-          </div>
-        </CardHeader>
-        <CardContent className="grid gap-3">
-          {diagnosticsEnabled ? <VoiceStateGrid states={voiceStates} /> : null}
-          {!voiceJoined ? (
-            <EmptyState
-              title={permissionDenied ? "Microphone blocked" : "Not in voice"}
-              copy={
-                permissionDenied
-                  ? (voiceSession?.permission_denied_copy ??
-                    "Grant microphone permission before joining voice.")
-                  : "Join to request microphone permission, select devices, and start the room."
-              }
-            />
-          ) : null}
-          {voiceJoined && visibleParticipants.length === 0 ? (
-            <EmptyState
-              title="No local participants"
-              copy="No participants are active in this room yet."
-            />
-          ) : null}
-          {suppressedRemoteCount > 0 ? (
-            <EmptyState
-              title="Remote audio unavailable"
-              copy={`${suppressedRemoteCount} remote participant${
-                suppressedRemoteCount === 1 ? "" : "s"
-              } waiting for a confirmed audio route.`}
-            />
-          ) : null}
-          {visibleParticipants.map((participant) => {
-            const isLocalParticipant = isLocalVoiceParticipant(
-              participant,
-              localUserId,
-            );
-            const audioSource = isLocalParticipant
-              ? null
-              : remoteAudioSource(participant, mediaRuntime);
-            const remoteStream = isLocalParticipant
-              ? null
-              : remoteStreams[participant.id];
-            return (
-              <div
-                key={participant.id}
-                data-testid={
-                  isLocalParticipant
-                    ? "voice-local-participant"
-                    : "voice-remote-participant"
-                }
-                className="grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4 md:grid-cols-[1fr_180px] md:items-center"
-              >
-                <div className="flex items-center gap-3">
-                  <div
-                    className={cn(
-                      "rounded-2xl p-0.5",
-                      participant.speaking &&
-                        !participant.muted &&
-                        "bg-emerald-300/70",
-                    )}
-                  >
-                    <Avatar>
-                      <AvatarFallback>
-                        {participant.name.slice(0, 2).toUpperCase()}
-                      </AvatarFallback>
-                    </Avatar>
-                  </div>
-                  <div>
-                    <p className="font-medium">
-                      {participant.name}{" "}
-                      <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                        · {participant.role}
-                      </span>
-                    </p>
-                    <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                      {participant.muted
-                        ? "muted"
-                        : participant.speaking
-                          ? "speaking now"
-                          : "listening"}
-                    </p>
-                  </div>
-                </div>
-                {isLocalParticipant ? (
-                  <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                    Local microphone level follows the active input device.
-                  </p>
-                ) : (
-                  <div className="grid gap-2">
-                    {audioSource ? (
-                      <RemoteAudioAttachment
-                        participant={participant}
-                        src={audioSource}
-                        stream={remoteStream}
-                      />
-                    ) : remoteStream ? (
-                      <RemoteAudioAttachment
-                        participant={participant}
-                        stream={remoteStream}
-                      />
-                    ) : (
-                      <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                        Connecting audio…
-                      </p>
-                    )}
-                    <div className="flex items-center gap-3">
-                      <Icon>vol</Icon>
-                      <Slider
-                        aria-label={`${participant.name} speaker volume`}
-                        data-testid="voice-remote-volume"
-                        title={`${participant.volume}%`}
-                        value={[participant.volume]}
-                        min={0}
-                        max={100}
-                        step={1}
-                        onValueChange={(value) =>
-                          setVolume(participant.id, value)
-                        }
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-          {diagnosticsEnabled && voiceJoined && remoteAudio.length > 0 ? (
-            <div className="grid gap-2 rounded-2xl border border-emerald-300/30 bg-emerald-300/10 p-4">
-              <p className="text-sm font-medium">Remote playback attachments</p>
-              {remoteAudio.map((track) => (
-                <div
-                  key={`${track.participant_id}:${track.audio_track_id}`}
-                  data-testid="voice-remote-audio-boundary"
-                  className="grid gap-2 text-xs text-[hsl(var(--muted-foreground))]"
-                >
-                  <audio
-                    id={track.playback_element_id}
-                    data-testid="voice-remote-audio"
-                    data-participant-id={track.participant_id}
-                    data-stream-id={track.stream_id}
-                    data-audio-track-id={track.audio_track_id}
-                    autoPlay
-                    ref={(element) => {
-                      if (element) {
-                        const playbackStream = voiceSession?.joined
-                          ? remoteStreams[track.participant_id]
-                          : null;
-                        element.srcObject = isUsableMediaStream(playbackStream)
-                          ? playbackStream
-                          : null;
-                      }
-                    }}
-                  />
-                  <span>
-                    Backend evidence: sent {track.local_audio_tracks_sent} local
-                    audio track(s), received {track.received_audio_frames}{" "}
-                    remote audio frame(s).
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </CardContent>
-      </Card>
-      <Card
-        data-testid="voice-dock"
-        className="h-fit border-[hsl(var(--primary)/0.24)] bg-[hsl(var(--card)/0.88)] xl:sticky xl:top-5"
+      <span
+        className="mt-1 grid h-7 w-7 place-items-center rounded-full border border-[hsl(var(--border))] text-xs text-[hsl(var(--muted-foreground))] opacity-70 transition-opacity group-hover:opacity-100"
+        title={statusTitle}
+        aria-label={statusTitle}
       >
-        <CardHeader>
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <CardTitle>Voice dock</CardTitle>
-              <CardDescription>
-                Focused on {focusedRoomLabel}. Choose your microphone, mute
-                yourself, and adjust participant volume.
-              </CardDescription>
-            </div>
-            <Badge variant={voiceJoined ? "success" : "secondary"}>
-              {localVoiceStatus}
-            </Badge>
-          </div>
-        </CardHeader>
-        <CardContent className="grid gap-5">
-          <div className="grid gap-2">
-            <Label htmlFor="voice-input-device">Microphone input</Label>
-            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-              <Select
-                id="voice-input-device"
-                aria-label="Microphone input"
-                data-testid="voice-mic-selector"
-                value={selectedInputDeviceId}
-                disabled={voiceJoined || !group}
-                onValueChange={onSelectInputDevice}
-              >
-                <SelectItem value="default">
-                  System default microphone
-                </SelectItem>
-                {inputDevices.map((device) => (
-                  <SelectItem key={device.device_id} value={device.device_id}>
-                    {device.label}
-                  </SelectItem>
-                ))}
-              </Select>
-              <Button
-                type="button"
-                variant="outline"
-                aria-label="Refresh microphone devices"
-                disabled={voiceJoined || !group}
-                onClick={onRefreshInputDevices}
-              >
-                Refresh
-              </Button>
-            </div>
-            <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              {voiceDeviceStatus ??
-                "Choose a microphone before joining. Refresh may ask for microphone access so device names can be listed."}
-            </p>
-          </div>
-          <ControlRow
-            label="Mute my microphone"
-            checked={selfMuted}
-            onCheckedChange={setSelfMuted}
-            disabled={!voiceJoined}
-          />
-          <Button
-            variant={voiceJoined ? "destructive" : "default"}
-            onClick={() => setVoiceJoined(!voiceJoined)}
-            disabled={!group}
-          >
-            {voiceJoined ? "Leave call" : "Join call"}
-          </Button>
-          <InfoRow title="Selected devices" copy={deviceCopy} />
-          {diagnosticsEnabled ? (
-            <>
-              <InfoRow
-                title="Media route"
-                copy={
-                  remoteTransportActive
-                    ? `${route} · ${mediaRuntime.status_copy}`
-                    : mediaRuntime.fail_closed_reason
-                }
-              />
-              <InfoRow
-                title="TURN relay gate"
-                copy={turnRequiredCopy(transportDiagnostics, connectivity)}
-              />
-              <InfoRow
-                title="Provider fallback state"
-                copy={providerFallbackCopy(transportDiagnostics)}
-              />
-              <InfoRow
-                title="Media runtime"
-                copy={`${mediaRuntime.boundary} · local capture ${
-                  mediaRuntime.local_capture_active ? "active" : "inactive"
-                } · remote transport ${
-                  remoteTransportActive ? "active" : "fail-closed"
-                }`}
-              />
-            </>
-          ) : null}
-          <InfoRow
-            title="Call status"
-            copy={
-              voiceSession?.status_copy ??
-              "Join voice to request microphone permission and select capture/playback devices."
-            }
-          />
-        </CardContent>
-      </Card>
-    </div>
+        {messageStateIcon(message.state_key)}
+      </span>
+    </article>
   );
 }
 
@@ -4897,20 +6022,22 @@ function RemoteAudioAttachment({
   participant,
   src,
   stream,
+  volumePercent,
+  outputDeviceId,
 }: {
   participant: VoiceParticipant;
   src?: string | null;
   stream?: MediaStream | null;
+  volumePercent?: number;
+  outputDeviceId?: string | null;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const volume = volumePercent ?? participant.volume;
   useEffect(() => {
     if (audioRef.current) {
-      audioRef.current.volume = Math.max(
-        0,
-        Math.min(1, participant.volume / 100),
-      );
+      audioRef.current.volume = Math.max(0, Math.min(1, volume / 100));
     }
-  }, [participant.volume]);
+  }, [volume]);
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -4922,6 +6049,16 @@ function RemoteAudioAttachment({
       }
     };
   }, [stream]);
+  useEffect(() => {
+    const audio = audioRef.current as
+      | (HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> })
+      | null;
+    if (!audio?.setSinkId || !outputDeviceId) return;
+    const sinkId = outputDeviceId === "default" ? "" : outputDeviceId;
+    void audio.setSinkId(sinkId).catch((error: unknown) => {
+      console.warn("Unable to update audio output device", error);
+    });
+  }, [outputDeviceId]);
   return (
     <audio
       ref={audioRef}
@@ -4938,16 +6075,12 @@ function DiagnosticsSheet({
   snapshot,
   appState,
   participants,
-  completedSteps,
   themeLabel,
-  templateLabel,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
   participants: VoiceParticipant[];
-  completedSteps: number;
   themeLabel: string;
-  templateLabel: string;
 }) {
   const latestEvents = appState.events.slice(-6).reverse();
   const speaking = participants.filter(
@@ -4960,7 +6093,7 @@ function DiagnosticsSheet({
           <CardHeader>
             <CardTitle>Workspace diagnostics</CardTitle>
             <CardDescription>
-              {completedSteps}/4 setup checks · {themeLabel} · {templateLabel}
+              {themeLabel}
             </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3">
@@ -5024,9 +6157,7 @@ function InspectorRail({
   snapshot,
   appState,
   participants,
-  completedSteps,
   themeLabel,
-  templateLabel,
   resetPhrase,
   setResetPhrase,
   onResetState,
@@ -5040,9 +6171,7 @@ function InspectorRail({
   snapshot: AppSnapshot;
   appState: AppState;
   participants: VoiceParticipant[];
-  completedSteps: number;
   themeLabel: string;
-  templateLabel: string;
   resetPhrase: string;
   setResetPhrase: (value: string) => void;
   onResetState: () => void;
@@ -5076,7 +6205,7 @@ function InspectorRail({
             <CardHeader>
               <CardTitle>Workspace state</CardTitle>
               <CardDescription>
-                {completedSteps}/4 setup checks · {themeLabel} · {templateLabel}
+                {themeLabel}
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3">

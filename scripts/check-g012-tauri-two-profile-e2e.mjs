@@ -22,7 +22,7 @@ for (const token of [
   "discrypt.g012.tauri_two_profile_e2e_harness.v1",
   "target/g012-e2e",
   "DISCRYPT_APP_STATE_PATH",
-  "tauri-runtime,local-dev",
+  "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter",
   "cargo",
   "tauri",
   "dev",

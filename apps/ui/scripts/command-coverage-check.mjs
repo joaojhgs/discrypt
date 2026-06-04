@@ -31,6 +31,18 @@ const expectedCommands = [
     compatibility: true,
   },
   {
+    command: "configure_storage_security",
+    exportName: "configureStorageSecurity",
+    args: ["mode", "passphrase"],
+    returns: "AppState",
+  },
+  {
+    command: "unlock_storage_security",
+    exportName: "unlockStorageSecurity",
+    args: ["passphrase"],
+    returns: "AppState",
+  },
+  {
     command: "create_user",
     exportName: "createUser",
     args: ["display_name", "device_name"],
@@ -127,7 +139,7 @@ const expectedCommands = [
   {
     command: "create_invite",
     exportName: "createInvite",
-    args: ["group_id", "expires", "max_use"],
+    args: ["group_id", "expires", "max_use", "password_gate"],
     returns: "AppState",
   },
   {
@@ -462,7 +474,7 @@ const requestTypes = [
   ["SetActiveGroupRequest", ["group_id"]],
   ["SetActiveChannelRequest", ["group_id", "channel_id"]],
   ["SetActiveDmRequest", ["dm_id"]],
-  ["CreateInviteRequest", ["group_id", "expires", "max_use"]],
+  ["CreateInviteRequest", ["group_id", "expires", "max_use", "password_gate"]],
   ["CreateDmInviteRequest", ["dm_id", "expires", "max_use"]],
   ["AcceptDmInviteRequest", ["invite_code", "display_name"]],
   ["CreateChannelRequest", ["group_id", "name", "kind", "retention_status"]],
@@ -873,12 +885,12 @@ if (!main.includes("not user-entered pairing fields") || !main.includes("ensureT
   failures.push("text runtime attachment must derive peers from invite/connectivity state and start automatically");
 }
 for (const inviteUiToken of [
-  "Latest invite descriptor",
+  "Invite ready",
+  "Copy invite",
   "Signaling endpoint",
-  "Revocation status",
-  "Password-gate status",
-  "MLS admission state",
-  "Max-use limit",
+  "Max uses",
+  "Admission",
+  "Password admission",
 ]) {
   if (!main.includes(inviteUiToken)) {
     failures.push(
@@ -917,14 +929,14 @@ if (
   );
 }
 
-const commandBackedCopy = [
-  "command-backed",
+const productionEvidenceCopy = [
   "backend media-route evidence",
   "pending on offline devices",
+  "not user-entered pairing fields",
 ];
-for (const copy of commandBackedCopy) {
+for (const copy of productionEvidenceCopy) {
   if (!main.includes(copy) && !commands.includes(copy)) {
-    failures.push(`expected honest/command-backed copy missing: ${copy}`);
+    failures.push(`expected production evidence copy missing: ${copy}`);
   }
 }
 
