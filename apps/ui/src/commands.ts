@@ -226,11 +226,75 @@ export type GroupRuntimePeerView = {
   source: string;
 };
 
+export type GroupRoleView = "owner" | "staff" | "member" | string;
+
+export type GroupAdmissionModeView =
+  | "automatic_when_authorized_online"
+  | "manual_approval"
+  | string;
+
+export type GroupMemberView = {
+  member_id: string;
+  display_name: string;
+  device_id?: string | null;
+  role: GroupRoleView;
+  status: "online" | "offline" | "unknown" | "revoked" | string;
+  signer_public_key_hex?: string | null;
+  joined_at: string;
+  last_seen_at?: string | null;
+  presence_expires_at?: string | null;
+  revoked_at?: string | null;
+  revoked_by?: string | null;
+};
+
+export type GroupRolePolicyView = {
+  admission_mode: GroupAdmissionModeView;
+  policy_epoch: number;
+  updated_by: string;
+  updated_at: string;
+};
+
+export type GroupAdmissionRequestView = {
+  request_id: string;
+  group_id: string;
+  invite_id?: string | null;
+  display_name: string;
+  device_name?: string | null;
+  member_identity: string;
+  signer_public_key_hex: string;
+  key_package: number[];
+  status: "pending" | "approved" | "refused" | "superseded" | string;
+  requested_at: string;
+  decided_by?: string | null;
+  decided_at?: string | null;
+  decision_reason?: string | null;
+  policy_epoch_at_request: number;
+  admission_mode_at_request?: GroupAdmissionModeView | null;
+};
+
+export type GroupGovernanceLogEntryView = {
+  event_id: string;
+  group_id: string;
+  event_kind: string;
+  actor_member_id: string;
+  target_member_id?: string | null;
+  request_id?: string | null;
+  role_before?: GroupRoleView | null;
+  role_after?: GroupRoleView | null;
+  created_at: string;
+  summary: string;
+};
+
 export type GroupView = {
   group_id: string;
   name: string;
+  /** Legacy/current-member role label; backend-authorized role state lives in members. */
   role: string;
   channels: ChannelStateView[];
+  members?: GroupMemberView[];
+  role_policy?: GroupRolePolicyView;
+  admission_requests?: GroupAdmissionRequestView[];
+  governance_log?: GroupGovernanceLogEntryView[];
   runtime_peers?: GroupRuntimePeerView[];
   connectivity?: ConnectivityPolicyView | null;
 };
@@ -648,6 +712,7 @@ export type SetConnectivityPolicyRequest = {
 export type CreateGroupRequest = {
   name: string;
   retention: string;
+  admission_mode?: GroupAdmissionModeView | null;
   adapter_kind?: SignalingAdapterKind | string | null;
   signaling_endpoint?: string | null;
   ice_stun_servers?: string[] | null;
@@ -657,6 +722,55 @@ export type CreateGroupRequest = {
 export type JoinGroupRequest = {
   invite_code: string;
   group_name?: string | null;
+};
+
+export type SetGroupAdmissionModeRequest = {
+  group_id: string;
+  admission_mode: GroupAdmissionModeView;
+};
+
+export type ApproveGroupAdmissionRequest = {
+  group_id: string;
+  request_id: string;
+};
+
+export type RefuseGroupAdmissionRequest = {
+  group_id: string;
+  request_id: string;
+  reason?: string | null;
+};
+
+export type PromoteGroupMemberRequest = {
+  group_id: string;
+  member_id: string;
+};
+
+export type DemoteGroupStaffRequest = {
+  group_id: string;
+  member_id: string;
+};
+
+export type RevokeGroupMemberAccessRequest = {
+  group_id: string;
+  member_id: string;
+  reason?: string | null;
+};
+
+export type PublishGroupPresenceRequest = {
+  group_id: string;
+  member_id?: string | null;
+  status?: "online" | "offline" | "unknown" | string;
+  ttl_seconds?: number | null;
+};
+
+export type GroupAdmissionDecisionRequest = ApproveGroupAdmissionRequest & {
+  reason?: string | null;
+};
+
+export type GroupMemberActionRequest = {
+  group_id: string;
+  member_id: string;
+  reason?: string | null;
 };
 
 export type SetActiveGroupRequest = {
@@ -1154,6 +1268,122 @@ const fallbackState: AppState = {
 
 let fallbackHydrated = false;
 
+function isoNow(): string {
+  return new Date().toISOString();
+}
+
+function normalizedAdmissionMode(
+  value?: GroupAdmissionModeView | null,
+): GroupAdmissionModeView {
+  return value === "automatic_when_authorized_online"
+    ? "automatic_when_authorized_online"
+    : "manual_approval";
+}
+
+function localMemberId(state: AppState): string {
+  return state.profile?.user_id ?? "local-profile-pending";
+}
+
+function governanceDisplayName(state: AppState): string {
+  return state.profile?.display_name ?? state.snapshot.friend.alias ?? "Local user";
+}
+
+function ensureGroupGovernance(
+  state: AppState,
+  group: GroupView,
+  roleOverride?: GroupRoleView,
+): GroupView {
+  const now = isoNow();
+  const localId = localMemberId(state);
+  const localRole = roleOverride ?? group.role ?? "member";
+  group.members ??= [];
+  if (!group.members.some((member) => member.member_id === localId)) {
+    group.members.push({
+      member_id: localId,
+      display_name: governanceDisplayName(state),
+      device_id: state.profile?.device_name ?? null,
+      role: localRole,
+      status: "online",
+      signer_public_key_hex: null,
+      joined_at: now,
+      last_seen_at: now,
+      presence_expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      revoked_at: null,
+      revoked_by: null,
+    });
+  }
+  group.role_policy ??= {
+    admission_mode: "manual_approval",
+    policy_epoch: 1,
+    updated_by: localId,
+    updated_at: now,
+  };
+  group.admission_requests ??= [];
+  group.governance_log ??= [];
+  if (!group.governance_log.some((entry) => entry.event_kind === "group.created")) {
+    group.governance_log.push({
+      event_id: `governance-${group.group_id}-created`,
+      group_id: group.group_id,
+      event_kind: "group.created",
+      actor_member_id: localId,
+      target_member_id: localId,
+      request_id: null,
+      role_before: null,
+      role_after: localRole,
+      created_at: now,
+      summary: `Initialized ${group.name} governance state`,
+    });
+  }
+  return group;
+}
+
+function governanceLog(
+  state: AppState,
+  group: GroupView,
+  entry: Omit<GroupGovernanceLogEntryView, "event_id" | "group_id" | "created_at"> & {
+    created_at?: string;
+  },
+): void {
+  group.governance_log ??= [];
+  const createdAt = entry.created_at ?? isoNow();
+  group.governance_log.push({
+    event_id: stableHash(
+      `${group.group_id}:${entry.event_kind}:${entry.actor_member_id}:${entry.target_member_id ?? ""}:${entry.request_id ?? ""}:${createdAt}`,
+    ),
+    group_id: group.group_id,
+    created_at: createdAt,
+    ...entry,
+  });
+  pushEvent(state, `group.${entry.event_kind}`, entry.summary);
+}
+
+function findGovernedGroup(state: AppState, groupId: string): GroupView {
+  const group = state.groups.find((item) => item.group_id === groupId);
+  if (!group) throw new Error("Requested group does not exist");
+  return ensureGroupGovernance(state, group);
+}
+
+function governanceLocalRoleForGroup(state: AppState, group: GroupView): string {
+  const local = group.members?.find((member) => member.member_id === localMemberId(state));
+  return local?.role ?? group.role ?? "member";
+}
+
+function canModerateAdmissions(state: AppState, group: GroupView): boolean {
+  return ["owner", "staff"].includes(governanceLocalRoleForGroup(state, group));
+}
+
+function canPromoteMembers(state: AppState, group: GroupView): boolean {
+  return governanceLocalRoleForGroup(state, group) === "owner";
+}
+
+function canRevokeMember(state: AppState, group: GroupView, target: GroupMemberView): boolean {
+  const role = governanceLocalRoleForGroup(state, group);
+  if (target.member_id === localMemberId(state)) return false;
+  if (role === "owner") return target.role !== "owner";
+  if (role === "staff") return target.role === "member";
+  return false;
+}
+
 function defaultVoiceMediaRuntime(
   sessionId: string,
   joined: boolean,
@@ -1226,6 +1456,7 @@ function hydrateFallbackState(): void {
   if (!stored) return;
   clearNonPersistentVoiceRuntime(stored);
   Object.assign(fallbackState, stored);
+  ensureGroupGovernanceDefaults(fallbackState);
   syncSnapshot(fallbackState);
 }
 
@@ -1246,6 +1477,7 @@ function persistFallbackState(): void {
 
 function syncSnapshot(state: AppState): AppState {
   normalizeVoiceSessionRuntime(state);
+  ensureGroupGovernanceDefaults(state);
   state.snapshot.schema_version = state.schema_version;
   state.snapshot.preferences = state.preferences;
   state.snapshot.devices = state.devices;
@@ -1872,6 +2104,110 @@ function localUserId(state: AppState): string {
   return state.profile?.user_id ?? "local-profile-pending";
 }
 
+function localDisplayName(state: AppState): string {
+  return state.profile?.display_name ?? "Local member";
+}
+
+function localDeviceId(state: AppState): string | null {
+  return state.devices.find((device) => device.local)?.device_id ?? null;
+}
+
+function normalizeGroupRole(role: string | null | undefined): GroupRoleView {
+  return role === "owner" || role === "staff" ? role : "member";
+}
+
+function initialGroupMember(
+  state: AppState,
+  role: GroupRoleView,
+  joinedAt: string,
+): GroupMemberView {
+  return {
+    member_id: localUserId(state),
+    display_name: localDisplayName(state),
+    device_id: localDeviceId(state),
+    role,
+    status: "unknown",
+    signer_public_key_hex: null,
+    joined_at: joinedAt,
+    last_seen_at: null,
+    presence_expires_at: null,
+    revoked_at: null,
+    revoked_by: null,
+  };
+}
+
+function initialGroupRolePolicy(
+  state: AppState,
+  admissionMode: GroupAdmissionModeView | null | undefined,
+  updatedAt: string,
+): GroupRolePolicyView {
+  return {
+    admission_mode: admissionMode ?? "automatic_when_authorized_online",
+    policy_epoch: 1,
+    updated_by: localUserId(state),
+    updated_at: updatedAt,
+  };
+}
+
+function initialGroupGovernanceLog(
+  state: AppState,
+  groupId: string,
+  role: GroupRoleView,
+  createdAt: string,
+): GroupGovernanceLogEntryView[] {
+  const actor = localUserId(state);
+  return [
+    {
+      event_id: `governance-${slugify(groupId)}-${slugify(actor)}-created`,
+      group_id: groupId,
+      event_kind: "group_created",
+      actor_member_id: actor,
+      target_member_id: actor,
+      request_id: null,
+      role_before: null,
+      role_after: role,
+      created_at: createdAt,
+      summary: "Initialized group owner/staff/member governance roster",
+    },
+  ];
+}
+
+function ensureGroupGovernanceDefaults(state: AppState): void {
+  const now = new Date().toISOString();
+  for (const group of state.groups) {
+    const role = normalizeGroupRole(group.role);
+    group.members ??= [initialGroupMember(state, role, now)];
+    if (group.members.length === 0) {
+      group.members.push(initialGroupMember(state, role, now));
+    }
+    group.role_policy ??= initialGroupRolePolicy(
+      state,
+      "automatic_when_authorized_online",
+      now,
+    );
+    group.role_policy.policy_epoch ||= 1;
+    group.admission_requests ??= [];
+    group.governance_log ??= initialGroupGovernanceLog(
+      state,
+      group.group_id,
+      group.members.find((member) => member.member_id === localUserId(state))?.role ??
+        role,
+      now,
+    );
+    if (group.governance_log.length === 0) {
+      group.governance_log.push(
+        ...initialGroupGovernanceLog(state, group.group_id, role, now),
+      );
+    }
+    const localMember = group.members.find(
+      (member) => member.member_id === localUserId(state) && !member.revoked_at,
+    );
+    if (localMember) {
+      group.role = normalizeGroupRole(localMember.role);
+    }
+  }
+}
+
 function inviteExpirationHorizon(label: string): string {
   const lower = label.toLowerCase();
   const now = Date.now();
@@ -2463,6 +2799,74 @@ export function commandErrorToAction(error: CommandErrorView | null): string {
   return error?.recovery_hint ?? "";
 }
 
+function localGroupMember(role: GroupRoleView): GroupMemberView {
+  const memberId = localUserId(fallbackState);
+  return {
+    member_id: memberId,
+    display_name: fallbackState.profile?.display_name ?? "Local member",
+    device_id: fallbackState.profile?.device_name ?? null,
+    role,
+    status: "offline",
+    signer_public_key_hex: null,
+    joined_at: new Date().toISOString(),
+    last_seen_at: null,
+    presence_expires_at: null,
+    revoked_at: null,
+    revoked_by: null,
+  };
+}
+
+function ensureFallbackGroupGovernanceDefaults(group: GroupView): void {
+  group.members ??= [localGroupMember((group.role as GroupRoleView) || "member")];
+  if (!group.members.some((member) => member.member_id === localUserId(fallbackState))) {
+    group.members.push(localGroupMember((group.role as GroupRoleView) || "member"));
+  }
+  group.governance_log ??= [
+    {
+      event_id: `fallback-governance-${group.group_id}`,
+      group_id: group.group_id,
+      event_kind: "governance.defaults_restored",
+      actor_member_id: localUserId(fallbackState),
+      target_member_id: null,
+      request_id: null,
+      role_before: null,
+      role_after: null,
+      created_at: new Date().toISOString(),
+      summary: "Restored fallback governance roster defaults",
+    },
+  ];
+}
+
+function fallbackLocalRoleForGroup(group: GroupView): GroupRoleView | null {
+  ensureFallbackGroupGovernanceDefaults(group);
+  const member = group.members?.find(
+    (item) => item.member_id === localUserId(fallbackState) && item.status !== "revoked",
+  );
+  return member?.role ?? null;
+}
+
+function governanceEntry(
+  group: GroupView,
+  eventKind: string,
+  targetMemberId: string | null,
+  roleBefore: GroupRoleView | null,
+  roleAfter: GroupRoleView | null,
+  summary: string,
+): GroupGovernanceLogEntryView {
+  return {
+    event_id: `fallback-${eventKind}-${group.governance_log?.length ?? 0}-${Date.now()}`,
+    group_id: group.group_id,
+    event_kind: eventKind,
+    actor_member_id: localUserId(fallbackState),
+    target_member_id: targetMemberId,
+    request_id: null,
+    role_before: roleBefore,
+    role_after: roleAfter,
+    created_at: new Date().toISOString(),
+    summary,
+  };
+}
+
 function pushCommandError(
   state: AppState,
   eventKind: string,
@@ -2589,6 +2993,8 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
       groupConnectivityPolicy(groupId),
       fallbackState.connectivity_defaults,
     );
+    const createdAt = new Date().toISOString();
+    const role: GroupRoleView = "member";
     fallbackState.groups.push({
       group_id: groupId,
       name: room,
@@ -2609,6 +3015,19 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
           connectivity: null,
         },
       ],
+      members: [initialGroupMember(fallbackState, role, createdAt)],
+      role_policy: initialGroupRolePolicy(
+        fallbackState,
+        "automatic_when_authorized_online",
+        createdAt,
+      ),
+      admission_requests: [],
+      governance_log: initialGroupGovernanceLog(
+        fallbackState,
+        groupId,
+        role,
+        createdAt,
+      ),
       runtime_peers: groupRuntimePeers(connectivity, "member"),
       connectivity,
     });
@@ -2809,11 +3228,26 @@ export async function recoverUser(
         const groupId = `group-${slugify(name)}`;
         if (!state.groups.some((group) => group.group_id === groupId)) {
           const connectivity = groupConnectivityPolicy(groupId);
+          const createdAt = new Date().toISOString();
+          const role: GroupRoleView = "member";
           state.groups.push({
             group_id: groupId,
             name,
             role: "member",
             channels: defaultGroupChannels(),
+            members: [initialGroupMember(state, role, createdAt)],
+            role_policy: initialGroupRolePolicy(
+              state,
+              "automatic_when_authorized_online",
+              createdAt,
+            ),
+            admission_requests: [],
+            governance_log: initialGroupGovernanceLog(
+              state,
+              groupId,
+              role,
+              createdAt,
+            ),
             runtime_peers: groupRuntimePeers(connectivity, "member"),
             connectivity,
           });
@@ -3110,14 +3544,30 @@ export async function createGroup(
             state.connectivity_defaults,
           );
         }
+        const createdAt = new Date().toISOString();
+        const role: GroupRoleView = "owner";
         state.groups.push({
           group_id: groupId,
           name,
           role: "owner",
           channels: defaultGroupChannels(),
+          members: [initialGroupMember(state, role, createdAt)],
+          role_policy: initialGroupRolePolicy(
+            state,
+            request.admission_mode,
+            createdAt,
+          ),
+          admission_requests: [],
+          governance_log: initialGroupGovernanceLog(
+            state,
+            groupId,
+            role,
+            createdAt,
+          ),
           runtime_peers: groupRuntimePeers(connectivity, "owner"),
           connectivity,
         });
+        ensureGroupGovernance(state, state.groups[state.groups.length - 1], "owner");
       }
       state.active_context = {
         kind: "group",
@@ -3159,15 +3609,32 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
       if (!state.groups.some((group) => group.group_id === groupId)) {
         const connectivity =
           parsedInvite?.connectivity ?? groupConnectivityPolicy(groupId);
+        const createdAt = new Date().toISOString();
+        const role: GroupRoleView = "member";
         state.groups.push({
           group_id: groupId,
           name,
           role: "member",
           channels: defaultGroupChannels(),
+          members: [initialGroupMember(state, role, createdAt)],
+          role_policy: initialGroupRolePolicy(
+            state,
+            "automatic_when_authorized_online",
+            createdAt,
+          ),
+          admission_requests: [],
+          governance_log: initialGroupGovernanceLog(
+            state,
+            groupId,
+            role,
+            createdAt,
+          ),
           runtime_peers: groupRuntimePeers(connectivity, "member"),
           connectivity,
         });
+        ensureGroupGovernance(state, state.groups[state.groups.length - 1], "member");
       }
+      ensureGroupGovernanceDefaults(state);
       state.active_context = {
         kind: "group",
         group_id: groupId,
@@ -3209,6 +3676,218 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         "group.joined",
         `Joined ${name} via ${request.invite_code}`,
       );
+    }),
+  );
+}
+
+export async function setGroupAdmissionMode(
+  request: SetGroupAdmissionModeRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("set_group_admission_mode", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      if (!canModerateAdmissions(state, group)) {
+        pushCommandError(
+          state,
+          "governance.unauthorized",
+          "set_group_admission_mode",
+          "forbidden",
+          "Only owners or staff can change admission mode",
+          "Ask an owner or staff member to update group admission policy",
+        );
+        return;
+      }
+      const previousMode = group.role_policy?.admission_mode ?? "manual_approval";
+      group.role_policy = {
+        admission_mode: normalizedAdmissionMode(request.admission_mode),
+        policy_epoch: (group.role_policy?.policy_epoch ?? 1) + 1,
+        updated_by: localMemberId(state),
+        updated_at: isoNow(),
+      };
+      governanceLog(state, group, {
+        event_kind: "admission.mode_changed",
+        actor_member_id: localMemberId(state),
+        target_member_id: null,
+        request_id: null,
+        role_before: previousMode,
+        role_after: group.role_policy.admission_mode,
+        summary: `Admission mode changed to ${group.role_policy.admission_mode}`,
+      });
+    }),
+  );
+}
+
+export async function approveGroupAdmissionRequest(
+  request: ApproveGroupAdmissionRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("approve_group_admission_request", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      if (!canModerateAdmissions(state, group)) {
+        pushCommandError(state, "governance.unauthorized", "approve_group_admission_request", "forbidden", "Only owners or staff can approve admission requests", "Ask an owner or staff member to review the request");
+        return;
+      }
+      const admission = group.admission_requests?.find((item) => item.request_id === request.request_id);
+      if (!admission) throw new Error("Admission request does not exist");
+      admission.status = "approved";
+      admission.decided_by = localMemberId(state);
+      admission.decided_at = isoNow();
+      admission.decision_reason = null;
+      group.members ??= [];
+      if (!group.members.some((member) => member.member_id === admission.member_identity)) {
+        group.members.push({
+          member_id: admission.member_identity,
+          display_name: admission.display_name,
+          device_id: admission.device_name ?? null,
+          role: "member",
+          status: "unknown",
+          signer_public_key_hex: admission.signer_public_key_hex,
+          joined_at: admission.decided_at,
+          last_seen_at: null,
+          presence_expires_at: null,
+          revoked_at: null,
+          revoked_by: null,
+        });
+      }
+      governanceLog(state, group, {
+        event_kind: "admission.approved",
+        actor_member_id: localMemberId(state),
+        target_member_id: admission.member_identity,
+        request_id: admission.request_id,
+        role_before: null,
+        role_after: "member",
+        summary: `Approved ${admission.display_name} for admission`,
+      });
+    }),
+  );
+}
+
+export async function refuseGroupAdmissionRequest(
+  request: RefuseGroupAdmissionRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("refuse_group_admission_request", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      if (!canModerateAdmissions(state, group)) {
+        pushCommandError(state, "governance.unauthorized", "refuse_group_admission_request", "forbidden", "Only owners or staff can refuse admission requests", "Ask an owner or staff member to review the request");
+        return;
+      }
+      const admission = group.admission_requests?.find((item) => item.request_id === request.request_id);
+      if (!admission) throw new Error("Admission request does not exist");
+      admission.status = "refused";
+      admission.decided_by = localMemberId(state);
+      admission.decided_at = isoNow();
+      admission.decision_reason = request.reason ?? null;
+      governanceLog(state, group, {
+        event_kind: "admission.refused",
+        actor_member_id: localMemberId(state),
+        target_member_id: admission.member_identity,
+        request_id: admission.request_id,
+        role_before: null,
+        role_after: null,
+        summary: `Refused ${admission.display_name} admission`,
+      });
+    }),
+  );
+}
+
+export async function promoteGroupMemberToStaff(
+  request: PromoteGroupMemberRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("promote_group_member_to_staff", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      if (!canPromoteMembers(state, group)) {
+        pushCommandError(state, "governance.unauthorized", "promote_group_member_to_staff", "forbidden", "Only owners can promote staff", "Ask the group owner to promote this member");
+        return;
+      }
+      const member = group.members?.find((item) => item.member_id === request.member_id);
+      if (!member) throw new Error("Group member does not exist");
+      const before = member.role;
+      if (before === "owner") return;
+      member.role = "staff";
+      governanceLog(state, group, {
+        event_kind: "member.role_changed",
+        actor_member_id: localMemberId(state),
+        target_member_id: member.member_id,
+        request_id: null,
+        role_before: before,
+        role_after: "staff",
+        summary: `Promoted ${member.display_name} to staff`,
+      });
+    }),
+  );
+}
+
+export async function demoteGroupStaffToMember(
+  request: DemoteGroupStaffRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("demote_group_staff_to_member", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      if (!canPromoteMembers(state, group)) {
+        pushCommandError(state, "governance.unauthorized", "demote_group_staff_to_member", "forbidden", "Only owners can demote staff", "Ask the group owner to change this role");
+        return;
+      }
+      const member = group.members?.find((item) => item.member_id === request.member_id);
+      if (!member) throw new Error("Group member does not exist");
+      const before = member.role;
+      if (before !== "staff") return;
+      member.role = "member";
+      governanceLog(state, group, {
+        event_kind: "member.role_changed",
+        actor_member_id: localMemberId(state),
+        target_member_id: member.member_id,
+        request_id: null,
+        role_before: before,
+        role_after: "member",
+        summary: `Demoted ${member.display_name} to member`,
+      });
+    }),
+  );
+}
+
+export async function revokeGroupMemberAccess(
+  request: RevokeGroupMemberAccessRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("revoke_group_member_access", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      const member = group.members?.find((item) => item.member_id === request.member_id);
+      if (!member) throw new Error("Group member does not exist");
+      if (!canRevokeMember(state, group, member)) {
+        pushCommandError(state, "governance.unauthorized", "revoke_group_member_access", "forbidden", "This role cannot revoke the selected member", "Owners can revoke staff or members; staff can revoke members only");
+        return;
+      }
+      member.status = "revoked";
+      member.revoked_at = isoNow();
+      member.revoked_by = localMemberId(state);
+      governanceLog(state, group, {
+        event_kind: "member.revoked",
+        actor_member_id: localMemberId(state),
+        target_member_id: member.member_id,
+        request_id: null,
+        role_before: member.role,
+        role_after: member.role,
+        summary: `Revoked ${member.display_name} access`,
+      });
+    }),
+  );
+}
+
+export async function publishGroupPresence(
+  request: PublishGroupPresenceRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("publish_group_presence", { request }, () =>
+    mutateFallback((state) => {
+      const group = findGovernedGroup(state, request.group_id);
+      const member = group.members?.find((item) => item.member_id === localMemberId(state));
+      if (!member || member.status === "revoked") return;
+      const now = isoNow();
+      member.status = request.status ?? "online";
+      member.last_seen_at = now;
+      member.presence_expires_at = new Date(Date.now() + Math.max(30, request.ttl_seconds ?? 300) * 1000).toISOString();
+      pushEvent(state, "group.presence", `Published ${request.status ?? "online"} presence for ${group.name}`);
     }),
   );
 }

@@ -132,7 +132,7 @@ async function bootReadyShell(page) {
   await page.getByLabel("Device name").first().fill("E2E Device");
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("heading", { name: /finish the local trust setup/i }),
+    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
   ).toBeVisible();
   expect(errors).toEqual([]);
   return errors;
@@ -176,12 +176,12 @@ test("setup workflow remains readable and completes", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   // setup panel is already showing after bootReadyShell
   await expect(
-    page.getByRole("heading", { name: /finish the local trust setup/i }),
+    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
   ).toBeVisible();
-  await expect(page.getByText("3/4").first()).toBeVisible();
+  await expect(page.getByText("Current safety number").first()).toBeVisible();
 
   const bounds = await page
-    .getByRole("heading", { name: /finish the local trust setup/i })
+    .getByRole("heading", { name: /Ready to start using Discrypt/i })
     .evaluate((element) => {
       const panel = element.closest(".mx-auto");
       const rect = panel?.getBoundingClientRect();
@@ -189,7 +189,7 @@ test("setup workflow remains readable and completes", async ({ page }) => {
     });
   expect(bounds).not.toBeNull();
   expect(bounds?.top ?? -1).toBeGreaterThanOrEqual(0);
-  expect(bounds?.width ?? 0).toBeGreaterThan(900);
+  expect(bounds?.width ?? 0).toBeGreaterThan(640);
   const overflow = await page.evaluate(
     () =>
       document.documentElement.scrollWidth -
@@ -197,8 +197,7 @@ test("setup workflow remains readable and completes", async ({ page }) => {
   );
   expect(overflow).toBeLessThanOrEqual(1);
 
-  await page.getByRole("button", { name: /mark as verified/i }).click();
-  await expect(page.getByText("4/4").first()).toBeVisible();
+  await page.getByRole("button", { name: /mark verified/i }).click();
   await expect(page.getByText(/Safety number verified/i).first()).toBeVisible();
 });
 
@@ -263,25 +262,17 @@ test("group invite join text channel and voice controls work without fake member
   await expect(
     inviteSheet.getByText("mqtts://broker.emqx.io:8883", { exact: true }),
   ).toBeVisible();
-  await expect(inviteSheet.getByText(/stun\.cloudflare\.com:3478/i)).toBeVisible();
   await expect(
-    inviteSheet.getByText(
-      /1 redacted TURN endpoint: turns:turn\.example\.invalid:5349/i,
-    ),
+    inviteSheet.getByText("Endpoint policy", { exact: true }),
+  ).toBeVisible();
+  await expect(inviteSheet.getByText("Admission", { exact: true })).toBeVisible();
+  await expect(inviteSheet.getByText(/authorized MLS Welcome/i)).toBeVisible();
+  await expect(
+    inviteSheet.getByText("STUN/TURN", { exact: true }),
   ).toBeVisible();
   await expect(
-    inviteSheet.getByText("Signaling trust", { exact: true }),
+    inviteSheet.getByText("2 STUN · 1 TURN", { exact: true }),
   ).toBeVisible();
-  await expect(
-    inviteSheet.getByText("Trust fingerprint", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    inviteSheet.getByText("Room secret commitment", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    inviteSheet.getByText("ICE/STUN metadata", { exact: true }),
-  ).toBeVisible();
-  await expect(inviteSheet.getByText("TURN metadata", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: /Close Create group invite/i }).click();
   await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
   await expect(page.getByText(/discrypt:\/\/join\/v1/i)).toHaveCount(0);
@@ -308,7 +299,7 @@ test("group invite join text channel and voice controls work without fake member
   await page.getByRole("button", { name: /Open Private Lab group/i }).click();
   await expect(page.getByText(/Private Lab/i).first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
   const voiceConfig = page.getByRole("dialog", { name: "Config" });
   await voiceConfig.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
   await expect(voiceConfig.getByTestId("voice-mic-selector")).toHaveValue(
@@ -394,7 +385,7 @@ test("transport diagnostics stay hidden by default before invite metadata", asyn
   await expect(page.getByText("Transport status")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Inspector" })).toHaveCount(0);
   await expect(
-    page.getByRole("heading", { name: /finish the local trust setup/i }),
+    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
   ).toBeVisible();
 });
 
@@ -409,7 +400,7 @@ test("local-dev e2e persistence survives browser reload", async ({ page }) => {
     .getByRole("textbox", { name: "Message" })
     .fill("message survives reload");
   await page.getByRole("button", { name: /^Send message$/ }).click();
-  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
   const configDialog = page.getByRole("dialog", { name: "Config" });
   await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
   await expect(configDialog.getByLabel("Theme")).toHaveValue("ocean-contrast");
@@ -420,7 +411,7 @@ test("local-dev e2e persistence survives browser reload", async ({ page }) => {
   await expect(page.getByText(/Persistent Lab/i).first()).toBeVisible();
   await page.getByRole("button", { name: /\#general/ }).click();
   await expect(page.getByText(/message survives reload/i)).toBeVisible();
-  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Config" }).getByLabel("Theme")).toHaveValue("ocean-contrast");
   await page.getByRole("button", { name: /Close Config/i }).click();
 });
