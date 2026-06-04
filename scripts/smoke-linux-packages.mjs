@@ -120,13 +120,19 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update >/tmp/apt.log 2>&1
 apt-get install -y /tmp/discrypt.deb xvfb dbus-x11 >/tmp/install.log 2>&1
+dpkg-deb -f /tmp/discrypt.deb Depends | tee /tmp/deb-depends.log
+grep -q gnome-keyring /tmp/deb-depends.log
+grep -q dbus-user-session /tmp/deb-depends.log
+grep -q libpam-gnome-keyring /tmp/deb-depends.log
+command -v gnome-keyring-daemon
 command -v discrypt-desktop
 rm -rf /tmp/discrypt-home
 mkdir -p /tmp/discrypt-home
 set +e
-timeout 8s dbus-run-session -- xvfb-run -a env HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1 discrypt-desktop >/tmp/discrypt-smoke.log 2>&1
+timeout 8s dbus-run-session -- bash -lc 'Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & xvfb_pid=$!; export DISPLAY=:99 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1; gnome-keyring-daemon --start --components=secrets >/tmp/gnome-keyring.env 2>/tmp/gnome-keyring.err || true; cat /tmp/gnome-keyring.err >&2 || true; busctl --user list | grep -q org.freedesktop.secrets; discrypt-desktop >/tmp/discrypt-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
 code=$?
 set -e
+cat /tmp/deb-depends.log || true
 tail -40 /tmp/install.log || true
 tail -80 /tmp/discrypt-smoke.log || true
 test "$code" -eq 0 -o "$code" -eq 124
@@ -142,12 +148,14 @@ steps.push(
     script: String.raw`
 set -euo pipefail
 rpm -qpR /tmp/discrypt.rpm >/tmp/rpm-requires.log
+grep -q '^gnome-keyring$' /tmp/rpm-requires.log
 dnf install -y /tmp/discrypt.rpm xorg-x11-server-Xvfb dbus-x11 >/tmp/install.log 2>&1
+command -v gnome-keyring-daemon
 command -v discrypt-desktop
 rm -rf /tmp/discrypt-home
 mkdir -p /tmp/discrypt-home
 set +e
-timeout 8s dbus-run-session -- bash -lc 'Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & xvfb_pid=$!; export DISPLAY=:99 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1; discrypt-desktop >/tmp/discrypt-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
+timeout 8s dbus-run-session -- bash -lc 'Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & xvfb_pid=$!; export DISPLAY=:99 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1; gnome-keyring-daemon --start --components=secrets >/tmp/gnome-keyring.env 2>/tmp/gnome-keyring.err || true; cat /tmp/gnome-keyring.err >&2 || true; busctl --user list | grep -q org.freedesktop.secrets; discrypt-desktop >/tmp/discrypt-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
 code=$?
 set -e
 cat /tmp/rpm-requires.log
@@ -168,12 +176,13 @@ steps.push(
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update >/tmp/apt.log 2>&1
-apt-get install -y xvfb dbus-x11 >/tmp/install.log 2>&1
+apt-get install -y xvfb dbus-x11 gnome-keyring >/tmp/install.log 2>&1
+command -v gnome-keyring-daemon
 chmod +x /tmp/discrypt.AppImage
 rm -rf /tmp/discrypt-home
 mkdir -p /tmp/discrypt-home
 set +e
-timeout 8s dbus-run-session -- xvfb-run -a env APPIMAGE_EXTRACT_AND_RUN=1 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1 /tmp/discrypt.AppImage >/tmp/discrypt-smoke.log 2>&1
+timeout 8s dbus-run-session -- bash -lc 'Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & xvfb_pid=$!; export DISPLAY=:99 APPIMAGE_EXTRACT_AND_RUN=1 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1; gnome-keyring-daemon --start --components=secrets >/tmp/gnome-keyring.env 2>/tmp/gnome-keyring.err || true; cat /tmp/gnome-keyring.err >&2 || true; busctl --user list | grep -q org.freedesktop.secrets; /tmp/discrypt.AppImage >/tmp/discrypt-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
 code=$?
 set -e
 tail -40 /tmp/install.log || true

@@ -11,12 +11,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(any(
-    test,
-    feature = "harness",
-    feature = "local-dev",
-    not(feature = "production-storage")
-))]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -30,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+use zeroize::Zeroizing;
 
 const ENVELOPE_FORMAT: &str = "discrypt.appdb.encrypted.v1";
 const DEFAULT_WRAPPING_KEY_ID: &str = "local-appdb-wrapping-key-v1";
@@ -100,13 +96,13 @@ pub const fn storage_keychain_decision() -> StorageKeychainDecision {
         app_store_runtime: "EncryptedAppDb persists a serde_json envelope encrypted with AES-256-GCM; app DB does not persist plaintext SQLite pages.",
         sqlite_schema_policy: "AppDbSchema and VERSION_1_DDL define the SQLite-compatible durable schema contract; OpenMLS protocol state uses openmls_sqlite_storage separately.",
         encrypted_store_crates: &["aes-gcm", "serde_json", "zeroize", "sha2", "hex"],
-        keychain_crate: "keyring 3.6.3 is optional behind production-storage; LinuxOsKeychain uses the Secret Service sync provider; MemoryAppDbKeychain is restricted to tests/local/non-production builds.",
+        keychain_crate: "keyring 3.6.3 is optional behind production-storage; LinuxOsKeychain uses the default Secret Service sync provider; ProductionAppDbKeychain may use an Argon2id/AES-GCM PassphraseVaultKeychain when the user chooses password-vault storage or an explicit operator passphrase is configured; MemoryAppDbKeychain is restricted to tests/local/non-production builds.",
         wal_journal_policy: "Encrypted envelope writes use temp-file plus rename; sqlite_wal_path, -shm, and -journal sidecars are leakage-checked or moved by quarantine_corrupt_store; no plaintext WAL is expected for EncryptedAppDb.",
         key_wrapping: "A random data key encrypts payload bytes; the AppDbKeychain wrapping key wraps that data key into wrapped_data_key with nonces in the envelope; the data key zeroized after wrapping/decryption.",
         schema_migrations: "AppDbMigrationPlan supports 0<->1 forward/backward/noop transitions, rejects future versions, and validate_observed_schema checks tables and columns before opening state.",
         secure_delete_limits: "Secure delete is best-effort enumeration plus verification for local files/keychain entries and cannot promise erasure from SSD wear-leveling, backups, or cloud snapshot copies.",
         platform_differences: &[
-            "Linux production-storage uses keyring Secret Service through LinuxOsKeychain.",
+            "Linux production-storage uses keyring default Secret Service through LinuxOsKeychain when keyring mode is selected, or a user-unlocked PassphraseVaultKeychain when password-vault mode is selected.",
             "Tests, harnesses, local-dev, and non-production builds may use MemoryAppDbKeychain only as a non-production boundary.",
             "macOS, Windows, Android, and iOS require platform keychain adapters before any production-storage claim.",
         ],
@@ -207,6 +203,7 @@ impl AppDbKeychain for MemoryAppDbKeychain {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinuxOsKeychain {
     service: String,
+    legacy_target: String,
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -216,6 +213,7 @@ impl LinuxOsKeychain {
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             service: service.into(),
+            legacy_target: "discrypt".to_owned(),
         }
     }
 
@@ -231,8 +229,27 @@ impl LinuxOsKeychain {
         &self.service
     }
 
+    /// Production Linux now uses the desktop default Secret Service collection.
+    /// A separate legacy target is retained only to read/delete keys from an
+    /// earlier GNOME-specific Discrypt collection build.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        "default"
+    }
+
+    /// Legacy custom Secret Service collection target used by earlier Linux builds.
+    #[must_use]
+    pub fn legacy_target(&self) -> &str {
+        &self.legacy_target
+    }
+
     fn entry(&self, key_id: &str) -> Result<keyring::Entry, AppStoreError> {
         keyring::Entry::new(&self.service, key_id).map_err(keyring_error)
+    }
+
+    fn legacy_target_entry(&self, key_id: &str) -> Result<keyring::Entry, AppStoreError> {
+        keyring::Entry::new_with_target(&self.legacy_target, &self.service, key_id)
+            .map_err(keyring_error)
     }
 }
 
@@ -248,36 +265,457 @@ impl AppDbKeychain for LinuxOsKeychain {
     fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
         let entry = self.entry(key_id)?;
         match entry.get_secret() {
+            Ok(secret) => return secret_to_wrapping_key(secret),
+            Err(keyring::Error::NoEntry) => {}
+            Err(error) => return Err(keyring_error(error)),
+        }
+
+        // Backward-compatible read for the temporary build that wrote to a
+        // GNOME-specific custom collection. KDE/KWallet implementations may not
+        // support that path, so production writes now use the default collection.
+        let legacy_entry = match self.legacy_target_entry(key_id) {
+            Ok(entry) => entry,
+            Err(_) => return Ok(None),
+        };
+        match legacy_entry.get_secret() {
             Ok(secret) => secret_to_wrapping_key(secret),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(keyring_error(error)),
+            Err(_) => Ok(None),
         }
     }
 
     fn store_wrapping_key(&mut self, key_id: &str, key: [u8; 32]) -> Result<(), AppStoreError> {
-        self.entry(key_id)?.set_secret(&key).map_err(keyring_error)
+        // Store text instead of arbitrary binary. Some Secret Service/KWallet
+        // stacks round-trip byte secrets inconsistently through their prompt
+        // bridges; hex keeps the OS-keyring value portable while still storing
+        // only key material in the keyring, never in the app-state envelope.
+        self.entry(key_id)?
+            .set_secret(hex::encode(key).as_bytes())
+            .map_err(keyring_error)
     }
 
     fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError> {
         let entry = self.entry(key_id)?;
         match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(keyring_error(error)),
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(error) => return Err(keyring_error(error)),
         }
+
+        let Ok(legacy_entry) = self.legacy_target_entry(key_id) else {
+            return Ok(());
+        };
+        legacy_delete_result(legacy_entry.delete_credential())
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
-fn secret_to_wrapping_key(secret: Vec<u8>) -> Result<Option<[u8; 32]>, AppStoreError> {
-    let key: [u8; 32] = secret
-        .try_into()
-        .map_err(|_| AppStoreError::Crypto("invalid OS keychain wrapping key length"))?;
-    Ok(Some(key))
+fn secret_to_wrapping_key(mut secret: Vec<u8>) -> Result<Option<[u8; 32]>, AppStoreError> {
+    let mut key = [0_u8; 32];
+    if secret.len() == 32 {
+        key.copy_from_slice(&secret);
+        secret.zeroize();
+        return Ok(Some(key));
+    }
+    if secret.len() == 64 {
+        let decoded = std::str::from_utf8(&secret)
+            .ok()
+            .and_then(|value| hex::decode(value).ok())
+            .and_then(|bytes| bytes.try_into().ok());
+        secret.zeroize();
+        if let Some(decoded) = decoded {
+            return Ok(Some(decoded));
+        }
+        return Err(AppStoreError::Crypto(
+            "invalid OS keychain wrapping key encoding",
+        ));
+    }
+    secret.zeroize();
+    Err(AppStoreError::Crypto(
+        "invalid OS keychain wrapping key length",
+    ))
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 fn keyring_error(error: keyring::Error) -> AppStoreError {
     AppStoreError::Keychain(error.to_string())
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn legacy_delete_result(result: Result<(), keyring::Error>) -> Result<(), AppStoreError> {
+    match result {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(keyring_error(error)),
+    }
+}
+
+/// Production-only encrypted vault fallback for app DB wrapping keys.
+///
+/// The vault exists only behind `production-storage` and is never used by
+/// local-dev/harness stores. It stores wrapping keys encrypted by a key derived
+/// from an explicit user/device passphrase; it is an escape hatch when the
+/// platform keychain is unavailable, not a plaintext fallback.
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+#[derive(Clone, Eq, PartialEq)]
+pub struct PassphraseVaultKeychain {
+    path: PathBuf,
+    passphrase: Zeroizing<String>,
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl fmt::Debug for PassphraseVaultKeychain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PassphraseVaultKeychain")
+            .field("path", &self.path)
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl PassphraseVaultKeychain {
+    /// Create a production vault keychain using an encrypted vault file and passphrase.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, passphrase: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            passphrase: Zeroizing::new(passphrase.into()),
+        }
+    }
+
+    /// Return the encrypted vault path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn load_entries(&self) -> Result<BTreeMap<String, Vec<u8>>, AppStoreError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new())
+            }
+            Err(error) => return Err(AppStoreError::Io(error)),
+        };
+        let envelope: PassphraseVaultEnvelope = serde_json::from_slice(&bytes)?;
+        envelope.validate()?;
+        let mut key = derive_vault_key(self.passphrase.as_bytes(), &envelope.salt)?;
+        let plaintext_result = decrypt_bytes(&key, &envelope.nonce, &envelope.ciphertext);
+        key.zeroize();
+        let mut plaintext = plaintext_result?;
+        let entries = serde_json::from_slice(&plaintext).map_err(AppStoreError::Serde);
+        plaintext.zeroize();
+        entries
+    }
+
+    fn save_entries(&self, entries: &BTreeMap<String, Vec<u8>>) -> Result<(), AppStoreError> {
+        if self.passphrase.len() < 12 {
+            return Err(AppStoreError::Keychain(
+                "Discrypt vault passphrase must be at least 12 characters".to_owned(),
+            ));
+        }
+        let salt = random_vault_salt();
+        let nonce = random_nonce();
+        let mut plaintext = serde_json::to_vec(entries)?;
+        let mut key = derive_vault_key(self.passphrase.as_bytes(), &salt)?;
+        let ciphertext = encrypt_bytes(&key, &nonce, &plaintext);
+        key.zeroize();
+        plaintext.zeroize();
+        let ciphertext = ciphertext?;
+        let envelope = PassphraseVaultEnvelope {
+            format: VAULT_FORMAT.to_owned(),
+            kdf: VAULT_KDF.to_owned(),
+            salt,
+            nonce,
+            ciphertext,
+        };
+        let serialized = serde_json::to_vec(&envelope)?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = self.path.with_extension("vault.tmp");
+        write_restricted_file(&tmp, &serialized)?;
+        fs::rename(tmp, &self.path)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn write_restricted_file(path: &Path, bytes: &[u8]) -> Result<(), AppStoreError> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let _ = fs::remove_file(path);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn zeroize_vault_entries(entries: &mut BTreeMap<String, Vec<u8>>) {
+    for secret in entries.values_mut() {
+        secret.zeroize();
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl AppDbKeychain for PassphraseVaultKeychain {
+    fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
+        let mut entries = self.load_entries()?;
+        let result = match entries.remove(key_id) {
+            Some(secret) => secret_to_wrapping_key(secret),
+            None => Ok(None),
+        };
+        zeroize_vault_entries(&mut entries);
+        result
+    }
+
+    fn store_wrapping_key(&mut self, key_id: &str, key: [u8; 32]) -> Result<(), AppStoreError> {
+        let mut entries = self.load_entries()?;
+        entries.insert(key_id.to_owned(), key.to_vec());
+        let result = self.save_entries(&entries);
+        zeroize_vault_entries(&mut entries);
+        result
+    }
+
+    fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError> {
+        let mut entries = self.load_entries()?;
+        if let Some(mut removed) = entries.remove(key_id) {
+            removed.zeroize();
+        }
+        let result = self.save_entries(&entries);
+        zeroize_vault_entries(&mut entries);
+        result
+    }
+}
+
+/// Production keychain strategy for Linux app DB wrapping keys.
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionAppDbKeychain {
+    os: LinuxOsKeychain,
+    vault: Option<PassphraseVaultKeychain>,
+    use_os: bool,
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl ProductionAppDbKeychain {
+    /// Create a production keychain with optional encrypted vault fallback.
+    #[must_use]
+    pub fn new(os: LinuxOsKeychain, vault: Option<PassphraseVaultKeychain>) -> Self {
+        Self {
+            os,
+            vault,
+            use_os: true,
+        }
+    }
+
+    /// Create the default Linux production keychain.
+    #[must_use]
+    pub fn discrypt_app_db(vault: Option<PassphraseVaultKeychain>) -> Self {
+        Self::new(LinuxOsKeychain::discrypt_app_db(), vault)
+    }
+
+    /// Create a production keychain that requires the user-supplied encrypted
+    /// vault and does not read or write the OS keychain.
+    #[must_use]
+    pub fn vault_only(vault: PassphraseVaultKeychain) -> Self {
+        Self {
+            os: LinuxOsKeychain::discrypt_app_db(),
+            vault: Some(vault),
+            use_os: false,
+        }
+    }
+
+    fn vault_mut(&mut self) -> Option<&mut PassphraseVaultKeychain> {
+        self.vault.as_mut()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn production_keychain_fallback_error(
+    operation: &str,
+    os_error: AppStoreError,
+    vault_error: AppStoreError,
+) -> AppStoreError {
+    AppStoreError::Keychain(format!(
+        "OS keychain {operation} failed ({os_error}); configured encrypted vault fallback failed ({vault_error})"
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn production_keychain_degraded_vault_warning(operation: &str, os_error: &AppStoreError) -> String {
+    format!(
+        "OS keychain {operation} failed ({os_error}); continuing with explicitly configured encrypted vault fallback"
+    )
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn log_production_keychain_degraded_vault(operation: &str, os_error: &AppStoreError) {
+    eprintln!(
+        "[Discrypt production storage] {}",
+        production_keychain_degraded_vault_warning(operation, os_error)
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn production_keychain_delete_result(
+    os_result: Result<(), AppStoreError>,
+    vault_result: Result<(), AppStoreError>,
+) -> Result<(), AppStoreError> {
+    match (os_result, vault_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(os_error), Ok(())) => Err(os_error),
+        (Ok(()), Err(vault_error)) => Err(vault_error),
+        (Err(os_error), Err(vault_error)) => Err(production_keychain_fallback_error(
+            "delete",
+            os_error,
+            vault_error,
+        )),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl AppDbKeychain for ProductionAppDbKeychain {
+    fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
+        if !self.use_os {
+            return self
+                .vault_mut()
+                .ok_or_else(|| {
+                    AppStoreError::KeychainMissing("user password vault is not unlocked".to_owned())
+                })?
+                .load_wrapping_key(key_id);
+        }
+        match self.os.load_wrapping_key(key_id) {
+            Ok(Some(key)) => Ok(Some(key)),
+            Ok(None) => match self.vault_mut() {
+                Some(vault) => vault.load_wrapping_key(key_id),
+                None => Ok(None),
+            },
+            Err(os_error) => match self.vault_mut() {
+                Some(vault) => match vault.load_wrapping_key(key_id) {
+                    Ok(Some(key)) => {
+                        log_production_keychain_degraded_vault("load", &os_error);
+                        Ok(Some(key))
+                    }
+                    Ok(None) => Err(production_keychain_fallback_error(
+                        "load",
+                        os_error,
+                        AppStoreError::KeychainMissing(format!(
+                            "configured encrypted vault has no wrapping key for {key_id}"
+                        )),
+                    )),
+                    Err(vault_error) => Err(production_keychain_fallback_error(
+                        "load",
+                        os_error,
+                        vault_error,
+                    )),
+                },
+                None => Err(os_error),
+            },
+        }
+    }
+
+    fn store_wrapping_key(&mut self, key_id: &str, key: [u8; 32]) -> Result<(), AppStoreError> {
+        if !self.use_os {
+            return self
+                .vault_mut()
+                .ok_or_else(|| {
+                    AppStoreError::KeychainMissing("user password vault is not unlocked".to_owned())
+                })?
+                .store_wrapping_key(key_id, key);
+        }
+        match self.os.store_wrapping_key(key_id, key) {
+            Ok(()) => Ok(()),
+            Err(os_error) => match self.vault_mut() {
+                Some(vault) => match vault.store_wrapping_key(key_id, key) {
+                    Ok(()) => {
+                        log_production_keychain_degraded_vault("store", &os_error);
+                        Ok(())
+                    }
+                    Err(vault_error) => Err(production_keychain_fallback_error(
+                        "store",
+                        os_error,
+                        vault_error,
+                    )),
+                },
+                None => Err(os_error),
+            },
+        }
+    }
+
+    fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError> {
+        if !self.use_os {
+            return self
+                .vault_mut()
+                .ok_or_else(|| {
+                    AppStoreError::KeychainMissing("user password vault is not unlocked".to_owned())
+                })?
+                .delete_wrapping_key(key_id);
+        }
+        let os_result = self.os.delete_wrapping_key(key_id);
+        if let Some(vault) = self.vault_mut() {
+            let vault_result = vault.delete_wrapping_key(key_id);
+            return production_keychain_delete_result(os_result, vault_result);
+        }
+        os_result
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+const VAULT_FORMAT: &str = "discrypt.appdb.vault.v1";
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+const VAULT_KDF: &str = "argon2id-v0.5-default";
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PassphraseVaultEnvelope {
+    format: String,
+    kdf: String,
+    salt: [u8; 16],
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+impl PassphraseVaultEnvelope {
+    fn validate(&self) -> Result<(), AppStoreError> {
+        if self.format != VAULT_FORMAT {
+            return Err(AppStoreError::Crypto("unsupported Discrypt vault format"));
+        }
+        if self.kdf != VAULT_KDF {
+            return Err(AppStoreError::Crypto("unsupported Discrypt vault KDF"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn random_vault_salt() -> [u8; 16] {
+    let mut salt = [0_u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+#[cfg(all(target_os = "linux", feature = "production-storage"))]
+fn derive_vault_key(passphrase: &[u8], salt: &[u8; 16]) -> Result<[u8; 32], AppStoreError> {
+    let mut key = [0_u8; 32];
+    argon2::Argon2::default()
+        .hash_password_into(passphrase, salt, &mut key)
+        .map_err(|_| AppStoreError::Crypto("Discrypt vault key derivation failed"))?;
+    Ok(key)
 }
 
 /// File-backed encrypted application DB.
@@ -327,8 +765,11 @@ where
     }
 
     fn load_or_create_wrapping_key(&mut self) -> Result<[u8; 32], AppStoreError> {
-        if let Some(key) = self.keychain.load_wrapping_key(&self.key_id)? {
-            return Ok(key);
+        match self.keychain.load_wrapping_key(&self.key_id) {
+            Ok(Some(key)) => return Ok(key),
+            Ok(None) => {}
+            Err(error) if self.path.exists() => return Err(error),
+            Err(_) => {}
         }
         let key = random_key();
         self.keychain.store_wrapping_key(&self.key_id, key)?;
@@ -348,25 +789,47 @@ where
         };
         let envelope: EncryptedAppDbEnvelope = serde_json::from_slice(&bytes)?;
         envelope.validate()?;
-        let wrapping_key = self.load_wrapping_key(&envelope.key_id)?;
-        let mut data_key = decrypt_bytes(
+        let mut wrapping_key = self.load_wrapping_key(&envelope.key_id)?;
+        let mut data_key = match decrypt_bytes(
             &wrapping_key,
             &envelope.wrapped_key_nonce,
             &envelope.wrapped_data_key,
-        )?;
-        let plaintext = decrypt_bytes(&data_key, &envelope.data_nonce, &envelope.ciphertext)?;
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                wrapping_key.zeroize();
+                return Err(error);
+            }
+        };
+        let plaintext = decrypt_bytes(&data_key, &envelope.data_nonce, &envelope.ciphertext);
         data_key.zeroize();
-        Ok(Some(plaintext))
+        wrapping_key.zeroize();
+        Ok(Some(plaintext?))
     }
 
     fn save_app_state(&mut self, bytes: &[u8]) -> Result<(), AppStoreError> {
-        let wrapping_key = self.load_or_create_wrapping_key()?;
+        let mut wrapping_key = self.load_or_create_wrapping_key()?;
         let mut data_key = random_key();
         let wrapped_key_nonce = random_nonce();
         let data_nonce = random_nonce();
-        let wrapped_data_key = encrypt_bytes(&wrapping_key, &wrapped_key_nonce, &data_key)?;
-        let ciphertext = encrypt_bytes(&data_key, &data_nonce, bytes)?;
+        let wrapped_data_key = match encrypt_bytes(&wrapping_key, &wrapped_key_nonce, &data_key) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                data_key.zeroize();
+                wrapping_key.zeroize();
+                return Err(error);
+            }
+        };
+        let ciphertext = match encrypt_bytes(&data_key, &data_nonce, bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                data_key.zeroize();
+                wrapping_key.zeroize();
+                return Err(error);
+            }
+        };
         data_key.zeroize();
+        wrapping_key.zeroize();
 
         let envelope = EncryptedAppDbEnvelope {
             format: ENVELOPE_FORMAT.to_owned(),
@@ -1338,6 +1801,42 @@ mod tests {
                 .unwrap_or(false)
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct LoadErrorCountingKeychain {
+        store_attempts: Arc<Mutex<usize>>,
+    }
+
+    impl LoadErrorCountingKeychain {
+        fn store_attempts(&self) -> Result<usize, AppStoreError> {
+            self.store_attempts
+                .lock()
+                .map_err(|_| AppStoreError::LockPoisoned)
+                .map(|attempts| *attempts)
+        }
+    }
+
+    impl AppDbKeychain for LoadErrorCountingKeychain {
+        fn load_wrapping_key(&mut self, _key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
+            Err(AppStoreError::Keychain("native provider locked".to_owned()))
+        }
+
+        fn store_wrapping_key(
+            &mut self,
+            _key_id: &str,
+            _key: [u8; 32],
+        ) -> Result<(), AppStoreError> {
+            *self
+                .store_attempts
+                .lock()
+                .map_err(|_| AppStoreError::LockPoisoned)? += 1;
+            Ok(())
+        }
+
+        fn delete_wrapping_key(&mut self, _key_id: &str) -> Result<(), AppStoreError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn encrypted_app_db_round_trips_without_plaintext_in_db_or_wal() -> Result<(), AppStoreError> {
         let path = temp_db_path("roundtrip");
@@ -1371,6 +1870,25 @@ mod tests {
             .all(|key| !sensitive.windows(key.len()).any(|window| window == key)));
 
         let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_app_db_does_not_create_new_key_when_existing_store_keychain_load_fails(
+    ) -> Result<(), AppStoreError> {
+        let path = temp_db_path("existing-keychain-load-failure");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"existing encrypted envelope placeholder")?;
+        let keychain = LoadErrorCountingKeychain::default();
+        let mut db = EncryptedAppDb::new(&path, keychain.clone());
+
+        let error = db
+            .save_app_state(br#"{"body":"must not overwrite"}"#)
+            .expect_err("existing encrypted DB must fail closed when keychain load fails");
+
+        assert!(error.to_string().contains("native provider locked"));
+        assert_eq!(keychain.store_attempts()?, 0);
+        assert_eq!(fs::read(&path)?, b"existing encrypted envelope placeholder");
         Ok(())
     }
 
@@ -1437,7 +1955,151 @@ mod tests {
         fn assert_keychain<K: AppDbKeychain>(_keychain: K) {}
         let keychain = LinuxOsKeychain::discrypt_app_db();
         assert_eq!(keychain.service(), "discrypt.appdb");
+        assert_eq!(keychain.target(), "default");
+        assert_eq!(keychain.legacy_target(), "discrypt");
         assert_keychain(keychain);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_passphrase_vault_round_trips_without_plaintext_key() -> Result<(), AppStoreError>
+    {
+        let path = temp_db_path("discrypt-vault").with_extension("vault");
+        let _ = fs::remove_file(&path);
+        let key_id = "vault-key";
+        let key = [7; 32];
+        let mut vault = PassphraseVaultKeychain::new(&path, "correct horse battery staple");
+
+        vault.store_wrapping_key(key_id, key)?;
+        assert_eq!(vault.load_wrapping_key(key_id)?, Some(key));
+        let bytes = fs::read(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "vault file must be owner-read/write only");
+        }
+        assert!(
+            !bytes.windows(32).any(|window| window == key),
+            "vault must not contain the raw wrapping key"
+        );
+        vault.delete_wrapping_key(key_id)?;
+        assert_eq!(vault.load_wrapping_key(key_id)?, None);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_passphrase_vault_rejects_short_passphrase() {
+        let path = temp_db_path("discrypt-short-vault").with_extension("vault");
+        let _ = fs::remove_file(&path);
+        let mut vault = PassphraseVaultKeychain::new(&path, "too-short");
+
+        let error = vault
+            .store_wrapping_key("vault-key", [7; 32])
+            .expect_err("short vault passphrase must be rejected");
+        assert!(error.to_string().contains("at least 12 characters"));
+        assert!(!path.exists());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_passphrase_vault_debug_redacts_passphrase() {
+        let path = temp_db_path("discrypt-debug-vault").with_extension("vault");
+        let vault =
+            PassphraseVaultKeychain::new(&path, "debug-secret-passphrase-that-must-not-leak");
+        let debug = format!("{vault:?}");
+
+        assert!(debug.contains("PassphraseVaultKeychain"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("debug-secret-passphrase-that-must-not-leak"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_keychain_fallback_error_preserves_both_failure_signals() {
+        let error = production_keychain_fallback_error(
+            "store",
+            AppStoreError::Keychain("native provider locked".to_owned()),
+            AppStoreError::Keychain(
+                "Discrypt vault passphrase must be at least 12 characters".to_owned(),
+            ),
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("OS keychain store failed"));
+        assert!(rendered.contains("native provider locked"));
+        assert!(rendered.contains("configured encrypted vault fallback failed"));
+        assert!(rendered.contains("at least 12 characters"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_degraded_vault_warning_preserves_os_failure_signal() {
+        let warning = production_keychain_degraded_vault_warning(
+            "load",
+            &AppStoreError::Keychain("native provider locked".to_owned()),
+        );
+
+        assert!(warning.contains("OS keychain load failed"));
+        assert!(warning.contains("native provider locked"));
+        assert!(warning.contains("explicitly configured encrypted vault fallback"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_delete_preserves_os_keychain_failure_when_vault_delete_succeeds() {
+        let error = production_keychain_delete_result(
+            Err(AppStoreError::Keychain(
+                "native delete permission denied".to_owned(),
+            )),
+            Ok(()),
+        )
+        .expect_err("OS keychain delete failure must not be masked by vault cleanup success");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("native delete permission denied"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn linux_legacy_delete_only_ignores_no_entry() {
+        assert!(legacy_delete_result(Ok(())).is_ok());
+        assert!(legacy_delete_result(Err(keyring::Error::NoEntry)).is_ok());
+
+        let error = legacy_delete_result(Err(keyring::Error::Invalid(
+            "legacy-target".to_owned(),
+            "delete denied".to_owned(),
+        )))
+        .expect_err("legacy delete errors other than NoEntry must be reported");
+        assert!(error.to_string().contains("delete denied"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn linux_secret_service_keychain_live_roundtrip_when_enabled() -> Result<(), AppStoreError> {
+        if std::env::var("DISCRYPT_LINUX_SECRET_SERVICE_E2E")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            eprintln!(
+                "skipping live Linux Secret Service keychain roundtrip; set DISCRYPT_LINUX_SECRET_SERVICE_E2E=1"
+            );
+            return Ok(());
+        }
+
+        let service = format!("discrypt.appdb.e2e.{}", std::process::id());
+        let key_id = "live-secret-service-key";
+        let key = [42; 32];
+        let mut keychain = LinuxOsKeychain::new(service);
+
+        let _ = keychain.delete_wrapping_key(key_id);
+        keychain.store_wrapping_key(key_id, key)?;
+        assert_eq!(keychain.load_wrapping_key(key_id)?, Some(key));
+        keychain.delete_wrapping_key(key_id)?;
+        assert_eq!(keychain.load_wrapping_key(key_id)?, None);
+        Ok(())
     }
 
     #[test]

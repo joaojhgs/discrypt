@@ -20,11 +20,23 @@ const failures = [];
 for (const bundle of ["deb", "rpm", "appimage"]) {
   if (!plan.bundles.includes(bundle)) failures.push(`missing Linux bundle target: ${bundle}`);
 }
+for (const dep of ["gnome-keyring", "dbus-user-session", "libpam-gnome-keyring"]) {
+  if (!plan.linuxRuntimeDependencies?.deb?.includes(dep)) {
+    failures.push(`release plan missing Debian runtime dependency: ${dep}`);
+  }
+}
+if (!plan.linuxRuntimeDependencies?.rpm?.includes("gnome-keyring")) {
+  failures.push("release plan missing RPM runtime dependency: gnome-keyring");
+}
 for (const feature of [
   "tauri-runtime",
   "production-network",
   "production-media",
   "production-storage",
+  "mqtt-adapter",
+  "nostr-adapter",
+  "ipfs-pubsub-adapter",
+  "discrypt-quic-rendezvous-adapter",
 ]) {
   if (!plan.releaseFeatures.includes(feature)) failures.push(`missing release feature: ${feature}`);
 }
@@ -45,8 +57,12 @@ for (const token of [
 ]) {
   if (!rendered.includes(token)) failures.push(`release plan missing command token: ${token}`);
 }
-if (!String(plan.tauriConfigPath).endsWith("apps/desktop/src-tauri/tauri.conf.json")) {
-  failures.push("release plan must use the desktop Tauri config");
+if (!String(plan.tauriConfigPath).endsWith("apps/desktop/src-tauri/tauri.release.conf.json")) {
+  failures.push("release plan must use the production desktop Tauri release config");
+}
+for (const feature of ["harness", "local-dev"]) {
+  if (plan.tauriBuildFeatures?.includes(feature)) failures.push(`release Tauri config must exclude harness/local-dev feature: ${feature}`);
+  if (plan.effectiveReleaseFeatures?.includes(feature)) failures.push(`effective release features must exclude harness/local-dev feature: ${feature}`);
 }
 if (!plan.sourceDateEpoch) failures.push("release plan missing SOURCE_DATE_EPOCH");
 for (const feature of ["harness", "local-dev"]) {

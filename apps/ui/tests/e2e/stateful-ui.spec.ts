@@ -86,6 +86,43 @@ async function bootReadyShell(page) {
       configurable: true,
       value: E2EAudioContext,
     });
+    class E2ERtcPeerConnection {
+      onicecandidate: ((event: unknown) => void) | null = null;
+      ontrack: ((event: unknown) => void) | null = null;
+      connectionState = "new";
+      iceConnectionState = "new";
+      addTrack(track: unknown, stream: unknown) {
+        window.queueMicrotask(() => {
+          this.connectionState = "connected";
+          this.iceConnectionState = "connected";
+          this.onicecandidate?.({ candidate: null });
+        });
+        return { track, stream };
+      }
+      createOffer() {
+        return Promise.resolve({ type: "offer", sdp: "v=0\r\na=mid:audio\r\n" });
+      }
+      createAnswer() {
+        return Promise.resolve({ type: "answer", sdp: "v=0\r\na=mid:audio\r\n" });
+      }
+      setLocalDescription() {
+        return Promise.resolve();
+      }
+      setRemoteDescription() {
+        return Promise.resolve();
+      }
+      addIceCandidate() {
+        return Promise.resolve();
+      }
+      close() {
+        this.connectionState = "closed";
+        this.iceConnectionState = "closed";
+      }
+    }
+    Object.defineProperty(window, "RTCPeerConnection", {
+      configurable: true,
+      value: E2ERtcPeerConnection,
+    });
   });
   await page.goto("/");
   await expect(
@@ -101,6 +138,27 @@ async function bootReadyShell(page) {
   return errors;
 }
 
+
+async function openLauncher(page) {
+  await page.getByRole("button", { name: "Add group or direct message", exact: true }).click();
+}
+
+async function openCreateGroupModal(page) {
+  await openLauncher(page);
+  await page.getByRole("button", { name: /create a new group/i }).click();
+}
+
+async function openGroupInviteModal(page, groupName = "Private Lab") {
+  await page.getByRole("button", { name: new RegExp(`Open ${groupName} group`, "i") }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: /create invite/i }).click();
+}
+
+async function startDirectMessage(page, contactName = "Local Friend") {
+  await openLauncher(page);
+  await page.getByLabel("Contact name").fill(contactName);
+  await page.getByRole("button", { name: /start direct message/i }).click();
+}
+
 test.beforeEach(async ({ page }) => {
   await bootReadyShell(page);
 });
@@ -108,12 +166,9 @@ test.beforeEach(async ({ page }) => {
 test("first run creates user and empty shell does not blank", async ({
   page,
 }) => {
-  await page.getByRole("button", { name: "New message" }).click();
+  await startDirectMessage(page);
   await expect(
-    page.getByRole("heading", { name: /New contact/i }).first(),
-  ).toBeVisible();
-  await expect(
-    page.getByText(/Local DM seeded from a generated friend-code\/QR payload/i).first(),
+    page.getByRole("heading", { name: /Local Friend/i }).first(),
   ).toBeVisible();
 });
 
@@ -154,9 +209,9 @@ test("direct message send stays command-backed", async ({ page }) => {
     if (message.type() === "error") errors.push(message.text());
   });
 
-  await page.getByRole("button", { name: "New message" }).click();
+  await startDirectMessage(page);
   await expect(
-    page.getByRole("heading", { name: /New contact/i }).first(),
+    page.getByRole("heading", { name: /Local Friend/i }).first(),
   ).toBeVisible();
   await page
     .getByRole("textbox", { name: "Message" })
@@ -176,7 +231,7 @@ test("group invite join text channel and voice controls work without fake member
     if (message.type() === "error") errors.push(message.text());
   });
 
-  await page.getByRole("button", { name: "Create group" }).click();
+  await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill("Private Lab");
   await page
     .locator('select[aria-label="Signaling adapter"]')
@@ -198,11 +253,9 @@ test("group invite join text channel and voice controls work without fake member
     page.getByText("TURN credential gate", { exact: true }),
   ).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Join group" }).click();
-  await page
-    .getByRole("button", { name: /create invite for active group/i })
-    .click();
-  const inviteSheet = page.getByRole("dialog", { name: "Invites" });
+  await openGroupInviteModal(page);
+  await page.getByRole("button", { name: /create invite for/i }).click();
+  const inviteSheet = page.getByRole("dialog", { name: "Create group invite" });
   await expect(inviteSheet.getByText(/discrypt:\/\/join\/v1/i).first()).toBeVisible();
   await expect(
     inviteSheet.getByText("Signaling endpoint", { exact: true }),
@@ -229,13 +282,15 @@ test("group invite join text channel and voice controls work without fake member
     inviteSheet.getByText("ICE/STUN metadata", { exact: true }),
   ).toBeVisible();
   await expect(inviteSheet.getByText("TURN metadata", { exact: true })).toBeVisible();
-  await inviteSheet.getByRole("button", { name: /use latest invite/i }).click();
-  await inviteSheet.getByRole("button", { name: /join\/open group/i }).click();
+  await page.getByRole("button", { name: /Close Create group invite/i }).click();
   await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+  await expect(page.getByText(/discrypt:\/\/join\/v1/i)).toHaveCount(0);
+  await expect(page.getByText(/Invite ready/i)).toHaveCount(0);
+  await expect(page.getByText(/Action failed/i)).toHaveCount(0);
 
-  await page.getByRole("button", { name: /create channel/i }).click();
-  await page.getByLabel("Channel name").fill("ops-room");
-  await page.getByRole("button", { name: "Text" }).last().click();
+  await page.getByRole("button", { name: /Add text channel/i }).click();
+  await page.getByLabel("Text channel name").fill("ops-room");
+  await page.getByLabel("Text channel name").press("Enter");
   await expect(page.getByText("#ops-room").first()).toBeVisible();
   await page
     .getByRole("textbox", { name: "Message" })
@@ -243,7 +298,7 @@ test("group invite join text channel and voice controls work without fake member
   await page.getByRole("button", { name: /^Send message$/ }).click();
   await expect(page.getByText(/text channel should dominate/i)).toBeVisible();
 
-  await page.getByRole("button", { name: "Create group" }).click();
+  await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill("Second Lab");
   await page
     .getByRole("button", { name: /^Create group$/ })
@@ -253,27 +308,20 @@ test("group invite join text channel and voice controls work without fake member
   await page.getByRole("button", { name: /Open Private Lab group/i }).click();
   await expect(page.getByText(/Private Lab/i).first()).toBeVisible();
 
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  const voiceConfig = page.getByRole("dialog", { name: "Config" });
+  await voiceConfig.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
+  await expect(voiceConfig.getByTestId("voice-mic-selector")).toHaveValue(
+    "backup-e2e-mic",
+  );
+  await page.getByRole("button", { name: /Close Config/i }).click();
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await expect(page.getByTestId("voice-dock")).toBeVisible();
+  await expect(page.getByTestId("voice-sidebar-status")).toBeVisible();
   await expect(
     page.getByRole("button", { name: /Voice Lobby/ }).first(),
   ).toHaveAttribute("aria-current", "page");
-  await expect(page.getByTestId("voice-mic-selector")).toBeEnabled();
-  await page.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
-  await expect(page.getByTestId("voice-mic-selector")).toHaveValue(
-    "backup-e2e-mic",
-  );
-  await page.getByRole("button", { name: /join call/i }).click();
-  await expect(page.getByTestId("voice-mic-selector")).toBeDisabled();
-  await expect(
-    page
-      .getByTestId("voice-dock")
-      .locator("p")
-      .filter({ hasText: /Backup E2E microphone/ }),
-  ).toBeVisible();
-  await expect(page.getByText(/You · you/)).toBeVisible();
-  await expect(page.getByText(/speaking now/).first()).toBeVisible();
-  await expect(page.getByText(/Call status/i)).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
+  await expect(page.getByText(/You/).first()).toBeVisible();
   // Coverage token: Local microphone level comes from the active MediaStream analyser.
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
     0,
@@ -282,11 +330,11 @@ test("group invite join text channel and voice controls work without fake member
   await expect(page.getByTestId("voice-remote-audio")).toHaveCount(0);
   await expect(page.getByText(/New contact · friend/)).toHaveCount(0);
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
-  await page.getByRole("switch", { name: /mute my microphone/i }).click();
-  await expect(page.getByText(/muted/).first()).toBeVisible();
+  await page.getByRole("button", { name: /^Mute$/i }).click();
+  await expect(page.getByRole("button", { name: /^Unmute$/i })).toBeVisible();
   await expect(page.getByTestId("voice-remote-volume")).toHaveCount(0);
-  await page.getByRole("button", { name: /leave call/i }).click();
-  await expect(page.getByText(/not in voice/i)).toBeVisible();
+  await page.getByRole("button", { name: /Leave voice call/i }).click();
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
   await expect(page.getByText(/Private Lab/i).first()).toBeVisible();
   expect(errors).toEqual([]);
 });
@@ -301,16 +349,37 @@ test("small-window navigation exposes setup groups invites text and voice withou
     1,
   );
   await expect(
-    page.getByRole("button", { name: "Create group" }),
+    page.getByRole("button", { name: "Add group or direct message", exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Join group" })).toBeVisible();
-  await page.getByRole("button", { name: "Create group" }).click();
+  await expect(page.getByRole("button", { name: "Add group or direct message", exact: true })).toBeVisible();
+  await openCreateGroupModal(page);
   await expect(page.getByLabel("Group name")).toBeVisible();
   await page.getByRole("button", { name: /Close Create group/i }).click();
-  await page.getByRole("button", { name: "Join group" }).click();
+  await openLauncher(page);
   await expect(
     page.getByRole("button", { name: /join\/open group/i }),
   ).toBeVisible();
+  await page.getByRole("button", { name: /Close Add group or direct message/i }).click();
+
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Mobile Voice Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Voice" }).click();
+  await expect(
+    page.getByRole("heading", { name: /Voice rooms/i }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(page.getByTestId("voice-sidebar-status")).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
+  await page.getByRole("button", { name: /^Mute$/i }).click();
+  await expect(page.getByRole("button", { name: /^Unmute$/i })).toBeVisible();
+  await page.getByRole("button", { name: /Leave voice call/i }).click();
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
+
   const horizontalOverflow = await page.evaluate(
     () =>
       document.documentElement.scrollWidth -
@@ -330,7 +399,7 @@ test("transport diagnostics stay hidden by default before invite metadata", asyn
 });
 
 test("local-dev e2e persistence survives browser reload", async ({ page }) => {
-  await page.getByRole("button", { name: "Create group" }).click();
+  await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill("Persistent Lab");
   await page
     .getByRole("button", { name: /^Create group$/ })
@@ -340,18 +409,50 @@ test("local-dev e2e persistence survives browser reload", async ({ page }) => {
     .getByRole("textbox", { name: "Message" })
     .fill("message survives reload");
   await page.getByRole("button", { name: /^Send message$/ }).click();
-  await page.getByLabel("Theme").selectOption("ocean-contrast");
-  await expect(page.getByLabel("Theme")).toHaveValue("ocean-contrast");
-  await page.getByLabel("Template").selectOption("compact-ops");
-  await expect(page.getByLabel("Template")).toHaveValue("compact-ops");
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  const configDialog = page.getByRole("dialog", { name: "Config" });
+  await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
+  await expect(configDialog.getByLabel("Theme")).toHaveValue("ocean-contrast");
+  await page.getByRole("button", { name: /Close Config/i }).click();
 
   await page.reload();
 
   await expect(page.getByText(/Persistent Lab/i).first()).toBeVisible();
   await page.getByRole("button", { name: /\#general/ }).click();
   await expect(page.getByText(/message survives reload/i)).toBeVisible();
-  await expect(page.getByLabel("Theme")).toHaveValue("ocean-contrast");
-  await expect(page.getByLabel("Template")).toHaveValue("compact-ops");
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Config" }).getByLabel("Theme")).toHaveValue("ocean-contrast");
+  await page.getByRole("button", { name: /Close Config/i }).click();
+});
+
+test("voice channel membership is runtime-only across browser reload", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Runtime Voice Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(page.getByTestId("voice-sidebar-status")).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
+
+  await page.reload();
+
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /Voice Lobby/ }).first(),
+  ).not.toHaveAttribute("aria-current", "page");
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
+  await page.getByRole("button", { name: /Leave voice call/i }).click();
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
 });
 
 // Coverage note: transport status surfaces signaling not-ready state before invite metadata when the diagnostics inspector is explicitly enabled; production default keeps it hidden.
@@ -364,7 +465,7 @@ test("production UX hides diagnostics and manual transport controls by default",
   await expect(page.getByRole("button", { name: "Inspector" })).toHaveCount(0);
   await expect(page.getByText(/runtime mode:/i)).toHaveCount(0);
 
-  await page.getByRole("button", { name: "New message" }).click();
+  await startDirectMessage(page);
   await expect(page.locator("#runtime-local-peer")).toHaveCount(0);
   await expect(page.locator("#runtime-remote-peer")).toHaveCount(0);
   await expect(
@@ -381,7 +482,7 @@ test("production UX hides diagnostics and manual transport controls by default",
   ).toHaveCount(0);
   await expect(page.getByText(/manual pairing|QR pairing/i)).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Create group" }).click();
+  await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill("Policy Lab");
   await page
     .getByRole("button", { name: /^Create group$/ })
@@ -389,18 +490,16 @@ test("production UX hides diagnostics and manual transport controls by default",
     .click();
   await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "Join group" }).click();
-  await page
-    .getByRole("button", { name: /create invite for active group/i })
-    .click();
-  const inviteSheet = page.getByRole("dialog", { name: "Invites" });
+  await openGroupInviteModal(page, "Policy Lab");
+  await page.getByRole("button", { name: /create invite for/i }).click();
+  const inviteSheet = page.getByRole("dialog", { name: "Create group invite" });
   await expect(inviteSheet.getByText(/discrypt:\/\/join\/v1/i).first()).toBeVisible();
-  await expect(inviteSheet.getByText(/Rendezvous link/i)).toBeVisible();
-  await page.getByRole("button", { name: /Close Invites/i }).click();
+  await expect(inviteSheet.getByText(/Signaling endpoint/i)).toBeVisible();
+  await page.getByRole("button", { name: /Close Create group invite/i }).click();
 
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await page.getByRole("button", { name: /join call/i }).click();
-  await expect(page.getByText(/Call status/i)).toBeVisible();
+  await expect(page.getByTestId("voice-sidebar-status")).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
   await expect(
     page.getByText("TURN relay gate", { exact: true }),
   ).toHaveCount(0);

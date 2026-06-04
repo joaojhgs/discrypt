@@ -33,7 +33,7 @@ GUI/WebDriver runner can pass `--run` to start one shared Vite dev server and tw
 concurrent Tauri instances with separate `DISCRYPT_APP_STATE_PATH` values. The
 wrapper captures Vite, Alice, and Bob process logs under `logs/` and leaves UI
 screenshots to the WebDriver layer under `screenshots/`. The default
-`DISCRYPT_G010_TAURI_FEATURES` is `tauri-runtime,local-dev` because the desktop
+`DISCRYPT_G010_TAURI_FEATURES` is `tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter` because the desktop
 state-path override is intentionally honored only in test/harness/local-dev
 builds; override it only with a feature set that still includes `tauri-runtime`
 and either `local-dev` or `harness`. This is profile-isolation harness evidence,

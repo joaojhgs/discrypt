@@ -843,7 +843,7 @@ const children = [];
 try {
   if (!skipBuild || !existsSync(appBinary)) {
     const ui = runCommand("ui-build", "npm", ["--prefix", "apps/ui", "run", "build"], repoRoot);
-    const tauri = runCommand("tauri-debug-build", "cargo", ["tauri", "build", "--debug", "--no-bundle", "--features", "tauri-runtime,local-dev,mqtt-adapter,nostr-adapter"], resolve(repoRoot, "apps/desktop/src-tauri"));
+    const tauri = runCommand("tauri-debug-build", "cargo", ["tauri", "build", "--debug", "--no-bundle", "--features", "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter"], resolve(repoRoot, "apps/desktop/src-tauri"));
     manifest.build = { ui, tauri };
   }
   writeManifest("starting-drivers");

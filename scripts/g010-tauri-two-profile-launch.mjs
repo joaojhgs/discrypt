@@ -23,7 +23,7 @@ if (!Number.isInteger(devServerPort) || devServerPort <= 0 || devServerPort > 65
   process.exit(2);
 }
 const devServerUrl = `http://127.0.0.1:${devServerPort}`;
-const tauriFeatures = (process.env.DISCRYPT_G010_TAURI_FEATURES || "tauri-runtime,local-dev")
+const tauriFeatures = (process.env.DISCRYPT_G010_TAURI_FEATURES || "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter")
   .split(",")
   .map((feature) => feature.trim())
   .filter(Boolean);

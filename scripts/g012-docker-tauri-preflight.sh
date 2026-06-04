@@ -32,7 +32,7 @@ apt-get install -y --no-install-recommends \
 npm --prefix apps/ui ci
 npm --prefix apps/ui run typecheck
 npm --prefix apps/ui run build
-cargo build -p discrypt-desktop --features tauri-runtime,local-dev
+cargo build -p discrypt-desktop --features tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter
 if [ ! -x "$DISCRYPT_G012_TAURI_DRIVER" ]; then
   cargo install tauri-driver --locked || cargo install tauri-driver
 fi

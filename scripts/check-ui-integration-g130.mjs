@@ -59,7 +59,8 @@ for (const token of [
   "joinVoice",
   "leaveVoice",
   "setSelfMute",
-  "setSpeakerVolume",
+  "updateVoiceActivity",
+  "attachVoiceRemoteMedia",
   "verifySafetyNumber",
   "savePreferences",
   "resetAppState",
@@ -67,21 +68,22 @@ for (const token of [
 
 for (const token of [
   "Set up your local discrypt profile",
-  "Workspace sections",
   "Direct messages",
   "Create group",
-  "Create invite for active group",
+  "Create group invite",
+  "Group configuration",
   "Signaling endpoint",
-  "Trust fingerprint",
-  "Room secret commitment",
-  "ICE/STUN metadata",
-  "TURN metadata",
+  "Invite ready",
+  "Copy invite",
+  "Max uses",
+  "STUN/TURN",
   "Message",
-  "Join call",
-  "Mute my microphone",
-  "Media route proof",
-  "Remote audio blocker",
-  "Speaker",
+  "Tap to join voice",
+  "Click a voice channel to join",
+  "Leave voice call",
+  "Mute",
+  "Microphone input",
+  "App output device",
   "Transport status",
 ]) requireText("main", token);
 
@@ -90,23 +92,13 @@ for (const token of [
   "midnight-steel",
   "graphite-calm",
   "ocean-contrast",
-  "templates: [",
-  "command-center",
-  "compact-ops",
   "accentIntent",
   "no neon/purple gradients",
   "shadcnComponentInventory",
   "src/components/ui/button.tsx",
   "src/components/ui/select.tsx",
-  "--template-shell-grid",
-  "--template-shell-grid-inspector",
   "--template-panel-radius",
 ]) requireText("config", token);
-
-for (const token of [
-  "var(--template-shell-grid)",
-  "var(--template-shell-grid-inspector)",
-]) requireText("main", token);
 requireCount("main", /<MobileWorkflowNav\b/g, 1, "mobile workflow navigation render");
 requireCount("main", /<RuntimeModeBanner\b/g, 1, "runtime mode banner render");
 requireCount("main", /<TransportStatusStrip\b/g, 1, "transport diagnostics strip render");
@@ -167,4 +159,4 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`- ${failure}`);
   process.exit(1);
 }
-console.log("G130 UI integration gate passed: production commands are surfaced through shadcn-owned UI, configurable themes/templates, and Playwright coverage for setup/recovery/DM/group/invite/text/voice/persistence.");
+console.log("G130 UI integration gate passed: production commands are surfaced through shadcn-owned UI, configurable themes, contextual group/invite/audio controls, and Playwright coverage for setup/recovery/DM/group/invite/text/voice/persistence.");

@@ -56,7 +56,7 @@ for (const token of [
   "dev",
   "--app-mode=",
   "DISCRYPT_G010_TAURI_FEATURES",
-  "tauri-runtime,local-dev",
+  "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter",
   "must include local-dev or harness",
   "profile_isolation_env",
   "manual_pairing_required",
@@ -79,7 +79,7 @@ for (const token of [
   "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E",
   "DISCRYPT_PUBLIC_TURN_E2E",
   "DISCRYPT_G010_TAURI_FEATURES",
-  "tauri-runtime,local-dev",
+  "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter",
 ]) {
   requireText("g010 docs", docs, token);
 }

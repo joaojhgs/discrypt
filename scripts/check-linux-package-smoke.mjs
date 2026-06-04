@@ -31,6 +31,7 @@ for (const [key, suffix] of [
   }
 }
 const rendered = plan.steps.map((step) => step.rendered).join("\n");
+const planText = JSON.stringify(plan);
 for (const token of [
   "dpkg-deb -I",
   "deb-install-launch",
@@ -38,6 +39,15 @@ for (const token of [
   "appimage-launch",
 ]) {
   if (!rendered.includes(token)) failures.push(`package smoke dry-run missing token: ${token}`);
+}
+for (const token of [
+  "gnome-keyring",
+  "dbus-user-session",
+  "libpam-gnome-keyring",
+  "org.freedesktop.secrets",
+  "gnome-keyring-daemon --start --components=secrets",
+]) {
+  if (!planText.includes(token)) failures.push(`package smoke dry-run missing Secret Service token: ${token}`);
 }
 for (const image of [
   "mcr.microsoft.com/playwright:v1.58.2-noble",

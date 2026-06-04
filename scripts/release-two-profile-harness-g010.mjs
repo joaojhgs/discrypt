@@ -246,7 +246,7 @@ async function launchBuiltProfiles() {
     profiles: Object.fromEntries(Object.entries(profileState).map(([name, path]) => [name, rel(path)])),
   };
   if (!launchBuilt) return { ...step, status: "skipped", reason: "set --launch-built or DISCRYPT_G010_LAUNCH_BUILT=1 after building the Tauri binary" };
-  if (!existsSync(binary)) throw new Error(`built Tauri binary not found at ${binary}; run npm --prefix apps/ui run release:linux or cargo build --release -p discrypt-desktop --features tauri-runtime,local-dev first so DISCRYPT_APP_STATE_PATH profile isolation is honored`);
+  if (!existsSync(binary)) throw new Error(`built Tauri binary not found at ${binary}; run npm --prefix apps/ui run release:linux or cargo build --release -p discrypt-desktop --features tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter first so DISCRYPT_APP_STATE_PATH profile isolation is honored and provider adapters are compiled`);
   if (dryRun) return { ...step, status: "planned" };
   mkdirSync(resolve(profileRoot, "alice"), { recursive: true });
   mkdirSync(resolve(profileRoot, "bob"), { recursive: true });

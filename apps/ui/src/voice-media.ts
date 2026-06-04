@@ -28,6 +28,7 @@ export type VoiceRemoteMediaEvidence = {
 export type VoiceMediaSessionHandle = {
   close: () => void;
   setMuted: (muted: boolean) => void;
+  setInputGain?: (gainPercent: number) => void;
 };
 
 type VoiceSignalKind = "offer" | "answer" | "candidate";
@@ -58,6 +59,7 @@ const LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED =
 type StartVoiceMediaSessionOptions = {
   session: VoiceSessionView;
   localStream: MediaStream;
+  inputGain?: number;
   localPeerId: string;
   remotePeerId: string;
   role: VoiceMediaRole;
@@ -184,16 +186,23 @@ export function startNativeRustVoiceMediaSession(
       if (evidenceTarget.__discryptG012WebDriverVoiceEvidence) {
         evidenceTarget.__discryptG012WebDriverVoiceEvidence.trackEnabled = !muted;
       }
-      if (!muted) return;
-      options.onStatus?.("Native Rust voice media mute is recorded by backend self-mute state");
+      // Native Rust media proof sessions are backend-owned. The actual mute state
+      // is applied by the `set_self_mute` command and reflected in backend
+      // participant/session state; this handle only mirrors WebDriver evidence.
     },
+    setInputGain: () => undefined,
   };
 }
 
 export function startWebViewVoiceMediaSession(
   options: StartVoiceMediaSessionOptions,
 ): VoiceMediaSessionHandle | null {
-  const audioTracks = localAudioTracks(options.localStream);
+  const processedCapture = createGainControlledStream(
+    options.localStream,
+    options.inputGain ?? 100,
+  );
+  const outboundStream = processedCapture.stream;
+  const audioTracks = localAudioTracks(outboundStream);
   if (
     typeof RTCPeerConnection === "undefined" ||
     audioTracks.length === 0 ||
@@ -216,7 +225,7 @@ export function startWebViewVoiceMediaSession(
 
   try {
     for (const track of audioTracks) {
-      pc.addTrack(track, options.localStream);
+      pc.addTrack(track, outboundStream);
     }
   } catch (error) {
     pc.close();
@@ -362,13 +371,70 @@ export function startWebViewVoiceMediaSession(
       pc.onicecandidate = null;
       pc.ontrack = null;
       pc.close();
+      processedCapture.close();
     },
     setMuted: (muted) => {
-      for (const track of audioTracks) {
+      for (const track of [
+        ...localAudioTracks(options.localStream),
+        ...audioTracks,
+      ]) {
         track.enabled = !muted;
       }
     },
+    setInputGain: (gainPercent) => {
+      processedCapture.setGain(gainPercent);
+    },
   };
+}
+
+function createGainControlledStream(
+  stream: MediaStream,
+  gainPercent: number,
+): {
+  stream: MediaStream;
+  setGain: (gainPercent: number) => void;
+  close: () => void;
+} {
+  const AudioContextCtor = window.AudioContext;
+  if (!AudioContextCtor || typeof MediaStreamAudioSourceNode === "undefined") {
+    return {
+      stream,
+      setGain: () => undefined,
+      close: () => undefined,
+    };
+  }
+  try {
+    const context = new AudioContextCtor();
+    const source = context.createMediaStreamSource(stream);
+    const gain = context.createGain();
+    const destination = context.createMediaStreamDestination();
+    const setGain = (nextPercent: number) => {
+      gain.gain.value = Math.max(0, Math.min(2, nextPercent / 100));
+    };
+    setGain(gainPercent);
+    source.connect(gain);
+    gain.connect(destination);
+    return {
+      stream: destination.stream,
+      setGain,
+      close: () => {
+        try {
+          source.disconnect();
+          gain.disconnect();
+          void context.close();
+        } catch {
+          // Closing media graph nodes is best effort; track cleanup is owned by
+          // the caller's local capture stream.
+        }
+      },
+    };
+  } catch {
+    return {
+      stream,
+      setGain: () => undefined,
+      close: () => undefined,
+    };
+  }
 }
 
 function recordG012NativeVoiceEvidence(update: {

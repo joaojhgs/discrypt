@@ -1,7 +1,21 @@
 import { expect, test } from "playwright/test";
 import { bootReadyShell, expectNoProductionCopyDebt } from "./support/app-shell";
 
-test("approved production smoke covers setup, text, invites, settings, and voice dock", async ({
+async function openLauncher(page) {
+  await page.getByRole("button", { name: "Add group or direct message", exact: true }).click();
+}
+
+async function openCreateGroupModal(page) {
+  await openLauncher(page);
+  await page.getByRole("button", { name: /create a new group/i }).click();
+}
+
+async function openGroupInviteModal(page, groupName) {
+  await page.getByRole("button", { name: new RegExp(`Open ${groupName} group`, "i") }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: /create invite/i }).click();
+}
+
+test("approved production smoke covers setup, text, invites, config, text, invites, and voice sidebar", async ({
   page,
 }) => {
   const errors = await bootReadyShell(page);
@@ -9,12 +23,16 @@ test("approved production smoke covers setup, text, invites, settings, and voice
 
   await page.getByRole("button", { name: /mark as verified/i }).click();
   await expect(page.getByText("4/4").first()).toBeVisible();
-  await page.getByLabel("Theme").selectOption("ocean-contrast");
-  await expect(page.getByLabel("Theme")).toHaveValue("ocean-contrast");
-  await page.getByLabel("Template").selectOption("compact-ops");
-  await expect(page.getByLabel("Template")).toHaveValue("compact-ops");
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  const configDialog = page.getByRole("dialog", { name: "Config" });
+  await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
+  await expect(configDialog.getByLabel("Theme")).toHaveValue("ocean-contrast");
+  await configDialog.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
+  await expect(configDialog.getByTestId("voice-mic-selector")).toHaveValue("backup-e2e-mic");
+  await configDialog.getByLabel("App output device").selectOption("default");
+  await page.getByRole("button", { name: /Close Config/i }).click();
 
-  await page.getByRole("button", { name: "Create group" }).first().click();
+  await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill("Production Smoke Lab");
   await page
     .locator('select[aria-label="Signaling adapter"]')
@@ -41,9 +59,9 @@ test("approved production smoke covers setup, text, invites, settings, and voice
   ).toHaveCount(0);
   await expect(page.getByText("TURN credential gate", { exact: true })).toHaveCount(0);
 
-  await page.getByRole("button", { name: /create channel/i }).click();
-  await page.getByLabel("Channel name").fill("ops-smoke");
-  await page.getByRole("button", { name: "Text" }).last().click();
+  await page.getByRole("button", { name: /Add text channel/i }).click();
+  await page.getByLabel("Text channel name").fill("ops-smoke");
+  await page.getByLabel("Text channel name").press("Enter");
   await expect(page.getByRole("heading", { name: "#ops-smoke" })).toBeVisible();
   await page
     .getByRole("textbox", { name: "Message" })
@@ -53,11 +71,9 @@ test("approved production smoke covers setup, text, invites, settings, and voice
     page.getByText("production smoke text remains visible"),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: "Join group" }).click();
-  await page
-    .getByRole("button", { name: /create invite for active group/i })
-    .click();
-  const inviteSheet = page.getByRole("dialog", { name: "Invites" });
+  await openGroupInviteModal(page, "Production Smoke Lab");
+  await page.getByRole("button", { name: /create invite for/i }).click();
+  const inviteSheet = page.getByRole("dialog", { name: "Create group invite" });
   await expect(
     inviteSheet.getByRole("heading", { name: "Latest invite descriptor" }),
   ).toBeVisible();
@@ -66,22 +82,18 @@ test("approved production smoke covers setup, text, invites, settings, and voice
   await expect(inviteSheet.getByText("TURN metadata", { exact: true })).toBeVisible();
   await expectNoProductionCopyDebt(page);
 
-  await page.getByRole("button", { name: /Close Invites/i }).click();
+  await page.getByRole("button", { name: /Close Create group invite/i }).click();
+  await expect(page.getByText(/discrypt:\/\/join\/v1/i)).toHaveCount(0);
+  await expect(page.getByText(/Invite ready/i)).toHaveCount(0);
+  await expect(page.getByText(/Action failed/i)).toHaveCount(0);
 
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await expect(page.getByTestId("voice-dock")).toBeVisible();
-  await expect(page.getByTestId("voice-mic-selector")).toBeEnabled();
+  await expect(page.getByTestId("voice-sidebar-status")).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
   await expect(page.getByRole("heading", { name: "#ops-smoke" })).toBeVisible();
-  await page.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
-  await expect(page.getByTestId("voice-mic-selector")).toHaveValue(
-    "backup-e2e-mic",
-  );
-  await page.getByRole("button", { name: /join call/i }).click();
-  await expect(page.getByTestId("voice-mic-selector")).toBeDisabled();
-  await expect(
-    page.getByText(/Backup E2E microphone → E2E speaker/),
-  ).toBeVisible();
-  await expect(page.getByText(/Call status/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Leave voice call/i })).toBeVisible();
+  await expect(page.getByRole("slider", { name: /Microphone input volume/i })).toBeVisible();
+  await expect(page.getByRole("slider", { name: /App output volume/i })).toBeVisible();
   await expectNoProductionCopyDebt(page);
   expect(errors).toEqual([]);
 });

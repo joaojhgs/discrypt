@@ -176,13 +176,16 @@ impl InviteEndpointPolicy {
             Self::ProductionTls => {
                 endpoint.starts_with("https://")
                     || endpoint.starts_with("wss://")
+                    || endpoint.starts_with("mqtts://")
                     || endpoint.starts_with("quic://")
             }
             Self::LocalDevLoopback => {
                 endpoint.starts_with("http://127.0.0.1:")
                     || endpoint.starts_with("ws://127.0.0.1:")
+                    || endpoint.starts_with("mqtt://127.0.0.1:")
                     || endpoint.starts_with("http://[::1]:")
                     || endpoint.starts_with("ws://[::1]:")
+                    || endpoint.starts_with("mqtt://[::1]:")
             }
         }
     }
