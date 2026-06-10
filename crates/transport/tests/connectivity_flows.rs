@@ -4,7 +4,7 @@ use discrypt_transport::{
 };
 
 #[test]
-fn valid_direct_overlay_and_turn_flows_select_expected_leg() -> Result<(), TransportError> {
+fn valid_direct_and_configured_turn_flows_select_expected_leg() -> Result<(), TransportError> {
     let config = ConnectivityConfig::default();
     let turn_config = ConnectivityConfig {
         default_turn: Endpoint::new("turns:transport-session-test.invalid:5349"),
@@ -13,16 +13,10 @@ fn valid_direct_overlay_and_turn_flows_select_expected_leg() -> Result<(), Trans
     let cases = [
         (&config, SimulatedNat::direct(), FallbackLeg::Stun, 1),
         (
-            &config,
-            SimulatedNat::overlay_only(),
-            FallbackLeg::RelayOverlay,
-            2,
-        ),
-        (
             &turn_config,
             SimulatedNat::turn_only(),
             FallbackLeg::Turn,
-            3,
+            2,
         ),
     ];
 
@@ -39,7 +33,7 @@ fn valid_direct_overlay_and_turn_flows_select_expected_leg() -> Result<(), Trans
             .attempts
             .last()
             .is_some_and(|attempt| attempt.succeeded));
-        assert!(plan.ordered_stun_overlay_turn());
+        assert!(plan.ordered_direct_turn());
         assert!(plan.relay_legs_ciphertext_only());
         assert!(plan.route_report().honest_and_ordered());
     }
@@ -62,9 +56,9 @@ fn turn_flow_uses_effective_turn_endpoint_without_parsing_ice_config() -> Result
         plan.endpoint,
         Endpoint::new("turns:transport-session-test.invalid:5349")
     );
-    assert_eq!(plan.attempts[2].endpoint, plan.endpoint);
-    assert!(plan.attempts[2].ciphertext_only);
-    assert!(!plan.attempts[2].carries_content);
+    assert_eq!(plan.attempts[1].endpoint, plan.endpoint);
+    assert!(plan.attempts[1].ciphertext_only);
+    assert!(!plan.attempts[1].carries_content);
     Ok(())
 }
 
@@ -73,7 +67,7 @@ fn disconnected_local_socket_flow_can_reconnect_with_ciphertext_only_delivery(
 ) -> Result<(), TransportError> {
     let adapter = LocalProcessSocketAdapter::new(
         ConnectivityConfig::default(),
-        SimulatedNat::overlay_only(),
+        SimulatedNat::direct(),
         b"cleartext session payload".to_vec(),
     );
 
@@ -92,10 +86,7 @@ fn disconnected_local_socket_flow_can_reconnect_with_ciphertext_only_delivery(
 
     let first_reconnect = adapter.run_conformance(b"ciphertext after reconnect one")?;
     assert!(first_reconnect.ready());
-    assert_eq!(
-        first_reconnect.route_report.selected,
-        FallbackLeg::RelayOverlay
-    );
+    assert_eq!(first_reconnect.route_report.selected, FallbackLeg::Stun);
 
     let second_reconnect = adapter.run_conformance(b"ciphertext after reconnect two")?;
     assert!(second_reconnect.ready());
@@ -144,7 +135,7 @@ fn turn_required_without_configured_relay_fails_closed() {
 }
 
 #[test]
-fn failure_flow_reports_no_viable_path_when_direct_overlay_and_turn_all_fail() {
+fn failure_flow_reports_no_viable_path_when_direct_and_turn_fail() {
     let config = ConnectivityConfig {
         default_turn: Endpoint::new("turns:transport-session-test.invalid:5349"),
         ..ConnectivityConfig::default()

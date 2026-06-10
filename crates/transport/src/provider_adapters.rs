@@ -59,7 +59,15 @@ use tokio::time::timeout;
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+use tokio::time::Instant;
 
 /// End-to-end readiness state used by registry and fallback planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2239,24 +2247,82 @@ where
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
     }
+    if provider_runtime_debug_enabled() {
+        eprintln!(
+            "discrypt-provider-runtime role=offerer event=send_offer local={} remote={} adapter={:?} endpoint={} topic#{}",
+            redacted_peer_label(&local_peer_id),
+            redacted_peer_label(&remote_peer_id),
+            profile.kind,
+            endpoint_label,
+            redacted_observable_digest(&rendezvous_topic)
+        );
+    }
     room.send_signal(remote_peer_id.clone(), sealed_offer.clone())
         .await?;
 
     let mut captured_sealed_answer = None;
     let mut sealed_ice_candidates = Vec::new();
+    let mut sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut answer_applied = false;
+    let mut pending_remote_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
+    let mut last_offer_resend = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline {
+        if !answer_applied && last_offer_resend.elapsed() >= Duration::from_secs(2) {
+            if provider_runtime_debug_enabled() {
+                eprintln!(
+                    "discrypt-provider-runtime role=offerer event=resend_offer local={} remote={} local_candidates_cached={}",
+                    redacted_peer_label(&local_peer_id),
+                    redacted_peer_label(&remote_peer_id),
+                    sealed_local_ice_candidates.len()
+                );
+            }
+            room.send_signal(remote_peer_id.clone(), sealed_offer.clone())
+                .await?;
+            for candidate in &sealed_local_ice_candidates {
+                room.send_signal(remote_peer_id.clone(), candidate.clone())
+                    .await?;
+            }
+            last_offer_resend = Instant::now();
+        }
+
         for candidate in webrtc.drain_local_candidates().await {
             let sealed_candidate = sealer.seal_candidate(&candidate)?;
             sealed_ice_candidates.push(sealed_candidate.clone());
+            sealed_local_ice_candidates.push(sealed_candidate.clone());
+            if provider_runtime_debug_enabled() {
+                eprintln!(
+                    "discrypt-provider-runtime role=offerer event=send_local_candidate local={} remote={} local_candidates_sent={}",
+                    redacted_peer_label(&local_peer_id),
+                    redacted_peer_label(&remote_peer_id),
+                    sealed_local_ice_candidates.len()
+                );
+            }
             room.send_signal(remote_peer_id.clone(), sealed_candidate)
                 .await?;
         }
 
         for signal in room.take_signals().await? {
             if signal.from_peer != remote_peer_id || signal.to_peer != local_peer_id {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=offerer event=ignore_signal kind={} from={} to={} expected_from={} expected_to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer),
+                        redacted_peer_label(&remote_peer_id),
+                        redacted_peer_label(&local_peer_id)
+                    );
+                }
                 continue;
+            }
+            if provider_runtime_debug_enabled() {
+                eprintln!(
+                    "discrypt-provider-runtime role=offerer event=receive_signal kind={} from={} to={}",
+                    negotiation_payload_kind_label(&signal.payload.kind),
+                    redacted_peer_label(&signal.from_peer),
+                    redacted_peer_label(&signal.to_peer)
+                );
             }
             match signal.payload.kind {
                 WebRtcNegotiationPayloadKind::Answer if !answer_applied => {
@@ -2265,12 +2331,21 @@ where
                         .accept_answer(sealer.open_description(&signal.payload)?)
                         .await?;
                     answer_applied = true;
+                    for pending in pending_remote_candidates.drain(..) {
+                        webrtc
+                            .add_remote_candidate(sealer.open_candidate(&pending)?)
+                            .await?;
+                    }
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
                     sealed_ice_candidates.push(signal.payload.clone());
-                    webrtc
-                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
-                        .await?;
+                    if answer_applied {
+                        webrtc
+                            .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                            .await?;
+                    } else {
+                        pending_remote_candidates.push(signal.payload.clone());
+                    }
                 }
                 WebRtcNegotiationPayloadKind::Offer | WebRtcNegotiationPayloadKind::Answer => {}
             }
@@ -2287,6 +2362,12 @@ where
 
     let data_metrics = webrtc.text_control_transport_metrics().await;
     if !data_metrics.open {
+        if provider_runtime_debug_enabled() {
+            eprintln!(
+                "discrypt-provider-runtime role=offerer event=data_channel_timeout metrics={:?}",
+                webrtc.direct_path_metrics().await
+            );
+        }
         return Err(TransportError::Unavailable(format!(
             "provider-signaled offerer WebRTC runtime data channel did not open: {:?}",
             webrtc.direct_path_metrics().await
@@ -2371,14 +2452,65 @@ where
     let webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
     let mut captured_sealed_offer = None;
-    let mut captured_sealed_answer = None;
+    let mut captured_sealed_answer: Option<SealedWebRtcNegotiationPayload> = None;
     let mut sealed_ice_candidates = Vec::new();
+    let mut sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut answer_sent = false;
+    let mut pending_remote_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
+    let mut last_answer_resend = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(45);
+    if provider_runtime_debug_enabled() {
+        eprintln!(
+            "discrypt-provider-runtime role=answerer event=wait_offer local={} remote={} adapter={:?} endpoint={} topic#{}",
+            redacted_peer_label(&local_peer_id),
+            redacted_peer_label(&remote_peer_id),
+            profile.kind,
+            endpoint_label,
+            redacted_observable_digest(&rendezvous_topic)
+        );
+    }
     while Instant::now() < deadline {
+        if answer_sent && last_answer_resend.elapsed() >= Duration::from_secs(2) {
+            if let Some(answer) = &captured_sealed_answer {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=answerer event=resend_answer local={} remote={} local_candidates_cached={}",
+                        redacted_peer_label(&local_peer_id),
+                        redacted_peer_label(&remote_peer_id),
+                        sealed_local_ice_candidates.len()
+                    );
+                }
+                room.send_signal(remote_peer_id.clone(), answer.clone())
+                    .await?;
+            }
+            for candidate in &sealed_local_ice_candidates {
+                room.send_signal(remote_peer_id.clone(), candidate.clone())
+                    .await?;
+            }
+            last_answer_resend = Instant::now();
+        }
+
         for signal in room.take_signals().await? {
             if signal.from_peer != remote_peer_id || signal.to_peer != local_peer_id {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=answerer event=ignore_signal kind={} from={} to={} expected_from={} expected_to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer),
+                        redacted_peer_label(&remote_peer_id),
+                        redacted_peer_label(&local_peer_id)
+                    );
+                }
                 continue;
+            }
+            if provider_runtime_debug_enabled() {
+                eprintln!(
+                    "discrypt-provider-runtime role=answerer event=receive_signal kind={} from={} to={}",
+                    negotiation_payload_kind_label(&signal.payload.kind),
+                    redacted_peer_label(&signal.from_peer),
+                    redacted_peer_label(&signal.to_peer)
+                );
             }
             match signal.payload.kind {
                 WebRtcNegotiationPayloadKind::Offer if !answer_sent => {
@@ -2387,15 +2519,32 @@ where
                     let answer = webrtc.create_answer(offer).await?;
                     let sealed_answer = sealer.seal_description(&answer)?;
                     captured_sealed_answer = Some(sealed_answer.clone());
+                    if provider_runtime_debug_enabled() {
+                        eprintln!(
+                            "discrypt-provider-runtime role=answerer event=send_answer local={} remote={}",
+                            redacted_peer_label(&local_peer_id),
+                            redacted_peer_label(&remote_peer_id)
+                        );
+                    }
                     room.send_signal(remote_peer_id.clone(), sealed_answer)
                         .await?;
                     answer_sent = true;
+                    for pending in pending_remote_candidates.drain(..) {
+                        webrtc
+                            .add_remote_candidate(sealer.open_candidate(&pending)?)
+                            .await?;
+                    }
+                    last_answer_resend = Instant::now();
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
                     sealed_ice_candidates.push(signal.payload.clone());
-                    webrtc
-                        .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
-                        .await?;
+                    if answer_sent {
+                        webrtc
+                            .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                            .await?;
+                    } else {
+                        pending_remote_candidates.push(signal.payload.clone());
+                    }
                 }
                 WebRtcNegotiationPayloadKind::Offer | WebRtcNegotiationPayloadKind::Answer => {}
             }
@@ -2404,6 +2553,15 @@ where
         for candidate in webrtc.drain_local_candidates().await {
             let sealed_candidate = sealer.seal_candidate(&candidate)?;
             sealed_ice_candidates.push(sealed_candidate.clone());
+            sealed_local_ice_candidates.push(sealed_candidate.clone());
+            if provider_runtime_debug_enabled() {
+                eprintln!(
+                    "discrypt-provider-runtime role=answerer event=send_local_candidate local={} remote={} local_candidates_sent={}",
+                    redacted_peer_label(&local_peer_id),
+                    redacted_peer_label(&remote_peer_id),
+                    sealed_local_ice_candidates.len()
+                );
+            }
             room.send_signal(remote_peer_id.clone(), sealed_candidate)
                 .await?;
         }
@@ -2419,6 +2577,12 @@ where
 
     let data_metrics = webrtc.text_control_transport_metrics().await;
     if !data_metrics.open {
+        if provider_runtime_debug_enabled() {
+            eprintln!(
+                "discrypt-provider-runtime role=answerer event=data_channel_timeout metrics={:?}",
+                webrtc.direct_path_metrics().await
+            );
+        }
         return Err(TransportError::Unavailable(format!(
             "provider-signaled answerer WebRTC runtime data channel did not open: {:?}",
             webrtc.direct_path_metrics().await
@@ -2801,13 +2965,7 @@ where
     }
 }
 
-#[cfg(any(
-    test,
-    feature = "mqtt-adapter",
-    feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter",
-    feature = "discrypt-quic-rendezvous-adapter"
-))]
+#[allow(dead_code)]
 fn redacted_endpoint_label(endpoint: &str) -> String {
     let digest = redacted_observable_digest(endpoint);
     let scheme = endpoint
@@ -2822,13 +2980,7 @@ fn redacted_observable_label(kind: &str, value: &str) -> String {
     format!("{kind}#{}", redacted_observable_digest(value))
 }
 
-#[cfg(any(
-    test,
-    feature = "mqtt-adapter",
-    feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter",
-    feature = "discrypt-quic-rendezvous-adapter"
-))]
+#[allow(dead_code)]
 fn redacted_observable_digest(value: &str) -> String {
     use sha2::Digest as _;
 
@@ -2839,6 +2991,33 @@ fn redacted_observable_digest(value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+#[allow(dead_code)]
+fn provider_runtime_debug_enabled() -> bool {
+    std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some()
+        || std::env::var_os("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_some()
+        || std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1")
+}
+
+#[allow(dead_code)]
+fn redacted_peer_label(peer: &SignalingPeerId) -> String {
+    format!("peer#{}", redacted_observable_digest(&peer.0))
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn negotiation_payload_kind_label(kind: &WebRtcNegotiationPayloadKind) -> &'static str {
+    match kind {
+        WebRtcNegotiationPayloadKind::Offer => "offer",
+        WebRtcNegotiationPayloadKind::Answer => "answer",
+        WebRtcNegotiationPayloadKind::Candidate => "candidate",
+    }
 }
 
 /// Production readiness for a provider adapter boundary.
@@ -5356,7 +5535,7 @@ impl MqttProviderRoom {
             match event {
                 Ok(Some(MqttProviderEvent::SubAck)) => {
                     acked += 1;
-                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                    if provider_runtime_debug_enabled() {
                         eprintln!("mqtt subscribe ack {acked}/{expected}");
                     }
                 }
@@ -5364,7 +5543,7 @@ impl MqttProviderRoom {
                     self.record_publish(topic, payload).await?;
                 }
                 Ok(Some(MqttProviderEvent::Error(err))) => {
-                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                    if provider_runtime_debug_enabled() {
                         eprintln!("mqtt event error redacted");
                     }
                     return Err(mqtt_err("event loop", err));
@@ -5393,7 +5572,7 @@ impl MqttProviderRoom {
             };
             match event {
                 Ok(Some(MqttProviderEvent::Publish { topic, payload })) => {
-                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                    if provider_runtime_debug_enabled() {
                         eprintln!(
                             "mqtt incoming publish {}",
                             redacted_observable_label("topic", &topic)
@@ -5402,12 +5581,12 @@ impl MqttProviderRoom {
                     self.record_publish(topic, payload).await?;
                 }
                 Ok(Some(MqttProviderEvent::SubAck)) => {
-                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                    if provider_runtime_debug_enabled() {
                         eprintln!("mqtt late subscribe ack");
                     }
                 }
                 Ok(Some(MqttProviderEvent::Error(err))) => {
-                    if std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1") {
+                    if provider_runtime_debug_enabled() {
                         eprintln!("mqtt event error redacted");
                     }
                     return Err(mqtt_err("event loop", err));
@@ -8700,6 +8879,9 @@ mod tests {
                 bob.clone(),
                 alice.clone(),
                 move |frame| {
+                    let is_fire_and_forget_notice = frame
+                        .windows(b"presence-notice".len())
+                        .any(|window| window == b"presence-notice");
                     answerer_received
                         .lock()
                         .map_err(|_| {
@@ -8708,6 +8890,9 @@ mod tests {
                             )
                         })?
                         .push(frame.clone());
+                    if is_fire_and_forget_notice {
+                        return Ok(Vec::new());
+                    }
                     Ok(
                         format!("ciphertext:role-split-receipt:{}", sha256_hex(&frame))
                             .into_bytes(),
@@ -8773,6 +8958,10 @@ mod tests {
             )?;
 
         let transport = offerer.transport();
+        let notice = b"ciphertext:role-split-presence-notice:0".to_vec();
+        transport.send_text_control_frame(notice.clone()).await?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
         let frame = b"ciphertext:role-split-frame:0".to_vec();
         let expected_receipt =
             format!("ciphertext:role-split-receipt:{}", sha256_hex(&frame)).into_bytes();
@@ -8790,7 +8979,7 @@ mod tests {
                 .lock()
                 .map_err(|_| TransportError::Unavailable("receipt lock poisoned".to_owned()))?
                 .as_slice(),
-            &[frame]
+            &[notice, frame]
         );
         assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
 

@@ -217,7 +217,22 @@ impl IceServerConfig {
         })
     }
 
-    /// Validate time-limited TURN credentials at `now`.
+    /// Build an explicit host-candidate-only config.
+    ///
+    /// This is intended for private-overlay/LAN diagnostics where STUN can
+    /// stall or mask viable host candidates. It is not a relay fallback: if
+    /// peers cannot reach one another directly, negotiation must fail unless
+    /// TURN is explicitly configured by policy.
+    #[must_use]
+    pub fn host_only() -> Self {
+        Self {
+            stun_servers: Vec::new(),
+            turn_servers: Vec::new(),
+        }
+    }
+
+    /// Validate time-limited TURN credentials at `now`. Empty STUN/TURN is
+    /// valid for explicit host-only WebRTC policies.
     pub fn validate_credentials_at(&self, now: DateTime<Utc>) -> Result<(), TransportError> {
         for server in &self.turn_servers {
             server.validate_credentials_at(now)?;

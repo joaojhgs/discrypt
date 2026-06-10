@@ -34,6 +34,7 @@ import {
   RESET_APP_CONFIRMATION_PHRASE,
   commandErrorToAction,
   configureStorageSecurity,
+  exportDiagnosticsLog,
   defaultSignalingEndpointForAdapter,
   createChannel as createChannelCommand,
   createGroup,
@@ -66,6 +67,7 @@ import {
   startTextSession,
   attachTextControlTransportRuntime,
   pumpTextControlTransportOnce,
+  publishGroupPresence,
   startDm,
   approveGroupAdmissionRequest,
   verifySafetyNumber,
@@ -1007,6 +1009,9 @@ function App() {
     Record<string, MediaStream>
   >({});
   const eventCursorRef = useRef(0);
+  const commandStateRef = useRef<AppState | null>(null);
+  const textRuntimeSyncInFlightRef = useRef(false);
+  const groupPresenceInFlightRef = useRef(false);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
   const voiceMediaSessionRef = useRef<VoiceMediaSessionHandle | null>(null);
   const stopVoiceActivityCaptureRef = useRef<StopVoiceActivityCapture | null>(
@@ -1029,6 +1034,10 @@ function App() {
     voiceCaptureRef.current = null;
     setLocalVoiceSpeaking(false);
   }
+
+  useEffect(() => {
+    commandStateRef.current = commandState;
+  }, [commandState]);
 
   useEffect(() => {
     voiceMediaSessionRef.current?.setInputGain?.(localMicGain);
@@ -1414,6 +1423,7 @@ function App() {
 
   async function ensureTextRuntimeForActiveScope(
     stateForScope: AppState,
+    reportFailures = true,
   ): Promise<AppState | null> {
     // Backend-derived runtime peers come from invite/connectivity state, not user-entered pairing fields.
     if (!window.__TAURI__?.core?.invoke) return stateForScope;
@@ -1428,37 +1438,152 @@ function App() {
     } catch (error) {
       const message =
         error instanceof Error ? error.message : String(error ?? "");
-      reportCommandError(message || "Text runtime did not start.", "start_text_session");
+      if (reportFailures) {
+        reportCommandError(message || "Text runtime did not start.", "start_text_session");
+      }
       return stateForScope;
     }
     setCommandState(started);
     if (started.last_command_error) {
       const action = commandErrorToAction(started.last_command_error);
-      reportCommandError(
-        action
-          ? `${started.last_command_error.message} — ${action}`
-          : started.last_command_error.message,
-        started.last_command_error.command,
-      );
+      if (reportFailures) {
+        reportCommandError(
+          action
+            ? `${started.last_command_error.message} — ${action}`
+            : started.last_command_error.message,
+          started.last_command_error.command,
+        );
+      }
       return started;
     }
     const attached = await attachTextRuntime(started).catch((error: unknown) => {
       const message =
         error instanceof Error ? error.message : String(error ?? "");
-      reportCommandError(
-        message || "Text runtime did not attach.",
-        "attach_text_control_transport_runtime",
-      );
+      if (reportFailures) {
+        reportCommandError(
+          message || "Text runtime did not attach.",
+          "attach_text_control_transport_runtime",
+        );
+      }
       return null;
     });
-    if (attached?.last_command_error) return attached;
-    await pumpTextControlTransportOnce({
+    const report = await pumpTextControlTransportOnce({
       target: null,
       limit: 8,
       operation_timeout_ms: 5_000,
     });
+    if (
+      reportFailures &&
+      attached?.last_command_error &&
+      report.frames_sent === 0 &&
+      report.response_frames_received === 0
+    ) {
+      const action = commandErrorToAction(attached.last_command_error);
+      reportCommandError(
+        action
+          ? `${attached.last_command_error.message} — ${action}`
+          : attached.last_command_error.message,
+        attached.last_command_error.command,
+      );
+    }
+    if (reportFailures && report.failures.length > 0) {
+      reportCommandError(
+        report.failures[0],
+        "pump_text_control_transport_once",
+      );
+    }
+    const refreshed = await loadAppState().catch(() => null);
+    if (refreshed) {
+      setCommandState(refreshed);
+      return refreshed;
+    }
     return attached ?? started;
   }
+
+  async function syncTextRuntimeForState(
+    stateForScope: AppState,
+    reportFailures = false,
+  ): Promise<AppState | null> {
+    if (textRuntimeSyncInFlightRef.current || !window.__TAURI__?.core?.invoke) {
+      return stateForScope;
+    }
+    textRuntimeSyncInFlightRef.current = true;
+    try {
+      const synced = await ensureTextRuntimeForActiveScope(stateForScope, reportFailures);
+      return synced;
+    } catch (error) {
+      if (reportFailures) {
+        reportCommandError(
+          error instanceof Error ? error.message : String(error ?? "Text runtime sync failed."),
+          "text_runtime_sync",
+        );
+      }
+      return stateForScope;
+    } finally {
+      textRuntimeSyncInFlightRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    const activeGroupId = commandState?.active_context?.group_id ?? null;
+    if (
+      !commandState ||
+      !activeGroupId ||
+      commandState.lifecycle === "first_run" ||
+      commandState.storage_security.status !== "ready" ||
+      commandState.runtime_mode.mode !== "native" ||
+      !window.__TAURI__?.core?.invoke
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const publishAndPump = async () => {
+      const latestState = commandStateRef.current ?? commandState;
+      const latestGroupId = latestState.active_context?.group_id ?? activeGroupId;
+      if (cancelled || groupPresenceInFlightRef.current || !latestGroupId) return;
+      groupPresenceInFlightRef.current = true;
+      try {
+        const localStatus = latestState.groups
+          .find((group) => group.group_id === latestGroupId)
+          ?.members?.find((member) => member.member_id === latestState.profile?.user_id)
+          ?.status;
+        if (localStatus === "pending") {
+          await syncTextRuntimeForState(latestState, false);
+          return;
+        }
+        const presenceState = await publishGroupPresence({
+          group_id: latestGroupId,
+          member_id: null,
+          status: "online",
+          ttl_seconds: 120,
+        });
+        if (cancelled) return;
+        setCommandState(presenceState);
+        commandStateRef.current = presenceState;
+        await syncTextRuntimeForState(presenceState, false);
+      } catch (error) {
+        if (!cancelled) {
+          console.error("[Discrypt] group presence/runtime sync failed", error);
+        }
+      } finally {
+        groupPresenceInFlightRef.current = false;
+      }
+    };
+
+    void publishAndPump();
+    const intervalId = window.setInterval(publishAndPump, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    commandState?.active_context?.group_id,
+    commandState?.lifecycle,
+    commandState?.runtime_mode.mode,
+    commandState?.storage_security.status,
+    commandState?.profile?.user_id,
+  ]);
 
   if (loadError) {
     return (
@@ -1508,6 +1633,10 @@ function App() {
   );
   const groupMembers = normalizedGroupMembers(activeGroup, appState);
   const localGroupRole = localGroupRoleForUi(activeGroup, appState);
+  const localMemberStatus = activeGroup?.members?.find(
+    (member) => member.member_id === appState.profile?.user_id,
+  )?.status;
+  const localAdmissionPending = localMemberStatus === "pending";
   const canReviewAdmissions = ["owner", "staff"].includes(localGroupRole);
   const pendingAdmissionRequests = (activeGroup?.admission_requests ?? []).filter(
     (request) => request.status === "pending",
@@ -1558,6 +1687,8 @@ function App() {
     ...backendVoiceParticipants,
     ...remoteStreamParticipants,
   ];
+
+
   const activeTheme =
     discryptUiConfig.themes.find(
       (theme) => theme.id === appState.preferences.theme_id,
@@ -1816,6 +1947,7 @@ function App() {
         setVisibleInviteId(null);
         setWorkflow("channel");
         setActiveOverlay(null);
+        void syncTextRuntimeForState(state, true);
       },
     );
   }
@@ -1945,8 +2077,9 @@ function App() {
     };
     const requestTransportProof = messageTransportProof;
     void (async () => {
-      if (requestTransportProof && runtimeState && window.__TAURI__?.core?.invoke) {
-        await ensureTextRuntimeForActiveScope(runtimeState);
+      let latestState = runtimeState;
+      if (runtimeState && window.__TAURI__?.core?.invoke) {
+        latestState = (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
       }
       await applyCommand(
         sendMessage({
@@ -1955,7 +2088,12 @@ function App() {
           transport_proof: requestTransportProof,
           adapter_kind: null,
         }),
-        () => setDraftMessage(""),
+        async (state) => {
+          setDraftMessage("");
+          if (latestState && window.__TAURI__?.core?.invoke) {
+            await syncTextRuntimeForState(state, false);
+          }
+        },
       );
     })();
   }
@@ -1972,8 +2110,9 @@ function App() {
     };
     const requestTransportProof = messageTransportProof;
     void (async () => {
-      if (requestTransportProof && runtimeState && window.__TAURI__?.core?.invoke) {
-        await ensureTextRuntimeForActiveScope(runtimeState);
+      let latestState = runtimeState;
+      if (runtimeState && window.__TAURI__?.core?.invoke) {
+        latestState = (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
       }
       await applyCommand(
         sendMessage({
@@ -1982,7 +2121,12 @@ function App() {
           transport_proof: requestTransportProof,
           adapter_kind: null,
         }),
-        () => setDraftMessage(""),
+        async (state) => {
+          setDraftMessage("");
+          if (latestState && window.__TAURI__?.core?.invoke) {
+            await syncTextRuntimeForState(state, false);
+          }
+        },
       );
     })();
   }
@@ -2358,13 +2502,22 @@ function App() {
     (appState.last_command_error
       ? `${appState.last_command_error.message} — ${appState.last_command_error.recovery_hint}`
       : null);
+  const storageErrorIsSecurityScoped =
+    appState.last_command_error?.command === "app_persistence" ||
+    appState.last_command_error?.command === "storage_security";
+  const storageModeRequiresPanel =
+    appState.storage_security.mode !== "development_store" &&
+    appState.storage_security.mode !== "unknown";
   const existingVaultNeedsUnlock =
-    appState.storage_security.status === "locked" ||
-    (appState.storage_security.status === "error" &&
-      appState.storage_security.mode === "passphrase_vault");
+    storageModeRequiresPanel &&
+    (appState.storage_security.status === "locked" ||
+      (appState.storage_security.status === "error" &&
+        (appState.storage_security.mode === "passphrase_vault" ||
+          storageErrorIsSecurityScoped)));
   if (
     existingVaultNeedsUnlock ||
-    (appState.lifecycle !== "first_run" &&
+    (storageModeRequiresPanel &&
+      appState.lifecycle !== "first_run" &&
       appState.storage_security.status !== "ready")
   ) {
     return (
@@ -2564,6 +2717,7 @@ function App() {
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
+                admissionPending={localAdmissionPending}
               />
             )}
           </div>
@@ -4360,6 +4514,7 @@ function TopBar({
   onOpenDiagnostics: () => void;
   inspectorOpen: boolean;
   diagnosticsEnabled: boolean;
+  admissionPending?: boolean;
 }) {
   return (
     <header
@@ -5106,6 +5261,7 @@ function DmPanel({
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
+  composerNotice?: string | null;
 }) {
   const visibleMessages = activeDm
     ? messages.filter((message) => message.target.dm_id === activeDm.dm_id)
@@ -6458,6 +6614,7 @@ function ChannelPanel({
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
+  admissionPending = false,
 }: {
   group: GroupView | null;
   activeChannel: ChannelStateView | null;
@@ -6470,6 +6627,7 @@ function ChannelPanel({
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
+  admissionPending?: boolean;
 }) {
   const visibleMessages = activeChannel
     ? messages.filter(
@@ -6515,7 +6673,8 @@ function ChannelPanel({
         setDraftMessage={setDraftMessage}
         sendLabel="Send message"
         onSend={onSendMessage}
-        disabled={false}
+        disabled={admissionPending}
+        composerNotice={admissionPending ? "Waiting for owner/staff approval before protected messages can be sent." : null}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
         diagnosticsEnabled={diagnosticsEnabled}
@@ -6537,6 +6696,7 @@ function Timeline({
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
+  composerNotice = null,
 }: {
   title: string;
   description: string;
@@ -6550,6 +6710,7 @@ function Timeline({
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
+  composerNotice?: string | null;
 }) {
   return (
     <Card className="flex h-full min-h-0 flex-col overflow-hidden border-[hsl(var(--border)/0.74)] bg-[hsl(var(--card)/0.54)] shadow-none">
@@ -6592,6 +6753,9 @@ function Timeline({
             <Icon>➤</Icon>
           </Button>
         </div>
+        {composerNotice ? (
+          <p className="mt-2 text-xs text-[hsl(var(--muted-foreground))]">{composerNotice}</p>
+        ) : null}
         {diagnosticsEnabled ? (
           <div className="mt-2 flex justify-end">
             <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
@@ -6761,15 +6925,39 @@ function DiagnosticsSheet({
   const speaking = participants.filter(
     (participant) => participant.speaking && !participant.muted,
   ).length;
+  const [exportStatus, setExportStatus] = useState<string>("");
+  const copyDiagnostics = async () => {
+    try {
+      const log = await exportDiagnosticsLog();
+      await navigator.clipboard?.writeText(log);
+      console.info("Discrypt diagnostics export", JSON.parse(log));
+      setExportStatus("Diagnostics copied to clipboard.");
+    } catch (error) {
+      console.error("Discrypt diagnostics export failed", error);
+      setExportStatus(
+        error instanceof Error
+          ? `Diagnostics export failed: ${error.message}`
+          : "Diagnostics export failed.",
+      );
+    }
+  };
   return (
     <div className="grid gap-4">
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Workspace diagnostics</CardTitle>
-            <CardDescription>
-              {themeLabel}
-            </CardDescription>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <CardTitle>Workspace diagnostics</CardTitle>
+                <CardDescription>{themeLabel}</CardDescription>
+              </div>
+              <Button type="button" size="sm" variant="secondary" onClick={copyDiagnostics}>
+                Copy logs
+              </Button>
+            </div>
+            {exportStatus ? (
+              <p className="text-xs text-[hsl(var(--muted-foreground))]">{exportStatus}</p>
+            ) : null}
           </CardHeader>
           <CardContent className="grid gap-3">
             <InfoRow

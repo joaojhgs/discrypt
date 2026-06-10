@@ -22,7 +22,7 @@ pub enum TransportSessionState {
     Checking,
     /// A direct ICE/STUN route is active.
     Direct,
-    /// The encrypted peer overlay relay route is active.
+    /// Legacy unsupported peer overlay route. Retained only for decoding old snapshots.
     OverlayRelay,
     /// The encrypted TURN route is active.
     TurnRelay,
@@ -55,7 +55,7 @@ impl TransportSessionState {
     /// True when the state represents an active data route.
     #[must_use]
     pub const fn is_connected(self) -> bool {
-        matches!(self, Self::Direct | Self::OverlayRelay | Self::TurnRelay)
+        matches!(self, Self::Direct | Self::TurnRelay)
     }
 }
 
@@ -64,7 +64,7 @@ impl TransportSessionState {
 pub enum TransportRoute {
     /// Direct ICE/STUN connectivity.
     Direct,
-    /// Encrypted peer overlay relay fallback.
+    /// Legacy unsupported peer overlay fallback. The current policy never selects it.
     OverlayRelay,
     /// Encrypted TURN fallback.
     TurnRelay,
@@ -101,7 +101,7 @@ pub enum TransportSessionEvent {
     StartConnectivityChecks,
     /// Select direct ICE/STUN connectivity.
     SelectDirect,
-    /// Select encrypted peer overlay relay connectivity.
+    /// Legacy unsupported peer overlay relay selection.
     SelectOverlayRelay,
     /// Select encrypted TURN connectivity.
     SelectTurnRelay,
@@ -242,6 +242,12 @@ pub enum TransportSessionError {
         /// Requested event.
         event: TransportSessionEvent,
     },
+    /// The route is not supported by the current fail-closed transport policy.
+    #[error("unsupported transport route under current policy: {route:?}")]
+    UnsupportedRoute {
+        /// Rejected route.
+        route: TransportRoute,
+    },
     /// Reconnect backoff policy is malformed.
     #[error("invalid reconnect backoff policy")]
     InvalidReconnectPolicy,
@@ -343,12 +349,14 @@ impl TransportSession {
         self.select_route(TransportRoute::Direct, endpoint, None)
     }
 
-    /// Select an encrypted overlay relay route from the checking state.
+    /// Reject the legacy overlay relay route; only direct WebRTC or configured TURN is allowed.
     pub fn select_overlay_relay(
         &mut self,
-        endpoint: Endpoint,
+        _endpoint: Endpoint,
     ) -> Result<TransportSessionSnapshot, TransportSessionError> {
-        self.select_route(TransportRoute::OverlayRelay, endpoint, None)
+        Err(TransportSessionError::UnsupportedRoute {
+            route: TransportRoute::OverlayRelay,
+        })
     }
 
     /// Select an encrypted TURN relay route from the checking state.
@@ -497,6 +505,9 @@ impl TransportSession {
         endpoint: Endpoint,
         route_report: Option<RouteReport>,
     ) -> Result<TransportSessionSnapshot, TransportSessionError> {
+        if route == TransportRoute::OverlayRelay {
+            return Err(TransportSessionError::UnsupportedRoute { route });
+        }
         self.require_state(
             match route {
                 TransportRoute::Direct => TransportSessionEvent::SelectDirect,
@@ -594,27 +605,11 @@ mod tests {
     }
 
     #[test]
-    fn overlay_and_turn_paths_follow_planner_selection() -> Result<(), Box<dyn std::error::Error>> {
-        let config = ConnectivityConfig::default();
+    fn configured_turn_path_follows_planner_selection() -> Result<(), Box<dyn std::error::Error>> {
         let turn_config = ConnectivityConfig {
             default_turn: Endpoint::new("turns:relay.example:5349"),
             ..ConnectivityConfig::default()
         };
-
-        let mut overlay = ready_session()?;
-        let overlay_plan = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?;
-        let overlay_snapshot = overlay.select_connectivity_plan(overlay_plan)?;
-        assert_eq!(overlay_snapshot.state, TransportSessionState::OverlayRelay);
-        assert_eq!(
-            overlay_snapshot.route.as_ref().map(|route| (
-                route.route,
-                route.route_report.as_ref().map(|report| report.selected)
-            )),
-            Some((
-                TransportRoute::OverlayRelay,
-                Some(FallbackLeg::RelayOverlay)
-            ))
-        );
 
         let mut turn = ready_session()?;
         let turn_plan = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;

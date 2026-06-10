@@ -112,8 +112,8 @@ pub enum TransportError {
     /// A conformance gate caught caller-supplied plaintext in relay-visible bytes.
     #[error("relay-visible payload contains forbidden plaintext")]
     PlaintextLeak,
-    /// Every Phase-6 fallback leg failed under the simulated NAT condition.
-    #[error("no viable STUN, relay-overlay, or TURN path")]
+    /// Every configured WebRTC path failed under the simulated NAT condition.
+    #[error("no viable direct WebRTC or configured TURN path")]
     NoViablePath,
     /// ICE/STUN/TURN endpoint policy is malformed or unsupported.
     #[error("invalid ICE endpoint policy: {0}")]
@@ -151,7 +151,7 @@ impl Transport for LoopbackTransport {
 pub enum FallbackLeg {
     /// Direct NAT traversal through STUN/ICE.
     Stun,
-    /// Peer relay overlay carrying end-to-end ciphertext.
+    /// Legacy peer overlay route. Kept for old diagnostics only; the planner no longer selects it.
     RelayOverlay,
     /// Provider TURN relay carrying end-to-end ciphertext.
     Turn,
@@ -162,7 +162,7 @@ pub enum FallbackLeg {
 pub struct SimulatedNat {
     /// Whether STUN/ICE direct traversal succeeds.
     pub stun_available: bool,
-    /// Whether the peer relay overlay can bridge the path.
+    /// Legacy overlay flag retained for old fixtures; ignored by the current planner.
     pub overlay_available: bool,
     /// Whether TURN is reachable as the final fallback.
     pub turn_available: bool,
@@ -179,13 +179,13 @@ impl SimulatedNat {
         }
     }
 
-    /// Scenario where STUN fails but the peer overlay succeeds.
+    /// Legacy overlay-only scenario. Current policy must fail unless TURN is configured.
     #[must_use]
     pub const fn overlay_only() -> Self {
         Self {
             stun_available: false,
             overlay_available: true,
-            turn_available: true,
+            turn_available: false,
         }
     }
 
@@ -285,7 +285,7 @@ pub struct ConnectionAttempt {
 /// Selected connectivity plan and attempted legs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConnectivityPlan {
-    /// Attempts in strict STUN -> overlay -> TURN order.
+    /// Attempts in strict direct/STUN -> configured TURN order.
     pub attempts: Vec<ConnectionAttempt>,
     /// Winning leg.
     pub selected: FallbackLeg,
@@ -294,28 +294,29 @@ pub struct ConnectivityPlan {
 }
 
 impl ConnectivityPlan {
-    /// Return true when attempts preserve the approved fallback ordering.
+    /// Return true when attempts preserve the approved direct/STUN -> configured TURN ordering.
     #[must_use]
-    pub fn ordered_stun_overlay_turn(&self) -> bool {
-        let order = [
-            FallbackLeg::Stun,
-            FallbackLeg::RelayOverlay,
-            FallbackLeg::Turn,
-        ];
+    pub fn ordered_direct_turn(&self) -> bool {
+        let order = [FallbackLeg::Stun, FallbackLeg::Turn];
         self.attempts
             .iter()
             .enumerate()
             .all(|(index, attempt)| order.get(index) == Some(&attempt.leg))
     }
 
-    /// Return true when overlay/TURN attempts do not carry plaintext content.
+    /// Compatibility alias for older call sites; overlay is no longer part of the valid order.
+    #[must_use]
+    pub fn ordered_stun_overlay_turn(&self) -> bool {
+        self.ordered_direct_turn()
+    }
+
+    /// Return true when TURN attempts do not carry plaintext content and no overlay route is selected.
     #[must_use]
     pub fn relay_legs_ciphertext_only(&self) -> bool {
         self.attempts.iter().all(|attempt| match attempt.leg {
             FallbackLeg::Stun => !attempt.carries_content,
-            FallbackLeg::RelayOverlay | FallbackLeg::Turn => {
-                attempt.ciphertext_only && !attempt.carries_content
-            }
+            FallbackLeg::Turn => attempt.ciphertext_only && !attempt.carries_content,
+            FallbackLeg::RelayOverlay => false,
         })
     }
 
@@ -343,7 +344,7 @@ pub struct RouteReport {
     pub endpoint: Endpoint,
     /// Attempted legs in order.
     pub attempted_legs: Vec<FallbackLeg>,
-    /// Whether relay-overlay/TURN legs are marked ciphertext-only.
+    /// Whether TURN legs are marked ciphertext-only and no overlay relay was selected.
     pub ciphertext_only_relay_legs: bool,
     /// Honest limitation copy for deterministic local tests.
     pub limitation: String,
@@ -353,11 +354,7 @@ impl RouteReport {
     /// True when the report is ordered and includes the local-test limitation.
     #[must_use]
     pub fn honest_and_ordered(&self) -> bool {
-        let expected = [
-            FallbackLeg::Stun,
-            FallbackLeg::RelayOverlay,
-            FallbackLeg::Turn,
-        ];
+        let expected = [FallbackLeg::Stun, FallbackLeg::Turn];
         !self.attempted_legs.is_empty()
             && self.attempted_legs.len() <= expected.len()
             && self
@@ -505,11 +502,11 @@ fn io_error(error: std::io::Error) -> TransportError {
     TransportError::Io(error.to_string())
 }
 
-/// Stateless Phase-6 fallback planner.
+/// Stateless fail-closed WebRTC route planner.
 pub struct ConnectivityPlanner;
 
 impl ConnectivityPlanner {
-    /// Resolve a path using strict STUN -> relay-overlay -> TURN fallback.
+    /// Resolve a path using strict direct/STUN -> configured TURN fallback.
     pub fn plan(
         config: &ConnectivityConfig,
         nat: SimulatedNat,
@@ -533,22 +530,6 @@ impl ConnectivityPlanner {
         }
 
         attempts.push(ConnectionAttempt {
-            leg: FallbackLeg::RelayOverlay,
-            endpoint: Endpoint::new("relay-overlay:self-healing-peer-route"),
-            carries_content: false,
-            ciphertext_only: true,
-            succeeded: nat.overlay_available,
-        });
-        if nat.overlay_available {
-            let endpoint = attempts[1].endpoint.clone();
-            return Ok(ConnectivityPlan {
-                attempts,
-                selected: FallbackLeg::RelayOverlay,
-                endpoint,
-            });
-        }
-
-        attempts.push(ConnectionAttempt {
             leg: FallbackLeg::Turn,
             endpoint: config.turn_endpoint(),
             carries_content: false,
@@ -556,7 +537,7 @@ impl ConnectivityPlanner {
             succeeded: nat.turn_available && config.turn_relay_configured(),
         });
         if nat.turn_available && config.turn_relay_configured() {
-            let endpoint = attempts[2].endpoint.clone();
+            let endpoint = attempts[1].endpoint.clone();
             return Ok(ConnectivityPlan {
                 attempts,
                 selected: FallbackLeg::Turn,
@@ -573,7 +554,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_uses_stun_overlay_turn_order() -> Result<(), TransportError> {
+    fn fallback_uses_direct_then_configured_turn_order() -> Result<(), TransportError> {
         let config = ConnectivityConfig::default();
         let turn_config = ConnectivityConfig {
             overrides: EndpointOverrides::new(
@@ -583,16 +564,15 @@ mod tests {
             ..ConnectivityConfig::default()
         };
         let direct = ConnectivityPlanner::plan(&config, SimulatedNat::direct())?;
-        let overlay = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?;
+        let overlay = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only());
         let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
 
         assert_eq!(direct.selected, FallbackLeg::Stun);
-        assert_eq!(overlay.selected, FallbackLeg::RelayOverlay);
+        assert_eq!(overlay, Err(TransportError::NoViablePath));
         assert_eq!(turn.selected, FallbackLeg::Turn);
-        assert!(direct.ordered_stun_overlay_turn());
-        assert!(overlay.ordered_stun_overlay_turn());
-        assert!(turn.ordered_stun_overlay_turn());
-        assert!(overlay.relay_legs_ciphertext_only());
+        assert_eq!(turn.attempts.len(), 2);
+        assert!(direct.ordered_direct_turn());
+        assert!(turn.ordered_direct_turn());
         assert!(turn.relay_legs_ciphertext_only());
         Ok(())
     }
@@ -627,9 +607,8 @@ mod tests {
     #[test]
     fn route_report_is_honest_about_local_process_limitations() -> Result<(), TransportError> {
         let config = ConnectivityConfig::default();
-        let report =
-            ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only())?.route_report();
-        assert_eq!(report.selected, FallbackLeg::RelayOverlay);
+        let report = ConnectivityPlanner::plan(&config, SimulatedNat::direct())?.route_report();
+        assert_eq!(report.selected, FallbackLeg::Stun);
         assert!(report.honest_and_ordered());
         assert!(report
             .limitation
@@ -641,7 +620,7 @@ mod tests {
     fn socket_adapter_delivers_ciphertext_and_rejects_plaintext() -> Result<(), TransportError> {
         let adapter = LocalProcessSocketAdapter::new(
             ConnectivityConfig::default(),
-            SimulatedNat::overlay_only(),
+            SimulatedNat::direct(),
             b"hello plaintext".to_vec(),
         );
         let report = adapter.run_conformance(b"sframe-like ciphertext bytes")?;

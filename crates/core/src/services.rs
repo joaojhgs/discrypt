@@ -318,7 +318,7 @@ pub struct SignalEnvelope {
 /// Connectivity candidate or selected transport leg.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransportLeg {
-    /// Leg label such as STUN, relay-overlay, or TURN.
+    /// Leg label such as direct WebRTC/STUN or configured TURN.
     pub label: String,
     /// Endpoint or route descriptor; may be owner-provided.
     pub endpoint: String,
@@ -1105,7 +1105,7 @@ mod tests {
     impl TransportService for BoundaryHarness {
         fn plan_transport(&self, _group_id: &GroupId) -> ServiceResult<Vec<TransportLeg>> {
             Ok(vec![TransportLeg {
-                label: "relay-overlay".to_owned(),
+                label: "turn-relay".to_owned(),
                 endpoint: "r1".to_owned(),
                 ciphertext_only: true,
             }])

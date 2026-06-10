@@ -10,8 +10,8 @@ use openmls::prelude::{
     tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait},
     BasicCredential, Ciphersuite, Credential, CredentialWithKey, Extensions,
     GroupId as OpenMlsGroupId, KeyPackage, KeyPackageIn, LeafNodeIndex, MlsGroup,
-    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyOut, MlsMessageOut, StagedWelcome,
-    Welcome,
+    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyOut, MlsMessageIn, MlsMessageOut,
+    ProcessedMessageContent, ProtocolMessage, StagedWelcome, Welcome,
 };
 use openmls::versions::ProtocolVersion;
 use openmls_basic_credential::SignatureKeyPair;
@@ -19,6 +19,7 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
 use openmls_traits::{types::SignatureScheme, OpenMlsProvider};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -134,6 +135,9 @@ pub enum OpenMlsGroupError {
     /// The Welcome joined a different OpenMLS group than the expected group id.
     #[error("welcome group id {actual} does not match expected group id {expected}")]
     WelcomeGroupIdMismatch { expected: String, actual: String },
+    /// The delivered OpenMLS message was not the expected commit message.
+    #[error("openmls message was not a staged commit for group {0}")]
+    UnexpectedCommitMessage(String),
 }
 
 /// Snapshot of durable OpenMLS group state used by higher-level service seams.
@@ -518,6 +522,117 @@ impl OpenMlsGroupEngine {
         snapshot(&tracked.group, &tracked.pending_commit)
     }
 
+    /// Apply a delivered OpenMLS commit from another member and persist the new epoch.
+    pub fn apply_external_commit(
+        &mut self,
+        group_id: &str,
+        expected_epoch: u64,
+        commit_bytes: &[u8],
+    ) -> Result<OpenMlsGroupSnapshot, OpenMlsGroupError> {
+        self.apply_external_commit_with_remove_target(group_id, expected_epoch, commit_bytes, None)
+    }
+
+    /// Apply a delivered OpenMLS remove-member commit and prove that it removes the expected leaf.
+    pub fn apply_external_remove_commit(
+        &mut self,
+        group_id: &str,
+        expected_epoch: u64,
+        commit_bytes: &[u8],
+        removed_member_identity: impl AsRef<str>,
+    ) -> Result<OpenMlsGroupSnapshot, OpenMlsGroupError> {
+        let removed_member = removed_member_identity.as_ref();
+        let target_leaf = self.member_leaf(group_id, removed_member)?.ok_or_else(|| {
+            OpenMlsGroupError::MemberNotFound {
+                group_id: group_id.to_owned(),
+                member: removed_member.to_owned(),
+            }
+        })?;
+        self.apply_external_commit_with_remove_target(
+            group_id,
+            expected_epoch,
+            commit_bytes,
+            Some((removed_member, target_leaf)),
+        )
+    }
+
+    fn apply_external_commit_with_remove_target(
+        &mut self,
+        group_id: &str,
+        expected_epoch: u64,
+        commit_bytes: &[u8],
+        required_remove_target: Option<(&str, LeafNodeIndex)>,
+    ) -> Result<OpenMlsGroupSnapshot, OpenMlsGroupError> {
+        let tracked = self
+            .groups
+            .get_mut(group_id)
+            .ok_or_else(|| OpenMlsGroupError::GroupNotFound(group_id.to_owned()))?;
+        let current = tracked.group.epoch().as_u64();
+        if expected_epoch != current.saturating_add(1) {
+            return Err(OpenMlsGroupError::StaleCommitEpoch {
+                current,
+                attempted: expected_epoch,
+            });
+        }
+        let mut encoded = commit_bytes;
+        let message = MlsMessageIn::tls_deserialize(&mut encoded)
+            .map_err(openmls_error)?
+            .try_into_protocol_message()
+            .map_err(openmls_error)?;
+        let processed = tracked
+            .group
+            .process_message(&self.provider, message)
+            .map_err(openmls_error)?;
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(commit) => {
+                if let Some((removed_member, target_leaf)) = required_remove_target {
+                    let removes_expected_leaf = commit
+                        .remove_proposals()
+                        .any(|proposal| proposal.remove_proposal().removed() == target_leaf);
+                    if !removes_expected_leaf {
+                        return Err(OpenMlsGroupError::UnexpectedCommitMessage(format!(
+                            "{group_id}:remove_target_mismatch:{removed_member}"
+                        )));
+                    }
+                }
+                tracked
+                    .group
+                    .merge_staged_commit(&self.provider, *commit)
+                    .map_err(openmls_error)?;
+                snapshot(&tracked.group, &tracked.pending_commit)
+            }
+            _ => Err(OpenMlsGroupError::UnexpectedCommitMessage(
+                group_id.to_owned(),
+            )),
+        }
+    }
+
+    /// Hash the confirmation tag carried by a serialized public commit before merging it.
+    ///
+    /// Higher layers use this as a fail-closed metadata check so a frame with a
+    /// forged epoch/tag cannot mutate durable OpenMLS state and then be reported
+    /// as rejected only after the merge.
+    pub fn public_commit_confirmation_tag_sha256(
+        commit_bytes: &[u8],
+    ) -> Result<Option<String>, OpenMlsGroupError> {
+        let mut encoded = commit_bytes;
+        let message = MlsMessageIn::tls_deserialize(&mut encoded)
+            .map_err(openmls_error)?
+            .try_into_protocol_message()
+            .map_err(openmls_error)?;
+        let ProtocolMessage::PublicMessage(public_message) = message else {
+            return Ok(None);
+        };
+        let confirmation_tag = public_message
+            .confirmation_tag()
+            .ok_or_else(|| OpenMlsGroupError::UnexpectedCommitMessage("missing_tag".to_owned()))?;
+        let confirmation_bytes = confirmation_tag
+            .tls_serialize_detached()
+            .map_err(openmls_error)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&confirmation_bytes);
+        Ok(Some(hex::encode(hasher.finalize())))
+    }
+
     /// Export secret material from the current OpenMLS epoch.
     pub fn export_secret(
         &self,
@@ -779,6 +894,47 @@ mod tests {
                 &tampered
             )
             .is_err());
+
+        let _ = std::fs::remove_file(alice_path);
+        let _ = std::fs::remove_file(bob_path);
+        Ok(())
+    }
+
+    #[test]
+    fn openmls_remove_commit_requires_expected_remove_target() -> Result<(), OpenMlsGroupError> {
+        let alice_path = temp_path("remove-target-alice");
+        let bob_path = temp_path("remove-target-bob");
+        let mut alice = OpenMlsGroupEngine::open(&alice_path)?;
+        let mut bob = OpenMlsGroupEngine::open(&bob_path)?;
+        alice.create_group("room-remove-target", b"alice")?;
+        let bob_package = bob.generate_member_package(b"bob")?;
+        let bob_added = alice.add_member_package("room-remove-target", &bob_package)?;
+        let bob_welcome = bob_added.welcome.as_ref().ok_or_else(|| {
+            OpenMlsGroupError::OpenMls("OpenMLS add did not produce Bob welcome".to_owned())
+        })?;
+        bob.join_from_welcome(
+            "room-remove-target",
+            bob_package.signer_public_key(),
+            bob_welcome,
+        )?;
+
+        let before_rejected_add =
+            bob.export_secret("room-remove-target", "discrypt/v1/text", b"room", 32)?;
+        let charlie_package = alice.generate_member_package(b"charlie")?;
+        let charlie_added = alice.add_member_package("room-remove-target", &charlie_package)?;
+        assert!(matches!(
+            bob.apply_external_remove_commit(
+                "room-remove-target",
+                charlie_added.state.epoch,
+                &charlie_added.commit,
+                "bob",
+            ),
+            Err(OpenMlsGroupError::UnexpectedCommitMessage(_))
+        ));
+        assert_eq!(
+            before_rejected_add,
+            bob.export_secret("room-remove-target", "discrypt/v1/text", b"room", 32)?
+        );
 
         let _ = std::fs::remove_file(alice_path);
         let _ = std::fs::remove_file(bob_path);

@@ -24,6 +24,12 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "export_diagnostics_log",
+    exportName: "exportDiagnosticsLog",
+    args: [],
+    returns: "string",
+  },
+  {
     command: "app_snapshot",
     exportName: "loadCompatibilityAppSnapshot",
     args: [],

@@ -25,8 +25,8 @@ fn deterministic_direct_stun_turn_and_no_turn_fail_closed_matrix() -> Result<(),
 
     let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
     assert_eq!(turn.selected, FallbackLeg::Turn);
-    assert_eq!(turn.attempts.len(), 3);
-    assert!(turn.ordered_stun_overlay_turn());
+    assert_eq!(turn.attempts.len(), 2);
+    assert!(turn.ordered_direct_turn());
     assert!(turn.relay_legs_ciphertext_only());
     assert!(turn.route_report().honest_and_ordered());
 
