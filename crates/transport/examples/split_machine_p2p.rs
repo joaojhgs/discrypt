@@ -196,10 +196,11 @@ async fn run_offerer(args: &Args) -> Result<serde_json::Value, TransportError> {
 }
 
 fn negotiation_config() -> Result<WebRtcNegotiationConfig, TransportError> {
-    Ok(WebRtcNegotiationConfig::new(IceServerConfig::new(
+    let config = WebRtcNegotiationConfig::new(IceServerConfig::new(
         vec![Endpoint::new("stun:stun.l.google.com:19302")],
         vec![],
-    )?))
+    )?);
+    Ok(config)
 }
 
 fn scope_for_room(room: &str) -> Result<ConversationScope, TransportError> {

@@ -972,11 +972,11 @@ fn seed_state() -> AppState {
             activity_feed: vec![
                 "Invite policy checked: expiry + max-use + revoke controls".to_owned(),
                 "Android wake path is content-free".to_owned(),
-                "Relay route carries ciphertext only in harness gates".to_owned(),
+                "Configured TURN route carries ciphertext only in harness gates".to_owned(),
                 "Deletion copy includes offline-device caveat".to_owned(),
             ],
             connectivity: ConnectivityView {
-                fallback_chain: "Command-backed policy: STUN → relay-overlay → TURN; runtime transport remains release-gated until E2E passes".to_owned(),
+                fallback_chain: "Command-backed policy: direct WebRTC P2P → configured TURN only; signaling providers never relay messages".to_owned(),
                 metadata_copy: "Content-private and metadata-minimizing, not metadata-anonymous".to_owned(),
                 push_copy: "Android FCM wake is content-free and carries no room, sender, or message body".to_owned(),
             },

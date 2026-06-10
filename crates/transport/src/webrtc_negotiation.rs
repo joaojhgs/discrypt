@@ -670,11 +670,79 @@ impl WebRtcNegotiationConfig {
     /// to `127.0.0.1:0` explicitly.
     #[must_use]
     pub fn new(ice_servers: IceServerConfig) -> Self {
-        Self {
+        let udp_addrs = std::env::var("DISCRYPT_WEBRTC_UDP_ADDRS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|addr| !addr.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|addrs| !addrs.is_empty())
+            .unwrap_or_else(|| vec!["0.0.0.0:0".to_owned()]);
+        let mut config = Self {
             ice_servers,
-            udp_addrs: vec!["0.0.0.0:0".to_owned()],
+            udp_addrs,
             data_channel_label: "discrypt-control".to_owned(),
             ice_transport_policy: WebRtcIceTransportPolicy::All,
+        };
+        config.apply_env_ice_mode();
+        config
+    }
+
+    /// Force host-candidate-only ICE. This disables STUN and TURN and proves
+    /// direct private-overlay/LAN reachability without silently falling back to
+    /// provider message relays.
+    #[must_use]
+    pub fn host_only(mut self) -> Self {
+        self.ice_servers = IceServerConfig::host_only();
+        self.ice_transport_policy = WebRtcIceTransportPolicy::All;
+        self
+    }
+
+    fn apply_env_ice_mode(&mut self) {
+        let legacy_host_only = std::env::var("DISCRYPT_WEBRTC_HOST_ONLY")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        let mode = std::env::var("DISCRYPT_WEBRTC_ICE_MODE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        if legacy_host_only
+            || matches!(
+                mode.as_deref(),
+                Some(
+                    "host_only"
+                        | "host-only"
+                        | "direct_only"
+                        | "direct-only"
+                        | "private_overlay"
+                        | "private-overlay"
+                        | "no_stun"
+                        | "no-stun"
+                )
+            )
+        {
+            self.ice_servers = IceServerConfig::host_only();
+            self.ice_transport_policy = WebRtcIceTransportPolicy::All;
+            return;
+        }
+        match mode.as_deref() {
+            Some("stun" | "stun_only" | "stun-only") => {
+                self.ice_servers.turn_servers.clear();
+                self.ice_transport_policy = WebRtcIceTransportPolicy::All;
+            }
+            Some("turn_relay" | "turn-relay" | "relay_only" | "relay-only") => {
+                self.ice_transport_policy = WebRtcIceTransportPolicy::RelayOnly;
+            }
+            Some("all" | "default") | None => {}
+            Some(other) => {
+                eprintln!(
+                    "discrypt-webrtc-invalid-ice-mode mode={other}; using policy-provided STUN/TURN configuration"
+                );
+            }
         }
     }
 
@@ -739,6 +807,15 @@ impl WebRtcNegotiator {
             register_default_interceptors(Registry::new(), &mut media).map_err(|err| {
                 TransportError::Unavailable(format!("register WebRTC interceptors failed: {err}"))
             })?;
+        if webrtc_debug_enabled() {
+            eprintln!(
+                "discrypt-webrtc-config udp_addrs={:?} stun_servers={} turn_servers={} ice_transport_policy={:?}",
+                config.udp_addrs,
+                config.ice_servers.stun_servers.len(),
+                config.ice_servers.turn_servers.len(),
+                config.ice_transport_policy
+            );
+        }
         let peer_connection = PeerConnectionBuilder::new()
             .with_configuration(
                 RTCConfigurationBuilder::new()
@@ -1073,6 +1150,9 @@ impl PeerConnectionEventHandler for CandidateCollector {
     }
 
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if webrtc_debug_enabled() {
+            eprintln!("discrypt-webrtc-ice-gathering-state state={state}");
+        }
         self.metrics.lock().await.ice_gathering_state = state;
         if state == RTCIceGatheringState::Complete {
             self.ice_gathering_complete.notify_waiters();
@@ -1080,10 +1160,16 @@ impl PeerConnectionEventHandler for CandidateCollector {
     }
 
     async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        if webrtc_debug_enabled() {
+            eprintln!("discrypt-webrtc-ice-connection-state state={state}");
+        }
         self.metrics.lock().await.ice_connection_state = state;
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        if webrtc_debug_enabled() {
+            eprintln!("discrypt-webrtc-peer-connection-state state={state}");
+        }
         self.metrics.lock().await.peer_connection_state = state;
     }
 
@@ -1098,6 +1184,15 @@ impl PeerConnectionEventHandler for CandidateCollector {
                     url: init.url,
                 };
                 let is_relay = candidate.is_turn_relay_candidate();
+                if webrtc_debug_enabled() {
+                    eprintln!(
+                        "discrypt-webrtc-local-candidate candidate={} mid={:?} mline={:?} ufrag_present={}",
+                        candidate.candidate,
+                        candidate.sdp_mid,
+                        candidate.sdp_mline_index,
+                        candidate.username_fragment.is_some()
+                    );
+                }
                 self.candidates.lock().await.push(candidate);
                 let mut metrics = self.metrics.lock().await;
                 metrics.local_candidates_gathered += 1;
@@ -1108,6 +1203,11 @@ impl PeerConnectionEventHandler for CandidateCollector {
             Err(_err) => {}
         }
     }
+}
+
+fn webrtc_debug_enabled() -> bool {
+    std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some()
+        || std::env::var_os("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_some()
 }
 
 fn to_rtc_ice_servers(config: &IceServerConfig) -> Vec<RTCIceServer> {

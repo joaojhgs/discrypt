@@ -128,6 +128,10 @@ const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
 const GROUP_PRESENCE_DEFAULT_TTL_SECONDS: i64 = 90;
 const GROUP_PRESENCE_MAX_TTL_SECONDS: i64 = 300;
 
+fn default_app_state_schema_version() -> u32 {
+    APP_STATE_SCHEMA_VERSION
+}
+
 /// Desktop/Tauri wrapper around the Rust signaling protocol client.
 pub struct DesktopSignalingClient<T> {
     inner: external_signaling::client::SignalingClient<T>,
@@ -1509,14 +1513,36 @@ pub enum TextControlFrameView {
         reason: Option<String>,
         created_at: String,
         crypto_removal_status: String,
+        #[serde(default)]
+        openmls_remove_commit: Option<Vec<u8>>,
+        #[serde(default)]
+        openmls_epoch: Option<u64>,
+        #[serde(default)]
+        openmls_confirmation_tag_sha256: Option<String>,
     },
     /// MLS-protected signed presence heartbeat with backend TTL semantics.
     GroupPresenceHeartbeat {
         group_id: String,
         event_id: String,
         member_id: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        device_id: Option<String>,
+        #[serde(default)]
+        role: Option<GroupRoleView>,
+        #[serde(default)]
+        signer_public_key_hex: Option<String>,
         last_seen_at: String,
         presence_expires_at: String,
+    },
+    /// Recipient acknowledgement that a governance frame was applied to local app state.
+    GroupGovernanceAck {
+        group_id: String,
+        event_id: String,
+        applied_by_member_id: String,
+        status: String,
+        created_at: String,
     },
     /// Backend-state-only browser media offer/answer/candidate message for the browser media runtime; this struct alone does not claim remote audio.
     VoiceSignal {
@@ -2438,8 +2464,17 @@ struct OpenMlsAdmissionWelcome {
     confirmation_tag_sha256: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenMlsMemberRemoval {
+    commit_bytes: Vec<u8>,
+    epoch: u64,
+    confirmation_tag_sha256: String,
+    status_copy: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
+    #[serde(default = "default_app_state_schema_version")]
     schema_version: u32,
     lifecycle: AppLifecycle,
     profile: Option<UserProfileView>,
@@ -2771,6 +2806,11 @@ impl TauriAppService {
                 "OpenMLS owner added a joiner key package and produced an authorized Welcome"
                     .to_owned();
         }
+        self.state.upsert_admitted_group_member(
+            &key_package.group_id,
+            &key_package.member_identity,
+            &key_package.signer_public_key_hex,
+        );
         self.state.push_event(
             "mls.admission_welcome_created",
             format!(
@@ -3001,14 +3041,42 @@ impl TauriAppService {
             }
         }
 
+        if let Some(pending) = self.pending_text_control_transport_runtime.clone() {
+            let report = TextControlTransportPumpReportView {
+                pending_before: self.state.list_pending_text_control_frames(&request).len(),
+                frames_sent: 0,
+                response_frames_received: 0,
+                receipts_applied: 0,
+                failures: Vec::new(),
+                metrics: discrypt_transport::WebRtcDataTransportMetrics {
+                    schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+                    label: "attaching-text-control-runtime".to_owned(),
+                    attached_channels: 0,
+                    open: false,
+                    frames_sent: 0,
+                    frames_received: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    last_state: format!(
+                        "attaching:{}:{}->{}",
+                        runtime_role_label(Some(pending.role)),
+                        pending.local_peer_id,
+                        pending.remote_peer_id
+                    ),
+                },
+            };
+            self.persist();
+            return report;
+        }
+
         let Some(runtime) = self.text_control_transport_runtime.clone() else {
-            let message = "text/control transport runtime is not attached".to_owned();
+            let message = "text/control direct data-channel runtime is not attached; provider signaling is not a message relay".to_owned();
             self.state.push_command_error(
                 "message.transport_pump_unavailable",
                 "pump_text_control_transport_once",
                 "transport_runtime_missing",
                 message.clone(),
-                "Start the text transport session and attach a transport runtime before trying to pump pending outbox frames",
+                "Start the text session and attach a direct runtime. Configure TURN explicitly if direct ICE cannot connect; MQTT/Nostr providers are used for signaling only and never relay messages.",
             );
             let report = failure_report("unattached-text-control-runtime", message);
             self.persist();
@@ -3112,6 +3180,96 @@ pub fn app_state() -> AppStateView {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.to_view()
+}
+
+/// Tauri command: export a redacted production diagnostics bundle for bug reports.
+///
+/// Invite links, key material, raw SDP, and ICE credentials are deliberately
+/// excluded/redacted. The export is intended for users to copy into support
+/// reports when direct ICE, storage, or runtime attach failures occur.
+pub fn export_diagnostics_log() -> String {
+    let service = app_service();
+    let guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let view = guard.to_view();
+    let groups = view
+        .groups
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "group_id": redacted_observable_ref("group", &group.group_id),
+                "name": &group.name,
+                "role": &group.role,
+                "member_count": group.members.len(),
+                "pending_admission_count": group.admission_requests.iter().filter(|request| request.status == "pending").count(),
+                "admission_mode": &group.role_policy.admission_mode,
+                "signaling_profiles": group.connectivity.as_ref().map(|policy| {
+                    policy.signaling_profiles.iter().map(|profile| {
+                        serde_json::json!({
+                            "profile_id": &profile.profile_id,
+                            "adapter_kind": &profile.adapter_kind,
+                            "endpoint_count": profile.endpoints.len(),
+                            "ttl_seconds": profile.ttl_seconds,
+                        })
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default(),
+                "stun_server_count": group.connectivity.as_ref().map(|policy| policy.ice_stun_servers.len()).unwrap_or_default(),
+                "turn_server_count": group.connectivity.as_ref().map(|policy| policy.ice_turn_servers.len()).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let voice_session = view.voice_session.as_ref().map(|session| {
+        serde_json::json!({
+            "session_id": redacted_observable_ref("voice_session", &session.session_id),
+            "group_id": redacted_observable_ref("group", &session.group_id),
+            "channel_id": redacted_observable_ref("channel", &session.channel_id),
+            "joined": session.joined,
+            "self_muted": session.self_muted,
+            "microphone_permission": &session.microphone_permission,
+            "status_copy": &session.status_copy,
+            "route_copy": &session.route_copy,
+            "participant_count": session.participants.len(),
+            "media_runtime": &session.media_runtime,
+            "signaling": &session.signaling,
+        })
+    });
+    let export = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": Utc::now().to_rfc3339(),
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "lifecycle": &view.lifecycle,
+        "storage_security": &view.storage_security,
+        "runtime_mode": &view.runtime_mode,
+        "webrtc_env": {
+            "ice_mode": std::env::var("DISCRYPT_WEBRTC_ICE_MODE").unwrap_or_else(|_| "default".to_owned()),
+            "host_only_legacy": std::env::var("DISCRYPT_WEBRTC_HOST_ONLY").unwrap_or_else(|_| "unset".to_owned()),
+            "udp_addrs_configured": std::env::var("DISCRYPT_WEBRTC_UDP_ADDRS").is_ok(),
+            "debug_enabled": std::env::var("DISCRYPT_WEBRTC_DEBUG").is_ok() || std::env::var("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_ok(),
+        },
+        "transport_policy": {
+            "message_relay_fallback": "disabled",
+            "provider_role": "signaling only for SDP/candidates",
+            "allowed_delivery_paths": ["direct_webrtc_p2p", "explicit_turn_webrtc"],
+        },
+        "active_context": &view.active_context,
+        "transport_status": &view.transport_status,
+        "transport_diagnostics": &view.transport_diagnostics,
+        "last_command_error": &view.last_command_error,
+        "events": &view.events,
+        "groups": groups,
+        "dm_count": view.dms.len(),
+        "message_count": view.messages.len(),
+        "voice_states": &view.voice_states,
+        "voice_session": voice_session,
+    });
+    serde_json::to_string_pretty(&export).unwrap_or_else(|error| {
+        format!(
+            "{{\"schema_version\":1,\"generated_at\":\"{}\",\"export_error\":\"{}\"}}",
+            Utc::now().to_rfc3339(),
+            redact_sensitive_observable_copy(error.to_string())
+        )
+    })
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
@@ -4412,15 +4570,16 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             return;
         }
         let parsed_invite = parse_invite_metadata(&invite_code);
-        let name = request
-            .group_name
-            .map(|value| normalize_label(&value, "joined enclave"))
-            .unwrap_or_else(|| parse_invite_group_name(&invite_code));
+        let name = invite_group_name_from_metadata(
+            &invite_code,
+            request.group_name.clone(),
+            parsed_invite.as_ref(),
+        );
         let group_id = parsed_invite
             .as_ref()
             .and_then(|parsed| parsed.group_id.clone())
             .unwrap_or_else(|| stable_id("group", &name, state.next_sequence));
-        if !state.groups.iter().any(|group| group.name == name) {
+        if !state.groups.iter().any(|group| group.group_id == group_id) {
             let connectivity = parsed_invite
                 .as_ref()
                 .map(|parsed| parsed.connectivity.clone())
@@ -4439,18 +4598,20 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 .find(|device| device.local)
                 .map(|device| device.device_id.clone());
             let role = GroupRoleView::Member;
+            let mut local_member = initial_group_member(
+                &local_member_id,
+                &display_name,
+                device_id,
+                role.clone(),
+                &created_at,
+            );
+            local_member.status = "pending".to_owned();
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "member".to_owned(),
                 channels: default_group_channels(state.next_sequence),
-                members: vec![initial_group_member(
-                    &local_member_id,
-                    &display_name,
-                    device_id,
-                    role.clone(),
-                    &created_at,
-                )],
+                members: vec![local_member],
                 role_policy: initial_group_role_policy(
                     GroupAdmissionModeView::default(),
                     &local_member_id,
@@ -4468,7 +4629,11 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 connectivity: Some(connectivity),
             });
         } else if let Some(parsed) = parsed_invite.as_ref() {
-            if let Some(existing_group) = state.groups.iter_mut().find(|group| group.name == name) {
+            if let Some(existing_group) = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+            {
                 existing_group.role = "member".to_owned();
                 existing_group.runtime_peers =
                     group_runtime_peers(Some(&parsed.connectivity), "member");
@@ -4476,12 +4641,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             }
         }
         state.ensure_group_governance_defaults();
-        let active_group_id = state
-            .groups
-            .iter()
-            .find(|group| group.name == name)
-            .map(|group| group.group_id.clone())
-            .unwrap_or(group_id);
+        let active_group_id = group_id.clone();
         state.active_context = Some(ActiveContextView {
             kind: "group".to_owned(),
             group_id: Some(active_group_id),
@@ -4540,9 +4700,9 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             });
         }
         state.push_event(
-            "group.joined",
+            "group.admission_requested",
             format!(
-                "Joined {} via {}",
+                "Requested admission to {} via {}",
                 redacted_observable_ref("group", &name),
                 redacted_observable_ref("invite", &invite_code)
             ),
@@ -5043,10 +5203,10 @@ pub fn revoke_group_member_access(request: RevokeGroupMemberAccessRequest) -> Ap
         state.ensure_ready_profile();
         let actor = state.local_user_id();
         let now = Utc::now().to_rfc3339();
-        let Some(group) = state
+        let Some(group_index) = state
             .groups
-            .iter_mut()
-            .find(|group| group.group_id == request.group_id)
+            .iter()
+            .position(|group| group.group_id == request.group_id)
         else {
             state.push_command_error(
                 "group.member_revoke_rejected",
@@ -5057,15 +5217,15 @@ pub fn revoke_group_member_access(request: RevokeGroupMemberAccessRequest) -> Ap
             );
             return;
         };
-        let actor_role = group
+        let actor_role = state.groups[group_index]
             .members
             .iter()
             .find(|member| member.member_id == actor && member.status != "revoked")
             .map(|member| member.role.clone());
-        let Some(member) = group
+        let Some(member_index) = state.groups[group_index]
             .members
-            .iter_mut()
-            .find(|member| member.member_id == request.member_id)
+            .iter()
+            .position(|member| member.member_id == request.member_id)
         else {
             state.push_command_error(
                 "group.member_revoke_rejected",
@@ -5076,12 +5236,22 @@ pub fn revoke_group_member_access(request: RevokeGroupMemberAccessRequest) -> Ap
             );
             return;
         };
+        let target_member = state.groups[group_index].members[member_index].clone();
+        let remaining_remote_member_count = state.groups[group_index]
+            .members
+            .iter()
+            .filter(|member| {
+                member.member_id != actor
+                    && member.member_id != request.member_id
+                    && member.status != "revoked"
+            })
+            .count();
         let allowed = match actor_role {
             Some(GroupRoleView::Owner) => {
-                member.role != GroupRoleView::Owner && member.member_id != actor
+                target_member.role != GroupRoleView::Owner && target_member.member_id != actor
             }
             Some(GroupRoleView::Staff) => {
-                member.role == GroupRoleView::Member && member.member_id != actor
+                target_member.role == GroupRoleView::Member && target_member.member_id != actor
             }
             _ => false,
         };
@@ -5095,43 +5265,130 @@ pub fn revoke_group_member_access(request: RevokeGroupMemberAccessRequest) -> Ap
             );
             return;
         }
-        let before = member.role.clone();
-        member.status = "revoked".to_owned();
-        member.revoked_at = Some(now.clone());
-        member.revoked_by = Some(actor.clone());
-        member.last_seen_at = None;
-        member.presence_expires_at = None;
+        let openmls_removal =
+            state.remove_openmls_group_member(&request.group_id, &request.member_id);
+        let (
+            crypto_removal_status,
+            openmls_remove_commit,
+            openmls_epoch,
+            openmls_confirmation_tag_sha256,
+            governance_summary,
+            event_summary,
+        ) = match openmls_removal {
+            Ok(removal) => (
+                removal.status_copy,
+                Some(removal.commit_bytes),
+                Some(removal.epoch),
+                Some(removal.confirmation_tag_sha256),
+                "Revoked member access and committed an OpenMLS remove-member epoch".to_owned(),
+                "Revoked member access with OpenMLS remove-member commit".to_owned(),
+            ),
+            Err(error) => {
+                let fallback_status =
+                    if error.contains("member not found") || error.contains("not found in group") {
+                        "fail_closed_app_state_only_openmls_member_leaf_missing"
+                    } else if error.contains("openmls_group_handle_missing") {
+                        "fail_closed_app_state_only_openmls_group_handle_missing"
+                    } else {
+                        "fail_closed_app_state_only_openmls_remove_member_failed"
+                    }
+                    .to_owned();
+                (
+                    fallback_status,
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "Revoked member access fail-closed at app state; OpenMLS removal could not be committed ({})",
+                        redacted_observable_ref("error", &error)
+                    ),
+                    "Revoked member access fail-closed; OpenMLS removal was unavailable"
+                        .to_owned(),
+                )
+            }
+        };
         let id = governance_event_id(
             &request.group_id,
             "member.revoked",
             &request.member_id,
             state.next_sequence,
         );
-        group.governance_log.push(governance_log_entry(&id, &request.group_id, "member.revoked", &actor, Some(&request.member_id), Some(before), None, &now, "Revoked member access fail-closed at app state; MLS removal is a documented crypto gap"));
-        let frame = TextControlFrameView::GroupMemberRevoked {
+        let group = &mut state.groups[group_index];
+        let member = &mut group.members[member_index];
+        let before = member.role.clone();
+        member.status = "revoked".to_owned();
+        member.revoked_at = Some(now.clone());
+        member.revoked_by = Some(actor.clone());
+        member.last_seen_at = None;
+        member.presence_expires_at = None;
+        group.governance_log.push(governance_log_entry(
+            &id,
+            &request.group_id,
+            "member.revoked",
+            &actor,
+            Some(&request.member_id),
+            Some(before),
+            None,
+            &now,
+            &governance_summary,
+        ));
+        let notice_id = format!("{id}-notice");
+        let notice_frame = TextControlFrameView::GroupMemberRevoked {
             group_id: request.group_id.clone(),
-            event_id: id.clone(),
+            event_id: notice_id.clone(),
             actor_member_id: actor.clone(),
             target_member_id: request.member_id.clone(),
             reason: request.reason.clone(),
             created_at: now.clone(),
-            crypto_removal_status: "fail_closed_app_state_only_openmls_remove_member_not_available"
-                .to_owned(),
+            crypto_removal_status: "fail_closed_app_state_revoke_notice".to_owned(),
+            openmls_remove_commit: None,
+            openmls_epoch: None,
+            openmls_confirmation_tag_sha256: None,
         };
-        if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
+        if let Err(error) =
+            queue_group_governance_frame(state, &request.group_id, &notice_id, notice_frame)
+        {
             state.push_command_error(
                 "group.member_revoke_rejected",
                 "revoke_group_member_access",
-                "governance_frame_queue_failed",
+                "governance_notice_frame_queue_failed",
                 error,
                 "Retry after text/control governance serialization is available",
             );
             return;
         }
-        state.push_event(
-            "group.member_revoked",
-            "Revoked member access fail-closed; MLS removal is a documented crypto gap",
-        );
+        let should_queue_commit_frame =
+            openmls_remove_commit.is_none() || remaining_remote_member_count > 0;
+        if should_queue_commit_frame {
+            let frame = TextControlFrameView::GroupMemberRevoked {
+                group_id: request.group_id.clone(),
+                event_id: id.clone(),
+                actor_member_id: actor.clone(),
+                target_member_id: request.member_id.clone(),
+                reason: request.reason.clone(),
+                created_at: now.clone(),
+                crypto_removal_status,
+                openmls_remove_commit,
+                openmls_epoch,
+                openmls_confirmation_tag_sha256,
+            };
+            if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
+                state.push_command_error(
+                    "group.member_revoke_rejected",
+                    "revoke_group_member_access",
+                    "governance_frame_queue_failed",
+                    error,
+                    "Retry after text/control governance serialization is available",
+                );
+                return;
+            }
+        } else {
+            state.push_event(
+                "group.member_revoke_commit_not_queued",
+                "OpenMLS remove-member commit stayed local because no remaining remote group members need the rekey",
+            );
+        }
+        state.push_event("group.member_revoked", event_summary);
     })
 }
 
@@ -5185,6 +5442,13 @@ pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateV
             );
             return;
         };
+        if member.status == "pending" {
+            state.push_event(
+                "group.presence_deferred",
+                "Deferred presence while local member is waiting for admission approval",
+            );
+            return;
+        }
         if member.status == "revoked" {
             state.push_command_error(
                 "group.presence_rejected",
@@ -5198,6 +5462,10 @@ pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateV
         member.status = "online".to_owned();
         member.last_seen_at = Some(now_string.clone());
         member.presence_expires_at = Some(expires_string.clone());
+        let member_display_name = member.display_name.clone();
+        let member_device_id = member.device_id.clone();
+        let member_role = member.role.clone();
+        let member_signer_public_key_hex = member.signer_public_key_hex.clone();
         group.governance_log.push(governance_log_entry(
             &event_id,
             &request.group_id,
@@ -5213,6 +5481,10 @@ pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateV
             group_id: request.group_id.clone(),
             event_id: event_id.clone(),
             member_id: member_id.clone(),
+            display_name: Some(member_display_name),
+            device_id: member_device_id,
+            role: Some(member_role),
+            signer_public_key_hex: member_signer_public_key_hex,
             last_seen_at: now_string.clone(),
             presence_expires_at: expires_string,
         };
@@ -5366,6 +5638,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             expires_at.as_str(),
             max_uses,
             Some(&group_id),
+            Some(&group_name),
         ) {
             Ok(code) => code,
             Err(error) => {
@@ -5567,7 +5840,7 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
             });
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
         let invite_code =
-            match production_invite_link(&descriptor, expires_at.as_str(), max_uses, None) {
+            match production_invite_link(&descriptor, expires_at.as_str(), max_uses, None, None) {
                 Ok(code) => code,
                 Err(error) => {
                     state.push_command_error(
@@ -5807,6 +6080,16 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
                 "message_empty",
                 "Empty message was not sent",
                 "Type a non-empty message before sending",
+            );
+            return;
+        }
+        if let Err(error) = ensure_channel_target_openmls_ready_for_send(state, &request.target) {
+            state.push_command_error(
+                "message.rejected",
+                "send_message",
+                error.0,
+                error.1,
+                error.2,
             );
             return;
         }
@@ -6755,6 +7038,11 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn export_diagnostics_log() -> String {
+        super::export_diagnostics_log()
+    }
+
+    #[tauri::command]
     pub(super) fn configure_storage_security(
         app_handle: tauri::AppHandle,
         request: ConfigureStorageSecurityRequest,
@@ -7258,6 +7546,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc_commands::app_snapshot,
             ipc_commands::app_state,
+            ipc_commands::export_diagnostics_log,
             ipc_commands::configure_storage_security,
             ipc_commands::unlock_storage_security,
             ipc_commands::start_signaling_session,
@@ -7539,6 +7828,135 @@ impl PersistedAppState {
         Ok(())
     }
 
+    fn remove_openmls_group_member(
+        &mut self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<OpenMlsMemberRemoval, String> {
+        let handle = self
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "openmls_group_handle_missing".to_owned())?;
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("openmls_signer_handle_invalid_hex:{error}"))?;
+        let store_path = handle
+            .openmls_store_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(app_openmls_store_path);
+        let mut engine = OpenMlsGroupEngine::open(&store_path)
+            .map_err(|error| format!("openmls_provider_open_failed:{error}"))?;
+        engine
+            .load_group(group_id, &signer_public_key)
+            .map_err(|error| format!("openmls_group_load_failed:{error}"))?;
+        let result = engine
+            .remove_member(group_id, member_id)
+            .map_err(|error| format!("openmls_remove_member_failed:{error}"))?;
+        let mut confirmation_hash = Sha256::new();
+        confirmation_hash.update(&result.state.confirmation_tag);
+        let confirmation_tag_sha256 = hex::encode(confirmation_hash.finalize());
+        if let Some(record) = self
+            .openmls_groups
+            .iter_mut()
+            .find(|record| record.group_id == group_id)
+        {
+            record.epoch = result.state.epoch;
+            record.confirmation_tag_sha256 = confirmation_tag_sha256.clone();
+            record.status_copy = format!(
+                "OpenMLS remove-member commit cryptographically removed {} from the current group epoch",
+                redacted_observable_ref("member", member_id)
+            );
+        }
+        Ok(OpenMlsMemberRemoval {
+            commit_bytes: result.commit,
+            epoch: result.state.epoch,
+            confirmation_tag_sha256,
+            status_copy: "openmls_remove_member_commit_applied".to_owned(),
+        })
+    }
+
+    fn apply_openmls_group_member_removal_commit(
+        &mut self,
+        group_id: &str,
+        target_member_id: &str,
+        commit_bytes: &[u8],
+        epoch: u64,
+        confirmation_tag_sha256: &str,
+    ) -> Result<(), String> {
+        if let Some(carried_confirmation) =
+            OpenMlsGroupEngine::public_commit_confirmation_tag_sha256(commit_bytes)
+                .map_err(|error| format!("openmls_remove_member_commit_preflight_failed:{error}"))?
+        {
+            if carried_confirmation != confirmation_tag_sha256 {
+                return Err("openmls_remove_member_commit_confirmation_tag_mismatch".to_owned());
+            }
+        }
+        if confirmation_tag_sha256.len() != 64
+            || !confirmation_tag_sha256
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err("openmls_remove_member_commit_confirmation_tag_mismatch".to_owned());
+        }
+        let handle = self
+            .openmls_groups
+            .iter()
+            .find(|record| record.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "openmls_group_handle_missing".to_owned())?;
+        let signer_public_key = hex::decode(&handle.signer_public_key_hex)
+            .map_err(|error| format!("openmls_signer_handle_invalid_hex:{error}"))?;
+        let store_path = handle
+            .openmls_store_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(app_openmls_store_path);
+        let mut engine = OpenMlsGroupEngine::open(&store_path)
+            .map_err(|error| format!("openmls_provider_open_failed:{error}"))?;
+        engine
+            .load_group(group_id, &signer_public_key)
+            .map_err(|error| format!("openmls_group_load_failed:{error}"))?;
+        let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.apply_external_remove_commit(group_id, epoch, commit_bytes, target_member_id)
+        }))
+        .map_err(|_| "openmls_remove_member_commit_apply_panicked".to_owned())?
+        .map_err(|error| format!("openmls_remove_member_commit_apply_failed:{error}"))?;
+        let mut confirmation_hash = Sha256::new();
+        confirmation_hash.update(&snapshot.confirmation_tag);
+        let applied_confirmation = hex::encode(confirmation_hash.finalize());
+        if self.local_user_id() == target_member_id {
+            self.openmls_groups
+                .retain(|record| record.group_id != group_id);
+            self.push_event(
+                "mls.member_removed_local",
+                "Removed local OpenMLS group handle after validating replicated revoke commit",
+            );
+            return Ok(());
+        }
+        if let Some(record) = self
+            .openmls_groups
+            .iter_mut()
+            .find(|record| record.group_id == group_id)
+        {
+            record.epoch = snapshot.epoch;
+            record.confirmation_tag_sha256 = applied_confirmation;
+            record.status_copy = format!(
+                "OpenMLS remove-member commit was applied for {}",
+                redacted_observable_ref("member", target_member_id)
+            );
+        }
+        self.push_event(
+            "mls.member_removal_commit_applied",
+            format!(
+                "Applied OpenMLS removal commit for {}",
+                redacted_observable_ref("group", group_id)
+            ),
+        );
+        Ok(())
+    }
+
     fn openmls_text_exporter_for_target(
         &self,
         target: &MessageTargetView,
@@ -7805,6 +8223,65 @@ impl PersistedAppState {
         Ok(())
     }
 
+    fn upsert_admitted_group_member(
+        &mut self,
+        group_id: &str,
+        member_identity: &str,
+        signer_public_key_hex: &str,
+    ) {
+        let actor_member_id = self.local_user_id();
+        let created_at = Utc::now().to_rfc3339();
+        let sequence = self.next_sequence;
+        let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+        else {
+            return;
+        };
+        if let Some(member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == member_identity)
+        {
+            member.role = GroupRoleView::Member;
+            member.signer_public_key_hex = Some(signer_public_key_hex.to_owned());
+            member.status = "unknown".to_owned();
+            member.revoked_at = None;
+            member.revoked_by = None;
+            return;
+        }
+        group.members.push(GroupMemberView {
+            member_id: member_identity.to_owned(),
+            display_name: redacted_observable_ref("member", member_identity),
+            device_id: None,
+            role: GroupRoleView::Member,
+            status: "unknown".to_owned(),
+            signer_public_key_hex: Some(signer_public_key_hex.to_owned()),
+            joined_at: created_at.clone(),
+            last_seen_at: None,
+            presence_expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+        });
+        group.governance_log.push(GroupGovernanceLogEntryView {
+            event_id: stable_id(
+                "governance",
+                &format!("{group_id}:{member_identity}:admitted"),
+                sequence,
+            ),
+            group_id: group_id.to_owned(),
+            event_kind: "member_admitted".to_owned(),
+            actor_member_id,
+            target_member_id: Some(member_identity.to_owned()),
+            request_id: None,
+            role_before: None,
+            role_after: Some(GroupRoleView::Member),
+            created_at,
+            summary: "Admitted member by issuing an OpenMLS Welcome".to_owned(),
+        });
+    }
+
     fn openmls_admission_welcome_from_frame(
         &mut self,
         group_id: &str,
@@ -7856,6 +8333,7 @@ impl PersistedAppState {
             record.status_copy =
                 format!("OpenMLS owner admitted {member_identity} from text/control key package");
         }
+        self.upsert_admitted_group_member(group_id, member_identity, signer_public_key_hex);
         self.push_event(
             "mls.admission_welcome_created",
             format!(
@@ -7915,6 +8393,8 @@ impl PersistedAppState {
                 status_copy: "OpenMLS member joined from text/control admission Welcome".to_owned(),
             },
         );
+        let local_member_id = self.local_user_id();
+        self.upsert_admitted_group_member(group_id, &local_member_id, member_signer_public_key_hex);
         self.push_event(
             "mls.admission_welcome_joined",
             format!(
@@ -8249,7 +8729,7 @@ impl PersistedAppState {
     fn fallback_leg_label(leg: FallbackLeg) -> &'static str {
         match leg {
             FallbackLeg::Stun => "stun",
-            FallbackLeg::RelayOverlay => "overlay",
+            FallbackLeg::RelayOverlay => "unsupported_overlay",
             FallbackLeg::Turn => "turn",
         }
     }
@@ -8291,7 +8771,6 @@ impl PersistedAppState {
                         | TransportSessionState::IceGathering
                         | TransportSessionState::Checking
                         | TransportSessionState::Direct
-                        | TransportSessionState::OverlayRelay
                         | TransportSessionState::TurnRelay
                         | TransportSessionState::Reconnecting => {
                             return Ok(existing.session_id.clone());
@@ -8301,7 +8780,8 @@ impl PersistedAppState {
                                 return Ok(existing.session_id.clone());
                             }
                         }
-                        TransportSessionState::Disconnected
+                        TransportSessionState::OverlayRelay
+                        | TransportSessionState::Disconnected
                         | TransportSessionState::Failed
                         | TransportSessionState::Cancelled => {
                             // Intentionally recreate to represent a fresh session lifecycle.
@@ -8488,34 +8968,35 @@ impl PersistedAppState {
             );
             return;
         }
-        let (selected_leg, endpoint) =
-            if probe.offerer_direct_path_ready && probe.answerer_direct_path_ready {
-                let endpoint = self
-                    .active_connectivity_policy()
-                    .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
-                    .map(Endpoint::new)
-                    .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
-                (FallbackLeg::Stun, endpoint)
-            } else if probe.offerer_turn_fallback_ready && probe.answerer_turn_fallback_ready {
-                let endpoint = self
-                    .active_connectivity_policy()
-                    .and_then(|(_, connectivity)| {
-                        connectivity
-                            .ice_turn_servers
-                            .first()
-                            .map(|server| server.endpoint.clone())
-                    })
-                    .map(Endpoint::new)
-                    .unwrap_or_else(|| Endpoint::new("turn:provider-relay.proofed"));
-                (FallbackLeg::Turn, endpoint)
-            } else {
-                (FallbackLeg::RelayOverlay, Endpoint::new("overlay:pending"))
-            };
-        if matches!(selected_leg, FallbackLeg::RelayOverlay) {
-            self.push_event(
-                "transport.text_route_pending",
-                "DataChannel opened, but direct STUN route readiness was not proven; route state left unconnected until TURN/overlay proof is available".to_owned(),
-            );
+        let (selected_leg, endpoint) = if probe.offerer_direct_path_ready
+            && probe.answerer_direct_path_ready
+        {
+            let endpoint = self
+                .active_connectivity_policy()
+                .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
+                .map(Endpoint::new)
+                .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
+            (FallbackLeg::Stun, endpoint)
+        } else if probe.offerer_turn_fallback_ready && probe.answerer_turn_fallback_ready {
+            let endpoint = self
+                .active_connectivity_policy()
+                .and_then(|(_, connectivity)| {
+                    connectivity
+                        .ice_turn_servers
+                        .first()
+                        .map(|server| server.endpoint.clone())
+                })
+                .map(Endpoint::new)
+                .unwrap_or_else(|| Endpoint::new("turn:configured-turn.proofed"));
+            (FallbackLeg::Turn, endpoint)
+        } else {
+            self.push_command_error(
+                    "transport.text_route_not_proofed",
+                    "start_text_session",
+                    "no_direct_or_turn_route",
+                    "DataChannel opened, but direct P2P or configured TURN readiness was not proven",
+                    "Inspect ICE logs and configure TURN if the peers are behind incompatible NAT; MQTT/Nostr providers are signaling-only and never relay messages",
+                );
             return;
         };
         let attempts = if matches!(selected_leg, FallbackLeg::Turn) {
@@ -8531,13 +9012,6 @@ impl PersistedAppState {
                         .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302")),
                     carries_content: false,
                     ciphertext_only: false,
-                    succeeded: false,
-                },
-                ConnectionAttempt {
-                    leg: FallbackLeg::RelayOverlay,
-                    endpoint: Endpoint::new("overlay:not-proofed"),
-                    carries_content: false,
-                    ciphertext_only: true,
                     succeeded: false,
                 },
                 ConnectionAttempt {
@@ -8998,12 +9472,9 @@ impl PersistedAppState {
                                 .mutate(|state| {
                                     response_frame = state.handle_text_control_frame(frame);
                                 });
-                            let response_frame = response_frame.ok_or_else(|| {
-                                TransportError::Unavailable(
-                                    "receiver did not accept live text/control frame or generate receipt"
-                                        .to_owned(),
-                                )
-                            })?;
+                            let Some(response_frame) = response_frame else {
+                                return Ok(Vec::new());
+                            };
                             serde_json::to_vec(&response_frame).map_err(|error| {
                                 TransportError::Unavailable(format!(
                                     "could not encode live text/control response frame: {error}"
@@ -9025,11 +9496,16 @@ impl PersistedAppState {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-                let answerer = tokio::time::timeout(std::time::Duration::from_secs(50), answerer_task)
-                    .await
-                    .map_err(|_| "timed out waiting for role-split receiver runtime attach".to_owned())?
-                    .map_err(|error| format!("role-split receiver runtime task failed: {error}"))?
-                    .map_err(|error| error.to_string())?;
+                let answerer =
+                    tokio::time::timeout(std::time::Duration::from_secs(50), answerer_task)
+                        .await
+                        .map_err(|_| {
+                            "timed out waiting for role-split receiver runtime attach".to_owned()
+                        })?
+                        .map_err(|error| {
+                            format!("role-split receiver runtime task failed: {error}")
+                        })?
+                        .map_err(|error| error.to_string())?;
                 let offerer_evidence = offerer.evidence().clone();
                 let answerer_evidence = answerer.evidence().clone();
                 let evidence = discrypt_transport::ProviderTextControlRuntimeEvidence {
@@ -9150,16 +9626,12 @@ impl PersistedAppState {
                     session.session_id.clone(),
                     match session.state() {
                         TransportSessionState::TurnRelay => "turn-ciphertext",
-                        TransportSessionState::OverlayRelay => "overlay-ciphertext",
+                        TransportSessionState::OverlayRelay => "unsupported-overlay",
                         TransportSessionState::Direct => "direct-ciphertext",
                         _ => "pending-text-control-outbox",
                     }
                     .to_owned(),
-                    if matches!(session.state(), TransportSessionState::OverlayRelay) {
-                        1
-                    } else {
-                        0
-                    },
+                    0,
                 )
             })
             .unwrap_or_else(|| {
@@ -9267,6 +9739,15 @@ impl PersistedAppState {
             sender_verifying_key_hex: envelope_record.sender_verifying_key_hex.clone(),
             recipient_leaf: None,
         };
+        self.enqueue_text_control_frame(target, message_id, frame)
+    }
+
+    fn enqueue_text_control_frame(
+        &mut self,
+        target: &MessageTargetView,
+        message_id: &str,
+        frame: TextControlFrameView,
+    ) -> Result<(), String> {
         let frame_sha256 = text_control_frame_sha256(&frame)?;
         if let Some(existing) = self
             .text_control_outbox
@@ -9710,7 +10191,7 @@ impl PersistedAppState {
                 else {
                     if self.message_has_peer_receipt(&frame.message_id) {
                         receipts_applied += 1;
-                    } else {
+                    } else if expects_text_receipt {
                         failures.push(format!(
                             "{}: receive text/control response failed: receive text/control response timed out after {} ms",
                             frame_ref,
@@ -9726,7 +10207,7 @@ impl PersistedAppState {
                     Ok(Err(error)) => {
                         if self.message_has_peer_receipt(&frame.message_id) {
                             receipts_applied += 1;
-                        } else {
+                        } else if expects_text_receipt {
                             failures.push(format!(
                                 "{}: receive text/control response failed: {error}",
                                 frame_ref
@@ -9737,7 +10218,7 @@ impl PersistedAppState {
                     Err(_) => {
                         if self.message_has_peer_receipt(&frame.message_id) {
                             receipts_applied += 1;
-                        } else {
+                        } else if expects_text_receipt {
                             failures.push(format!(
                                 "{}: receive text/control response failed: receive text/control response timed out after {} ms",
                                 frame_ref,
@@ -10261,7 +10742,13 @@ impl PersistedAppState {
                     role_after,
                     &created_at,
                 );
-                None
+                Some(TextControlFrameView::GroupGovernanceAck {
+                    group_id,
+                    event_id,
+                    applied_by_member_id: self.local_user_id(),
+                    status: "role_changed_applied".to_owned(),
+                    created_at: Utc::now().to_rfc3339(),
+                })
             }
             TextControlFrameView::GroupMemberRevoked {
                 group_id,
@@ -10270,8 +10757,76 @@ impl PersistedAppState {
                 target_member_id,
                 reason: _,
                 created_at,
-                crypto_removal_status: _,
+                crypto_removal_status,
+                openmls_remove_commit,
+                openmls_epoch,
+                openmls_confirmation_tag_sha256,
             } => {
+                let commit_status = match (
+                    openmls_remove_commit.as_ref(),
+                    openmls_epoch,
+                    openmls_confirmation_tag_sha256.as_deref(),
+                ) {
+                    (Some(commit), Some(epoch), Some(confirmation_tag_sha256)) => {
+                        match self.apply_openmls_group_member_removal_commit(
+                            &group_id,
+                            &target_member_id,
+                            commit,
+                            epoch,
+                            confirmation_tag_sha256,
+                        ) {
+                            Ok(()) => "member_revoked_commit_applied",
+                            Err(error) => {
+                                self.push_command_error(
+                                    "mls.member_remove_commit_rejected",
+                                    "handle_text_control_frame",
+                                    "openmls_remove_member_commit_apply_failed",
+                                    error,
+                                    "Refresh group membership from another authorized owner or staff device",
+                                );
+                                return Some(TextControlFrameView::GroupGovernanceAck {
+                                    group_id,
+                                    event_id,
+                                    applied_by_member_id: self.local_user_id(),
+                                    status: "member_revoked_commit_failed".to_owned(),
+                                    created_at: Utc::now().to_rfc3339(),
+                                });
+                            }
+                        }
+                    }
+                    (Some(_), _, _) => {
+                        self.push_command_error(
+                            "mls.member_remove_commit_rejected",
+                            "handle_text_control_frame",
+                            "openmls_remove_member_commit_metadata_missing",
+                            "OpenMLS remove-member frame carried commit bytes without epoch or confirmation tag",
+                            "Refresh group membership from another authorized owner or staff device",
+                        );
+                        return Some(TextControlFrameView::GroupGovernanceAck {
+                            group_id,
+                            event_id,
+                            applied_by_member_id: self.local_user_id(),
+                            status: "member_revoked_commit_failed".to_owned(),
+                            created_at: Utc::now().to_rfc3339(),
+                        });
+                    }
+                    (None, _, _) => {
+                        if self.local_user_id() != target_member_id {
+                            self.push_event(
+                                "group.member_revoke_notice_ignored",
+                                "Ignored notice-only revoke frame for another member; waiting for validated OpenMLS remove commit",
+                            );
+                            return Some(TextControlFrameView::GroupGovernanceAck {
+                                group_id,
+                                event_id,
+                                applied_by_member_id: self.local_user_id(),
+                                status: "member_revoked_notice_ignored".to_owned(),
+                                created_at: Utc::now().to_rfc3339(),
+                            });
+                        }
+                        "member_revoked_notice_applied"
+                    }
+                };
                 apply_group_member_revoked(
                     self,
                     &group_id,
@@ -10279,13 +10834,44 @@ impl PersistedAppState {
                     &actor_member_id,
                     &target_member_id,
                     &created_at,
+                    &crypto_removal_status,
                 );
+                Some(TextControlFrameView::GroupGovernanceAck {
+                    group_id,
+                    event_id,
+                    applied_by_member_id: self.local_user_id(),
+                    status: commit_status.to_owned(),
+                    created_at: Utc::now().to_rfc3339(),
+                })
+            }
+            TextControlFrameView::GroupGovernanceAck {
+                group_id,
+                event_id,
+                applied_by_member_id,
+                status,
+                created_at,
+            } => {
+                self.push_event(
+                    "group.governance_ack_received",
+                    format!(
+                        "Governance ack {} for {} from {} at {}",
+                        redacted_observable_ref("status", &status),
+                        redacted_observable_ref("event", &event_id),
+                        redacted_observable_ref("member", &applied_by_member_id),
+                        redacted_observable_ref("time", &created_at)
+                    ),
+                );
+                let _ = group_id;
                 None
             }
             TextControlFrameView::GroupPresenceHeartbeat {
                 group_id,
                 event_id,
                 member_id,
+                display_name,
+                device_id,
+                role,
+                signer_public_key_hex,
                 last_seen_at,
                 presence_expires_at,
             } => {
@@ -10294,6 +10880,10 @@ impl PersistedAppState {
                     &group_id,
                     &event_id,
                     &member_id,
+                    display_name,
+                    device_id,
+                    role,
+                    signer_public_key_hex,
                     &last_seen_at,
                     &presence_expires_at,
                 );
@@ -10466,8 +11056,18 @@ impl PersistedAppState {
                         "Active group {group_id} is missing for text/control runtime peer attachment"
                     )
                 })?;
-            let local = group
-                .runtime_peers
+            let local_role = local_role_for_group(group, &self.local_user_id())
+                .cloned()
+                .unwrap_or_else(|| group_role_from_legacy_label(&group.role));
+            let local_role_label = group_role_label(&local_role);
+            let repaired_runtime_peers =
+                group_runtime_peers(group.connectivity.as_ref(), local_role_label);
+            let runtime_peers = if repaired_runtime_peers.len() == 2 {
+                repaired_runtime_peers.as_slice()
+            } else {
+                group.runtime_peers.as_slice()
+            };
+            let local = runtime_peers
                 .iter()
                 .find(|peer| peer.is_local)
                 .ok_or_else(|| {
@@ -10475,8 +11075,7 @@ impl PersistedAppState {
                         "Active group {group_id} has no local runtime peer from signed bootstrap metadata"
                     )
                 })?;
-            let remote = group
-                .runtime_peers
+            let remote = runtime_peers
                 .iter()
                 .find(|peer| !peer.is_local)
                 .ok_or_else(|| {
@@ -10484,6 +11083,21 @@ impl PersistedAppState {
                         "Active group {group_id} has no remote runtime peer from signed bootstrap metadata"
                     )
                 })?;
+            if discrypt_webrtc_debug_enabled() && group.runtime_peers != runtime_peers {
+                eprintln!(
+                    "discrypt-text-runtime-peer-repair group={} local_member_role={} persisted_local_role={} derived_local_role={} local_peer={} remote_peer={}",
+                    group_id,
+                    local_role_label,
+                    group.runtime_peers
+                        .iter()
+                        .find(|peer| peer.is_local)
+                        .map(|peer| peer.role.as_str())
+                        .unwrap_or("missing"),
+                    local.role,
+                    local.peer_id,
+                    remote.peer_id
+                );
+            }
             return Ok(TextControlRuntimePeerAttachment {
                 role: if local.role == "member" {
                     ProviderTextControlRuntimePeerRole::Answerer
@@ -10823,7 +11437,7 @@ impl PersistedAppState {
             TransportSessionState::IceGathering => "ice_gathering",
             TransportSessionState::Checking => "checking",
             TransportSessionState::Direct => "direct",
-            TransportSessionState::OverlayRelay => "overlay_relay",
+            TransportSessionState::OverlayRelay => "unsupported_overlay",
             TransportSessionState::TurnRelay => "turn_relay",
             TransportSessionState::Reconnecting => "reconnecting",
             TransportSessionState::Disconnected => "disconnected",
@@ -11325,7 +11939,7 @@ impl PersistedAppState {
         };
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.events.push(event);
-        let overflow = self.events.len().saturating_sub(48);
+        let overflow = self.events.len().saturating_sub(256);
         if overflow > 0 {
             self.events.drain(0..overflow);
         }
@@ -11357,6 +11971,15 @@ impl PersistedAppState {
         let event_kind = event_kind.into();
         let code = code.into();
         let message = message.into();
+        let command = command.into();
+        let recovery_hint = recovery_hint.into();
+        eprintln!(
+            "discrypt-command-error command={} code={} message={} recovery_hint={}",
+            command,
+            code,
+            redact_sensitive_observable_copy(&message),
+            redact_sensitive_observable_copy(&recovery_hint)
+        );
         self.set_command_error(command, code.clone(), message.clone(), recovery_hint);
         self.push_event(event_kind, format!("{code}: {message}"));
     }
@@ -12056,8 +12679,10 @@ fn production_storage_gate_state() -> Option<PersistedAppState> {
 
 #[cfg(not(all(target_os = "linux", feature = "production-storage", not(test))))]
 fn storage_security_view(last_error: Option<&CommandErrorView>) -> StorageSecurityView {
+    let storage_error = last_error
+        .filter(|error| error.command == "app_persistence" || error.command == "storage_security");
     StorageSecurityView {
-        status: if last_error.is_some() {
+        status: if storage_error.is_some() {
             "error"
         } else {
             "ready"
@@ -12066,7 +12691,7 @@ fn storage_security_view(last_error: Option<&CommandErrorView>) -> StorageSecuri
         mode: "development_store".to_owned(),
         title: "Development storage".to_owned(),
         detail: "This build uses the non-production local development storage path.".to_owned(),
-        recovery_hint: last_error
+        recovery_hint: storage_error
             .map(|error| error.recovery_hint.clone())
             .unwrap_or_else(|| "Continue.".to_owned()),
         password_required: false,
@@ -12366,6 +12991,11 @@ fn env_app_state_override_allowed() -> bool {
 
 fn explicit_text_runtime_attachment_allowed() -> bool {
     cfg!(any(test, feature = "harness", feature = "local-dev"))
+}
+
+fn discrypt_webrtc_debug_enabled() -> bool {
+    std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some()
+        || std::env::var_os("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_some()
 }
 
 fn app_store_path_with_env_override(allow_env_override: bool) -> PathBuf {
@@ -13404,6 +14034,33 @@ fn prepare_text_control_runtime_attach_job(
             pending.remote_peer_id
         ),
     );
+    if discrypt_webrtc_debug_enabled() {
+        let endpoint_summary = runtime_inputs
+            .profile
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.endpoint.0.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let stun_summary = runtime_inputs
+            .ice_config
+            .stun_servers
+            .iter()
+            .map(|endpoint| endpoint.0.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "discrypt-text-runtime-attach session={} role={} local_peer={} remote_peer={} adapter={} endpoint={} stun={} turn={}",
+            active_session_id,
+            runtime_role_label(Some(attachment.role)),
+            pending.local_peer_id,
+            pending.remote_peer_id,
+            runtime_inputs.profile.kind.canonical_name(),
+            endpoint_summary,
+            stun_summary,
+            runtime_inputs.ice_config.turn_servers.len()
+        );
+    }
     guard.persist();
     TextControlRuntimeAttachJob {
         command_name,
@@ -13452,6 +14109,8 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(feature = "tauri-runtime")]
+        let previous_cursor = guard.state.latest_event_cursor();
         match runtime_result {
             Ok(runtime) => {
                 guard
@@ -13484,11 +14143,17 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
                     job.command_name,
                     "transport_runtime_attach_failed",
                     error,
-                    "Ensure both peers are online in the same DM/group scope, the invite/provider profile matches, and provider-signaled STUN/TURN policy proves WebRTC attach readiness",
+                    "Ensure both peers are online in the same DM/group scope and that ICE can establish direct P2P connectivity. Configure TURN explicitly for configured relay fallback; MQTT/Nostr providers only carry SDP/candidates and never relay messages.",
                 );
             }
         }
         guard.persist();
+        #[cfg(feature = "tauri-runtime")]
+        {
+            let state = guard.to_view();
+            drop(guard);
+            emit_background_app_events(&state, previous_cursor);
+        }
     });
 }
 
@@ -13524,29 +14189,30 @@ fn start_role_split_text_control_runtime(
                         local_peer_id,
                         remote_peer_id,
                         move |received| {
-                            let frame: TextControlFrameView =
-                                serde_json::from_slice(&received).map_err(|error| {
+                            let frame: TextControlFrameView = serde_json::from_slice(&received)
+                                .map_err(|error| {
                                     TransportError::Unavailable(format!(
                                         "receiver could not decode live text/control frame: {error}"
                                     ))
                                 })?;
-                            let mut response_frame = None;
-                            app_service()
-                                .lock()
-                                .map_err(|_| {
+                            let (response_frame, state, previous_cursor) = {
+                                let mut guard = app_service().lock().map_err(|_| {
                                     TransportError::Unavailable(
                                         "live runtime app service lock poisoned".to_owned(),
                                     )
-                                })?
-                                .mutate(|state| {
-                                    response_frame = state.handle_text_control_frame(frame);
-                                });
-                            let response_frame = response_frame.ok_or_else(|| {
-                                TransportError::Unavailable(
-                                    "receiver did not accept live text/control frame or generate receipt"
-                                        .to_owned(),
-                                )
-                            })?;
+                                })?;
+                                let previous_cursor = guard.state.latest_event_cursor();
+                                let response_frame = guard.state.handle_text_control_frame(frame);
+                                guard.persist();
+                                let state = guard.to_view();
+                                (response_frame, state, previous_cursor)
+                            };
+                            #[cfg(feature = "tauri-runtime")]
+                            emit_background_app_events(&state, previous_cursor);
+                            let _ = (state, previous_cursor);
+                            let Some(response_frame) = response_frame else {
+                                return Ok(Vec::new());
+                            };
                             serde_json::to_vec(&response_frame).map_err(|error| {
                                 TransportError::Unavailable(format!(
                                     "could not encode live text/control response frame: {error}"
@@ -13891,7 +14557,12 @@ fn group_runtime_peers(
     );
     let member_peer_id =
         runtime_peer_id_from_commitment("group-member-runtime-peer", &member_commitment);
-    let local_is_owner = local_role == "owner";
+    // The signed group bootstrap is a two-sided control-plane: the authorized
+    // side (owner/staff) creates offers and admits members; the member side
+    // answers and submits admission key packages.  Persisted runtime_peers can
+    // be stale after role changes, so callers should pass the current local
+    // governance role rather than trusting old per-group peer rows.
+    let local_is_owner = matches!(local_role, "owner" | "staff");
     vec![
         GroupRuntimePeerView {
             peer_id: owner_peer_id,
@@ -14128,7 +14799,7 @@ fn ensure_group_sender_not_revoked(
         .find(|group| group.group_id == group_id)
         .is_some_and(|group| local_member_is_revoked(group, &local_member_id))
     {
-        return Err("Local member is revoked in backend governance state; access is fail-closed and no cryptographic MLS removal is claimed yet".to_owned());
+        return Err("Local member is revoked in backend governance state; access is fail-closed and any local OpenMLS handle is unusable".to_owned());
     }
     Ok(())
 }
@@ -14141,6 +14812,54 @@ fn ensure_text_target_not_revoked(
         if let Some(group_id) = target.group_id.as_deref() {
             ensure_group_sender_not_revoked(state, group_id)?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_channel_target_openmls_ready_for_send(
+    state: &PersistedAppState,
+    target: &MessageTargetView,
+) -> Result<(), (&'static str, String, &'static str)> {
+    if target.kind != "channel" {
+        return Ok(());
+    }
+    let Some(group_id) = target.group_id.as_deref() else {
+        return Err((
+            "openmls_group_target_missing",
+            "Channel text requires a persisted group before protected delivery can be created"
+                .to_owned(),
+            "Open or join a group channel before sending protected text",
+        ));
+    };
+    let local_member_id = state.local_user_id();
+    if let Some(group) = state.groups.iter().find(|group| group.group_id == group_id) {
+        if group
+            .members
+            .iter()
+            .find(|member| member.member_id == local_member_id && member.status != "revoked")
+            .is_some_and(|member| member.status == "pending")
+        {
+            return Err((
+                "admission_pending",
+                "This profile is still waiting for owner/staff admission; protected group text is blocked until an OpenMLS Welcome is received"
+                    .to_owned(),
+                "Keep both peers online, wait for approval, then retry after the group shows admitted membership",
+            ));
+        }
+    }
+    if !state
+        .openmls_groups
+        .iter()
+        .any(|handle| handle.group_id == group_id)
+    {
+        return Err((
+            "openmls_group_state_missing",
+            format!(
+                "OpenMLS group state is missing for {}",
+                redacted_observable_ref("group", group_id)
+            ),
+            "Create the group locally or complete invite admission so a persisted OpenMLS group handle exists before sending protected text",
+        ));
     }
     Ok(())
 }
@@ -14222,6 +14941,7 @@ fn apply_group_member_revoked(
     actor_member_id: &str,
     target_member_id: &str,
     created_at: &str,
+    crypto_removal_status: &str,
 ) {
     let local_member_id = state.local_user_id();
     let local_display = profile_display_name(state);
@@ -14265,7 +14985,11 @@ fn apply_group_member_revoked(
         role_before,
         None,
         created_at,
-        "Applied replicated fail-closed member revocation; MLS removal is not claimed",
+        if crypto_removal_status == "openmls_remove_member_commit_applied" {
+            "Applied replicated member revocation with OpenMLS remove-member commit"
+        } else {
+            "Applied replicated fail-closed member revocation without OpenMLS commit"
+        },
     ));
 }
 
@@ -14274,6 +14998,10 @@ fn apply_group_presence_heartbeat(
     group_id: &str,
     event_id: &str,
     member_id: &str,
+    display_name: Option<String>,
+    device_id: Option<String>,
+    role: Option<GroupRoleView>,
+    signer_public_key_hex: Option<String>,
     last_seen_at: &str,
     presence_expires_at: &str,
 ) {
@@ -14300,10 +15028,42 @@ fn apply_group_presence_heartbeat(
         .find(|member| member.member_id == member_id)
     {
         if member.status != "revoked" {
+            if let Some(display_name) = display_name
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                member.display_name = display_name.clone();
+            }
+            if device_id.is_some() {
+                member.device_id = device_id.clone();
+            }
+            if let Some(role) = role.as_ref() {
+                member.role = role.clone();
+            }
+            if signer_public_key_hex.is_some() {
+                member.signer_public_key_hex = signer_public_key_hex.clone();
+            }
             member.status = "online".to_owned();
             member.last_seen_at = Some(last_seen_at.to_owned());
             member.presence_expires_at = Some(presence_expires_at.to_owned());
         }
+    } else {
+        let member = GroupMemberView {
+            member_id: member_id.to_owned(),
+            display_name: display_name
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| redacted_observable_ref("member", member_id)),
+            device_id,
+            role: role.unwrap_or(GroupRoleView::Member),
+            status: "online".to_owned(),
+            signer_public_key_hex,
+            joined_at: last_seen_at.to_owned(),
+            last_seen_at: Some(last_seen_at.to_owned()),
+            presence_expires_at: Some(presence_expires_at.to_owned()),
+            revoked_at: None,
+            revoked_by: None,
+        };
+        group.members.push(member);
     }
     group.governance_log.push(governance_log_entry(
         event_id,
@@ -14814,6 +15574,7 @@ fn production_invite_link(
     expires_at: &str,
     max_uses: u32,
     group_id: Option<&str>,
+    _group_name: Option<&str>,
 ) -> Result<String, String> {
     let descriptor_bytes = serde_json::to_vec(descriptor)
         .map_err(|error| format!("Could not encode signed invite descriptor: {error}"))?;
@@ -14841,20 +15602,60 @@ fn url_component(value: &str) -> String {
     encoded
 }
 
+fn group_name_from_group_id(group_id: &str) -> Option<String> {
+    let raw = group_id.strip_prefix("group-").unwrap_or(group_id);
+    let without_sequence = raw
+        .rsplit_once('-')
+        .filter(|(_, tail)| tail.chars().all(|character| character.is_ascii_digit()))
+        .map(|(head, _)| head)
+        .unwrap_or(raw);
+    let name = without_sequence.replace('-', " ");
+    let normalized = normalize_label(&name, "joined group");
+    (!normalized.trim().is_empty() && normalized != "joined group").then_some(normalized)
+}
+
 fn parse_invite_group_name(invite_code: &str) -> String {
-    invite_code
-        .rsplit('/')
-        .next()
-        .and_then(|tail| tail.split_once('-').map(|(_, slug)| slug))
-        .map(|slug| slug.replace('-', " "))
+    let path = invite_code.split('?').next().unwrap_or(invite_code);
+    let tail = path.rsplit('/').next().unwrap_or_default();
+    if tail.len() >= 32
+        && tail
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
+    {
+        return "joined group".to_owned();
+    }
+    tail.split_once('-')
+        .map(|(_, slug)| normalize_label(&slug.replace('-', " "), "joined group"))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "joined group".to_owned())
+}
+
+fn invite_group_name_from_metadata(
+    invite_code: &str,
+    request_name: Option<String>,
+    parsed_invite: Option<&ParsedInviteMetadata>,
+) -> String {
+    request_name
+        .map(|value| normalize_label(&value, "joined group"))
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            parsed_invite
+                .and_then(|parsed| parsed.group_name.clone())
+                .map(|value| normalize_label(&value, "joined group"))
+        })
+        .or_else(|| {
+            parsed_invite
+                .and_then(|parsed| parsed.group_id.as_deref())
+                .and_then(group_name_from_group_id)
+        })
+        .unwrap_or_else(|| parse_invite_group_name(invite_code))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedInviteMetadata {
     invite_key: String,
     group_id: Option<String>,
+    group_name: Option<String>,
     room_secret_hash: String,
     signaling_endpoint: String,
     signaling_trust_fingerprint: String,
@@ -14898,6 +15699,11 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         return Some(ParsedInviteMetadata {
             invite_key: descriptor.invite_id,
             group_id: query_value(query, "gid").and_then(percent_decode),
+            // Signed descriptor links intentionally ignore unsigned display-name
+            // query parameters.  A label can still be derived from the signed
+            // group id slug; otherwise callers should ask the user for a local
+            // display label instead of trusting invite-link decoration.
+            group_name: None,
             room_secret_hash: hex::encode(descriptor.room_secret_commitment),
             signaling_endpoint: descriptor.signaling_metadata.signaling_endpoint,
             signaling_trust_fingerprint: descriptor.signaling_metadata.trust.signaling_fingerprint,
@@ -14937,6 +15743,11 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
     Some(ParsedInviteMetadata {
         invite_key: invite_key.clone(),
         group_id: query_value(query, "gid").and_then(percent_decode),
+        group_name: query_value(query, "gname")
+            .or_else(|| query_value(query, "name"))
+            .and_then(percent_decode)
+            .map(|value| normalize_label(&value, "joined group"))
+            .filter(|value| !value.trim().is_empty()),
         room_secret_hash,
         signaling_endpoint: endpoint,
         signaling_trust_fingerprint,
@@ -15307,12 +16118,12 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn join_group_invite_as_test_profile(
+    fn join_group_invite_as_test_profile_with_optional_name(
         profile_name: &str,
         display_name: &str,
         device_name: &str,
         invite_code: String,
-        group_name: &str,
+        group_name: Option<&str>,
     ) -> Result<(PathBuf, TauriAppService), String> {
         let path = reset_with_temp_state(profile_name);
         create_user(CreateUserRequest {
@@ -15321,7 +16132,7 @@ mod tests {
         });
         let joined = join_group(JoinGroupRequest {
             invite_code,
-            group_name: Some(group_name.to_owned()),
+            group_name: group_name.map(ToOwned::to_owned),
         });
         if joined.last_command_error.is_some() {
             return Err(format!(
@@ -15330,6 +16141,23 @@ mod tests {
             ));
         }
         Ok((path.clone(), TauriAppService::load_for_test_path(path)))
+    }
+
+    #[allow(dead_code)]
+    fn join_group_invite_as_test_profile(
+        profile_name: &str,
+        display_name: &str,
+        device_name: &str,
+        invite_code: String,
+        group_name: &str,
+    ) -> Result<(PathBuf, TauriAppService), String> {
+        join_group_invite_as_test_profile_with_optional_name(
+            profile_name,
+            display_name,
+            device_name,
+            invite_code,
+            Some(group_name),
+        )
     }
 
     fn attach_text_control_transport_runtime_for_test(
@@ -15468,11 +16296,10 @@ mod tests {
             .find(|member| member.member_id == "member-bob")
             .expect("bob member present");
         assert_eq!(bob.status, "revoked");
-        assert!(revoked.events.iter().any(|event| {
-            event
-                .summary
-                .contains("MLS removal is a documented crypto gap")
-        }));
+        assert!(revoked
+            .events
+            .iter()
+            .any(|event| { event.summary.contains("OpenMLS removal was unavailable") }));
 
         let service = app_service();
         let guard = service
@@ -15483,10 +16310,255 @@ mod tests {
                 &record.frame,
                 TextControlFrameView::GroupMemberRevoked {
                     crypto_removal_status,
+                    openmls_remove_commit,
                     ..
-                } if crypto_removal_status == "fail_closed_app_state_only_openmls_remove_member_not_available"
+                } if crypto_removal_status == "fail_closed_app_state_only_openmls_member_leaf_missing"
+                    && openmls_remove_commit.is_none()
             )
         }));
+    }
+
+    #[test]
+    fn g005_revocation_commits_openmls_remove_member_and_rekeys_remaining_members(
+    ) -> Result<(), String> {
+        let _lock = test_lock();
+        let alice_path = reset_with_temp_state("g005-openmls-revocation-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "OpenMLS Revocation Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created.groups[0].group_id.clone();
+
+        let bob_path = fresh_state_path("g005-openmls-revocation-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path.clone());
+        bob.state.create_user(
+            CreateUserRequest {
+                display_name: "Bob".to_owned(),
+                device_name: Some("Bob laptop".to_owned()),
+            },
+            false,
+        );
+        bob.persist();
+        let bob_package = bob.request_openmls_admission_key_package(&group_id)?;
+        let bob_member_id = bob_package.member_identity.clone();
+
+        let charlie_path = fresh_state_path("g005-openmls-revocation-charlie");
+        let _ = fs::remove_file(&charlie_path);
+        let mut charlie = TauriAppService::load_for_test_path(charlie_path.clone());
+        charlie.state.create_user(
+            CreateUserRequest {
+                display_name: "Charlie".to_owned(),
+                device_name: Some("Charlie laptop".to_owned()),
+            },
+            false,
+        );
+        charlie.persist();
+        let charlie_package = charlie.request_openmls_admission_key_package(&group_id)?;
+        let charlie_member_id = charlie_package.member_identity.clone();
+
+        let mut alice = TauriAppService::load_for_test_path(alice_path.clone());
+        let bob_welcome = alice.issue_openmls_admission_welcome(&bob_package)?;
+        bob.join_openmls_group_from_welcome(&bob_welcome)?;
+        let charlie_welcome = alice.issue_openmls_admission_welcome(&charlie_package)?;
+        charlie.join_openmls_group_from_welcome(&charlie_welcome)?;
+
+        reload_global_app_service_from_path(&alice_path);
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .ok_or_else(|| "alice group missing".to_owned())?;
+            for (member_id, display_name) in [
+                (bob_member_id.as_str(), "Bob"),
+                (charlie_member_id.as_str(), "Charlie"),
+            ] {
+                if !group
+                    .members
+                    .iter()
+                    .any(|member| member.member_id == member_id)
+                {
+                    group.members.push(GroupMemberView {
+                        member_id: member_id.to_owned(),
+                        display_name: display_name.to_owned(),
+                        device_id: None,
+                        role: GroupRoleView::Member,
+                        status: "offline".to_owned(),
+                        signer_public_key_hex: None,
+                        joined_at: Utc::now().to_rfc3339(),
+                        last_seen_at: None,
+                        presence_expires_at: None,
+                        revoked_at: None,
+                        revoked_by: None,
+                    });
+                }
+            }
+            guard.persist();
+        }
+
+        let alice_before = TauriAppService::load_for_test_path(alice_path.clone());
+        let alice_secret_before = alice_before.state.openmls_text_exporter_secret(&group_id)?;
+        let charlie_secret_before = charlie.state.openmls_text_exporter_secret(&group_id)?;
+        assert_eq!(alice_secret_before, charlie_secret_before);
+
+        let revoked = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: bob_member_id.clone(),
+            reason: Some("policy".to_owned()),
+        });
+        assert_eq!(revoked.last_command_error, None);
+        let revoked_bob = revoked.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == bob_member_id)
+            .ok_or_else(|| "revoked bob missing".to_owned())?;
+        assert_eq!(revoked_bob.status, "revoked");
+
+        let (notice_frame, frame) = {
+            let service = app_service();
+            let guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let notice = guard
+                .state
+                .text_control_outbox
+                .iter()
+                .find_map(|record| match &record.frame {
+                    TextControlFrameView::GroupMemberRevoked {
+                        crypto_removal_status,
+                        openmls_remove_commit,
+                        ..
+                    } if crypto_removal_status == "fail_closed_app_state_revoke_notice"
+                        && openmls_remove_commit.is_none() =>
+                    {
+                        Some(record.frame.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| "fail-closed revoke notice frame missing".to_owned())?;
+            let commit = guard
+                .state
+                .text_control_outbox
+                .iter()
+                .rev()
+                .find_map(|record| match &record.frame {
+                    TextControlFrameView::GroupMemberRevoked {
+                        crypto_removal_status,
+                        openmls_remove_commit,
+                        openmls_epoch,
+                        openmls_confirmation_tag_sha256,
+                        ..
+                    } if crypto_removal_status == "openmls_remove_member_commit_applied"
+                        && openmls_remove_commit.is_some()
+                        && openmls_epoch.is_some()
+                        && openmls_confirmation_tag_sha256.is_some() =>
+                    {
+                        Some(record.frame.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| "OpenMLS revoke frame missing".to_owned())?;
+            (notice, commit)
+        };
+
+        let alice_after = TauriAppService::load_for_test_path(alice_path.clone());
+        let alice_secret_after = alice_after.state.openmls_text_exporter_secret(&group_id)?;
+        assert_ne!(alice_secret_before, alice_secret_after);
+
+        let mut charlie_tampered = TauriAppService::load_for_test_path(charlie_path.clone());
+        let mut tampered_frame = frame.clone();
+        if let TextControlFrameView::GroupMemberRevoked { openmls_epoch, .. } = &mut tampered_frame
+        {
+            *openmls_epoch = Some(999);
+        }
+        assert!(matches!(
+            charlie_tampered.state.handle_text_control_frame(tampered_frame),
+            Some(TextControlFrameView::GroupGovernanceAck { status, .. }) if status == "member_revoked_commit_failed"
+        ));
+        assert!(charlie_tampered.state.last_command_error.is_some());
+        assert!(
+            !charlie_tampered.state.groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.members.iter().any(|member| {
+                        member.member_id == bob_member_id && member.status == "revoked"
+                    })
+            }),
+            "tampered OpenMLS remove commits must not apply app-level revocation"
+        );
+        let charlie_secret_after_rejected = charlie_tampered
+            .state
+            .openmls_text_exporter_secret(&group_id)?;
+        assert_eq!(charlie_secret_before, charlie_secret_after_rejected);
+
+        let charlie_notice_ack = charlie
+            .state
+            .handle_text_control_frame(notice_frame.clone());
+        assert!(
+            matches!(
+                charlie_notice_ack,
+                Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                    if status == "member_revoked_notice_ignored"
+            ),
+            "non-target members must ignore notice-only revoke frames until a validated OpenMLS remove commit is applied: {charlie_notice_ack:?}"
+        );
+        assert!(
+            !charlie.state.groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.members.iter().any(|member| {
+                        member.member_id == bob_member_id && member.status == "revoked"
+                    })
+            }),
+            "notice-only revoke frame must not apply app-level revocation for non-target members"
+        );
+        assert_eq!(
+            charlie_secret_before,
+            charlie.state.openmls_text_exporter_secret(&group_id)?
+        );
+
+        let charlie_ack = charlie.state.handle_text_control_frame(frame.clone());
+        assert!(
+            matches!(
+                charlie_ack,
+                Some(TextControlFrameView::GroupGovernanceAck { ref status, .. }) if status == "member_revoked_commit_applied"
+            ),
+            "unexpected charlie ack {charlie_ack:?}, error {:?}",
+            charlie.state.last_command_error
+        );
+        assert_eq!(charlie.state.last_command_error, None);
+        let charlie_secret_after = charlie.state.openmls_text_exporter_secret(&group_id)?;
+        assert_eq!(alice_secret_after, charlie_secret_after);
+        assert_ne!(charlie_secret_before, charlie_secret_after);
+
+        assert!(matches!(
+            bob.state.handle_text_control_frame(notice_frame),
+            Some(TextControlFrameView::GroupGovernanceAck { status, .. }) if status == "member_revoked_notice_applied"
+        ));
+        assert!(matches!(
+            bob.state.handle_text_control_frame(frame),
+            Some(TextControlFrameView::GroupGovernanceAck { status, .. }) if status == "member_revoked_commit_failed"
+        ));
+        assert!(bob
+            .state
+            .openmls_groups
+            .iter()
+            .any(|handle| handle.group_id == group_id));
+        Ok(())
     }
 
     #[test]
@@ -15516,6 +16588,45 @@ mod tests {
         assert_eq!(present.last_command_error, None);
         assert_eq!(present.groups[0].members[0].status, "online");
         assert!(present.groups[0].members[0].presence_expires_at.is_some());
+        let presence_frame = load_state_from_path(&_path)
+            .text_control_outbox
+            .iter()
+            .find_map(|record| match &record.frame {
+                TextControlFrameView::GroupPresenceHeartbeat { .. } => Some(record.frame.clone()),
+                _ => None,
+            })
+            .expect("presence heartbeat frame queued");
+        let other_path = reset_with_temp_state("g005-presence-receiver");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        create_group(CreateGroupRequest {
+            name: "Presence Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        {
+            let mut receiver = TauriAppService::load_for_test_path(other_path.clone());
+            assert_eq!(
+                receiver.state.handle_text_control_frame(presence_frame),
+                None
+            );
+            receiver.persist();
+        }
+        let receiver_state = load_state_from_path(&other_path);
+        assert!(
+            receiver_state.groups[0]
+                .members
+                .iter()
+                .any(|member| member.display_name == "Alice" && member.status == "online"),
+            "presence frames should replicate unknown roster members with display/role metadata"
+        );
+        reload_global_app_service_from_path(&_path);
 
         {
             let service = app_service();
@@ -15565,6 +16676,51 @@ mod tests {
                 .map(|error| error.code.as_str()),
             Some("member_revoked")
         );
+    }
+
+    #[test]
+    fn group_presence_without_role_does_not_promote_unknown_member_to_owner() {
+        let _lock = test_lock();
+        let path = reset_with_temp_state("presence-role-none-no-owner-promotion");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Presence Role Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        {
+            let mut service = TauriAppService::load_for_test_path(path.clone());
+            service.state.groups[0].role = "member".to_owned();
+            apply_group_presence_heartbeat(
+                &mut service.state,
+                &group_id,
+                "presence-event-without-role",
+                "member-charlie",
+                Some("Charlie".to_owned()),
+                Some("Charlie laptop".to_owned()),
+                None,
+                None,
+                "2026-06-05T00:00:00Z",
+                "2026-06-05T00:05:00Z",
+            );
+            service.persist();
+        }
+        let state = load_state_from_path(&path);
+        let charlie = state.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == "member-charlie")
+            .expect("presence-created member missing");
+        assert_eq!(charlie.role, GroupRoleView::Member);
+        assert_eq!(charlie.status, "online");
     }
 
     #[derive(Debug)]
@@ -17408,7 +18564,17 @@ mod tests {
         );
         assert!(group_invite.ice_turn_servers.is_empty());
         assert!(group_invite.code.contains("?d="));
-        assert!(!group_invite.code.contains("Private%20Lab"));
+        assert!(
+            !group_invite.code.contains("gname="),
+            "signed group invites must not trust unsigned display-name query decoration"
+        );
+        let parsed_group_invite =
+            parse_invite_metadata(&group_invite.code).expect("group invite metadata parses");
+        assert_eq!(
+            parsed_group_invite.group_name.as_deref(),
+            None,
+            "display labels are derived from signed group ids or user input, not unsigned gname"
+        );
         assert!(!group_invite.code.contains("room_secret="));
 
         let dm_state = start_dm(StartDmRequest {
@@ -17719,6 +18885,223 @@ mod tests {
     }
 
     #[test]
+    fn g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("g007-manual-admission-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice G007".to_owned(),
+            device_name: Some("Alice admin laptop".to_owned()),
+        });
+        let created_group = create_group(CreateGroupRequest {
+            name: "G007 Manual Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(
+            created_group.last_command_error.is_none(),
+            "{created_group:?}"
+        );
+        let group = created_group.groups[0].clone();
+        let group_id = group.group_id.clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "manual group text channel missing".to_owned())?;
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        assert!(
+            invite_state.last_command_error.is_none(),
+            "{invite_state:?}"
+        );
+        let invite = invite_state
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "manual admission invite missing".to_owned())?;
+
+        let (bob_path, _) = join_group_invite_as_test_profile_with_optional_name(
+            "g007-manual-admission-bob",
+            "Bob G007",
+            "Bob member laptop",
+            invite,
+            None,
+        )?;
+        let bob_requested = load_state_from_path(&bob_path);
+        let bob_requested_group = bob_requested
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "Bob local admission group missing".to_owned())?;
+        assert_eq!(
+            bob_requested_group.members[0].status, "pending",
+            "joiners must stay pending until an OpenMLS Welcome is applied"
+        );
+        assert!(
+            bob_requested
+                .events
+                .iter()
+                .any(|event| event.kind == "group.admission_requested"),
+            "invite consumption should be represented as an admission request, not a completed join"
+        );
+        let bob_key_package = bob_requested
+            .text_control_outbox
+            .iter()
+            .find_map(|record| match &record.frame {
+                TextControlFrameView::OpenMlsAdmissionKeyPackage { .. } => {
+                    Some(record.frame.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| "Bob admission key package frame missing".to_owned())?;
+
+        assert!(
+            matches!(
+                bob_key_package,
+                TextControlFrameView::OpenMlsAdmissionKeyPackage { .. }
+            ),
+            "Bob admission frame should be the fire-and-forget key package"
+        );
+        reload_global_app_service_from_path(&bob_path);
+        let admission_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(alice_path.clone()),
+        ));
+        let admission_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g007-manual-admission-key-package".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(
+            admission_session.last_command_error.is_none(),
+            "{admission_session:?}"
+        );
+        let admission_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "Bob admission transport session missing".to_owned())?;
+        attach_text_control_transport_runtime_for_test(admission_receiver, admission_session_id);
+        let admission_report =
+            pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(250),
+            });
+        assert!(
+            admission_report.failures.is_empty(),
+            "manual admission key-package delivery is fire-and-forget and must not surface a timeout: {:?}",
+            admission_report.failures
+        );
+        assert_eq!(admission_report.frames_sent, 1);
+        assert_eq!(admission_report.response_frames_received, 0);
+        clear_text_control_transport_runtime_for_test();
+        let pending_state = load_state_from_path(&alice_path);
+        let request_id = pending_state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|request| request.status == "pending")
+                    .map(|request| request.request_id.clone())
+            })
+            .ok_or_else(|| "manual admission request was not persisted".to_owned())?;
+
+        reload_global_app_service_from_path(&alice_path);
+        let switched = set_group_admission_mode(SetGroupAdmissionModeRequest {
+            group_id: group_id.clone(),
+            admission_mode: GroupAdmissionModeView::AutomaticWhenAuthorizedOnline,
+        });
+        assert!(switched.last_command_error.is_none(), "{switched:?}");
+        let still_pending = switched
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|request| request.request_id == request_id)
+            })
+            .ok_or_else(|| "manual request disappeared after admission mode switch".to_owned())?;
+        assert_eq!(
+            still_pending.status, "pending",
+            "manual requests created before a mode switch must not be auto-approved"
+        );
+
+        let approved = approve_group_admission_request(ApproveGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+        });
+        assert!(approved.last_command_error.is_none(), "{approved:?}");
+        let approved_request = approved
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|request| request.request_id == request_id)
+            })
+            .ok_or_else(|| "approved request missing".to_owned())?;
+        assert_eq!(approved_request.status, "approved");
+        let welcome_frame = load_state_from_path(&alice_path)
+            .text_control_outbox
+            .iter()
+            .rev()
+            .find_map(|record| match &record.frame {
+                TextControlFrameView::OpenMlsAdmissionWelcome { .. } => Some(record.frame.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| "approval did not queue OpenMLS Welcome".to_owned())?;
+
+        reload_global_app_service_from_path(&bob_path);
+        let bob_joined = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: welcome_frame,
+        });
+        assert_eq!(bob_joined.state.last_command_error, None, "{bob_joined:?}");
+        let bob_after_welcome = load_state_from_path(&bob_path);
+        assert!(
+            bob_after_welcome
+                .openmls_groups
+                .iter()
+                .any(|handle| handle.group_id == group_id),
+            "approved joiner must persist OpenMLS group state before protected text"
+        );
+
+        reload_global_app_service_from_path(&bob_path);
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id),
+                channel_id: Some(channel_id),
+            },
+            body: "g007 protected text after manual approval".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(
+            sent.last_command_error.is_none(),
+            "approved invite join must not fail with missing OpenMLS state: {sent:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn g012_channel_send_uses_openmls_exporter_for_text_ciphertext() -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("g012-openmls-outbound-text");
@@ -17863,6 +19246,82 @@ mod tests {
             error.message.contains("OpenMLS group"),
             "unexpected error: {error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn g012_pending_invite_joiner_cannot_send_before_openmls_welcome() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("g012-pending-send-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Pending Send Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .first()
+            .ok_or_else(|| "owner group missing".to_owned())?
+            .clone();
+        let invite = create_invite(CreateInviteRequest {
+            group_id: Some(group.group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        })
+        .invites
+        .last()
+        .map(|invite| invite.code.clone())
+        .ok_or_else(|| "invite missing".to_owned())?;
+
+        reset_with_temp_state("g012-pending-send-bob");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code: invite,
+            group_name: None,
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let bob_group = joined
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group.group_id)
+            .ok_or_else(|| "Bob pending group missing".to_owned())?;
+        assert_eq!(bob_group.members[0].status, "pending");
+        let channel_id = bob_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "pending group text channel missing".to_owned())?;
+
+        let rejected = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group.group_id),
+                channel_id: Some(channel_id),
+            },
+            body: "must wait for welcome".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let error = rejected
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "pending joiner send should be rejected".to_owned())?;
+        assert_eq!(error.code, "admission_pending");
         Ok(())
     }
 
@@ -18259,6 +19718,65 @@ mod tests {
             .first()
             .ok_or_else(|| "persisted member group missing".to_owned())?;
         assert_eq!(persisted_group.runtime_peers, member_group.runtime_peers);
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachment_repairs_stale_owner_runtime_peer_role() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("group-runtime-peer-repair-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Repair Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .first()
+            .ok_or_else(|| "created group missing".to_owned())?
+            .clone();
+        let owner_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "owner")
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "owner peer missing".to_owned())?;
+        let member_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "member")
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "member peer missing".to_owned())?;
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active_group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|candidate| candidate.group_id == group.group_id)
+                .ok_or_else(|| "active group missing".to_owned())?;
+            active_group.role = "member".to_owned();
+            active_group.runtime_peers =
+                group_runtime_peers(active_group.connectivity.as_ref(), "member");
+        }
+
+        let attachment = load_state().active_runtime_peer_attachment_for_text_control()?;
+        assert_eq!(attachment.role, ProviderTextControlRuntimePeerRole::Offerer);
+        assert_eq!(attachment.local_peer_id.0, owner_peer);
+        assert_eq!(attachment.remote_peer_id.0, member_peer);
         Ok(())
     }
 
@@ -19320,6 +20838,33 @@ mod tests {
                 .recovery_hint
                 .contains("do not silently treat this as a first-run profile"),
             "{error:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_state_without_schema_version_migrates_to_current_schema() {
+        let _guard = test_lock();
+        let path = fresh_state_path("missing-schema-version-state");
+        let mut value =
+            serde_json::to_value(PersistedAppState::initial()).expect("initial state serializes");
+        value
+            .as_object_mut()
+            .expect("persisted state is an object")
+            .remove("schema_version");
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("legacy state encodes"),
+        )
+        .expect("write legacy app state");
+
+        let mut store = FileAppStore::new(&path);
+        let state = load_state_from_store(&mut store);
+        assert_eq!(state.schema_version, APP_STATE_SCHEMA_VERSION);
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
         );
         let _ = fs::remove_file(path);
     }
@@ -20544,12 +22089,28 @@ mod tests {
             .cloned()
             .ok_or_else(|| "group invite missing".to_owned())?;
 
-        let (bob_path, _) = join_group_invite_as_test_profile(
+        assert!(
+            !group_invite.code.contains("gname="),
+            "production group invites must not trust unsigned display labels"
+        );
+        let old_style_invite_code = group_invite.code.clone();
+        let old_style_metadata = parse_invite_metadata(&old_style_invite_code)
+            .ok_or_else(|| "old-style signed invite metadata did not parse".to_owned())?;
+        let old_style_name = invite_group_name_from_metadata(
+            &old_style_invite_code,
+            None,
+            Some(&old_style_metadata),
+        );
+        assert_eq!(
+            old_style_name, "g012 text lab",
+            "old signed invites without gname must recover a sane label from gid, not the invite uuid"
+        );
+        let (bob_path, _) = join_group_invite_as_test_profile_with_optional_name(
             "g012-group-text-bob",
             "Bob G012",
             "Bob Tauri profile",
             group_invite.code.clone(),
-            "G012 Text Lab",
+            None,
         )?;
         let bob_loaded = TauriAppService::load_for_test_path(bob_path.clone());
         let bob_group = bob_loaded
@@ -20557,8 +22118,9 @@ mod tests {
             .to_view()
             .groups
             .into_iter()
-            .find(|group| group.name == "G012 Text Lab")
+            .find(|group| group.group_id == alice_group_id)
             .ok_or_else(|| "bob joined group missing".to_owned())?;
+        assert_eq!(bob_group.name, "g012 text lab");
         let bob_group_id = bob_group.group_id.clone();
         let bob_channel_id = bob_group
             .channels
@@ -20939,7 +22501,7 @@ mod tests {
             report
                 .failures
                 .iter()
-                .any(|failure| failure.contains("transport runtime is not attached")),
+                .any(|failure| failure.contains("direct data-channel runtime is not attached")),
             "expected missing-runtime failure detail",
         );
         assert_eq!(
@@ -20954,6 +22516,10 @@ mod tests {
             report.response_frames_received, 0,
             "no response frames should be received without runtime"
         );
+        assert_ne!(
+            report.metrics.label, "provider-control-relay",
+            "provider signaling must not be used as a message/control relay fallback"
+        );
 
         let state_after = load_state();
         let command_error = state_after
@@ -20961,6 +22527,10 @@ mod tests {
             .expect("missing transport runtime should be reported as a command error");
         assert_eq!(command_error.command, "pump_text_control_transport_once");
         assert_eq!(command_error.code, "transport_runtime_missing");
+        assert!(
+            command_error.recovery_hint.contains("never relay messages"),
+            "missing-runtime recovery hint must make the no-provider-message-relay policy explicit: {command_error:?}"
+        );
     }
 
     #[test]
@@ -21328,6 +22898,73 @@ mod tests {
             .pending_text_control_transport_runtime
             .as_ref()
             .is_some_and(|pending| pending.session_id == active_session_id));
+    }
+
+    #[test]
+    fn text_control_pump_waits_without_error_while_runtime_attach_is_pending() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-runtime-pending-pump-waits");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "queued while provider runtime attaches".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(sent.last_command_error.is_none(), "{sent:?}");
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("pending-runtime-pump".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+
+        let service = app_service();
+        {
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.pending_text_control_transport_runtime =
+                Some(PendingTextControlTransportRuntime {
+                    session_id: active_session_id,
+                    role: ProviderTextControlRuntimePeerRole::Offerer,
+                    local_peer_id: "alice-runtime-peer".to_owned(),
+                    remote_peer_id: "bob-runtime-peer".to_owned(),
+                });
+        }
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(8),
+            operation_timeout_ms: Some(250),
+        });
+
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.frames_sent, 0);
+        assert!(
+            report.failures.is_empty(),
+            "attach-in-progress is not a delivery failure: {:?}",
+            report.failures
+        );
+        assert_eq!(report.metrics.label, "attaching-text-control-runtime");
+        assert_eq!(load_state().last_command_error, None);
     }
 
     #[test]
