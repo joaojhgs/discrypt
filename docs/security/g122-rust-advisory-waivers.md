@@ -12,11 +12,12 @@ The required scan is `cargo audit` over the committed `Cargo.lock`, enforced by
 gate no longer permits vulnerability waivers: any future vulnerability ID fails
 CI until the dependency graph is fixed or the release is explicitly held.
 
-The remaining `cargo audit` output is a documented warning watchlist: 16
+The remaining `cargo audit` output is a documented warning watchlist: 17
 unmaintained warnings and 1 unsound warning. These warnings are not vulnerability
 waivers and do not prove production readiness by themselves. They remain visible
 so release engineering can replace or target-scope the underlying GTK3/Tauri and
-parser transitive dependencies before a production release candidate.
+parser/OpenMLS proof-tooling transitive dependencies before a production release
+candidate.
 
 ## Removed vulnerability waiver
 
@@ -47,6 +48,7 @@ removed from the dependency graph and this document is updated.
 | RUSTSEC-2024-0384 | `instant` | unmaintained | desktop/runtime dependency owner | 2026-07-31 | Replace via upstream dependency updates; target-scope if retained only through platform/runtime transitive edges. |
 | RUSTSEC-2024-0436 | `paste` | unmaintained | Rust dependency owner | 2026-07-31 | Replace through upstream dependency updates or remove direct/transitive edge. |
 | RUSTSEC-2024-0370 | `proc-macro-error` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive macro stack upgrade through GTK/glib dependencies. |
+| RUSTSEC-2026-0173 | `proc-macro-error2` | unmaintained | MLS/OpenMLS dependency owner | 2026-07-31 | Transitive through `openmls_rust_crypto` -> `hpke-rs` -> `libcrux` hax macro tooling; no safe upgrade is currently available, so `deny.toml` carries a temporary explicit advisory ignore until upstream migrates away from `proc-macro-error2` or the MLS crypto stack is replaced. |
 | RUSTSEC-2025-0081 | `unic-char-property` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive `tauri-utils`/`urlpattern` replacement or upstream fix. |
 | RUSTSEC-2025-0075 | `unic-char-range` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive `tauri-utils`/`urlpattern` replacement or upstream fix. |
 | RUSTSEC-2025-0080 | `unic-common` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive `tauri-utils`/`urlpattern` replacement or upstream fix. |

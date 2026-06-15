@@ -18,7 +18,8 @@ function requireText(name, text, token) {
 for (const token of [
   "[advisories]",
   "yanked = \"deny\"",
-  "ignore = []",
+  "RUSTSEC-2026-0173",
+  "docs/security/g122-rust-advisory-waivers.md",
   "[licenses]",
   "allow = [",
   "MIT",
@@ -38,6 +39,7 @@ for (const token of [
   "license",
   "unknown-registry",
   "unknown-git",
+  "documented exception names the advisory",
 ]) requireText("ADR-008", adr, token);
 
 requireText("package.json", packageJson, "test:cargo-deny-g121");
