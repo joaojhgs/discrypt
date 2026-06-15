@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-15T16:04:14.904Z",
-  "updatedAt": "2026-06-15T16:05:48.738Z",
+  "updatedAt": "2026-06-15T16:09:25.007Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -33,10 +33,12 @@
       "id": "G003-publish-review-evidence",
       "title": "Publish review evidence",
       "objective": "Commit workflow artifacts, open a PR if possible, and hand off to QA with required status/log evidence.",
-      "status": "pending",
+      "status": "complete",
       "attempt": 0,
       "createdAt": "2026-06-15T16:04:14.904Z",
-      "updatedAt": "2026-06-15T16:04:14.904Z"
+      "updatedAt": "2026-06-15T16:09:25.007Z",
+      "evidence": "Committed workflow artifacts, pushed branch multica-P0-T01-worktree-baseline, opened draft PR https://github.com/joaojhgs/discrypt/pull/1, reran git status/log/diff evidence, and prepared QA handoff.",
+      "completedAt": "2026-06-15T16:09:25.007Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json for PER-3 / P0-T01; use .omx/ultragoal/ledger.jsonl as the audit trail; do not edit product code unless dirty production files are discovered; finish with Git status/log evidence and QA handoff."
