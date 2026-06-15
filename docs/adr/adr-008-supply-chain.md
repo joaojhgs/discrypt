@@ -50,6 +50,8 @@ Policy:
 3. Vulnerability advisories in crypto-sensitive transitive dependencies block
    release unless a documented exception names the advisory, exposure path,
    mitigation, owner, expiry, and replacement plan.
+   `deny.toml` may carry only those explicit temporary advisory exceptions, and
+   each exception must also appear in `docs/security/g122-rust-advisory-waivers.md`.
 4. Vendoring is not the default. If network-isolated or long-term support builds
    require vendoring, vendor hashes and source URLs must be stored with the SBOM
    and package hashes.

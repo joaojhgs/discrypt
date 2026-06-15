@@ -1246,6 +1246,10 @@ mod tests {
             .any(|window| window == needle)
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "live loopback WebRTC offer/answer datachannel readiness is runner-dependent outside Linux CI"
+    )]
     #[tokio::test]
     async fn generates_offer_answer_and_accepts_candidates_without_selecting_transport_route(
     ) -> Result<(), TransportError> {
