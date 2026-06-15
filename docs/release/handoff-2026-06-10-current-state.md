@@ -10,6 +10,11 @@ storage vault reinstall behavior.
 The current known-bad regression ledger is
 [`current-regressions.md`](current-regressions.md).
 
+The current release gap matrix is
+[`release-gap-matrix-2026-06-15.md`](release-gap-matrix-2026-06-15.md). It
+supersedes older "complete" or green ledgers unless fresh post-reset evidence is
+named there.
+
 ## Regression summary
 
 The following user-reported scenarios are open regression targets:
