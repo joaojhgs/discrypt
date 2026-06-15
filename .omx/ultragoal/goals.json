@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "createdAt": "2026-06-15T16:04:14.904Z",
+  "updatedAt": "2026-06-15T16:05:48.738Z",
+  "briefPath": ".omx/ultragoal/brief.md",
+  "goalsPath": ".omx/ultragoal/goals.json",
+  "ledgerPath": ".omx/ultragoal/ledger.jsonl",
+  "codexGoalMode": "aggregate",
+  "goals": [
+    {
+      "id": "G001-inspect-repository-baseline",
+      "title": "Inspect repository baseline",
+      "objective": "Record branch, status, missing expected docs, and current log before changing product code.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-15T16:04:14.904Z",
+      "updatedAt": "2026-06-15T16:05:41.000Z",
+      "completedAt": "2026-06-15T16:05:41.000Z",
+      "evidence": "Branch multica-P0-T01-worktree-baseline. git status --short --branch before artifact commit showed only untracked .omx/ created by this workflow; no pre-existing dirty production files in this checkout. Expected .omx/plans/production-release-master-plan-2026-06-10.md and docs/release/handoff-2026-06-10-current-state.md are absent."
+    },
+    {
+      "id": "G002-preserve-or-shelve-current-work",
+      "title": "Preserve or shelve current work",
+      "objective": "If dirty production files exist, split them into Lore commits or explicit patch artifacts by lane; if none exist, record that clean baseline.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-15T16:04:14.904Z",
+      "updatedAt": "2026-06-15T16:05:48.738Z",
+      "completedAt": "2026-06-15T16:05:48.738Z",
+      "evidence": "No pre-existing dirty production files were present after Multica checkout and branch creation. No shelved patches required. Current preserved changes are limited to .omx planning/ultragoal artifacts for this baseline task."
+    },
+    {
+      "id": "G003-publish-review-evidence",
+      "title": "Publish review evidence",
+      "objective": "Commit workflow artifacts, open a PR if possible, and hand off to QA with required status/log evidence.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-15T16:04:14.904Z",
+      "updatedAt": "2026-06-15T16:04:14.904Z"
+    }
+  ],
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json for PER-3 / P0-T01; use .omx/ultragoal/ledger.jsonl as the audit trail; do not edit product code unless dirty production files are discovered; finish with Git status/log evidence and QA handoff."
+}
