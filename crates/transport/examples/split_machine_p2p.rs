@@ -1,10 +1,13 @@
 use discrypt_transport::{
     derive_scope_commitment, start_provider_webrtc_text_control_answer_runtime_with_answerer,
-    start_provider_webrtc_text_control_offer_runtime, AdapterTrustLabel, ConnectivityScopeLevel,
-    ConversationScope, Endpoint, IceServerConfig, ProviderMetadataPosture,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
+    start_provider_webrtc_text_control_offer_runtime, ConnectivityScopeLevel, ConversationScope,
+    Endpoint, IceServerConfig, SignalingAdapterProfile, SignalingPeerId, TransportError,
     WebRtcNegotiationConfig,
+};
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+use discrypt_transport::{
+    AdapterTrustLabel, ProviderMetadataPosture, SignalingAdapterCapabilities, SignalingAdapterKind,
+    SignalingEndpointSecurity, SignalingProviderEndpoint,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
