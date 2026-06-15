@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-15T23:11:00.093Z",
-  "updatedAt": "2026-06-15T23:11:11.053Z",
+  "updatedAt": "2026-06-15T23:17:07.152Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -11,13 +11,24 @@
       "id": "G001-per-4-p0-t02-produce-a-current-relea",
       "title": "PER-4 / P0-T02: Produce a current release-gap matrix that supersedes...",
       "objective": "PER-4 / P0-T02: Produce a current release-gap matrix that supersedes stale complete ledgers. Scope: docs/release release-gap matrix, release readiness gate script, .omx planning/ultragoal artifacts only. Acceptance: matrix labels each feature verified, implemented-unverified, planned, or blocked; script fails if final report says production-ready while blockers exist; no product runtime behavior changes; verify with doc review and gate commands; open PR and hand off to QA.",
-      "status": "in_progress",
+      "status": "review_blocked",
       "attempt": 1,
       "createdAt": "2026-06-15T23:11:00.093Z",
-      "updatedAt": "2026-06-15T23:11:11.053Z",
-      "startedAt": "2026-06-15T23:11:11.053Z"
+      "updatedAt": "2026-06-15T23:17:07.152Z",
+      "startedAt": "2026-06-15T23:11:11.053Z",
+      "reviewBlockedAt": "2026-06-15T23:17:07.152Z",
+      "evidence": "Implementation and PR are complete, but omx agents list returned no native agents in this runtime, so required independent code-reviewer/architect final gate could not run."
+    },
+    {
+      "id": "G002-resolve-final-code-review-blockers",
+      "title": "Resolve final code-review blockers",
+      "objective": "Run independent OMX code-reviewer and architect review lanes for PER-4/P0-T02 release-gap matrix changes, then checkpoint the final Ultragoal gate if both lanes return clean evidence.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-15T23:17:07.152Z",
+      "updatedAt": "2026-06-15T23:17:07.152Z",
+      "evidence": "Implementation and PR are complete, but omx agents list returned no native agents in this runtime, so required independent code-reviewer/architect final gate could not run."
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
-  "activeGoalId": "G001-per-4-p0-t02-produce-a-current-relea"
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
 }
