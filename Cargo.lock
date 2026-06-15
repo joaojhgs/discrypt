@@ -1427,7 +1427,6 @@ dependencies = [
  "discrypt-media",
  "discrypt-mls-core",
  "discrypt-mls-delivery",
- "discrypt-signaling",
  "discrypt-storage",
  "discrypt-transport",
  "ed25519-dalek",
@@ -1511,7 +1510,6 @@ dependencies = [
  "discrypt-mls-delivery",
  "discrypt-push",
  "discrypt-relay-overlay",
- "discrypt-signaling",
  "discrypt-storage",
  "discrypt-transport",
  "ed25519-dalek",
@@ -1538,39 +1536,6 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "discrypt-signaling"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "discrypt-signaling-transport",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "discrypt-signaling-transport"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "hmac",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha1",
- "thiserror 2.0.18",
- "tokio",
- "webrtc",
 ]
 
 [[package]]

@@ -165,6 +165,18 @@
     {
       "path": "apps/ui/src/commands.ts",
       "pattern": "local-dev",
+      "expected": "app_version: \"local-dev-fallback\",",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
+      "expected": "detail: \"Local-dev fallback storage is active for this browser harness.\",",
+      "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
+    },
+    {
+      "path": "apps/ui/src/commands.ts",
+      "pattern": "local-dev",
       "expected": "safetyNumber: groupSafetyHash(`local-dev-fallback:${publicKey}`),",
       "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
     },
@@ -423,8 +435,8 @@
     {
       "path": "crates/storage/src/appdb.rs",
       "pattern": "local-dev",
-      "expected": "feature = \"local-dev\",",
-      "reason": "Compile-time local-dev keychain boundary is feature-gated and rejected by production status gates."
+      "expected": "/// local-dev/harness stores. It stores wrapping keys encrypted by a key derived",
+      "reason": "Storage documentation states local-dev keychain use is non-production and release-gated."
     },
     {
       "path": "crates/storage/src/appdb.rs",
