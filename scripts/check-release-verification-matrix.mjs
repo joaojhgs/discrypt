@@ -19,6 +19,14 @@ function resolveSiblingRepoRoot(repoName) {
 
 for (const token of [
   "# Release verification matrix",
+  "## Frozen release evidence definitions",
+  "| Production-ready | A release candidate built from a named commit has passed every required package, platform runner, governance, privacy, provider, OpenMLS/admission, text delivery, and voice/media gate in this matrix with retained artifacts and no unresolved critical release blockers. |",
+  "| E2E-tested | The named user journey was exercised through the real layer under discussion, with both endpoints, state persistence, cryptographic/admission evidence, transport route evidence, and retained logs/artifacts. |",
+  "| Split-machine | Two peers ran on distinct machines or network hosts with isolated profile/state paths and exchanged the claimed payload over the stated route while retaining local and remote artifacts. |",
+  "| Voice proof | The named voice claim is backed by native/media evidence appropriate to that claim: generated or captured audio frames, SFrame/MLS keying boundary, WebRTC route state, remote receive evidence, and retained artifacts. |",
+  "| Overlay relay | Application text/media was forwarded by a peer-assisted encrypted overlay leg with explicit route evidence, relay authority, E2EE/ciphertext-only validation, and no provider application relay. |",
+  "unqualified \"E2E-tested\" is forbidden",
+  "MQTT, Nostr, IPFS PubSub, and Discrypt QUIC rendezvous are signaling-only and are never overlay relay evidence.",
   "npm --prefix apps/ui run release:linux",
   "npm --prefix apps/ui run release:two-profile-harness-g010",
   "npm --prefix apps/ui run release:two-profile-harness-g010:dry-run",
@@ -73,6 +81,37 @@ const forbiddenValues = [
   "CRASH_REPORT_UPLOAD_TOKEN",
   "TAURI_PRIVATE_KEY",
 ];
+
+const forbiddenOverclaimPatterns = [
+  {
+    pattern: /\bDiscrypt is production-ready\b(?!\s+(?:yet|only within|within))/i,
+    message: "absolute Discrypt production-ready claim without release-matrix qualifier",
+  },
+  {
+    pattern: /\bproduction-ready(?:\s+(?:app|release|build|product|candidate|status|proof))\b/i,
+    message: "production-ready phrase attached to an app/release/build/product without matrix evidence qualifier",
+  },
+  {
+    pattern: /\bfully E2E-tested\b/i,
+    message: "unqualified fully E2E-tested claim",
+  },
+  {
+    pattern: /\b(?:complete|full|final)\s+split-machine\s+(?:proof|evidence|validation)\b/i,
+    message: "absolute split-machine proof claim",
+  },
+  {
+    pattern: /\b(?:complete|full|final|real)\s+voice proof\b/i,
+    message: "absolute voice proof claim",
+  },
+  {
+    pattern: /\b(?:MQTT|Nostr|IPFS PubSub|Discrypt QUIC)\s+(?:is|as|provides|proves)\s+(?:an?\s+)?overlay relay\b/i,
+    message: "signaling provider described as overlay relay evidence",
+  },
+];
+
+for (const { pattern, message } of forbiddenOverclaimPatterns) {
+  if (pattern.test(docs)) failures.push(`release verification matrix contains forbidden overclaim: ${message}`);
+}
 
 if (failures.length === 0) {
   const runExternalSmoke = process.env.DISCRYPT_EXTERNAL_SIGNALING_SMOKE === "1";
