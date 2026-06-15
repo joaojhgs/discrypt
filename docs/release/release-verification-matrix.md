@@ -4,6 +4,19 @@ G094 release verification ties package install/launch, service deployment smoke,
 and privacy-log checks into one auditable matrix. Each row must retain command
 output with the release candidate commit and artifact hashes.
 
+## Frozen release evidence definitions
+
+These definitions are release gates, not marketing copy. A row can satisfy only
+its own evidence level and must not be used as shorthand for a stronger level.
+
+| Term | Frozen definition | Minimum evidence before the term may be claimed | Explicit non-claim |
+| --- | --- | --- | --- |
+| Production-ready | A release candidate built from a named commit has passed every required package, platform runner, governance, privacy, provider, OpenMLS/admission, text delivery, and voice/media gate in this matrix with retained artifacts and no unresolved critical release blockers. | Fresh matrix row artifacts, package hashes, CI/runner logs, public-provider rows where required, and final release evidence tying the artifacts to the candidate commit. | A local smoke, documentation gate, Playwright run, same-process Tauri harness, or single split-machine transport proof is not production-ready evidence by itself. |
+| E2E-tested | The named user journey was exercised through the real layer under discussion, with both endpoints, state persistence, cryptographic/admission evidence, transport route evidence, and retained logs/artifacts. | The evidence must name whether it is local harness, Tauri WebDriver, installed two-profile, split-machine, or public-provider E2E; unqualified "E2E-tested" is forbidden. | Component tests, mocked provider flows, local-dev fallback UI tests, and launch-only Tauri checks are not end-to-end product proof. |
+| Split-machine | Two peers ran on distinct machines or network hosts with isolated profile/state paths and exchanged the claimed payload over the stated route while retaining local and remote artifacts. | Host identities or labels, commit, commands, signaling provider, route evidence, copied remote artifacts, and provider-visible privacy scan results. | Two profiles in one process, two browser contexts, or two local state files are not split-machine proof. |
+| Voice proof | The named voice claim is backed by native/media evidence appropriate to that claim: generated or captured audio frames, SFrame/MLS keying boundary, WebRTC route state, remote receive evidence, and retained artifacts. | The artifact must say whether it proves backend voice state, protected frame generation, WebRTC DataChannel media-frame transport, native loopback, or real remote audio playback. | Backend voice state persistence, generated protected frames, or UI speaking indicators alone do not prove real transported voice audio. |
+| Overlay relay | Application text/media was forwarded by a peer-assisted encrypted overlay leg with explicit route evidence, relay authority, E2EE/ciphertext-only validation, and no provider application relay. | Route report naming direct/STUN, overlay, or TURN; relay peer identity; hop evidence; ciphertext-only scan; fail-closed behavior when relay evidence is missing. | MQTT, Nostr, IPFS PubSub, and Discrypt QUIC rendezvous are signaling-only and are never overlay relay evidence. |
+
 | Gate | Command | Required evidence | Local status boundary |
 | --- | --- | --- | --- |
 | Linux package build | `npm --prefix apps/ui run release:linux` | `.deb`, `.rpm`, and `.AppImage` paths plus package hashes. | Runs on Linux builder with Tauri build dependencies. |
