@@ -88,4 +88,3 @@ specific evidence is re-run and cited in a current row.
 - Do not replace an unreadable vault/keyring profile with a new profile.
 - Do not promote the final report to production-ready while any row remains
   `blocked`, `planned`, or `implemented-unverified`.
-
