@@ -1,24 +1,23 @@
 {
   "version": 1,
-  "createdAt": "2026-06-15T19:40:15.579Z",
-  "updatedAt": "2026-06-15T19:45:37.335Z",
+  "createdAt": "2026-06-15T23:11:00.093Z",
+  "updatedAt": "2026-06-15T23:11:11.053Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
   "codexGoalMode": "aggregate",
   "goals": [
     {
-      "id": "G001-per-5-p0-t03-freeze-release-terminol",
-      "title": "PER-5 / P0-T03: Freeze release terminology in docs/release/release-ve...",
-      "objective": "PER-5 / P0-T03: Freeze release terminology in docs/release/release-verification-matrix.md. Define production-ready, E2E-tested, split-machine, voice proof, and overlay relay so local smoke, Tauri WebDriver, split-machine, and public-provider proof cannot be confused. Add/adjust a grep gate for forbidden overclaim phrases, verify with docs/gate commands, open PR, and hand off to QA. Scope is docs and release gate only unless existing code requires otherwise.",
-      "status": "complete",
+      "id": "G001-per-4-p0-t02-produce-a-current-relea",
+      "title": "PER-4 / P0-T02: Produce a current release-gap matrix that supersedes...",
+      "objective": "PER-4 / P0-T02: Produce a current release-gap matrix that supersedes stale complete ledgers. Scope: docs/release release-gap matrix, release readiness gate script, .omx planning/ultragoal artifacts only. Acceptance: matrix labels each feature verified, implemented-unverified, planned, or blocked; script fails if final report says production-ready while blockers exist; no product runtime behavior changes; verify with doc review and gate commands; open PR and hand off to QA.",
+      "status": "in_progress",
       "attempt": 1,
-      "createdAt": "2026-06-15T19:40:15.579Z",
-      "updatedAt": "2026-06-15T19:45:37.335Z",
-      "startedAt": "2026-06-15T19:44:54.339Z",
-      "evidence": "Completed G001-per-5-p0-t03-freeze-release-terminol in .omx/ultragoal/goals.json: defined frozen release evidence terms, added overclaim assertions to release matrix gate, verified release matrix and explicit rg forbidden-overclaim scan, and documented that native independent review agents were unavailable before PR/QA review.",
-      "completedAt": "2026-06-15T19:45:37.335Z"
+      "createdAt": "2026-06-15T23:11:00.093Z",
+      "updatedAt": "2026-06-15T23:11:11.053Z",
+      "startedAt": "2026-06-15T23:11:11.053Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json for PER-5 / P0-T03; update release definitions and overclaim gate only within assigned docs/gate scope; verify with the release matrix gate and grep evidence; open/update PR and hand off to QA."
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
+  "activeGoalId": "G001-per-4-p0-t02-produce-a-current-relea"
 }
