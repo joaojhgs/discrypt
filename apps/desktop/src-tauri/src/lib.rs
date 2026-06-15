@@ -132,46 +132,6 @@ fn default_app_state_schema_version() -> u32 {
     APP_STATE_SCHEMA_VERSION
 }
 
-/// Desktop/Tauri wrapper around the Rust signaling protocol client.
-pub struct DesktopSignalingClient<T> {
-    inner: external_signaling::client::SignalingClient<T>,
-}
-
-impl<T> DesktopSignalingClient<T>
-where
-    T: external_signaling::client::SignalingTransport,
-{
-    /// Construct the app-service signaling client wrapper.
-    pub fn new(inner: external_signaling::client::SignalingClient<T>) -> Self {
-        Self { inner }
-    }
-
-    /// Publish an opaque signaling payload for a Tauri/app-service session.
-    pub fn publish_opaque_signal(
-        &mut self,
-        kind: external_signaling::server::SignalKind,
-        session_id: &str,
-        payload: &[u8],
-        expires_at: chrono::DateTime<Utc>,
-    ) -> Result<(), String> {
-        self.inner
-            .publish_signal(kind, session_id.as_bytes(), payload, expires_at)
-            .map_err(|err| err.to_string())
-    }
-
-    /// Take opaque signaling payloads for a Tauri/app-service session.
-    pub fn take_opaque_signals(
-        &mut self,
-        kind: external_signaling::server::SignalKind,
-        session_id: &str,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        self.inner
-            .take_signals(kind, session_id.as_bytes())
-            .map(|signals| signals.into_iter().map(|signal| signal.payload).collect())
-            .map_err(|err| err.to_string())
-    }
-}
-
 /// Lifecycle route for the desktop app shell.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,19 +275,14 @@ pub struct GroupRuntimePeerView {
     pub source: String,
 }
 
-/// Backend-authorized group role. UI labels must be derived from this state, not local-only strings.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Backend-authorized group role. UI labels must be derived from this state, not frontend strings.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupRoleView {
     Owner,
     Staff,
+    #[default]
     Member,
-}
-
-impl Default for GroupRoleView {
-    fn default() -> Self {
-        Self::Member
-    }
 }
 
 impl GroupRoleView {
@@ -345,18 +300,13 @@ impl GroupRoleView {
 }
 
 /// Group invite admission policy persisted with the roster/governance state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupAdmissionModeView {
     /// Preserve existing invite behavior unless an owner/staff peer switches to manual approval.
+    #[default]
     AutomaticWhenAuthorizedOnline,
     ManualApproval,
-}
-
-impl Default for GroupAdmissionModeView {
-    fn default() -> Self {
-        Self::AutomaticWhenAuthorizedOnline
-    }
 }
 
 /// Persisted group member roster row used by role checks, presence, and member-panel UI.
@@ -10734,13 +10684,15 @@ impl PersistedAppState {
             } => {
                 apply_group_member_role_changed(
                     self,
-                    &group_id,
-                    &event_id,
-                    &actor_member_id,
-                    &target_member_id,
-                    role_before,
-                    role_after,
-                    &created_at,
+                    GroupMemberRoleChangedEvent {
+                        group_id: &group_id,
+                        event_id: &event_id,
+                        actor_member_id: &actor_member_id,
+                        target_member_id: &target_member_id,
+                        role_before,
+                        role_after,
+                        created_at: &created_at,
+                    },
                 );
                 Some(TextControlFrameView::GroupGovernanceAck {
                     group_id,
@@ -10877,15 +10829,17 @@ impl PersistedAppState {
             } => {
                 apply_group_presence_heartbeat(
                     self,
-                    &group_id,
-                    &event_id,
-                    &member_id,
-                    display_name,
-                    device_id,
-                    role,
-                    signer_public_key_hex,
-                    &last_seen_at,
-                    &presence_expires_at,
+                    GroupPresenceHeartbeatEvent {
+                        group_id: &group_id,
+                        event_id: &event_id,
+                        member_id: &member_id,
+                        display_name,
+                        device_id,
+                        role,
+                        signer_public_key_hex,
+                        last_seen_at: &last_seen_at,
+                        presence_expires_at: &presence_expires_at,
+                    },
                 );
                 None
             }
@@ -14882,54 +14836,58 @@ fn group_with_effective_presence(mut group: GroupView) -> GroupView {
     group
 }
 
-fn apply_group_member_role_changed(
-    state: &mut PersistedAppState,
-    group_id: &str,
-    event_id: &str,
-    actor_member_id: &str,
-    target_member_id: &str,
+struct GroupMemberRoleChangedEvent<'a> {
+    group_id: &'a str,
+    event_id: &'a str,
+    actor_member_id: &'a str,
+    target_member_id: &'a str,
     role_before: GroupRoleView,
     role_after: GroupRoleView,
-    created_at: &str,
+    created_at: &'a str,
+}
+
+fn apply_group_member_role_changed(
+    state: &mut PersistedAppState,
+    event: GroupMemberRoleChangedEvent<'_>,
 ) {
     let local_member_id = state.local_user_id();
     let local_display = profile_display_name(state);
-    ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
+    ensure_group_governance_defaults(state, event.group_id, &local_member_id, local_display);
     let Some(group) = state
         .groups
         .iter_mut()
-        .find(|group| group.group_id == group_id)
+        .find(|group| group.group_id == event.group_id)
     else {
         return;
     };
     if group
         .governance_log
         .iter()
-        .any(|entry| entry.event_id == event_id)
+        .any(|entry| entry.event_id == event.event_id)
     {
         return;
     }
     if let Some(member) = group
         .members
         .iter_mut()
-        .find(|member| member.member_id == target_member_id)
+        .find(|member| member.member_id == event.target_member_id)
     {
         if member.status != "revoked" {
-            member.role = role_after.clone();
-            if target_member_id == local_member_id {
-                group.role = role_after.as_str().to_owned();
+            member.role = event.role_after.clone();
+            if event.target_member_id == local_member_id {
+                group.role = event.role_after.as_str().to_owned();
             }
         }
     }
     group.governance_log.push(governance_log_entry(
-        event_id,
-        group_id,
+        event.event_id,
+        event.group_id,
         "member.role_changed",
-        actor_member_id,
-        Some(target_member_id),
-        Some(role_before),
-        Some(role_after),
-        created_at,
+        event.actor_member_id,
+        Some(event.target_member_id),
+        Some(event.role_before),
+        Some(event.role_after),
+        event.created_at,
         "Applied replicated group member role change",
     ));
 }
@@ -14993,87 +14951,93 @@ fn apply_group_member_revoked(
     ));
 }
 
-fn apply_group_presence_heartbeat(
-    state: &mut PersistedAppState,
-    group_id: &str,
-    event_id: &str,
-    member_id: &str,
+struct GroupPresenceHeartbeatEvent<'a> {
+    group_id: &'a str,
+    event_id: &'a str,
+    member_id: &'a str,
     display_name: Option<String>,
     device_id: Option<String>,
     role: Option<GroupRoleView>,
     signer_public_key_hex: Option<String>,
-    last_seen_at: &str,
-    presence_expires_at: &str,
+    last_seen_at: &'a str,
+    presence_expires_at: &'a str,
+}
+
+fn apply_group_presence_heartbeat(
+    state: &mut PersistedAppState,
+    event: GroupPresenceHeartbeatEvent<'_>,
 ) {
     let local_member_id = state.local_user_id();
     let local_display = profile_display_name(state);
-    ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
+    ensure_group_governance_defaults(state, event.group_id, &local_member_id, local_display);
     let Some(group) = state
         .groups
         .iter_mut()
-        .find(|group| group.group_id == group_id)
+        .find(|group| group.group_id == event.group_id)
     else {
         return;
     };
     if group
         .governance_log
         .iter()
-        .any(|entry| entry.event_id == event_id)
+        .any(|entry| entry.event_id == event.event_id)
     {
         return;
     }
     if let Some(member) = group
         .members
         .iter_mut()
-        .find(|member| member.member_id == member_id)
+        .find(|member| member.member_id == event.member_id)
     {
         if member.status != "revoked" {
-            if let Some(display_name) = display_name
+            if let Some(display_name) = event
+                .display_name
                 .as_ref()
                 .filter(|value| !value.trim().is_empty())
             {
                 member.display_name = display_name.clone();
             }
-            if device_id.is_some() {
-                member.device_id = device_id.clone();
+            if event.device_id.is_some() {
+                member.device_id = event.device_id.clone();
             }
-            if let Some(role) = role.as_ref() {
+            if let Some(role) = event.role.as_ref() {
                 member.role = role.clone();
             }
-            if signer_public_key_hex.is_some() {
-                member.signer_public_key_hex = signer_public_key_hex.clone();
+            if event.signer_public_key_hex.is_some() {
+                member.signer_public_key_hex = event.signer_public_key_hex.clone();
             }
             member.status = "online".to_owned();
-            member.last_seen_at = Some(last_seen_at.to_owned());
-            member.presence_expires_at = Some(presence_expires_at.to_owned());
+            member.last_seen_at = Some(event.last_seen_at.to_owned());
+            member.presence_expires_at = Some(event.presence_expires_at.to_owned());
         }
     } else {
         let member = GroupMemberView {
-            member_id: member_id.to_owned(),
-            display_name: display_name
+            member_id: event.member_id.to_owned(),
+            display_name: event
+                .display_name
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| redacted_observable_ref("member", member_id)),
-            device_id,
-            role: role.unwrap_or(GroupRoleView::Member),
+                .unwrap_or_else(|| redacted_observable_ref("member", event.member_id)),
+            device_id: event.device_id,
+            role: event.role.unwrap_or(GroupRoleView::Member),
             status: "online".to_owned(),
-            signer_public_key_hex,
-            joined_at: last_seen_at.to_owned(),
-            last_seen_at: Some(last_seen_at.to_owned()),
-            presence_expires_at: Some(presence_expires_at.to_owned()),
+            signer_public_key_hex: event.signer_public_key_hex,
+            joined_at: event.last_seen_at.to_owned(),
+            last_seen_at: Some(event.last_seen_at.to_owned()),
+            presence_expires_at: Some(event.presence_expires_at.to_owned()),
             revoked_at: None,
             revoked_by: None,
         };
         group.members.push(member);
     }
     group.governance_log.push(governance_log_entry(
-        event_id,
-        group_id,
+        event.event_id,
+        event.group_id,
         "presence.heartbeat",
-        member_id,
-        Some(member_id),
+        event.member_id,
+        Some(event.member_id),
         None,
         None,
-        last_seen_at,
+        event.last_seen_at,
         "Applied replicated TTL-backed presence heartbeat",
     ));
 }
@@ -16701,15 +16665,17 @@ mod tests {
             service.state.groups[0].role = "member".to_owned();
             apply_group_presence_heartbeat(
                 &mut service.state,
-                &group_id,
-                "presence-event-without-role",
-                "member-charlie",
-                Some("Charlie".to_owned()),
-                Some("Charlie laptop".to_owned()),
-                None,
-                None,
-                "2026-06-05T00:00:00Z",
-                "2026-06-05T00:05:00Z",
+                GroupPresenceHeartbeatEvent {
+                    group_id: &group_id,
+                    event_id: "presence-event-without-role",
+                    member_id: "member-charlie",
+                    display_name: Some("Charlie".to_owned()),
+                    device_id: Some("Charlie laptop".to_owned()),
+                    role: None,
+                    signer_public_key_hex: None,
+                    last_seen_at: "2026-06-05T00:00:00Z",
+                    presence_expires_at: "2026-06-05T00:05:00Z",
+                },
             );
             service.persist();
         }
@@ -17583,10 +17549,10 @@ mod tests {
             .last_command_error
             .as_ref()
             .ok_or_else(|| "joined profile without OpenMLS state should fail closed".to_owned())?;
-        assert_eq!(bob_send_error.code, "text_delivery_envelope_failed");
+        assert_eq!(bob_send_error.code, "admission_pending");
         assert!(bob_send_error
             .message
-            .contains("OpenMLS group state is missing"));
+            .contains("waiting for owner/staff admission"));
         assert!(bob_sent.messages.is_empty());
 
         let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
@@ -20867,39 +20833,6 @@ mod tests {
             state.last_command_error
         );
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn desktop_signaling_client_wraps_rust_protocol_client() -> Result<(), String> {
-        let service = external_signaling::server::SharedSignalingService::new();
-        let transport = external_signaling::client::SharedServiceTransport::new(
-            service,
-            external_signaling::server::ServerConfig::default(),
-        );
-        let client = external_signaling::client::SignalingClient::new(
-            external_signaling::client::SignalingClientConfig::new(
-                "https://127.0.0.1:8787",
-                b"desktop-client-token".to_vec(),
-                b"desktop-nonce-seed".to_vec(),
-            )
-            .map_err(|err| err.to_string())?,
-            transport,
-        )
-        .map_err(|err| err.to_string())?;
-        let mut desktop_client = DesktopSignalingClient::new(client);
-        let expires_at = Utc::now() + Duration::seconds(60);
-
-        desktop_client.publish_opaque_signal(
-            external_signaling::server::SignalKind::Offer,
-            "session-1",
-            b"opaque-offer",
-            expires_at,
-        )?;
-        let signals = desktop_client
-            .take_opaque_signals(external_signaling::server::SignalKind::Offer, "session-1")?;
-
-        assert_eq!(signals, vec![b"opaque-offer".to_vec()]);
-        Ok(())
     }
 
     #[test]

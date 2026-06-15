@@ -21,7 +21,6 @@ harness = [
   "discrypt-media/harness",
   "discrypt-relay-overlay/harness",
   "discrypt-push/harness",
-  "external-signaling/harness",
   "discrypt-transport/harness",
   "discrypt-desktop/harness",
 ]
@@ -36,7 +35,6 @@ local-dev = [
   "discrypt-media/local-dev",
   "discrypt-relay-overlay/local-dev",
   "discrypt-push/local-dev",
-  "external-signaling/local-dev",
   "discrypt-transport/local-dev",
   "discrypt-desktop/local-dev",
 ]
@@ -51,7 +49,6 @@ production-network = [
   "discrypt-media/production-network",
   "discrypt-relay-overlay/production-network",
   "discrypt-push/production-network",
-  "external-signaling/production-network",
   "discrypt-transport/production-network",
   "discrypt-desktop/production-network",
 ]
@@ -66,7 +63,6 @@ production-media = [
   "discrypt-media/production-media",
   "discrypt-relay-overlay/production-media",
   "discrypt-push/production-media",
-  "external-signaling/production-media",
   "discrypt-transport/production-media",
   "discrypt-desktop/production-media",
 ]
@@ -81,7 +77,6 @@ production-storage = [
   "discrypt-media/production-storage",
   "discrypt-relay-overlay/production-storage",
   "discrypt-push/production-storage",
-  "external-signaling/production-storage",
   "discrypt-transport/production-storage",
   "discrypt-desktop/production-storage",
 ]
@@ -99,7 +94,6 @@ discrypt-storage = { path = "../../crates/storage", version = "0.1.0" }
 discrypt-media = { path = "../../crates/media", version = "0.1.0" }
 discrypt-relay-overlay = { path = "../../crates/relay-overlay", version = "0.1.0" }
 discrypt-push = { path = "../../crates/push", version = "0.1.0" }
-external-signaling = { package = "discrypt-signaling", path = "../../../discrypt-signaling", version = "0.1.0" }
 discrypt-transport = { path = "../../crates/transport", version = "0.1.0" }
 discrypt-desktop = { path = "../../apps/desktop/src-tauri", version = "0.1.0" }
 ed25519-dalek = { workspace = true }

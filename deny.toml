@@ -1,7 +1,11 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # Transitive through openmls_rust_crypto -> hpke-rs -> libcrux; no safe
+  # upgrade is available. Tracked in docs/security/g122-rust-advisory-waivers.md.
+  "RUSTSEC-2026-0173",
+]
 
 [licenses]
 version = 2

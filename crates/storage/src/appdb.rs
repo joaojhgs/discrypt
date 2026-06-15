@@ -1882,9 +1882,14 @@ mod tests {
         let keychain = LoadErrorCountingKeychain::default();
         let mut db = EncryptedAppDb::new(&path, keychain.clone());
 
-        let error = db
-            .save_app_state(br#"{"body":"must not overwrite"}"#)
-            .expect_err("existing encrypted DB must fail closed when keychain load fails");
+        let error = match db.save_app_state(br#"{"body":"must not overwrite"}"#) {
+            Ok(()) => {
+                return Err(AppStoreError::Io(std::io::Error::other(
+                    "existing encrypted DB must fail closed when keychain load fails",
+                )));
+            }
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("native provider locked"));
         assert_eq!(keychain.store_attempts()?, 0);

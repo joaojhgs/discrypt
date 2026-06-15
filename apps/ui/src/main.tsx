@@ -1055,7 +1055,6 @@ function App() {
       message,
       createdAt: new Date().toLocaleTimeString(),
     };
-    console.error(`[Discrypt] ${title}: ${message}`);
     setCommandError(message);
     setCommandNotifications((current) => [notification, ...current].slice(0, 6));
   }
@@ -1562,10 +1561,7 @@ function App() {
         setCommandState(presenceState);
         commandStateRef.current = presenceState;
         await syncTextRuntimeForState(presenceState, false);
-      } catch (error) {
-        if (!cancelled) {
-          console.error("[Discrypt] group presence/runtime sync failed", error);
-        }
+      } catch (_error) {
       } finally {
         groupPresenceInFlightRef.current = false;
       }
@@ -6895,7 +6891,7 @@ function RemoteAudioAttachment({
     if (!audio?.setSinkId || !outputDeviceId) return;
     const sinkId = outputDeviceId === "default" ? "" : outputDeviceId;
     void audio.setSinkId(sinkId).catch((error: unknown) => {
-      console.warn("Unable to update audio output device", error);
+      void error;
     });
   }, [outputDeviceId]);
   return (
@@ -6930,10 +6926,8 @@ function DiagnosticsSheet({
     try {
       const log = await exportDiagnosticsLog();
       await navigator.clipboard?.writeText(log);
-      console.info("Discrypt diagnostics export", JSON.parse(log));
       setExportStatus("Diagnostics copied to clipboard.");
     } catch (error) {
-      console.error("Discrypt diagnostics export failed", error);
       setExportStatus(
         error instanceof Error
           ? `Diagnostics export failed: ${error.message}`

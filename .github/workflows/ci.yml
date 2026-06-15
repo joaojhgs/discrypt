@@ -25,6 +25,7 @@ jobs:
     name: android target check
     runs-on: ubuntu-latest
     env:
+      ANDROID_API_LEVEL: "35"
       ANDROID_NDK_VERSION: "28.0.13004108"
     steps:
       - uses: actions/checkout@v4
@@ -35,8 +36,15 @@ jobs:
       - name: Install Android NDK for cargo target check
         run: |
           sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
-          echo "NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          ndk_home="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          llvm_bin="${ndk_home}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=${ndk_home}"
+            echo "NDK_HOME=${ndk_home}"
+            echo "CC_aarch64_linux_android=${llvm_bin}/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+            echo "AR_aarch64_linux_android=${llvm_bin}/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${llvm_bin}/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+          } >> "$GITHUB_ENV"
       - run: cargo check --workspace --target aarch64-linux-android
 
   supply-chain:

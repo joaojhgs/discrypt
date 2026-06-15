@@ -44,6 +44,8 @@ for (const token of [
 
 for (const token of [
   'yanked = "deny"',
+  'RUSTSEC-2026-0173',
+  'docs/security/g122-rust-advisory-waivers.md',
   'wildcards = "deny"',
   'unknown-registry = "deny"',
   'unknown-git = "deny"',
@@ -79,7 +81,16 @@ for (const token of ['test:adr-008-supply-chain', 'test:sbom-g124', 'test:no-pla
 for (const token of ['SBOMs, lockfile hashes, and git commit', 'reproducibility evidence archived']) requireText('releasePolicy', token);
 
 if (/TODO|FIXME|unimplemented!|todo!/i.test(files.adr)) failures.push('ADR-008 contains unfinished-work marker');
-if (/ignore = \[[^\]]+\]/.test(files.deny)) failures.push('deny.toml advisory ignore list must remain empty for G109 policy lock');
+const advisoryIgnores = [...files.deny.matchAll(/"RUSTSEC-[0-9-]+"/g)].map((match) => match[0].slice(1, -1));
+const allowedAdvisoryIgnores = ['RUSTSEC-2026-0173'];
+for (const advisory of advisoryIgnores) {
+  if (!allowedAdvisoryIgnores.includes(advisory)) {
+    failures.push(`deny.toml contains undocumented advisory ignore: ${advisory}`);
+  }
+}
+for (const advisory of allowedAdvisoryIgnores) {
+  if (!advisoryIgnores.includes(advisory)) failures.push(`deny.toml missing tracked advisory ignore: ${advisory}`);
+}
 
 run('cargo metadata locked', 'cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps']);
 run('cargo deny licenses', 'cargo', ['deny', 'check', 'licenses', '--hide-inclusion-graph']);

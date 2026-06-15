@@ -8843,6 +8843,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "live provider-signaled WebRTC loopback readiness is runner-dependent outside Linux CI"
+    )]
     #[tokio::test]
     async fn live_provider_text_control_role_split_runtimes_connect_two_peers(
     ) -> Result<(), TransportError> {

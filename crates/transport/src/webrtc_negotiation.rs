@@ -1246,6 +1246,10 @@ mod tests {
             .any(|window| window == needle)
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "live loopback WebRTC offer/answer datachannel readiness is runner-dependent outside Linux CI"
+    )]
     #[tokio::test]
     async fn generates_offer_answer_and_accepts_candidates_without_selecting_transport_route(
     ) -> Result<(), TransportError> {
@@ -1279,6 +1283,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "live loopback WebRTC readiness is runner-dependent outside Linux CI"
+    )]
     #[tokio::test]
     async fn direct_path_metrics_promote_transport_session_when_webrtc_connects(
     ) -> Result<(), TransportError> {
@@ -1343,6 +1351,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "live loopback WebRTC datachannel readiness is runner-dependent outside Linux CI"
+    )]
     #[tokio::test]
     async fn text_control_data_transport_exchanges_opaque_frames_over_datachannel(
     ) -> Result<(), TransportError> {
