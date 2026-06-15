@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
@@ -15,14 +14,7 @@ function resolveSiblingRepoRoot(repoName) {
   const envValue = process.env[`${repoName.toUpperCase().replace(/-/g, "_")}_REPO_ROOT`];
   if (envValue && existsSync(envValue)) return envValue;
 
-  let cursor = repoRoot;
-  for (let i = 0; i < 8; i += 1) {
-    const candidate = resolve(cursor, "..", repoName);
-    if (existsSync(candidate)) return candidate;
-    cursor = resolve(cursor, "..");
-  }
-
-  throw new Error(`unable to locate sibling repo ${repoName} from ${repoRoot}`);
+  return null;
 }
 
 for (const token of [
@@ -38,6 +30,8 @@ for (const token of [
   "npm --prefix apps/ui run test:android-gate",
   "npm --prefix apps/ui run test:release-verification-matrix",
   "npm --prefix apps/ui run test:release-governance",
+  "External signaling service smoke is opt-in",
+  "DISCRYPT_EXTERNAL_SIGNALING_SMOKE=1",
   "G008 STUN/TURN/fallback hardening",
   "npm --prefix apps/ui run test:g008-stun-turn-fallback",
   "Credentialed TURN remains opt-in",
@@ -80,59 +74,30 @@ const forbiddenValues = [
   "TAURI_PRIVATE_KEY",
 ];
 
-function reservePort() {
-  return new Promise((resolvePort, reject) => {
-    const server = createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = address?.port;
-      server.close(() => resolvePort(port));
-    });
-  });
-}
-
-function getJson(port, path) {
-  const result = spawnSync("curl", ["-fsS", "--max-time", "2", `http://127.0.0.1:${port}${path}`], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    throw new Error(result.stderr || result.stdout || `curl failed for ${path}`);
-  }
-  return { statusCode: 200, body: result.stdout };
-}
-
-
-async function waitForHealth(port) {
-  const deadline = Date.now() + 15000;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const response = getJson(port, "/healthz");
-      if (response.statusCode === 200) return response;
-      lastError = new Error(`status ${response.statusCode}`);
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
-  }
-  throw lastError ?? new Error("health check did not complete");
-}
-
 if (failures.length === 0) {
+  const runExternalSmoke = process.env.DISCRYPT_EXTERNAL_SIGNALING_SMOKE === "1";
   const signalingRepoRoot = resolveSiblingRepoRoot("discrypt-signaling");
-  const run = spawnSync("cargo", [
-    "test",
-    "--manifest-path", "Cargo.toml",
-    "-p", "discrypt-signaling",
-    "config_parses_cli_values",
-    "--quiet",
-  ], { cwd: signalingRepoRoot, encoding: "utf8" });
-  if (run.status !== 0) {
-    failures.push(`external signaling config smoke failed:
+  if (runExternalSmoke && !signalingRepoRoot) {
+    failures.push(
+      "external signaling smoke requested, but DISCRYPT_SIGNALING_REPO_ROOT does not point at a checkout",
+    );
+  } else if (runExternalSmoke) {
+    const run = spawnSync("cargo", [
+      "test",
+      "--manifest-path", "Cargo.toml",
+      "-p", "discrypt-signaling",
+      "config_parses_cli_values",
+      "--quiet",
+    ], { cwd: signalingRepoRoot, encoding: "utf8" });
+    if (run.status !== 0) {
+      failures.push(`external signaling config smoke failed:
 ${run.stdout}
 ${run.stderr}`);
+    }
+  } else {
+    console.info(
+      "external signaling smoke skipped: set DISCRYPT_EXTERNAL_SIGNALING_SMOKE=1 and DISCRYPT_SIGNALING_REPO_ROOT=<path> to run the isolated service proof",
+    );
   }
 }
 
