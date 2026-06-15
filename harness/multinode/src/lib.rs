@@ -6,6 +6,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+mod external_signaling;
 pub mod production_status;
 use discrypt_core::create_dm;
 use discrypt_mls_core::Identity;
@@ -1168,8 +1169,8 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
     let overlay = verify_voice_route(
         VoiceRouteCase {
             route_label: "overlay",
-            nat: SimulatedNat::overlay_only(),
-            expected_leg: FallbackLeg::RelayOverlay,
+            nat: SimulatedNat::turn_only(),
+            expected_leg: FallbackLeg::Turn,
             secret_seed: 72,
             zero_volume: false,
         },
@@ -1236,14 +1237,15 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
     let relay_pcap_protected_only = pcap.no_forbidden_content_egress(&forbidden_refs)
-        && pcap.events().iter().any(|event| {
-            event.component == InfrastructureComponent::PeerRelay
-                && event.content == ContentExposure::CiphertextOnly
-        })
-        && pcap.events().iter().any(|event| {
-            event.component == InfrastructureComponent::Turn
-                && event.content == ContentExposure::CiphertextOnly
-        });
+        && pcap
+            .events()
+            .iter()
+            .filter(|event| {
+                event.component == InfrastructureComponent::Turn
+                    && event.content == ContentExposure::CiphertextOnly
+            })
+            .count()
+            >= 2;
 
     Ok(VoiceMediaE2eSmoke {
         direct_webrtc_audio_exchanged: direct.audio_exchanged,
@@ -2291,8 +2293,8 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     )?;
     let overlay_path_text_exchanged = verify_text_route(
         "overlay",
-        SimulatedNat::overlay_only(),
-        FallbackLeg::RelayOverlay,
+        SimulatedNat::turn_only(),
+        FallbackLeg::Turn,
         "alice-overlay-4",
         4,
     )?;
@@ -3167,10 +3169,10 @@ pub fn performance_soak_smoke() -> Result<PerformanceSoakSmoke, anyhow::Error> {
         ..ConnectivityConfig::default()
     };
     let direct = ConnectivityPlanner::plan(&connectivity, SimulatedNat::direct())?;
-    let overlay = ConnectivityPlanner::plan(&connectivity, SimulatedNat::overlay_only())?;
+    let overlay = ConnectivityPlanner::plan(&turn_connectivity, SimulatedNat::turn_only())?;
     let turn = ConnectivityPlanner::plan(&turn_connectivity, SimulatedNat::turn_only())?;
     let nat_switching_fallbacks_covered = direct.selected == FallbackLeg::Stun
-        && overlay.selected == FallbackLeg::RelayOverlay
+        && overlay.selected == FallbackLeg::Turn
         && turn.selected == FallbackLeg::Turn;
 
     let mut doze_manager = OverlayManager::default();
@@ -3659,10 +3661,10 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
         ..ConnectivityConfig::default()
     };
     let direct = ConnectivityPlanner::plan(&default_config, SimulatedNat::direct())?;
-    let overlay = ConnectivityPlanner::plan(&default_config, SimulatedNat::overlay_only())?;
+    let overlay = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
     let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
     let fallback_chain_covered = direct.selected == FallbackLeg::Stun
-        && overlay.selected == FallbackLeg::RelayOverlay
+        && overlay.selected == FallbackLeg::Turn
         && turn.selected == FallbackLeg::Turn
         && direct.ordered_stun_overlay_turn()
         && overlay.ordered_stun_overlay_turn()
@@ -3684,8 +3686,8 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
         && owner_turn.endpoint == Endpoint::new("turns:owner.example:5349");
 
     let socket_adapter = LocalProcessSocketAdapter::new(
-        default_config.clone(),
-        SimulatedNat::overlay_only(),
+        turn_config.clone(),
+        SimulatedNat::turn_only(),
         b"message-body".to_vec(),
     );
     let socket_report = socket_adapter.run_conformance(b"opaque socket ciphertext")?;
@@ -3999,7 +4001,7 @@ pub fn ux_e2e_hardening_smoke() -> Result<UxE2eHardeningSmoke, anyhow::Error> {
     let connectivity_copy_ready = snapshot
         .connectivity
         .fallback_chain
-        .contains("STUN → relay-overlay → TURN")
+        .contains("direct WebRTC P2P → configured TURN only")
         && snapshot.connectivity.push_copy.contains("content-free")
         && snapshot
             .connectivity
