@@ -52,6 +52,10 @@ jobs:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: apps/ui/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-package-release-v1
       - name: Install Linux Tauri build dependencies
         run: |
           sudo apt-get update
@@ -62,6 +66,18 @@ jobs:
             librsvg2-dev \
             patchelf \
             rpm
+      - name: Install package release cargo tools
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo install cargo-deny --locked || true
+          cargo install cargo-sbom --locked || true
+          cargo audit --version
+          cargo deny --version
+          cargo sbom --version
+      - name: Test password vault reinstall durability
+        run: |
+          cargo test -p discrypt-storage --features production-storage production_passphrase_vault_app_db_survives_fresh_instance_with_same_password -- --nocapture
+          cargo test -p discrypt-storage --features production-storage existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite -- --nocapture
       - run: npm --prefix apps/ui run release:linux
       - run: npm --prefix apps/ui run smoke:linux-packages
       - uses: actions/upload-artifact@v4
