@@ -1544,7 +1544,7 @@ function applyFirstRunStorageE2eState(state: AppState): void {
     password_required: false,
     keyring_available: true,
     keyring_detail:
-      "Local-dev E2E storage setup hook; packaged builds report real keyring preflight.",
+      "E2E storage setup hook; packaged builds report real keyring preflight.",
   };
 }
 
