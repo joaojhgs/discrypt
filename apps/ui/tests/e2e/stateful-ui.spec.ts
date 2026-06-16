@@ -1,5 +1,7 @@
 import { expect, test } from "playwright/test";
 
+const FIRST_RUN_STORAGE_E2E_KEY = "discrypt:e2e:first-run-storage-setup";
+
 async function bootReadyShell(page) {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -128,6 +130,10 @@ async function bootReadyShell(page) {
   await expect(
     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
   ).toBeVisible();
+  const storageSetup = page.getByTestId("first-run-storage");
+  if ((await storageSetup.count()) > 0) {
+    await storageSetup.getByRole("button", { name: /use os keyring/i }).click();
+  }
   await page.getByLabel("Display name").first().fill("E2E User");
   await page.getByLabel("Device name").first().fill("E2E Device");
   await page.getByRole("button", { name: /create new user/i }).click();
@@ -136,6 +142,56 @@ async function bootReadyShell(page) {
   ).toBeVisible();
   expect(errors).toEqual([]);
   return errors;
+}
+
+async function openStorageSetupFirstRun(page) {
+  await page.evaluate((key) => {
+    window.localStorage.clear();
+    window.localStorage.setItem(key, "1");
+  }, FIRST_RUN_STORAGE_E2E_KEY);
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: /set up your local discrypt profile/i }),
+  ).toBeVisible();
+  await expect(page.getByTestId("first-run-storage")).toBeVisible();
+}
+
+async function expectNoDocumentHorizontalOverflow(page) {
+  const overflow = await page.evaluate(
+    () =>
+      document.documentElement.scrollWidth -
+      document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+}
+
+async function expectStorageLayoutStable(page) {
+  await expect(page.getByTestId("first-run-storage")).toBeVisible();
+  await expect(page.getByTestId("first-run-account-forms")).toBeVisible();
+  await expectNoDocumentHorizontalOverflow(page);
+
+  const boxes = await page.evaluate(() => {
+    const storage = document.querySelector('[data-testid="first-run-storage"]');
+    const forms = document.querySelector('[data-testid="first-run-account-forms"]');
+    const modeOptions = document.querySelector(
+      '[data-testid="first-run-storage-mode-options"]',
+    );
+    const storageRect = storage?.getBoundingClientRect();
+    const formsRect = forms?.getBoundingClientRect();
+    const modeRect = modeOptions?.getBoundingClientRect();
+    return storageRect && formsRect && modeRect
+      ? {
+          storageTop: storageRect.top,
+          storageBottom: storageRect.bottom,
+          formsTop: formsRect.top,
+          modeWidth: modeRect.width,
+        }
+      : null;
+  });
+  expect(boxes).not.toBeNull();
+  expect(boxes?.storageTop ?? -1).toBeGreaterThanOrEqual(0);
+  expect(boxes?.formsTop ?? 0).toBeGreaterThan(boxes?.storageBottom ?? 0);
+  expect(boxes?.modeWidth ?? 0).toBeGreaterThan(600);
 }
 
 
@@ -199,6 +255,56 @@ test("setup workflow remains readable and completes", async ({ page }) => {
 
   await page.getByRole("button", { name: /mark verified/i }).click();
   await expect(page.getByText(/Safety number verified/i).first()).toBeVisible();
+});
+
+test("first-run storage setup remains readable at required widths", async ({
+  page,
+}, testInfo) => {
+  for (const viewport of [
+    { name: "1024", width: 1024, height: 900 },
+    { name: "1440", width: 1440, height: 1000 },
+    { name: "ultrawide", width: 2560, height: 1200 },
+  ]) {
+    await page.setViewportSize({
+      width: viewport.width,
+      height: viewport.height,
+    });
+    await openStorageSetupFirstRun(page);
+
+    await expectStorageLayoutStable(page);
+    await expect(
+      page.getByRole("button", { name: /create new user/i }),
+    ).toBeDisabled();
+
+    await page
+      .getByTestId("first-run-storage")
+      .getByRole("button", { name: /use discrypt password vault/i })
+      .click();
+    await expect(page.getByLabel("Storage password", { exact: true })).toHaveCount(1);
+    await expect(
+      page.getByLabel("Confirm storage password", { exact: true }),
+    ).toHaveCount(1);
+    await page
+      .getByLabel("Storage password", { exact: true })
+      .fill("correct horse battery");
+    await page
+      .getByLabel("Confirm storage password", { exact: true })
+      .fill("correct horse battery");
+    await expect(page.getByText(/password vault will be created/i)).toBeVisible();
+
+    const passwordInput = page.getByLabel("Storage password", { exact: true });
+    await expect(passwordInput).toHaveAttribute("type", "password");
+    await page.getByRole("button", { name: "Show password" }).first().click();
+    await expect(passwordInput).toHaveAttribute("type", "text");
+    await page.getByRole("button", { name: "Hide password" }).first().click();
+    await expect(passwordInput).toHaveAttribute("type", "password");
+
+    await expectStorageLayoutStable(page);
+    await page.screenshot({
+      fullPage: true,
+      path: testInfo.outputPath(`first-run-storage-${viewport.name}.png`),
+    });
+  }
 });
 
 test("direct message send stays command-backed", async ({ page }) => {
