@@ -13068,6 +13068,7 @@ fn app_store_path_with_options(allow_env_override: bool, domain: AppStatePathDom
     app_store_path_in_dir(domain.dir_name())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn production_app_store_path() -> PathBuf {
     app_store_path_with_options(false, AppStatePathDomain::Production)
 }
