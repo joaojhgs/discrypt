@@ -37,6 +37,12 @@ if (!tauriFeatures.some((feature) => ["local-dev", "harness"].includes(feature))
   );
   process.exit(2);
 }
+if (tauriFeatures.includes("production-storage")) {
+  console.error(
+    "DISCRYPT_G010_TAURI_FEATURES must not include production-storage because production-storage builds do not honor DISCRYPT_APP_STATE_PATH profile isolation.",
+  );
+  process.exit(2);
+}
 const tauriFeatureArg = tauriFeatures.join(",");
 const artifactRoot = resolve(
   repoRoot,
