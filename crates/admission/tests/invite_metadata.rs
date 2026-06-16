@@ -4,7 +4,8 @@ use discrypt_admission::{
     GroupInviteBootstrap, InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy,
     InviteError, InviteKind, InvitePasswordPolicy, InviteRevocationPolicy,
     InviteSignalingAdapterKind, InviteSignalingMetadata, InviteSignalingProfile, InviteStore,
-    InviteTrustMetadata, INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_DESCRIPTOR_SCHEMA_VERSION,
+    InviteTrustMetadata, StoredInvite, INVITE_CONNECTIVITY_SCHEMA_VERSION,
+    INVITE_DESCRIPTOR_SCHEMA_VERSION,
 };
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
@@ -300,6 +301,33 @@ fn canonical_password_policy() -> Result<InvitePasswordPolicy, InviteError> {
     InvitePasswordPolicy::online_helper("helper-main", test_commitment('7'))
 }
 
+fn admission_snapshot_mut(
+    invite: &mut StoredInvite,
+) -> Result<&mut InviteAdmissionSnapshot, Box<dyn std::error::Error>> {
+    invite
+        .admission_snapshot
+        .as_mut()
+        .ok_or_else(|| Box::<dyn std::error::Error>::from("admission snapshot missing"))
+}
+
+fn bootstrap_metadata_mut(
+    invite: &mut StoredInvite,
+) -> Result<&mut InviteBootstrapMetadata, Box<dyn std::error::Error>> {
+    invite
+        .bootstrap_metadata
+        .as_mut()
+        .ok_or_else(|| Box::<dyn std::error::Error>::from("bootstrap metadata missing"))
+}
+
+fn password_policy_mut(
+    invite: &mut StoredInvite,
+) -> Result<&mut InvitePasswordPolicy, Box<dyn std::error::Error>> {
+    invite
+        .password_policy
+        .as_mut()
+        .ok_or_else(|| Box::<dyn std::error::Error>::from("password policy missing"))
+}
+
 #[test]
 fn signed_invite_descriptor_covers_group_and_dm_bootstrap_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -431,7 +459,7 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
     );
     assert!(invite.verify_issuer_signature().is_ok());
     assert!(invite.admission_snapshot.is_some());
-    assert_eq!(invite.revocation_policy.max_use_enforced, true);
+    assert!(invite.revocation_policy.max_use_enforced);
     assert_eq!(
         invite
             .password_policy
@@ -462,37 +490,22 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
     }
 
     assert_tampered_signature!(tampered_group_id, {
-        tampered_group_id
-            .admission_snapshot
-            .as_mut()
-            .expect("admission snapshot")
-            .group_id_commitment = test_commitment('1');
+        admission_snapshot_mut(&mut tampered_group_id)?.group_id_commitment = test_commitment('1');
     });
     assert_tampered_signature!(tampered_group_commitment, {
-        tampered_group_commitment
-            .admission_snapshot
-            .as_mut()
-            .expect("admission snapshot")
-            .group_commitment = test_commitment('2');
+        admission_snapshot_mut(&mut tampered_group_commitment)?.group_commitment =
+            test_commitment('2');
     });
     assert_tampered_signature!(tampered_endpoint, {
         tampered_endpoint.signaling_metadata.signaling_endpoint =
             "https://changed.example.invalid/v1/rendezvous".to_owned();
     });
     assert_tampered_signature!(tampered_adapter, {
-        tampered_adapter
-            .bootstrap_metadata
-            .as_mut()
-            .expect("bootstrap metadata")
-            .signaling_profiles[0]
-            .adapter_kind = InviteSignalingAdapterKind::Nostr;
+        bootstrap_metadata_mut(&mut tampered_adapter)?.signaling_profiles[0].adapter_kind =
+            InviteSignalingAdapterKind::Nostr;
     });
     assert_tampered_signature!(tampered_allowlist, {
-        tampered_allowlist
-            .bootstrap_metadata
-            .as_mut()
-            .expect("bootstrap metadata")
-            .signaling_profiles[0]
+        bootstrap_metadata_mut(&mut tampered_allowlist)?.signaling_profiles[0]
             .endpoint_allowlist_commitments[0] = test_commitment('3');
     });
     assert_tampered_signature!(tampered_ice, {
@@ -513,26 +526,16 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
             .revocation_authority_commitment = test_commitment('4');
     });
     assert_tampered_signature!(tampered_admission_mode, {
-        tampered_admission_mode
-            .admission_snapshot
-            .as_mut()
-            .expect("admission snapshot")
-            .admission_mode = "automatic_when_authorized_online".to_owned();
+        admission_snapshot_mut(&mut tampered_admission_mode)?.admission_mode =
+            "automatic_when_authorized_online".to_owned();
     });
     assert_tampered_signature!(tampered_password_policy, {
-        tampered_password_policy
-            .password_policy
-            .as_mut()
-            .expect("password policy")
-            .helper_id = Some("other-helper".to_owned());
+        password_policy_mut(&mut tampered_password_policy)?.helper_id =
+            Some("other-helper".to_owned());
     });
 
     let mut offline_verifier = invite.clone();
-    offline_verifier
-        .password_policy
-        .as_mut()
-        .expect("password policy")
-        .offline_verifier_allowed = true;
+    password_policy_mut(&mut offline_verifier)?.offline_verifier_allowed = true;
     assert_eq!(
         offline_verifier.verify_issuer_signature(),
         Err(InviteError::OfflineVerifierRejected)
