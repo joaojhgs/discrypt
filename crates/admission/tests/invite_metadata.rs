@@ -1,10 +1,10 @@
 use chrono::{Duration, Utc};
 use discrypt_admission::{
-    signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
-    InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy, InviteError,
-    InviteKind, InvitePasswordPolicy, InviteRevocationPolicy, InviteSignalingAdapterKind,
-    InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
-    INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_DESCRIPTOR_SCHEMA_VERSION,
+    signaling_fingerprint_for_endpoint, CanonicalGroupInviteV1Input, DmInviteBootstrap,
+    GroupInviteBootstrap, InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy,
+    InviteError, InviteKind, InvitePasswordPolicy, InviteRevocationPolicy,
+    InviteSignalingAdapterKind, InviteSignalingMetadata, InviteSignalingProfile, InviteStore,
+    InviteTrustMetadata, INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_DESCRIPTOR_SCHEMA_VERSION,
 };
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
@@ -412,14 +412,16 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
     let scope = test_commitment('a');
     let mut store = InviteStore::new();
     let invite = store.issue_canonical_group_invite_v1(
-        b"canonical-room-secret:not-in-descriptor",
-        now + Duration::minutes(10),
-        4,
-        signaling_metadata,
-        canonical_group_bootstrap(&scope)?,
-        canonical_admission_snapshot(&scope)?,
-        canonical_revocation_policy()?,
-        Some(canonical_password_policy()?),
+        CanonicalGroupInviteV1Input {
+            room_secret: b"canonical-room-secret:not-in-descriptor",
+            expires_at: now + Duration::minutes(10),
+            max_uses: 4,
+            signaling_metadata,
+            bootstrap_metadata: canonical_group_bootstrap(&scope)?,
+            admission_snapshot: canonical_admission_snapshot(&scope)?,
+            revocation_policy: canonical_revocation_policy()?,
+            password_policy: Some(canonical_password_policy()?),
+        },
         &issuer,
     )?;
 

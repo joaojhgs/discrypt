@@ -14,7 +14,8 @@ use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
 use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
-    signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
+    signaling_fingerprint_for_endpoint, CanonicalGroupInviteV1Input, DmInviteBootstrap,
+    GroupInviteBootstrap,
     InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind,
     InvitePasswordPolicy, InviteRevocationPolicy, InviteSignalingAdapterKind,
     InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
@@ -5658,14 +5659,16 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
         let descriptor = match invite_store.issue_canonical_group_invite_v1(
-            room_secret.as_bytes(),
-            descriptor_expires_at,
-            max_uses,
-            signaling_metadata.clone(),
-            bootstrap_metadata,
-            admission_snapshot,
-            revocation_policy,
-            password_policy,
+            CanonicalGroupInviteV1Input {
+                room_secret: room_secret.as_bytes(),
+                expires_at: descriptor_expires_at,
+                max_uses,
+                signaling_metadata: signaling_metadata.clone(),
+                bootstrap_metadata,
+                admission_snapshot,
+                revocation_policy,
+                password_policy,
+            },
             &issuer,
         ) {
             Ok(descriptor) => descriptor,
