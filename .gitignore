@@ -14,6 +14,7 @@
 .omx/state/
 .omx/logs/
 .omx/runtime/
+.omx/cache/
 .omx/metrics.json
 .omx/hud-config.json
 .omx/setup-scope.json

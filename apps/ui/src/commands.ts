@@ -1540,7 +1540,7 @@ function applyFirstRunStorageE2eState(state: AppState): void {
     detail:
       "Select the OS keyring or a Discrypt password vault before account setup.",
     recovery_hint:
-      "Existing unreadable storage is preserved; setup must configure storage before creating identity state.",
+      "Existing unreadable storage is preserved, not restored or overwritten; setup must configure storage before creating identity state.",
     password_required: false,
     keyring_available: true,
     keyring_detail:
