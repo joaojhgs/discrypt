@@ -1,6 +1,6 @@
 # Discrypt UI — Production Gap Analysis
 
-**Date:** 2026-05-30  
+**Date:** 2026-05-30
 **Status:** Historical / superseded by the current release matrices
 
 This document is retained as the pre-cleanup UI gap analysis. It is **not** the
@@ -94,9 +94,9 @@ These are true production gaps but do NOT block the UI from working for local/LA
 
 ## Implementation Order
 
-1. **P0** — UI harness cleanup (this session, no backend touches)  
-2. **P1a** — Channel/DM panels as default view (sidebar click → panel, no workflow nav required)  
-3. **P1b** — Auto-attach transport on DM/channel open  
-4. **P1c** — Tauri event push for new messages (backend + frontend)  
-5. **P2** — Voice audio pipeline  
-6. **P3** — Signaling config UI in group creation  
+1. **P0** — UI harness cleanup (this session, no backend touches)
+2. **P1a** — Channel/DM panels as default view (sidebar click → panel, no workflow nav required)
+3. **P1b** — Auto-attach transport on DM/channel open
+4. **P1c** — Tauri event push for new messages (backend + frontend)
+5. **P2** — Voice audio pipeline
+6. **P3** — Signaling config UI in group creation
