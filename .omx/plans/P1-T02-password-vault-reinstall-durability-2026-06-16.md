@@ -49,5 +49,6 @@ Observed blocker: manual GitHub package run `27595324488` built Linux package ar
 
 Focused unblock plan:
 - Add explicit release cargo-tool provisioning to `.github/workflows/package-desktop.yml` before `npm --prefix apps/ui run release:linux`; `release:linux` currently needs `cargo-sbom` for G124 SBOM generation and `cargo-audit`/`cargo-deny` for G126 reproducibility evidence.
+- Run the focused `discrypt-storage --features production-storage` password-vault durability tests in the same Linux package workflow before packaging, because this task's exact regression tests are feature-gated and not covered by default `cargo test --workspace`.
 - Keep the package workflow validator in `scripts/check-desktop-package-ci.mjs` aware of that prerequisite.
 - Rerun the package workflow on `multica/P1-T02-password-vault-reinstall-durability` with Linux packaging enabled and treat the workflow artifact/log as the real `.deb` reinstall evidence only if `smoke:linux-packages` completes after package build.

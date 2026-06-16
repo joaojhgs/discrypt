@@ -74,6 +74,10 @@ jobs:
           cargo audit --version
           cargo deny --version
           cargo sbom --version
+      - name: Test password vault reinstall durability
+        run: |
+          cargo test -p discrypt-storage --features production-storage production_passphrase_vault_app_db_survives_fresh_instance_with_same_password -- --nocapture
+          cargo test -p discrypt-storage --features production-storage existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite -- --nocapture
       - run: npm --prefix apps/ui run release:linux
       - run: npm --prefix apps/ui run smoke:linux-packages
       - uses: actions/upload-artifact@v4

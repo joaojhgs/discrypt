@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T06:35:30.591Z",
+  "updatedAt": "2026-06-16T07:14:34.202Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -224,14 +224,14 @@
       "id": "G020-unblock-package-linux-sbom-smoke",
       "title": "Unblock package Linux SBOM smoke",
       "objective": "Install or provide cargo-sbom in the package Linux workflow before release:linux so scripts/generate-sbom-g124.mjs can run cargo sbom, then verify package workflow checks and rerun the Linux package smoke evidence path.",
-      "status": "in_progress",
+      "status": "complete",
       "attempt": 1,
       "createdAt": "2026-06-16T06:35:24.026Z",
-      "updatedAt": "2026-06-16T06:35:30.591Z",
-      "evidence": "Multica issue metadata and workflow run 27595324488: release:linux built .deb/.rpm/AppImage, then generate-sbom-g124 failed because cargo sbom was unavailable; smoke:linux-packages was skipped.",
-      "startedAt": "2026-06-16T06:35:30.591Z"
+      "updatedAt": "2026-06-16T07:14:34.202Z",
+      "evidence": "Workflow run https://github.com/joaojhgs/discrypt/actions/runs/27599766687 succeeded on commit 190da7c: package Linux installed release cargo tools, release:linux passed, smoke:linux-packages passed, and discrypt-linux-packages artifact uploaded.",
+      "startedAt": "2026-06-16T06:35:30.591Z",
+      "completedAt": "2026-06-16T07:14:34.202Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
-  "activeGoalId": "G020-unblock-package-linux-sbom-smoke"
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
 }
