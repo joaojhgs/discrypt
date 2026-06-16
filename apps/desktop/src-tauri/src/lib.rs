@@ -2474,6 +2474,14 @@ struct PersistedAppState {
     next_sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistedSchemaVersion {
+    Current,
+    Legacy { version: u32, missing: bool },
+    Future(u32),
+    Invalid,
+}
+
 static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
@@ -12326,23 +12334,7 @@ fn load_state() -> PersistedAppState {
 
 fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
     match store.load_app_state() {
-        Ok(Some(bytes)) => match serde_json::from_slice::<PersistedAppState>(&bytes) {
-            Ok(mut state) if state.schema_version == APP_STATE_SCHEMA_VERSION => {
-                state.clear_non_persistent_voice_runtime();
-                state.ensure_group_governance_defaults();
-                state
-            }
-            Ok(_) => initial_state_with_persistence_error(
-                "state_schema_mismatch",
-                "Stored app state uses an unsupported schema version.",
-                "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
-            ),
-            Err(error) => initial_state_with_persistence_error(
-                "state_decode_failed",
-                format!("Stored app state could not be decoded: {error}"),
-                "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
-            ),
-        },
+        Ok(Some(bytes)) => load_state_from_bytes(store, &bytes),
         Ok(None) => PersistedAppState::initial(),
         Err(error) => initial_state_with_persistence_error(
             "state_load_failed",
@@ -12350,6 +12342,109 @@ fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
             "Check local storage/keychain access before creating or recovering another profile.",
         ),
     }
+}
+
+fn load_state_from_bytes(store: &mut impl AppStore, bytes: &[u8]) -> PersistedAppState {
+    match persisted_schema_version(bytes) {
+        Ok(PersistedSchemaVersion::Current) => decode_current_app_state(bytes),
+        Ok(PersistedSchemaVersion::Legacy { version, missing }) => {
+            migrate_legacy_app_state(store, bytes, version, missing)
+        }
+        Ok(PersistedSchemaVersion::Future(version)) => initial_state_with_persistence_error(
+            "state_schema_future",
+            format!(
+                "Stored app state schema version {version} is newer than supported version {APP_STATE_SCHEMA_VERSION}."
+            ),
+            "Keep the existing store for recovery with a newer Discrypt build; this app will not downgrade or overwrite it.",
+        ),
+        Ok(PersistedSchemaVersion::Invalid) => initial_state_with_persistence_error(
+            "state_schema_invalid",
+            "Stored app state has an invalid schema_version field.",
+            "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
+        ),
+        Err(error) => initial_state_with_persistence_error(
+            "state_decode_failed",
+            format!("Stored app state could not be decoded: {error}"),
+            "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
+        ),
+    }
+}
+
+fn persisted_schema_version(bytes: &[u8]) -> Result<PersistedSchemaVersion, serde_json::Error> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes)?;
+    let Some(raw_version) = value.get("schema_version") else {
+        return Ok(PersistedSchemaVersion::Legacy {
+            version: 0,
+            missing: true,
+        });
+    };
+    let Some(version) = raw_version
+        .as_u64()
+        .and_then(|version| u32::try_from(version).ok())
+    else {
+        return Ok(PersistedSchemaVersion::Invalid);
+    };
+    if version == APP_STATE_SCHEMA_VERSION {
+        Ok(PersistedSchemaVersion::Current)
+    } else if version < APP_STATE_SCHEMA_VERSION {
+        Ok(PersistedSchemaVersion::Legacy {
+            version,
+            missing: false,
+        })
+    } else {
+        Ok(PersistedSchemaVersion::Future(version))
+    }
+}
+
+fn decode_current_app_state(bytes: &[u8]) -> PersistedAppState {
+    match serde_json::from_slice::<PersistedAppState>(bytes) {
+        Ok(mut state) => {
+            state.schema_version = APP_STATE_SCHEMA_VERSION;
+            state.clear_non_persistent_voice_runtime();
+            state.ensure_group_governance_defaults();
+            state
+        }
+        Err(error) => initial_state_with_persistence_error(
+            "state_decode_failed",
+            format!("Stored app state could not be decoded: {error}"),
+            "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
+        ),
+    }
+}
+
+fn migrate_legacy_app_state(
+    store: &mut impl AppStore,
+    bytes: &[u8],
+    version: u32,
+    missing: bool,
+) -> PersistedAppState {
+    let mut state = match serde_json::from_slice::<PersistedAppState>(bytes) {
+        Ok(state) => state,
+        Err(error) => {
+            return initial_state_with_persistence_error(
+                "state_decode_failed",
+                format!("Stored legacy app state version {version} could not be decoded: {error}"),
+                "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
+            )
+        }
+    };
+    state.schema_version = APP_STATE_SCHEMA_VERSION;
+    state.clear_non_persistent_voice_runtime();
+    state.ensure_group_governance_defaults();
+
+    let source = if missing {
+        "missing schema_version"
+    } else {
+        "schema_version below current"
+    };
+    if let Err(error) = persist_state_to_store(store, &state) {
+        state.last_command_error = Some(error);
+    } else {
+        eprintln!(
+            "[Discrypt persistence] migrated legacy app state ({source}, version {version}) to schema {APP_STATE_SCHEMA_VERSION}"
+        );
+    }
+    state
 }
 
 fn persist_state(state: &PersistedAppState) -> Result<(), CommandErrorView> {
@@ -20790,7 +20885,8 @@ mod tests {
     fn corrupt_persisted_state_surfaces_recovery_error_instead_of_silent_first_run() {
         let _guard = test_lock();
         let path = fresh_state_path("corrupt-state");
-        fs::write(&path, b"{not-json").expect("write corrupt app state");
+        let corrupt_bytes = b"{not-json";
+        fs::write(&path, corrupt_bytes).expect("write corrupt app state");
         let mut store = FileAppStore::new(&path);
         let state = load_state_from_store(&mut store);
         let error = state
@@ -20804,6 +20900,11 @@ mod tests {
                 .recovery_hint
                 .contains("do not silently treat this as a first-run profile"),
             "{error:?}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("corrupt store remains readable"),
+            corrupt_bytes,
+            "corrupt existing state must be preserved for recovery"
         );
         let _ = fs::remove_file(path);
     }
@@ -20831,6 +20932,84 @@ mod tests {
             state.last_command_error.is_none(),
             "{:?}",
             state.last_command_error
+        );
+        let persisted = fs::read(&path).expect("migrated store persists");
+        assert_eq!(
+            persisted_schema_version(&persisted).expect("migrated schema parses"),
+            PersistedSchemaVersion::Current
+        );
+        let decoded: PersistedAppState =
+            serde_json::from_slice(&persisted).expect("migrated state decodes");
+        assert_eq!(decoded.schema_version, APP_STATE_SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_old_schema_version_migrates_to_current_schema() {
+        let _guard = test_lock();
+        let path = fresh_state_path("old-schema-version-state");
+        let mut value =
+            serde_json::to_value(PersistedAppState::initial()).expect("initial state serializes");
+        value
+            .as_object_mut()
+            .expect("persisted state is an object")
+            .insert("schema_version".to_owned(), serde_json::json!(0));
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("legacy state encodes"),
+        )
+        .expect("write old app state");
+
+        let mut store = FileAppStore::new(&path);
+        let state = load_state_from_store(&mut store);
+        assert_eq!(state.schema_version, APP_STATE_SCHEMA_VERSION);
+        assert!(
+            state.last_command_error.is_none(),
+            "{:?}",
+            state.last_command_error
+        );
+        let persisted = fs::read(&path).expect("migrated store persists");
+        assert_eq!(
+            persisted_schema_version(&persisted).expect("migrated schema parses"),
+            PersistedSchemaVersion::Current
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn future_schema_version_fails_closed_without_overwriting_store() {
+        let _guard = test_lock();
+        let path = fresh_state_path("future-schema-version-state");
+        let mut value =
+            serde_json::to_value(PersistedAppState::initial()).expect("initial state serializes");
+        value
+            .as_object_mut()
+            .expect("persisted state is an object")
+            .insert(
+                "schema_version".to_owned(),
+                serde_json::json!(APP_STATE_SCHEMA_VERSION + 1),
+            );
+        let future_bytes = serde_json::to_vec(&value).expect("future state encodes");
+        fs::write(&path, &future_bytes).expect("write future app state");
+
+        let mut store = FileAppStore::new(&path);
+        let state = load_state_from_store(&mut store);
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("future schema must surface an error");
+        assert_eq!(error.command, "app_persistence");
+        assert_eq!(error.code, "state_schema_future");
+        assert!(
+            error
+                .recovery_hint
+                .contains("will not downgrade or overwrite"),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("future store remains readable"),
+            future_bytes,
+            "future existing state must be preserved for a newer build"
         );
         let _ = fs::remove_file(path);
     }
