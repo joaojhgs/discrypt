@@ -474,7 +474,8 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
     assert!(serialized.contains("revocation_policy"));
     assert!(serialized.contains("password_policy"));
     assert!(!serialized.contains("canonical-room-secret"));
-    assert!(!serialized.contains("offline_verifier"));
+    assert!(!serialized.contains("offline_verifier_secret"));
+    assert!(!serialized.contains("offline_verifier_material"));
     assert!(!serialized.contains("password_secret"));
 
     macro_rules! assert_tampered_signature {
