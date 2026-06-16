@@ -467,9 +467,7 @@ pub struct InviteRevocationPolicy {
 
 impl InviteRevocationPolicy {
     /// Construct and validate a revocation policy snapshot.
-    pub fn new(
-        revocation_authority_commitment: impl Into<String>,
-    ) -> Result<Self, InviteError> {
+    pub fn new(revocation_authority_commitment: impl Into<String>) -> Result<Self, InviteError> {
         let policy = Self {
             revocable: true,
             revocation_authority_commitment: revocation_authority_commitment.into(),

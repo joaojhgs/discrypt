@@ -5591,7 +5591,10 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .as_ref()
             .map(|bootstrap| bootstrap.role_admission_policy_commitment.clone())
             .unwrap_or_else(|| {
-                hash_commitment("discrypt-group-admission-policy-commitment-v1", &[&group_id])
+                hash_commitment(
+                    "discrypt-group-admission-policy-commitment-v1",
+                    &[&group_id],
+                )
             });
         let issuer_user_id = state.local_user_id();
         let admission_snapshot = match InviteAdmissionSnapshot::new(

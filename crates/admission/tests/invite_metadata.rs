@@ -423,12 +423,18 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
         &issuer,
     )?;
 
-    assert_eq!(invite.descriptor_schema_version, INVITE_DESCRIPTOR_SCHEMA_VERSION);
+    assert_eq!(
+        invite.descriptor_schema_version,
+        INVITE_DESCRIPTOR_SCHEMA_VERSION
+    );
     assert!(invite.verify_issuer_signature().is_ok());
     assert!(invite.admission_snapshot.is_some());
     assert_eq!(invite.revocation_policy.max_use_enforced, true);
     assert_eq!(
-        invite.password_policy.as_ref().map(|policy| policy.offline_verifier_allowed),
+        invite
+            .password_policy
+            .as_ref()
+            .map(|policy| policy.offline_verifier_allowed),
         Some(false)
     );
 
@@ -500,8 +506,9 @@ fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
         tampered_max_use.max_uses = 99;
     });
     assert_tampered_signature!(tampered_revocation, {
-        tampered_revocation.revocation_policy.revocation_authority_commitment =
-            test_commitment('4');
+        tampered_revocation
+            .revocation_policy
+            .revocation_authority_commitment = test_commitment('4');
     });
     assert_tampered_signature!(tampered_admission_mode, {
         tampered_admission_mode
