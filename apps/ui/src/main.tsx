@@ -3177,8 +3177,9 @@ function StorageSecurityPanel({
                 separate app-level secret.
               </p>
               <p className="rounded-xl border border-amber-300/25 bg-amber-300/10 p-3 text-amber-100">
-                No recovery flow exists yet for a lost password, broken
-                keyring, or migrated vault. That roadmap is tracked in docs.
+                No storage restore flow exists yet for a lost password, broken
+                keyring, or moved vault. Discrypt preserves existing unreadable
+                state and leaves recovery/migration on the roadmap.
               </p>
             </div>
             {locked || storage.mode === "passphrase_vault" ? (
@@ -3479,7 +3480,8 @@ function FirstRunPanel({
                       app starts.
                     </p>
                     <p className="mt-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs leading-5 text-amber-100">
-                      No recovery exists yet for a lost storage password.
+                      No storage restore exists yet for a lost password;
+                      existing unreadable state is preserved.
                     </p>
                   </Button>
                   </div>

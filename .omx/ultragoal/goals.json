@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T14:37:03.220Z",
+  "updatedAt": "2026-06-16T19:25:33.093Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -256,6 +256,18 @@
       "evidence": "Implemented dev/prod app-state storage separation for PER-10/P1-T04: local-dev/harness defaults use discrypt-local-dev, non-test production-storage selects discrypt and disables dev/harness DISCRYPT_APP_STATE_PATH overrides, production helper ignores overrides, no-HOME fallback is domain-qualified, OpenMLS sidecar follows selected app-state, G010 rejects production-storage profile-isolated launches, and static gates passed. Local cargo unavailable.",
       "startedAt": "2026-06-16T14:12:20.797Z",
       "completedAt": "2026-06-16T14:37:03.220Z"
+    },
+    {
+      "id": "G023-p1-t06-recovery-roadmap-stubs",
+      "title": "P1-T06 recovery roadmap stubs",
+      "objective": "Add PER-12 recovery roadmap/copy/test gates that document preserve-dont-overwrite behavior and avoid fake storage restore claims.",
+      "status": "complete",
+      "attempt": 1,
+      "createdAt": "2026-06-16T19:10:01.342Z",
+      "updatedAt": "2026-06-16T19:25:33.093Z",
+      "evidence": "PER-12 recovery roadmap stubs now document preserve-dont-overwrite behavior, UI/command copy avoids fake restore claims, the P1-T06 static gate passed via direct node and npm wrapper commands, typecheck/build passed, and generated OMX cache state was removed/ignored before commit.",
+      "startedAt": "2026-06-16T19:10:09.494Z",
+      "completedAt": "2026-06-16T19:25:33.093Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
