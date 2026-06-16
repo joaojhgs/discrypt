@@ -48,6 +48,6 @@ Stop at PR + QA handoff with exact test evidence. Do not claim production-ready 
 Observed blocker: manual GitHub package run `27595324488` built Linux package artifacts, then `scripts/generate-sbom-g124.mjs --require-packaged-artifacts` failed because `cargo sbom` was not available in the `package Linux` job. Because `release:linux` exited there, `smoke:linux-packages` never ran and the required real `.deb` reinstall evidence remained missing.
 
 Focused unblock plan:
-- Add explicit `cargo-sbom` provisioning to `.github/workflows/package-desktop.yml` before `npm --prefix apps/ui run release:linux`.
+- Add explicit release cargo-tool provisioning to `.github/workflows/package-desktop.yml` before `npm --prefix apps/ui run release:linux`; `release:linux` currently needs `cargo-sbom` for G124 SBOM generation and `cargo-audit`/`cargo-deny` for G126 reproducibility evidence.
 - Keep the package workflow validator in `scripts/check-desktop-package-ci.mjs` aware of that prerequisite.
 - Rerun the package workflow on `multica/P1-T02-password-vault-reinstall-durability` with Linux packaging enabled and treat the workflow artifact/log as the real `.deb` reinstall evidence only if `smoke:linux-packages` completes after package build.
