@@ -312,6 +312,15 @@ pub enum GroupAdmissionModeView {
     ManualApproval,
 }
 
+impl GroupAdmissionModeView {
+    fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::AutomaticWhenAuthorizedOnline => "automatic_when_authorized_online",
+            Self::ManualApproval => "manual_approval",
+        }
+    }
+}
+
 /// Persisted group member roster row used by role checks, presence, and member-panel UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GroupMemberView {
@@ -5575,8 +5584,9 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .canonical_name()
             .to_owned();
         let admission_mode = group
-            .map(|group| group.role_policy.admission_mode.clone())
-            .unwrap_or_else(|| "manual_approval".to_owned());
+            .map(|group| group.role_policy.admission_mode.canonical_name())
+            .unwrap_or("manual_approval")
+            .to_owned();
         let policy_epoch = group
             .map(|group| group.role_policy.policy_epoch)
             .unwrap_or(1);
