@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T19:58:35.727Z",
+  "updatedAt": "2026-06-16T22:37:36.950Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -273,14 +273,14 @@
       "id": "G024-p2-t01-canonical-invite-descriptor-s",
       "title": "P2-T01 canonical invite descriptor schema v1",
       "objective": "Implement PER-13/P2-T01 canonical signed invite descriptor schema v1, update Rust/Tauri/TS DTOs as needed, add tamper tests for group id, endpoint, adapter, ICE, expiry, max-use, password policy, revocation, and admission snapshot, then record verification evidence.",
-      "status": "in_progress",
+      "status": "complete",
       "attempt": 1,
       "createdAt": "2026-06-16T19:58:16.293Z",
-      "updatedAt": "2026-06-16T19:58:35.727Z",
-      "evidence": ".omx/plans/P2-T01-invite-schema-v1-2026-06-16.md created from PER-13 issue metadata and Phase 2 acceptance criteria.",
-      "startedAt": "2026-06-16T19:58:35.727Z"
+      "updatedAt": "2026-06-16T22:37:36.950Z",
+      "evidence": "PER-13/P2-T01 canonical invite schema v1 implemented and QA-approved on PR #12 head dcc143a: signed descriptor includes group id/group commitment/signaling profiles/ICE/admission snapshot/expiry/max-use/revocation/password policy, tamper coverage exercises the required descriptor axes, Rust InviteView and TS DTO descriptor fields are aligned, PR is non-draft/mergeable with green GitHub Actions, and architect review accepted product-code scope while requiring only terminal OMX state cleanup.",
+      "startedAt": "2026-06-16T19:58:35.727Z",
+      "completedAt": "2026-06-16T22:37:36.950Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
-  "activeGoalId": "G024-p2-t01-canonical-invite-descriptor-s"
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
 }
