@@ -129,13 +129,22 @@ command -v discrypt-desktop
 rm -rf /tmp/discrypt-home
 mkdir -p /tmp/discrypt-home
 set +e
-timeout 8s dbus-run-session -- bash -lc 'Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & xvfb_pid=$!; export DISPLAY=:99 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1; gnome-keyring-daemon --start --components=secrets >/tmp/gnome-keyring.env 2>/tmp/gnome-keyring.err || true; cat /tmp/gnome-keyring.err >&2 || true; busctl --user list | grep -q org.freedesktop.secrets; discrypt-desktop >/tmp/discrypt-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
+timeout 8s dbus-run-session -- bash -lc 'Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 & xvfb_pid=$!; export DISPLAY=:99 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1 DISCRYPT_APPDB_VAULT_PASSPHRASE="correct horse battery staple"; gnome-keyring-daemon --start --components=secrets >/tmp/gnome-keyring.env 2>/tmp/gnome-keyring.err || true; cat /tmp/gnome-keyring.err >&2 || true; busctl --user list | grep -q org.freedesktop.secrets; discrypt-desktop >/tmp/discrypt-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
 code=$?
 set -e
 cat /tmp/deb-depends.log || true
 tail -40 /tmp/install.log || true
 tail -80 /tmp/discrypt-smoke.log || true
 test "$code" -eq 0 -o "$code" -eq 124
+apt-get install -y --reinstall /tmp/discrypt.deb >/tmp/reinstall.log 2>&1
+command -v discrypt-desktop
+set +e
+timeout 8s dbus-run-session -- bash -lc 'Xvfb :100 -screen 0 1280x720x24 >/tmp/xvfb-reinstall.log 2>&1 & xvfb_pid=$!; export DISPLAY=:100 HOME=/tmp/discrypt-home XDG_DATA_HOME=/tmp/discrypt-home/.local/share WEBKIT_DISABLE_COMPOSITING_MODE=1 DISCRYPT_APPDB_VAULT_PASSPHRASE="correct horse battery staple"; gnome-keyring-daemon --start --components=secrets >/tmp/gnome-keyring-reinstall.env 2>/tmp/gnome-keyring-reinstall.err || true; cat /tmp/gnome-keyring-reinstall.err >&2 || true; discrypt-desktop >/tmp/discrypt-reinstall-smoke.log 2>&1; code=$?; kill "$xvfb_pid" >/dev/null 2>&1 || true; exit "$code"'
+reinstall_code=$?
+set -e
+tail -40 /tmp/reinstall.log || true
+tail -80 /tmp/discrypt-reinstall-smoke.log || true
+test "$reinstall_code" -eq 0 -o "$reinstall_code" -eq 124
 `,
   }),
 );

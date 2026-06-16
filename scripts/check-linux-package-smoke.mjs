@@ -41,6 +41,12 @@ for (const token of [
   if (!rendered.includes(token)) failures.push(`package smoke dry-run missing token: ${token}`);
 }
 for (const token of [
+  "apt-get install -y --reinstall /tmp/discrypt.deb",
+  "DISCRYPT_APPDB_VAULT_PASSPHRASE",
+]) {
+  if (!planText.includes(token)) failures.push(`package smoke dry-run missing token: ${token}`);
+}
+for (const token of [
   "gnome-keyring",
   "dbus-user-session",
   "libpam-gnome-keyring",

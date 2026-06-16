@@ -767,6 +767,9 @@ where
     fn load_or_create_wrapping_key(&mut self) -> Result<[u8; 32], AppStoreError> {
         match self.keychain.load_wrapping_key(&self.key_id) {
             Ok(Some(key)) => return Ok(key),
+            Ok(None) if self.path.exists() => {
+                return Err(AppStoreError::KeychainMissing(self.key_id.clone()))
+            }
             Ok(None) => {}
             Err(error) if self.path.exists() => return Err(error),
             Err(_) => {}
@@ -1990,6 +1993,97 @@ mod tests {
         );
         vault.delete_wrapping_key(key_id)?;
         assert_eq!(vault.load_wrapping_key(key_id)?, None);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn production_passphrase_vault_app_db_survives_fresh_instance_with_same_password(
+    ) -> Result<(), AppStoreError> {
+        let state_path = temp_db_path("discrypt-vault-reinstall");
+        let vault_path = state_path.with_extension("vault");
+        let _ = fs::remove_file(&state_path);
+        let _ = fs::remove_file(&vault_path);
+        let passphrase = "correct horse battery staple";
+        let payload = br#"{"profile_id":"same-profile-after-reinstall"}"#;
+
+        let mut first_install = EncryptedAppDb::new(
+            &state_path,
+            ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+                &vault_path,
+                passphrase,
+            )),
+        );
+        first_install.save_app_state(payload)?;
+        let state_bytes_after_first_save = fs::read(&state_path)?;
+        let vault_bytes_after_first_save = fs::read(&vault_path)?;
+
+        let mut reinstalled = EncryptedAppDb::new(
+            &state_path,
+            ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+                &vault_path,
+                passphrase,
+            )),
+        );
+        assert_eq!(reinstalled.load_app_state()?, Some(payload.to_vec()));
+
+        let mut wrong_password = EncryptedAppDb::new(
+            &state_path,
+            ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+                &vault_path,
+                "wrong horse battery staple",
+            )),
+        );
+        assert!(matches!(
+            wrong_password.load_app_state(),
+            Err(AppStoreError::Crypto("app db decryption failed"))
+        ));
+        assert_eq!(fs::read(&state_path)?, state_bytes_after_first_save);
+        assert_eq!(fs::read(&vault_path)?, vault_bytes_after_first_save);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite(
+    ) -> Result<(), AppStoreError> {
+        let state_path = temp_db_path("discrypt-vault-missing-key");
+        let vault_path = state_path.with_extension("vault");
+        let missing_vault_path = state_path.with_extension("missing.vault");
+        let _ = fs::remove_file(&state_path);
+        let _ = fs::remove_file(&vault_path);
+        let _ = fs::remove_file(&missing_vault_path);
+
+        let mut original = EncryptedAppDb::new(
+            &state_path,
+            ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+                &vault_path,
+                "correct horse battery staple",
+            )),
+        );
+        original.save_app_state(br#"{"profile_id":"must-not-reset"}"#)?;
+        let state_bytes_after_first_save = fs::read(&state_path)?;
+
+        let mut missing_vault = EncryptedAppDb::new(
+            &state_path,
+            ProductionAppDbKeychain::vault_only(PassphraseVaultKeychain::new(
+                &missing_vault_path,
+                "correct horse battery staple",
+            )),
+        );
+        let error = missing_vault
+            .save_app_state(br#"{"profile_id":"replacement-profile"}"#)
+            .expect_err("existing encrypted state must not seed a replacement vault key");
+
+        assert!(matches!(
+            error,
+            AppStoreError::KeychainMissing(ref key_id) if key_id == DEFAULT_WRAPPING_KEY_ID
+        ));
+        assert_eq!(fs::read(&state_path)?, state_bytes_after_first_save);
+        assert!(
+            !missing_vault_path.exists(),
+            "missing vault path must not be created for existing unreadable state"
+        );
         Ok(())
     }
 
