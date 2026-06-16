@@ -19,6 +19,28 @@ Discrypt must not silently create a new vault/keyring entry when local encrypted
 
 If either mode fails to unlock existing app state, Discrypt must error out and preserve the existing files. Recovery and migration are future work; the app must not overwrite an old vault/keyring path with a replacement secret just to continue.
 
+## Current recovery boundary: preserve, do not overwrite
+
+This release does not contain a storage restore flow. The current supported path
+for unreadable or locked local state is deliberately conservative:
+
+1. **Stop before account setup or app-state writes.** Existing ciphertext,
+   vault files, keyring material, and app-state paths stay in place.
+2. **Surface the storage error and recovery hint.** The user may retry with the
+   same OS keyring session, the same password vault material, or the original
+   profile directory, but Discrypt must not claim that retry restored data.
+3. **Preserve diagnostic evidence.** Logs and release evidence should identify
+   whether the failure was missing keyring material, wrong password, moved
+   vault/profile files, unsupported schema, or corrupt/unreadable bytes.
+4. **Defer repair to an explicit future flow.** A later recovery/migration
+   wizard must verify source material, re-encrypt into a selected mode, and
+   prove rollback/no-overwrite behavior before it can claim recovery.
+
+Until that future flow exists, product and release copy must say that existing
+unreadable storage is preserved. It must not say that Discrypt can restore a
+lost storage password, rebuild a missing keyring secret, recover content keys,
+or safely replace an unreadable profile with a new one.
+
 ## Production-storage follow-ups
 
 - [ ] Add a guided recovery flow for broken OS keyring access without replacing encrypted app state.
