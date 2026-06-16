@@ -108,6 +108,8 @@ use webkit2gtk::{
 
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
 const APP_STATE_STORE_FILENAME: &str = "app-state.discrypt-store";
+const APP_STATE_PRODUCTION_DIR_NAME: &str = "discrypt";
+const APP_STATE_LOCAL_DEV_DIR_NAME: &str = "discrypt-local-dev";
 const DEFAULT_THEME_ID: &str = "graphite-calm";
 const DEFAULT_TEMPLATE_ID: &str = "command-center";
 const UI_THEME_IDS: &[&str] = &["midnight-steel", "graphite-calm", "ocean-contrast"];
@@ -13006,7 +13008,10 @@ fn persist_state_to_path(
 }
 
 fn app_store_path() -> PathBuf {
-    app_store_path_with_env_override(env_app_state_override_allowed())
+    app_store_path_with_options(
+        env_app_state_override_allowed(),
+        default_app_state_path_domain(),
+    )
 }
 
 fn app_openmls_store_path() -> PathBuf {
@@ -13023,7 +13028,11 @@ fn openmls_store_path_for_app_state_path(app_state_path: &std::path::Path) -> Pa
 }
 
 fn env_app_state_override_allowed() -> bool {
-    cfg!(any(test, feature = "harness", feature = "local-dev"))
+    cfg!(any(
+        test,
+        all(feature = "harness", not(feature = "production-storage")),
+        all(feature = "local-dev", not(feature = "production-storage"))
+    ))
 }
 
 fn explicit_text_runtime_attachment_allowed() -> bool {
@@ -13035,25 +13044,59 @@ fn discrypt_webrtc_debug_enabled() -> bool {
         || std::env::var_os("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_some()
 }
 
-fn app_store_path_with_env_override(allow_env_override: bool) -> PathBuf {
+#[derive(Clone, Copy)]
+enum AppStatePathDomain {
+    Production,
+    LocalDev,
+}
+
+impl AppStatePathDomain {
+    fn dir_name(self) -> &'static str {
+        match self {
+            Self::Production => APP_STATE_PRODUCTION_DIR_NAME,
+            Self::LocalDev => APP_STATE_LOCAL_DEV_DIR_NAME,
+        }
+    }
+}
+
+fn app_store_path_with_options(allow_env_override: bool, domain: AppStatePathDomain) -> PathBuf {
     if allow_env_override {
         if let Some(path) = std::env::var_os("DISCRYPT_APP_STATE_PATH") {
             return PathBuf::from(path);
         }
     }
+    app_store_path_in_dir(domain.dir_name())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn production_app_store_path() -> PathBuf {
+    app_store_path_with_options(false, AppStatePathDomain::Production)
+}
+
+fn default_app_state_path_domain() -> AppStatePathDomain {
+    if cfg!(all(not(test), feature = "production-storage")) {
+        AppStatePathDomain::Production
+    } else if cfg!(any(test, feature = "harness", feature = "local-dev")) {
+        AppStatePathDomain::LocalDev
+    } else {
+        AppStatePathDomain::Production
+    }
+}
+
+fn app_store_path_in_dir(app_dir: &str) -> PathBuf {
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(data_home)
-            .join("discrypt")
+            .join(app_dir)
             .join(APP_STATE_STORE_FILENAME);
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
             .join(".local")
             .join("share")
-            .join("discrypt")
+            .join(app_dir)
             .join(APP_STATE_STORE_FILENAME);
     }
-    PathBuf::from(APP_STATE_STORE_FILENAME)
+    PathBuf::from(app_dir).join(APP_STATE_STORE_FILENAME)
 }
 
 fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
@@ -16110,6 +16153,29 @@ mod tests {
         let _ = fs::remove_file(&path);
         reset_app_state();
         path
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
     }
 
     fn attach_test_remote_voice(session_id: &str, participant_id: &str) -> AppStateView {
@@ -20861,11 +20927,58 @@ mod tests {
         let _guard = test_lock();
         let path = fresh_state_path("prod-env-ignored");
         std::env::set_var("DISCRYPT_APP_STATE_PATH", &path);
-        let production_path = app_store_path_with_env_override(false);
+        let production_path = production_app_store_path();
         assert_ne!(production_path, path);
         assert_eq!(
             production_path.file_name().and_then(|value| value.to_str()),
             Some(APP_STATE_STORE_FILENAME)
+        );
+    }
+
+    #[test]
+    fn dev_app_store_path_uses_local_dev_domain_by_default() {
+        let _guard = test_lock();
+        let _env_guard = EnvVarGuard::remove("DISCRYPT_APP_STATE_PATH");
+        let dev_path = app_store_path();
+        assert_eq!(
+            dev_path.parent().and_then(|value| value.file_name()),
+            Some(std::ffi::OsStr::new(APP_STATE_LOCAL_DEV_DIR_NAME)),
+            "implicit test/harness/local-dev app state must not share the production host directory"
+        );
+        assert_ne!(
+            dev_path,
+            production_app_store_path(),
+            "implicit local-dev path and package production path must stay separated"
+        );
+    }
+
+    #[test]
+    fn explicit_env_override_can_select_profile_path_in_local_dev() {
+        let _guard = test_lock();
+        let explicit_path = fresh_state_path("explicit-dev-profile");
+        let _override_guard = TestAppStatePathOverrideGuard::activate(&explicit_path);
+        assert_eq!(app_store_path(), explicit_path);
+        assert_eq!(
+            app_openmls_store_path(),
+            openmls_store_path_for_app_state_path(&explicit_path),
+            "OpenMLS sidecar storage must follow the explicitly selected app-state profile"
+        );
+    }
+
+    #[test]
+    fn production_app_store_path_stays_on_host_profile_domain() {
+        let _guard = test_lock();
+        let explicit_path = fresh_state_path("production-host-profile");
+        let _override_guard = TestAppStatePathOverrideGuard::activate(&explicit_path);
+        let production_path = production_app_store_path();
+        assert_ne!(
+            production_path, explicit_path,
+            "package/production path helper must not honor local-dev profile overrides"
+        );
+        assert_eq!(
+            production_path.parent().and_then(|value| value.file_name()),
+            Some(std::ffi::OsStr::new(APP_STATE_PRODUCTION_DIR_NAME)),
+            "package/production builds keep using the host production profile directory"
         );
     }
 
@@ -24302,7 +24415,7 @@ mod tests {
         let _guard = test_lock();
         let path = fresh_state_path("production-adapter-env");
         std::env::set_var("DISCRYPT_APP_STATE_PATH", &path);
-        let production_path = app_store_path_with_env_override(false);
+        let production_path = production_app_store_path();
         assert_ne!(production_path, path);
         assert!(production_path.ends_with(APP_STATE_STORE_FILENAME));
         assert!(!env_app_state_override_allowed() || cfg!(test));
