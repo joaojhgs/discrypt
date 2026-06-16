@@ -3400,7 +3400,10 @@ function FirstRunPanel({
               </p>
             ) : null}
             {storageSetupRequired ? (
-              <section className="grid gap-4 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-4">
+              <section
+                data-testid="first-run-storage"
+                className="grid gap-4 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-4"
+              >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-semibold">
@@ -3422,12 +3425,18 @@ function FirstRunPanel({
                       : "keyring needs attention"}
                   </Badge>
                 </div>
-                <div className="grid gap-4 md:grid-cols-2">
+                <fieldset className="grid gap-3">
+                  <legend className="sr-only">Storage mode</legend>
+                  <div
+                    data-testid="first-run-storage-mode-options"
+                    className="grid gap-3 lg:grid-cols-2"
+                  >
                   <Button
                     type="button"
                     variant="outline"
+                    aria-pressed={selectedStorageMode === "keyring"}
                     className={cn(
-                      "h-auto min-h-36 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
+                      "h-auto min-h-40 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
                       selectedStorageMode === "keyring"
                         ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
                         : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
@@ -3473,10 +3482,55 @@ function FirstRunPanel({
                       No recovery exists yet for a lost storage password.
                     </p>
                   </Button>
-                </div>
+                  </div>
+                </fieldset>
+                {vaultSelected ? (
+                  <div className="grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)] p-4 md:grid-cols-2">
+                    <div className="md:col-span-2">
+                      <h3 className="text-base font-semibold">
+                        Password vault credentials
+                      </h3>
+                      <p className="mt-1 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                        These credentials protect local storage for this device.
+                        They are checked when you submit either account form.
+                      </p>
+                    </div>
+                    <Label className="grid gap-2">
+                      Storage password
+                      <PasswordInput
+                        value={storagePassword}
+                        autoComplete="new-password"
+                        placeholder="At least 12 characters"
+                        onChange={setStoragePassword}
+                      />
+                    </Label>
+                    <Label className="grid gap-2">
+                      Confirm storage password
+                      <PasswordInput
+                        value={storagePasswordConfirm}
+                        autoComplete="new-password"
+                        placeholder="Repeat storage password"
+                        onChange={setStoragePasswordConfirm}
+                      />
+                    </Label>
+                    <p
+                      className={cn(
+                        "text-sm md:col-span-2",
+                        passwordLongEnough && passwordsMatch
+                          ? "text-emerald-200"
+                          : "text-amber-100",
+                      )}
+                    >
+                      {passwordMessage}
+                    </p>
+                  </div>
+                ) : null}
               </section>
             ) : null}
-            <section className="grid gap-4 md:grid-cols-2">
+            <section
+              data-testid="first-run-account-forms"
+              className="grid gap-4 lg:grid-cols-2"
+            >
               <div className="flex min-h-72 flex-col rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.38)] p-4">
                 <div className="mb-4">
                   <h2 className="text-lg font-semibold">New local user</h2>
@@ -3500,38 +3554,6 @@ function FirstRunPanel({
                     onChange={(event) => setDeviceName(event.target.value)}
                   />
                 </Label>
-                {vaultSelected ? (
-                  <div className="mt-4 grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
-                    <Label className="grid gap-2">
-                      Storage password
-                      <PasswordInput
-                        value={storagePassword}
-                        autoComplete="new-password"
-                        placeholder="At least 12 characters"
-                        onChange={setStoragePassword}
-                      />
-                    </Label>
-                    <Label className="grid gap-2">
-                      Confirm storage password
-                      <PasswordInput
-                        value={storagePasswordConfirm}
-                        autoComplete="new-password"
-                        placeholder="Repeat storage password"
-                        onChange={setStoragePasswordConfirm}
-                      />
-                    </Label>
-                    <p
-                      className={cn(
-                        "text-sm",
-                        passwordLongEnough && passwordsMatch
-                          ? "text-emerald-200"
-                          : "text-amber-100",
-                      )}
-                    >
-                      {passwordMessage}
-                    </p>
-                  </div>
-                ) : null}
                 <Button
                   className="mt-auto w-full"
                   onClick={onCreate}
@@ -3567,38 +3589,6 @@ function FirstRunPanel({
                     onChange={(event) => setDeviceName(event.target.value)}
                   />
                 </Label>
-                {vaultSelected ? (
-                  <div className="mt-4 grid gap-3 rounded-2xl border border-[hsl(var(--border))] bg-black/10 p-3">
-                    <Label className="grid gap-2">
-                      Storage password
-                      <PasswordInput
-                        value={storagePassword}
-                        autoComplete="new-password"
-                        placeholder="At least 12 characters"
-                        onChange={setStoragePassword}
-                      />
-                    </Label>
-                    <Label className="grid gap-2">
-                      Confirm storage password
-                      <PasswordInput
-                        value={storagePasswordConfirm}
-                        autoComplete="new-password"
-                        placeholder="Repeat storage password"
-                        onChange={setStoragePasswordConfirm}
-                      />
-                    </Label>
-                    <p
-                      className={cn(
-                        "text-sm",
-                        passwordLongEnough && passwordsMatch
-                          ? "text-emerald-200"
-                          : "text-amber-100",
-                      )}
-                    >
-                      {passwordMessage}
-                    </p>
-                  </div>
-                ) : null}
                 <Label className="mt-4 grid gap-2">
                   Recovery phrase/code
                   <Input
