@@ -1178,6 +1178,7 @@ type TauriListen = <T>(
 const LOCAL_DEV_FALLBACK_ENABLED =
   import.meta.env.DEV ||
   import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
+const FIRST_RUN_STORAGE_E2E_KEY = "discrypt:e2e:first-run-storage-setup";
 const FALLBACK_STORAGE_KEY = "discrypt.local-dev.app-state.v1";
 
 const fallbackFriendIdentity = createFallbackFriendIdentity("New contact");
@@ -1526,6 +1527,25 @@ function hydrateFallbackState(): void {
   Object.assign(fallbackState, stored);
   ensureGroupGovernanceDefaults(fallbackState);
   syncSnapshot(fallbackState);
+}
+
+function applyFirstRunStorageE2eState(state: AppState): void {
+  if (typeof window === "undefined") return;
+  if (window.localStorage.getItem(FIRST_RUN_STORAGE_E2E_KEY) !== "1") return;
+  if (state.lifecycle !== "first_run") return;
+  state.storage_security = {
+    status: "unconfigured",
+    mode: "unconfigured",
+    title: "Choose local storage protection",
+    detail:
+      "Select the OS keyring or a Discrypt password vault before account setup.",
+    recovery_hint:
+      "Existing unreadable storage is preserved; setup must configure storage before creating identity state.",
+    password_required: false,
+    keyring_available: true,
+    keyring_detail:
+      "Local-dev E2E storage setup hook; packaged builds report real keyring preflight.",
+  };
 }
 
 function persistFallbackState(): void {
@@ -3202,6 +3222,7 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
 export async function loadAppState(): Promise<AppState> {
   return invokeOrFallback<AppState>("app_state", undefined, () => {
     hydrateFallbackState();
+    applyFirstRunStorageE2eState(fallbackState);
     return cloneState(syncSnapshot(fallbackState));
   });
 }
