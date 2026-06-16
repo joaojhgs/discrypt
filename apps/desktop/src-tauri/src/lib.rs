@@ -13059,10 +13059,7 @@ impl AppStatePathDomain {
     }
 }
 
-fn app_store_path_with_options(
-    allow_env_override: bool,
-    domain: AppStatePathDomain,
-) -> PathBuf {
+fn app_store_path_with_options(allow_env_override: bool, domain: AppStatePathDomain) -> PathBuf {
     if allow_env_override {
         if let Some(path) = std::env::var_os("DISCRYPT_APP_STATE_PATH") {
             return PathBuf::from(path);

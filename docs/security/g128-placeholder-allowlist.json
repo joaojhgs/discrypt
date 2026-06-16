@@ -75,6 +75,12 @@
     {
       "path": "apps/desktop/src-tauri/src/lib.rs",
       "pattern": "local-dev",
+      "expected": "const APP_STATE_LOCAL_DEV_DIR_NAME: &str = \"discrypt-local-dev\";",
+      "reason": "P1-T04 intentionally names the separate dev app-state directory so cargo tauri dev cannot collide with production host storage."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
       "expected": "\"local-dev / harness mode\".to_owned()",
       "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
     },
@@ -105,14 +111,38 @@
     {
       "path": "apps/desktop/src-tauri/src/lib.rs",
       "pattern": "local-dev",
-      "expected": "cfg!(any(test, feature = \"harness\", feature = \"local-dev\"))",
-      "reason": "Crate-level production-status documentation names the disabled local-dev feature flag; it is not executable production fallback logic."
+      "expected": "all(feature = \"local-dev\", not(feature = \"production-storage\"))",
+      "reason": "P1-T04 guards local-dev DISCRYPT_APP_STATE_PATH overrides so production-storage builds cannot use dev profile isolation."
     },
     {
       "path": "apps/desktop/src-tauri/src/lib.rs",
       "pattern": "local-dev",
       "expected": "cfg!(any(test, feature = \"harness\", feature = \"local-dev\"))",
-      "reason": "Desktop has two audited local-dev feature gates: one for app-state env override and one for explicit text runtime attachment; both are disabled in production builds."
+      "reason": "Desktop keeps explicit text runtime attachment behind test/harness/local-dev gates; production builds keep this development path disabled."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "} else if cfg!(any(test, feature = \"harness\", feature = \"local-dev\")) {",
+      "reason": "P1-T04 uses the local-dev domain only for test/harness/local-dev defaults; production-storage is handled by the preceding production branch."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "\"implicit test/harness/local-dev app state must not share the production host directory\"",
+      "reason": "P1-T04 regression coverage asserts implicit local-dev app state stays separate from the production host directory."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "\"implicit local-dev path and package production path must stay separated\"",
+      "reason": "P1-T04 regression coverage asserts local-dev and package production paths do not resolve to the same app-state file."
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "pattern": "local-dev",
+      "expected": "\"package/production path helper must not honor local-dev profile overrides\"",
+      "reason": "P1-T04 regression coverage asserts the production path helper ignores local-dev DISCRYPT_APP_STATE_PATH overrides."
     },
     {
       "path": "apps/desktop/src-tauri/src/production_status.rs",
