@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T19:25:33.093Z",
+  "updatedAt": "2026-06-16T19:58:35.727Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -268,7 +268,19 @@
       "evidence": "PER-12 recovery roadmap stubs now document preserve-dont-overwrite behavior, UI/command copy avoids fake restore claims, the P1-T06 static gate passed via direct node and npm wrapper commands, typecheck/build passed, and generated OMX cache state was removed/ignored before commit.",
       "startedAt": "2026-06-16T19:10:09.494Z",
       "completedAt": "2026-06-16T19:25:33.093Z"
+    },
+    {
+      "id": "G024-p2-t01-canonical-invite-descriptor-s",
+      "title": "P2-T01 canonical invite descriptor schema v1",
+      "objective": "Implement PER-13/P2-T01 canonical signed invite descriptor schema v1, update Rust/Tauri/TS DTOs as needed, add tamper tests for group id, endpoint, adapter, ICE, expiry, max-use, password policy, revocation, and admission snapshot, then record verification evidence.",
+      "status": "in_progress",
+      "attempt": 1,
+      "createdAt": "2026-06-16T19:58:16.293Z",
+      "updatedAt": "2026-06-16T19:58:35.727Z",
+      "evidence": ".omx/plans/P2-T01-invite-schema-v1-2026-06-16.md created from PER-13 issue metadata and Phase 2 acceptance criteria.",
+      "startedAt": "2026-06-16T19:58:35.727Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
+  "activeGoalId": "G024-p2-t01-canonical-invite-descriptor-s"
 }

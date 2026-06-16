@@ -1,9 +1,10 @@
 use chrono::{Duration, Utc};
 use discrypt_admission::{
     signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
-    InviteBootstrapMetadata, InviteEndpointPolicy, InviteError, InviteKind,
-    InviteSignalingAdapterKind, InviteSignalingMetadata, InviteSignalingProfile, InviteStore,
-    InviteTrustMetadata, INVITE_CONNECTIVITY_SCHEMA_VERSION,
+    InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy, InviteError,
+    InviteKind, InvitePasswordPolicy, InviteRevocationPolicy, InviteSignalingAdapterKind,
+    InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
+    INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_DESCRIPTOR_SCHEMA_VERSION,
 };
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
@@ -269,6 +270,36 @@ fn test_bootstrap_profile(scope: &str) -> InviteSignalingProfile {
     }
 }
 
+fn canonical_group_bootstrap(scope: &str) -> Result<InviteBootstrapMetadata, InviteError> {
+    InviteBootstrapMetadata::group_join(
+        scope.to_owned(),
+        vec![test_bootstrap_profile(scope)],
+        GroupInviteBootstrap {
+            group_identity_commitment: scope.to_owned(),
+            role_admission_policy_commitment: test_commitment('b'),
+            channel_policy_commitment: test_commitment('c'),
+        },
+    )
+}
+
+fn canonical_admission_snapshot(scope: &str) -> Result<InviteAdmissionSnapshot, InviteError> {
+    InviteAdmissionSnapshot::new(
+        scope.to_owned(),
+        test_commitment('9'),
+        "manual_approval",
+        7,
+        test_commitment('b'),
+    )
+}
+
+fn canonical_revocation_policy() -> Result<InviteRevocationPolicy, InviteError> {
+    InviteRevocationPolicy::new(test_commitment('8'))
+}
+
+fn canonical_password_policy() -> Result<InvitePasswordPolicy, InviteError> {
+    InvitePasswordPolicy::online_helper("helper-main", test_commitment('7'))
+}
+
 #[test]
 fn signed_invite_descriptor_covers_group_and_dm_bootstrap_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -358,5 +389,144 @@ fn signed_invite_descriptor_covers_group_and_dm_bootstrap_metadata(
     let serialized_dm = serde_json::to_string(&dm_invite)?;
     assert!(serialized_dm.contains("dm_contact"));
     assert!(!serialized_dm.contains("hidden-token"));
+    Ok(())
+}
+
+#[test]
+fn canonical_group_invite_descriptor_v1_signs_all_release_policy_axes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use discrypt_transport::{Endpoint, IceEndpointPolicy};
+
+    let issuer = SigningKey::generate(&mut OsRng);
+    let now = Utc::now();
+    let endpoint = "https://signal.example.invalid/v1/rendezvous";
+    let signaling_metadata = InviteSignalingMetadata::new(
+        endpoint,
+        InviteEndpointPolicy::ProductionTls,
+        trust_for(endpoint)?,
+    )?
+    .with_ice_endpoint_policy(IceEndpointPolicy::new(
+        vec![Endpoint::new("stun:invite.example.invalid:3478")],
+        vec![],
+    )?)?;
+    let scope = test_commitment('a');
+    let mut store = InviteStore::new();
+    let invite = store.issue_canonical_group_invite_v1(
+        b"canonical-room-secret:not-in-descriptor",
+        now + Duration::minutes(10),
+        4,
+        signaling_metadata,
+        canonical_group_bootstrap(&scope)?,
+        canonical_admission_snapshot(&scope)?,
+        canonical_revocation_policy()?,
+        Some(canonical_password_policy()?),
+        &issuer,
+    )?;
+
+    assert_eq!(invite.descriptor_schema_version, INVITE_DESCRIPTOR_SCHEMA_VERSION);
+    assert!(invite.verify_issuer_signature().is_ok());
+    assert!(invite.admission_snapshot.is_some());
+    assert_eq!(invite.revocation_policy.max_use_enforced, true);
+    assert_eq!(
+        invite.password_policy.as_ref().map(|policy| policy.offline_verifier_allowed),
+        Some(false)
+    );
+
+    let serialized = serde_json::to_string(&invite)?;
+    assert!(serialized.contains("descriptor_schema_version"));
+    assert!(serialized.contains("admission_snapshot"));
+    assert!(serialized.contains("revocation_policy"));
+    assert!(serialized.contains("password_policy"));
+    assert!(!serialized.contains("canonical-room-secret"));
+    assert!(!serialized.contains("offline_verifier"));
+    assert!(!serialized.contains("password_secret"));
+
+    macro_rules! assert_tampered_signature {
+        ($name:ident, $mutation:expr) => {{
+            let mut $name = invite.clone();
+            $mutation;
+            assert_eq!(
+                $name.verify_issuer_signature(),
+                Err(InviteError::InvalidIssuerSignature),
+                "tamper should invalidate signature"
+            );
+        }};
+    }
+
+    assert_tampered_signature!(tampered_group_id, {
+        tampered_group_id
+            .admission_snapshot
+            .as_mut()
+            .expect("admission snapshot")
+            .group_id_commitment = test_commitment('1');
+    });
+    assert_tampered_signature!(tampered_group_commitment, {
+        tampered_group_commitment
+            .admission_snapshot
+            .as_mut()
+            .expect("admission snapshot")
+            .group_commitment = test_commitment('2');
+    });
+    assert_tampered_signature!(tampered_endpoint, {
+        tampered_endpoint.signaling_metadata.signaling_endpoint =
+            "https://changed.example.invalid/v1/rendezvous".to_owned();
+    });
+    assert_tampered_signature!(tampered_adapter, {
+        tampered_adapter
+            .bootstrap_metadata
+            .as_mut()
+            .expect("bootstrap metadata")
+            .signaling_profiles[0]
+            .adapter_kind = InviteSignalingAdapterKind::Nostr;
+    });
+    assert_tampered_signature!(tampered_allowlist, {
+        tampered_allowlist
+            .bootstrap_metadata
+            .as_mut()
+            .expect("bootstrap metadata")
+            .signaling_profiles[0]
+            .endpoint_allowlist_commitments[0] = test_commitment('3');
+    });
+    assert_tampered_signature!(tampered_ice, {
+        tampered_ice
+            .signaling_metadata
+            .ice_endpoint_policy
+            .stun_servers[0] = Endpoint::new("stun:changed.example.invalid:3478");
+    });
+    assert_tampered_signature!(tampered_expiry, {
+        tampered_expiry.expires_at = now + Duration::hours(24);
+    });
+    assert_tampered_signature!(tampered_max_use, {
+        tampered_max_use.max_uses = 99;
+    });
+    assert_tampered_signature!(tampered_revocation, {
+        tampered_revocation.revocation_policy.revocation_authority_commitment =
+            test_commitment('4');
+    });
+    assert_tampered_signature!(tampered_admission_mode, {
+        tampered_admission_mode
+            .admission_snapshot
+            .as_mut()
+            .expect("admission snapshot")
+            .admission_mode = "automatic_when_authorized_online".to_owned();
+    });
+    assert_tampered_signature!(tampered_password_policy, {
+        tampered_password_policy
+            .password_policy
+            .as_mut()
+            .expect("password policy")
+            .helper_id = Some("other-helper".to_owned());
+    });
+
+    let mut offline_verifier = invite.clone();
+    offline_verifier
+        .password_policy
+        .as_mut()
+        .expect("password policy")
+        .offline_verifier_allowed = true;
+    assert_eq!(
+        offline_verifier.verify_issuer_signature(),
+        Err(InviteError::OfflineVerifierRejected)
+    );
     Ok(())
 }

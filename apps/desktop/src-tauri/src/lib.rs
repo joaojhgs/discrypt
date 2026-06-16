@@ -15,7 +15,8 @@ use chrono::{DateTime, Duration, Utc};
 use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
     signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
-    InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind, InviteSignalingAdapterKind,
+    InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind,
+    InvitePasswordPolicy, InviteRevocationPolicy, InviteSignalingAdapterKind,
     InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
     INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_PROVIDER_POLICY_VERSION,
 };
@@ -5573,25 +5574,109 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .endpoint_policy
             .canonical_name()
             .to_owned();
+        let admission_mode = group
+            .and_then(|group| group.role_policy.as_ref())
+            .map(|policy| policy.admission_mode.clone())
+            .unwrap_or_else(|| "manual_approval".to_owned());
+        let policy_epoch = group
+            .and_then(|group| group.role_policy.as_ref())
+            .map(|policy| policy.policy_epoch)
+            .unwrap_or(1);
+        let group_id_commitment =
+            hash_commitment("discrypt-signed-invite-group-id-v1", &[&group_id]);
+        let group_commitment =
+            hash_commitment("discrypt-signed-invite-openmls-group-v1", &[&group_id]);
+        let role_admission_policy_commitment = connectivity
+            .group_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.role_admission_policy_commitment.clone())
+            .unwrap_or_else(|| {
+                hash_commitment("discrypt-group-admission-policy-commitment-v1", &[&group_id])
+            });
+        let issuer_user_id = state.local_user_id();
+        let admission_snapshot = match InviteAdmissionSnapshot::new(
+            group_id_commitment,
+            group_commitment,
+            admission_mode,
+            policy_epoch,
+            role_admission_policy_commitment,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_admission_snapshot_invalid",
+                    error.to_string(),
+                    "Refresh group admission policy before issuing another invite",
+                );
+                return;
+            }
+        };
+        let revocation_policy = match InviteRevocationPolicy::new(hash_commitment(
+            "discrypt-invite-revocation-authority-v1",
+            &[&group_id, &issuer_user_id],
+        )) {
+            Ok(policy) => policy,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_revocation_policy_invalid",
+                    error.to_string(),
+                    "Refresh group governance policy before issuing another invite",
+                );
+                return;
+            }
+        };
+        let password_policy = if password_gate_requested {
+            match InvitePasswordPolicy::online_helper(
+                format!("admission-helper-{group_id}"),
+                hash_commitment(
+                    "discrypt-invite-password-rate-limit-policy-v1",
+                    &[&group_id, &issuer_user_id],
+                ),
+            ) {
+                Ok(policy) => Some(policy),
+                Err(error) => {
+                    state.push_command_error(
+                        "invite.rejected",
+                        "create_invite",
+                        "invite_password_policy_invalid",
+                        error.to_string(),
+                        "Use online-helper or PAKE password admission; offline verifiers are not allowed",
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut invite_store = InviteStore::new();
         let issuer = SigningKey::generate(&mut OsRng);
-        let descriptor = invite_store
-            .issue_invite_with_bootstrap_metadata(
-                room_secret.as_bytes(),
-                descriptor_expires_at,
-                max_uses,
-                signaling_metadata.clone(),
-                bootstrap_metadata,
-                &issuer,
-            )
-            .unwrap_or_else(|_| {
-                invite_store.issue_invite(
-                    room_secret.as_bytes(),
-                    descriptor_expires_at,
-                    max_uses,
-                    &issuer,
-                )
-            });
+        let descriptor = match invite_store.issue_canonical_group_invite_v1(
+            room_secret.as_bytes(),
+            descriptor_expires_at,
+            max_uses,
+            signaling_metadata.clone(),
+            bootstrap_metadata,
+            admission_snapshot,
+            revocation_policy,
+            password_policy,
+            &issuer,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_descriptor_invalid",
+                    error.to_string(),
+                    "Regenerate the invite after refreshing signed group admission and connectivity policy",
+                );
+                return;
+            }
+        };
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
         let invite_code = match production_invite_link(
             &descriptor,
