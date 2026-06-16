@@ -47,6 +47,39 @@ jobs:
           } >> "$GITHUB_ENV"
       - run: cargo check --workspace --target aarch64-linux-android
 
+  production-storage:
+    name: production-storage keyring preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Linux Secret Service build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 gnome-keyring libdbus-1-dev pkg-config
+      - name: Test production-storage preflight regressions
+        run: |
+          cargo test -p discrypt-storage --features production-storage keychain_preflight -- --nocapture
+          cargo test -p discrypt-storage --features production-storage invalid_os_keychain_wrapping_key_length_is_rejected -- --nocapture
+          cargo test -p discrypt-storage --features production-storage existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite -- --nocapture
+      - name: Install release-baseline Rust 1.89.0 toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --no-self-update
+      - name: Test production-storage release-baseline gates
+        run: |
+          RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features production-storage production_passphrase_vault_app_db_survives_fresh_instance_with_same_password -- --nocapture
+          RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features production-storage existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite -- --nocapture
+      - name: Live GNOME Secret Service save-load-delete preflight
+        env:
+          DISCRYPT_LINUX_SECRET_SERVICE_E2E: "1"
+        run: |
+          dbus-run-session -- bash -euxo pipefail -c '
+            export XDG_RUNTIME_DIR="${RUNNER_TEMP}/discrypt-keyring-runtime"
+            mkdir -p "${XDG_RUNTIME_DIR}"
+            chmod 700 "${XDG_RUNTIME_DIR}"
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            cargo test -p discrypt-storage linux_secret_service_keychain_live_roundtrip_when_enabled --features production-storage -- --nocapture
+          '
+
   supply-chain:
     name: supply-chain
     runs-on: ubuntu-latest

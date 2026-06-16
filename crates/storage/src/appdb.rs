@@ -125,6 +125,44 @@ pub trait AppDbKeychain: Clone + Send + Sync + 'static {
     fn delete_wrapping_key(&mut self, key_id: &str) -> Result<(), AppStoreError>;
 }
 
+/// Prove that a keychain can persist and reload a Discrypt app DB wrapping key.
+///
+/// Production setup uses this before claiming OS-keyring storage is usable. The
+/// check is intentionally stronger than service discovery: it writes a 32-byte
+/// probe key, reloads and byte-compares it, deletes it, then verifies the probe
+/// key is gone.
+pub fn preflight_app_db_keychain<K: AppDbKeychain>(
+    keychain: &mut K,
+    key_id: &str,
+    test_key: [u8; 32],
+) -> Result<(), AppStoreError> {
+    keychain.store_wrapping_key(key_id, test_key)?;
+    match keychain.load_wrapping_key(key_id) {
+        Err(error) => {
+            let _ = keychain.delete_wrapping_key(key_id);
+            return Err(error);
+        }
+        Ok(Some(loaded)) if loaded == test_key => {}
+        Ok(Some(_)) => {
+            let _ = keychain.delete_wrapping_key(key_id);
+            return Err(AppStoreError::Crypto(
+                "OS keyring preflight returned a different wrapping key",
+            ));
+        }
+        Ok(None) => {
+            let _ = keychain.delete_wrapping_key(key_id);
+            return Err(AppStoreError::KeychainMissing(key_id.to_owned()));
+        }
+    }
+    keychain.delete_wrapping_key(key_id)?;
+    match keychain.load_wrapping_key(key_id)? {
+        None => Ok(()),
+        Some(_) => Err(AppStoreError::Crypto(
+            "OS keyring preflight probe key remained after delete",
+        )),
+    }
+}
+
 /// Local deterministic keychains are excluded from production-storage-only builds.
 #[cfg(any(
     test,
@@ -1840,6 +1878,113 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct PreflightTestKeychain {
+        state: Arc<Mutex<PreflightTestKeychainState>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PreflightTestKeychainState {
+        stored: Option<[u8; 32]>,
+        load_override: Option<Option<[u8; 32]>>,
+        load_errors: bool,
+        delete_removes_key: bool,
+    }
+
+    impl PreflightTestKeychain {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PreflightTestKeychainState {
+                    stored: None,
+                    load_override: None,
+                    load_errors: false,
+                    delete_removes_key: true,
+                })),
+            }
+        }
+
+        fn with_load_override(load_override: Option<[u8; 32]>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PreflightTestKeychainState {
+                    stored: None,
+                    load_override: Some(load_override),
+                    load_errors: false,
+                    delete_removes_key: true,
+                })),
+            }
+        }
+
+        fn with_load_error() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PreflightTestKeychainState {
+                    stored: None,
+                    load_override: None,
+                    load_errors: true,
+                    delete_removes_key: true,
+                })),
+            }
+        }
+
+        fn with_delete_failure() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(PreflightTestKeychainState {
+                    stored: None,
+                    load_override: None,
+                    load_errors: false,
+                    delete_removes_key: false,
+                })),
+            }
+        }
+
+        fn stored_key(&self) -> Result<Option<[u8; 32]>, AppStoreError> {
+            self.state
+                .lock()
+                .map_err(|_| AppStoreError::LockPoisoned)
+                .map(|state| state.stored)
+        }
+    }
+
+    impl Default for PreflightTestKeychain {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl AppDbKeychain for PreflightTestKeychain {
+        fn load_wrapping_key(&mut self, _key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
+            self.state
+                .lock()
+                .map_err(|_| AppStoreError::LockPoisoned)
+                .and_then(|state| {
+                    if state.load_errors {
+                        Err(AppStoreError::Keychain("reload failed".to_owned()))
+                    } else {
+                        Ok(state.load_override.unwrap_or(state.stored))
+                    }
+                })
+        }
+
+        fn store_wrapping_key(
+            &mut self,
+            _key_id: &str,
+            key: [u8; 32],
+        ) -> Result<(), AppStoreError> {
+            self.state
+                .lock()
+                .map_err(|_| AppStoreError::LockPoisoned)?
+                .stored = Some(key);
+            Ok(())
+        }
+
+        fn delete_wrapping_key(&mut self, _key_id: &str) -> Result<(), AppStoreError> {
+            let mut state = self.state.lock().map_err(|_| AppStoreError::LockPoisoned)?;
+            if state.delete_removes_key {
+                state.stored = None;
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn encrypted_app_db_round_trips_without_plaintext_in_db_or_wal() -> Result<(), AppStoreError> {
         let path = temp_db_path("roundtrip");
@@ -1957,6 +2102,75 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn keychain_preflight_round_trips_and_removes_probe_key() -> Result<(), AppStoreError> {
+        let keychain = PreflightTestKeychain::new();
+        let mut probe = keychain.clone();
+
+        preflight_app_db_keychain(&mut probe, "probe-key", [0x42; 32])?;
+
+        assert_eq!(keychain.stored_key()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_preflight_rejects_wrong_wrapping_key_and_cleans_probe() -> Result<(), AppStoreError>
+    {
+        let keychain = PreflightTestKeychain::with_load_override(Some([0x24; 32]));
+        let mut probe = keychain.clone();
+
+        assert!(matches!(
+            preflight_app_db_keychain(&mut probe, "probe-key", [0x42; 32]),
+            Err(AppStoreError::Crypto(
+                "OS keyring preflight returned a different wrapping key"
+            ))
+        ));
+        assert_eq!(keychain.stored_key()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_preflight_rejects_missing_loaded_key_and_cleans_probe() -> Result<(), AppStoreError>
+    {
+        let keychain = PreflightTestKeychain::with_load_override(None);
+        let mut probe = keychain.clone();
+
+        assert!(matches!(
+            preflight_app_db_keychain(&mut probe, "probe-key", [0x42; 32]),
+            Err(AppStoreError::KeychainMissing(ref key_id)) if key_id == "probe-key"
+        ));
+        assert_eq!(keychain.stored_key()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_preflight_cleans_probe_when_reload_errors() -> Result<(), AppStoreError> {
+        let keychain = PreflightTestKeychain::with_load_error();
+        let mut probe = keychain.clone();
+
+        assert!(matches!(
+            preflight_app_db_keychain(&mut probe, "probe-key", [0x42; 32]),
+            Err(AppStoreError::Keychain(ref error)) if error == "reload failed"
+        ));
+        assert_eq!(keychain.stored_key()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_preflight_rejects_probe_key_that_survives_delete() -> Result<(), AppStoreError> {
+        let keychain = PreflightTestKeychain::with_delete_failure();
+        let mut probe = keychain.clone();
+
+        assert!(matches!(
+            preflight_app_db_keychain(&mut probe, "probe-key", [0x42; 32]),
+            Err(AppStoreError::Crypto(
+                "OS keyring preflight probe key remained after delete"
+            ))
+        ));
+        assert_eq!(keychain.stored_key()?, Some([0x42; 32]));
+        Ok(())
+    }
+
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
     #[test]
     fn production_storage_exposes_linux_os_keychain_boundary() {
@@ -1966,6 +2180,18 @@ mod tests {
         assert_eq!(keychain.target(), "default");
         assert_eq!(keychain.legacy_target(), "discrypt");
         assert_keychain(keychain);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "production-storage"))]
+    #[test]
+    fn invalid_os_keychain_wrapping_key_length_is_rejected() {
+        let error = secret_to_wrapping_key(vec![0x11; 31])
+            .expect_err("short keyring material must fail closed");
+
+        assert!(matches!(
+            error,
+            AppStoreError::Crypto("invalid OS keychain wrapping key length")
+        ));
     }
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -2194,9 +2420,7 @@ mod tests {
         let mut keychain = LinuxOsKeychain::new(service);
 
         let _ = keychain.delete_wrapping_key(key_id);
-        keychain.store_wrapping_key(key_id, key)?;
-        assert_eq!(keychain.load_wrapping_key(key_id)?, Some(key));
-        keychain.delete_wrapping_key(key_id)?;
+        preflight_app_db_keychain(&mut keychain, key_id, key)?;
         assert_eq!(keychain.load_wrapping_key(key_id)?, None);
         Ok(())
     }

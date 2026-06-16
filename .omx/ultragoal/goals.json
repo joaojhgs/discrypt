@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T07:14:34.202Z",
+  "updatedAt": "2026-06-16T13:01:51.509Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -122,15 +122,13 @@
       "id": "G011-run-targeted-storage-tests-and-packa",
       "title": "Run targeted storage tests and package-smoke dry-run/checks; run real...",
       "objective": "Run targeted storage tests and package-smoke dry-run/checks; run real `.deb` smoke if release bundles and container runtime are available.",
-      "status": "failed",
-      "attempt": 0,
+      "status": "complete",
+      "attempt": 1,
       "createdAt": "2026-06-16T02:41:31.847Z",
-      "updatedAt": "2026-06-16T02:49:00.570Z",
-      "failedAt": "2026-06-16T02:49:00.570Z",
-      "failureReason": "Package-smoke dry-run and git diff --check passed. Rust tests and real .deb smoke could not run: cargo/rustup are missing, Docker socket access is denied, and no target/release/bundle artifacts exist.",
-      "blockerSignature": "EXTERNAL_AUTHORIZATION_REQUIRED",
-      "blockerOccurrenceCount": 1,
-      "requiredExternalDecision": "provide the missing external authorization/credential, or explicitly choose a different unblock path"
+      "updatedAt": "2026-06-16T11:53:05.637Z",
+      "startedAt": "2026-06-16T11:37:22.548Z",
+      "completedAt": "2026-06-16T11:53:05.637Z",
+      "evidence": "PR #8 head c0e4a2a added pull_request CI job 'production-storage keyring preflight'. GitHub Actions runs 27615105778 and 27615108355 passed targeted production-storage keychain_preflight, invalid_os_keychain_wrapping_key_length_is_rejected, existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite, and live GNOME Secret Service save-load-delete preflight. Local node scripts/check-linux-package-smoke.mjs passed; local cargo remains unavailable; real .deb smoke was not available because no target/release/bundle/deb artifact exists and docker daemon access is denied."
     },
     {
       "id": "G012-missing-vault-keyring-entry-with-exi",
@@ -180,23 +178,25 @@
       "id": "G016-rustup-toolchain-1-89-0-cargo-test-p",
       "title": "`RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features pr...",
       "objective": "`RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features production-storage production_passphrase_vault_app_db_survives_fresh_instance_with_same_password -- --nocapture`",
-      "status": "failed",
-      "attempt": 0,
+      "status": "complete",
+      "attempt": 1,
       "createdAt": "2026-06-16T02:41:31.847Z",
-      "updatedAt": "2026-06-16T02:49:02.043Z",
-      "failedAt": "2026-06-16T02:49:02.043Z",
-      "failureReason": "Not run: cargo and rustup are not installed in this runtime, so the focused production-storage same-password test could not execute locally."
+      "updatedAt": "2026-06-16T12:02:25.770Z",
+      "startedAt": "2026-06-16T11:53:21.695Z",
+      "completedAt": "2026-06-16T12:02:25.770Z",
+      "evidence": "PR #8 head 053b86e production-storage keyring preflight job passed on runs 27615629994 and 27615632987. The job now installs Rust 1.89.0 and runs exact gate: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features production-storage production_passphrase_vault_app_db_survives_fresh_instance_with_same_password -- --nocapture."
     },
     {
       "id": "G017-rustup-toolchain-1-89-0-cargo-test-p",
       "title": "`RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features pr...",
       "objective": "`RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features production-storage existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite -- --nocapture`",
-      "status": "failed",
-      "attempt": 0,
+      "status": "complete",
+      "attempt": 1,
       "createdAt": "2026-06-16T02:41:31.847Z",
-      "updatedAt": "2026-06-16T02:49:02.344Z",
-      "failedAt": "2026-06-16T02:49:02.344Z",
-      "failureReason": "Not run: cargo and rustup are not installed in this runtime, so the focused production-storage missing-vault test could not execute locally."
+      "updatedAt": "2026-06-16T12:03:08.692Z",
+      "startedAt": "2026-06-16T12:02:26.098Z",
+      "completedAt": "2026-06-16T12:03:08.692Z",
+      "evidence": "PR #8 head 053b86e production-storage keyring preflight job passed on runs 27615629994 and 27615632987. The job now installs Rust 1.89.0 and runs exact gate: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-storage --features production-storage existing_encrypted_app_db_missing_vault_key_fails_closed_without_overwrite -- --nocapture."
     },
     {
       "id": "G018-node-scripts-check-linux-package-smo",
@@ -213,12 +213,13 @@
       "id": "G019-real-deb-reinstall-smoke-via-node-sc",
       "title": "Real `.deb` reinstall smoke via `node scripts/smoke-linux-packages.mj...",
       "objective": "Real `.deb` reinstall smoke via `node scripts/smoke-linux-packages.mjs` after release bundles are available.",
-      "status": "failed",
-      "attempt": 0,
+      "status": "complete",
+      "attempt": 1,
       "createdAt": "2026-06-16T02:41:31.847Z",
-      "updatedAt": "2026-06-16T02:49:02.948Z",
-      "failedAt": "2026-06-16T02:49:02.948Z",
-      "failureReason": "Not run: no target/release/bundle .deb exists and Docker socket access is denied, so real .deb reinstall smoke cannot run in this runtime."
+      "updatedAt": "2026-06-16T13:01:51.509Z",
+      "startedAt": "2026-06-16T12:03:09.031Z",
+      "evidence": "PR #8 head 05d20e9391d9226c49fb303077ccb84ed8e5af11 passed all PR checks. Fresh workflow_dispatch package desktop run 27617915784 succeeded on the same head: package Linux job 81658490827 passed password vault reinstall durability, npm --prefix apps/ui run release:linux, npm --prefix apps/ui run smoke:linux-packages, and artifact upload. Final cleanup fixed the code-reviewer P2 reload-error probe cleanup finding and added keychain_preflight_cleans_probe_when_reload_errors; production-storage preflight CI passed on runs 27617898300 and 27617901164. Final independent PER-9 scoped architecture review returned CLEAR; remaining keyring-ready UI nuance and packaged OS-keyring-preflight are non-blocking watch items outside this PR scope.",
+      "completedAt": "2026-06-16T13:01:51.509Z"
     },
     {
       "id": "G020-unblock-package-linux-sbom-smoke",
@@ -231,6 +232,18 @@
       "evidence": "Workflow run https://github.com/joaojhgs/discrypt/actions/runs/27599766687 succeeded on commit 190da7c: package Linux installed release cargo tools, release:linux passed, smoke:linux-packages passed, and discrypt-linux-packages artifact uploaded.",
       "startedAt": "2026-06-16T06:35:30.591Z",
       "completedAt": "2026-06-16T07:14:34.202Z"
+    },
+    {
+      "id": "G021-p1-t03-keyring-wrapping-preflight",
+      "title": "P1-T03 keyring wrapping preflight",
+      "objective": "Implement storage-layer keyring wrapping-key round-trip preflight, wire Linux Tauri storage preflight to it, add regression tests for 32-byte key validation and fail-closed state preservation, and record verification evidence for PER-9.",
+      "status": "complete",
+      "attempt": 1,
+      "createdAt": "2026-06-16T08:12:44.681Z",
+      "updatedAt": "2026-06-16T08:34:27.824Z",
+      "evidence": "Implemented storage-layer preflight_app_db_keychain, wired Linux Tauri keyring preflight to it, added storage regression tests for write/load/delete preflight and invalid wrapping-key length. PR #8 https://github.com/joaojhgs/discrypt/pull/8 at 9e8533c has passing CI: rust ubuntu/macos/windows, ui, android target, supply-chain, validate package workflow, validate Android build/media gate. Live KDE/KWallet/GNOME Secret Service E2E remains not run in this runtime.",
+      "startedAt": "2026-06-16T08:12:57.167Z",
+      "completedAt": "2026-06-16T08:34:27.824Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

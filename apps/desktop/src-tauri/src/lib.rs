@@ -57,7 +57,7 @@ use discrypt_storage::{
 #[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
-use discrypt_storage::{AppDbKeychain as _, LinuxOsKeychain, ProductionAppDbKeychain};
+use discrypt_storage::{LinuxOsKeychain, ProductionAppDbKeychain};
 #[cfg(test)]
 use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
 #[cfg(test)]
@@ -12608,19 +12608,7 @@ fn keyring_preflight_status() -> (bool, String) {
     let mut keychain = LinuxOsKeychain::discrypt_app_db();
     let key_id = "__discrypt_keyring_preflight_v1__";
     let test_key = [0x42_u8; 32];
-    let result = keychain
-        .store_wrapping_key(key_id, test_key)
-        .and_then(|()| match keychain.load_wrapping_key(key_id) {
-            Ok(Some(loaded)) if loaded == test_key => Ok(()),
-            Ok(Some(_)) => Err(discrypt_storage::AppStoreError::Crypto(
-                "OS keyring preflight returned a different wrapping key",
-            )),
-            Ok(None) => Err(discrypt_storage::AppStoreError::KeychainMissing(
-                key_id.to_owned(),
-            )),
-            Err(error) => Err(error),
-        });
-    let _ = keychain.delete_wrapping_key(key_id);
+    let result = discrypt_storage::preflight_app_db_keychain(&mut keychain, key_id, test_key);
     match result {
         Ok(()) => (
             true,
