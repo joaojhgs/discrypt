@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T02:49:02.948Z",
+  "updatedAt": "2026-06-16T06:35:30.591Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -219,7 +219,19 @@
       "updatedAt": "2026-06-16T02:49:02.948Z",
       "failedAt": "2026-06-16T02:49:02.948Z",
       "failureReason": "Not run: no target/release/bundle .deb exists and Docker socket access is denied, so real .deb reinstall smoke cannot run in this runtime."
+    },
+    {
+      "id": "G020-unblock-package-linux-sbom-smoke",
+      "title": "Unblock package Linux SBOM smoke",
+      "objective": "Install or provide cargo-sbom in the package Linux workflow before release:linux so scripts/generate-sbom-g124.mjs can run cargo sbom, then verify package workflow checks and rerun the Linux package smoke evidence path.",
+      "status": "in_progress",
+      "attempt": 1,
+      "createdAt": "2026-06-16T06:35:24.026Z",
+      "updatedAt": "2026-06-16T06:35:30.591Z",
+      "evidence": "Multica issue metadata and workflow run 27595324488: release:linux built .deb/.rpm/AppImage, then generate-sbom-g124 failed because cargo sbom was unavailable; smoke:linux-packages was skipped.",
+      "startedAt": "2026-06-16T06:35:30.591Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
+  "activeGoalId": "G020-unblock-package-linux-sbom-smoke"
 }

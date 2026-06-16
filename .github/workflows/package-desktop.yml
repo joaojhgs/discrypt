@@ -52,6 +52,10 @@ jobs:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: apps/ui/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-package-sbom-v1
       - name: Install Linux Tauri build dependencies
         run: |
           sudo apt-get update
@@ -62,6 +66,10 @@ jobs:
             librsvg2-dev \
             patchelf \
             rpm
+      - name: Install package SBOM tool
+        run: |
+          cargo install cargo-sbom --locked || true
+          cargo sbom --version
       - run: npm --prefix apps/ui run release:linux
       - run: npm --prefix apps/ui run smoke:linux-packages
       - uses: actions/upload-artifact@v4
