@@ -225,8 +225,15 @@ impl InviteTrustMetadata {
 /// Signed invite bootstrap descriptor schema version for connectivity policy metadata.
 pub const INVITE_CONNECTIVITY_SCHEMA_VERSION: u32 = 1;
 
+/// Canonical signed invite descriptor schema version.
+pub const INVITE_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+
 /// Signed provider allowlist/rotation policy schema version.
 pub const INVITE_PROVIDER_POLICY_VERSION: u32 = 1;
+
+fn default_descriptor_schema_version() -> u32 {
+    INVITE_DESCRIPTOR_SCHEMA_VERSION
+}
 
 fn default_provider_policy_version() -> u32 {
     INVITE_PROVIDER_POLICY_VERSION
@@ -388,6 +395,172 @@ impl GroupInviteBootstrap {
             || !is_hex_fingerprint(&self.channel_policy_commitment)
         {
             return Err(InviteError::InvalidEndpointPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// Signed admission policy snapshot pinned to a group invite descriptor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InviteAdmissionSnapshot {
+    /// Commitment to the stable backend group id; never the display name.
+    pub group_id_commitment: String,
+    /// Commitment to the OpenMLS group id/tree/epoch binding used by admission.
+    pub group_commitment: String,
+    /// Admission mode at invite issuance, for example `manual_approval`.
+    pub admission_mode: String,
+    /// Policy epoch that produced this snapshot.
+    pub policy_epoch: u64,
+    /// Commitment to the signed role/admission policy.
+    pub role_admission_policy_commitment: String,
+    /// Canonical v1 group invites require final MLS Welcome/add authorization.
+    pub welcome_required: bool,
+}
+
+impl InviteAdmissionSnapshot {
+    /// Construct and validate a signed admission snapshot.
+    pub fn new(
+        group_id_commitment: impl Into<String>,
+        group_commitment: impl Into<String>,
+        admission_mode: impl Into<String>,
+        policy_epoch: u64,
+        role_admission_policy_commitment: impl Into<String>,
+    ) -> Result<Self, InviteError> {
+        let snapshot = Self {
+            group_id_commitment: group_id_commitment.into(),
+            group_commitment: group_commitment.into(),
+            admission_mode: admission_mode.into(),
+            policy_epoch,
+            role_admission_policy_commitment: role_admission_policy_commitment.into(),
+            welcome_required: true,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn validate(&self) -> Result<(), InviteError> {
+        if !is_hex_fingerprint(&self.group_id_commitment)
+            || !is_hex_fingerprint(&self.group_commitment)
+            || self.admission_mode.trim().is_empty()
+            || self.admission_mode.trim() != self.admission_mode
+            || !is_hex_fingerprint(&self.role_admission_policy_commitment)
+            || !self.welcome_required
+        {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// Signed invite revocation policy snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InviteRevocationPolicy {
+    /// Whether governance can revoke this invite before expiry/max-use.
+    pub revocable: bool,
+    /// Commitment to the governance authority allowed to revoke the invite.
+    pub revocation_authority_commitment: String,
+    /// Expiry is enforced before any admission side effect.
+    pub expiry_enforced: bool,
+    /// Max-use is enforced before any admission side effect.
+    pub max_use_enforced: bool,
+}
+
+impl InviteRevocationPolicy {
+    /// Construct and validate a revocation policy snapshot.
+    pub fn new(revocation_authority_commitment: impl Into<String>) -> Result<Self, InviteError> {
+        let policy = Self {
+            revocable: true,
+            revocation_authority_commitment: revocation_authority_commitment.into(),
+            expiry_enforced: true,
+            max_use_enforced: true,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn default_open() -> Self {
+        Self {
+            revocable: true,
+            revocation_authority_commitment: hex::encode(Sha256::digest(
+                b"discrypt-default-revocation-authority-v1",
+            )),
+            expiry_enforced: true,
+            max_use_enforced: true,
+        }
+    }
+
+    fn validate(&self) -> Result<(), InviteError> {
+        if !self.revocable
+            || !is_hex_fingerprint(&self.revocation_authority_commitment)
+            || !self.expiry_enforced
+            || !self.max_use_enforced
+        {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        Ok(())
+    }
+}
+
+impl Default for InviteRevocationPolicy {
+    fn default() -> Self {
+        Self::default_open()
+    }
+}
+
+/// Signed password policy for a descriptor. It carries no offline verifier.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InvitePasswordPolicy {
+    /// Whether a password/helper proof is required before Welcome processing.
+    pub required: bool,
+    /// Allowed password protocol for this descriptor.
+    pub protocol: AdmissionPasswordProtocol,
+    /// Online helper id for the selected helper path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_id: Option<String>,
+    /// Commitment to rate-limit policy; not a password verifier.
+    pub rate_limit_policy_commitment: String,
+    /// Must remain false; offline verifiers cannot enforce rate limits.
+    pub offline_verifier_allowed: bool,
+}
+
+impl InvitePasswordPolicy {
+    /// Construct and validate an online-helper password policy.
+    pub fn online_helper(
+        helper_id: impl Into<String>,
+        rate_limit_policy_commitment: impl Into<String>,
+    ) -> Result<Self, InviteError> {
+        let policy = Self {
+            required: true,
+            protocol: AdmissionPasswordProtocol::OnlineAuthorizedHelper,
+            helper_id: Some(helper_id.into()),
+            rate_limit_policy_commitment: rate_limit_policy_commitment.into(),
+            offline_verifier_allowed: false,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(&self) -> Result<(), InviteError> {
+        if self.offline_verifier_allowed {
+            return Err(InviteError::OfflineVerifierRejected);
+        }
+        if !self.required {
+            return Ok(());
+        }
+        if !is_hex_fingerprint(&self.rate_limit_policy_commitment) {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        match &self.protocol {
+            AdmissionPasswordProtocol::OnlineAuthorizedHelper => {
+                if self
+                    .helper_id
+                    .as_deref()
+                    .is_none_or(|helper_id| helper_id.trim().is_empty())
+                {
+                    return Err(InviteError::HelperMismatch);
+                }
+            }
+            AdmissionPasswordProtocol::OpaquePakeReserved => {}
         }
         Ok(())
     }
@@ -570,9 +743,24 @@ impl InviteSignalingMetadata {
     }
 }
 
+/// Inputs required to issue a canonical v1 signed group invite descriptor.
+pub struct CanonicalGroupInviteV1Input<'a> {
+    pub room_secret: &'a [u8],
+    pub expires_at: DateTime<Utc>,
+    pub max_uses: u32,
+    pub signaling_metadata: InviteSignalingMetadata,
+    pub bootstrap_metadata: InviteBootstrapMetadata,
+    pub admission_snapshot: InviteAdmissionSnapshot,
+    pub revocation_policy: InviteRevocationPolicy,
+    pub password_policy: Option<InvitePasswordPolicy>,
+}
+
 /// Production invite descriptor stored and exchanged without exposing the raw room secret.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredInvite {
+    /// Canonical signed descriptor schema version.
+    #[serde(default = "default_descriptor_schema_version")]
+    pub descriptor_schema_version: u32,
     /// Opaque random invite id; not derived from room/group names or counters.
     pub invite_id: String,
     /// Domain-separated commitment to the room secret.
@@ -586,6 +774,15 @@ pub struct StoredInvite {
     /// Optional signed bootstrap metadata for group joins, first-contact DMs, and device pairing.
     #[serde(default)]
     pub bootstrap_metadata: Option<InviteBootstrapMetadata>,
+    /// Optional signed admission snapshot for group invites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_snapshot: Option<InviteAdmissionSnapshot>,
+    /// Signed revocation/expiry/max-use policy snapshot.
+    #[serde(default)]
+    pub revocation_policy: InviteRevocationPolicy,
+    /// Optional signed password policy; contains no offline verifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_policy: Option<InvitePasswordPolicy>,
     /// Expiry timestamp.
     pub expires_at: DateTime<Utc>,
     /// Maximum accepted uses.
@@ -596,12 +793,47 @@ pub struct StoredInvite {
     pub revocation_event_id: Option<String>,
 }
 
+struct StoredInviteSignInput {
+    invite_id: String,
+    room_secret_commitment: [u8; 32],
+    expires_at: DateTime<Utc>,
+    max_uses: u32,
+    signaling_metadata: InviteSignalingMetadata,
+    bootstrap_metadata: Option<InviteBootstrapMetadata>,
+    admission_snapshot: Option<InviteAdmissionSnapshot>,
+    revocation_policy: InviteRevocationPolicy,
+    password_policy: Option<InvitePasswordPolicy>,
+}
+
+struct InviteSigningDescriptor<'a> {
+    invite_id: &'a str,
+    room_secret_commitment: &'a [u8; 32],
+    issuer_public_key: &'a [u8],
+    signaling_metadata: &'a InviteSignalingMetadata,
+    bootstrap_metadata: Option<&'a InviteBootstrapMetadata>,
+    admission_snapshot: Option<&'a InviteAdmissionSnapshot>,
+    revocation_policy: &'a InviteRevocationPolicy,
+    password_policy: Option<&'a InvitePasswordPolicy>,
+    expires_at: DateTime<Utc>,
+    max_uses: u32,
+}
+
 impl StoredInvite {
     /// Verify the issuer signature on this invite descriptor.
     pub fn verify_issuer_signature(&self) -> Result<(), InviteError> {
         self.signaling_metadata.validate()?;
         if let Some(bootstrap_metadata) = &self.bootstrap_metadata {
             bootstrap_metadata.validate()?;
+        }
+        if self.descriptor_schema_version != INVITE_DESCRIPTOR_SCHEMA_VERSION {
+            return Err(InviteError::InvalidEndpointPolicy);
+        }
+        if let Some(admission_snapshot) = &self.admission_snapshot {
+            admission_snapshot.validate()?;
+        }
+        self.revocation_policy.validate()?;
+        if let Some(password_policy) = &self.password_policy {
+            password_policy.validate()?;
         }
         let verifying_key = VerifyingKey::from_bytes(
             &self
@@ -652,25 +884,21 @@ impl StoredInvite {
         self.revocation_event_id.is_some()
     }
 
-    fn sign(
-        invite_id: String,
-        room_secret_commitment: [u8; 32],
-        expires_at: DateTime<Utc>,
-        max_uses: u32,
-        signaling_metadata: InviteSignalingMetadata,
-        bootstrap_metadata: Option<InviteBootstrapMetadata>,
-        issuer: &SigningKey,
-    ) -> Self {
+    fn sign(input: StoredInviteSignInput, issuer: &SigningKey) -> Self {
         let issuer_public_key = issuer.verifying_key().to_bytes().to_vec();
         let mut invite = Self {
-            invite_id,
-            room_secret_commitment,
+            descriptor_schema_version: INVITE_DESCRIPTOR_SCHEMA_VERSION,
+            invite_id: input.invite_id,
+            room_secret_commitment: input.room_secret_commitment,
             issuer_public_key,
             issuer_signature: Vec::new(),
-            signaling_metadata,
-            bootstrap_metadata,
-            expires_at,
-            max_uses,
+            signaling_metadata: input.signaling_metadata,
+            bootstrap_metadata: input.bootstrap_metadata,
+            admission_snapshot: input.admission_snapshot,
+            revocation_policy: input.revocation_policy,
+            password_policy: input.password_policy,
+            expires_at: input.expires_at,
+            max_uses: input.max_uses,
             consumed_uses: 0,
             revocation_event_id: None,
         };
@@ -679,15 +907,18 @@ impl StoredInvite {
     }
 
     fn signing_bytes(&self) -> Vec<u8> {
-        canonical_invite_signing_bytes(
-            &self.invite_id,
-            &self.room_secret_commitment,
-            &self.issuer_public_key,
-            &self.signaling_metadata,
-            self.bootstrap_metadata.as_ref(),
-            self.expires_at,
-            self.max_uses,
-        )
+        canonical_invite_signing_bytes(InviteSigningDescriptor {
+            invite_id: &self.invite_id,
+            room_secret_commitment: &self.room_secret_commitment,
+            issuer_public_key: &self.issuer_public_key,
+            signaling_metadata: &self.signaling_metadata,
+            bootstrap_metadata: self.bootstrap_metadata.as_ref(),
+            admission_snapshot: self.admission_snapshot.as_ref(),
+            revocation_policy: &self.revocation_policy,
+            password_policy: self.password_policy.as_ref(),
+            expires_at: self.expires_at,
+            max_uses: self.max_uses,
+        })
     }
 }
 
@@ -714,12 +945,17 @@ impl InviteStore {
         issuer: &SigningKey,
     ) -> StoredInvite {
         let invite = StoredInvite::sign(
-            opaque_invite_id(),
-            room_secret_commitment(room_secret),
-            expires_at,
-            max_uses.max(1),
-            InviteSignalingMetadata::default_production(),
-            None,
+            StoredInviteSignInput {
+                invite_id: opaque_invite_id(),
+                room_secret_commitment: room_secret_commitment(room_secret),
+                expires_at,
+                max_uses: max_uses.max(1),
+                signaling_metadata: InviteSignalingMetadata::default_production(),
+                bootstrap_metadata: None,
+                admission_snapshot: None,
+                revocation_policy: InviteRevocationPolicy::default(),
+                password_policy: None,
+            },
             issuer,
         );
         self.invites
@@ -738,12 +974,17 @@ impl InviteStore {
     ) -> Result<StoredInvite, InviteError> {
         signaling_metadata.validate()?;
         let invite = StoredInvite::sign(
-            opaque_invite_id(),
-            room_secret_commitment(room_secret),
-            expires_at,
-            max_uses.max(1),
-            signaling_metadata,
-            None,
+            StoredInviteSignInput {
+                invite_id: opaque_invite_id(),
+                room_secret_commitment: room_secret_commitment(room_secret),
+                expires_at,
+                max_uses: max_uses.max(1),
+                signaling_metadata,
+                bootstrap_metadata: None,
+                admission_snapshot: None,
+                revocation_policy: InviteRevocationPolicy::default(),
+                password_policy: None,
+            },
             issuer,
         );
         self.invites
@@ -764,12 +1005,49 @@ impl InviteStore {
         signaling_metadata.validate()?;
         bootstrap_metadata.validate()?;
         let invite = StoredInvite::sign(
-            opaque_invite_id(),
-            room_secret_commitment(room_secret),
-            expires_at,
-            max_uses.max(1),
-            signaling_metadata,
-            Some(bootstrap_metadata),
+            StoredInviteSignInput {
+                invite_id: opaque_invite_id(),
+                room_secret_commitment: room_secret_commitment(room_secret),
+                expires_at,
+                max_uses: max_uses.max(1),
+                signaling_metadata,
+                bootstrap_metadata: Some(bootstrap_metadata),
+                admission_snapshot: None,
+                revocation_policy: InviteRevocationPolicy::default(),
+                password_policy: None,
+            },
+            issuer,
+        );
+        self.invites
+            .insert(invite.invite_id.clone(), invite.clone());
+        Ok(invite)
+    }
+
+    /// Issue and persist a canonical v1 signed group invite descriptor.
+    pub fn issue_canonical_group_invite_v1(
+        &mut self,
+        input: CanonicalGroupInviteV1Input<'_>,
+        issuer: &SigningKey,
+    ) -> Result<StoredInvite, InviteError> {
+        input.signaling_metadata.validate()?;
+        input.bootstrap_metadata.validate()?;
+        input.admission_snapshot.validate()?;
+        input.revocation_policy.validate()?;
+        if let Some(password_policy) = &input.password_policy {
+            password_policy.validate()?;
+        }
+        let invite = StoredInvite::sign(
+            StoredInviteSignInput {
+                invite_id: opaque_invite_id(),
+                room_secret_commitment: room_secret_commitment(input.room_secret),
+                expires_at: input.expires_at,
+                max_uses: input.max_uses.max(1),
+                signaling_metadata: input.signaling_metadata,
+                bootstrap_metadata: Some(input.bootstrap_metadata),
+                admission_snapshot: Some(input.admission_snapshot),
+                revocation_policy: input.revocation_policy,
+                password_policy: input.password_policy,
+            },
             issuer,
         );
         self.invites
@@ -846,37 +1124,50 @@ fn is_hex_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
 }
 
-fn canonical_invite_signing_bytes(
-    invite_id: &str,
-    room_secret_commitment: &[u8; 32],
-    issuer_public_key: &[u8],
-    signaling_metadata: &InviteSignalingMetadata,
-    bootstrap_metadata: Option<&InviteBootstrapMetadata>,
-    expires_at: DateTime<Utc>,
-    max_uses: u32,
-) -> Vec<u8> {
+fn canonical_invite_signing_bytes(descriptor: InviteSigningDescriptor<'_>) -> Vec<u8> {
     let mut bytes = b"discrypt-invite-descriptor".to_vec();
-    bytes.push(1);
-    bytes.extend_from_slice(&(invite_id.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(invite_id.as_bytes());
-    bytes.extend_from_slice(room_secret_commitment);
-    bytes.extend_from_slice(&(issuer_public_key.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(issuer_public_key);
-    bytes.extend_from_slice(&(signaling_metadata.signaling_endpoint.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(signaling_metadata.signaling_endpoint.as_bytes());
-    let policy = signaling_metadata.endpoint_policy.canonical_name();
+    bytes.extend_from_slice(&INVITE_DESCRIPTOR_SCHEMA_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(descriptor.invite_id.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(descriptor.invite_id.as_bytes());
+    bytes.extend_from_slice(descriptor.room_secret_commitment);
+    bytes.extend_from_slice(&(descriptor.issuer_public_key.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(descriptor.issuer_public_key);
+    bytes.extend_from_slice(
+        &(descriptor.signaling_metadata.signaling_endpoint.len() as u64).to_le_bytes(),
+    );
+    bytes.extend_from_slice(descriptor.signaling_metadata.signaling_endpoint.as_bytes());
+    let policy = descriptor
+        .signaling_metadata
+        .endpoint_policy
+        .canonical_name();
     bytes.extend_from_slice(&(policy.len() as u64).to_le_bytes());
     bytes.extend_from_slice(policy.as_bytes());
     bytes.extend_from_slice(
-        &(signaling_metadata.trust.signaling_fingerprint.len() as u64).to_le_bytes(),
+        &(descriptor
+            .signaling_metadata
+            .trust
+            .signaling_fingerprint
+            .len() as u64)
+            .to_le_bytes(),
     );
-    bytes.extend_from_slice(signaling_metadata.trust.signaling_fingerprint.as_bytes());
-    bytes.extend_from_slice(&(signaling_metadata.trust.trust_status.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(signaling_metadata.trust.trust_status.as_bytes());
-    let ice_policy = signaling_metadata.ice_endpoint_policy.signing_bytes();
+    bytes.extend_from_slice(
+        descriptor
+            .signaling_metadata
+            .trust
+            .signaling_fingerprint
+            .as_bytes(),
+    );
+    bytes.extend_from_slice(
+        &(descriptor.signaling_metadata.trust.trust_status.len() as u64).to_le_bytes(),
+    );
+    bytes.extend_from_slice(descriptor.signaling_metadata.trust.trust_status.as_bytes());
+    let ice_policy = descriptor
+        .signaling_metadata
+        .ice_endpoint_policy
+        .signing_bytes();
     bytes.extend_from_slice(&(ice_policy.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&ice_policy);
-    if let Some(bootstrap) = bootstrap_metadata {
+    if let Some(bootstrap) = descriptor.bootstrap_metadata {
         bytes.push(1);
         let bootstrap_bytes = bootstrap.signing_bytes();
         bytes.extend_from_slice(&(bootstrap_bytes.len() as u64).to_le_bytes());
@@ -884,8 +1175,47 @@ fn canonical_invite_signing_bytes(
     } else {
         bytes.push(0);
     }
-    bytes.extend_from_slice(&expires_at.timestamp_millis().to_le_bytes());
-    bytes.extend_from_slice(&max_uses.to_le_bytes());
+    if let Some(snapshot) = descriptor.admission_snapshot {
+        bytes.push(1);
+        append_signed_str(&mut bytes, &snapshot.group_id_commitment);
+        append_signed_str(&mut bytes, &snapshot.group_commitment);
+        append_signed_str(&mut bytes, &snapshot.admission_mode);
+        bytes.extend_from_slice(&snapshot.policy_epoch.to_le_bytes());
+        append_signed_str(&mut bytes, &snapshot.role_admission_policy_commitment);
+        bytes.push(u8::from(snapshot.welcome_required));
+    } else {
+        bytes.push(0);
+    }
+    bytes.push(u8::from(descriptor.revocation_policy.revocable));
+    append_signed_str(
+        &mut bytes,
+        &descriptor.revocation_policy.revocation_authority_commitment,
+    );
+    bytes.push(u8::from(descriptor.revocation_policy.expiry_enforced));
+    bytes.push(u8::from(descriptor.revocation_policy.max_use_enforced));
+    if let Some(policy) = descriptor.password_policy {
+        bytes.push(1);
+        bytes.push(u8::from(policy.required));
+        append_signed_str(
+            &mut bytes,
+            match &policy.protocol {
+                AdmissionPasswordProtocol::OnlineAuthorizedHelper => "online_authorized_helper",
+                AdmissionPasswordProtocol::OpaquePakeReserved => "opaque_pake_reserved",
+            },
+        );
+        if let Some(helper_id) = &policy.helper_id {
+            bytes.push(1);
+            append_signed_str(&mut bytes, helper_id);
+        } else {
+            bytes.push(0);
+        }
+        append_signed_str(&mut bytes, &policy.rate_limit_policy_commitment);
+        bytes.push(u8::from(policy.offline_verifier_allowed));
+    } else {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&descriptor.expires_at.timestamp_millis().to_le_bytes());
+    bytes.extend_from_slice(&descriptor.max_uses.to_le_bytes());
     bytes
 }
 
@@ -913,6 +1243,14 @@ impl InviteBootstrapMetadata {
             for capability in &profile.capabilities {
                 append_signed_str(&mut bytes, capability);
             }
+            bytes.extend_from_slice(&profile.provider_policy_version.to_le_bytes());
+            bytes.extend_from_slice(
+                &(profile.endpoint_allowlist_commitments.len() as u64).to_le_bytes(),
+            );
+            for commitment in &profile.endpoint_allowlist_commitments {
+                append_signed_str(&mut bytes, commitment);
+            }
+            append_signed_str(&mut bytes, &profile.provider_rotation_policy);
         }
         if let Some(dm) = &self.dm_bootstrap {
             bytes.push(1);

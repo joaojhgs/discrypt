@@ -405,6 +405,30 @@ export type GroupInviteBootstrapView = {
   channel_policy_commitment: string;
 };
 
+export type InviteAdmissionSnapshotView = {
+  group_id_commitment: string;
+  group_commitment: string;
+  admission_mode: GroupAdmissionModeView;
+  policy_epoch: number;
+  role_admission_policy_commitment: string;
+  welcome_required: boolean;
+};
+
+export type InviteRevocationPolicyView = {
+  revocable: boolean;
+  revocation_authority_commitment: string;
+  expiry_enforced: boolean;
+  max_use_enforced: boolean;
+};
+
+export type InvitePasswordPolicyView = {
+  required: boolean;
+  protocol: "OnlineAuthorizedHelper" | "OpaquePakeReserved" | string;
+  helper_id?: string | null;
+  rate_limit_policy_commitment: string;
+  offline_verifier_allowed: boolean;
+};
+
 export type ConnectivityPolicyView = {
   connectivity_schema_version: number;
   invite_kind: string;
@@ -519,6 +543,7 @@ export type RuntimeModeView = {
 export type InviteView = {
   invite_id: string;
   invite_key: string;
+  descriptor_schema_version?: number | null;
   group_id: string;
   dm_id?: string | null;
   connectivity_schema_version: number;
@@ -528,6 +553,9 @@ export type InviteView = {
   privacy_label: string;
   dm_bootstrap: DmInviteBootstrapView | null;
   group_bootstrap: GroupInviteBootstrapView | null;
+  admission_snapshot?: InviteAdmissionSnapshotView | null;
+  revocation_policy?: InviteRevocationPolicyView | null;
+  password_policy?: InvitePasswordPolicyView | null;
   code: string;
   room_secret_hash: string;
   signaling_endpoint: string;

@@ -1,7 +1,7 @@
 # G008 STUN/TURN/fallback hardening audit
 
-Date: 2026-06-01  
-Base commit under audit: `31ee435`  
+Date: 2026-06-01
+Base commit under audit: `31ee435`
 Scope: direct/STUN success, no-TURN fail-closed behavior, credentialed TURN relay success, signaling-adapter fallback/outage behavior, retry/backoff, duplicate-session prevention, and honest UI states for TURN-required/provider-failed cases.
 
 ## Executive finding

@@ -14,8 +14,9 @@ use chrono::{DateTime, Duration, Utc};
 #[cfg(test)]
 use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
-    signaling_fingerprint_for_endpoint, DmInviteBootstrap, GroupInviteBootstrap,
-    InviteBootstrapMetadata, InviteEndpointPolicy, InviteKind, InviteSignalingAdapterKind,
+    signaling_fingerprint_for_endpoint, CanonicalGroupInviteV1Input, DmInviteBootstrap,
+    GroupInviteBootstrap, InviteAdmissionSnapshot, InviteBootstrapMetadata, InviteEndpointPolicy,
+    InviteKind, InvitePasswordPolicy, InviteRevocationPolicy, InviteSignalingAdapterKind,
     InviteSignalingMetadata, InviteSignalingProfile, InviteStore, InviteTrustMetadata,
     INVITE_CONNECTIVITY_SCHEMA_VERSION, INVITE_PROVIDER_POLICY_VERSION,
 };
@@ -309,6 +310,15 @@ pub enum GroupAdmissionModeView {
     #[default]
     AutomaticWhenAuthorizedOnline,
     ManualApproval,
+}
+
+impl GroupAdmissionModeView {
+    fn canonical_name(&self) -> &'static str {
+        match self {
+            Self::AutomaticWhenAuthorizedOnline => "automatic_when_authorized_online",
+            Self::ManualApproval => "manual_approval",
+        }
+    }
 }
 
 /// Persisted group member roster row used by role checks, presence, and member-panel UI.
@@ -637,6 +647,9 @@ pub struct InviteView {
     /// Opaque invite key embedded in the link.
     #[serde(default)]
     pub invite_key: String,
+    /// Canonical signed descriptor schema version when this row came from a v1 descriptor.
+    #[serde(default)]
+    pub descriptor_schema_version: Option<u32>,
     /// Group id this invite targets; empty for DM contact invites.
     pub group_id: String,
     /// DM id this invite targets for first-contact DM invites.
@@ -663,6 +676,15 @@ pub struct InviteView {
     /// Optional group admission bootstrap.
     #[serde(default)]
     pub group_bootstrap: Option<GroupInviteBootstrapView>,
+    /// Signed group-admission snapshot pinned to canonical v1 group invites.
+    #[serde(default)]
+    pub admission_snapshot: Option<InviteAdmissionSnapshot>,
+    /// Signed revocation/expiry/max-use policy pinned to canonical descriptors.
+    #[serde(default)]
+    pub revocation_policy: Option<InviteRevocationPolicy>,
+    /// Optional signed password admission policy; never contains an offline verifier.
+    #[serde(default)]
+    pub password_policy: Option<InvitePasswordPolicy>,
     /// User-pastable invite code/URL.
     pub code: String,
     /// Hash of the room secret; the plan requires secret-derived admission, not incremental ids.
@@ -4628,6 +4650,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             state.invites.push(InviteView {
                 invite_id: format!("invite-{}", parsed.invite_key),
                 invite_key: parsed.invite_key,
+                descriptor_schema_version: parsed.descriptor_schema_version,
                 group_id: state
                     .active_context
                     .as_ref()
@@ -4641,6 +4664,9 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 privacy_label: parsed.connectivity.privacy_label.clone(),
                 dm_bootstrap: parsed.connectivity.dm_bootstrap.clone(),
                 group_bootstrap: parsed.connectivity.group_bootstrap.clone(),
+                admission_snapshot: parsed.admission_snapshot,
+                revocation_policy: parsed.revocation_policy,
+                password_policy: parsed.password_policy,
                 code: invite_code.clone(),
                 room_secret_hash: parsed.room_secret_hash,
                 signaling_endpoint: parsed.signaling_endpoint,
@@ -5573,25 +5599,113 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .endpoint_policy
             .canonical_name()
             .to_owned();
-        let mut invite_store = InviteStore::new();
-        let issuer = SigningKey::generate(&mut OsRng);
-        let descriptor = invite_store
-            .issue_invite_with_bootstrap_metadata(
-                room_secret.as_bytes(),
-                descriptor_expires_at,
-                max_uses,
-                signaling_metadata.clone(),
-                bootstrap_metadata,
-                &issuer,
-            )
-            .unwrap_or_else(|_| {
-                invite_store.issue_invite(
-                    room_secret.as_bytes(),
-                    descriptor_expires_at,
-                    max_uses,
-                    &issuer,
+        let admission_mode = group
+            .map(|group| group.role_policy.admission_mode.canonical_name())
+            .unwrap_or("manual_approval")
+            .to_owned();
+        let policy_epoch = group
+            .map(|group| group.role_policy.policy_epoch)
+            .unwrap_or(1);
+        let group_id_commitment =
+            hash_commitment("discrypt-signed-invite-group-id-v1", &[&group_id]);
+        let group_commitment =
+            hash_commitment("discrypt-signed-invite-openmls-group-v1", &[&group_id]);
+        let role_admission_policy_commitment = connectivity
+            .group_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.role_admission_policy_commitment.clone())
+            .unwrap_or_else(|| {
+                hash_commitment(
+                    "discrypt-group-admission-policy-commitment-v1",
+                    &[&group_id],
                 )
             });
+        let issuer_user_id = state.local_user_id();
+        let admission_snapshot = match InviteAdmissionSnapshot::new(
+            group_id_commitment,
+            group_commitment,
+            admission_mode,
+            policy_epoch,
+            role_admission_policy_commitment,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_admission_snapshot_invalid",
+                    error.to_string(),
+                    "Refresh group admission policy before issuing another invite",
+                );
+                return;
+            }
+        };
+        let revocation_policy = match InviteRevocationPolicy::new(hash_commitment(
+            "discrypt-invite-revocation-authority-v1",
+            &[&group_id, &issuer_user_id],
+        )) {
+            Ok(policy) => policy,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_revocation_policy_invalid",
+                    error.to_string(),
+                    "Refresh group governance policy before issuing another invite",
+                );
+                return;
+            }
+        };
+        let password_policy = if password_gate_requested {
+            match InvitePasswordPolicy::online_helper(
+                format!("admission-helper-{group_id}"),
+                hash_commitment(
+                    "discrypt-invite-password-rate-limit-policy-v1",
+                    &[&group_id, &issuer_user_id],
+                ),
+            ) {
+                Ok(policy) => Some(policy),
+                Err(error) => {
+                    state.push_command_error(
+                        "invite.rejected",
+                        "create_invite",
+                        "invite_password_policy_invalid",
+                        error.to_string(),
+                        "Use online-helper or PAKE password admission; offline verifiers are not allowed",
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut invite_store = InviteStore::new();
+        let issuer = SigningKey::generate(&mut OsRng);
+        let descriptor = match invite_store.issue_canonical_group_invite_v1(
+            CanonicalGroupInviteV1Input {
+                room_secret: room_secret.as_bytes(),
+                expires_at: descriptor_expires_at,
+                max_uses,
+                signaling_metadata: signaling_metadata.clone(),
+                bootstrap_metadata,
+                admission_snapshot,
+                revocation_policy,
+                password_policy,
+            },
+            &issuer,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                state.push_command_error(
+                    "invite.rejected",
+                    "create_invite",
+                    "invite_descriptor_invalid",
+                    error.to_string(),
+                    "Regenerate the invite after refreshing signed group admission and connectivity policy",
+                );
+                return;
+            }
+        };
         let room_secret_hash = hex::encode(descriptor.room_secret_commitment);
         let invite_code = match production_invite_link(
             &descriptor,
@@ -5615,6 +5729,7 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
         let invite = InviteView {
             invite_id: format!("invite-{}", descriptor.invite_id),
             invite_key: descriptor.invite_id.clone(),
+            descriptor_schema_version: Some(descriptor.descriptor_schema_version),
             group_id: group_id.clone(),
             dm_id: None,
             connectivity_schema_version: connectivity.connectivity_schema_version,
@@ -5624,6 +5739,9 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             privacy_label: connectivity.privacy_label.clone(),
             dm_bootstrap: connectivity.dm_bootstrap.clone(),
             group_bootstrap: connectivity.group_bootstrap.clone(),
+            admission_snapshot: descriptor.admission_snapshot.clone(),
+            revocation_policy: Some(descriptor.revocation_policy.clone()),
+            password_policy: descriptor.password_policy.clone(),
             code: invite_code,
             room_secret_hash,
             signaling_endpoint,
@@ -5816,6 +5934,7 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
         let invite = InviteView {
             invite_id: format!("invite-{}", descriptor.invite_id),
             invite_key: descriptor.invite_id.clone(),
+            descriptor_schema_version: Some(descriptor.descriptor_schema_version),
             group_id: String::new(),
             dm_id: Some(dm.dm_id.clone()),
             connectivity_schema_version: connectivity.connectivity_schema_version,
@@ -5825,6 +5944,9 @@ pub fn create_dm_invite(request: CreateDmInviteRequest) -> AppStateView {
             privacy_label: connectivity.privacy_label.clone(),
             dm_bootstrap: connectivity.dm_bootstrap.clone(),
             group_bootstrap: connectivity.group_bootstrap.clone(),
+            admission_snapshot: descriptor.admission_snapshot.clone(),
+            revocation_policy: Some(descriptor.revocation_policy.clone()),
+            password_policy: descriptor.password_policy.clone(),
             code: invite_code,
             room_secret_hash,
             signaling_endpoint,
@@ -5921,6 +6043,7 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
         state.invites.push(InviteView {
             invite_id: format!("invite-{}", parsed.invite_key),
             invite_key: parsed.invite_key,
+            descriptor_schema_version: parsed.descriptor_schema_version,
             group_id: String::new(),
             dm_id: Some(active_dm_id),
             connectivity_schema_version: parsed.connectivity.connectivity_schema_version,
@@ -5930,6 +6053,9 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
             privacy_label: parsed.connectivity.privacy_label.clone(),
             dm_bootstrap: parsed.connectivity.dm_bootstrap.clone(),
             group_bootstrap: parsed.connectivity.group_bootstrap.clone(),
+            admission_snapshot: parsed.admission_snapshot,
+            revocation_policy: parsed.revocation_policy,
+            password_policy: parsed.password_policy,
             code: invite_code.clone(),
             room_secret_hash: parsed.room_secret_hash,
             signaling_endpoint: parsed.signaling_endpoint,
@@ -15744,6 +15870,7 @@ fn invite_group_name_from_metadata(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedInviteMetadata {
     invite_key: String,
+    descriptor_schema_version: Option<u32>,
     group_id: Option<String>,
     group_name: Option<String>,
     room_secret_hash: String,
@@ -15754,6 +15881,9 @@ struct ParsedInviteMetadata {
     ice_stun_servers: Vec<String>,
     ice_turn_servers: Vec<IceTurnServerView>,
     connectivity: ConnectivityPolicyView,
+    admission_snapshot: Option<InviteAdmissionSnapshot>,
+    revocation_policy: Option<InviteRevocationPolicy>,
+    password_policy: Option<InvitePasswordPolicy>,
     expires_at: String,
     max_uses: u32,
 }
@@ -15788,6 +15918,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             .unwrap_or_else(|| group_connectivity_policy(&descriptor.invite_id));
         return Some(ParsedInviteMetadata {
             invite_key: descriptor.invite_id,
+            descriptor_schema_version: Some(descriptor.descriptor_schema_version),
             group_id: query_value(query, "gid").and_then(percent_decode),
             // Signed descriptor links intentionally ignore unsigned display-name
             // query parameters.  A label can still be derived from the signed
@@ -15802,6 +15933,9 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             ice_stun_servers,
             ice_turn_servers,
             connectivity,
+            admission_snapshot: descriptor.admission_snapshot,
+            revocation_policy: Some(descriptor.revocation_policy),
+            password_policy: descriptor.password_policy,
             expires_at: descriptor.expires_at.to_rfc3339(),
             max_uses: descriptor.max_uses,
         });
@@ -15832,6 +15966,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         hash_commitment("discrypt-legacy-invite-scope-commitment-v1", &[&invite_key]);
     Some(ParsedInviteMetadata {
         invite_key: invite_key.clone(),
+        descriptor_schema_version: None,
         group_id: query_value(query, "gid").and_then(percent_decode),
         group_name: query_value(query, "gname")
             .or_else(|| query_value(query, "name"))
@@ -15860,6 +15995,9 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
                 channel_policy_commitment: hash_commitment("discrypt-legacy-channel-policy-v1", &[&invite_key]),
             }),
         },
+        admission_snapshot: None,
+        revocation_policy: None,
+        password_policy: None,
         expires_at,
         max_uses,
     })
