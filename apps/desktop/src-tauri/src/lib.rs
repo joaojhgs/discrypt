@@ -5575,12 +5575,10 @@ pub fn create_invite(request: CreateInviteRequest) -> AppStateView {
             .canonical_name()
             .to_owned();
         let admission_mode = group
-            .and_then(|group| group.role_policy.as_ref())
-            .map(|policy| policy.admission_mode.clone())
+            .map(|group| group.role_policy.admission_mode.clone())
             .unwrap_or_else(|| "manual_approval".to_owned());
         let policy_epoch = group
-            .and_then(|group| group.role_policy.as_ref())
-            .map(|policy| policy.policy_epoch)
+            .map(|group| group.role_policy.policy_epoch)
             .unwrap_or(1);
         let group_id_commitment =
             hash_commitment("discrypt-signed-invite-group-id-v1", &[&group_id]);
