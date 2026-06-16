@@ -31,6 +31,7 @@
     "test:android-gate": "node ../../scripts/check-android-gate.mjs",
     "test:release-governance": "node ../../scripts/check-release-governance.mjs",
     "test:release-verification-matrix": "node ../../scripts/check-release-verification-matrix.mjs",
+    "test:release-gap-matrix": "node ../../scripts/check-release-gap-matrix.mjs",
     "test:security-review-g095": "node ../../scripts/check-security-review-g095.mjs",
     "test:pcap-suite-g096": "node ../../scripts/check-pcap-suite-g096.mjs",
     "test:malicious-relay-g097": "node ../../scripts/check-malicious-relay-g097.mjs",
