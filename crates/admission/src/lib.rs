@@ -1136,7 +1136,10 @@ fn canonical_invite_signing_bytes(descriptor: InviteSigningDescriptor<'_>) -> Ve
         &(descriptor.signaling_metadata.signaling_endpoint.len() as u64).to_le_bytes(),
     );
     bytes.extend_from_slice(descriptor.signaling_metadata.signaling_endpoint.as_bytes());
-    let policy = descriptor.signaling_metadata.endpoint_policy.canonical_name();
+    let policy = descriptor
+        .signaling_metadata
+        .endpoint_policy
+        .canonical_name();
     bytes.extend_from_slice(&(policy.len() as u64).to_le_bytes());
     bytes.extend_from_slice(policy.as_bytes());
     bytes.extend_from_slice(
@@ -1186,9 +1189,7 @@ fn canonical_invite_signing_bytes(descriptor: InviteSigningDescriptor<'_>) -> Ve
     bytes.push(u8::from(descriptor.revocation_policy.revocable));
     append_signed_str(
         &mut bytes,
-        &descriptor
-            .revocation_policy
-            .revocation_authority_commitment,
+        &descriptor.revocation_policy.revocation_authority_commitment,
     );
     bytes.push(u8::from(descriptor.revocation_policy.expiry_enforced));
     bytes.push(u8::from(descriptor.revocation_policy.max_use_enforced));
