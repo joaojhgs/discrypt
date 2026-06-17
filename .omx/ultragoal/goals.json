@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-17T09:15:20.508Z",
+  "updatedAt": "2026-06-17T11:34:45.359Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -309,14 +309,14 @@
       "id": "G027-p2-t04-pending-join-non-member-state",
       "title": "P2-T04 pending join non-member state",
       "objective": "Implement PER-16/P2-T04 pending invite join as explicit non-member state: pending joiner cannot send protected text or join protected voice, pending state survives reload without OpenMLS member handle, signed descriptor naming remains correct, and post-Welcome admitted send works without missing OpenMLS group state.",
-      "status": "in_progress",
+      "status": "complete",
       "attempt": 1,
       "createdAt": "2026-06-17T09:15:12.545Z",
-      "updatedAt": "2026-06-17T09:15:20.508Z",
-      "evidence": ".omx/plans/P2-T04-pending-join-non-member-state-2026-06-17.md",
-      "startedAt": "2026-06-17T09:15:20.508Z"
+      "updatedAt": "2026-06-17T11:34:45.359Z",
+      "evidence": "PER-16/P2-T04 pending join non-member state implemented on PR #17 head 6c19e24f921f0c6242dd017908c2d2a6dd413103: parsed invite joins persist as pending/non-member, pending reload does not promote membership, protected text and voice reject before OpenMLS Welcome, no pre-Welcome OpenMLS handle is created, post-Welcome protected send succeeds, QA approved, architect accepted product-code scope, and GitHub Actions required checks are green.",
+      "startedAt": "2026-06-17T09:15:20.508Z",
+      "completedAt": "2026-06-17T11:34:45.359Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
-  "activeGoalId": "G027-p2-t04-pending-join-non-member-state"
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
 }
