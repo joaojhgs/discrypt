@@ -19,7 +19,8 @@ use crate::{
     RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
-    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcNegotiationConfig,
+    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDiagnosticTimeline,
+    WebRtcNegotiationConfig,
 };
 #[cfg(any(
     test,
@@ -450,6 +451,12 @@ pub struct ProviderWebRtcDataChannelProbe {
     /// Versioned serialized runtime handoff material captured during the probe.
     #[serde(default)]
     pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
+    /// Offerer-side redacted ICE/DTLS/DataChannel diagnostic timeline.
+    #[serde(default)]
+    pub offerer_diagnostic_timeline: Option<WebRtcDiagnosticTimeline>,
+    /// Answerer-side redacted ICE/DTLS/DataChannel diagnostic timeline.
+    #[serde(default)]
+    pub answerer_diagnostic_timeline: Option<WebRtcDiagnosticTimeline>,
 }
 
 /// Evidence returned when a live provider-signaled text/control runtime is attached.
@@ -2113,10 +2120,14 @@ where
     let offerer_data = alice_webrtc.text_control_transport_metrics().await;
     let answerer_data = bob_webrtc.text_control_transport_metrics().await;
     if !offerer_data.open || !answerer_data.open {
+        let offerer_timeline = alice_webrtc.diagnostic_timeline().await.to_redacted_json();
+        let answerer_timeline = bob_webrtc.diagnostic_timeline().await.to_redacted_json();
         return Err(TransportError::Unavailable(format!(
-            "provider-signaled WebRTC runtime data channel did not open: alice={:?} bob={:?}",
+            "provider-signaled WebRTC runtime data channel did not open: alice={:?} bob={:?} offerer_timeline={} answerer_timeline={}",
             alice_webrtc.direct_path_metrics().await,
-            bob_webrtc.direct_path_metrics().await
+            bob_webrtc.direct_path_metrics().await,
+            offerer_timeline,
+            answerer_timeline
         )));
     }
 
@@ -2825,10 +2836,14 @@ where
     let offerer_data = alice_webrtc.text_control_transport_metrics().await;
     let answerer_data = bob_webrtc.text_control_transport_metrics().await;
     if !offerer_data.open || !answerer_data.open {
+        let offerer_timeline = alice_webrtc.diagnostic_timeline().await.to_redacted_json();
+        let answerer_timeline = bob_webrtc.diagnostic_timeline().await.to_redacted_json();
         return Err(TransportError::Unavailable(format!(
-            "provider-signaled WebRTC data channel did not open: alice={:?} bob={:?}",
+            "provider-signaled WebRTC data channel did not open: alice={:?} bob={:?} offerer_timeline={} answerer_timeline={}",
             alice_webrtc.direct_path_metrics().await,
-            bob_webrtc.direct_path_metrics().await
+            bob_webrtc.direct_path_metrics().await,
+            offerer_timeline,
+            answerer_timeline
         )));
     }
 
@@ -2866,6 +2881,8 @@ where
     let bob_direct = bob_webrtc.direct_path_metrics().await;
     let offerer_data = alice_webrtc.text_control_transport_metrics().await;
     let answerer_data = bob_webrtc.text_control_transport_metrics().await;
+    let offerer_diagnostic_timeline = alice_webrtc.diagnostic_timeline().await;
+    let answerer_diagnostic_timeline = bob_webrtc.diagnostic_timeline().await;
 
     let now_unix_seconds = Utc::now().timestamp();
     let mut runtime_ice_candidates = Vec::new();
@@ -2919,6 +2936,8 @@ where
         receipt_frame_roundtrip,
         receipt_frame_sha256,
         runtime_spec: Some(runtime_spec),
+        offerer_diagnostic_timeline: Some(offerer_diagnostic_timeline),
+        answerer_diagnostic_timeline: Some(answerer_diagnostic_timeline),
     })
 }
 
@@ -8272,6 +8291,8 @@ mod tests {
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "receipt-sha".to_owned(),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
         let spec = ProviderTextControlRuntimeSpec::from_probe_without_negotiation_material(
             &probe, 100, 60,
