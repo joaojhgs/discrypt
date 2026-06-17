@@ -1224,10 +1224,18 @@ impl WebRtcNegotiator {
         &self,
         candidate: WebRtcIceCandidate,
     ) -> Result<(), TransportError> {
-        if self.peer_connection.remote_description().await.is_none() {
+        let queued = {
+            let mut pending = self.pending_remote_candidates.lock().await;
+            if self.peer_connection.remote_description().await.is_none() {
+                pending.push(candidate.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if queued {
             self.record_remote_candidate_event(&candidate, "queued")
                 .await;
-            self.pending_remote_candidates.lock().await.push(candidate);
             return Ok(());
         }
         self.apply_remote_candidate(candidate).await
