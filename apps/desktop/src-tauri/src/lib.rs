@@ -7822,7 +7822,7 @@ impl PersistedAppState {
                     display_name: local_display_name.clone(),
                     device_id: local_device_id.clone(),
                     role: group_role_from_legacy_label(&group.role),
-                    status: "unknown".to_owned(),
+                    status: "migration_default".to_owned(),
                     signer_public_key_hex: None,
                     joined_at: migrated_at.clone(),
                     last_seen_at: None,
@@ -11121,11 +11121,7 @@ impl PersistedAppState {
                     )
                 })?;
             return Ok(TextControlRuntimePeerAttachment {
-                role: if local.role == "reply" {
-                    ProviderTextControlRuntimePeerRole::Answerer
-                } else {
-                    ProviderTextControlRuntimePeerRole::Offerer
-                },
+                role: dm_text_control_runtime_role(&local.role),
                 local_peer_id: SignalingPeerId::new(local.peer_id.clone())
                     .map_err(|error| error.to_string())?,
                 remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
@@ -11142,17 +11138,20 @@ impl PersistedAppState {
                         "Active group {group_id} is missing for text/control runtime peer attachment"
                     )
                 })?;
-            let local_role = local_role_for_group(group, &self.local_user_id())
+            let local_role = runtime_role_for_group(group, &self.local_user_id())
                 .cloned()
-                .unwrap_or_else(|| group_role_from_legacy_label(&group.role));
+                .ok_or_else(|| {
+                    format!(
+                        "Active group {group_id} has no current backend-governed local member role for text/control runtime peer attachment"
+                    )
+                })?;
             let local_role_label = group_role_label(&local_role);
-            let repaired_runtime_peers =
-                group_runtime_peers(group.connectivity.as_ref(), local_role_label);
-            let runtime_peers = if repaired_runtime_peers.len() == 2 {
-                repaired_runtime_peers.as_slice()
-            } else {
-                group.runtime_peers.as_slice()
-            };
+            let runtime_peers = group_runtime_peers(group.connectivity.as_ref(), local_role_label);
+            if runtime_peers.len() != 2 {
+                return Err(format!(
+                    "Active group {group_id} has no signed group bootstrap peer ids for text/control runtime peer attachment"
+                ));
+            }
             let local = runtime_peers
                 .iter()
                 .find(|peer| peer.is_local)
@@ -11185,11 +11184,11 @@ impl PersistedAppState {
                 );
             }
             return Ok(TextControlRuntimePeerAttachment {
-                role: if local.role == "member" {
-                    ProviderTextControlRuntimePeerRole::Answerer
-                } else {
-                    ProviderTextControlRuntimePeerRole::Offerer
-                },
+                role: group_text_control_runtime_role(
+                    &local_role,
+                    &local.peer_id,
+                    &remote.peer_id,
+                )?,
                 local_peer_id: SignalingPeerId::new(local.peer_id.clone())
                     .map_err(|error| error.to_string())?,
                 remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
@@ -14216,6 +14215,31 @@ fn parse_text_control_runtime_role(
     }
 }
 
+fn dm_text_control_runtime_role(local_role: &str) -> ProviderTextControlRuntimePeerRole {
+    if local_role == "reply" {
+        ProviderTextControlRuntimePeerRole::Answerer
+    } else {
+        ProviderTextControlRuntimePeerRole::Offerer
+    }
+}
+
+fn group_text_control_runtime_role(
+    local_role: &GroupRoleView,
+    local_peer_id: &str,
+    remote_peer_id: &str,
+) -> Result<ProviderTextControlRuntimePeerRole, String> {
+    if local_peer_id == remote_peer_id {
+        return Err(
+            "Text/control runtime role is ambiguous because local and remote peer ids match"
+                .to_owned(),
+        );
+    }
+    Ok(match local_role {
+        GroupRoleView::Owner | GroupRoleView::Staff => ProviderTextControlRuntimePeerRole::Offerer,
+        GroupRoleView::Member => ProviderTextControlRuntimePeerRole::Answerer,
+    })
+}
+
 fn prepare_text_control_runtime_attach_job(
     guard: &mut TauriAppService,
     command_name: &'static str,
@@ -14953,6 +14977,30 @@ fn local_role_for_group<'a>(
         .iter()
         .find(|member| member.member_id == local_member_id && member.status != "revoked")
         .map(|member| &member.role)
+}
+
+fn runtime_role_for_group<'a>(
+    group: &'a GroupView,
+    local_member_id: &str,
+) -> Option<&'a GroupRoleView> {
+    let member = group.members.iter().find(|member| {
+        member.member_id == local_member_id
+            && member.status != "revoked"
+            && member.status != "migration_default"
+    })?;
+    let has_role_evidence = group.governance_log.iter().any(|entry| {
+        entry.target_member_id.as_deref() == Some(local_member_id)
+            && entry.role_after.as_ref() == Some(&member.role)
+            && !matches!(
+                entry.event_kind.as_str(),
+                "group_governance_initialized" | "governance.defaults_restored"
+            )
+    });
+    if has_role_evidence {
+        Some(&member.role)
+    } else {
+        None
+    }
 }
 
 fn local_member_is_revoked(group: &GroupView, local_member_id: &str) -> bool {
@@ -20032,9 +20080,9 @@ mod tests {
     }
 
     #[test]
-    fn group_text_runtime_attachment_repairs_stale_owner_runtime_peer_role() -> Result<(), String> {
+    fn group_text_runtime_attachment_derives_owner_offer_role_after_reload() -> Result<(), String> {
         let _guard = test_lock();
-        reset_with_temp_state("group-runtime-peer-repair-owner");
+        let path = reset_with_temp_state("group-runtime-peer-contract-owner");
         create_user(CreateUserRequest {
             display_name: "Alice Owner".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -20081,12 +20129,307 @@ mod tests {
             active_group.role = "member".to_owned();
             active_group.runtime_peers =
                 group_runtime_peers(active_group.connectivity.as_ref(), "member");
+            guard.persist();
         }
 
-        let attachment = load_state().active_runtime_peer_attachment_for_text_control()?;
+        let attachment =
+            load_state_from_path(&path).active_runtime_peer_attachment_for_text_control()?;
         assert_eq!(attachment.role, ProviderTextControlRuntimePeerRole::Offerer);
         assert_eq!(attachment.local_peer_id.0, owner_peer);
         assert_eq!(attachment.remote_peer_id.0, member_peer);
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachment_derives_staff_offer_role_after_reload() -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-runtime-peer-contract-staff");
+        create_user(CreateUserRequest {
+            display_name: "Alice Staff".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Staff Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .first()
+            .ok_or_else(|| "created group missing".to_owned())?
+            .clone();
+        let owner_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "owner")
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "owner peer missing".to_owned())?;
+        let member_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "member")
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "member peer missing".to_owned())?;
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let local_user_id = guard.state.local_user_id();
+            let active_group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|candidate| candidate.group_id == group.group_id)
+                .ok_or_else(|| "active group missing".to_owned())?;
+            active_group.role = "member".to_owned();
+            active_group.runtime_peers =
+                group_runtime_peers(active_group.connectivity.as_ref(), "member");
+            let local_member = active_group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == local_user_id)
+                .ok_or_else(|| "local member missing".to_owned())?;
+            local_member.role = GroupRoleView::Staff;
+            let now = Utc::now().to_rfc3339();
+            let event_id = stable_id(
+                "governance",
+                &format!(
+                    "{}:{}:staff-runtime-test",
+                    active_group.group_id, local_user_id
+                ),
+                active_group.governance_log.len() as u64 + 1,
+            );
+            active_group.governance_log.push(governance_log_entry(
+                &event_id,
+                &active_group.group_id,
+                "member.promoted",
+                &local_user_id,
+                Some(&local_user_id),
+                Some(GroupRoleView::Owner),
+                Some(GroupRoleView::Staff),
+                &now,
+                "Promoted local member to staff for runtime role selection test",
+            ));
+            guard.persist();
+        }
+
+        let attachment =
+            load_state_from_path(&path).active_runtime_peer_attachment_for_text_control()?;
+        assert_eq!(attachment.role, ProviderTextControlRuntimePeerRole::Offerer);
+        assert_eq!(attachment.local_peer_id.0, owner_peer);
+        assert_eq!(attachment.remote_peer_id.0, member_peer);
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachment_derives_member_answer_role_after_invite_join(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("group-runtime-peer-contract-owner-invite");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Invite Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let owner_group = created
+            .groups
+            .first()
+            .ok_or_else(|| "owner group missing".to_owned())?
+            .clone();
+        let owner_peer = owner_group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "owner")
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "owner peer missing".to_owned())?;
+        let member_peer = owner_group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "member")
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "member peer missing".to_owned())?;
+        let invited = create_invite(CreateInviteRequest {
+            group_id: Some(owner_group.group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        assert!(invited.last_command_error.is_none(), "{invited:?}");
+        let invite_code = invited
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "group invite code missing".to_owned())?;
+
+        let bob_path = reset_with_temp_state("group-runtime-peer-contract-member-join");
+        create_user(CreateUserRequest {
+            display_name: "Bob Member".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: Some("Runtime Invite Lab".to_owned()),
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active_group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|candidate| candidate.group_id == owner_group.group_id)
+                .ok_or_else(|| "joined group missing".to_owned())?;
+            active_group.role = "owner".to_owned();
+            active_group.runtime_peers =
+                group_runtime_peers(active_group.connectivity.as_ref(), "owner");
+            guard.persist();
+        }
+
+        let attachment =
+            load_state_from_path(&bob_path).active_runtime_peer_attachment_for_text_control()?;
+        assert_eq!(
+            attachment.role,
+            ProviderTextControlRuntimePeerRole::Answerer
+        );
+        assert_eq!(attachment.local_peer_id.0, member_peer);
+        assert_eq!(attachment.remote_peer_id.0, owner_peer);
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachment_fails_without_current_local_member_role() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-runtime-peer-contract-missing-roster-role");
+        create_user(CreateUserRequest {
+            display_name: "Alice Missing Role".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Missing Role Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active_group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|candidate| candidate.group_id == group_id)
+                .ok_or_else(|| "active group missing".to_owned())?;
+            active_group.role = "owner".to_owned();
+            active_group.members.clear();
+            active_group.runtime_peers =
+                group_runtime_peers(active_group.connectivity.as_ref(), "owner");
+            guard.persist();
+        }
+
+        let error =
+            match load_state_from_path(&path).active_runtime_peer_attachment_for_text_control() {
+                Ok(_) => {
+                    return Err("runtime attachment unexpectedly used stale legacy role".to_owned())
+                }
+                Err(error) => error,
+            };
+        assert!(
+            error.contains("no current backend-governed local member role"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachment_fails_without_signed_bootstrap_peer_ids() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-runtime-peer-contract-missing-bootstrap");
+        create_user(CreateUserRequest {
+            display_name: "Alice Missing Bootstrap".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Missing Bootstrap Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active_group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|candidate| candidate.group_id == group_id)
+                .ok_or_else(|| "active group missing".to_owned())?;
+            active_group.role = "member".to_owned();
+            active_group.runtime_peers =
+                group_runtime_peers(active_group.connectivity.as_ref(), "member");
+            active_group.connectivity = None;
+            guard.persist();
+        }
+
+        let error = match load_state_from_path(&path)
+            .active_runtime_peer_attachment_for_text_control()
+        {
+            Ok(_) => {
+                return Err(
+                    "runtime attachment unexpectedly used stale persisted runtime peers".to_owned(),
+                )
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("no signed group bootstrap peer ids"),
+            "{error}"
+        );
         Ok(())
     }
 
