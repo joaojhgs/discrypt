@@ -14382,12 +14382,14 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
             }
         };
 
+        let runtime_local_peer_id = job.local_peer_id.clone();
+        let runtime_remote_peer_id = job.remote_peer_id.clone();
         let runtime_result = start_role_split_text_control_runtime(
             executor.clone(),
             job.inputs,
             job.role,
-            job.local_peer_id,
-            job.remote_peer_id,
+            runtime_local_peer_id,
+            runtime_remote_peer_id,
         );
         let service = app_service();
         let mut guard = service
