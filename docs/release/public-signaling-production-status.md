@@ -75,12 +75,10 @@ Behavior:
 - Joins a pre-derived `RendezvousCapability` and creates provider-visible topics under:
   - `discrypt/v1/rendezvous/{hashed-topic}/presence`
   - `discrypt/v1/rendezvous/{hashed-topic}/signal/{peer-id}`
-  - `discrypt/v1/rendezvous/{hashed-topic}/control`
 - Publishes only sealed/opaque payload envelopes:
   - encrypted presence bytes
   - `SealedWebRtcNegotiationPayload` for offer/answer/candidate signaling
-  - opaque room control bytes
-- Keeps the public broker away from raw SDP, ICE credentials, display names, group names, invite secrets, message plaintext, and audio plaintext.
+- Keeps the public broker away from raw SDP, ICE credentials, display names, group names, invite secrets, message plaintext, application data frames, receipts, and audio plaintext.
 - Marks MQTT boundary readiness as `implementation_available` only when compiled with `mqtt-adapter`.
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
 - **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
@@ -213,7 +211,7 @@ Nostr status:
 - It verifies opaque provider roundtrip only:
   1. Alice publishes sealed presence and Bob receives it.
   2. Alice sends a sealed WebRTC offer envelope to Bob and Bob receives it.
-  3. Bob broadcasts sealed control and Alice receives it.
+  3. No app data or receipts are sent through the provider; text/control proof belongs to the WebRTC DataChannel tests below.
 
 These are real public signaling proofs at the provider adapter boundary.
 

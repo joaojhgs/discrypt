@@ -98,6 +98,7 @@ for (const path of [
 }
 
 for (const path of [
+  "docs/adapters/nostr-adapter-readiness.md",
   "docs/security/g132-stun-turn-provider-privacy-gate.md",
   "docs/release/public-signaling-production-status.md",
 ]) {
@@ -105,6 +106,17 @@ for (const path of [
     path,
     /sealed (?:WebRTC-negotiation payload, and sealed control broadcast|presence\/signal\/control)/,
     "release copy must describe providers as presence plus sealed WebRTC negotiation only"
+  );
+}
+
+for (const path of [
+  "docs/adapters/nostr-adapter-readiness.md",
+  "docs/release/public-signaling-production-status.md",
+]) {
+  forbid(
+    path,
+    /opaque room control bytes|control messages via the healthy relay set|discrypt\/v1\/rendezvous\/\{hashed-topic\}\/control|Bob broadcasts sealed control/,
+    "provider-facing docs must not advertise provider control/app-payload relay"
   );
 }
 
