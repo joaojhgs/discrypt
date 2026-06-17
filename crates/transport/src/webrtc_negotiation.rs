@@ -689,7 +689,10 @@ impl DataChannelHub {
         if self.metrics.lock().await.open {
             return Ok(());
         }
-        if timeout(duration, self.open_notify.notified()).await.is_err() {
+        if timeout(duration, self.open_notify.notified())
+            .await
+            .is_err()
+        {
             let mut event = diagnostic_event("failure");
             event.peer_role = Some("local".to_owned());
             event.failure_reason = Some("DataChannel did not open".to_owned());
@@ -1200,7 +1203,9 @@ impl WebRtcNegotiator {
         self.peer_connection
             .set_remote_description(remote_answer.into_rtc()?)
             .await
-            .map_err(|err| TransportError::Unavailable(format!("set remote answer failed: {err}")))?;
+            .map_err(|err| {
+                TransportError::Unavailable(format!("set remote answer failed: {err}"))
+            })?;
         let mut event = diagnostic_event("sdp");
         event.peer_role = Some("offerer".to_owned());
         event.direction = Some("remote".to_owned());
@@ -1333,10 +1338,9 @@ impl WebRtcNegotiator {
 
     /// Close the peer connection.
     pub async fn close(&self) -> Result<(), TransportError> {
-        self.peer_connection
-            .close()
-            .await
-            .map_err(|err| TransportError::Unavailable(format!("close WebRTC peer failed: {err}")))?;
+        self.peer_connection.close().await.map_err(|err| {
+            TransportError::Unavailable(format!("close WebRTC peer failed: {err}"))
+        })?;
         let mut event = diagnostic_event("peer_connection");
         event.peer_role = Some("local".to_owned());
         event.state = Some("closed".to_owned());
@@ -1462,16 +1466,18 @@ impl PeerConnectionEventHandler for CandidateCollector {
         record_timeline_event(&self.timeline, event).await;
         let mut dtls_event = diagnostic_event("dtls_transport_state");
         dtls_event.peer_role = Some("local".to_owned());
-        dtls_event.state = Some(match state {
-            RTCPeerConnectionState::Connected => "connected",
-            RTCPeerConnectionState::Connecting => "connecting",
-            RTCPeerConnectionState::Disconnected => "disconnected",
-            RTCPeerConnectionState::Failed => "failed",
-            RTCPeerConnectionState::Closed => "closed",
-            RTCPeerConnectionState::New => "new",
-            _ => "unknown",
-        }
-        .to_owned());
+        dtls_event.state = Some(
+            match state {
+                RTCPeerConnectionState::Connected => "connected",
+                RTCPeerConnectionState::Connecting => "connecting",
+                RTCPeerConnectionState::Disconnected => "disconnected",
+                RTCPeerConnectionState::Failed => "failed",
+                RTCPeerConnectionState::Closed => "closed",
+                RTCPeerConnectionState::New => "new",
+                _ => "unknown",
+            }
+            .to_owned(),
+        );
         record_timeline_event(&self.timeline, dtls_event).await;
     }
 
@@ -1512,8 +1518,9 @@ impl PeerConnectionEventHandler for CandidateCollector {
             Err(err) => {
                 let mut event = diagnostic_event("failure");
                 event.peer_role = Some("local".to_owned());
-                event.failure_reason =
-                    Some(redacted_failure_reason(format!("ICE candidate export failed: {err}")));
+                event.failure_reason = Some(redacted_failure_reason(format!(
+                    "ICE candidate export failed: {err}"
+                )));
                 record_timeline_event(&self.timeline, event).await;
             }
         }
@@ -1743,13 +1750,11 @@ mod tests {
         assert!(offerer_timeline
             .events
             .iter()
-            .any(|event| event.kind == "data_channel"
-                && event.state.as_deref() == Some("open")));
+            .any(|event| event.kind == "data_channel" && event.state.as_deref() == Some("open")));
         assert!(offerer_timeline
             .events
             .iter()
-            .any(|event| event.kind == "data_channel"
-                && event.state.as_deref() == Some("closed")));
+            .any(|event| event.kind == "data_channel" && event.state.as_deref() == Some("closed")));
         Ok(())
     }
 
@@ -1802,7 +1807,10 @@ mod tests {
             "ice-pwd",
             "v=0",
         ] {
-            assert!(!json.contains(forbidden), "timeline leaked {forbidden}: {json}");
+            assert!(
+                !json.contains(forbidden),
+                "timeline leaked {forbidden}: {json}"
+            );
         }
         assert!(json.contains("DataChannel did not open"));
         assert!(json.contains("remote"));
