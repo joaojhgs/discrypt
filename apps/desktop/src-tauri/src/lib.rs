@@ -4589,7 +4589,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
-                role: "member".to_owned(),
+                role: "pending".to_owned(),
                 channels: default_group_channels(state.next_sequence),
                 members: vec![local_member],
                 role_policy: initial_group_role_policy(
@@ -4609,12 +4609,20 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 connectivity: Some(connectivity),
             });
         } else if let Some(parsed) = parsed_invite.as_ref() {
+            let has_openmls_handle = state
+                .openmls_groups
+                .iter()
+                .any(|handle| handle.group_id == group_id);
             if let Some(existing_group) = state
                 .groups
                 .iter_mut()
                 .find(|group| group.group_id == group_id)
             {
-                existing_group.role = "member".to_owned();
+                existing_group.role = if has_openmls_handle {
+                    "member".to_owned()
+                } else {
+                    "pending".to_owned()
+                };
                 existing_group.runtime_peers =
                     group_runtime_peers(Some(&parsed.connectivity), "member");
                 existing_group.connectivity = Some(parsed.connectivity.clone());
@@ -6516,6 +6524,10 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
         let session_id = stable_voice_session_id(&request.group_id, &request.channel_id);
+        if let Err(error) = ensure_group_sender_admitted_for_voice(state, &request.group_id) {
+            state.push_command_error("voice.rejected", "join_voice", error.0, error.1, error.2);
+            return;
+        }
         if let Err(error) = ensure_group_sender_not_revoked(state, &request.group_id) {
             state.push_command_error(
                 "voice.rejected",
@@ -7831,11 +7843,11 @@ impl PersistedAppState {
                     revoked_by: None,
                 });
             }
-            if let Some(local_member) = group
-                .members
-                .iter()
-                .find(|member| member.member_id == local_member_id && member.revoked_at.is_none())
-            {
+            if let Some(local_member) = group.members.iter().find(|member| {
+                member.member_id == local_member_id
+                    && member.revoked_at.is_none()
+                    && member.status != "pending"
+            }) {
                 group.role = group_role_label(&local_member.role).to_owned();
             }
             if group.governance_log.is_empty() {
@@ -8108,7 +8120,11 @@ impl PersistedAppState {
         let role = group
             .members
             .iter()
-            .find(|member| member.member_id == local_member_id && member.status != "revoked")
+            .find(|member| {
+                member.member_id == local_member_id
+                    && member.status != "revoked"
+                    && member.status != "pending"
+            })
             .map(|member| member.role.clone())
             .unwrap_or_else(|| group_role_from_legacy_label(&group.role));
         match role {
@@ -8333,6 +8349,9 @@ impl PersistedAppState {
             member.status = "unknown".to_owned();
             member.revoked_at = None;
             member.revoked_by = None;
+            if member_identity == actor_member_id {
+                group.role = "member".to_owned();
+            }
             return;
         }
         group.members.push(GroupMemberView {
@@ -14975,7 +14994,11 @@ fn local_role_for_group<'a>(
     group
         .members
         .iter()
-        .find(|member| member.member_id == local_member_id && member.status != "revoked")
+        .find(|member| {
+            member.member_id == local_member_id
+                && member.status != "revoked"
+                && member.status != "pending"
+        })
         .map(|member| &member.role)
 }
 
@@ -15065,6 +15088,43 @@ fn ensure_text_target_not_revoked(
         if let Some(group_id) = target.group_id.as_deref() {
             ensure_group_sender_not_revoked(state, group_id)?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_group_sender_admitted_for_voice(
+    state: &PersistedAppState,
+    group_id: &str,
+) -> Result<(), (&'static str, String, &'static str)> {
+    let local_member_id = state.local_user_id();
+    if let Some(group) = state.groups.iter().find(|group| group.group_id == group_id) {
+        if group
+            .members
+            .iter()
+            .find(|member| member.member_id == local_member_id && member.status != "revoked")
+            .is_some_and(|member| member.status == "pending")
+        {
+            return Err((
+                "admission_pending",
+                "This profile is still waiting for owner/staff admission; protected voice is blocked until an OpenMLS Welcome is received"
+                    .to_owned(),
+                "Keep both peers online, wait for approval, then retry after the group shows admitted membership",
+            ));
+        }
+    }
+    if !state
+        .openmls_groups
+        .iter()
+        .any(|handle| handle.group_id == group_id)
+    {
+        return Err((
+            "openmls_group_state_missing",
+            format!(
+                "OpenMLS group state is missing for {}",
+                redacted_observable_ref("group", group_id)
+            ),
+            "Complete invite admission so a persisted OpenMLS group handle exists before joining protected voice",
+        ));
     }
     Ok(())
 }
@@ -17850,7 +17910,11 @@ mod tests {
             .find(|group| group.name == "G010 Native Lab")
             .cloned()
             .ok_or_else(|| "bob native group missing".to_owned())?;
-        assert_eq!(bob_group.role, "member");
+        assert_eq!(
+            bob_group.role, "pending",
+            "invite parsing must not surface pending joiners as admitted members"
+        );
+        assert_eq!(bob_group.members[0].status, "pending");
         assert!(bob_group.connectivity.as_ref().is_some_and(|policy| {
             policy.scope_id_commitment == group_invite.scope_id_commitment
                 && policy.ice_stun_servers == group_invite.ice_stun_servers
@@ -17920,35 +17984,23 @@ mod tests {
             output_device_label: Some("Bob native speaker".to_owned()),
         });
         assert!(
-            bob_voice_joined.last_command_error.is_none(),
-            "{bob_voice_joined:?}"
+            bob_voice_joined.voice_session.is_none(),
+            "pending invite joiner must not create a joined voice session: {bob_voice_joined:?}"
         );
-        let bob_voice_session = bob_voice_joined
-            .voice_session
+        let bob_voice_error = bob_voice_joined
+            .last_command_error
             .as_ref()
-            .ok_or_else(|| "bob voice session missing".to_owned())?;
-        assert!(bob_voice_session.joined);
-        assert_eq!(bob_voice_session.participants.len(), 1);
-        assert!(!bob_voice_session.media_runtime.remote_transport_active);
-        assert!(bob_voice_session.media_runtime.remote_audio.is_empty());
-        let bob_session_id = bob_voice_session.session_id.clone();
-        assert!(set_self_mute(SetSelfMuteRequest {
-            session_id: bob_session_id.clone(),
-            muted: true,
-        })
-        .voice_session
-        .as_ref()
-        .map(|session| session.self_muted)
-        .unwrap_or(false));
-        assert!(!leave_voice(LeaveVoiceRequest {
-            session_id: bob_session_id,
-        })
-        .voice_session
-        .as_ref()
-        .map(|session| session.joined)
-        .unwrap_or(true));
+            .ok_or_else(|| "pending joiner voice should be rejected".to_owned())?;
+        assert_eq!(bob_voice_error.code, "admission_pending");
 
         let bob_reloaded = load_state_from_path(&bob_path).to_view();
+        let reloaded_group = bob_reloaded
+            .groups
+            .iter()
+            .find(|group| group.group_id == bob_group.group_id)
+            .ok_or_else(|| "bob pending group missing after reload".to_owned())?;
+        assert_eq!(reloaded_group.role, "pending");
+        assert_eq!(reloaded_group.members[0].status, "pending");
         assert!(bob_reloaded.messages.iter().any(|message| {
             message.message_id == alice_message.message_id
                 && message.state_key == "received_envelope"
@@ -18384,7 +18436,7 @@ mod tests {
         }));
         assert!(bob_reloaded.groups.iter().any(|group| {
             group.name == "G004 Lab"
-                && group.role == "member"
+                && group.role == "pending"
                 && group.connectivity.as_ref().is_some_and(|policy| {
                     policy.scope_id_commitment == group_invite.scope_id_commitment
                         && policy.ice_stun_servers == group_invite.ice_stun_servers
@@ -19302,6 +19354,10 @@ mod tests {
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| "Bob local admission group missing".to_owned())?;
         assert_eq!(
+            bob_requested_group.role, "pending",
+            "joiner compatibility role must remain pending before Welcome"
+        );
+        assert_eq!(
             bob_requested_group.members[0].status, "pending",
             "joiners must stay pending until an OpenMLS Welcome is applied"
         );
@@ -19439,6 +19495,16 @@ mod tests {
                 .any(|handle| handle.group_id == group_id),
             "approved joiner must persist OpenMLS group state before protected text"
         );
+        let bob_admitted_group = bob_after_welcome
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "Bob admitted group missing after Welcome".to_owned())?;
+        assert_eq!(bob_admitted_group.role, "member");
+        assert!(bob_admitted_group
+            .members
+            .iter()
+            .any(|member| member.status != "pending"));
 
         reload_global_app_service_from_path(&bob_path);
         let sent = send_message(SendMessageRequest {
@@ -19656,6 +19722,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate.group_id == group.group_id)
             .ok_or_else(|| "Bob pending group missing".to_owned())?;
+        assert_eq!(bob_group.name, "pending send lab");
+        assert_eq!(bob_group.role, "pending");
         assert_eq!(bob_group.members[0].status, "pending");
         let channel_id = bob_group
             .channels
@@ -19680,6 +19748,10 @@ mod tests {
             .as_ref()
             .ok_or_else(|| "pending joiner send should be rejected".to_owned())?;
         assert_eq!(error.code, "admission_pending");
+        assert!(
+            load_state().openmls_groups.is_empty(),
+            "pending invite parsing must not create a local OpenMLS group handle"
+        );
         Ok(())
     }
 
@@ -24493,7 +24565,7 @@ mod tests {
                 .groups
                 .iter()
                 .any(|group| group.name == "G004 Lab"
-                    && group.role == "member"
+                    && group.role == "pending"
                     && group
                         .connectivity
                         .as_ref()
