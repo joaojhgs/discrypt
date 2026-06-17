@@ -1740,7 +1740,8 @@ mod tests {
                     && event.state.as_deref() == Some("applied")
             }));
 
-        let answerer_candidates = wait_for_local_candidates(&answerer, Duration::from_secs(5)).await;
+        let answerer_candidates =
+            wait_for_local_candidates(&answerer, Duration::from_secs(5)).await;
         assert!(
             !answerer_candidates.is_empty(),
             "answerer must gather at least one local candidate for pre-answer queueing coverage"
