@@ -1338,14 +1338,28 @@ impl WebRtcNegotiator {
 
     /// Close the peer connection.
     pub async fn close(&self) -> Result<(), TransportError> {
-        self.peer_connection.close().await.map_err(|err| {
-            TransportError::Unavailable(format!("close WebRTC peer failed: {err}"))
-        })?;
-        let mut event = diagnostic_event("peer_connection");
-        event.peer_role = Some("local".to_owned());
-        event.state = Some("closed".to_owned());
-        record_timeline_event(&self.timeline, event).await;
-        Ok(())
+        match self.peer_connection.close().await {
+            Ok(()) => {
+                let mut event = diagnostic_event("peer_connection");
+                event.peer_role = Some("local".to_owned());
+                event.state = Some("closed".to_owned());
+                record_timeline_event(&self.timeline, event).await;
+                Ok(())
+            }
+            Err(err) => {
+                let reason = redacted_failure_reason(format!("close WebRTC peer failed: {err}"));
+                let mut event = diagnostic_event("peer_connection");
+                event.peer_role = Some("local".to_owned());
+                event.state = Some("close_failed".to_owned());
+                event.failure_reason = Some(reason.clone());
+                record_timeline_event(&self.timeline, event).await;
+                if reason.contains("Disconnected(Close)") {
+                    Ok(())
+                } else {
+                    Err(TransportError::Unavailable(reason))
+                }
+            }
+        }
     }
 }
 
