@@ -1350,10 +1350,15 @@ impl WebRtcNegotiator {
                 let reason = redacted_failure_reason(format!("close WebRTC peer failed: {err}"));
                 let mut event = diagnostic_event("peer_connection");
                 event.peer_role = Some("local".to_owned());
-                event.state = Some("close_failed".to_owned());
+                let already_disconnected = reason.contains("Disconnected(Close)");
+                event.state = Some(if already_disconnected {
+                    "close_already_disconnected".to_owned()
+                } else {
+                    "close_failed".to_owned()
+                });
                 event.failure_reason = Some(reason.clone());
                 record_timeline_event(&self.timeline, event).await;
-                if reason.contains("Disconnected(Close)") {
+                if already_disconnected {
                     Ok(())
                 } else {
                     Err(TransportError::Unavailable(reason))
