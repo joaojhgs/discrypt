@@ -2021,10 +2021,14 @@ mod tests {
             username_fragment: Some("ufrag-secret".to_owned()),
             url: Some("turns:secret-turn.example.invalid:5349".to_owned()),
         };
-        let error = answerer
-            .add_remote_candidate(malformed)
-            .await
-            .expect_err("malformed candidate after remote SDP must fail closed");
+        let error = match answerer.add_remote_candidate(malformed).await {
+            Ok(()) => {
+                return Err(TransportError::Unavailable(
+                    "malformed candidate after remote SDP must fail closed".to_owned(),
+                ))
+            }
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(!message.contains("secret-host"));
         assert!(!message.contains("ufrag-secret"));
