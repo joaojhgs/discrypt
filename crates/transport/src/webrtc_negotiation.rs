@@ -23,6 +23,190 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState, RTCSdpType, RTCSessionDescription, Registry,
 };
 
+/// Redacted WebRTC diagnostic timeline safe for logs, Tauri diagnostics, and issue evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebRtcDiagnosticTimeline {
+    /// Snapshot schema version for diagnostic consumers.
+    pub schema_version: u16,
+    /// Ordered redacted WebRTC events.
+    pub events: Vec<WebRtcDiagnosticEvent>,
+    /// Redacted SDP offers observed locally or remotely.
+    pub offer_count: u64,
+    /// Redacted SDP answers observed locally or remotely.
+    pub answer_count: u64,
+    /// Local ICE candidates gathered by this peer.
+    pub local_candidate_count: u64,
+    /// Remote ICE candidates applied or queued for this peer.
+    pub remote_candidate_count: u64,
+    /// Last failure reason, if any. This must never contain raw SDP, ICE, TURN, or frame bytes.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+impl WebRtcDiagnosticTimeline {
+    /// Current diagnostic timeline schema.
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    /// Compact JSON export intended for failing-run logs.
+    pub fn to_redacted_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            "{\"schema_version\":1,\"events\":[],\"failure_reason\":\"diagnostic timeline serialization failed\"}".to_owned()
+        })
+    }
+}
+
+/// One ordered redacted WebRTC diagnostic event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebRtcDiagnosticEvent {
+    /// Monotonic sequence within this peer timeline.
+    pub sequence: u64,
+    /// Event time in RFC3339 form.
+    pub observed_at: DateTime<Utc>,
+    /// Stable event kind.
+    pub kind: String,
+    /// Peer role when known: `offerer`, `answerer`, or `local`.
+    #[serde(default)]
+    pub peer_role: Option<String>,
+    /// Direction when relevant: `local` or `remote`.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Redacted state value when relevant.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// SDP type when relevant.
+    #[serde(default)]
+    pub sdp_type: Option<WebRtcSdpType>,
+    /// ICE candidate type parsed from the candidate line without exposing address material.
+    #[serde(default)]
+    pub candidate_type: Option<String>,
+    /// Whether the candidate was relay/TURN-derived.
+    #[serde(default)]
+    pub relay_candidate: Option<bool>,
+    /// Count attached to count/checkpoint events.
+    #[serde(default)]
+    pub count: Option<u64>,
+    /// Redacted failure reason.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticTimelineState {
+    next_sequence: u64,
+    events: Vec<WebRtcDiagnosticEvent>,
+    offer_count: u64,
+    answer_count: u64,
+    local_candidate_count: u64,
+    remote_candidate_count: u64,
+    failure_reason: Option<String>,
+}
+
+impl Default for DiagnosticTimelineState {
+    fn default() -> Self {
+        Self {
+            next_sequence: 1,
+            events: Vec::new(),
+            offer_count: 0,
+            answer_count: 0,
+            local_candidate_count: 0,
+            remote_candidate_count: 0,
+            failure_reason: None,
+        }
+    }
+}
+
+impl DiagnosticTimelineState {
+    fn snapshot(&self) -> WebRtcDiagnosticTimeline {
+        WebRtcDiagnosticTimeline {
+            schema_version: WebRtcDiagnosticTimeline::SCHEMA_VERSION,
+            events: self.events.clone(),
+            offer_count: self.offer_count,
+            answer_count: self.answer_count,
+            local_candidate_count: self.local_candidate_count,
+            remote_candidate_count: self.remote_candidate_count,
+            failure_reason: self.failure_reason.clone(),
+        }
+    }
+
+    fn push(&mut self, mut event: WebRtcDiagnosticEvent) {
+        event.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if event.kind == "sdp" {
+            match event.sdp_type {
+                Some(WebRtcSdpType::Offer) => self.offer_count = self.offer_count.saturating_add(1),
+                Some(WebRtcSdpType::Answer) => {
+                    self.answer_count = self.answer_count.saturating_add(1);
+                }
+                None => {}
+            }
+        }
+        if event.kind == "ice_candidate" {
+            match event.direction.as_deref() {
+                Some("local") => {
+                    self.local_candidate_count = self.local_candidate_count.saturating_add(1);
+                    event.count = Some(self.local_candidate_count);
+                }
+                Some("remote") => {
+                    self.remote_candidate_count = self.remote_candidate_count.saturating_add(1);
+                    event.count = Some(self.remote_candidate_count);
+                }
+                _ => {}
+            }
+        }
+        if let Some(reason) = &event.failure_reason {
+            self.failure_reason = Some(reason.clone());
+        }
+        self.events.push(event);
+    }
+}
+
+fn diagnostic_event(kind: &str) -> WebRtcDiagnosticEvent {
+    WebRtcDiagnosticEvent {
+        sequence: 0,
+        observed_at: Utc::now(),
+        kind: kind.to_owned(),
+        peer_role: None,
+        direction: None,
+        state: None,
+        sdp_type: None,
+        candidate_type: None,
+        relay_candidate: None,
+        count: None,
+        failure_reason: None,
+    }
+}
+
+async fn record_timeline_event(
+    timeline: &Arc<Mutex<DiagnosticTimelineState>>,
+    event: WebRtcDiagnosticEvent,
+) {
+    timeline.lock().await.push(event);
+}
+
+fn redacted_failure_reason(reason: impl fmt::Display) -> String {
+    let reason = reason.to_string();
+    if reason.contains("v=0")
+        || reason.contains("candidate:")
+        || reason.contains("ice-pwd")
+        || reason.contains("ice-ufrag")
+        || reason.contains("turn:")
+        || reason.contains("turns:")
+    {
+        "redacted WebRTC failure; inspect structured diagnostic timeline".to_owned()
+    } else {
+        reason
+    }
+}
+
+fn ice_candidate_type(candidate: &WebRtcIceCandidate) -> Option<String> {
+    candidate
+        .candidate
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|pair| (pair[0] == "typ").then(|| pair[1].to_owned()))
+}
+
 /// SDP type carried through signaling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -393,10 +577,11 @@ struct DataChannelHub {
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     metrics: Arc<Mutex<DataTransportMetricsState>>,
     open_notify: Arc<Notify>,
+    timeline: Arc<Mutex<DiagnosticTimelineState>>,
 }
 
 impl DataChannelHub {
-    fn new(label: String) -> Self {
+    fn new(label: String, timeline: Arc<Mutex<DiagnosticTimelineState>>) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         Self {
             metrics: Arc::new(Mutex::new(DataTransportMetricsState::new(label.clone()))),
@@ -405,6 +590,7 @@ impl DataChannelHub {
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
             open_notify: Arc::new(Notify::new()),
+            timeline,
         }
     }
 
@@ -420,9 +606,15 @@ impl DataChannelHub {
             metrics.attached_channels = channels.len() as u64;
             metrics.last_state = "attached".to_owned();
         }
+        let mut event = diagnostic_event("data_channel");
+        event.peer_role = Some("local".to_owned());
+        event.direction = Some("local".to_owned());
+        event.state = Some("attached".to_owned());
+        record_timeline_event(&self.timeline, event).await;
         let inbound_tx = self.inbound_tx.clone();
         let metrics = Arc::clone(&self.metrics);
         let open_notify = Arc::clone(&self.open_notify);
+        let timeline = Arc::clone(&self.timeline);
         tokio::spawn(async move {
             while let Some(event) = channel.poll().await {
                 match event {
@@ -432,6 +624,10 @@ impl DataChannelHub {
                         metrics.last_state = "open".to_owned();
                         drop(metrics);
                         open_notify.notify_waiters();
+                        let mut event = diagnostic_event("data_channel");
+                        event.peer_role = Some("local".to_owned());
+                        event.state = Some("open".to_owned());
+                        record_timeline_event(&timeline, event).await;
                     }
                     DataChannelEvent::OnMessage(message) => {
                         let bytes = message.data.to_vec();
@@ -442,6 +638,12 @@ impl DataChannelHub {
                                 metrics.bytes_received.saturating_add(bytes.len() as u64);
                             metrics.last_state = "message".to_owned();
                         }
+                        let mut event = diagnostic_event("data_channel");
+                        event.peer_role = Some("local".to_owned());
+                        event.direction = Some("remote".to_owned());
+                        event.state = Some("message".to_owned());
+                        event.count = Some(bytes.len() as u64);
+                        record_timeline_event(&timeline, event).await;
                         if inbound_tx.send(bytes).await.is_err() {
                             break;
                         }
@@ -450,13 +652,27 @@ impl DataChannelHub {
                         let mut metrics = metrics.lock().await;
                         metrics.open = false;
                         metrics.last_state = "closed".to_owned();
+                        drop(metrics);
+                        let mut event = diagnostic_event("data_channel");
+                        event.peer_role = Some("local".to_owned());
+                        event.state = Some("closed".to_owned());
+                        record_timeline_event(&timeline, event).await;
                         break;
                     }
                     DataChannelEvent::OnClosing => {
                         metrics.lock().await.last_state = "closing".to_owned();
+                        let mut event = diagnostic_event("data_channel");
+                        event.peer_role = Some("local".to_owned());
+                        event.state = Some("closing".to_owned());
+                        record_timeline_event(&timeline, event).await;
                     }
                     DataChannelEvent::OnError => {
                         metrics.lock().await.last_state = "error".to_owned();
+                        let mut event = diagnostic_event("data_channel");
+                        event.peer_role = Some("local".to_owned());
+                        event.state = Some("error".to_owned());
+                        event.failure_reason = Some("DataChannel event error".to_owned());
+                        record_timeline_event(&timeline, event).await;
                     }
                     DataChannelEvent::OnBufferedAmountLow => {
                         metrics.lock().await.last_state = "buffered_amount_low".to_owned();
@@ -473,9 +689,15 @@ impl DataChannelHub {
         if self.metrics.lock().await.open {
             return Ok(());
         }
-        timeout(duration, self.open_notify.notified())
-            .await
-            .map_err(|_| TransportError::Unavailable("DataChannel did not open".to_owned()))?;
+        if timeout(duration, self.open_notify.notified()).await.is_err() {
+            let mut event = diagnostic_event("failure");
+            event.peer_role = Some("local".to_owned());
+            event.failure_reason = Some("DataChannel did not open".to_owned());
+            record_timeline_event(&self.timeline, event).await;
+            return Err(TransportError::Unavailable(
+                "DataChannel did not open".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -506,6 +728,13 @@ impl DataChannelHub {
         metrics.frames_sent = metrics.frames_sent.saturating_add(1);
         metrics.bytes_sent = metrics.bytes_sent.saturating_add(sent_len as u64);
         metrics.last_state = "sent".to_owned();
+        drop(metrics);
+        let mut event = diagnostic_event("data_channel");
+        event.peer_role = Some("local".to_owned());
+        event.direction = Some("local".to_owned());
+        event.state = Some("sent".to_owned());
+        event.count = Some(sent_len as u64);
+        record_timeline_event(&self.timeline, event).await;
         Ok(())
     }
 
@@ -529,6 +758,11 @@ impl DataChannelHub {
         let mut metrics = self.metrics.lock().await;
         metrics.open = false;
         metrics.last_state = "closed".to_owned();
+        drop(metrics);
+        let mut event = diagnostic_event("data_channel");
+        event.peer_role = Some("local".to_owned());
+        event.state = Some("closed".to_owned());
+        record_timeline_event(&self.timeline, event).await;
         Ok(())
     }
 }
@@ -774,6 +1008,7 @@ pub struct WebRtcNegotiator {
     peer_connection: Box<dyn PeerConnection>,
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
+    timeline: Arc<Mutex<DiagnosticTimelineState>>,
     ice_gathering_complete: Arc<Notify>,
     data_channels: DataChannelHub,
     data_channel_label: String,
@@ -792,10 +1027,13 @@ impl WebRtcNegotiator {
                 config.ice_servers.turn_servers.len() as u64,
             ),
         ));
-        let data_channels = DataChannelHub::new(config.data_channel_label.clone());
+        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
+        let data_channels =
+            DataChannelHub::new(config.data_channel_label.clone(), Arc::clone(&timeline));
         let handler = Arc::new(CandidateCollector {
             candidates: Arc::clone(&candidates),
             metrics: Arc::clone(&metrics),
+            timeline: Arc::clone(&timeline),
             ice_gathering_complete: Arc::clone(&ice_gathering_complete),
             data_channels: data_channels.clone(),
         });
@@ -836,6 +1074,7 @@ impl WebRtcNegotiator {
             peer_connection: Box::new(peer_connection),
             candidates,
             metrics,
+            timeline,
             ice_gathering_complete,
             data_channels,
             data_channel_label: config.data_channel_label,
@@ -869,6 +1108,11 @@ impl WebRtcNegotiator {
             .set_local_description(offer)
             .await
             .map_err(|err| TransportError::Unavailable(format!("set local offer failed: {err}")))?;
+        let mut event = diagnostic_event("sdp");
+        event.peer_role = Some("offerer".to_owned());
+        event.direction = Some("local".to_owned());
+        event.sdp_type = Some(WebRtcSdpType::Offer);
+        record_timeline_event(&self.timeline, event).await;
         let local = self
             .peer_connection
             .local_description()
@@ -904,6 +1148,11 @@ impl WebRtcNegotiator {
             .map_err(|err| {
                 TransportError::Unavailable(format!("set remote offer failed: {err}"))
             })?;
+        let mut remote_event = diagnostic_event("sdp");
+        remote_event.peer_role = Some("answerer".to_owned());
+        remote_event.direction = Some("remote".to_owned());
+        remote_event.sdp_type = Some(WebRtcSdpType::Offer);
+        record_timeline_event(&self.timeline, remote_event).await;
         let answer = self
             .peer_connection
             .create_answer(None)
@@ -917,6 +1166,11 @@ impl WebRtcNegotiator {
             .map_err(|err| {
                 TransportError::Unavailable(format!("set local answer failed: {err}"))
             })?;
+        let mut local_event = diagnostic_event("sdp");
+        local_event.peer_role = Some("answerer".to_owned());
+        local_event.direction = Some("local".to_owned());
+        local_event.sdp_type = Some(WebRtcSdpType::Answer);
+        record_timeline_event(&self.timeline, local_event).await;
         let local = self
             .peer_connection
             .local_description()
@@ -946,7 +1200,13 @@ impl WebRtcNegotiator {
         self.peer_connection
             .set_remote_description(remote_answer.into_rtc()?)
             .await
-            .map_err(|err| TransportError::Unavailable(format!("set remote answer failed: {err}")))
+            .map_err(|err| TransportError::Unavailable(format!("set remote answer failed: {err}")))?;
+        let mut event = diagnostic_event("sdp");
+        event.peer_role = Some("offerer".to_owned());
+        event.direction = Some("remote".to_owned());
+        event.sdp_type = Some(WebRtcSdpType::Answer);
+        record_timeline_event(&self.timeline, event).await;
+        Ok(())
     }
 
     /// Apply one trickled remote ICE candidate.
@@ -957,6 +1217,12 @@ impl WebRtcNegotiator {
         if candidate.is_turn_relay_candidate() {
             self.metrics.lock().await.remote_relay_candidates_applied += 1;
         }
+        let mut event = diagnostic_event("ice_candidate");
+        event.peer_role = Some("local".to_owned());
+        event.direction = Some("remote".to_owned());
+        event.candidate_type = ice_candidate_type(&candidate);
+        event.relay_candidate = Some(candidate.is_turn_relay_candidate());
+        record_timeline_event(&self.timeline, event).await;
         self.peer_connection
             .add_ice_candidate(candidate.into_rtc())
             .await
@@ -1001,6 +1267,11 @@ impl WebRtcNegotiator {
     /// Current direct ICE/WebRTC metrics for app-service/Tauri state surfaces.
     pub async fn direct_path_metrics(&self) -> WebRtcDirectPathMetrics {
         self.metrics.lock().await.snapshot()
+    }
+
+    /// Current redacted diagnostic timeline for failing-run export and logs.
+    pub async fn diagnostic_timeline(&self) -> WebRtcDiagnosticTimeline {
+        self.timeline.lock().await.snapshot()
     }
 
     async fn local_description(&self) -> Result<WebRtcSessionDescription, TransportError> {
@@ -1065,7 +1336,12 @@ impl WebRtcNegotiator {
         self.peer_connection
             .close()
             .await
-            .map_err(|err| TransportError::Unavailable(format!("close WebRTC peer failed: {err}")))
+            .map_err(|err| TransportError::Unavailable(format!("close WebRTC peer failed: {err}")))?;
+        let mut event = diagnostic_event("peer_connection");
+        event.peer_role = Some("local".to_owned());
+        event.state = Some("closed".to_owned());
+        record_timeline_event(&self.timeline, event).await;
+        Ok(())
     }
 }
 
@@ -1139,6 +1415,7 @@ impl WebRtcIceCandidate {
 struct CandidateCollector {
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
+    timeline: Arc<Mutex<DiagnosticTimelineState>>,
     ice_gathering_complete: Arc<Notify>,
     data_channels: DataChannelHub,
 }
@@ -1154,6 +1431,10 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-ice-gathering-state state={state}");
         }
         self.metrics.lock().await.ice_gathering_state = state;
+        let mut event = diagnostic_event("ice_gathering_state");
+        event.peer_role = Some("local".to_owned());
+        event.state = Some(state.to_string());
+        record_timeline_event(&self.timeline, event).await;
         if state == RTCIceGatheringState::Complete {
             self.ice_gathering_complete.notify_waiters();
         }
@@ -1164,6 +1445,10 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-ice-connection-state state={state}");
         }
         self.metrics.lock().await.ice_connection_state = state;
+        let mut event = diagnostic_event("ice_connection_state");
+        event.peer_role = Some("local".to_owned());
+        event.state = Some(state.to_string());
+        record_timeline_event(&self.timeline, event).await;
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
@@ -1171,6 +1456,23 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-peer-connection-state state={state}");
         }
         self.metrics.lock().await.peer_connection_state = state;
+        let mut event = diagnostic_event("peer_connection_state");
+        event.peer_role = Some("local".to_owned());
+        event.state = Some(state.to_string());
+        record_timeline_event(&self.timeline, event).await;
+        let mut dtls_event = diagnostic_event("dtls_transport_state");
+        dtls_event.peer_role = Some("local".to_owned());
+        dtls_event.state = Some(match state {
+            RTCPeerConnectionState::Connected => "connected",
+            RTCPeerConnectionState::Connecting => "connecting",
+            RTCPeerConnectionState::Disconnected => "disconnected",
+            RTCPeerConnectionState::Failed => "failed",
+            RTCPeerConnectionState::Closed => "closed",
+            RTCPeerConnectionState::New => "new",
+            _ => "unknown",
+        }
+        .to_owned());
+        record_timeline_event(&self.timeline, dtls_event).await;
     }
 
     async fn on_ice_candidate(&self, event: webrtc::peer_connection::RTCPeerConnectionIceEvent) {
@@ -1186,13 +1488,20 @@ impl PeerConnectionEventHandler for CandidateCollector {
                 let is_relay = candidate.is_turn_relay_candidate();
                 if webrtc_debug_enabled() {
                     eprintln!(
-                        "discrypt-webrtc-local-candidate candidate={} mid={:?} mline={:?} ufrag_present={}",
-                        candidate.candidate,
+                        "discrypt-webrtc-local-candidate type={:?} relay={} mid={:?} mline={:?} ufrag_present={}",
+                        ice_candidate_type(&candidate),
+                        is_relay,
                         candidate.sdp_mid,
                         candidate.sdp_mline_index,
                         candidate.username_fragment.is_some()
                     );
                 }
+                let mut event = diagnostic_event("ice_candidate");
+                event.peer_role = Some("local".to_owned());
+                event.direction = Some("local".to_owned());
+                event.candidate_type = ice_candidate_type(&candidate);
+                event.relay_candidate = Some(is_relay);
+                record_timeline_event(&self.timeline, event).await;
                 self.candidates.lock().await.push(candidate);
                 let mut metrics = self.metrics.lock().await;
                 metrics.local_candidates_gathered += 1;
@@ -1200,7 +1509,13 @@ impl PeerConnectionEventHandler for CandidateCollector {
                     metrics.local_relay_candidates_gathered += 1;
                 }
             }
-            Err(_err) => {}
+            Err(err) => {
+                let mut event = diagnostic_event("failure");
+                event.peer_role = Some("local".to_owned());
+                event.failure_reason =
+                    Some(redacted_failure_reason(format!("ICE candidate export failed: {err}")));
+                record_timeline_event(&self.timeline, event).await;
+            }
         }
     }
 }
@@ -1346,8 +1661,8 @@ mod tests {
                 > 0
         );
 
-        offerer.close().await?;
-        answerer.close().await?;
+        offerer.tear_down().await?;
+        answerer.tear_down().await?;
         Ok(())
     }
 
@@ -1417,8 +1732,83 @@ mod tests {
         assert_eq!(answerer_metrics.frames_sent, 1);
         assert_eq!(answerer_metrics.frames_received, 1);
 
-        offerer.close().await?;
-        answerer.close().await?;
+        offerer.tear_down().await?;
+        answerer.tear_down().await?;
+        let offerer_timeline = offerer.diagnostic_timeline().await;
+        assert!(offerer_timeline
+            .events
+            .iter()
+            .any(|event| event.kind == "dtls_transport_state"
+                && event.state.as_deref() == Some("connected")));
+        assert!(offerer_timeline
+            .events
+            .iter()
+            .any(|event| event.kind == "data_channel"
+                && event.state.as_deref() == Some("open")));
+        assert!(offerer_timeline
+            .events
+            .iter()
+            .any(|event| event.kind == "data_channel"
+                && event.state.as_deref() == Some("closed")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diagnostic_timeline_exports_redacted_counts_directions_and_failure_reason(
+    ) -> Result<(), TransportError> {
+        let negotiator =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let offer = negotiator.create_offer().await?;
+        assert_eq!(offer.sdp_type, WebRtcSdpType::Offer);
+
+        let candidate = WebRtcIceCandidate {
+            candidate: "candidate:secret-host 1 udp 1 203.0.113.42 5349 typ relay".to_owned(),
+            sdp_mid: Some("data".to_owned()),
+            sdp_mline_index: Some(0),
+            username_fragment: Some("ufrag-secret".to_owned()),
+            url: Some("turns:secret-turn.example.invalid:5349".to_owned()),
+        };
+        let _ = negotiator.add_remote_candidate(candidate).await;
+        let _ = negotiator
+            .wait_text_control_transport_ready(Duration::from_millis(1))
+            .await;
+
+        let timeline = negotiator.diagnostic_timeline().await;
+        assert_eq!(timeline.offer_count, 1);
+        assert_eq!(timeline.remote_candidate_count, 1);
+        assert_eq!(
+            timeline.failure_reason.as_deref(),
+            Some("DataChannel did not open")
+        );
+        assert!(timeline.events.iter().any(|event| {
+            event.kind == "ice_candidate"
+                && event.direction.as_deref() == Some("remote")
+                && event.candidate_type.as_deref() == Some("relay")
+                && event.relay_candidate == Some(true)
+        }));
+        assert!(timeline.events.iter().any(|event| {
+            event.kind == "sdp"
+                && event.direction.as_deref() == Some("local")
+                && event.sdp_type == Some(WebRtcSdpType::Offer)
+        }));
+
+        let json = timeline.to_redacted_json();
+        for forbidden in [
+            "secret-host",
+            "203.0.113.42",
+            "secret-turn",
+            "ufrag-secret",
+            "candidate:",
+            "ice-pwd",
+            "v=0",
+        ] {
+            assert!(!json.contains(forbidden), "timeline leaked {forbidden}: {json}");
+        }
+        assert!(json.contains("DataChannel did not open"));
+        assert!(json.contains("remote"));
+        assert!(json.contains("relay"));
+
+        negotiator.close().await?;
         Ok(())
     }
 

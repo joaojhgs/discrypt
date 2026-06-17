@@ -83,9 +83,9 @@ use std::time::Duration;
 use thiserror::Error;
 pub use webrtc_negotiation::{
     SealedWebRtcNegotiationPayload, TextControlDataTransport, WebRtcDataTransportMetrics,
-    WebRtcDirectPathMetrics, WebRtcIceCandidate, WebRtcIceTransportPolicy, WebRtcNegotiationConfig,
-    WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcNegotiator, WebRtcSdpType,
-    WebRtcSessionDescription,
+    WebRtcDiagnosticEvent, WebRtcDiagnosticTimeline, WebRtcDirectPathMetrics, WebRtcIceCandidate,
+    WebRtcIceTransportPolicy, WebRtcNegotiationConfig, WebRtcNegotiationPayloadKind,
+    WebRtcNegotiationSealer, WebRtcNegotiator, WebRtcSdpType, WebRtcSessionDescription,
 };
 
 /// Transport address or provider URI.
