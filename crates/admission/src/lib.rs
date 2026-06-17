@@ -693,10 +693,10 @@ impl InviteSignalingMetadata {
         Ok(metadata)
     }
 
-    /// Deterministic safe default used by local command surfaces and tests.
+    /// Deterministic production-shaped default used by command surfaces and tests.
     #[must_use]
     pub fn default_production() -> Self {
-        let endpoint = "https://signaling.discrypt.invalid/v1/rendezvous".to_owned();
+        let endpoint = "mqtts://broker.emqx.io:8883".to_owned();
         let fingerprint = signaling_fingerprint_for_endpoint(&endpoint);
         Self {
             signaling_endpoint: endpoint,
