@@ -13947,7 +13947,11 @@ fn default_signaling_endpoint() -> String {
             )
             .is_ok()
         });
-    configured.unwrap_or_else(|| InviteSignalingMetadata::default_production().signaling_endpoint)
+    configured.unwrap_or_else(|| {
+        default_adapter_endpoint(&InviteSignalingAdapterKind::Nostr)
+            .or_else(|| default_adapter_endpoint(&InviteSignalingAdapterKind::Mqtt))
+            .unwrap_or_else(|| "wss://relay.damus.io".to_owned())
+    })
 }
 
 fn invite_endpoint_policy_for_endpoint(endpoint: &str) -> InviteEndpointPolicy {
@@ -18772,6 +18776,64 @@ mod tests {
         );
         assert!(parsed.ice_turn_servers.is_empty());
         assert!(!format!("{parsed:?}").contains("raw-turn-secret"));
+    }
+
+    #[test]
+    fn invite_descriptor_decodes_selected_mqtt_and_nostr_group_endpoints() {
+        let _guard = test_lock();
+        let endpoints = [
+            ("mqtt", "mqtts://broker.emqx.io:8883"),
+            ("nostr", "wss://relay.damus.io"),
+        ];
+
+        for (adapter_kind, endpoint) in endpoints {
+            let _path = reset_with_temp_state(&format!("invite-endpoint-{adapter_kind}"));
+            create_user(CreateUserRequest {
+                display_name: "Alice".to_owned(),
+                device_name: None,
+            });
+            let group_state = create_group(CreateGroupRequest {
+                name: format!("{adapter_kind} invite lab"),
+                retention: "24 hours".to_owned(),
+                admission_mode: None,
+                adapter_kind: Some(adapter_kind.to_owned()),
+                signaling_endpoint: Some(endpoint.to_owned()),
+                ice_stun_servers: None,
+                ice_turn_servers: None,
+            });
+            assert!(group_state.last_command_error.is_none(), "{group_state:?}");
+            let invite_state = create_invite(CreateInviteRequest {
+                group_id: Some(group_state.groups[0].group_id.clone()),
+                expires: "1 day".to_owned(),
+                max_use: "2".to_owned(),
+                password_gate: None,
+            });
+            assert!(
+                invite_state.last_command_error.is_none(),
+                "{invite_state:?}"
+            );
+            let invite = invite_state
+                .invites
+                .last()
+                .expect("created invite is returned");
+            assert_eq!(invite.signaling_profiles[0].adapter_kind, adapter_kind);
+            assert_eq!(invite.signaling_endpoint, endpoint);
+            assert!(!invite.signaling_endpoint.contains(".invalid"));
+            assert!(!invite.code.contains(".invalid"));
+
+            let parsed =
+                parse_invite_metadata(&invite.code).expect("signed invite descriptor parses");
+            assert_eq!(parsed.signaling_endpoint, endpoint);
+            assert_eq!(
+                parsed.connectivity.signaling_profiles[0].adapter_kind,
+                adapter_kind
+            );
+            assert_eq!(
+                parsed.connectivity.signaling_profiles[0].endpoints,
+                vec![endpoint.to_owned()]
+            );
+            assert!(!format!("{parsed:?}").contains(".invalid"));
+        }
     }
 
     #[test]
