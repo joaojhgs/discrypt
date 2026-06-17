@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-17T17:40:27.852Z",
+  "updatedAt": "2026-06-17T19:16:05.785Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -339,6 +339,16 @@
       "updatedAt": "2026-06-17T17:40:27.852Z",
       "evidence": ".omx/plans/P3-T03-candidate-queueing-late-arrival-2026-06-17.md created from PER-24 issue metadata and Phase 3 acceptance criteria.",
       "startedAt": "2026-06-17T17:40:27.852Z"
+    },
+    {
+      "id": "G030-p3-t04-glare-reconnect-idempotent-at",
+      "title": "P3-T04 glare reconnect idempotent attach",
+      "objective": "Implement and verify PER-25/P3-T04 provider-signaled WebRTC text/control glare, reconnect, and idempotent attach behavior: duplicate attach and rapid restart must not create split-brain, stale sessions, duplicate DataChannels, or stale provider subscriptions.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-17T19:16:05.785Z",
+      "updatedAt": "2026-06-17T19:16:05.785Z",
+      "evidence": ".omx/plans/P3-T04-glare-reconnect-idempotent-attach-2026-06-17.md created from PER-25 issue metadata and Phase 3 acceptance criteria."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",

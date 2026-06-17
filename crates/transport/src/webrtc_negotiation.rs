@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -573,6 +574,7 @@ impl DataTransportMetricsState {
 struct DataChannelHub {
     label: String,
     channels: Arc<Mutex<Vec<Arc<dyn DataChannel>>>>,
+    channel_keys: Arc<Mutex<HashSet<(String, u16)>>>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     metrics: Arc<Mutex<DataTransportMetricsState>>,
@@ -587,6 +589,7 @@ impl DataChannelHub {
             metrics: Arc::new(Mutex::new(DataTransportMetricsState::new(label.clone()))),
             label,
             channels: Arc::new(Mutex::new(Vec::new())),
+            channel_keys: Arc::new(Mutex::new(HashSet::new())),
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
             open_notify: Arc::new(Notify::new()),
@@ -598,6 +601,21 @@ impl DataChannelHub {
         let label = channel.label().await.unwrap_or_else(|_| self.label.clone());
         if label != self.label {
             return;
+        }
+        let channel_key = (label.clone(), channel.id());
+        {
+            let mut channel_keys = self.channel_keys.lock().await;
+            if !channel_keys.insert(channel_key) {
+                let mut metrics = self.metrics.lock().await;
+                metrics.last_state = "duplicate_attach_ignored".to_owned();
+                drop(metrics);
+                let mut event = diagnostic_event("data_channel");
+                event.peer_role = Some("local".to_owned());
+                event.direction = Some("local".to_owned());
+                event.state = Some("duplicate_attach_ignored".to_owned());
+                record_timeline_event(&self.timeline, event).await;
+                return;
+            }
         }
         {
             let mut channels = self.channels.lock().await;
@@ -615,6 +633,9 @@ impl DataChannelHub {
         let metrics = Arc::clone(&self.metrics);
         let open_notify = Arc::clone(&self.open_notify);
         let timeline = Arc::clone(&self.timeline);
+        let channels = Arc::clone(&self.channels);
+        let channel_keys = Arc::clone(&self.channel_keys);
+        let channel_key = (label, channel.id());
         tokio::spawn(async move {
             while let Some(event) = channel.poll().await {
                 match event {
@@ -649,10 +670,15 @@ impl DataChannelHub {
                         }
                     }
                     DataChannelEvent::OnClose => {
-                        let mut metrics = metrics.lock().await;
-                        metrics.open = false;
-                        metrics.last_state = "closed".to_owned();
-                        drop(metrics);
+                        {
+                            channel_keys.lock().await.remove(&channel_key);
+                            let mut channels = channels.lock().await;
+                            channels.retain(|attached| attached.id() != channel_key.1);
+                            let mut metrics = metrics.lock().await;
+                            metrics.attached_channels = channels.len() as u64;
+                            metrics.open = false;
+                            metrics.last_state = "closed".to_owned();
+                        }
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closed".to_owned());
@@ -660,7 +686,9 @@ impl DataChannelHub {
                         break;
                     }
                     DataChannelEvent::OnClosing => {
-                        metrics.lock().await.last_state = "closing".to_owned();
+                        let mut metrics = metrics.lock().await;
+                        metrics.last_state = "closing".to_owned();
+                        drop(metrics);
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closing".to_owned());
@@ -1638,7 +1666,106 @@ mod tests {
     use super::*;
     use crate::{Endpoint, TurnServerConfig};
     use chrono::Duration as ChronoDuration;
+    use std::collections::VecDeque;
     use tokio::time::{sleep, Duration, Instant};
+    use webrtc::data_channel::RTCDataChannelId;
+
+    struct MockDataChannel {
+        id: RTCDataChannelId,
+        label: String,
+        events: Mutex<VecDeque<DataChannelEvent>>,
+    }
+
+    impl MockDataChannel {
+        fn new(id: RTCDataChannelId, label: &str) -> Self {
+            Self {
+                id,
+                label: label.to_owned(),
+                events: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        fn with_events(id: RTCDataChannelId, label: &str, events: Vec<DataChannelEvent>) -> Self {
+            Self {
+                id,
+                label: label.to_owned(),
+                events: Mutex::new(VecDeque::from(events)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DataChannel for MockDataChannel {
+        async fn label(&self) -> webrtc::error::Result<String> {
+            Ok(self.label.clone())
+        }
+
+        async fn ordered(&self) -> webrtc::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn max_packet_life_time(&self) -> webrtc::error::Result<Option<u16>> {
+            Ok(None)
+        }
+
+        async fn max_retransmits(&self) -> webrtc::error::Result<Option<u16>> {
+            Ok(None)
+        }
+
+        async fn protocol(&self) -> webrtc::error::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn negotiated(&self) -> webrtc::error::Result<bool> {
+            Ok(false)
+        }
+
+        fn id(&self) -> RTCDataChannelId {
+            self.id
+        }
+
+        async fn ready_state(&self) -> webrtc::error::Result<RTCDataChannelState> {
+            Ok(RTCDataChannelState::Open)
+        }
+
+        async fn buffered_amount_high_threshold(&self) -> webrtc::error::Result<u32> {
+            Ok(0)
+        }
+
+        async fn set_buffered_amount_high_threshold(
+            &self,
+            _threshold: u32,
+        ) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+
+        async fn buffered_amount_low_threshold(&self) -> webrtc::error::Result<u32> {
+            Ok(0)
+        }
+
+        async fn set_buffered_amount_low_threshold(
+            &self,
+            _threshold: u32,
+        ) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, _data: BytesMut) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, _text: &str) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+
+        async fn poll(&self) -> Option<DataChannelEvent> {
+            self.events.lock().await.pop_front()
+        }
+
+        async fn close(&self) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_ice_config() -> Result<IceServerConfig, TransportError> {
         IceServerConfig::new(vec![Endpoint::new("stun:127.0.0.1:3478")], vec![])
@@ -1662,6 +1789,43 @@ mod tests {
             }
             sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn data_channel_attach_is_idempotent_for_same_label_and_id_but_allows_reconnect_after_close(
+    ) {
+        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
+        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), Arc::clone(&timeline));
+        let closed_channel: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
+            7,
+            "discrypt-text-control",
+            vec![DataChannelEvent::OnClose],
+        ));
+        hub.attach(closed_channel).await;
+        sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            hub.metrics.lock().await.snapshot().attached_channels,
+            0,
+            "closed DataChannel ids must be released so reconnect can attach"
+        );
+
+        let channel: Arc<dyn DataChannel> =
+            Arc::new(MockDataChannel::new(7, "discrypt-text-control"));
+
+        hub.attach(Arc::clone(&channel)).await;
+        hub.attach(channel).await;
+
+        let metrics = hub.metrics.lock().await.snapshot();
+        assert_eq!(
+            metrics.attached_channels, 1,
+            "duplicate attach of the same DataChannel id must not create split-brain send paths"
+        );
+        assert_eq!(metrics.last_state, "duplicate_attach_ignored");
+        let timeline = timeline.lock().await.snapshot();
+        assert!(timeline.events.iter().any(|event| {
+            event.kind == "data_channel"
+                && event.state.as_deref() == Some("duplicate_attach_ignored")
+        }));
     }
 
     #[cfg_attr(
