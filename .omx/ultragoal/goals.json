@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-17T19:16:05.785Z",
+  "updatedAt": "2026-06-17T20:40:51.815Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -349,6 +349,16 @@
       "createdAt": "2026-06-17T19:16:05.785Z",
       "updatedAt": "2026-06-17T19:16:05.785Z",
       "evidence": ".omx/plans/P3-T04-glare-reconnect-idempotent-attach-2026-06-17.md created from PER-25 issue metadata and Phase 3 acceptance criteria."
+    },
+    {
+      "id": "G031-p2-t05-pre-admission-request-route",
+      "title": "P2-T05 pre-admission request route",
+      "objective": "Implement PER-17/P2-T05: provider text/control route delivers invite-bound OpenMLS admission requests to owner/staff, pending requests persist without admitting membership, focused tests verify binding and signaling-only behavior, PR and QA handoff are prepared.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-17T20:40:51.815Z",
+      "updatedAt": "2026-06-17T20:40:51.815Z",
+      "evidence": ".omx plans list has no P2-T05 plan yet; Multica PER-17 metadata requires branch multica/P2-T05-pre-admission-request-route and two-profile/split-machine admission evidence."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",

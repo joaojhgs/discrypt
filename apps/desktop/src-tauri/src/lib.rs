@@ -375,6 +375,12 @@ pub struct GroupAdmissionRequestView {
     pub group_id: String,
     #[serde(default)]
     pub invite_id: Option<String>,
+    #[serde(default)]
+    pub invite_key: Option<String>,
+    #[serde(default)]
+    pub room_secret_hash: Option<String>,
+    #[serde(default)]
+    pub descriptor_schema_version: Option<u32>,
     pub display_name: String,
     #[serde(default)]
     pub device_name: Option<String>,
@@ -392,6 +398,27 @@ pub struct GroupAdmissionRequestView {
     pub policy_epoch_at_request: u64,
     #[serde(default)]
     pub admission_mode_at_request: Option<GroupAdmissionModeView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InviteAdmissionRequestBinding {
+    invite_id: String,
+    invite_key: String,
+    room_secret_hash: String,
+    descriptor_schema_version: Option<u32>,
+    admission_snapshot: Option<InviteAdmissionSnapshot>,
+}
+
+impl From<&InviteView> for InviteAdmissionRequestBinding {
+    fn from(invite: &InviteView) -> Self {
+        Self {
+            invite_id: invite.invite_id.clone(),
+            invite_key: invite.invite_key.clone(),
+            room_secret_hash: invite.room_secret_hash.clone(),
+            descriptor_schema_version: invite.descriptor_schema_version,
+            admission_snapshot: invite.admission_snapshot.clone(),
+        }
+    }
 }
 
 /// Append-only governance event summary for audit/reconciliation surfaces.
@@ -1418,6 +1445,21 @@ pub enum TextControlFrameView {
     OpenMlsAdmissionKeyPackage {
         /// Target group id from the signed invite.
         group_id: String,
+        /// Durable invite row id from the signed descriptor that produced this request.
+        #[serde(default)]
+        invite_id: Option<String>,
+        /// Signed descriptor invite key; binds this request to the invite route.
+        #[serde(default)]
+        invite_key: Option<String>,
+        /// Hash commitment to the invite room secret; never carries the room secret itself.
+        #[serde(default)]
+        room_secret_hash: Option<String>,
+        /// Canonical signed descriptor schema version when available.
+        #[serde(default)]
+        descriptor_schema_version: Option<u32>,
+        /// Signed admission snapshot pinned to the invite descriptor.
+        #[serde(default)]
+        admission_snapshot: Option<InviteAdmissionSnapshot>,
         /// Joiner profile identity label embedded in the OpenMLS key package credential.
         member_identity: String,
         /// Joiner signer public key handle used to reload its private signer when applying Welcome.
@@ -4671,6 +4713,50 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             channel_id: None,
             dm_id: None,
         });
+        if let Some(parsed) = parsed_invite.as_ref() {
+            let invite_id = format!("invite-{}", parsed.invite_key);
+            if !state.invites.iter().any(|invite| {
+                invite.group_id == group_id
+                    && invite.invite_key == parsed.invite_key
+                    && invite
+                        .room_secret_hash
+                        .eq_ignore_ascii_case(&parsed.room_secret_hash)
+            }) {
+                state.invites.push(InviteView {
+                    invite_id,
+                    invite_key: parsed.invite_key.clone(),
+                    descriptor_schema_version: parsed.descriptor_schema_version,
+                    group_id: group_id.clone(),
+                    dm_id: None,
+                    connectivity_schema_version: parsed.connectivity.connectivity_schema_version,
+                    invite_kind: parsed.connectivity.invite_kind.clone(),
+                    scope_id_commitment: parsed.connectivity.scope_id_commitment.clone(),
+                    signaling_profiles: parsed.connectivity.signaling_profiles.clone(),
+                    privacy_label: parsed.connectivity.privacy_label.clone(),
+                    dm_bootstrap: parsed.connectivity.dm_bootstrap.clone(),
+                    group_bootstrap: parsed.connectivity.group_bootstrap.clone(),
+                    admission_snapshot: parsed.admission_snapshot.clone(),
+                    revocation_policy: parsed.revocation_policy.clone(),
+                    password_policy: parsed.password_policy.clone(),
+                    code: invite_code.clone(),
+                    room_secret_hash: parsed.room_secret_hash.clone(),
+                    signaling_endpoint: parsed.signaling_endpoint.clone(),
+                    signaling_trust_fingerprint: parsed.signaling_trust_fingerprint.clone(),
+                    signaling_trust_status: parsed.signaling_trust_status.clone(),
+                    endpoint_policy: parsed.endpoint_policy.clone(),
+                    ice_stun_servers: parsed.ice_stun_servers.clone(),
+                    ice_turn_servers: parsed.ice_turn_servers.clone(),
+                    expires: "Invite expiry from signed descriptor".to_owned(),
+                    expires_at: parsed.expires_at.clone(),
+                    max_use: parsed.max_uses.to_string(),
+                    uses: 1,
+                    revoked: false,
+                    admission_copy:
+                        "Parsed production invite metadata; final admission still requires authorized MLS Welcome/add"
+                            .to_owned(),
+                });
+            }
+        }
         if let Some(group_id) = state
             .active_context
             .as_ref()
@@ -4686,45 +4772,6 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 );
                 return;
             }
-        }
-        if let Some(parsed) = parsed_invite {
-            state.invites.push(InviteView {
-                invite_id: format!("invite-{}", parsed.invite_key),
-                invite_key: parsed.invite_key,
-                descriptor_schema_version: parsed.descriptor_schema_version,
-                group_id: state
-                    .active_context
-                    .as_ref()
-                    .and_then(|context| context.group_id.clone())
-                    .unwrap_or_default(),
-                dm_id: None,
-                connectivity_schema_version: parsed.connectivity.connectivity_schema_version,
-                invite_kind: parsed.connectivity.invite_kind.clone(),
-                scope_id_commitment: parsed.connectivity.scope_id_commitment.clone(),
-                signaling_profiles: parsed.connectivity.signaling_profiles.clone(),
-                privacy_label: parsed.connectivity.privacy_label.clone(),
-                dm_bootstrap: parsed.connectivity.dm_bootstrap.clone(),
-                group_bootstrap: parsed.connectivity.group_bootstrap.clone(),
-                admission_snapshot: parsed.admission_snapshot,
-                revocation_policy: parsed.revocation_policy,
-                password_policy: parsed.password_policy,
-                code: invite_code.clone(),
-                room_secret_hash: parsed.room_secret_hash,
-                signaling_endpoint: parsed.signaling_endpoint,
-                signaling_trust_fingerprint: parsed.signaling_trust_fingerprint,
-                signaling_trust_status: parsed.signaling_trust_status,
-                endpoint_policy: parsed.endpoint_policy,
-                ice_stun_servers: parsed.ice_stun_servers,
-                ice_turn_servers: parsed.ice_turn_servers,
-                expires: "Invite expiry from signed descriptor".to_owned(),
-                expires_at: parsed.expires_at,
-                max_use: parsed.max_uses.to_string(),
-                uses: 1,
-                revoked: false,
-                admission_copy:
-                    "Parsed production invite metadata; final admission still requires authorized MLS Welcome/add"
-                        .to_owned(),
-            });
         }
         state.push_event(
             "group.admission_requested",
@@ -8170,9 +8217,65 @@ impl PersistedAppState {
         }
     }
 
+    fn validated_admission_request_invite_binding(
+        &self,
+        group_id: &str,
+        invite_id: Option<&str>,
+        invite_key: Option<&str>,
+        room_secret_hash: Option<&str>,
+        descriptor_schema_version: Option<u32>,
+        admission_snapshot: Option<&InviteAdmissionSnapshot>,
+    ) -> Result<Option<InviteAdmissionRequestBinding>, String> {
+        if invite_id.is_none()
+            && invite_key.is_none()
+            && room_secret_hash.is_none()
+            && descriptor_schema_version.is_none()
+            && admission_snapshot.is_none()
+        {
+            return Ok(None);
+        }
+        let invite_key = invite_key
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Admission request is missing invite key binding".to_owned())?;
+        let room_secret_hash = room_secret_hash
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "Admission request is missing room-secret commitment binding".to_owned()
+            })?;
+        let invite = self
+            .invites
+            .iter()
+            .find(|invite| {
+                invite.group_id == group_id
+                    && invite.invite_key == invite_key
+                    && invite
+                        .room_secret_hash
+                        .eq_ignore_ascii_case(room_secret_hash)
+                    && invite_id.is_none_or(|id| invite.invite_id == id)
+            })
+            .ok_or_else(|| {
+                "Admission request invite binding does not match a known group invite".to_owned()
+            })?;
+        if invite.revoked {
+            return Err("Admission request invite binding references a revoked invite".to_owned());
+        }
+        if invite.descriptor_schema_version != descriptor_schema_version {
+            return Err(
+                "Admission request descriptor schema version does not match the invite".to_owned(),
+            );
+        }
+        if invite.admission_snapshot.as_ref() != admission_snapshot {
+            return Err(
+                "Admission request admission snapshot does not match the invite".to_owned(),
+            );
+        }
+        Ok(Some(InviteAdmissionRequestBinding::from(invite)))
+    }
+
     fn upsert_pending_group_admission_request(
         &mut self,
         group_id: &str,
+        invite_binding: Option<&InviteAdmissionRequestBinding>,
         member_identity: &str,
         signer_public_key_hex: &str,
         key_package: &[u8],
@@ -8191,6 +8294,19 @@ impl PersistedAppState {
         {
             if existing.status == "pending" {
                 existing.key_package = key_package.to_vec();
+                if let Some(binding) = invite_binding {
+                    existing.invite_id = Some(binding.invite_id.clone());
+                    existing.invite_key = Some(binding.invite_key.clone());
+                    existing.room_secret_hash = Some(binding.room_secret_hash.clone());
+                    existing.descriptor_schema_version = binding.descriptor_schema_version;
+                    existing.admission_mode_at_request =
+                        binding.admission_snapshot.as_ref().map(|snapshot| {
+                            match snapshot.admission_mode.as_str() {
+                                "manual_approval" => GroupAdmissionModeView::ManualApproval,
+                                _ => GroupAdmissionModeView::AutomaticWhenAuthorizedOnline,
+                            }
+                        });
+                }
             }
             return Ok(request_id);
         }
@@ -8198,7 +8314,11 @@ impl PersistedAppState {
         group.admission_requests.push(GroupAdmissionRequestView {
             request_id: request_id.clone(),
             group_id: group_id.to_owned(),
-            invite_id: None,
+            invite_id: invite_binding.map(|binding| binding.invite_id.clone()),
+            invite_key: invite_binding.map(|binding| binding.invite_key.clone()),
+            room_secret_hash: invite_binding.map(|binding| binding.room_secret_hash.clone()),
+            descriptor_schema_version: invite_binding
+                .and_then(|binding| binding.descriptor_schema_version),
             display_name: member_identity.to_owned(),
             device_name: None,
             member_identity: member_identity.to_owned(),
@@ -8320,8 +8440,29 @@ impl PersistedAppState {
         let key_package = package
             .key_package_bytes()
             .map_err(|error| format!("OpenMLS key package could not be serialized: {error}"))?;
+        let invite_binding = self
+            .invites
+            .iter()
+            .rev()
+            .find(|invite| invite.group_id == group_id && !invite.revoked)
+            .map(InviteAdmissionRequestBinding::from);
         let frame = TextControlFrameView::OpenMlsAdmissionKeyPackage {
             group_id: group_id.to_owned(),
+            invite_id: invite_binding
+                .as_ref()
+                .map(|binding| binding.invite_id.clone()),
+            invite_key: invite_binding
+                .as_ref()
+                .map(|binding| binding.invite_key.clone()),
+            room_secret_hash: invite_binding
+                .as_ref()
+                .map(|binding| binding.room_secret_hash.clone()),
+            descriptor_schema_version: invite_binding
+                .as_ref()
+                .and_then(|binding| binding.descriptor_schema_version),
+            admission_snapshot: invite_binding
+                .as_ref()
+                .and_then(|binding| binding.admission_snapshot.clone()),
             member_identity,
             signer_public_key_hex,
             key_package,
@@ -10738,10 +10879,35 @@ impl PersistedAppState {
         match frame {
             TextControlFrameView::OpenMlsAdmissionKeyPackage {
                 group_id,
+                invite_id,
+                invite_key,
+                room_secret_hash,
+                descriptor_schema_version,
+                admission_snapshot,
                 member_identity,
                 signer_public_key_hex,
                 key_package,
             } => {
+                let invite_binding = match self.validated_admission_request_invite_binding(
+                    &group_id,
+                    invite_id.as_deref(),
+                    invite_key.as_deref(),
+                    room_secret_hash.as_deref(),
+                    descriptor_schema_version,
+                    admission_snapshot.as_ref(),
+                ) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.push_command_error(
+                            "group.admission_request_rejected",
+                            "handle_text_control_frame",
+                            "admission_request_invite_binding_invalid",
+                            error,
+                            "Request admission again from a current owner-issued invite before any Welcome can be issued",
+                        );
+                        return None;
+                    }
+                };
                 let admission_mode = self
                     .groups
                     .iter()
@@ -10751,6 +10917,7 @@ impl PersistedAppState {
                 if admission_mode == GroupAdmissionModeView::ManualApproval {
                     if let Err(error) = self.upsert_pending_group_admission_request(
                         &group_id,
+                        invite_binding.as_ref(),
                         &member_identity,
                         &signer_public_key_hex,
                         &key_package,
@@ -19445,6 +19612,81 @@ mod tests {
             ),
             "Bob admission frame should be the fire-and-forget key package"
         );
+        let TextControlFrameView::OpenMlsAdmissionKeyPackage {
+            invite_id,
+            invite_key,
+            room_secret_hash,
+            descriptor_schema_version,
+            admission_snapshot,
+            ..
+        } = &bob_key_package
+        else {
+            unreachable!("admission frame already matched above")
+        };
+        assert!(
+            invite_id.is_some(),
+            "production invite admission request must name the invite row"
+        );
+        assert!(
+            invite_key.is_some(),
+            "production invite admission request must bind to the descriptor invite key"
+        );
+        assert_eq!(
+            room_secret_hash.as_deref(),
+            invite_state
+                .invites
+                .last()
+                .map(|invite| invite.room_secret_hash.as_str()),
+            "admission request must bind to the invite room-secret commitment"
+        );
+        assert_eq!(
+            *descriptor_schema_version,
+            invite_state
+                .invites
+                .last()
+                .and_then(|invite| invite.descriptor_schema_version),
+            "admission request must carry the canonical descriptor version"
+        );
+        assert_eq!(
+            admission_snapshot.as_ref(),
+            invite_state
+                .invites
+                .last()
+                .and_then(|invite| invite.admission_snapshot.as_ref()),
+            "admission request must carry the invite admission snapshot"
+        );
+        let mut tampered_key_package = bob_key_package.clone();
+        if let TextControlFrameView::OpenMlsAdmissionKeyPackage {
+            room_secret_hash, ..
+        } = &mut tampered_key_package
+        {
+            *room_secret_hash = Some("tampered-room-secret-commitment".to_owned());
+        }
+        reload_global_app_service_from_path(&alice_path);
+        let tampered = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: tampered_key_package,
+        });
+        assert!(
+            matches!(
+                tampered
+                    .state
+                    .last_command_error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some("admission_request_invite_binding_invalid")
+            ),
+            "owner/staff must reject a request whose invite binding does not match: {:?}",
+            tampered.state.last_command_error
+        );
+        let rejected_state = load_state_from_path(&alice_path);
+        assert!(
+            rejected_state
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .is_none_or(|group| group.admission_requests.is_empty()),
+            "tampered invite binding must not persist a pending request"
+        );
         reload_global_app_service_from_path(&bob_path);
         let admission_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
             TauriAppService::load_for_test_path(alice_path.clone()),
@@ -19491,6 +19733,36 @@ mod tests {
                     .map(|request| request.request_id.clone())
             })
             .ok_or_else(|| "manual admission request was not persisted".to_owned())?;
+        let pending_request = pending_state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|request| request.request_id == request_id)
+            })
+            .ok_or_else(|| "manual admission request row missing".to_owned())?;
+        assert_eq!(
+            pending_request.invite_id.as_ref(),
+            invite_id.as_ref(),
+            "owner/staff pending request must persist the invite id binding"
+        );
+        assert_eq!(
+            pending_request.invite_key.as_ref(),
+            invite_key.as_ref(),
+            "owner/staff pending request must persist the invite key binding"
+        );
+        assert_eq!(
+            pending_request.room_secret_hash.as_ref(),
+            room_secret_hash.as_ref(),
+            "owner/staff pending request must persist the room-secret commitment binding"
+        );
+        assert_eq!(
+            pending_request.descriptor_schema_version, *descriptor_schema_version,
+            "owner/staff pending request must persist the descriptor version binding"
+        );
 
         reload_global_app_service_from_path(&alice_path);
         let switched = set_group_admission_mode(SetGroupAdmissionModeRequest {

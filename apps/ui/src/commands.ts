@@ -258,6 +258,9 @@ export type GroupAdmissionRequestView = {
   request_id: string;
   group_id: string;
   invite_id?: string | null;
+  invite_key?: string | null;
+  room_secret_hash?: string | null;
+  descriptor_schema_version?: number | null;
   display_name: string;
   device_name?: string | null;
   member_identity: string;
@@ -989,6 +992,11 @@ export type TextControlFrameView =
   | {
       kind: "open_mls_admission_key_package";
       group_id: string;
+      invite_id?: string | null;
+      invite_key?: string | null;
+      room_secret_hash?: string | null;
+      descriptor_schema_version?: number | null;
+      admission_snapshot?: InviteAdmissionSnapshotView | null;
       member_identity: string;
       signer_public_key_hex: string;
       key_package: number[];
