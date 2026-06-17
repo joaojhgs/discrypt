@@ -2058,8 +2058,6 @@ pub struct SignalingAdapterProbeView {
     pub presence_roundtrip: bool,
     /// Sealed signal proof flag.
     pub signal_roundtrip: bool,
-    /// Sealed control proof flag.
-    pub control_roundtrip: bool,
 }
 
 /// Backend evidence from a provider-signaled WebRTC DataChannel probe.
@@ -8678,14 +8676,13 @@ impl PersistedAppState {
             return (
                 "provider-roundtrip-proofed".to_owned(),
                 format!(
-                    "adapter={} profile={} endpoint={} {} presence={} signal={} control={}",
+                    "adapter={} profile={} endpoint={} {} presence={} signal={}",
                     probe.kind,
                     probe.profile_id,
                     probe.endpoint_label,
                     redacted_observable_ref("room_topic", &probe.rendezvous_topic),
                     probe.presence_roundtrip,
-                    probe.signal_roundtrip,
-                    probe.control_roundtrip
+                    probe.signal_roundtrip
                 ),
             );
         }
@@ -8987,7 +8984,6 @@ impl PersistedAppState {
             rendezvous_topic: probe.rendezvous_topic,
             presence_roundtrip: probe.presence_roundtrip,
             signal_roundtrip: probe.signal_roundtrip,
-            control_roundtrip: probe.control_roundtrip,
         };
         self.latest_signaling_probe_error = None;
         self.latest_signaling_probe = Some(view.clone());
@@ -14685,7 +14681,6 @@ fn signaling_profile_for_endpoint(
         capabilities: vec![
             "presence_ttl".to_owned(),
             "trickle_ice".to_owned(),
-            "broadcast_control".to_owned(),
             "health_telemetry".to_owned(),
         ],
     }

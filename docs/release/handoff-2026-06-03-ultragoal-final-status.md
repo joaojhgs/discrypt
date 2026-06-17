@@ -112,8 +112,8 @@ Worker-3 created an isolated remote artifact directory, later refreshed to curre
 
 After the initial blocker report, Docker was used as an isolated fallback on `skyron-server` without installing host packages. These remote container proofs passed before the final source refresh, using the transferred Discrypt tree and public provider endpoints:
 
-- Public MQTT signaling smoke: `cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` with `DISCRYPT_PUBLIC_SIGNALING_E2E=1` and `DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883` — **passed**.
-- Public Nostr signaling smoke: `cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture` with `DISCRYPT_PUBLIC_NOSTR_E2E=1` and `DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol` — **passed**.
+- Public MQTT signaling smoke: `cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture` with `DISCRYPT_PUBLIC_SIGNALING_E2E=1` and `DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883` — **passed**.
+- Public Nostr signaling smoke: `cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_and_signal_roundtrip -- --nocapture` with `DISCRYPT_PUBLIC_NOSTR_E2E=1` and `DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol` — **passed**.
 - Public MQTT WebRTC DataChannel proof: `cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_datachannel_roundtrip -- --nocapture` with `DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E=1` — **passed**.
 - Public MQTT WebRTC media-frame proof: `cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_media_frame_roundtrip -- --nocapture` with `DISCRYPT_PUBLIC_MQTT_MEDIA_WEBRTC_E2E=1` — **passed**.
 - Refreshed-source container metadata check on the final refreshed source tree recorded in the remote manifest: `/usr/local/cargo/bin/cargo metadata --no-deps --format-version=1` — **passed**.

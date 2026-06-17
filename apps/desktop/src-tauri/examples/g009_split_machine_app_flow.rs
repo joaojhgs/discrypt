@@ -350,24 +350,22 @@ fn start_and_attach_runtime_derived_or_relay() -> Result<bool, Box<dyn std::erro
             local_peer_id: None,
             remote_peer_id: None,
             derive_from_state: true,
-        });
+    });
     if let Some(error) = attached.last_command_error {
-        eprintln!(
-            "g009 direct text/control runtime attach unavailable; continuing with provider relay fallback: {}: {}",
+        return Err(format!(
+            "g009 direct text/control runtime attach unavailable; provider signaling is not a message relay: {}: {}",
             error.code, error.message
-        );
-        return Ok(false);
+        )
+        .into());
     }
     match wait_until(90, "runtime attached", || {
         runtime_status() == Some("attached".to_owned())
     }) {
         Ok(()) => Ok(true),
-        Err(error) => {
-            eprintln!(
-                "g009 direct text/control runtime did not become attached; continuing with provider relay fallback: {error}"
-            );
-            Ok(false)
-        }
+        Err(error) => Err(format!(
+            "g009 direct text/control runtime did not become attached; provider signaling is not a message relay: {error}"
+        )
+        .into()),
     }
 }
 

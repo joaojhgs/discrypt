@@ -25,7 +25,7 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_adapter_feature_is_selectable_with_real_libp2p_client
 
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
-  ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+  ipfs_pubsub_local_two_peer_presence_and_signal_roundtrip -- --nocapture
 
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   public_ipfs_two_peer_signaling_smoke -- --nocapture

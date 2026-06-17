@@ -485,7 +485,6 @@ export type SignalingAdapterProbeView = {
   rendezvous_topic: string;
   presence_roundtrip: boolean;
   signal_roundtrip: boolean;
-  control_roundtrip: boolean;
 };
 
 export type ProviderWebRtcDataChannelProbeView = {
@@ -2563,7 +2562,6 @@ function signalingProfileForEndpoint(
     capabilities: [
       "presence_ttl",
       "trickle_ice",
-      "broadcast_control",
       "health_telemetry",
     ],
   };
