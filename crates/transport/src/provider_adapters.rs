@@ -374,9 +374,10 @@ pub struct SignalingAdapterFallbackPlan {
 ///
 /// This is intentionally limited to signaling/rendezvous evidence. It proves
 /// that two local peers can use the selected provider adapter to exchange
-/// opaque presence, one sealed WebRTC-negotiation envelope, and one sealed
-/// control payload over the configured provider profile. It does **not** claim
-/// that ICE, WebRTC data channels, or media/audio are connected.
+/// opaque presence and one sealed WebRTC-negotiation envelope over the
+/// configured provider profile. It does **not** claim that provider-visible
+/// app/control payload relay, ICE, WebRTC data channels, or media/audio are
+/// connected.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderAdapterRoundtripProbe {
     /// Adapter that completed the probe.
@@ -393,8 +394,6 @@ pub struct ProviderAdapterRoundtripProbe {
     pub presence_roundtrip: bool,
     /// Sealed offer/control signal was received by the peer.
     pub signal_roundtrip: bool,
-    /// Sealed room-control broadcast was received by the peer.
-    pub control_roundtrip: bool,
 }
 
 /// Evidence returned by a provider-signaled WebRTC DataChannel probe.
@@ -651,6 +650,13 @@ pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
 /// Recovery guidance for the missing long-lived runtime constructor path.
 pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
     "Persisted provider offer/answer/ICE handoff and a long-lived receiver loop are still required before runtime attachment can be established";
+
+const PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE: &str =
+    "provider application-payload relay is disabled; providers carry presence and sealed WebRTC negotiation only";
+
+fn provider_app_payload_relay_disabled_error() -> TransportError {
+    TransportError::SignalingAdapter(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE.to_owned())
+}
 
 /// Typed boundary when a runtime spec is missing from a resume attachment.
 pub const TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE: &str =
@@ -922,10 +928,11 @@ pub fn plan_signaling_adapter_fallback(
 ///
 /// The probe connects two local peer sessions to the selected provider, joins
 /// the same derived rendezvous capability, then verifies opaque presence,
-/// sealed WebRTC negotiation, and sealed control delivery. It is suitable for
-/// Tauri/backend diagnostics because it exercises the same adapter contract as
-/// production signaling without exposing raw SDP, ICE credentials, identities,
-/// room names, message plaintext, or audio.
+/// and sealed WebRTC negotiation. It is suitable for Tauri/backend diagnostics
+/// because it exercises the same adapter contract as production signaling
+/// without exposing raw SDP, ICE credentials, identities, room names, message
+/// plaintext, or audio. Text/control delivery must be proven by WebRTC
+/// DataChannel route evidence, not provider app-payload relay.
 pub async fn probe_provider_adapter_roundtrip(
     profile: SignalingAdapterProfile,
     scope: ConversationScope,
@@ -1942,17 +1949,6 @@ where
     })
     .await?;
 
-    bob_room
-        .broadcast_control(OpaqueSignalingPayload::new(
-            b"sealed-runtime-probe-control".to_vec(),
-        )?)
-        .await?;
-    let control_roundtrip = wait_for_probe(|| async {
-        let controls = alice_room.take_control_payloads().await?;
-        Ok(controls.into_iter().any(|control| control.from_peer == bob))
-    })
-    .await?;
-
     alice_room.leave().await?;
     bob_room.leave().await?;
     alice_session.close().await?;
@@ -1966,7 +1962,6 @@ where
         rendezvous_topic,
         presence_roundtrip,
         signal_roundtrip,
-        control_roundtrip,
     })
 }
 
@@ -3205,8 +3200,9 @@ pub struct FeatureGatedProviderRoom {
 ///
 /// This is not a production provider client. It deliberately uses the same
 /// [`SignalingAdapter`] contract as real providers so every required adapter
-/// kind can prove opaque presence, sealed negotiation payload, and sealed
-/// control delivery without reaching an external network.
+/// kind can prove opaque presence and sealed WebRTC negotiation without
+/// reaching an external network. Provider app/control payload relay remains
+/// fail-closed in this conformance path.
 #[derive(Clone, Debug, Default)]
 pub struct LocalConformanceProviderBus {
     inner: Arc<Mutex<LocalConformanceState>>,
@@ -3523,8 +3519,8 @@ enum MqttWireEnvelope {
 /// Real Nostr relay signaling adapter.
 ///
 /// The relay receives NIP-01 events whose content is a Discrypt-specific JSON
-/// envelope containing only already-sealed presence, control, and WebRTC
-/// negotiation payload bytes. The public event kind is intentionally scoped to a
+/// envelope containing only already-sealed presence and WebRTC negotiation
+/// payload bytes. The public event kind is intentionally scoped to a
 /// random/hashed rendezvous topic (`d` tag); display names, room labels, raw SDP,
 /// ICE credentials, and invite secrets are not serialized into provider-visible
 /// fields.
@@ -3585,7 +3581,7 @@ enum NostrWireEnvelope {
 /// This adapter uses rust-libp2p gossipsub over configured bootstrap
 /// multiaddrs. The PubSub topic is derived from [`RendezvousCapability`] and
 /// every published message is a Discrypt-specific JSON envelope containing
-/// only already-sealed presence, WebRTC negotiation, or control bytes.
+/// only already-sealed presence or WebRTC negotiation bytes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IpfsPubsubProviderAdapter;
 
@@ -5147,20 +5143,12 @@ impl RendezvousRoom for IpfsPubsubProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        reject_forbidden_plaintext(&sealed_payload.bytes)?;
-        let payload = ipfs_encode_envelope(&IpfsPubsubWireEnvelope::Control {
-            schema: IPFS_PUBSUB_EVENT_SCHEMA,
-            from_peer: self.local_peer_id.clone(),
-            payload: sealed_payload,
-        })?;
-        ipfs_command(&self.commands, payload).await
+        let _ = sealed_payload;
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        self.take_health_fault().await?;
-        let mut inbox = self.inbox.lock().await;
-        Ok(std::mem::take(&mut inbox.controls))
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -5475,19 +5463,12 @@ impl RendezvousRoom for NostrProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        reject_forbidden_plaintext(&sealed_payload.bytes)?;
-        self.publish_envelope(NostrWireEnvelope::Control {
-            schema: NOSTR_EVENT_SCHEMA,
-            from_peer: self.local_peer_id.clone(),
-            payload: sealed_payload,
-        })
-        .await
+        let _ = sealed_payload;
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        self.drain_network_for(Duration::from_millis(500)).await?;
-        let mut inbox = self.inbox.lock().await;
-        Ok(std::mem::take(&mut inbox.controls))
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -5878,40 +5859,12 @@ impl RendezvousRoom for DiscryptQuicRendezvousProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        reject_forbidden_plaintext(&sealed_payload.bytes)?;
-        self.publish_envelope(
-            DiscryptRendezvousSignalKind::AdmissionHelper,
-            discrypt_rendezvous_key(&self.topic, "control", None),
-            DiscryptRendezvousWireEnvelope::Control {
-                schema: 1,
-                from_peer: self.local_peer_id.clone(),
-                payload: sealed_payload,
-            },
-            120,
-        )
-        .await
+        let _ = sealed_payload;
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        let envelopes = self
-            .take_envelopes(
-                DiscryptRendezvousSignalKind::AdmissionHelper,
-                discrypt_rendezvous_key(&self.topic, "control", None),
-            )
-            .await?;
-        Ok(envelopes
-            .into_iter()
-            .filter_map(|envelope| match envelope {
-                DiscryptRendezvousWireEnvelope::Control {
-                    schema: 1,
-                    from_peer,
-                    payload,
-                } if from_peer != self.local_peer_id => {
-                    Some(ControlBroadcast { from_peer, payload })
-                }
-                _ => None,
-            })
-            .collect())
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6119,22 +6072,12 @@ impl RendezvousRoom for MqttProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        reject_forbidden_plaintext(&sealed_payload.bytes)?;
-        self.publish_envelope(
-            self.topics.control.clone(),
-            MqttWireEnvelope::Control {
-                schema: 1,
-                from_peer: self.local_peer_id.clone(),
-                payload: sealed_payload,
-            },
-        )
-        .await
+        let _ = sealed_payload;
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        self.drain_network_for(Duration::from_millis(300)).await?;
-        let mut inbox = self.inbox.lock().await;
-        Ok(std::mem::take(&mut inbox.controls))
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6321,36 +6264,12 @@ impl RendezvousRoom for LocalConformanceProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        reject_forbidden_plaintext(&sealed_payload.bytes)?;
-        self.bus.with_state(|state| {
-            state
-                .rooms
-                .entry(self.key.clone())
-                .or_default()
-                .controls
-                .push(ControlBroadcast {
-                    from_peer: self.local_peer_id.clone(),
-                    payload: sealed_payload,
-                });
-        })
+        let _ = sealed_payload;
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        self.bus.with_state(|state| {
-            let Some(room) = state.rooms.get_mut(&self.key) else {
-                return Vec::new();
-            };
-            let mut delivered = Vec::new();
-            room.controls.retain(|control| {
-                if control.from_peer != self.local_peer_id {
-                    delivered.push(control.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            delivered
-        })
+        Err(provider_app_payload_relay_disabled_error())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6537,6 +6456,21 @@ mod tests {
             capabilities: SignalingAdapterCapabilities::production_required(),
             trust_label: AdapterTrustLabel::new(kind.canonical_name(), "local conformance")?,
         })
+    }
+
+    fn assert_provider_app_payload_relay_disabled<T>(result: Result<T, TransportError>) {
+        assert!(
+            result.is_err(),
+            "provider application-payload relay path unexpectedly succeeded"
+        );
+        if let Err(error) = result {
+            assert!(
+                error
+                    .to_string()
+                    .contains(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE),
+                "unexpected provider relay error: {error}"
+            );
+        }
     }
 
     fn expected_readiness(boundary: ProviderAdapterBoundary) -> ProviderAdapterReadiness {
@@ -7063,8 +6997,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "ipfs-pubsub-adapter")]
-    async fn ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip(
-    ) -> Result<(), TransportError> {
+    async fn ipfs_pubsub_local_two_peer_presence_and_signal_roundtrip() -> Result<(), TransportError>
+    {
         let adapter = IpfsPubsubProviderAdapter;
         let alice = SignalingPeerId::new("alice-device")?;
         let bob = SignalingPeerId::new("bob-device")?;
@@ -7142,13 +7076,14 @@ mod tests {
         let bob_signals = bob_room.take_signals().await?;
         assert!(bob_signals.iter().any(|signal| signal.payload == offer));
 
-        bob_room
-            .broadcast_control(OpaqueSignalingPayload::new(b"sealed-control-bob".to_vec())?)
-            .await?;
-        let alice_controls = alice_room.take_control_payloads().await?;
-        assert!(alice_controls
-            .iter()
-            .any(|control| control.from_peer == bob));
+        assert_provider_app_payload_relay_disabled(
+            bob_room
+                .broadcast_control(OpaqueSignalingPayload::new(
+                    b"sealed-provider-relay-attempt-bob".to_vec(),
+                )?)
+                .await,
+        );
+        assert_provider_app_payload_relay_disabled(alice_room.take_control_payloads().await);
 
         alice_room.leave().await?;
         bob_room.leave().await?;
@@ -8086,7 +8021,6 @@ mod tests {
         let probe = probe?;
         assert!(probe.presence_roundtrip);
         assert!(probe.signal_roundtrip);
-        assert!(probe.control_roundtrip);
         Ok(())
     }
 
@@ -8620,15 +8554,14 @@ mod tests {
             assert_eq!(alice_signals[0].payload, answer);
             assert_eq!(alice_signals[1].payload, bob_candidate);
 
-            alice_room
-                .broadcast_control(OpaqueSignalingPayload::new(
-                    b"sealed-control-alice".to_vec(),
-                )?)
-                .await?;
-            let bob_controls = bob_room.take_control_payloads().await?;
-            assert_eq!(bob_controls.len(), 1);
-            assert_eq!(bob_controls[0].from_peer, alice);
-            assert_eq!(bob_controls[0].payload.bytes, b"sealed-control-alice");
+            assert_provider_app_payload_relay_disabled(
+                alice_room
+                    .broadcast_control(OpaqueSignalingPayload::new(
+                        b"sealed-provider-relay-attempt-alice".to_vec(),
+                    )?)
+                    .await,
+            );
+            assert_provider_app_payload_relay_disabled(bob_room.take_control_payloads().await);
 
             assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
             let observability = format!(
@@ -8690,7 +8623,7 @@ mod tests {
         assert!(matches!(
             room.broadcast_control(OpaqueSignalingPayload::new(b"raw sdp control".to_vec())?)
                 .await,
-            Err(TransportError::PlaintextLeak)
+            Err(TransportError::SignalingAdapter(_))
         ));
         Ok(())
     }
@@ -8739,9 +8672,9 @@ mod tests {
                         marker.as_bytes().to_vec()
                     )?)
                     .await,
-                    Err(TransportError::PlaintextLeak)
+                    Err(TransportError::SignalingAdapter(_))
                 ),
-                "provider-visible control payload must reject {marker}"
+                "provider-visible control payload must fail closed before relaying {marker}"
             );
         }
         Ok(())

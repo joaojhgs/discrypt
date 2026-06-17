@@ -64,7 +64,7 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub -
 cargo check -q -p discrypt-transport --features ipfs-pubsub-adapter,mqtt-adapter,nostr-adapter
 cargo check -q -p discrypt-desktop --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter
 cargo test -q -p discrypt-mls-core
-DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_signaling_e2e public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_signaling_e2e public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_datachannel_roundtrip -- --nocapture
 cargo tree --workspace --all-features --target all -i hickory-proto@0.25.2
 cargo audit --json > /tmp/discrypt-cargo-audit-libp2p-patched.json

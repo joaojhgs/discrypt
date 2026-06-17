@@ -75,12 +75,10 @@ Behavior:
 - Joins a pre-derived `RendezvousCapability` and creates provider-visible topics under:
   - `discrypt/v1/rendezvous/{hashed-topic}/presence`
   - `discrypt/v1/rendezvous/{hashed-topic}/signal/{peer-id}`
-  - `discrypt/v1/rendezvous/{hashed-topic}/control`
 - Publishes only sealed/opaque payload envelopes:
   - encrypted presence bytes
   - `SealedWebRtcNegotiationPayload` for offer/answer/candidate signaling
-  - opaque room control bytes
-- Keeps the public broker away from raw SDP, ICE credentials, display names, group names, invite secrets, message plaintext, and audio plaintext.
+- Keeps the public broker away from raw SDP, ICE credentials, display names, group names, invite secrets, message plaintext, application data frames, receipts, and audio plaintext.
 - Marks MQTT boundary readiness as `implementation_available` only when compiled with `mqtt-adapter`.
 - Leaves the generic `FeatureGatedProviderAdapter` fail-closed; production code should instantiate `MqttProviderAdapter` for MQTT.
 - **UI state integration:** command state now surfaces transport/join/voice status cards from command state and keeps route/media claims policy-only when proof is absent.
@@ -102,7 +100,7 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
   ipfs_pubsub_adapter_feature_is_selectable_with_real_libp2p_client
 
 cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter \
-  ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+  ipfs_pubsub_local_two_peer_presence_and_signal_roundtrip -- --nocapture
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
   quic_rendezvous_feature_gate_is_selectable_but_rejects_reserved_native_quic_scheme
 
@@ -110,7 +108,7 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
   discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available -- --nocapture
 ```
 
-Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; the separate Discrypt rendezvous adapter is selectable when feature-gated and uses the sibling service HTTP API for sealed presence/signal/control roundtrips. The adapter still rejects native `quic://` endpoints because the sibling service ADR reserves them until a native QUIC client is implemented and audited.
+Result: Nostr is selectable when feature-gated and backed by `nostr-sdk`; IPFS/libp2p is selectable when feature-gated and backed by rust-libp2p gossipsub; the separate Discrypt rendezvous adapter is selectable when feature-gated and uses the sibling service HTTP API for sealed presence/signal roundtrips. The adapter still rejects native `quic://` endpoints because the sibling service ADR reserves them until a native QUIC client is implemented and audited.
 
 - Nostr profile handling now preserves every configured relay endpoint when joining a room and publishes/subscribes against the configured relay set instead of silently collapsing a profile to the first relay. The latest single-relay public WebRTC smoke still passes against `wss://nos.lol`; a degraded multi-relay public soak now proves fallback behavior with one intentionally invalid relay, and blocked-relay auth evidence now maps to typed `provider_auth_required`; reproducible public rate-limit evidence remains opportunistic.
 
@@ -126,7 +124,7 @@ Files:
 
 Behavior:
 
-- Adds `probe_provider_adapter_roundtrip(...)`, a reusable transport-layer probe that connects two local peers through the selected real provider adapter and verifies opaque presence, sealed WebRTC-negotiation payload, and sealed control broadcast delivery.
+- Adds `probe_provider_adapter_roundtrip(...)`, a reusable transport-layer probe that connects two local peers through the selected real provider adapter and verifies opaque presence plus sealed WebRTC-negotiation payload delivery only. Provider control/app-payload relay is disabled; text/control delivery evidence must come from an open WebRTC DataChannel route.
 - Extends `start_signaling_session` with `adapter_probe=true` and optional `adapter_kind` so the Tauri backend can run the selected DM/group/invite signaling profile instead of only showing static readiness.
 - Persists structured `adapter_probe_status`, `adapter_probe_detail`, and redacted probe evidence into transport diagnostics.
 - Adds a UI "Probe adapter" action in the transport status panel.
@@ -189,7 +187,7 @@ MQTT command:
 ```bash
 DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
   cargo test -q -p discrypt-transport --features mqtt-adapter \
-  public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+  public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 ```
 
 MQTT status:
@@ -203,7 +201,7 @@ Nostr command:
 DISCRYPT_PUBLIC_NOSTR_E2E=1 \
 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io \
   cargo test -q -p discrypt-transport --features nostr-adapter \
-  public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+  public_nostr_two_peer_presence_and_signal_roundtrip -- --nocapture
 ```
 
 Nostr status:
@@ -213,7 +211,7 @@ Nostr status:
 - It verifies opaque provider roundtrip only:
   1. Alice publishes sealed presence and Bob receives it.
   2. Alice sends a sealed WebRTC offer envelope to Bob and Bob receives it.
-  3. Bob broadcasts sealed control and Alice receives it.
+  3. No app data or receipts are sent through the provider; text/control proof belongs to the WebRTC DataChannel tests below.
 
 These are real public signaling proofs at the provider adapter boundary.
 
@@ -336,7 +334,7 @@ npm --prefix apps/ui run test:command-coverage
   - receives/filters by rendezvous topic.
 - [ ] Complete Nostr production hardening:
   - map relay failures/rate limits/auth requirements to typed `SignalingHealthState`; conservative failure-class parsing and structured `NOTICE`/`CLOSED`/negative `OK` relay-message extraction now map common rate-limit/auth/message-size/trust strings to typed health states, and Nostr all-relay publish/subscribe failures include the redacted failure class; public auth/block rejection evidence passed on 2026-05-30 against `wss://nostr.oxtr.dev` with `failure_class=provider_auth_required`, while reproducible public rate-limit evidence remains opportunistic,
-  - public multi-relay fallback soak passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`, proving sealed presence/signal/control delivery survives one degraded configured relay,
+  - public multi-relay fallback soak passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`, proving sealed presence/signal delivery survives one degraded configured relay,
   - provider-visible capture scans are covered by G133; external host packet capture remains a separate release-run artifact.
 - [x] Lock IPFS/libp2p feature-gate/fail-closed readiness and document production requirements.
 - [x] Implement real IPFS/libp2p PubSub adapter with rust-libp2p gossipsub, derived topics, opaque envelopes, unsubscribe, duplicate suppression, and local two-node transport E2E.
@@ -417,11 +415,11 @@ npm --prefix apps/ui run test:command-coverage
 | --- | --- | --- |
 | STUN overlay ordering and TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
 | Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
-| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture` | Latest reruns passed against `mqtts://broker.emqx.io:8883` after broker `SUBACK` readiness was enforced; `test.mosquitto.org` certificate incompatibility and `broker.hivemq.com` network timeout remain provider-specific caveats. |
-| Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_signal_and_control_roundtrip -- --nocapture`; `DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture`; `DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_blocked_relay_maps_to_auth_required -- --nocapture` | Latest single-relay rerun passed against `wss://relay.damus.io`; degraded multi-relay fallback passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`; blocked relay rejection passed against `wss://nostr.oxtr.dev` with typed `provider_auth_required` and no payload leakage |
+| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture` | Latest reruns passed against `mqtts://broker.emqx.io:8883` after broker `SUBACK` readiness was enforced; `test.mosquitto.org` certificate incompatibility and `broker.hivemq.com` network timeout remain provider-specific caveats. |
+| Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_and_signal_roundtrip -- --nocapture`; `DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture`; `DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_blocked_relay_maps_to_auth_required -- --nocapture` | Latest single-relay rerun passed against `wss://relay.damus.io`; degraded multi-relay fallback passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`; blocked relay rejection passed against `wss://nostr.oxtr.dev` with typed `provider_auth_required` and no payload leakage |
 | Optional public provider-signaled WebRTC data-channel proof | `DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_datachannel_roundtrip -- --nocapture` and `DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol cargo test -q -p discrypt-transport --features nostr-adapter --test public_webrtc_datachannel_e2e public_nostr_signals_real_webrtc_datachannel_roundtrip -- --nocapture` | Latest MQTT and Nostr runs passed. They use `stun:stun.l.google.com:19302`, bind WebRTC UDP to `0.0.0.0:0`, exchange sealed offer/answer through the provider, open a WebRTC DataChannel, and deliver an opaque text/control frame. Damus was rate-limited in one rerun, so `nos.lol` is the latest green public Nostr relay evidence. |
 | Optional public TURN relay-only WebRTC proof | `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<turns://...> DISCRYPT_PUBLIC_TURN_USERNAME=<user> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<secret> cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture` | Executable opt-in release gate. Local deterministic coverage rejects relay-only WebRTC without configured TURN. A real credentialed TURN run is still missing before hard-NAT/TURN production closure. |
-| IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_signal_and_control_roundtrip -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_resource_policy_is_bounded_and_default_bootstrap_is_parseable -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_bootstrap_policy_rejects_duplicates_and_overflow -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_unreachable_bootstrap_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_oversized_envelope_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_duplicate_storm_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_swarm_runtime_errors_map_to_typed_health -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal/control only; bootstrap/resource policy is bounded and parse-tested with empty public defaults plus explicit direct endpoint validation; unreachable bootstrap, topic mesh, duplicate storms, libp2p listener runtime errors, and oversize failures map to typed health |
+| IPFS local libp2p proof | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_local_two_peer_presence_and_signal_roundtrip -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_resource_policy_is_bounded_and_default_bootstrap_is_parseable -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_bootstrap_policy_rejects_duplicates_and_overflow -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_unreachable_bootstrap_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_oversized_envelope_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_insufficient_peers_reports_actionable_topic_mesh_error -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_duplicate_storm_maps_to_typed_health -- --nocapture`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub_swarm_runtime_errors_map_to_typed_health -- --nocapture` | Passed locally with two rust-libp2p gossipsub nodes over loopback; opaque presence/signal only; bootstrap/resource policy is bounded and parse-tested with empty public defaults plus explicit direct endpoint validation; unreachable bootstrap, topic mesh, duplicate storms, libp2p listener runtime errors, and oversize failures map to typed health |
 | IPFS public-provider proof | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture`; `DISCRYPT_PUBLIC_IPFS_WEBRTC_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter --test public_webrtc_datachannel_e2e public_ipfs_signals_real_webrtc_datachannel_roundtrip -- --nocapture`; `DISCRYPT_PUBLIC_IPFS_MEDIA_WEBRTC_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-multiaddr,...> cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter --test public_webrtc_datachannel_e2e public_ipfs_signals_real_webrtc_media_frame_roundtrip -- --nocapture` | Public signaling/DataChannel/media-frame gates are executable and fail closed unless explicit direct topic-peer `/p2p/<peer-id>` multiaddrs are supplied. Missing real public/direct topic-peer run in this environment. The previous `/dnsaddr/bootstrap.libp2p.io/...` approach is no longer a production default because DNS bootstrap is audit-blocked and generic bootstrap-only peers did not provide a topic mesh. |
 | QUIC public-provider / separate rendezvous service proof | `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter discrypt_rendezvous_sibling_service_roundtrip_when_binary_is_available -- --nocapture`; `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter public_quic_two_peer_signaling_smoke -- --nocapture`; `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_WEBRTC_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter --test public_webrtc_datachannel_e2e public_quic_rendezvous_signals_real_webrtc_datachannel_roundtrip -- --nocapture`; `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_MEDIA_WEBRTC_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=https://... cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter --test public_webrtc_datachannel_e2e public_quic_rendezvous_signals_real_webrtc_media_frame_roundtrip -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_feature_gate_is_selectable_but_rejects_reserved_native_quic_scheme -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_rejects_https_endpoint_without_signed_trust_fingerprint -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_rejects_mismatched_signed_trust_fingerprint -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_health_requires_matching_public_base_for_production -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_health_accepts_signed_identity_and_rotation_metadata -- --nocapture`; `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter quic_rendezvous_health_requires_production_protocol_metadata -- --nocapture` | Local sibling binary roundtrip passed when `../discrypt-signaling/target/debug/discrypt-signaling-server` is available; native `quic://` endpoint use is still rejected as reserved; production/self-hosted HTTPS/WSS endpoints must carry the signed endpoint fingerprint and `/healthz` must advertise matching public-base/protocol/max-body/rate-limit metadata plus service identity, accepted ALPN, future expiry, rotation policy, and endpoint allowlist commitment before connect succeeds. Deployed signaling, WebRTC DataChannel, and media-frame gates are executable but remain opt-in and unproven until a staged HTTPS/WSS endpoint is supplied. External TLS certificate/public-key pinning and capture-scan evidence are still missing. |
 
@@ -435,7 +433,7 @@ Default public broker:
 ```bash
 DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
   cargo test -q -p discrypt-transport --features mqtt-adapter \
-  public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+  public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 ```
 
 Custom public broker:
@@ -444,7 +442,7 @@ Custom public broker:
 DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 \
   cargo test -q -p discrypt-transport --features mqtt-adapter \
-  public_mqtt_two_peer_presence_signal_and_control_roundtrip -- --nocapture
+  public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 ```
 
 The test is intentionally environment-gated so normal unit tests do not depend on public network availability.
@@ -859,7 +857,7 @@ voice/audio capture/playback E2E.
 ## 2026-05-30 update: sibling Discrypt rendezvous runtime-pair proof passed
 
 The separate sibling `discrypt-signaling` service path now has a local
-runtime-pair text/control proof in addition to the existing presence/signal/control
+runtime-pair text/control proof in addition to the existing presence/signal
 roundtrip. When `../discrypt-signaling/target/debug/discrypt-signaling-server`
 is built, the test starts that external binary on a random loopback port,
 validates health, opens a `discrypt_quic_rendezvous` adapter profile against the

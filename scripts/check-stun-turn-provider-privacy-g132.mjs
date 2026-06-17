@@ -119,7 +119,7 @@ if (process.env.DISCRYPT_PUBLIC_SIGNALING_E2E === "1") {
       "discrypt-transport",
       "--features",
       "mqtt-adapter",
-      "public_mqtt_two_peer_presence_signal_and_control_roundtrip",
+      "public_mqtt_two_peer_presence_and_signal_roundtrip",
       "--",
       "--nocapture",
     ],

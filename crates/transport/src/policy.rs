@@ -284,8 +284,6 @@ pub struct SignalingAdapterCapabilities {
     pub presence_ttl: bool,
     /// Supports trickled ICE candidate delivery.
     pub trickle_ice: bool,
-    /// Supports room-wide sealed control broadcast.
-    pub broadcast_control: bool,
     /// Supports retained presence that can be explicitly cleared on leave.
     pub retained_presence: bool,
     /// Supports redacted health telemetry.
@@ -299,7 +297,6 @@ impl SignalingAdapterCapabilities {
         Self {
             presence_ttl: true,
             trickle_ice: true,
-            broadcast_control: true,
             retained_presence: false,
             health_telemetry: true,
         }
@@ -308,7 +305,7 @@ impl SignalingAdapterCapabilities {
     /// True when the adapter can satisfy the common production contract.
     #[must_use]
     pub const fn satisfies_production_contract(&self) -> bool {
-        self.presence_ttl && self.trickle_ice && self.broadcast_control && self.health_telemetry
+        self.presence_ttl && self.trickle_ice && self.health_telemetry
     }
 }
 

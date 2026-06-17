@@ -234,8 +234,7 @@ where
 
 #[cfg(feature = "mqtt-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_mqtt_two_peer_presence_signal_and_control_roundtrip() -> Result<(), TransportError>
-{
+async fn public_mqtt_two_peer_presence_and_signal_roundtrip() -> Result<(), TransportError> {
     if std::env::var("DISCRYPT_PUBLIC_SIGNALING_E2E").as_deref() != Ok("1") {
         eprintln!("skipping public MQTT E2E; set DISCRYPT_PUBLIC_SIGNALING_E2E=1 to run");
         return Ok(());
@@ -299,21 +298,6 @@ async fn public_mqtt_two_peer_presence_signal_and_control_roundtrip() -> Result<
     })
     .await?;
     assert_eq!(received_offer.payload, offer);
-
-    bob_room
-        .broadcast_control(OpaqueSignalingPayload::new(b"sealed-control-bob".to_vec())?)
-        .await?;
-    let received_control = wait_for(|| async {
-        let controls = alice_room.take_control_payloads().await?;
-        Ok(controls
-            .into_iter()
-            .find(|control| control.from_peer == bob))
-    })
-    .await?;
-    assert_eq!(
-        received_control.payload.bytes,
-        b"sealed-control-bob".to_vec()
-    );
 
     alice_room.leave().await?;
     bob_room.leave().await?;
@@ -384,21 +368,6 @@ async fn run_public_nostr_two_peer_roundtrip(
     .await?;
     assert_eq!(received_offer.payload, offer);
 
-    bob_room
-        .broadcast_control(OpaqueSignalingPayload::new(b"sealed-control-bob".to_vec())?)
-        .await?;
-    let received_control = wait_for(|| async {
-        let controls = alice_room.take_control_payloads().await?;
-        Ok(controls
-            .into_iter()
-            .find(|control| control.from_peer == bob))
-    })
-    .await?;
-    assert_eq!(
-        received_control.payload.bytes,
-        b"sealed-control-bob".to_vec()
-    );
-
     alice_room.leave().await?;
     bob_room.leave().await?;
     alice_session.close().await?;
@@ -408,8 +377,7 @@ async fn run_public_nostr_two_peer_roundtrip(
 
 #[cfg(feature = "nostr-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_nostr_two_peer_presence_signal_and_control_roundtrip() -> Result<(), TransportError>
-{
+async fn public_nostr_two_peer_presence_and_signal_roundtrip() -> Result<(), TransportError> {
     if std::env::var("DISCRYPT_PUBLIC_NOSTR_E2E").as_deref() != Ok("1") {
         eprintln!("skipping public Nostr E2E; set DISCRYPT_PUBLIC_NOSTR_E2E=1 to run");
         return Ok(());
@@ -573,21 +541,6 @@ async fn public_ipfs_two_peer_signaling_smoke() -> Result<(), TransportError> {
     .await?;
     assert_eq!(received_offer.payload, offer);
 
-    bob_room
-        .broadcast_control(OpaqueSignalingPayload::new(b"sealed-control-bob".to_vec())?)
-        .await?;
-    let received_control = wait_for(|| async {
-        let controls = alice_room.take_control_payloads().await?;
-        Ok(controls
-            .into_iter()
-            .find(|control| control.from_peer == bob))
-    })
-    .await?;
-    assert_eq!(
-        received_control.payload.bytes,
-        b"sealed-control-bob".to_vec()
-    );
-
     alice_room.leave().await?;
     bob_room.leave().await?;
     alice_session.close().await?;
@@ -631,6 +584,5 @@ async fn public_quic_two_peer_signaling_smoke() -> Result<(), TransportError> {
     .await?;
     assert!(probe.presence_roundtrip);
     assert!(probe.signal_roundtrip);
-    assert!(probe.control_roundtrip);
     Ok(())
 }

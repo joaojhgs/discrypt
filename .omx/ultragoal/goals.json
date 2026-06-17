@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-16T22:37:36.950Z",
+  "updatedAt": "2026-06-17T03:04:45.340Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -280,6 +280,18 @@
       "evidence": "PER-13/P2-T01 canonical invite schema v1 implemented and QA-approved on PR #12 head dcc143a: signed descriptor includes group id/group commitment/signaling profiles/ICE/admission snapshot/expiry/max-use/revocation/password policy, tamper coverage exercises the required descriptor axes, Rust InviteView and TS DTO descriptor fields are aligned, PR is non-draft/mergeable with green GitHub Actions, and architect review accepted product-code scope while requiring only terminal OMX state cleanup.",
       "startedAt": "2026-06-16T19:58:35.727Z",
       "completedAt": "2026-06-16T22:37:36.950Z"
+    },
+    {
+      "id": "G025-p3-t05-enforce-signaling-only-provid",
+      "title": "P3-T05 enforce signaling-only providers",
+      "objective": "Enforce PER-26/P3-T05: MQTT, Nostr, IPFS PubSub, and Discrypt QUIC rendezvous providers carry presence and sealed WebRTC negotiation only; provider-carried app/control payload paths fail closed; examples, docs, and tests must use DataChannel route evidence for text/control delivery and include a static grep gate.",
+      "status": "complete",
+      "attempt": 1,
+      "createdAt": "2026-06-17T02:40:15.820Z",
+      "updatedAt": "2026-06-17T03:04:45.340Z",
+      "evidence": "PER-26/P3-T05 provider app-payload relay fallback removed: provider control send/take paths fail closed per MQTT/Nostr/IPFS/QUIC/local provider checks, g009 no longer falls back to provider relay, probe DTO/capabilities no longer advertise provider control relay, public/local provider smoke copy is presence plus sealed WebRTC negotiation only, and P3-T05 static gate/npm wrapper/git diff checks passed. Local cargo and tsc checks are blocked by missing tools/dependencies.",
+      "startedAt": "2026-06-17T02:40:23.733Z",
+      "completedAt": "2026-06-17T03:04:45.340Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
