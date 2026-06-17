@@ -6525,13 +6525,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
         state.ensure_ready_profile();
         let session_id = stable_voice_session_id(&request.group_id, &request.channel_id);
         if let Err(error) = ensure_group_sender_admitted_for_voice(state, &request.group_id) {
-            state.push_command_error(
-                "voice.rejected",
-                "join_voice",
-                error.0,
-                error.1,
-                error.2,
-            );
+            state.push_command_error("voice.rejected", "join_voice", error.0, error.1, error.2);
             return;
         }
         if let Err(error) = ensure_group_sender_not_revoked(state, &request.group_id) {
@@ -7849,15 +7843,11 @@ impl PersistedAppState {
                     revoked_by: None,
                 });
             }
-            if let Some(local_member) = group
-                .members
-                .iter()
-                .find(|member| {
-                    member.member_id == local_member_id
-                        && member.revoked_at.is_none()
-                        && member.status != "pending"
-                })
-            {
+            if let Some(local_member) = group.members.iter().find(|member| {
+                member.member_id == local_member_id
+                    && member.revoked_at.is_none()
+                    && member.status != "pending"
+            }) {
                 group.role = group_role_label(&local_member.role).to_owned();
             }
             if group.governance_log.is_empty() {
