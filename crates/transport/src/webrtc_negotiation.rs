@@ -1010,6 +1010,7 @@ impl WebRtcNegotiationConfig {
 pub struct WebRtcNegotiator {
     peer_connection: Box<dyn PeerConnection>,
     candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
+    pending_remote_candidates: Arc<Mutex<Vec<WebRtcIceCandidate>>>,
     metrics: Arc<Mutex<DirectPathMetricsState>>,
     timeline: Arc<Mutex<DiagnosticTimelineState>>,
     ice_gathering_complete: Arc<Notify>,
@@ -1024,6 +1025,7 @@ impl WebRtcNegotiator {
         ensure_rustls_crypto_provider_for_mqtt_feature();
         config.validate(Utc::now())?;
         let candidates = Arc::new(Mutex::new(Vec::new()));
+        let pending_remote_candidates = Arc::new(Mutex::new(Vec::new()));
         let ice_gathering_complete = Arc::new(Notify::new());
         let metrics = Arc::new(Mutex::new(
             DirectPathMetricsState::with_configured_turn_servers(
@@ -1076,6 +1078,7 @@ impl WebRtcNegotiator {
         Ok(Self {
             peer_connection: Box::new(peer_connection),
             candidates,
+            pending_remote_candidates,
             metrics,
             timeline,
             ice_gathering_complete,
@@ -1156,6 +1159,7 @@ impl WebRtcNegotiator {
         remote_event.direction = Some("remote".to_owned());
         remote_event.sdp_type = Some(WebRtcSdpType::Offer);
         record_timeline_event(&self.timeline, remote_event).await;
+        self.flush_pending_remote_candidates().await?;
         let answer = self
             .peer_connection
             .create_answer(None)
@@ -1211,31 +1215,77 @@ impl WebRtcNegotiator {
         event.direction = Some("remote".to_owned());
         event.sdp_type = Some(WebRtcSdpType::Answer);
         record_timeline_event(&self.timeline, event).await;
+        self.flush_pending_remote_candidates().await?;
         Ok(())
     }
 
-    /// Apply one trickled remote ICE candidate.
+    /// Apply one trickled remote ICE candidate, or queue it until remote SDP exists.
     pub async fn add_remote_candidate(
         &self,
         candidate: WebRtcIceCandidate,
     ) -> Result<(), TransportError> {
-        if candidate.is_turn_relay_candidate() {
-            self.metrics.lock().await.remote_relay_candidates_applied += 1;
+        if self.peer_connection.remote_description().await.is_none() {
+            self.record_remote_candidate_event(&candidate, "queued").await;
+            self.pending_remote_candidates.lock().await.push(candidate);
+            return Ok(());
+        }
+        self.apply_remote_candidate(candidate).await
+    }
+
+    async fn flush_pending_remote_candidates(&self) -> Result<(), TransportError> {
+        let pending = {
+            let mut pending = self.pending_remote_candidates.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        for candidate in pending {
+            self.apply_remote_candidate(candidate).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_remote_candidate(
+        &self,
+        candidate: WebRtcIceCandidate,
+    ) -> Result<(), TransportError> {
+        let is_relay = candidate.is_turn_relay_candidate();
+        let candidate_type = ice_candidate_type(&candidate);
+        if let Err(err) = self.peer_connection.add_ice_candidate(candidate.into_rtc()).await {
+            let reason = redacted_failure_reason(format!("add ICE candidate failed: {err}"));
+            let mut event = diagnostic_event("ice_candidate");
+            event.peer_role = Some("local".to_owned());
+            event.direction = Some("remote".to_owned());
+            event.state = Some("apply_failed".to_owned());
+            event.candidate_type = candidate_type;
+            event.relay_candidate = Some(is_relay);
+            event.failure_reason = Some(reason.clone());
+            record_timeline_event(&self.timeline, event).await;
+            return Err(TransportError::Unavailable(reason));
+        }
+        {
+            let mut metrics = self.metrics.lock().await;
+            metrics.remote_candidates_applied += 1;
+            if is_relay {
+                metrics.remote_relay_candidates_applied += 1;
+            }
         }
         let mut event = diagnostic_event("ice_candidate");
         event.peer_role = Some("local".to_owned());
         event.direction = Some("remote".to_owned());
-        event.candidate_type = ice_candidate_type(&candidate);
+        event.state = Some("applied".to_owned());
+        event.candidate_type = candidate_type;
+        event.relay_candidate = Some(is_relay);
+        record_timeline_event(&self.timeline, event).await;
+        Ok(())
+    }
+
+    async fn record_remote_candidate_event(&self, candidate: &WebRtcIceCandidate, state: &str) {
+        let mut event = diagnostic_event("ice_candidate");
+        event.peer_role = Some("local".to_owned());
+        event.direction = Some("remote".to_owned());
+        event.state = Some(state.to_owned());
+        event.candidate_type = ice_candidate_type(candidate);
         event.relay_candidate = Some(candidate.is_turn_relay_candidate());
         record_timeline_event(&self.timeline, event).await;
-        self.peer_connection
-            .add_ice_candidate(candidate.into_rtc())
-            .await
-            .map_err(|err| {
-                TransportError::Unavailable(format!("add ICE candidate failed: {err}"))
-            })?;
-        self.metrics.lock().await.remote_candidates_applied += 1;
-        Ok(())
     }
 
     /// Drain locally gathered ICE candidates in callback order for signaling.
@@ -1626,6 +1676,105 @@ mod tests {
 
     #[cfg_attr(
         not(target_os = "linux"),
+        ignore = "live loopback WebRTC candidate queueing is runner-dependent outside Linux CI"
+    )]
+    #[tokio::test]
+    async fn queues_candidates_until_remote_description_then_applies_late_candidates(
+    ) -> Result<(), TransportError> {
+        let offerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let answerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+
+        let offer = offerer.create_offer().await?;
+        offerer
+            .wait_ice_gathering_complete(Duration::from_secs(5))
+            .await?;
+        let offerer_candidates = offerer.drain_local_candidates().await;
+        assert!(
+            !offerer_candidates.is_empty(),
+            "offerer must gather at least one local candidate for shuffled-order coverage"
+        );
+
+        let answer = answerer.create_answer(offer).await?;
+        for candidate in offerer_candidates {
+            answerer.add_remote_candidate(candidate).await?;
+        }
+        let answerer_metrics = answerer.direct_path_metrics().await;
+        assert!(
+            answerer_metrics.remote_candidates_applied > 0,
+            "late candidates after remote offer should apply immediately: {answerer_metrics:?}"
+        );
+        assert!(answerer.diagnostic_timeline().await.events.iter().any(|event| {
+            event.kind == "ice_candidate"
+                && event.direction.as_deref() == Some("remote")
+                && event.state.as_deref() == Some("applied")
+        }));
+
+        answerer
+            .wait_ice_gathering_complete(Duration::from_secs(5))
+            .await?;
+        let answerer_candidates = answerer.drain_local_candidates().await;
+        assert!(
+            !answerer_candidates.is_empty(),
+            "answerer must gather at least one local candidate for pre-answer queueing coverage"
+        );
+
+        for candidate in answerer_candidates {
+            offerer.add_remote_candidate(candidate).await?;
+        }
+        let queued_before_answer = offerer.diagnostic_timeline().await;
+        let queued_count = queued_before_answer
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "ice_candidate"
+                    && event.direction.as_deref() == Some("remote")
+                    && event.state.as_deref() == Some("queued")
+            })
+            .count() as u64;
+        assert!(queued_count > 0, "candidate must queue before remote answer");
+        assert_eq!(
+            offerer.direct_path_metrics().await.remote_candidates_applied,
+            0,
+            "queued candidates must not count as WebRTC-applied before remote answer"
+        );
+
+        offerer.accept_answer(answer).await?;
+        let offerer_metrics = offerer.direct_path_metrics().await;
+        assert_eq!(
+            offerer_metrics.remote_candidates_applied, queued_count,
+            "queued candidates must flush into the WebRTC stack exactly once"
+        );
+        let offerer_timeline = offerer.diagnostic_timeline().await;
+        let applied_count = offerer_timeline
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == "ice_candidate"
+                    && event.direction.as_deref() == Some("remote")
+                    && event.state.as_deref() == Some("applied")
+            })
+            .count() as u64;
+        assert_eq!(
+            applied_count, queued_count,
+            "each queued candidate should produce exactly one applied event after answer"
+        );
+        let timeline_json = offerer_timeline.to_redacted_json();
+        for forbidden in ["candidate:", "ice-pwd", "ice-ufrag", "v=0"] {
+            assert!(
+                !timeline_json.contains(forbidden),
+                "queued candidate timeline leaked {forbidden}: {timeline_json}"
+            );
+        }
+
+        offerer.tear_down().await?;
+        answerer.tear_down().await?;
+        Ok(())
+    }
+
+    #[cfg_attr(
+        not(target_os = "linux"),
         ignore = "live loopback WebRTC readiness is runner-dependent outside Linux CI"
     )]
     #[tokio::test]
@@ -1836,6 +1985,54 @@ mod tests {
         assert!(json.contains("relay"));
 
         negotiator.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_candidate_after_remote_description_fails_closed_with_redacted_diagnostic(
+    ) -> Result<(), TransportError> {
+        let offerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let answerer =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let offer = offerer.create_offer().await?;
+        let _answer = answerer.create_answer(offer).await?;
+
+        let malformed = WebRtcIceCandidate {
+            candidate: "candidate:secret-host".to_owned(),
+            sdp_mid: Some("data".to_owned()),
+            sdp_mline_index: Some(0),
+            username_fragment: Some("ufrag-secret".to_owned()),
+            url: Some("turns:secret-turn.example.invalid:5349".to_owned()),
+        };
+        let error = answerer
+            .add_remote_candidate(malformed)
+            .await
+            .expect_err("malformed candidate after remote SDP must fail closed");
+        let message = error.to_string();
+        assert!(!message.contains("secret-host"));
+        assert!(!message.contains("ufrag-secret"));
+        assert!(!message.contains("secret-turn"));
+        assert!(!message.contains("candidate:"));
+
+        let timeline = answerer.diagnostic_timeline().await;
+        assert!(timeline.events.iter().any(|event| {
+            event.kind == "ice_candidate"
+                && event.direction.as_deref() == Some("remote")
+                && event.state.as_deref() == Some("apply_failed")
+                && event.failure_reason.as_deref()
+                    == Some("redacted WebRTC failure; inspect structured diagnostic timeline")
+        }));
+        let json = timeline.to_redacted_json();
+        for forbidden in ["secret-host", "ufrag-secret", "secret-turn", "candidate:", "v=0"] {
+            assert!(
+                !json.contains(forbidden),
+                "malformed candidate diagnostic leaked {forbidden}: {json}"
+            );
+        }
+
+        offerer.close().await?;
+        answerer.close().await?;
         Ok(())
     }
 
