@@ -2996,6 +2996,41 @@ impl TauriAppService {
         false
     }
 
+    fn text_control_runtime_attach_still_current(
+        &self,
+        active_session_id: &str,
+        role: ProviderTextControlRuntimePeerRole,
+        local_peer_id: &SignalingPeerId,
+        remote_peer_id: &SignalingPeerId,
+    ) -> Result<(), String> {
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            return Err(format!(
+                "text/control runtime attach for session {active_session_id} finished after the text session stopped"
+            ));
+        };
+        if session.session_id != active_session_id {
+            return Err(format!(
+                "text/control runtime attach for session {active_session_id} finished after active session changed to {}",
+                session.session_id
+            ));
+        }
+        let Some(pending) = &self.pending_text_control_transport_runtime else {
+            return Err(format!(
+                "text/control runtime attach for session {active_session_id} finished after pending attach state was cleared"
+            ));
+        };
+        if pending.session_id != active_session_id
+            || pending.role != role
+            || pending.local_peer_id != local_peer_id.0
+            || pending.remote_peer_id != remote_peer_id.0
+        {
+            return Err(format!(
+                "text/control runtime attach for session {active_session_id} finished after pending role or peer ids changed"
+            ));
+        }
+        Ok(())
+    }
+
     fn pump_text_control_transport_once(
         &mut self,
         request: ListPendingTextControlFramesRequest,
@@ -14362,6 +14397,28 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
         let previous_cursor = guard.state.latest_event_cursor();
         match runtime_result {
             Ok(runtime) => {
+                if let Err(error) = guard.text_control_runtime_attach_still_current(
+                    &job.active_session_id,
+                    job.role,
+                    &job.local_peer_id,
+                    &job.remote_peer_id,
+                ) {
+                    guard.state.push_command_error(
+                        "transport.text_runtime_attach_stale",
+                        job.command_name,
+                        "transport_runtime_attach_stale",
+                        error,
+                        "Retry attach against the current text session; late provider runtime completions are discarded to avoid stale sessions or split-brain DataChannels",
+                    );
+                    guard.persist();
+                    #[cfg(feature = "tauri-runtime")]
+                    {
+                        let state = guard.to_view();
+                        drop(guard);
+                        emit_background_app_events(&state, previous_cursor);
+                    }
+                    return;
+                }
                 guard
                     .state
                     .mark_text_session_runtime_route_proof(runtime.evidence());
@@ -23721,6 +23778,88 @@ mod tests {
             .pending_text_control_transport_runtime
             .as_ref()
             .is_some_and(|pending| pending.session_id == active_session_id));
+    }
+
+    #[test]
+    fn stale_text_runtime_attach_completion_is_rejected_after_rapid_restart() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-stale-completion");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let first = start_text_session(StartTextSessionRequest {
+            scope_label: Some("rapid-restart-first".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(first.last_command_error.is_none(), "{first:?}");
+        let first_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("first text session should be active");
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.pending_text_control_transport_runtime =
+                Some(PendingTextControlTransportRuntime {
+                    session_id: first_session_id.clone(),
+                    role: ProviderTextControlRuntimePeerRole::Offerer,
+                    local_peer_id: "alice-runtime-peer".to_owned(),
+                    remote_peer_id: "bob-runtime-peer".to_owned(),
+                });
+        }
+
+        let second = start_text_session(StartTextSessionRequest {
+            scope_label: Some("rapid-restart-second".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(second.last_command_error.is_none(), "{second:?}");
+        let second_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("second text session should be active");
+        assert_ne!(
+            first_session_id, second_session_id,
+            "rapid restart must create a new text session id"
+        );
+
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_peer_id = SignalingPeerId::new("alice-runtime-peer".to_owned())
+            .expect("test local runtime peer id should validate");
+        let remote_peer_id = SignalingPeerId::new("bob-runtime-peer".to_owned())
+            .expect("test remote runtime peer id should validate");
+        let stale = guard.text_control_runtime_attach_still_current(
+            &first_session_id,
+            ProviderTextControlRuntimePeerRole::Offerer,
+            &local_peer_id,
+            &remote_peer_id,
+        );
+        assert!(
+            stale
+                .as_ref()
+                .is_err_and(|error| error.contains("active session changed")),
+            "late attach completion should be rejected after rapid restart: {stale:?}"
+        );
+        assert!(
+            guard.pending_text_control_transport_runtime.is_none(),
+            "rapid restart must clear pending runtime for the old text session"
+        );
+        assert!(
+            guard.text_control_transport_runtime.is_none(),
+            "stale completion validation must not install a runtime"
+        );
     }
 
     #[test]
