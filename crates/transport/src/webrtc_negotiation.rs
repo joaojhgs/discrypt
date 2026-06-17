@@ -1225,7 +1225,8 @@ impl WebRtcNegotiator {
         candidate: WebRtcIceCandidate,
     ) -> Result<(), TransportError> {
         if self.peer_connection.remote_description().await.is_none() {
-            self.record_remote_candidate_event(&candidate, "queued").await;
+            self.record_remote_candidate_event(&candidate, "queued")
+                .await;
             self.pending_remote_candidates.lock().await.push(candidate);
             return Ok(());
         }
@@ -1249,7 +1250,11 @@ impl WebRtcNegotiator {
     ) -> Result<(), TransportError> {
         let is_relay = candidate.is_turn_relay_candidate();
         let candidate_type = ice_candidate_type(&candidate);
-        if let Err(err) = self.peer_connection.add_ice_candidate(candidate.into_rtc()).await {
+        if let Err(err) = self
+            .peer_connection
+            .add_ice_candidate(candidate.into_rtc())
+            .await
+        {
             let reason = redacted_failure_reason(format!("add ICE candidate failed: {err}"));
             let mut event = diagnostic_event("ice_candidate");
             event.peer_role = Some("local".to_owned());
@@ -1705,11 +1710,16 @@ mod tests {
             answerer_metrics.remote_candidates_applied > 0,
             "late candidates after remote offer should apply immediately: {answerer_metrics:?}"
         );
-        assert!(answerer.diagnostic_timeline().await.events.iter().any(|event| {
-            event.kind == "ice_candidate"
-                && event.direction.as_deref() == Some("remote")
-                && event.state.as_deref() == Some("applied")
-        }));
+        assert!(answerer
+            .diagnostic_timeline()
+            .await
+            .events
+            .iter()
+            .any(|event| {
+                event.kind == "ice_candidate"
+                    && event.direction.as_deref() == Some("remote")
+                    && event.state.as_deref() == Some("applied")
+            }));
 
         answerer
             .wait_ice_gathering_complete(Duration::from_secs(5))
@@ -1733,9 +1743,15 @@ mod tests {
                     && event.state.as_deref() == Some("queued")
             })
             .count() as u64;
-        assert!(queued_count > 0, "candidate must queue before remote answer");
+        assert!(
+            queued_count > 0,
+            "candidate must queue before remote answer"
+        );
         assert_eq!(
-            offerer.direct_path_metrics().await.remote_candidates_applied,
+            offerer
+                .direct_path_metrics()
+                .await
+                .remote_candidates_applied,
             0,
             "queued candidates must not count as WebRTC-applied before remote answer"
         );
@@ -2024,7 +2040,13 @@ mod tests {
                     == Some("redacted WebRTC failure; inspect structured diagnostic timeline")
         }));
         let json = timeline.to_redacted_json();
-        for forbidden in ["secret-host", "ufrag-secret", "secret-turn", "candidate:", "v=0"] {
+        for forbidden in [
+            "secret-host",
+            "ufrag-secret",
+            "secret-turn",
+            "candidate:",
+            "v=0",
+        ] {
             assert!(
                 !json.contains(forbidden),
                 "malformed candidate diagnostic leaked {forbidden}: {json}"
