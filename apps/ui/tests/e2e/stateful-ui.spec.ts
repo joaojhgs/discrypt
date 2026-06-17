@@ -328,8 +328,12 @@ test("direct message send stays command-backed", async ({ page }) => {
 
 // transport status surfaces signaling not-ready state before invite metadata
 test("group invite join text channel and voice controls work without fake members", async ({
+  context,
   page,
 }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], {
+    origin: "http://127.0.0.1:4173",
+  });
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   page.on("console", (message) => {
@@ -359,9 +363,29 @@ test("group invite join text channel and voice controls work without fake member
   ).toHaveCount(0);
 
   await openGroupInviteModal(page);
-  await page.getByRole("button", { name: /create invite for/i }).click();
   const inviteSheet = page.getByRole("dialog", { name: "Create group invite" });
+  await inviteSheet.getByLabel("Invite expiry").selectOption("30");
+  await inviteSheet.getByLabel("Maximum uses").fill("9");
+  await inviteSheet.getByLabel("Invite revocation state").selectOption("active_revocable");
+  await expect(inviteSheet.getByText("Adapter snapshot", { exact: true })).toBeVisible();
+  await expect(
+    inviteSheet.getByTitle("mqtt · mqtts://broker.emqx.io:8883"),
+  ).toBeVisible();
+  await inviteSheet.getByLabel("Require invite password").click();
+  await inviteSheet
+    .getByRole("textbox", { name: "Invite password" })
+    .fill("correct horse battery staple");
+  await page.getByRole("button", { name: /create invite for/i }).click();
   await expect(inviteSheet.getByText(/discrypt:\/\/join\/v1/i).first()).toBeVisible();
+  await expect(inviteSheet.getByText("Max uses", { exact: true })).toBeVisible();
+  await expect(inviteSheet.getByText("9 uses", { exact: true })).toBeVisible();
+  await expect(inviteSheet.getByText("Revocation state", { exact: true })).toBeVisible();
+  await expect(
+    inviteSheet.getByText("Active, owner-revocable", { exact: true }).last(),
+  ).toBeVisible();
+  await expect(inviteSheet.getByText("Password gate", { exact: true })).toBeVisible();
+  await expect(inviteSheet.getByText(/OnlineAuthorizedHelper/i)).toBeVisible();
+  await expect(inviteSheet.getByText("Adapter snapshot", { exact: true }).first()).toBeVisible();
   await expect(
     inviteSheet.getByText("Signaling endpoint", { exact: true }),
   ).toBeVisible();
@@ -379,6 +403,24 @@ test("group invite join text channel and voice controls work without fake member
   await expect(
     inviteSheet.getByText("2 STUN · 1 TURN", { exact: true }),
   ).toBeVisible();
+  const inviteLink = inviteSheet.getByTestId("invite-link");
+  const generatedInvite = await inviteLink.inputValue();
+  await inviteLink.click();
+  await expect
+    .poll(() =>
+      inviteLink.evaluate(
+        (node) =>
+          node instanceof HTMLTextAreaElement
+            ? node.selectionEnd - node.selectionStart
+            : 0,
+      ),
+    )
+    .toBe(generatedInvite.length);
+  await inviteSheet.getByRole("button", { name: /copy invite/i }).click();
+  await expect(inviteSheet.getByRole("button", { name: /copied/i })).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(generatedInvite);
   await page.getByRole("button", { name: /Close Create group invite/i }).click();
   await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
   await expect(page.getByText(/discrypt:\/\/join\/v1/i)).toHaveCount(0);

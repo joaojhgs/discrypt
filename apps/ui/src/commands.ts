@@ -819,6 +819,7 @@ export type CreateInviteRequest = {
   expires: string;
   max_use: string;
   password_gate?: string | null;
+  revocation_state?: "active_revocable" | string | null;
 };
 
 export type CreateDmInviteRequest = {
@@ -2343,6 +2344,55 @@ function inviteExpirationHorizon(label: string): string {
 function parseMaxUses(label: string): number {
   const match = label.match(/\d+/);
   return match ? Number(match[0]) || 5 : 5;
+}
+
+function inviteAdmissionSnapshot(
+  groupId: string,
+  connectivity: ConnectivityPolicyView,
+): InviteAdmissionSnapshotView {
+  return {
+    group_id_commitment: hashCommitment("discrypt-signed-invite-group-id-v1", [
+      groupId,
+    ]),
+    group_commitment: hashCommitment("discrypt-signed-invite-openmls-group-v1", [
+      groupId,
+    ]),
+    admission_mode: "manual_approval",
+    policy_epoch: 1,
+    role_admission_policy_commitment:
+      connectivity.group_bootstrap?.role_admission_policy_commitment ??
+      hashCommitment("discrypt-group-admission-policy-commitment-v1", [groupId]),
+    welcome_required: true,
+  };
+}
+
+function inviteRevocationPolicy(
+  groupId: string,
+): InviteRevocationPolicyView {
+  return {
+    revocable: true,
+    revocation_authority_commitment: hashCommitment(
+      "discrypt-invite-revocation-authority-v1",
+      [groupId, localUserId(fallbackState)],
+    ),
+    expiry_enforced: true,
+    max_use_enforced: true,
+  };
+}
+
+function invitePasswordPolicy(
+  groupId: string,
+): InvitePasswordPolicyView {
+  return {
+    required: true,
+    protocol: "OnlineAuthorizedHelper",
+    helper_id: `admission-helper-${groupId}`,
+    rate_limit_policy_commitment: hashCommitment(
+      "discrypt-invite-password-rate-limit-policy-v1",
+      [groupId, localUserId(fallbackState)],
+    ),
+    offline_verifier_allowed: false,
+  };
 }
 
 function groupNameFromGroupId(groupId: string | null | undefined): string | null {
@@ -4302,6 +4352,9 @@ export async function createInvite(
         privacy_label: connectivity.privacy_label,
         dm_bootstrap: connectivity.dm_bootstrap,
         group_bootstrap: connectivity.group_bootstrap,
+        admission_snapshot: inviteAdmissionSnapshot(groupId, connectivity),
+        revocation_policy: inviteRevocationPolicy(groupId),
+        password_policy: passwordGate ? invitePasswordPolicy(groupId) : null,
         code: productionInviteLink(inviteMetadata),
         room_secret_hash: roomSecretHash,
         signaling_endpoint: signalingEndpoint,
