@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-17T03:04:45.340Z",
+  "updatedAt": "2026-06-17T07:13:30.956Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -292,6 +292,18 @@
       "evidence": "PER-26/P3-T05 provider app-payload relay fallback removed: provider control send/take paths fail closed per MQTT/Nostr/IPFS/QUIC/local provider checks, g009 no longer falls back to provider relay, probe DTO/capabilities no longer advertise provider control relay, public/local provider smoke copy is presence plus sealed WebRTC negotiation only, and P3-T05 static gate/npm wrapper/git diff checks passed. Local cargo and tsc checks are blocked by missing tools/dependencies.",
       "startedAt": "2026-06-17T02:40:23.733Z",
       "completedAt": "2026-06-17T03:04:45.340Z"
+    },
+    {
+      "id": "G026-p3-t01-runtime-role-selection-contra",
+      "title": "P3-T01 runtime role selection contract",
+      "objective": "Implement PER-22/P3-T01 runtime role selection contract: derive provider-signaled WebRTC text/control offerer/answerer from current backend membership/admission role plus stable peer ids, add owner/staff/member reload and invite-join unit coverage, and record verification evidence.",
+      "status": "complete",
+      "attempt": 1,
+      "createdAt": "2026-06-17T06:19:20.625Z",
+      "updatedAt": "2026-06-17T07:13:30.956Z",
+      "evidence": "PER-22/P3-T01 runtime role selection contract implemented on PR #16 head ffb5b6325ac5ced474584a39ef27a73604ea787d: group runtime role derives from backend-governed role evidence and signed bootstrap peer ids, migration-only defaults fail closed, owner/staff/member reload and invite-join coverage added, independent review clear, ai-slop-cleaner passed, and GitHub Actions CI is green.",
+      "startedAt": "2026-06-17T06:19:32.478Z",
+      "completedAt": "2026-06-17T07:13:30.956Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
