@@ -960,6 +960,8 @@ function App() {
   const [draftJoinName, setDraftJoinName] = useState("");
   const [inviteExpiryDays, setInviteExpiryDays] = useState("7");
   const [inviteMaxUses, setInviteMaxUses] = useState("5");
+  const [inviteRevocationState, setInviteRevocationState] =
+    useState("active_revocable");
   const [invitePasswordEnabled, setInvitePasswordEnabled] = useState(false);
   const [invitePassword, setInvitePassword] = useState("");
   const [draftDisplayName, setDraftDisplayName] = useState("");
@@ -2143,6 +2145,7 @@ function App() {
         group_id: groupId,
         expires: expiresLabel,
         max_use: maxUseLabel,
+        revocation_state: inviteRevocationState,
         password_gate: invitePasswordEnabled ? invitePassword : null,
       }),
       (state) => {
@@ -2838,6 +2841,8 @@ function App() {
             setExpiryDays={setInviteExpiryDays}
             maxUses={inviteMaxUses}
             setMaxUses={setInviteMaxUses}
+            revocationState={inviteRevocationState}
+            setRevocationState={setInviteRevocationState}
             passwordEnabled={invitePasswordEnabled}
             setPasswordEnabled={setInvitePasswordEnabled}
             password={invitePassword}
@@ -5905,6 +5910,8 @@ function GroupInvitePanel({
   setExpiryDays,
   maxUses,
   setMaxUses,
+  revocationState,
+  setRevocationState,
   passwordEnabled,
   setPasswordEnabled,
   password,
@@ -5917,6 +5924,8 @@ function GroupInvitePanel({
   setExpiryDays: (value: string) => void;
   maxUses: string;
   setMaxUses: (value: string) => void;
+  revocationState: string;
+  setRevocationState: (value: string) => void;
   passwordEnabled: boolean;
   setPasswordEnabled: (value: boolean) => void;
   password: string;
@@ -5925,6 +5934,9 @@ function GroupInvitePanel({
 }) {
   const selectedProfile = group?.connectivity?.signaling_profiles[0] ?? null;
   const passwordReady = !passwordEnabled || password.trim().length >= 8;
+  const adapterSnapshot = selectedProfile
+    ? `${selectedProfile.adapter_kind} · ${selectedProfile.endpoints[0] ?? "endpoint missing"}`
+    : "No signaling profile selected";
   return (
     <div className="grid gap-4 py-5">
       <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-4">
@@ -5974,6 +5986,33 @@ function GroupInvitePanel({
             </Label>
           </div>
 
+          <div className="grid gap-4 md:grid-cols-2">
+            <Label className="grid gap-2">
+              Revocation state
+              <Select
+                value={revocationState}
+                onValueChange={setRevocationState}
+                aria-label="Invite revocation state"
+              >
+                <SelectItem value="active_revocable">
+                  Active, owner-revocable
+                </SelectItem>
+              </Select>
+            </Label>
+            <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.18)] p-4">
+              <p className="text-sm font-medium">Adapter snapshot</p>
+              <p
+                className="mt-1 truncate text-sm text-[hsl(var(--muted-foreground))]"
+                title={adapterSnapshot}
+              >
+                {adapterSnapshot}
+              </p>
+              <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                This signed snapshot is copied from the selected group policy when the invite is issued.
+              </p>
+            </div>
+          </div>
+
           <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.18)] p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -5982,7 +6021,11 @@ function GroupInvitePanel({
                   Optional admission password. The raw password is never embedded in the pasted invite.
                 </p>
               </div>
-              <Switch checked={passwordEnabled} onCheckedChange={setPasswordEnabled} />
+              <Switch
+                checked={passwordEnabled}
+                onCheckedChange={setPasswordEnabled}
+                aria-label="Require invite password"
+              />
             </div>
             {passwordEnabled ? (
               <Label className="mt-4 grid gap-2">
@@ -6196,6 +6239,20 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
     ? Math.max(0, maxUsesNumber - invite.uses)
     : null;
   const selectedProfile = invite.signaling_profiles[0] ?? null;
+  const adapterSnapshot = selectedProfile
+    ? `${selectedProfile.adapter_kind} · ${selectedProfile.endpoints[0] ?? "endpoint missing"}`
+    : invite.signaling_endpoint || invite.invite_kind;
+  const revocationState = invite.revoked
+    ? "Revoked locally"
+    : invite.revocation_policy?.revocable
+      ? "Active, owner-revocable"
+      : "Active";
+  const passwordGate = invite.password_policy?.required
+    ? `${invite.password_policy.protocol}; offline verifier not embedded`
+    : "Not required";
+  const admissionSnapshot = invite.admission_snapshot
+    ? `${invite.admission_snapshot.admission_mode}; Welcome required`
+    : "Authorized MLS Welcome required";
   const copyInvite = async () => {
     await navigator.clipboard?.writeText(invite.code);
     setCopied(true);
@@ -6227,6 +6284,7 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             onFocus={(event) => event.currentTarget.select()}
             onClick={(event) => event.currentTarget.select()}
             aria-label="Invite link"
+            data-testid="invite-link"
             className="h-20 resize-none overflow-auto bg-transparent font-mono text-xs leading-5 text-emerald-50/90 outline-none"
           />
           <div className="flex items-center justify-between gap-3">
@@ -6246,6 +6304,10 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             value={selectedProfile?.adapter_kind ?? invite.invite_kind}
           />
           <InviteFact
+            label="Adapter snapshot"
+            value={adapterSnapshot}
+          />
+          <InviteFact
             label="Signaling endpoint"
             value={invite.signaling_endpoint || selectedProfile?.endpoints[0] || "not provided"}
           />
@@ -6262,9 +6324,15 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             label="Remaining local uses"
             value={remainingUses === null ? "not parsed" : String(remainingUses)}
           />
+          <InviteFact label="Revocation state" value={revocationState} />
+          <InviteFact label="Password gate" value={passwordGate} />
           <InviteFact
             label="Admission"
             value={invite.admission_copy || "Authorized MLS welcome required"}
+          />
+          <InviteFact
+            label="Admission snapshot"
+            value={admissionSnapshot}
           />
           <InviteFact
             label="STUN/TURN"
