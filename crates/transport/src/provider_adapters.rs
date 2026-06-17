@@ -6459,15 +6459,18 @@ mod tests {
     }
 
     fn assert_provider_app_payload_relay_disabled<T>(result: Result<T, TransportError>) {
-        let Err(error) = result else {
-            panic!("provider application-payload relay path unexpectedly succeeded");
-        };
         assert!(
-            error
-                .to_string()
-                .contains(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE),
-            "unexpected provider relay error: {error}"
+            result.is_err(),
+            "provider application-payload relay path unexpectedly succeeded"
         );
+        if let Err(error) = result {
+            assert!(
+                error
+                    .to_string()
+                    .contains(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE),
+                "unexpected provider relay error: {error}"
+            );
+        }
     }
 
     fn expected_readiness(boundary: ProviderAdapterBoundary) -> ProviderAdapterReadiness {
