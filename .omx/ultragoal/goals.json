@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-17T16:31:00.323Z",
+  "updatedAt": "2026-06-17T17:40:27.852Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -328,7 +328,19 @@
       "evidence": "PER-23/P3-T02 implementation ready for QA on PR #18 head 17f0a2f33dd5761e5a9e53d7504d93c695dd3a9f: redacted ICE/DTLS/DataChannel diagnostic timeline implemented, provider boundary preserved, Windows Disconnected(Close) teardown stabilized and relabeled as close_already_disconnected, independent code review approved, architect product-code watch addressed, git diff --check passed, local Rust unavailable, GitHub Actions all passed including both Windows Rust jobs.",
       "startedAt": "2026-06-17T13:11:24.614Z",
       "completedAt": "2026-06-17T16:31:00.323Z"
+    },
+    {
+      "id": "G029-p3-t03-candidate-queueing-late-arriv",
+      "title": "P3-T03 candidate queueing late arrival",
+      "objective": "Implement and verify PER-24/P3-T03 WebRTC remote ICE candidate queueing before remote SDP, exact-once flush after offer/answer, late candidate direct application, and redacted diagnostics.",
+      "status": "in_progress",
+      "attempt": 1,
+      "createdAt": "2026-06-17T17:40:19.487Z",
+      "updatedAt": "2026-06-17T17:40:27.852Z",
+      "evidence": ".omx/plans/P3-T03-candidate-queueing-late-arrival-2026-06-17.md created from PER-24 issue metadata and Phase 3 acceptance criteria.",
+      "startedAt": "2026-06-17T17:40:27.852Z"
     }
   ],
-  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
+  "activeGoalId": "G029-p3-t03-candidate-queueing-late-arriv"
 }
