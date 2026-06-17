@@ -6994,8 +6994,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "ipfs-pubsub-adapter")]
-    async fn ipfs_pubsub_local_two_peer_presence_and_signal_roundtrip(
-    ) -> Result<(), TransportError> {
+    async fn ipfs_pubsub_local_two_peer_presence_and_signal_roundtrip() -> Result<(), TransportError>
+    {
         let adapter = IpfsPubsubProviderAdapter;
         let alice = SignalingPeerId::new("alice-device")?;
         let bob = SignalingPeerId::new("bob-device")?;

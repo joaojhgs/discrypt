@@ -350,7 +350,7 @@ fn start_and_attach_runtime_derived_or_relay() -> Result<bool, Box<dyn std::erro
             local_peer_id: None,
             remote_peer_id: None,
             derive_from_state: true,
-    });
+        });
     if let Some(error) = attached.last_command_error {
         return Err(format!(
             "g009 direct text/control runtime attach unavailable; provider signaling is not a message relay: {}: {}",
