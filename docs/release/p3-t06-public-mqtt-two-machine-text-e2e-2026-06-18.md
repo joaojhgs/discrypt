@@ -7,10 +7,10 @@ Issue: PER-27 / P3-T06.
 Status: PR namespace proof passed.
 
 GitHub Actions PR run
-`https://github.com/joaojhgs/discrypt/actions/runs/27789088226` passed the
+`https://github.com/joaojhgs/discrypt/actions/runs/27789466361` passed the
 `PER-27 public MQTT namespace proof` job on branch
 `multica/P3-T06-public-mqtt-two-machine-text-e2e`, head
-`3fc5cbe320c4ba1f1721e4f505e7f0f2d1521296`.
+`1207b6cf16a721d75b1b86817d09db0cb7195c73`.
 
 The proof ran the public MQTT split-machine transport example in two distinct
 Docker network namespaces on a user-defined bridge network. MQTT remained the
@@ -24,18 +24,18 @@ answerer returned opaque receipts over the same DataChannel.
 
 PR artifact name:
 
-`per27-public-mqtt-namespace-27789088226-1`
+`per27-public-mqtt-namespace-27789466361-1`
 
 Downloaded validation directory:
 
-`/tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1`
+`/tmp/per27-gha-namespace-latest/per27-public-mqtt-namespace-27789466361-1`
 
 Files:
 
 - `split-machine-mqtt-offerer.json`
-  - SHA-256: `c10ef714591514f372c7acc34ca152f89176a73acfd8ebec0dfa6a950167a378`
+  - SHA-256: `2ec7cb20fbd92dac38ea786fcae8240d29090dc8f209c6ce461deceed426cd06`
   - `status`: `passed`
-  - `room`: `discrypt-per-27-mqtt-gha-27789088226-1`
+  - `room`: `discrypt-per-27-mqtt-gha-27789466361-1`
   - `endpoint`: `mqtts://broker.emqx.io:8883`
   - `direct_path_ready`: `true`
   - `data_channel_open`: `true`
@@ -44,9 +44,9 @@ Files:
   - `provider_application_relay_used`: `false`
   - provider boundary `application_payload_relay_used`: `false`
 - `split-machine-mqtt-answerer.json`
-  - SHA-256: `3262ab35fd23f8c68a46d17fed0f334e7226249cbe518a06eff1a66d29835238`
+  - SHA-256: `f35bbc1cddee13e04b0895af5996577f261772b9d7f28c035a51ae6759b3571f`
   - `status`: `passed`
-  - `room`: `discrypt-per-27-mqtt-gha-27789088226-1`
+  - `room`: `discrypt-per-27-mqtt-gha-27789466361-1`
   - `endpoint`: `mqtts://broker.emqx.io:8883`
   - `direct_path_ready`: `true`
   - `data_channel_open`: `true`
@@ -55,17 +55,17 @@ Files:
   - `provider_application_relay_used`: `false`
   - provider boundary `application_payload_relay_used`: `false`
 - `answerer-docker-namespace.txt`
-  - SHA-256: `ef9612b1e18d9c25f231a1d449d50d92119a72d9e0c4aeffd1e39f638a5770ad`
+  - SHA-256: `2d6bc5d38a27fbb5d6c9d6f568b8174a5fc96cebed20bc3fc213860f3d3bc93e`
   - `container_ip`: `172.18.0.2`
   - `webrtc_udp_addrs`: `172.18.0.2:0`
   - namespace: `net:[4026532274]`
 - `offerer-docker-namespace.txt`
-  - SHA-256: `0e9a1833952a3d5e413e7358055c9d8398d3a7f3ef8070ca22e0471ad11a0245`
+  - SHA-256: `4c506a8166dbbe1fef33a1eb693603d2098516fc71985b0f510eb1b69a491c7f`
   - `container_ip`: `172.18.0.3`
   - `webrtc_udp_addrs`: `172.18.0.3:0`
   - namespace: `net:[4026532339]`
 - `runner-build-namespace.txt`
-  - SHA-256: `9818befabb16ed4f08d345cdc1430a42a88d11ae8fbf2a9a594fff61c40579b9`
+  - SHA-256: `4c474ab3df6b93cf03ac747aa9c06d94670f4da9fd01a0887711cd846f6621ce`
   - runner namespace: `net:[4026531833]`
 
 The artifacts include `release_boundary` and `provider_boundary` objects. These
@@ -144,15 +144,15 @@ Result: both role processes passed and wrote artifacts.
 PR namespace verification:
 
 ```bash
-gh run view 27789088226 --repo joaojhgs/discrypt --json status,conclusion,jobs,url,headSha,attempt
-gh run download 27789088226 --repo joaojhgs/discrypt -D /tmp/per27-gha-namespace-pass
+gh run view 27789466361 --repo joaojhgs/discrypt --json status,conclusion,jobs,url,headSha,attempt
+gh run download 27789466361 --repo joaojhgs/discrypt -D /tmp/per27-gha-namespace-latest
 jq '{status,adapter,role,room,endpoint,evidence:{direct_path_ready:.evidence.direct_path_ready,data_channel_open:.evidence.data_channel_open,p2p_datachannel_open:.evidence.p2p_datachannel_open,bidirectional_text_control:.evidence.bidirectional_text_control,provider_application_relay_used:.evidence.provider_application_relay_used,received_frame_count:.evidence.received_frame_count,provider_boundary:.provider_boundary.application_payload_relay_used}}' \
-  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-offerer.json \
-  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-answerer.json
+  /tmp/per27-gha-namespace-latest/per27-public-mqtt-namespace-27789466361-1/split-machine-mqtt-offerer.json \
+  /tmp/per27-gha-namespace-latest/per27-public-mqtt-namespace-27789466361-1/split-machine-mqtt-answerer.json
 sha256sum \
-  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-offerer.json \
-  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-answerer.json \
-  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/*namespace.txt
+  /tmp/per27-gha-namespace-latest/per27-public-mqtt-namespace-27789466361-1/split-machine-mqtt-offerer.json \
+  /tmp/per27-gha-namespace-latest/per27-public-mqtt-namespace-27789466361-1/split-machine-mqtt-answerer.json \
+  /tmp/per27-gha-namespace-latest/per27-public-mqtt-namespace-27789466361-1/*namespace.txt
 ```
 
 Result: PR proof job passed. Both JSON artifacts reported `status: passed`,
