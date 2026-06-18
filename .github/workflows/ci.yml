@@ -149,8 +149,8 @@ jobs:
       - run: npm run test:final-e2e-g131
         working-directory: apps/ui
 
-  per27-public-mqtt-answerer:
-    name: PER-27 public MQTT answerer
+  per27-public-mqtt-namespace:
+    name: PER-27 public MQTT namespace proof
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: ${{ github.head_ref == 'multica/P3-T06-public-mqtt-two-machine-text-e2e' || github.ref_name == 'multica/P3-T06-public-mqtt-two-machine-text-e2e' }}
@@ -161,75 +161,69 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
-      - name: Record runner identity
+      - name: Record host namespace identity
         run: |
           mkdir -p "${DISCRYPT_PER27_ARTIFACT_DIR}"
           {
-            echo "role=answerer"
+            echo "role=offerer-host-namespace"
             echo "runner_name=${RUNNER_NAME}"
             echo "runner_os=${RUNNER_OS}"
             echo "hostname=$(hostname)"
             echo "room=${DISCRYPT_PER27_ROOM}"
             echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
             ip route || true
-          } > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-runner.txt"
+          } > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-host-namespace.txt"
       - name: Build split-machine proof example
         run: cargo build -p discrypt-transport --features mqtt-adapter --example split_machine_p2p
-      - name: Run public MQTT answerer
+      - name: Run answerer in Docker network namespace and offerer on host
         run: |
-          cargo run -q -p discrypt-transport --features mqtt-adapter --example split_machine_p2p -- \
-            --adapter mqtt \
-            --role answerer \
-            --room "${DISCRYPT_PER27_ROOM}" \
-            --endpoint "${DISCRYPT_PUBLIC_MQTT_ENDPOINT}" \
-            --artifact-dir "${DISCRYPT_PER27_ARTIFACT_DIR}" \
-            --answerer-hold-secs 300 \
-            --receipt-timeout-secs 90
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: per27-public-mqtt-answerer-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/e2e/per-27-public-mqtt-gha-${{ github.run_id }}-${{ github.run_attempt }}
+          mkdir -p "${DISCRYPT_PER27_ARTIFACT_DIR}"
+          docker run \
+            --name discrypt-per27-answerer \
+            --detach \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env DISCRYPT_PER27_ROOM \
+            --env DISCRYPT_PER27_ARTIFACT_DIR \
+            --env DISCRYPT_PUBLIC_MQTT_ENDPOINT \
+            rust:1.96 \
+            bash -lc '{
+              echo "role=answerer-docker-network-namespace"
+              echo "container_hostname=$(hostname)"
+              echo "room=${DISCRYPT_PER27_ROOM}"
+              echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
+              ip route || true
+            } > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker-namespace.txt";
+            target/debug/examples/split_machine_p2p \
+              --adapter mqtt \
+              --role answerer \
+              --room "${DISCRYPT_PER27_ROOM}" \
+              --endpoint "${DISCRYPT_PUBLIC_MQTT_ENDPOINT}" \
+              --artifact-dir "${DISCRYPT_PER27_ARTIFACT_DIR}" \
+              --answerer-hold-secs 120 \
+              --receipt-timeout-secs 90'
 
-  per27-public-mqtt-offerer:
-    name: PER-27 public MQTT offerer
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    if: ${{ github.head_ref == 'multica/P3-T06-public-mqtt-two-machine-text-e2e' || github.ref_name == 'multica/P3-T06-public-mqtt-two-machine-text-e2e' }}
-    env:
-      DISCRYPT_PER27_ROOM: discrypt-per-27-mqtt-gha-${{ github.run_id }}-${{ github.run_attempt }}
-      DISCRYPT_PER27_ARTIFACT_DIR: target/e2e/per-27-public-mqtt-gha-${{ github.run_id }}-${{ github.run_attempt }}
-      DISCRYPT_PUBLIC_MQTT_ENDPOINT: mqtts://broker.emqx.io:8883
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-      - name: Record runner identity
-        run: |
-          mkdir -p "${DISCRYPT_PER27_ARTIFACT_DIR}"
-          {
-            echo "role=offerer"
-            echo "runner_name=${RUNNER_NAME}"
-            echo "runner_os=${RUNNER_OS}"
-            echo "hostname=$(hostname)"
-            echo "room=${DISCRYPT_PER27_ROOM}"
-            echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
-            ip route || true
-          } > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-runner.txt"
-      - name: Build split-machine proof example
-        run: cargo build -p discrypt-transport --features mqtt-adapter --example split_machine_p2p
-      - name: Give answerer runner time to subscribe
-        run: sleep 30
-      - name: Run public MQTT offerer
-        run: |
-          cargo run -q -p discrypt-transport --features mqtt-adapter --example split_machine_p2p -- \
+          sleep 15
+          set +e
+          target/debug/examples/split_machine_p2p \
             --adapter mqtt \
             --role offerer \
             --room "${DISCRYPT_PER27_ROOM}" \
             --endpoint "${DISCRYPT_PUBLIC_MQTT_ENDPOINT}" \
             --artifact-dir "${DISCRYPT_PER27_ARTIFACT_DIR}" \
             --receipt-timeout-secs 90
+          offerer_status=$?
+          docker wait discrypt-per27-answerer > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker-exit-code.txt"
+          answerer_status=$(cat "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker-exit-code.txt")
+          docker logs discrypt-per27-answerer > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker.log" 2>&1 || true
+          docker rm discrypt-per27-answerer
+          set -e
+          echo "offerer_status=${offerer_status}" > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-exit-code.txt"
+          echo "answerer_status=${answerer_status}" >> "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-exit-code.txt"
+          test "${offerer_status}" -eq 0
+          test "${answerer_status}" -eq 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: per27-public-mqtt-offerer-${{ github.run_id }}-${{ github.run_attempt }}
+          name: per27-public-mqtt-namespace-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/e2e/per-27-public-mqtt-gha-${{ github.run_id }}-${{ github.run_attempt }}
