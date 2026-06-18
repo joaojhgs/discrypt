@@ -268,3 +268,123 @@ jobs:
         with:
           name: per27-public-mqtt-namespace-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/e2e/per-27-public-mqtt-gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+  per28-public-nostr-namespace:
+    name: PER-28 public Nostr namespace proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.head_ref == 'multica/P3-T07-public-nostr-two-machine-text-e2e' || github.ref_name == 'multica/P3-T07-public-nostr-two-machine-text-e2e' }}
+    env:
+      DISCRYPT_PER28_ROOM: discrypt-per-28-nostr-gha-${{ github.run_id }}-${{ github.run_attempt }}
+      DISCRYPT_PER28_ARTIFACT_DIR: target/e2e/per-28-public-nostr-gha-${{ github.run_id }}-${{ github.run_attempt }}
+      DISCRYPT_PUBLIC_NOSTR_ENDPOINT: wss://nos.lol
+      DISCRYPT_WEBRTC_ICE_MODE: host_only
+      DISCRYPT_WEBRTC_DEBUG_CANDIDATES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Record runner namespace identity
+        run: |
+          mkdir -p "${DISCRYPT_PER28_ARTIFACT_DIR}"
+          {
+            echo "role=github-runner-build-namespace"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "hostname=$(hostname)"
+            echo "room=${DISCRYPT_PER28_ROOM}"
+            echo "endpoint=${DISCRYPT_PUBLIC_NOSTR_ENDPOINT}"
+            readlink /proc/self/ns/net || true
+            ip route || true
+          } > "${DISCRYPT_PER28_ARTIFACT_DIR}/runner-build-namespace.txt"
+      - name: Build split-machine proof example
+        run: cargo build -p discrypt-transport --features nostr-adapter --example split_machine_p2p
+      - name: Run answerer and offerer in distinct Docker network namespaces
+        run: |
+          mkdir -p "${DISCRYPT_PER28_ARTIFACT_DIR}"
+          docker network create discrypt-per28-net
+          cleanup() {
+            docker rm -f discrypt-per28-answerer discrypt-per28-offerer >/dev/null 2>&1 || true
+            docker network rm discrypt-per28-net >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run \
+            --name discrypt-per28-answerer \
+            --detach \
+            --network discrypt-per28-net \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env DISCRYPT_PER28_ROOM \
+            --env DISCRYPT_PER28_ARTIFACT_DIR \
+            --env DISCRYPT_PUBLIC_NOSTR_ENDPOINT \
+            --env DISCRYPT_WEBRTC_ICE_MODE \
+            --env DISCRYPT_WEBRTC_DEBUG_CANDIDATES \
+            rust:1.96 \
+            bash -lc 'container_ip="$(hostname -I | awk "{print \$1}")";
+            export DISCRYPT_WEBRTC_UDP_ADDRS="${container_ip}:0";
+            {
+              echo "role=answerer-docker-network-namespace"
+              echo "container_hostname=$(hostname)"
+              echo "container_ip=${container_ip}"
+              echo "webrtc_udp_addrs=${DISCRYPT_WEBRTC_UDP_ADDRS}"
+              echo "room=${DISCRYPT_PER28_ROOM}"
+              echo "endpoint=${DISCRYPT_PUBLIC_NOSTR_ENDPOINT}"
+              readlink /proc/self/ns/net || true
+              cat /proc/net/route || true
+            } > "${DISCRYPT_PER28_ARTIFACT_DIR}/answerer-docker-namespace.txt";
+            target/debug/examples/split_machine_p2p \
+              --adapter nostr \
+              --role answerer \
+              --room "${DISCRYPT_PER28_ROOM}" \
+              --endpoint "${DISCRYPT_PUBLIC_NOSTR_ENDPOINT}" \
+              --artifact-dir "${DISCRYPT_PER28_ARTIFACT_DIR}" \
+              --answerer-hold-secs 120 \
+              --receipt-timeout-secs 90'
+
+          sleep 15
+          set +e
+          docker run \
+            --name discrypt-per28-offerer \
+            --network discrypt-per28-net \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env DISCRYPT_PER28_ROOM \
+            --env DISCRYPT_PER28_ARTIFACT_DIR \
+            --env DISCRYPT_PUBLIC_NOSTR_ENDPOINT \
+            --env DISCRYPT_WEBRTC_ICE_MODE \
+            --env DISCRYPT_WEBRTC_DEBUG_CANDIDATES \
+            rust:1.96 \
+            bash -lc 'container_ip="$(hostname -I | awk "{print \$1}")";
+            export DISCRYPT_WEBRTC_UDP_ADDRS="${container_ip}:0";
+            {
+              echo "role=offerer-docker-network-namespace"
+              echo "container_hostname=$(hostname)"
+              echo "container_ip=${container_ip}"
+              echo "webrtc_udp_addrs=${DISCRYPT_WEBRTC_UDP_ADDRS}"
+              echo "room=${DISCRYPT_PER28_ROOM}"
+              echo "endpoint=${DISCRYPT_PUBLIC_NOSTR_ENDPOINT}"
+              readlink /proc/self/ns/net || true
+              cat /proc/net/route || true
+            } > "${DISCRYPT_PER28_ARTIFACT_DIR}/offerer-docker-namespace.txt";
+            target/debug/examples/split_machine_p2p \
+              --adapter nostr \
+              --role offerer \
+              --room "${DISCRYPT_PER28_ROOM}" \
+              --endpoint "${DISCRYPT_PUBLIC_NOSTR_ENDPOINT}" \
+              --artifact-dir "${DISCRYPT_PER28_ARTIFACT_DIR}" \
+              --receipt-timeout-secs 90'
+          offerer_status=$?
+          docker wait discrypt-per28-answerer > "${DISCRYPT_PER28_ARTIFACT_DIR}/answerer-docker-exit-code.txt"
+          answerer_status=$(cat "${DISCRYPT_PER28_ARTIFACT_DIR}/answerer-docker-exit-code.txt")
+          docker logs discrypt-per28-answerer > "${DISCRYPT_PER28_ARTIFACT_DIR}/answerer-docker.log" 2>&1 || true
+          docker logs discrypt-per28-offerer > "${DISCRYPT_PER28_ARTIFACT_DIR}/offerer-docker.log" 2>&1 || true
+          set -e
+          echo "offerer_status=${offerer_status}" > "${DISCRYPT_PER28_ARTIFACT_DIR}/offerer-exit-code.txt"
+          echo "answerer_status=${answerer_status}" >> "${DISCRYPT_PER28_ARTIFACT_DIR}/offerer-exit-code.txt"
+          test "${offerer_status}" -eq 0
+          test "${answerer_status}" -eq 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: per28-public-nostr-namespace-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/e2e/per-28-public-nostr-gha-${{ github.run_id }}-${{ github.run_attempt }}

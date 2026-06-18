@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-17T19:16:05.785Z",
+  "updatedAt": "2026-06-18T23:39:40.655Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -349,6 +349,16 @@
       "createdAt": "2026-06-17T19:16:05.785Z",
       "updatedAt": "2026-06-17T19:16:05.785Z",
       "evidence": ".omx/plans/P3-T04-glare-reconnect-idempotent-attach-2026-06-17.md created from PER-25 issue metadata and Phase 3 acceptance criteria."
+    },
+    {
+      "id": "G031-p3-t07-public-nostr-two-machine-text",
+      "title": "P3-T07 public Nostr two-machine text E2E",
+      "objective": "Implement and verify PER-28/P3-T07 public Nostr provider-signaled WebRTC text/control evidence: split-machine Nostr artifacts must prove DataChannel open, direct path ready, bidirectional opaque text/control receipts, and provider-visible signaling-only boundary under target/e2e plus docs/release report.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-18T23:39:40.655Z",
+      "updatedAt": "2026-06-18T23:39:40.655Z",
+      "evidence": "PER-28 issue metadata requires public Nostr two-machine text E2E, same as P3-T06 MQTT, with provider-visible privacy capture and no provider application relay."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",

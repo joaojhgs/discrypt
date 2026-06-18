@@ -331,8 +331,13 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn release_boundary(adapter: Adapter) -> serde_json::Value {
+    let (issue, task) = match adapter {
+        Adapter::Mqtt => ("PER-27 / P3-T06", "public MQTT two-machine text/control"),
+        Adapter::Nostr => ("PER-28 / P3-T07", "public Nostr two-machine text/control"),
+    };
     json!({
-        "issue": "PER-27 / P3-T06",
+        "issue": issue,
+        "task": task,
         "proof_level": "split-machine transport proof when roles run on distinct hosts with retained local and remote artifacts",
         "adapter": adapter.as_str(),
         "claims": [
