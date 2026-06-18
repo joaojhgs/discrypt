@@ -161,26 +161,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
-      - name: Record host namespace identity
+      - name: Record runner namespace identity
         run: |
           mkdir -p "${DISCRYPT_PER27_ARTIFACT_DIR}"
           {
-            echo "role=offerer-host-namespace"
+            echo "role=github-runner-build-namespace"
             echo "runner_name=${RUNNER_NAME}"
             echo "runner_os=${RUNNER_OS}"
             echo "hostname=$(hostname)"
             echo "room=${DISCRYPT_PER27_ROOM}"
             echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
+            readlink /proc/self/ns/net || true
             ip route || true
-          } > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-host-namespace.txt"
+          } > "${DISCRYPT_PER27_ARTIFACT_DIR}/runner-build-namespace.txt"
       - name: Build split-machine proof example
         run: cargo build -p discrypt-transport --features mqtt-adapter --example split_machine_p2p
-      - name: Run answerer in Docker network namespace and offerer on host
+      - name: Run answerer and offerer in distinct Docker network namespaces
         run: |
           mkdir -p "${DISCRYPT_PER27_ARTIFACT_DIR}"
+          docker network create discrypt-per27-net
+          cleanup() {
+            docker rm -f discrypt-per27-answerer discrypt-per27-offerer >/dev/null 2>&1 || true
+            docker network rm discrypt-per27-net >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
           docker run \
             --name discrypt-per27-answerer \
             --detach \
+            --network discrypt-per27-net \
             --volume "$PWD:/work" \
             --workdir /work \
             --env DISCRYPT_PER27_ROOM \
@@ -192,7 +201,8 @@ jobs:
               echo "container_hostname=$(hostname)"
               echo "room=${DISCRYPT_PER27_ROOM}"
               echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
-              ip route || true
+              readlink /proc/self/ns/net || true
+              cat /proc/net/route || true
             } > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker-namespace.txt";
             target/debug/examples/split_machine_p2p \
               --adapter mqtt \
@@ -205,18 +215,35 @@ jobs:
 
           sleep 15
           set +e
-          target/debug/examples/split_machine_p2p \
-            --adapter mqtt \
-            --role offerer \
-            --room "${DISCRYPT_PER27_ROOM}" \
-            --endpoint "${DISCRYPT_PUBLIC_MQTT_ENDPOINT}" \
-            --artifact-dir "${DISCRYPT_PER27_ARTIFACT_DIR}" \
-            --receipt-timeout-secs 90
+          docker run \
+            --name discrypt-per27-offerer \
+            --network discrypt-per27-net \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            --env DISCRYPT_PER27_ROOM \
+            --env DISCRYPT_PER27_ARTIFACT_DIR \
+            --env DISCRYPT_PUBLIC_MQTT_ENDPOINT \
+            rust:1.96 \
+            bash -lc '{
+              echo "role=offerer-docker-network-namespace"
+              echo "container_hostname=$(hostname)"
+              echo "room=${DISCRYPT_PER27_ROOM}"
+              echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
+              readlink /proc/self/ns/net || true
+              cat /proc/net/route || true
+            } > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-docker-namespace.txt";
+            target/debug/examples/split_machine_p2p \
+              --adapter mqtt \
+              --role offerer \
+              --room "${DISCRYPT_PER27_ROOM}" \
+              --endpoint "${DISCRYPT_PUBLIC_MQTT_ENDPOINT}" \
+              --artifact-dir "${DISCRYPT_PER27_ARTIFACT_DIR}" \
+              --receipt-timeout-secs 90'
           offerer_status=$?
           docker wait discrypt-per27-answerer > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker-exit-code.txt"
           answerer_status=$(cat "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker-exit-code.txt")
           docker logs discrypt-per27-answerer > "${DISCRYPT_PER27_ARTIFACT_DIR}/answerer-docker.log" 2>&1 || true
-          docker rm discrypt-per27-answerer
+          docker logs discrypt-per27-offerer > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-docker.log" 2>&1 || true
           set -e
           echo "offerer_status=${offerer_status}" > "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-exit-code.txt"
           echo "answerer_status=${answerer_status}" >> "${DISCRYPT_PER27_ARTIFACT_DIR}/offerer-exit-code.txt"
