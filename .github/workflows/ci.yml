@@ -200,9 +200,13 @@ jobs:
             --env DISCRYPT_WEBRTC_ICE_MODE \
             --env DISCRYPT_WEBRTC_DEBUG_CANDIDATES \
             rust:1.96 \
-            bash -lc '{
+            bash -lc 'container_ip="$(hostname -I | awk "{print \$1}")";
+            export DISCRYPT_WEBRTC_UDP_ADDRS="${container_ip}:0";
+            {
               echo "role=answerer-docker-network-namespace"
               echo "container_hostname=$(hostname)"
+              echo "container_ip=${container_ip}"
+              echo "webrtc_udp_addrs=${DISCRYPT_WEBRTC_UDP_ADDRS}"
               echo "room=${DISCRYPT_PER27_ROOM}"
               echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
               readlink /proc/self/ns/net || true
@@ -230,9 +234,13 @@ jobs:
             --env DISCRYPT_WEBRTC_ICE_MODE \
             --env DISCRYPT_WEBRTC_DEBUG_CANDIDATES \
             rust:1.96 \
-            bash -lc '{
+            bash -lc 'container_ip="$(hostname -I | awk "{print \$1}")";
+            export DISCRYPT_WEBRTC_UDP_ADDRS="${container_ip}:0";
+            {
               echo "role=offerer-docker-network-namespace"
               echo "container_hostname=$(hostname)"
+              echo "container_ip=${container_ip}"
+              echo "webrtc_udp_addrs=${DISCRYPT_WEBRTC_UDP_ADDRS}"
               echo "room=${DISCRYPT_PER27_ROOM}"
               echo "endpoint=${DISCRYPT_PUBLIC_MQTT_ENDPOINT}"
               readlink /proc/self/ns/net || true
