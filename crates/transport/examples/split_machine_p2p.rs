@@ -54,6 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "role": args.role.as_str(),
                 "room": args.room,
                 "endpoint": args.endpoint,
+                "release_boundary": release_boundary(args.adapter),
+                "provider_boundary": provider_boundary(args.adapter),
                 "started_at": started_at.to_rfc3339(),
                 "completed_at": completed_at.to_rfc3339(),
                 "evidence": evidence,
@@ -75,6 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "role": args.role.as_str(),
                 "room": args.room,
                 "endpoint": args.endpoint,
+                "release_boundary": release_boundary(args.adapter),
+                "provider_boundary": provider_boundary(args.adapter),
                 "started_at": started_at.to_rfc3339(),
                 "completed_at": completed_at.to_rfc3339(),
                 "error": error.to_string(),
@@ -123,9 +127,12 @@ async fn run_answerer(args: &Args) -> Result<serde_json::Value, TransportError> 
         "runtime": evidence,
         "received_frame_count": received_count_final,
         "received_opaque_bytes": received_bytes_final,
-        "p2p_datachannel_open": true,
+        "p2p_datachannel_open": data_channel_open,
         "direct_path_ready": direct_path_ready,
         "data_channel_open": data_channel_open,
+        "text_control_receipt_behavior": "answerer returns an opaque receipt over the WebRTC DataChannel for each received opaque frame",
+        "provider_application_relay_used": false,
+        "provider_payload_boundary": "provider carries only sealed WebRTC negotiation for this role; opaque application frames are received on the DataChannel",
     }))
 }
 
@@ -193,6 +200,9 @@ async fn run_offerer(args: &Args) -> Result<serde_json::Value, TransportError> {
         "media_frame_sha256": to_hex(&sha256_bytes(&media_frame)),
         "media_receipt_sha256": to_hex(&sha256_bytes(&media_receipt)),
         "media_receipt_prefix_ok": media_receipt.starts_with(b"ciphertext:split-machine-receipt:"),
+        "bidirectional_text_control": text_receipt.starts_with(b"ciphertext:split-machine-receipt:"),
+        "provider_application_relay_used": false,
+        "provider_payload_boundary": "provider carries only sealed WebRTC negotiation for this role; opaque text/control and media-shaped frames are sent on the DataChannel",
         "text_chat_boundary": "opaque text/control frame crossed a real provider-signaled WebRTC DataChannel between local and SSH-host peer",
         "voice_boundary": "opaque media-frame ciphertext crossed the same real provider-signaled WebRTC DataChannel; this is native media-frame transport proof, not physical microphone audio",
     }))
@@ -318,6 +328,47 @@ fn to_hex(bytes: &[u8]) -> String {
         out.push(TABLE[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn release_boundary(adapter: Adapter) -> serde_json::Value {
+    json!({
+        "issue": "PER-27 / P3-T06",
+        "proof_level": "split-machine transport proof when roles run on distinct hosts with retained local and remote artifacts",
+        "adapter": adapter.as_str(),
+        "claims": [
+            "public provider-signaled WebRTC text/control runtime can open a real DataChannel",
+            "opaque text/control frame and opaque receipt cross the DataChannel",
+            "provider-visible rendezvous is limited to signaling metadata and sealed negotiation payloads"
+        ],
+        "non_claims": [
+            "not production-ready evidence for the full app",
+            "not a two-installed-Tauri-GUI proof",
+            "not physical microphone/speaker audio proof",
+            "not OpenMLS invite/admission proof unless paired with a separate app-flow artifact"
+        ],
+    })
+}
+
+fn provider_boundary(adapter: Adapter) -> serde_json::Value {
+    json!({
+        "adapter": adapter.as_str(),
+        "provider_role": "signaling/rendezvous only",
+        "application_payload_relay_allowed": false,
+        "application_payload_relay_used": false,
+        "provider_visible_material": [
+            "adapter endpoint label",
+            "derived hashed rendezvous topic",
+            "sealed WebRTC offer/answer/candidate envelopes"
+        ],
+        "not_provider_visible": [
+            "message plaintext",
+            "opaque text/control frame bytes",
+            "opaque media-frame bytes",
+            "receipt bytes",
+            "MLS secrets",
+            "SFrame/content keys"
+        ],
+    })
 }
 
 struct Args {
