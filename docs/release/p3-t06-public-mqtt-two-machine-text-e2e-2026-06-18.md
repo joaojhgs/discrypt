@@ -4,42 +4,69 @@ Issue: PER-27 / P3-T06.
 
 ## Result
 
-Status: partial evidence, not full split-machine closure.
+Status: PR namespace proof passed.
 
-The public MQTT role-split transport proof passed on this branch using two
-separate local processes and the public MQTT endpoint
-`mqtts://broker.emqx.io:8883`. Both roles opened a real provider-signaled WebRTC
-DataChannel, the offerer sent opaque text/control and media-shaped frames over
-the DataChannel, and the answerer returned opaque receipts over the same
-DataChannel.
+GitHub Actions PR run
+`https://github.com/joaojhgs/discrypt/actions/runs/27789088226` passed the
+`PER-27 public MQTT namespace proof` job on branch
+`multica/P3-T06-public-mqtt-two-machine-text-e2e`, head
+`3fc5cbe320c4ba1f1721e4f505e7f0f2d1521296`.
 
-This is useful transport evidence, but it is not a full release-matrix
-split-machine proof because the available runtime could not authenticate to the
-SSH remote and could not access the Docker daemon to create an isolated
-container-host substitute.
+The proof ran the public MQTT split-machine transport example in two distinct
+Docker network namespaces on a user-defined bridge network. MQTT remained the
+public signaling/rendezvous provider at `mqtts://broker.emqx.io:8883`; WebRTC
+ICE used host-only candidates bound to each container's real bridge IP, then
+opened a DataChannel directly between the two namespaces. The offerer sent
+opaque text/control and media-shaped frames over the DataChannel, and the
+answerer returned opaque receipts over the same DataChannel.
 
 ## Fresh Artifacts
 
-Artifact directory:
+PR artifact name:
 
-`target/e2e/per-27-public-mqtt-two-machine-text-e2e-20260618T034157Z`
+`per27-public-mqtt-namespace-27789088226-1`
+
+Downloaded validation directory:
+
+`/tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1`
 
 Files:
 
 - `split-machine-mqtt-offerer.json`
-  - SHA-256: `bb7e899dba6c854e26cb1c2b8a50cfe69fd8e644d627e170e819063049431746`
+  - SHA-256: `c10ef714591514f372c7acc34ca152f89176a73acfd8ebec0dfa6a950167a378`
   - `status`: `passed`
+  - `room`: `discrypt-per-27-mqtt-gha-27789088226-1`
+  - `endpoint`: `mqtts://broker.emqx.io:8883`
   - `direct_path_ready`: `true`
   - `data_channel_open`: `true`
+  - `p2p_datachannel_open`: `true`
   - `bidirectional_text_control`: `true`
   - `provider_application_relay_used`: `false`
+  - provider boundary `application_payload_relay_used`: `false`
 - `split-machine-mqtt-answerer.json`
-  - SHA-256: `faa0d6bc858be12bcd8f2fd239125f2bb34abcd38fdb4759f4256c03f899dd3a`
+  - SHA-256: `3262ab35fd23f8c68a46d17fed0f334e7226249cbe518a06eff1a66d29835238`
   - `status`: `passed`
+  - `room`: `discrypt-per-27-mqtt-gha-27789088226-1`
+  - `endpoint`: `mqtts://broker.emqx.io:8883`
   - `direct_path_ready`: `true`
   - `data_channel_open`: `true`
+  - `p2p_datachannel_open`: `true`
   - `received_frame_count`: `2`
   - `provider_application_relay_used`: `false`
+  - provider boundary `application_payload_relay_used`: `false`
+- `answerer-docker-namespace.txt`
+  - SHA-256: `ef9612b1e18d9c25f231a1d449d50d92119a72d9e0c4aeffd1e39f638a5770ad`
+  - `container_ip`: `172.18.0.2`
+  - `webrtc_udp_addrs`: `172.18.0.2:0`
+  - namespace: `net:[4026532274]`
+- `offerer-docker-namespace.txt`
+  - SHA-256: `0e9a1833952a3d5e413e7358055c9d8398d3a7f3ef8070ca22e0471ad11a0245`
+  - `container_ip`: `172.18.0.3`
+  - `webrtc_udp_addrs`: `172.18.0.3:0`
+  - namespace: `net:[4026532339]`
+- `runner-build-namespace.txt`
+  - SHA-256: `9818befabb16ed4f08d345cdc1430a42a88d11ae8fbf2a9a594fff61c40579b9`
+  - runner namespace: `net:[4026531833]`
 
 The artifacts include `release_boundary` and `provider_boundary` objects. These
 state that MQTT is signaling/rendezvous only, application payload relay is not
@@ -113,6 +140,37 @@ PATH=/tmp/discrypt-rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin:$PATH \
 ```
 
 Result: both role processes passed and wrote artifacts.
+
+PR namespace verification:
+
+```bash
+gh run view 27789088226 --repo joaojhgs/discrypt --json status,conclusion,jobs,url,headSha,attempt
+gh run download 27789088226 --repo joaojhgs/discrypt -D /tmp/per27-gha-namespace-pass
+jq '{status,adapter,role,room,endpoint,evidence:{direct_path_ready:.evidence.direct_path_ready,data_channel_open:.evidence.data_channel_open,p2p_datachannel_open:.evidence.p2p_datachannel_open,bidirectional_text_control:.evidence.bidirectional_text_control,provider_application_relay_used:.evidence.provider_application_relay_used,received_frame_count:.evidence.received_frame_count,provider_boundary:.provider_boundary.application_payload_relay_used}}' \
+  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-offerer.json \
+  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-answerer.json
+sha256sum \
+  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-offerer.json \
+  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/split-machine-mqtt-answerer.json \
+  /tmp/per27-gha-namespace-pass/per27-public-mqtt-namespace-27789088226-1/*namespace.txt
+```
+
+Result: PR proof job passed. Both JSON artifacts reported `status: passed`,
+`direct_path_ready: true`, `data_channel_open: true`, and
+`provider_application_relay_used: false`; the offerer reported
+`bidirectional_text_control: true`, and the answerer reported
+`received_frame_count: 2`.
+
+## Historical Same-Host Artifact
+
+Before the PR namespace proof existed, a same-host local role-split transport
+proof passed under:
+
+`target/e2e/per-27-public-mqtt-two-machine-text-e2e-20260618T034157Z`
+
+This older evidence is retained only as supporting context. It is not the
+merge-readiness proof because it used two local processes in the same host
+namespace.
 
 ## Blocked Split-Machine Attempts
 
