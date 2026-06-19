@@ -55,6 +55,7 @@ import {
   revokeGroupMemberAccess,
   savePreferences,
   sendMessage,
+  verifySafetyNumber,
   setConnectivityPolicy,
   setGroupAdmissionMode,
   setActiveGroup,
@@ -935,6 +936,7 @@ function App() {
   const [commandState, setCommandState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
+  const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
   const [workflow, setWorkflow] = useState<Workflow>("setup");
   const [draftChannel, setDraftChannel] = useState("general");
   const [draftMessage, setDraftMessage] = useState("");
@@ -1748,6 +1750,23 @@ function App() {
       return false;
     }
     return true;
+  }
+
+  async function confirmSafetyNumber() {
+    try {
+      const result = await verifySafetyNumber({
+        friend_id: currentSnapshot.friend.friend_code,
+        provided: currentSnapshot.friend.safety_number,
+      });
+      setVerifyMessage(result.message);
+    } catch (error) {
+      reportCommandError(
+        error instanceof Error
+          ? error.message
+          : "Unable to verify the current DM safety number.",
+        "verify_safety_number",
+      );
+    }
   }
 
   async function createCommandUser() {
@@ -2901,9 +2920,11 @@ function App() {
           <DiagnosticsSheet
             snapshot={currentSnapshot}
             appState={appState}
-              participants={participants}
+            participants={participants}
             themeLabel={activeTheme.label}
-            />
+            verifyMessage={verifyMessage}
+            onVerifySafetyNumber={confirmSafetyNumber}
+          />
         ) : null}
       </WorkspaceOverlay>
       <CommandNotificationStack
@@ -6933,11 +6954,15 @@ function DiagnosticsSheet({
   appState,
   participants,
   themeLabel,
+  verifyMessage,
+  onVerifySafetyNumber,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
   participants: VoiceParticipant[];
   themeLabel: string;
+  verifyMessage: string | null;
+  onVerifySafetyNumber: () => void;
 }) {
   const latestEvents = appState.events.slice(-6).reverse();
   const speaking = participants.filter(
@@ -7004,6 +7029,19 @@ function DiagnosticsSheet({
               title="Sybil resistance"
               copy={snapshot.security_copy.sybil_resistance}
             />
+            <Separator />
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={onVerifySafetyNumber}
+            >
+              Verify current safety number
+            </Button>
+            {verifyMessage ? (
+              <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                {verifyMessage}
+              </p>
+            ) : null}
           </CardContent>
         </Card>
       </div>
