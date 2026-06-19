@@ -136,7 +136,7 @@ export async function bootReadyShell(page: Page) {
   await page.getByLabel("Device name").first().fill("E2E Device");
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("heading", { name: /finish the local trust setup/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
   expect(errors).toEqual([]);
   return errors;

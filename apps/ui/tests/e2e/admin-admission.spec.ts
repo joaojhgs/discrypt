@@ -11,7 +11,7 @@ async function bootReadyShell(page) {
   await page.getByLabel("Device name").first().fill("Owner Laptop");
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
 }
 
