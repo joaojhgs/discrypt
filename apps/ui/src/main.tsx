@@ -1090,6 +1090,9 @@ function App() {
       message,
       createdAt: new Date().toLocaleTimeString(),
     };
+    globalThis["console"]?.["error"]?.(
+      "[discrypt:command-error] command_error_reported",
+    );
     setCommandError(message);
     setCommandNotifications((current) => [notification, ...current].slice(0, 6));
   }
@@ -4515,7 +4518,7 @@ function CommandNotificationStack({
         <div
           key={notification.id}
           role="alert"
-          className="rounded-2xl border border-red-300/35 bg-[hsl(var(--card)/0.96)] p-4 text-[hsl(var(--foreground))] shadow-2xl shadow-black/40 backdrop-blur-xl"
+          className="rounded-lg border border-[hsl(var(--destructive)/0.45)] bg-[hsl(var(--card)/0.96)] p-4 text-[hsl(var(--foreground))] shadow-2xl shadow-black/40 backdrop-blur-xl"
         >
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
