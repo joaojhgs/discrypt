@@ -4,9 +4,9 @@ Issue: PER-28 / P3-T07.
 
 ## Result
 
-Status: local same-host role-split Nostr proof passed; PR namespace proof passed
-on GitHub Actions run `27796349927` for PR #23 head
-`43ae6a8f0c85cea50a7ff619d6f6083151fe8003`.
+Status: local same-host role-split Nostr proof passed; final PR namespace proof
+passed on GitHub Actions run `27797223641` for PR #23 head
+`a7daa71a3d7a5a9d7708171456d4e3a12886d8fd`.
 
 This proof uses `crates/transport/examples/split_machine_p2p.rs` with
 `--adapter nostr`. Nostr remains the public signaling/rendezvous provider. The
@@ -21,11 +21,11 @@ Local artifact directory:
 
 PR namespace artifact name:
 
-`per28-public-nostr-namespace-27796349927-1`
+`per28-public-nostr-namespace-27797223641-1`
 
 PR artifact validation download:
 
-`/tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1`
+`/tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1`
 
 Expected files:
 
@@ -179,29 +179,29 @@ Actual PR namespace verification:
 
 ```bash
 gh pr view 23 --json number,title,url,headRefName,headRefOid,isDraft,state,statusCheckRollup
-gh run download 27796349927 --repo joaojhgs/discrypt -D /tmp/per28-gha-namespace-27796349927
+gh run download 27797223641 --repo joaojhgs/discrypt -D /tmp/per28-gha-namespace-27797223641
 jq -s '[.[] | {status, adapter, role, room, endpoint, release_issue: .release_boundary.issue, task: .release_boundary.task, direct_path_ready: .evidence.direct_path_ready, data_channel_open: .evidence.data_channel_open, p2p_datachannel_open: .evidence.p2p_datachannel_open, bidirectional_text_control: .evidence.bidirectional_text_control, provider_application_relay_used: .evidence.provider_application_relay_used, received_frame_count: .evidence.received_frame_count, received_opaque_bytes: .evidence.received_opaque_bytes, provider_boundary_relay: .provider_boundary.application_payload_relay_used}]' \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/split-machine-nostr-offerer.json \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/split-machine-nostr-answerer.json
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/split-machine-nostr-offerer.json \
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/split-machine-nostr-answerer.json
 sha256sum \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/split-machine-nostr-offerer.json \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/split-machine-nostr-answerer.json \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/offerer-docker-namespace.txt \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/answerer-docker-namespace.txt \
-  /tmp/per28-gha-namespace-27796349927/per28-public-nostr-namespace-27796349927-1/runner-build-namespace.txt
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/split-machine-nostr-offerer.json \
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/split-machine-nostr-answerer.json \
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/offerer-docker-namespace.txt \
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/answerer-docker-namespace.txt \
+  /tmp/per28-gha-namespace-27797223641/per28-public-nostr-namespace-27797223641-1/runner-build-namespace.txt
 ```
 
-Result: PR run `27796349927` concluded successfully. The `PER-28 public Nostr
-namespace proof` job passed in `4m10s` with job ID `82256888886`, and all other
+Result: PR run `27797223641` concluded successfully. The `PER-28 public Nostr
+namespace proof` job passed in `4m11s` with job ID `82259532759`, and all other
 PR checks in that run also passed.
 
 PR artifact values:
 
 - `split-machine-nostr-offerer.json`
-  - SHA-256: `70dafe5a7c25d2d49f2e45b539736b3ddec91d4c4cddc0fc779324916432596f`
+  - SHA-256: `09a0928b059d33b73a4b0bf3673bff539d4b32c251775239622723626e835896`
   - `status`: `passed`
   - `adapter`: `nostr`
-  - `room`: `discrypt-per-28-nostr-gha-27796349927-1`
+  - `room`: `discrypt-per-28-nostr-gha-27797223641-1`
   - `endpoint`: `wss://nos.lol`
   - `release_boundary.issue`: `PER-28 / P3-T07`
   - `release_boundary.task`: `public Nostr two-machine text/control`
@@ -212,10 +212,10 @@ PR artifact values:
   - `evidence.provider_application_relay_used`: `false`
   - `provider_boundary.application_payload_relay_used`: `false`
 - `split-machine-nostr-answerer.json`
-  - SHA-256: `9123e833d9551070d94ec8f34359a8d5d450f686b3f3c1f75fd7837f20b8c3a0`
+  - SHA-256: `134c8602c5720721b3179a05fb526806f4bb0352894c07301d89186b64fb7c3e`
   - `status`: `passed`
   - `adapter`: `nostr`
-  - `room`: `discrypt-per-28-nostr-gha-27796349927-1`
+  - `room`: `discrypt-per-28-nostr-gha-27797223641-1`
   - `endpoint`: `wss://nos.lol`
   - `release_boundary.issue`: `PER-28 / P3-T07`
   - `release_boundary.task`: `public Nostr two-machine text/control`
@@ -227,13 +227,13 @@ PR artifact values:
   - `evidence.provider_application_relay_used`: `false`
   - `provider_boundary.application_payload_relay_used`: `false`
 - `offerer-docker-namespace.txt`
-  - SHA-256: `23dd4cb8f68457ec0f002e016419380219a732ee17764a4316f18a845a8bd805`
+  - SHA-256: `7464cdbad4431cc9b3b7bec8dd530437a9eb8ed6486a83f91ee89b92a18d8dfa`
   - recorded `net:[4026532339]`
 - `answerer-docker-namespace.txt`
-  - SHA-256: `604d6c0f6ee7670ca3dae55d1414f5f5bca3fe878ffdaa6ee7c049e7478cd03e`
+  - SHA-256: `559a26b723ab3246b48daf36aa1f038efba61175129f28e1094f099eb440c327`
   - recorded `net:[4026532273]`
 - `runner-build-namespace.txt`
-  - SHA-256: `b624142e28db827064721be367b2f20885b7229a8504fb96bdbe1f449e431689`
+  - SHA-256: `8f9724b3dcc31f04cceb6fcb677a2677ac26b1851e0b82c0e62ec1b45f65675e`
   - recorded `net:[4026531833]`
 
 ## Historical Same-Host Artifact
