@@ -12,6 +12,15 @@ async function openCreateGroupModal(page: Page) {
   await page.getByRole("button", { name: /create a new group/i }).click();
 }
 
+async function expectHeaderWithoutGroupActions(page: Page) {
+  const topbar = page.getByLabel("Workspace topbar");
+  await expect(
+    topbar.getByRole("button", {
+      name: /create invite|group configuration|join\/open group|create a new group/i,
+    }),
+  ).toHaveCount(0);
+}
+
 async function createGroup(page: Page, name: string) {
   await openCreateGroupModal(page);
   await page.getByLabel("Group name").fill(name);
@@ -33,7 +42,17 @@ test("shared context menus support right-click and keyboard access on group chan
   page,
 }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 900 });
+  await expectHeaderWithoutGroupActions(page);
+  await openLauncher(page);
+  const launcher = page.getByRole("dialog", { name: /Add group or direct message/i });
+  await expect(launcher.getByLabel("Invite URL or code")).toBeVisible();
+  await expect(launcher.getByRole("button", { name: /Join\/open group/i })).toBeVisible();
+  await expect(launcher.getByRole("button", { name: /create a new group/i })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(launcher).toHaveCount(0);
+
   await createGroup(page, "Context Menu Lab");
+  await expectHeaderWithoutGroupActions(page);
 
   const groupButton = page.getByRole("button", {
     name: /Open Context Menu Lab group/i,
