@@ -7137,8 +7137,9 @@ function MessageRow({
       </div>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="icon"
             data-testid="message-delivery-status"
             className={cn(
               "mt-1 grid h-7 w-7 place-items-center rounded-full border text-xs font-semibold opacity-75 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--card))] group-hover:opacity-100",
@@ -7147,7 +7148,7 @@ function MessageRow({
             aria-label={statusTitle}
           >
             {messageStateIcon(message.state_key)}
-          </button>
+          </Button>
         </TooltipTrigger>
         <TooltipContent side="left">{statusTitle}</TooltipContent>
       </Tooltip>
