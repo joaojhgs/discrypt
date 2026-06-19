@@ -38,6 +38,16 @@ async function expectFocusInsideDialog(dialog: Locator) {
     .toBe(true);
 }
 
+async function expectFocusOutsideDialog(dialog: Locator) {
+  await expect
+    .poll(
+      async () =>
+        dialog.evaluate((element) => element.contains(document.activeElement)),
+      { message: "active element has escaped the modal dialog" },
+    )
+    .toBe(false);
+}
+
 test.beforeEach(async ({ page }) => {
   await bootReadyShell(page);
 });
@@ -117,4 +127,29 @@ test("shared modal blocks background interaction and supports safe outside close
   await expect(
     page.getByRole("dialog", { name: /Create group/i }),
   ).toHaveCount(0);
+});
+
+test("shared modal recovers escaped background focus on Tab", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const { dialog } = await openLauncherModal(page);
+  const closeButton = dialog.getByRole("button", {
+    name: /Close Add group or direct message/i,
+  });
+  const backgroundCreate = page.getByRole("button", { name: /^Create group$/ });
+
+  await backgroundCreate.evaluate((button) => button.focus());
+  await expectFocusOutsideDialog(dialog);
+
+  await page.keyboard.press("Tab");
+  await expect(closeButton).toBeFocused();
+  await expectFocusInsideDialog(dialog);
+
+  await backgroundCreate.evaluate((button) => button.focus());
+  await expectFocusOutsideDialog(dialog);
+
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog.locator(focusableSelector).last()).toBeFocused();
+  await expectFocusInsideDialog(dialog);
 });

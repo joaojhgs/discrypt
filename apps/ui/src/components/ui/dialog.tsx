@@ -109,6 +109,13 @@ const DialogContent = React.forwardRef<
         const lastElement = focusableElements[focusableElements.length - 1];
         const activeElement = document.activeElement;
 
+        if (!(activeElement instanceof Node) || !content.contains(activeElement)) {
+          event.preventDefault();
+          const nextElement = event.shiftKey ? lastElement : firstElement;
+          nextElement.focus({ preventScroll: true });
+          return;
+        }
+
         if (
           event.shiftKey &&
           (activeElement === firstElement || activeElement === content)
