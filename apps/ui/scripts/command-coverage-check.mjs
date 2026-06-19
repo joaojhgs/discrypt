@@ -1021,7 +1021,7 @@ if (
   );
 }
 for (const e2eToken of [
-  "setup workflow remains readable and completes",
+  "empty post-setup state shows only concise create and join actions",
   "group invite join text channel and voice controls work without fake members",
   "local-dev e2e persistence survives browser reload",
   "small-window navigation exposes topbar controls without overflow",

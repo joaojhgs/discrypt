@@ -55,6 +55,7 @@ import {
   revokeGroupMemberAccess,
   savePreferences,
   sendMessage,
+  verifySafetyNumber,
   setConnectivityPolicy,
   setGroupAdmissionMode,
   setActiveGroup,
@@ -70,7 +71,6 @@ import {
   publishGroupPresence,
   startDm,
   approveGroupAdmissionRequest,
-  verifySafetyNumber,
   unlockStorageSecurity,
 } from "./commands";
 import {
@@ -1601,6 +1601,7 @@ function App() {
   const appState = commandState;
   const currentSnapshot = appState.snapshot;
   const activeGroup = getActiveGroup(appState);
+  const hasActiveGroup = Boolean(activeGroup);
   const overlayGroup =
     appState.groups.find((group) => group.group_id === overlayGroupId) ??
     activeGroup;
@@ -1694,13 +1695,13 @@ function App() {
   const themeStyle = {
     ...activeTheme.cssVars,
     "--shell-grid":
-      workflow === "dm"
+      workflow === "dm" || workflow === "setup" || !hasActiveGroup
         ? "72px minmax(0,1fr)"
         : membersPanelOpen
           ? "72px 300px minmax(0,1fr) 320px"
           : "72px 300px minmax(0,1fr)",
     "--shell-grid-inspector":
-      workflow === "dm"
+      workflow === "dm" || workflow === "setup" || !hasActiveGroup
         ? "72px minmax(0,1fr) 280px"
         : "72px 300px minmax(0,1fr) 280px",
     "--shell-font-size": "16px",
@@ -1708,21 +1709,6 @@ function App() {
   } as React.CSSProperties & Record<`--${string}`, string>;
   const showInspector =
     diagnosticsUiEnabled && inspectorOpen && workflow !== "setup";
-
-  async function confirmSafetyNumber() {
-    try {
-      const result = await verifySafetyNumber({
-        friend_id: currentSnapshot.friend.friend_code,
-        provided: currentSnapshot.friend.safety_number,
-      });
-      setVerifyMessage(result.message);
-      if (result.verified) await applyCommand(loadAppState());
-    } catch (error: unknown) {
-      setVerifyMessage(
-        `Safety verification command failed: ${error instanceof Error ? error.message : "unknown error"}`,
-      );
-    }
-  }
 
   async function configureFirstRunStorage(): Promise<boolean> {
     if (appState.storage_security.status === "ready") return true;
@@ -1764,6 +1750,23 @@ function App() {
       return false;
     }
     return true;
+  }
+
+  async function confirmSafetyNumber() {
+    try {
+      const result = await verifySafetyNumber({
+        friend_id: currentSnapshot.friend.friend_code,
+        provided: currentSnapshot.friend.safety_number,
+      });
+      setVerifyMessage(result.message);
+    } catch (error) {
+      reportCommandError(
+        error instanceof Error
+          ? error.message
+          : "Unable to verify the current DM safety number.",
+        "verify_safety_number",
+      );
+    }
   }
 
   async function createCommandUser() {
@@ -2586,7 +2589,7 @@ function App() {
           setGroupContextMenu({ groupId, x, y })
         }
       />
-      {showDesktopSidebar && workflow !== "dm" ? (
+      {showDesktopSidebar && workflow !== "dm" && workflow !== "setup" && hasActiveGroup ? (
         <ChannelSidebar
           groupLabel={groupLabel}
           role={localGroupRole || activeGroup?.role || "local profile"}
@@ -2635,6 +2638,7 @@ function App() {
           activeSubtitle={activePane.subtitle}
           membersPanelOpen={membersPanelOpen}
           onToggleMembers={() => setMembersPanelOpen((open) => !open)}
+          membersPanelAvailable={workflow !== "setup" && hasActiveGroup}
           onOpenDiagnostics={() => {
             setInspectorOpen(true);
             setActiveOverlay("diagnostics");
@@ -2646,9 +2650,8 @@ function App() {
           <div className="flex h-full w-full flex-col">
             {workflow === "setup" ? (
               <SetupPanel
-                snapshot={currentSnapshot}
-                verifyMessage={verifyMessage}
-                onVerify={confirmSafetyNumber}
+                onCreateGroup={() => setActiveOverlay("create-group")}
+                onJoinInvite={openLauncherOverlay}
               />
             ) : workflow === "dm" ? (
               <DmPanel
@@ -2722,7 +2725,7 @@ function App() {
           </div>
         </div>
       </section>
-      {workflow !== "dm" && membersPanelOpen ? (
+      {workflow !== "dm" && workflow !== "setup" && membersPanelOpen && hasActiveGroup ? (
         <MemberPanel
           group={activeGroup}
           members={groupMembers}
@@ -2917,9 +2920,11 @@ function App() {
           <DiagnosticsSheet
             snapshot={currentSnapshot}
             appState={appState}
-              participants={participants}
+            participants={participants}
             themeLabel={activeTheme.label}
-            />
+            verifyMessage={verifyMessage}
+            onVerifySafetyNumber={confirmSafetyNumber}
+          />
         ) : null}
       </WorkspaceOverlay>
       <CommandNotificationStack
@@ -4495,6 +4500,7 @@ function TopBar({
   activeSubtitle,
   membersPanelOpen,
   onToggleMembers,
+  membersPanelAvailable,
   onOpenDiagnostics,
   inspectorOpen,
   diagnosticsEnabled,
@@ -4504,6 +4510,7 @@ function TopBar({
   activeSubtitle: string;
   membersPanelOpen: boolean;
   onToggleMembers: () => void;
+  membersPanelAvailable: boolean;
   onOpenDiagnostics: () => void;
   inspectorOpen: boolean;
   diagnosticsEnabled: boolean;
@@ -4530,17 +4537,19 @@ function TopBar({
           </p>
         </div>
         <div className="flex shrink-0 items-center justify-end gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            aria-label={membersPanelOpen ? "Close member panel" : "Open member panel"}
-            title="Members"
-            onClick={onToggleMembers}
-            className="h-9 w-9"
-          >
-            <Icon>👥</Icon>
-          </Button>
+          {membersPanelAvailable ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              aria-label={membersPanelOpen ? "Close member panel" : "Open member panel"}
+              title="Members"
+              onClick={onToggleMembers}
+              className="h-9 w-9"
+            >
+              <Icon>👥</Icon>
+            </Button>
+          ) : null}
           {diagnosticsEnabled ? (
             <Button
               type="button"
@@ -5165,62 +5174,36 @@ function MobileWorkflowNav({
 }
 
 function SetupPanel({
-  snapshot,
-  verifyMessage,
-  onVerify,
+  onCreateGroup,
+  onJoinInvite,
 }: {
-  snapshot: AppSnapshot;
-  verifyMessage: string | null;
-  onVerify: () => void;
+  onCreateGroup: () => void;
+  onJoinInvite: () => void;
 }) {
   return (
-    <div className="mx-auto grid max-w-4xl gap-5 py-8">
-      <Card className="overflow-hidden border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-xl shadow-black/20">
-        <CardContent className="grid gap-5 p-6 md:grid-cols-[1fr_auto] md:items-center">
-          <div className="min-w-0">
-            <Badge variant="secondary" className="mb-3 w-fit">
-              Local profile
-            </Badge>
-            <h2 className="text-2xl font-semibold tracking-tight md:text-3xl">
-              Ready to start using Discrypt
-            </h2>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-[hsl(var(--muted-foreground))] md:text-base">
-              Create a group or use an invite from the + button in the server rail.
-              This screen stays minimal until you add a conversation.
-            </p>
-          </div>
-          <div className="grid gap-2 rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.36)] p-4 text-sm">
-            <span className="font-medium">Local identity</span>
-            <span className="text-[hsl(var(--muted-foreground))]">
-              {snapshot.friend.alias}
-            </span>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Verify trusted contacts when you add them</CardTitle>
-          <CardDescription>
-            Safety numbers appear here only when there is a contact to verify.
+    <div className="grid h-full min-h-0 place-items-center px-2 py-8">
+      <Card className="w-full max-w-lg border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-xl shadow-black/20">
+        <CardHeader className="text-center">
+          <Badge variant="secondary" className="mx-auto w-fit">
+            Local profile ready
+          </Badge>
+          <CardTitle className="text-2xl tracking-tight md:text-3xl">
+            Start a private space
+          </CardTitle>
+          <CardDescription className="mx-auto max-w-sm text-sm leading-6">
+            Create a group or open an invite to begin.
           </CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-[1fr_auto] md:items-center">
-          <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.42)] p-4">
-            <p className="text-sm text-[hsl(var(--muted-foreground))]">
-              Current safety number
-            </p>
-            <p className="mt-2 break-words font-mono text-lg font-semibold tracking-[0.12em]">
-              {snapshot.friend.safety_number}
-            </p>
-            {verifyMessage ? (
-              <p className="mt-3 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                {verifyMessage}
-              </p>
-            ) : null}
-          </div>
-          <Button onClick={onVerify} variant="secondary">
-            {snapshot.friend.verified ? <Icon>✓</Icon> : <Icon>□</Icon>} Mark verified
+        <CardContent className="grid gap-3 sm:grid-cols-2">
+          <Button className="justify-center" onClick={onCreateGroup}>
+            <Icon>+</Icon>Create group
+          </Button>
+          <Button
+            className="justify-center"
+            variant="secondary"
+            onClick={onJoinInvite}
+          >
+            Join with invite
           </Button>
         </CardContent>
       </Card>
@@ -6971,11 +6954,15 @@ function DiagnosticsSheet({
   appState,
   participants,
   themeLabel,
+  verifyMessage,
+  onVerifySafetyNumber,
 }: {
   snapshot: AppSnapshot;
   appState: AppState;
   participants: VoiceParticipant[];
   themeLabel: string;
+  verifyMessage: string | null;
+  onVerifySafetyNumber: () => void;
 }) {
   const latestEvents = appState.events.slice(-6).reverse();
   const speaking = participants.filter(
@@ -7042,6 +7029,19 @@ function DiagnosticsSheet({
               title="Sybil resistance"
               copy={snapshot.security_copy.sybil_resistance}
             />
+            <Separator />
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={onVerifySafetyNumber}
+            >
+              Verify current safety number
+            </Button>
+            {verifyMessage ? (
+              <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                {verifyMessage}
+              </p>
+            ) : null}
           </CardContent>
         </Card>
       </div>

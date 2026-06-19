@@ -163,7 +163,7 @@ async function openProfile(
   await page.getByLabel("Device name").first().fill(deviceName);
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("heading", { name: /finish the local trust setup/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
   await expect(page.getByText(deviceName).first()).toHaveCount(0);
   return { context, page, errors };
@@ -425,11 +425,11 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     await bob.page.reload();
     await expect(
       alice.page.getByRole("heading", {
-        name: /finish the local trust setup/i,
+        name: /Start a private space/i,
       }),
     ).toBeVisible();
     await expect(
-      bob.page.getByRole("heading", { name: /finish the local trust setup/i }),
+      bob.page.getByRole("heading", { name: /Start a private space/i }),
     ).toBeVisible();
     await openDm(alice.page, "Bob");
     await openDm(bob.page, "Alice");

@@ -127,6 +127,8 @@ async function bootReadyShell(page) {
     });
   });
   await page.goto("/");
+  await page.evaluate(() => window.localStorage.clear());
+  await page.reload();
   await expect(
     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
   ).toBeVisible();
@@ -138,7 +140,7 @@ async function bootReadyShell(page) {
   await page.getByLabel("Device name").first().fill("E2E Device");
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
   expect(errors).toEqual([]);
   return errors;
@@ -228,24 +230,37 @@ test("first run creates user and empty shell does not blank", async ({
   ).toBeVisible();
 });
 
-test("setup workflow remains readable and completes", async ({ page }) => {
+test("empty post-setup state shows only concise create and join actions", async ({
+  page,
+}, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   // setup panel is already showing after bootReadyShell
   await expect(
-    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
-  await expect(page.getByText("Current safety number").first()).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /^Create group$/ }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /^Join with invite$/ }),
+  ).toBeVisible();
+  await expect(page.getByText(/Current safety number/i)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /mark verified/i })).toHaveCount(0);
+  await expect(page.getByText(/Group join progress/i)).toHaveCount(0);
+  await expect(page.getByText(/Voice idle/i)).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: /^No group$/ })).toHaveCount(0);
+  await expect(page.getByText(/template|proof|checklist/i)).toHaveCount(0);
 
   const bounds = await page
-    .getByRole("heading", { name: /Ready to start using Discrypt/i })
+    .getByRole("heading", { name: /Start a private space/i })
     .evaluate((element) => {
-      const panel = element.closest(".mx-auto");
+      const panel = element.closest(".grid");
       const rect = panel?.getBoundingClientRect();
       return rect ? { top: rect.top, width: rect.width } : null;
     });
   expect(bounds).not.toBeNull();
   expect(bounds?.top ?? -1).toBeGreaterThanOrEqual(0);
-  expect(bounds?.width ?? 0).toBeGreaterThan(640);
+  expect(bounds?.width ?? 0).toBeGreaterThan(420);
   const overflow = await page.evaluate(
     () =>
       document.documentElement.scrollWidth -
@@ -253,8 +268,20 @@ test("setup workflow remains readable and completes", async ({ page }) => {
   );
   expect(overflow).toBeLessThanOrEqual(1);
 
-  await page.getByRole("button", { name: /mark verified/i }).click();
-  await expect(page.getByText(/Safety number verified/i).first()).toBeVisible();
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("empty-post-setup-state.png"),
+  });
+
+  await page.getByRole("button", { name: /^Join with invite$/ }).click();
+  await expect(
+    page.getByRole("dialog", { name: /Add group or direct message/i }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: /Close Add group or direct message/i })
+    .click();
+  await page.getByRole("button", { name: /^Create group$/ }).click();
+  await expect(page.getByRole("dialog", { name: /Create group/i })).toBeVisible();
 });
 
 test("first-run storage setup remains readable at required widths", async ({
@@ -604,7 +631,7 @@ test("transport diagnostics stay hidden by default before invite metadata", asyn
   await expect(page.getByText("Transport status")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Inspector" })).toHaveCount(0);
   await expect(
-    page.getByRole("heading", { name: /Ready to start using Discrypt/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
 });
 

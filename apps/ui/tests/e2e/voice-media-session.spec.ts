@@ -254,7 +254,7 @@ async function openProfile(
   await page.getByLabel("Device name").first().fill(deviceName);
   await page.getByRole("button", { name: /create new user/i }).click();
   await expect(
-    page.getByRole("heading", { name: /finish the local trust setup/i }),
+    page.getByRole("heading", { name: /Start a private space/i }),
   ).toBeVisible();
   return { context, page, errors };
 }
