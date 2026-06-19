@@ -410,7 +410,7 @@ jobs:
           sudo apt-get install -y coturn
       - name: Start loopback coturn with CI-only credentials
         run: |
-          cat > "${RUNNER_TEMP}/discrypt-coturn.conf" <<'EOF'
+          cat > "${RUNNER_TEMP}/discrypt-coturn.conf" <<EOF
           listening-port=3478
           listening-ip=127.0.0.1
           relay-ip=127.0.0.1
