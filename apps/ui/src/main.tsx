@@ -106,6 +106,7 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { logSanitizedCommandError } from "./command-error-log";
 import "./styles.css";
 
 type Workflow =
@@ -1090,9 +1091,7 @@ function App() {
       message,
       createdAt: new Date().toLocaleTimeString(),
     };
-    globalThis["console"]?.["error"]?.(
-      "[discrypt:command-error] command_error_reported",
-    );
+    logSanitizedCommandError();
     setCommandError(message);
     setCommandNotifications((current) => [notification, ...current].slice(0, 6));
   }

@@ -31,6 +31,11 @@ release docs must not expose:
 - Runtime observability must use hashed/redacted references such as
   `redacted_observable_ref`, `redacted_endpoint_label`, or
   `redacted_observable_label`, never raw rendezvous topics or message ids.
+- UI source must not call `console.*` for runtime state. The only permitted UI
+  console path is `apps/ui/src/command-error-log.ts`, and it may emit only the
+  marker `[discrypt:command-error] command_error_reported` without command
+  names, backend messages, stacks, profile, channel, identity, provider,
+  transport, or other runtime payload fields.
 - Production Tauri storage uses `EncryptedAppDb` with OS keychain wrapping.
   Plain `FileAppStore` and browser `localStorage` are test/local-dev harnesses
   only and must stay labeled as non-production.

@@ -37,6 +37,7 @@ const desktop = read("apps/desktop/src-tauri/src/lib.rs");
 const storage = read("crates/storage/src/appdb.rs");
 const commands = read("apps/ui/src/commands.ts");
 const voiceMedia = read("apps/ui/src/voice-media.ts");
+const commandErrorLog = read("apps/ui/src/command-error-log.ts");
 const ci = read(".github/workflows/ci.yml");
 const releaseMatrix = read("docs/release/release-verification-matrix.md");
 const handoff = read("docs/release/handoff-2026-06-01.md");
@@ -118,9 +119,36 @@ for (const token of [
   "mqtt event error redacted",
 ]) requireText("redacted runtime observability", `${desktop}\n${providerAdapters}`, token);
 
+for (const token of [
+  "COMMAND_ERROR_LOG_MARKER",
+  "\"[discrypt:command-error] command_error_reported\"",
+  "export function logSanitizedCommandError(): void",
+  "console.error(COMMAND_ERROR_LOG_MARKER);",
+]) requireText("sanitized UI command-error console logger", commandErrorLog, token);
+const commandErrorConsoleMatches =
+  commandErrorLog.match(/console\.(?:log|debug|info|warn|error)\(/g) ?? [];
+if (
+  commandErrorConsoleMatches.length !== 1 ||
+  commandErrorConsoleMatches[0] !== "console.error("
+) {
+  failures.push(
+    "apps/ui/src/command-error-log.ts may contain only the approved marker-only console.error path",
+  );
+}
+if (
+  /title|message|stack|profile|channel|identity|provider|transport|backend/.test(
+    commandErrorLog,
+  )
+) {
+  failures.push(
+    "apps/ui/src/command-error-log.ts must not include runtime payload fields in the console log path",
+  );
+}
+
 const forbiddenSourcePatterns = [
   [/eprintln!\([^\n]*(?:\{topic\}|\{payload\}|\{err\}|room_secret|credential|message_id)/, "source eprintln may leak raw topic/payload/error/secret/message id"],
   [/console\.(?:log|debug|info|warn|error)\(/, "UI source must not log potentially sensitive runtime state"],
+  [/(?:globalThis|window)\s*\[\s*["']console["']\s*\]|\[\s*["']console["']\s*\]\s*\?\./, "UI source must not bypass console logging policy with bracket access"],
   [/localStorage\.setItem\((?!\s*FALLBACK_STORAGE_KEY)/, "localStorage writes must use the explicit local-dev fallback key"],
 ];
 
@@ -131,6 +159,12 @@ for (const file of [
 ]) {
   const text = readFileSync(file, "utf8");
   for (const [pattern, message] of forbiddenSourcePatterns) {
+    if (
+      message === "UI source must not log potentially sensitive runtime state" &&
+      repoPath(file) === "apps/ui/src/command-error-log.ts"
+    ) {
+      continue;
+    }
     if (pattern.test(text)) failures.push(`${repoPath(file)}: ${message}`);
   }
 }
