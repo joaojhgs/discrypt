@@ -442,6 +442,68 @@ test("direct message send stays command-backed", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test("direct messages live in the left rail and open a chat-only view", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Rail Lab");
+  await page.getByRole("button", { name: /^Create group$/ }).last().click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  await startDirectMessage(page, "Ada Lovelace");
+  const dmRailButton = page.getByRole("button", {
+    name: "Open Ada Lovelace direct message",
+  });
+  await expect(dmRailButton).toBeVisible();
+  await expect(dmRailButton).toHaveAttribute("aria-current", "page");
+  await expect(
+    page.getByLabel("Workspace topbar").getByText("Direct messages"),
+  ).toBeVisible();
+  await expect(page.getByLabel("Channel navigation")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: /Open member panel/i }),
+  ).toHaveCount(0);
+  await expect(
+    page
+      .getByTestId("message-timeline")
+      .getByRole("heading", { name: "Ada Lovelace", exact: true }),
+  ).toBeVisible();
+
+  await page.getByRole("button", { name: "Open Rail Lab group" }).click();
+  await expect(page.getByLabel("Channel navigation")).toBeVisible();
+  await expect(
+    page.getByLabel("Channel navigation").getByText("Ada Lovelace"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Open Rail Lab group" }),
+  ).toHaveAttribute("aria-current", "page");
+
+  await dmRailButton.click();
+  await expect(page.getByLabel("Channel navigation")).toHaveCount(0);
+  await expect(dmRailButton).toHaveAttribute("aria-current", "page");
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("dm-left-rail-desktop.png"),
+  });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(
+    page
+      .getByTestId("message-timeline")
+      .getByRole("heading", { name: "Ada Lovelace", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Channel navigation")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: /Open member panel/i }),
+  ).toHaveCount(0);
+  await expect(page.locator('nav[aria-label="Workspace sections"]')).toBeVisible();
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("dm-chat-only-mobile.png"),
+  });
+});
+
 // transport status surfaces signaling not-ready state before invite metadata
 test("group invite join text channel and voice controls work without fake members", async ({
   context,
