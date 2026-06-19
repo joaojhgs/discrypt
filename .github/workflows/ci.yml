@@ -388,3 +388,70 @@ jobs:
         with:
           name: per28-public-nostr-namespace-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/e2e/per-28-public-nostr-gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+  per30-configured-turn-proof:
+    name: PER-30 configured TURN proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.head_ref == 'multica/P3-T09-configured-turn-proof' || github.ref_name == 'multica/P3-T09-configured-turn-proof' }}
+    env:
+      DISCRYPT_PUBLIC_MQTT_ENDPOINT: mqtts://broker.emqx.io:8883
+      DISCRYPT_PUBLIC_TURN_E2E: "1"
+      DISCRYPT_PUBLIC_TURN_ENDPOINT: turn:127.0.0.1:3478?transport=udp
+      DISCRYPT_PUBLIC_TURN_USERNAME: discrypt-ci
+      DISCRYPT_PUBLIC_TURN_CREDENTIAL: discrypt-ci-turn-${{ github.run_id }}-${{ github.run_attempt }}
+      DISCRYPT_PUBLIC_TURN_ARTIFACT_PATH: target/e2e/per-30-configured-turn-proof/public-turn-relay-only.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install coturn
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coturn
+      - name: Start loopback coturn with CI-only credentials
+        run: |
+          cat > "${RUNNER_TEMP}/discrypt-coturn.conf" <<EOF
+          listening-port=3478
+          listening-ip=127.0.0.1
+          relay-ip=127.0.0.1
+          min-port=49160
+          max-port=49200
+          fingerprint
+          lt-cred-mech
+          realm=discrypt-ci.local
+          user=${DISCRYPT_PUBLIC_TURN_USERNAME}:${DISCRYPT_PUBLIC_TURN_CREDENTIAL}
+          no-cli
+          no-tcp
+          no-tls
+          no-dtls
+          allow-loopback-peers
+          no-multicast-peers
+          log-file=stdout
+          EOF
+          turnserver -c "${RUNNER_TEMP}/discrypt-coturn.conf" > "${RUNNER_TEMP}/discrypt-coturn.log" 2>&1 &
+          echo "$!" > "${RUNNER_TEMP}/discrypt-coturn.pid"
+          sleep 3
+          ps -p "$(cat "${RUNNER_TEMP}/discrypt-coturn.pid")"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - name: Install browser proof dependencies
+        run: |
+          npm ci --prefix apps/ui
+          npm --prefix apps/ui exec playwright install --with-deps chromium
+      - name: Run configured TURN relay-only browser proof
+        run: |
+          node scripts/per30-browser-turn-proof.mjs
+          node scripts/check-configured-turn-proof-p3-t09.mjs
+      - name: Capture coturn log
+        if: always()
+        run: |
+          mkdir -p target/e2e/per-30-configured-turn-proof
+          cp "${RUNNER_TEMP}/discrypt-coturn.log" target/e2e/per-30-configured-turn-proof/coturn.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: per30-configured-turn-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/e2e/per-30-configured-turn-proof

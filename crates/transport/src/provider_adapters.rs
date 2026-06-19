@@ -2737,6 +2737,10 @@ where
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
+    let relay_only_probe = matches!(
+        negotiation_config.ice_transport_policy,
+        crate::WebRtcIceTransportPolicy::RelayOnly
+    );
     let alice_config = negotiation_config.clone();
     let bob_config = negotiation_config;
     let alice_webrtc = WebRtcNegotiator::new(alice_config).await?;
@@ -2845,6 +2849,25 @@ where
             offerer_timeline,
             answerer_timeline
         )));
+    }
+
+    if relay_only_probe {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let alice_direct = alice_webrtc.direct_path_metrics().await;
+            let bob_direct = bob_webrtc.direct_path_metrics().await;
+            if alice_direct.turn_fallback_ready && bob_direct.turn_fallback_ready {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let offerer_timeline = alice_webrtc.diagnostic_timeline().await.to_redacted_json();
+                let answerer_timeline = bob_webrtc.diagnostic_timeline().await.to_redacted_json();
+                return Err(TransportError::Unavailable(format!(
+                    "relay-only WebRTC data channel opened without TURN fallback readiness: alice={alice_direct:?} bob={bob_direct:?} offerer_timeline={offerer_timeline} answerer_timeline={answerer_timeline}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     let frame = text_control_frame;
