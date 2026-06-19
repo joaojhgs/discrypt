@@ -36,9 +36,19 @@ function isNonCopyToken(text) {
   return /\bplaceholder:/.test(text);
 }
 
+function isExplicitDiagnosticException(file, text) {
+  return (
+    repoPath(file) === "apps/ui/src/commands.ts" &&
+    text.includes("Tauri IPC unavailable") &&
+    text.includes("VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1") &&
+    text.includes("local-dev/test harness")
+  );
+}
+
 function checkText(file, lineNumber, text, context) {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (!normalized || isNonCopyToken(normalized)) return;
+  if (isExplicitDiagnosticException(file, normalized)) return;
   for (const rule of bannedCopy) {
     if (rule.pattern.test(normalized)) {
       failures.push(

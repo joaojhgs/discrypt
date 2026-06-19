@@ -171,7 +171,7 @@
     {
       "path": "apps/ui/src/commands.ts",
       "pattern": "local-dev",
-      "expected": "`Tauri IPC unavailable for ${command}; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev harness`,",
+      "expected": "`Tauri IPC unavailable for ${command}; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev/test harness`,",
       "reason": "UI local-dev fallback is gated by VITE_DISCRYPT_LOCAL_DEV_FALLBACK for non-Tauri tests; G129 enforces release failure if production depends on it."
     },
     {
