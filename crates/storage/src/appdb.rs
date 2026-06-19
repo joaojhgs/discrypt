@@ -64,6 +64,7 @@ impl StorageKeychainDecision {
                 .contains("not persist plaintext SQLite pages")
             && self.sqlite_schema_policy.contains("AppDbSchema")
             && self.sqlite_schema_policy.contains("VERSION_1_DDL")
+            && self.sqlite_schema_policy.contains("VERSION_2_DDL")
             && self.sqlite_schema_policy.contains("openmls_sqlite_storage")
             && self.encrypted_store_crates.contains(&"aes-gcm")
             && self.encrypted_store_crates.contains(&"serde_json")
@@ -94,12 +95,12 @@ impl StorageKeychainDecision {
 pub const fn storage_keychain_decision() -> StorageKeychainDecision {
     StorageKeychainDecision {
         app_store_runtime: "EncryptedAppDb persists a serde_json envelope encrypted with AES-256-GCM; app DB does not persist plaintext SQLite pages.",
-        sqlite_schema_policy: "AppDbSchema and VERSION_1_DDL define the SQLite-compatible durable schema contract; OpenMLS protocol state uses openmls_sqlite_storage separately.",
+        sqlite_schema_policy: "AppDbSchema, VERSION_1_DDL, and VERSION_2_DDL define the SQLite-compatible durable schema contract; OpenMLS protocol state uses openmls_sqlite_storage separately.",
         encrypted_store_crates: &["aes-gcm", "serde_json", "zeroize", "sha2", "hex"],
         keychain_crate: "keyring 3.6.3 is optional behind production-storage; LinuxOsKeychain uses the default Secret Service sync provider; ProductionAppDbKeychain may use an Argon2id/AES-GCM PassphraseVaultKeychain when the user chooses password-vault storage or an explicit operator passphrase is configured; MemoryAppDbKeychain is restricted to tests/local/non-production builds.",
         wal_journal_policy: "Encrypted envelope writes use temp-file plus rename; sqlite_wal_path, -shm, and -journal sidecars are leakage-checked or moved by quarantine_corrupt_store; no plaintext WAL is expected for EncryptedAppDb.",
         key_wrapping: "A random data key encrypts payload bytes; the AppDbKeychain wrapping key wraps that data key into wrapped_data_key with nonces in the envelope; the data key zeroized after wrapping/decryption.",
-        schema_migrations: "AppDbMigrationPlan supports 0<->1 forward/backward/noop transitions, rejects future versions, and validate_observed_schema checks tables and columns before opening state.",
+        schema_migrations: "AppDbMigrationPlan supports 0<->2 and 1<->2 forward/backward/noop transitions, rejects future versions, and validate_observed_schema checks tables and columns before opening state.",
         secure_delete_limits: "Secure delete is best-effort enumeration plus verification for local files/keychain entries and cannot promise erasure from SSD wear-leveling, backups, or cloud snapshot copies.",
         platform_differences: &[
             "Linux production-storage uses keyring default Secret Service through LinuxOsKeychain when keyring mode is selected, or a user-unlocked PassphraseVaultKeychain when password-vault mode is selected.",
@@ -961,7 +962,7 @@ fn decrypt_bytes(
 }
 
 /// Current application database schema version.
-pub const APP_DB_SCHEMA_VERSION: u32 = 1;
+pub const APP_DB_SCHEMA_VERSION: u32 = 2;
 
 /// The first schema version supported by this crate.
 pub const MIN_SUPPORTED_APP_DB_SCHEMA_VERSION: u32 = 0;
@@ -971,6 +972,11 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "profiles",
     "devices",
     "groups",
+    "group_role_policy",
+    "group_members",
+    "group_admission_requests",
+    "group_governance_log",
+    "group_member_presence",
     "channels",
     "invites",
     "governance_events",
@@ -984,6 +990,11 @@ pub const REQUIRED_TABLES: &[&str] = &[
 const CREATE_PROFILES: &str = "CREATE TABLE IF NOT EXISTS profiles (profile_id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, friend_code TEXT NOT NULL, safety_number TEXT NOT NULL, safety_verified INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)";
 const CREATE_DEVICES: &str = "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY NOT NULL, profile_id TEXT NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE, mls_leaf INTEGER NOT NULL, credential_hash BLOB NOT NULL, identity_key_ref TEXT NOT NULL, status TEXT NOT NULL, added_at_ms INTEGER NOT NULL, removed_at_ms INTEGER)";
 const CREATE_GROUPS: &str = "CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY NOT NULL, profile_id TEXT NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE, name TEXT NOT NULL, role TEXT NOT NULL, mls_epoch INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)";
+const CREATE_GROUP_ROLE_POLICY: &str = "CREATE TABLE IF NOT EXISTS group_role_policy (group_id TEXT PRIMARY KEY NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, admission_mode TEXT NOT NULL, policy_epoch INTEGER NOT NULL, updated_by TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)";
+const CREATE_GROUP_MEMBERS: &str = "CREATE TABLE IF NOT EXISTS group_members (group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, member_id TEXT NOT NULL, display_name TEXT NOT NULL, device_id TEXT, role TEXT NOT NULL, status TEXT NOT NULL, signer_public_key_hex TEXT, joined_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER, presence_expires_at_ms INTEGER, revoked_at_ms INTEGER, revoked_by TEXT, PRIMARY KEY(group_id, member_id))";
+const CREATE_GROUP_ADMISSION_REQUESTS: &str = "CREATE TABLE IF NOT EXISTS group_admission_requests (request_id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, invite_id TEXT, display_name TEXT NOT NULL, device_name TEXT, member_identity TEXT NOT NULL, signer_public_key_hex TEXT NOT NULL, key_package BLOB NOT NULL, status TEXT NOT NULL, requested_at_ms INTEGER NOT NULL, decided_by TEXT, decided_at_ms INTEGER, decision_reason TEXT, policy_epoch_at_request INTEGER NOT NULL, admission_mode_at_request TEXT)";
+const CREATE_GROUP_GOVERNANCE_LOG: &str = "CREATE TABLE IF NOT EXISTS group_governance_log (event_id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, sequence INTEGER NOT NULL, event_kind TEXT NOT NULL, actor_member_id TEXT NOT NULL, target_member_id TEXT, request_id TEXT, role_before TEXT, role_after TEXT, policy_epoch INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, summary TEXT NOT NULL, signed_event_id TEXT REFERENCES governance_events(event_id) ON DELETE SET NULL, UNIQUE(group_id, sequence))";
+const CREATE_GROUP_MEMBER_PRESENCE: &str = "CREATE TABLE IF NOT EXISTS group_member_presence (group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, member_id TEXT NOT NULL, status TEXT NOT NULL, last_seen_at_ms INTEGER, presence_expires_at_ms INTEGER NOT NULL, heartbeat_observed_at_ms INTEGER NOT NULL, evidence_source TEXT NOT NULL, PRIMARY KEY(group_id, member_id), FOREIGN KEY(group_id, member_id) REFERENCES group_members(group_id, member_id) ON DELETE CASCADE)";
 const CREATE_CHANNELS: &str = "CREATE TABLE IF NOT EXISTS channels (channel_id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, retention_preset TEXT NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)";
 const CREATE_INVITES: &str = "CREATE TABLE IF NOT EXISTS invites (invite_id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, expires_at_ms INTEGER NOT NULL, max_uses INTEGER NOT NULL, password_gate TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL)";
 const CREATE_GOVERNANCE_EVENTS: &str = "CREATE TABLE IF NOT EXISTS governance_events (event_id TEXT PRIMARY KEY NOT NULL, group_id TEXT NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE, sequence INTEGER NOT NULL, event_type TEXT NOT NULL, signed_payload BLOB NOT NULL, author_device_id TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, UNIQUE(group_id, sequence))";
@@ -1000,6 +1011,9 @@ const CREATE_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_delivery_status_attempt ON delivery_queue(status, next_attempt_ms)",
     "CREATE INDEX IF NOT EXISTS idx_retention_message ON retention_state(message_id)",
     "CREATE INDEX IF NOT EXISTS idx_governance_group_sequence ON governance_events(group_id, sequence)",
+    "CREATE INDEX IF NOT EXISTS idx_group_members_group_role ON group_members(group_id, role)",
+    "CREATE INDEX IF NOT EXISTS idx_group_admission_requests_group_status ON group_admission_requests(group_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_group_presence_expiry ON group_member_presence(group_id, presence_expires_at_ms)",
 ];
 
 const VERSION_1_DDL: &[&str] = &[
@@ -1021,6 +1035,27 @@ const VERSION_1_DDL: &[&str] = &[
     CREATE_INDEXES[3],
     CREATE_INDEXES[4],
     CREATE_INDEXES[5],
+    "PRAGMA user_version = 1",
+];
+
+const VERSION_2_DDL: &[&str] = &[
+    CREATE_GROUP_ROLE_POLICY,
+    CREATE_GROUP_MEMBERS,
+    CREATE_GROUP_ADMISSION_REQUESTS,
+    CREATE_GROUP_GOVERNANCE_LOG,
+    CREATE_GROUP_MEMBER_PRESENCE,
+    CREATE_INDEXES[6],
+    CREATE_INDEXES[7],
+    CREATE_INDEXES[8],
+    "PRAGMA user_version = 2",
+];
+
+const VERSION_2_ROLLBACK: &[&str] = &[
+    "DROP TABLE IF EXISTS group_member_presence",
+    "DROP TABLE IF EXISTS group_governance_log",
+    "DROP TABLE IF EXISTS group_admission_requests",
+    "DROP TABLE IF EXISTS group_members",
+    "DROP TABLE IF EXISTS group_role_policy",
     "PRAGMA user_version = 1",
 ];
 
@@ -1246,6 +1281,281 @@ const GROUP_COLUMNS: &[AppDbColumn] = &[
     AppDbColumn {
         name: "updated_at_ms",
         sql_type: "INTEGER",
+        sensitive: false,
+    },
+];
+
+const GROUP_ROLE_POLICY_COLUMNS: &[AppDbColumn] = &[
+    AppDbColumn {
+        name: "group_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "admission_mode",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "policy_epoch",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "updated_by",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "updated_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+];
+
+const GROUP_MEMBER_COLUMNS: &[AppDbColumn] = &[
+    AppDbColumn {
+        name: "group_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "member_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "display_name",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "device_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "role",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "status",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "signer_public_key_hex",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "joined_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "last_seen_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "presence_expires_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "revoked_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "revoked_by",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+];
+
+const GROUP_ADMISSION_REQUEST_COLUMNS: &[AppDbColumn] = &[
+    AppDbColumn {
+        name: "request_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "group_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "invite_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "display_name",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "device_name",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "member_identity",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "signer_public_key_hex",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "key_package",
+        sql_type: "BLOB",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "status",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "requested_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "decided_by",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "decided_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "decision_reason",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "policy_epoch_at_request",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "admission_mode_at_request",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+];
+
+const GROUP_GOVERNANCE_LOG_COLUMNS: &[AppDbColumn] = &[
+    AppDbColumn {
+        name: "event_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "group_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "sequence",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "event_kind",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "actor_member_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "target_member_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "request_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "role_before",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "role_after",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "policy_epoch",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "created_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "summary",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "signed_event_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+];
+
+const GROUP_MEMBER_PRESENCE_COLUMNS: &[AppDbColumn] = &[
+    AppDbColumn {
+        name: "group_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "member_id",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "status",
+        sql_type: "TEXT",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "last_seen_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "presence_expires_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "heartbeat_observed_at_ms",
+        sql_type: "INTEGER",
+        sensitive: false,
+    },
+    AppDbColumn {
+        name: "evidence_source",
+        sql_type: "TEXT",
         sensitive: false,
     },
 ];
@@ -1583,6 +1893,26 @@ const APP_DB_TABLES: &[AppDbTable] = &[
         columns: GROUP_COLUMNS,
     },
     AppDbTable {
+        name: "group_role_policy",
+        columns: GROUP_ROLE_POLICY_COLUMNS,
+    },
+    AppDbTable {
+        name: "group_members",
+        columns: GROUP_MEMBER_COLUMNS,
+    },
+    AppDbTable {
+        name: "group_admission_requests",
+        columns: GROUP_ADMISSION_REQUEST_COLUMNS,
+    },
+    AppDbTable {
+        name: "group_governance_log",
+        columns: GROUP_GOVERNANCE_LOG_COLUMNS,
+    },
+    AppDbTable {
+        name: "group_member_presence",
+        columns: GROUP_MEMBER_PRESENCE_COLUMNS,
+    },
+    AppDbTable {
         name: "channels",
         columns: CHANNEL_COLUMNS,
     },
@@ -1668,6 +1998,35 @@ impl AppDbMigrationPlan {
             });
         }
 
+        if from_version == 0 && to_version == 2 {
+            let mut statements = VERSION_1_DDL.to_vec();
+            statements.extend_from_slice(VERSION_2_DDL);
+            return Ok(Self {
+                from_version,
+                to_version,
+                direction: MigrationDirection::Forward,
+                statements,
+            });
+        }
+
+        if from_version == 1 && to_version == 2 {
+            return Ok(Self {
+                from_version,
+                to_version,
+                direction: MigrationDirection::Forward,
+                statements: VERSION_2_DDL.to_vec(),
+            });
+        }
+
+        if from_version == 2 && to_version == 1 {
+            return Ok(Self {
+                from_version,
+                to_version,
+                direction: MigrationDirection::Backward,
+                statements: VERSION_2_ROLLBACK.to_vec(),
+            });
+        }
+
         if from_version == 1 && to_version == 0 {
             return Ok(Self {
                 from_version,
@@ -1677,7 +2036,18 @@ impl AppDbMigrationPlan {
             });
         }
 
-        // The version validator keeps this arm unreachable for the current two-version graph,
+        if from_version == 2 && to_version == 0 {
+            let mut statements = VERSION_2_ROLLBACK.to_vec();
+            statements.extend_from_slice(VERSION_1_ROLLBACK);
+            return Ok(Self {
+                from_version,
+                to_version,
+                direction: MigrationDirection::Backward,
+                statements,
+            });
+        }
+
+        // The version validator keeps this arm unreachable for the current version graph,
         // but keeping the explicit future error makes added versions fail safely.
         Err(AppDbError::UnsupportedFutureVersion {
             version: to_version,
@@ -2454,8 +2824,121 @@ mod tests {
                 "missing migration statement for {required}"
             );
         }
-        assert!(plan.statements.contains(&"PRAGMA user_version = 1"));
+        assert!(plan.statements.contains(&"PRAGMA user_version = 2"));
         Ok(())
+    }
+
+    #[test]
+    fn migration_from_v1_store_adds_canonical_governance_state() -> Result<(), AppDbError> {
+        let plan = AppDbMigrationPlan::plan(1, APP_DB_SCHEMA_VERSION)?;
+        assert_eq!(plan.direction, MigrationDirection::Forward);
+        assert!(plan.statements.contains(&CREATE_GROUP_ROLE_POLICY));
+        assert!(plan.statements.contains(&CREATE_GROUP_MEMBERS));
+        assert!(plan.statements.contains(&CREATE_GROUP_ADMISSION_REQUESTS));
+        assert!(plan.statements.contains(&CREATE_GROUP_GOVERNANCE_LOG));
+        assert!(plan.statements.contains(&CREATE_GROUP_MEMBER_PRESENCE));
+        assert!(plan.statements.contains(&"PRAGMA user_version = 2"));
+        Ok(())
+    }
+
+    #[test]
+    fn current_schema_persists_canonical_governance_state() {
+        let schema = AppDbSchema::current();
+
+        let role_policy = schema
+            .table("group_role_policy")
+            .expect("role policy table exists");
+        assert_columns(
+            role_policy,
+            [
+                "group_id",
+                "admission_mode",
+                "policy_epoch",
+                "updated_by",
+                "updated_at_ms",
+            ],
+        );
+
+        let members = schema.table("group_members").expect("members table exists");
+        assert_columns(
+            members,
+            [
+                "group_id",
+                "member_id",
+                "display_name",
+                "device_id",
+                "role",
+                "status",
+                "signer_public_key_hex",
+                "joined_at_ms",
+                "last_seen_at_ms",
+                "presence_expires_at_ms",
+                "revoked_at_ms",
+                "revoked_by",
+            ],
+        );
+
+        let requests = schema
+            .table("group_admission_requests")
+            .expect("admission request table exists");
+        assert_columns(
+            requests,
+            [
+                "request_id",
+                "group_id",
+                "invite_id",
+                "display_name",
+                "device_name",
+                "member_identity",
+                "signer_public_key_hex",
+                "key_package",
+                "status",
+                "requested_at_ms",
+                "decided_by",
+                "decided_at_ms",
+                "decision_reason",
+                "policy_epoch_at_request",
+                "admission_mode_at_request",
+            ],
+        );
+
+        let governance_log = schema
+            .table("group_governance_log")
+            .expect("governance log table exists");
+        assert_columns(
+            governance_log,
+            [
+                "event_id",
+                "group_id",
+                "sequence",
+                "event_kind",
+                "actor_member_id",
+                "target_member_id",
+                "request_id",
+                "role_before",
+                "role_after",
+                "policy_epoch",
+                "created_at_ms",
+                "summary",
+                "signed_event_id",
+            ],
+        );
+
+        let presence = schema
+            .table("group_member_presence")
+            .expect("presence table exists");
+        assert_columns(
+            presence,
+            [
+                "group_id",
+                "member_id",
+                "status",
+                "last_seen_at_ms",
+                "presence_expires_at_ms",
+                "heartbeat_observed_at_ms",
+                "evidence_source",
+            ],
+        );
     }
 
     #[test]
@@ -2518,6 +3001,17 @@ mod tests {
                 "retention_state.key_ref".to_owned(),
             ])
         );
+    }
+
+    fn assert_columns<const N: usize>(table: &AppDbTable, expected: [&str; N]) {
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| column.name)
+            .collect::<BTreeSet<_>>();
+        for column in expected {
+            assert!(columns.contains(column), "missing {}.{column}", table.name);
+        }
     }
 
     #[test]
