@@ -8751,6 +8751,31 @@ impl PersistedAppState {
 
     fn data_channel_probe_status(&self) -> (String, String) {
         if let Some(probe) = &self.latest_data_channel_probe {
+            let direct_ready = data_channel_probe_direct_ready(probe);
+            let configured_turn_endpoint = self
+                .active_connectivity_policy()
+                .and_then(|(_, connectivity)| configured_turn_endpoint(&connectivity));
+            let turn_ready = data_channel_probe_configured_turn_ready(
+                probe,
+                configured_turn_endpoint.as_deref(),
+            );
+            if !direct_ready && !turn_ready {
+                return (
+                    "webrtc-datachannel-failed".to_owned(),
+                    format!(
+                        "direct_failed_turn_required adapter={} profile={} endpoint={} {} offerer_direct={} answerer_direct={} configured_turn_servers={}/{} configured_turn_endpoint={} provider_application_relay_used=false",
+                        probe.kind,
+                        probe.profile_id,
+                        probe.endpoint_label,
+                        redacted_observable_ref("room_topic", &probe.rendezvous_topic),
+                        probe.offerer_direct_path_ready,
+                        probe.answerer_direct_path_ready,
+                        probe.offerer_configured_turn_servers,
+                        probe.answerer_configured_turn_servers,
+                        configured_turn_endpoint.is_some(),
+                    ),
+                );
+            }
             return (
                 "webrtc-datachannel-proofed".to_owned(),
                 format!(
@@ -9104,17 +9129,29 @@ impl PersistedAppState {
             );
             return;
         }
-        let (selected_leg, endpoint) = if probe.offerer_direct_path_ready
-            && probe.answerer_direct_path_ready
-        {
+        let configured_turn_endpoint = self
+            .active_connectivity_policy()
+            .and_then(|(_, connectivity)| configured_turn_endpoint(&connectivity));
+        let (selected_leg, endpoint) = if data_channel_probe_direct_ready(probe) {
             let endpoint = self
                 .active_connectivity_policy()
                 .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
                 .map(Endpoint::new)
                 .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
             (FallbackLeg::Stun, endpoint)
-        } else if probe.offerer_turn_fallback_ready && probe.answerer_turn_fallback_ready {
-            let endpoint = self
+        } else if let Some(endpoint) = configured_turn_endpoint
+            .as_deref()
+            .filter(|endpoint| data_channel_probe_configured_turn_ready(probe, Some(*endpoint)))
+            .map(Endpoint::new)
+        {
+            (FallbackLeg::Turn, endpoint)
+        } else {
+            let stun_endpoint = self
+                .active_connectivity_policy()
+                .and_then(|(_, connectivity)| connectivity.ice_stun_servers.first().cloned())
+                .map(Endpoint::new)
+                .unwrap_or_else(|| Endpoint::new("stun:stun.l.google.com:19302"));
+            let turn_endpoint = self
                 .active_connectivity_policy()
                 .and_then(|(_, connectivity)| {
                     connectivity
@@ -9123,14 +9160,30 @@ impl PersistedAppState {
                         .map(|server| server.endpoint.clone())
                 })
                 .map(Endpoint::new)
-                .unwrap_or_else(|| Endpoint::new("turn:configured-turn.proofed"));
-            (FallbackLeg::Turn, endpoint)
-        } else {
+                .unwrap_or_else(|| {
+                    Endpoint::new(
+                        discrypt_transport::ConnectivityConfig::UNCONFIGURED_TURN_ENDPOINT,
+                    )
+                });
+            if let Some(record) = self
+                .transport_session_mut(BackendTransportMode::Text)
+                .as_mut()
+            {
+                if matches!(record.state(), TransportSessionState::Signaling) {
+                    let _ = record.session.begin_ice_gathering();
+                }
+                if matches!(record.state(), TransportSessionState::IceGathering) {
+                    let _ = record.session.begin_checking();
+                }
+                let _ = record
+                    .session
+                    .fail_direct_path_turn_required(stun_endpoint, turn_endpoint);
+            }
             self.push_command_error(
                     "transport.text_route_not_proofed",
                     "start_text_session",
-                    "no_direct_or_turn_route",
-                    "DataChannel opened, but direct P2P or configured TURN readiness was not proven",
+                    "direct_failed_turn_required",
+                    "Direct WebRTC failed and TURN is required, but no configured TURN route was proven",
                     "Inspect ICE logs and configure TURN if the peers are behind incompatible NAT; MQTT/Nostr providers are signaling-only and never relay messages",
                 );
             return;
@@ -12343,6 +12396,30 @@ fn abuse_controls_contract_covers_g116() -> bool {
 
 fn app_service() -> &'static Mutex<TauriAppService> {
     APP_SERVICE.get_or_init(|| Mutex::new(TauriAppService::load()))
+}
+
+fn data_channel_probe_direct_ready(probe: &ProviderWebRtcDataChannelProbeView) -> bool {
+    probe.offerer_direct_path_ready && probe.answerer_direct_path_ready
+}
+
+fn configured_turn_endpoint(connectivity: &ConnectivityPolicyView) -> Option<String> {
+    connectivity
+        .ice_turn_servers
+        .first()
+        .map(|server| server.endpoint.trim())
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn data_channel_probe_configured_turn_ready(
+    probe: &ProviderWebRtcDataChannelProbeView,
+    configured_turn_endpoint: Option<&str>,
+) -> bool {
+    probe.offerer_turn_fallback_ready
+        && probe.answerer_turn_fallback_ready
+        && probe.offerer_configured_turn_servers > 0
+        && probe.answerer_configured_turn_servers > 0
+        && configured_turn_endpoint.is_some_and(|endpoint| !endpoint.trim().is_empty())
 }
 
 fn with_state<T>(read: impl FnOnce(&PersistedAppState) -> T) -> T {
@@ -25335,9 +25412,9 @@ mod tests {
     }
 
     #[test]
-    fn text_session_turn_probe_marks_turn_route_and_diagnostics() {
+    fn turn_needed_fail_closed_probe_marks_failed_without_delivery_claim() {
         let _guard = test_lock();
-        let _path = reset_with_temp_state("text-session-turn-route-proof");
+        let _path = reset_with_temp_state("turn-needed-fail-closed");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Desktop".to_owned()),
@@ -25345,6 +25422,214 @@ mod tests {
         start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
         });
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none());
+
+        let blocked_probe = ProviderWebRtcDataChannelProbeView {
+            kind: "mqtt".to_owned(),
+            profile_id: "mqtt-default".to_owned(),
+            endpoint_label: "mqtts://broker.example".to_owned(),
+            scope_commitment: "scope-commitment".to_owned(),
+            rendezvous_topic: "topic-commitment".to_owned(),
+            offerer_direct_path_ready: false,
+            answerer_direct_path_ready: false,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: false,
+            receipt_frame_sha256: String::new(),
+            runtime_spec: None,
+        };
+
+        let state = mutate_app_service(|state| {
+            state.latest_data_channel_probe = Some(blocked_probe.clone());
+            state.mark_text_session_data_channel_route_proof(&blocked_probe);
+        });
+
+        let error = state
+            .last_command_error
+            .as_ref()
+            .expect("TURN-needed route must surface a command error");
+        assert_eq!(error.code, "direct_failed_turn_required");
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-failed"
+        );
+        assert!(state
+            .transport_diagnostics
+            .data_channel_probe_detail
+            .contains("provider_application_relay_used=false"));
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-report-stored"
+        );
+        assert_eq!(state.transport_diagnostics.turn_required, "turn-required");
+        assert!(state
+            .transport_diagnostics
+            .route_proof_detail
+            .contains("selected=turn"));
+        assert!(state
+            .transport_diagnostics
+            .route_proof_detail
+            .contains("not a production NAT/pcap proof"));
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| status.label == "text session" && status.status == "failed"));
+        assert!(with_state(|state| state.text_delivery_receipts.is_empty()));
+
+        let diagnostics = export_diagnostics_log();
+        assert!(diagnostics.contains("direct_failed_turn_required"));
+        assert!(diagnostics.contains("turn-required"));
+        assert!(diagnostics.contains("webrtc-datachannel-failed"));
+    }
+
+    #[test]
+    fn turn_ready_booleans_without_configured_turn_still_fail_closed() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("turn-booleans-without-config-fail-closed");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("dm:bob".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none());
+
+        let misleading_probe = ProviderWebRtcDataChannelProbeView {
+            kind: "mqtt".to_owned(),
+            profile_id: "mqtt-default".to_owned(),
+            endpoint_label: "mqtts://broker.example".to_owned(),
+            scope_commitment: "scope-commitment".to_owned(),
+            rendezvous_topic: "topic-commitment".to_owned(),
+            offerer_direct_path_ready: false,
+            answerer_direct_path_ready: false,
+            offerer_turn_fallback_ready: true,
+            answerer_turn_fallback_ready: true,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 1,
+            answerer_local_relay_candidates_gathered: 1,
+            offerer_remote_relay_candidates_applied: 1,
+            answerer_remote_relay_candidates_applied: 1,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "b".repeat(64),
+            runtime_spec: None,
+        };
+
+        let state = mutate_app_service(|state| {
+            state.latest_data_channel_probe = Some(misleading_probe.clone());
+            state.mark_text_session_data_channel_route_proof(&misleading_probe);
+        });
+
+        assert_eq!(
+            state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("direct_failed_turn_required")
+        );
+        assert_eq!(
+            state.transport_diagnostics.data_channel_probe_status,
+            "webrtc-datachannel-failed"
+        );
+        assert!(state
+            .transport_diagnostics
+            .data_channel_probe_detail
+            .contains("configured_turn_servers=0/0"));
+        assert!(state
+            .transport_diagnostics
+            .data_channel_probe_detail
+            .contains("provider_application_relay_used=false"));
+        assert_eq!(
+            state.transport_diagnostics.route_proof_status,
+            "route-report-stored"
+        );
+        assert_eq!(state.transport_diagnostics.turn_required, "turn-required");
+        assert!(state
+            .transport_status
+            .iter()
+            .any(|status| status.label == "text session" && status.status == "failed"));
+        assert!(with_state(|state| state.text_delivery_receipts.is_empty()));
+
+        let diagnostics = export_diagnostics_log();
+        assert!(diagnostics.contains("direct_failed_turn_required"));
+        assert!(diagnostics.contains("configured_turn_servers=0/0"));
+        assert!(!diagnostics.contains("turn:configured-turn.proofed"));
+    }
+
+    #[test]
+    fn text_session_turn_probe_marks_turn_route_and_diagnostics() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-session-turn-route-proof");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let dm_id = dm_state
+            .dms
+            .iter()
+            .rev()
+            .find(|dm| dm.display_name == "Bob")
+            .map(|dm| dm.dm_id.clone())
+            .expect("Bob DM should exist for TURN route proof test");
+        let updated_policy = set_connectivity_policy(SetConnectivityPolicyRequest {
+            scope_kind: "dm".to_owned(),
+            group_id: None,
+            channel_id: None,
+            dm_id: Some(dm_id.clone()),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.example.invalid:5349".to_owned(),
+                credential_declared: true,
+                credential_expires_at: None,
+            }]),
+        });
+        assert!(
+            updated_policy.last_command_error.is_none(),
+            "{updated_policy:?}"
+        );
+        assert_eq!(
+            updated_policy
+                .dms
+                .iter()
+                .rev()
+                .find(|dm| dm.display_name == "Bob")
+                .and_then(|dm| dm.connectivity.as_ref())
+                .and_then(configured_turn_endpoint)
+                .as_deref(),
+            Some("turns:turn.example.invalid:5349")
+        );
 
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("dm:bob".to_owned()),

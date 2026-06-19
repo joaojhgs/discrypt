@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-19T00:11:13.246Z",
+  "updatedAt": "2026-06-19T02:41:08.949Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -360,6 +360,16 @@
       "updatedAt": "2026-06-19T00:11:13.246Z",
       "evidence": "PER-28 branch multica/P3-T07-public-nostr-two-machine-text-e2e pushed; draft PR #23 open; current-head PR run 27796670182 green; PER-28 public Nostr namespace proof job 82257853899 passed; latest artifact per28-public-nostr-namespace-27796670182-1 validated with provider_application_relay_used=false and DataChannel text/control evidence.",
       "completedAt": "2026-06-19T00:11:13.246Z"
+    },
+    {
+      "id": "G032-p3-t08-turn-needed-fail-closed-path",
+      "title": "P3-T08 TURN-needed fail-closed path",
+      "objective": "Implement and verify PER-29/P3-T08: when direct WebRTC is impossible and no TURN route is configured, desktop/transport diagnostics fail closed with direct failed/TURN required, no connected or delivered claim, retained harness evidence, and release report.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-19T02:41:08.949Z",
+      "updatedAt": "2026-06-19T02:41:08.949Z",
+      "evidence": ".omx/plans/P3-T08-turn-needed-fail-closed-path-2026-06-19.md and Multica PER-29 metadata"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
