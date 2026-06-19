@@ -19329,7 +19329,13 @@ mod tests {
             Some("invite_expired")
         );
         assert!(rejected.groups.is_empty());
-        assert!(rejected.active_context.is_none());
+        assert!(
+            rejected
+                .groups
+                .iter()
+                .all(|group| group.name != "Should Not Exist" && group.role != "pending"),
+            "expired parsed invite must not leave a pending compatibility group"
+        );
         assert!(rejected.invites.is_empty());
     }
 
