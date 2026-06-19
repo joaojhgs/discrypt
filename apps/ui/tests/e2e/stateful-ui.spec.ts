@@ -478,6 +478,77 @@ test("group invite join text channel and voice controls work without fake member
   expect(errors).toEqual([]);
 });
 
+test("expired revoked and max-used invites fail clearly without pending group state", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(message.text());
+  });
+
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Invite Failure Lab");
+  await page.getByRole("button", { name: /^Create group$/ }).last().click();
+  await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
+
+  await openGroupInviteModal(page, "Invite Failure Lab");
+  const inviteSheet = page.getByRole("dialog", { name: "Create group invite" });
+  await inviteSheet.getByLabel("Maximum uses").fill("1");
+  await page.getByRole("button", { name: /create invite for/i }).click();
+  const firstInvite = await inviteSheet.getByTestId("invite-link").inputValue();
+  await page.getByRole("button", { name: /create invite for/i }).click();
+  const secondInvite = await inviteSheet.getByTestId("invite-link").inputValue();
+  await page.getByRole("button", { name: /Close Create group invite/i }).click();
+
+  await page.evaluate(
+    ([storageKey, revokedCode, maxUsedCode]) => {
+      const raw = window.localStorage.getItem(storageKey);
+      if (!raw) throw new Error("fallback state missing");
+      const state = JSON.parse(raw);
+      for (const invite of state.invites ?? []) {
+        if (invite.code === revokedCode) invite.revoked = true;
+        if (invite.code === maxUsedCode) {
+          invite.max_use = "1 use";
+          invite.uses = 1;
+        }
+      }
+      window.localStorage.setItem(storageKey, JSON.stringify(state));
+    },
+    ["discrypt.local-dev.app-state.v1", firstInvite, secondInvite],
+  );
+  await page.reload();
+  await expect(
+    page
+      .getByLabel("Channel navigation")
+      .getByRole("heading", { name: /Invite Failure Lab/i }),
+  ).toBeVisible();
+
+  await openLauncher(page);
+  await page.getByPlaceholder("Paste invite URL or code").fill(firstInvite);
+  await page.getByLabel("Local label").fill("Revoked Should Not Exist");
+  await page.getByRole("button", { name: /Join\/open group/i }).click();
+  await expect(page.getByText(/Invite was revoked before admission/i)).toBeVisible();
+  await expect(page.getByText(/Revoked Should Not Exist/i)).toHaveCount(0);
+
+  await openLauncher(page);
+  await page.getByPlaceholder("Paste invite URL or code").fill(secondInvite);
+  await page.getByLabel("Local label").fill("Max Used Should Not Exist");
+  await page.getByRole("button", { name: /Join\/open group/i }).click();
+  await expect(page.getByText(/Invite maximum use count/i)).toBeVisible();
+  await expect(page.getByText(/Max Used Should Not Exist/i)).toHaveCount(0);
+
+  const expiredInvite =
+    "discrypt://join/v1/expired-ui?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2000-01-01T00%3A00%3A00Z&max=3";
+  await openLauncher(page);
+  await page.getByPlaceholder("Paste invite URL or code").fill(expiredInvite);
+  await page.getByLabel("Local label").fill("Expired Should Not Exist");
+  await page.getByRole("button", { name: /Join\/open group/i }).click();
+  await expect(page.getByText(/Invite expired before admission/i)).toBeVisible();
+  await expect(page.getByText(/Expired Should Not Exist/i)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
 test("small-window navigation exposes setup groups invites text and voice without overflow", async ({
   page,
 }) => {

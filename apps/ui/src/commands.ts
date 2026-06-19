@@ -2345,6 +2345,90 @@ function parseMaxUses(label: string): number {
   return match ? Number(match[0]) || 5 : 5;
 }
 
+type InviteUseFailure = {
+  code: string;
+  message: string;
+  recoveryHint: string;
+};
+
+function inviteUseFailure(
+  code: string,
+  message: string,
+  recoveryHint: string,
+): InviteUseFailure {
+  return { code, message, recoveryHint };
+}
+
+function validateLocalInviteUsable(invite: InviteView, now = Date.now()): InviteUseFailure | null {
+  if (invite.revoked) {
+    return inviteUseFailure(
+      "invite_revoked",
+      "Invite was revoked before admission could proceed",
+      "Request a fresh invite from an owner or staff member",
+    );
+  }
+  const expiresAt = Date.parse(invite.expires_at);
+  if (Number.isFinite(expiresAt) && now > expiresAt) {
+    return inviteUseFailure(
+      "invite_expired",
+      "Invite expired before admission could proceed",
+      "Request a fresh invite from an owner or staff member",
+    );
+  }
+  if (invite.uses >= parseMaxUses(invite.max_use)) {
+    return inviteUseFailure(
+      "invite_max_uses_exhausted",
+      "Invite maximum use count has already been reached",
+      "Request a fresh invite with available uses",
+    );
+  }
+  return null;
+}
+
+function validateParsedInviteUsable(
+  invite: ParsedInviteMetadata,
+  now = Date.now(),
+): InviteUseFailure | null {
+  if (invite.revoked) {
+    return inviteUseFailure(
+      "invite_revoked",
+      "Invite was revoked before admission could proceed",
+      "Request a fresh invite from an owner or staff member",
+    );
+  }
+  const expiresAt = Date.parse(invite.expiresAt);
+  if (Number.isFinite(expiresAt) && now > expiresAt) {
+    return inviteUseFailure(
+      "invite_expired",
+      "Invite expired before admission could proceed",
+      "Request a fresh invite from an owner or staff member",
+    );
+  }
+  if (invite.consumedUses >= invite.maxUses) {
+    return inviteUseFailure(
+      "invite_max_uses_exhausted",
+      "Invite maximum use count has already been reached",
+      "Request a fresh invite with available uses",
+    );
+  }
+  return null;
+}
+
+function pushInviteUseFailure(
+  state: AppState,
+  command: "join_group" | "accept_dm_invite",
+  failure: InviteUseFailure,
+): void {
+  pushCommandError(
+    state,
+    "invite.rejected",
+    command,
+    failure.code,
+    failure.message,
+    failure.recoveryHint,
+  );
+}
+
 function inviteAdmissionSnapshot(
   groupId: string,
   connectivity: ConnectivityPolicyView,
@@ -2470,6 +2554,8 @@ type ParsedInviteMetadata = {
   connectivity: ConnectivityPolicyView;
   expiresAt: string;
   maxUses: number;
+  consumedUses: number;
+  revoked: boolean;
 };
 
 export function defaultSignalingEndpointForAdapter(
@@ -3025,6 +3111,8 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
     connectivity,
     expiresAt: params.get("exp") ?? descriptor?.expires_at ?? "",
     maxUses: Number(params.get("max") ?? descriptor?.max_uses ?? 1) || 1,
+    consumedUses: Number(descriptor?.consumed_uses ?? 0) || 0,
+    revoked: Boolean(descriptor?.revocation_event_id),
   };
 }
 
@@ -3883,6 +3971,11 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         (invite) => invite.code === inviteCode,
       );
       if (localInvite) {
+        const failure = validateLocalInviteUsable(localInvite);
+        if (failure) {
+          pushInviteUseFailure(state, "join_group", failure);
+          return;
+        }
         state.active_context = {
           kind: "group",
           group_id: localInvite.group_id,
@@ -3897,6 +3990,13 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         return;
       }
       const parsedInvite = parseInviteMetadata(inviteCode);
+      if (parsedInvite) {
+        const failure = validateParsedInviteUsable(parsedInvite);
+        if (failure) {
+          pushInviteUseFailure(state, "join_group", failure);
+          return;
+        }
+      }
       const name = inviteGroupNameFromMetadata(
         inviteCode,
         request.group_name,
@@ -4316,6 +4416,7 @@ export async function createInvite(
       const maxUse = request.max_use || fallbackState.snapshot.invite.max_use;
       const passwordGate = request.password_gate?.trim();
       const expiresAt = inviteExpirationHorizon(expires);
+      const revokedAtIssue = request.revocation_state === "revoked";
       const signalingEndpoint = defaultSignalingEndpoint(connectivity);
       const signalingTrustFingerprint = stableHash(
         `external-signaling-endpoint-fingerprint-v1:${signalingEndpoint}`,
@@ -4337,6 +4438,8 @@ export async function createInvite(
         connectivity,
         expiresAt,
         maxUses: parseMaxUses(maxUse),
+        consumedUses: 0,
+        revoked: revokedAtIssue,
       };
       state.invites.push({
         invite_id: `invite-${inviteKey}`,
@@ -4365,7 +4468,7 @@ export async function createInvite(
         expires_at: expiresAt,
         max_use: maxUse,
         uses: 0,
-        revoked: false,
+        revoked: revokedAtIssue,
         admission_copy: passwordGate
           ? "Password-gated admission requested; final admission still requires an authorized MLS Welcome/add and no password verifier is embedded in the invite"
           : "Final admission still requires an authorized MLS Welcome/add; the room-secret link alone is insufficient",
@@ -4438,6 +4541,8 @@ export async function createDmInvite(
         connectivity,
         expiresAt,
         maxUses: parseMaxUses(maxUse),
+        consumedUses: 0,
+        revoked: false,
       };
       state.invites.push({
         invite_id: `invite-${inviteKey}`,
@@ -4493,6 +4598,14 @@ export async function acceptDmInvite(
           "DM contact invite metadata could not be parsed",
           "Paste a signed DM contact invite descriptor before accepting",
         );
+        return;
+      }
+      const localInvite = state.invites.find((invite) => invite.code === inviteCode);
+      const failure = localInvite
+        ? validateLocalInviteUsable(localInvite)
+        : validateParsedInviteUsable(parsedInvite);
+      if (failure) {
+        pushInviteUseFailure(state, "accept_dm_invite", failure);
         return;
       }
       if (parsedInvite.connectivity.invite_kind !== "dm_contact") {
