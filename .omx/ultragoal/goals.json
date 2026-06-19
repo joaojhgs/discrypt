@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-19T05:34:49.151Z",
+  "updatedAt": "2026-06-19T06:53:51.845Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -380,6 +380,16 @@
       "createdAt": "2026-06-19T05:34:49.151Z",
       "updatedAt": "2026-06-19T05:34:49.151Z",
       "evidence": "PER-30 issue metadata and .omx/plans/P3-T08-turn-needed-fail-closed-path-2026-06-19.md adjacent context"
+    },
+    {
+      "id": "G034-per-18-approval-welcome-persistence",
+      "title": "PER-18 approval Welcome persistence",
+      "objective": "Complete PER-18/P2-T06 by proving owner/staff approval queues an OpenMLS Welcome, joiner persists admitted OpenMLS state, pre-approval send fails, and post-approval send succeeds after reload.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-19T06:53:51.845Z",
+      "updatedAt": "2026-06-19T06:53:51.845Z",
+      "evidence": "Plan .omx/plans/P2-T06-approval-welcome-persistence-2026-06-19.md; tests passing for mls-core Welcome persistence and desktop admission gating."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
