@@ -122,6 +122,19 @@ type OverlayKind =
   | "group-config"
   | "settings"
   | "diagnostics";
+type ContextMenuPoint = {
+  x: number;
+  y: number;
+};
+type SharedContextMenuItem = {
+  id: string;
+  label: string;
+  icon?: React.ReactNode;
+  description?: string;
+  danger?: boolean;
+  disabled?: boolean;
+  onSelect?: () => void;
+};
 type VoiceParticipant = VoiceParticipantView;
 type StorageSetupChoice = "keyring" | "passphrase_vault";
 type CommandNotification = {
@@ -908,6 +921,25 @@ function Icon({
       {children}
     </span>
   );
+}
+
+function isKeyboardContextMenu(event: React.KeyboardEvent<HTMLElement>): boolean {
+  return event.key === "ContextMenu" || (event.shiftKey && event.key === "F10");
+}
+
+function contextMenuPointFromElement(element: HTMLElement): ContextMenuPoint {
+  const rect = element.getBoundingClientRect();
+  return {
+    x: Math.min(rect.left + 16, Math.max(12, window.innerWidth - 240)),
+    y: Math.min(rect.top + Math.min(rect.height, 36), Math.max(12, window.innerHeight - 160)),
+  };
+}
+
+function clampContextMenuPoint(point: ContextMenuPoint): ContextMenuPoint {
+  return {
+    x: Math.min(point.x, Math.max(12, window.innerWidth - 240)),
+    y: Math.min(point.y, Math.max(12, window.innerHeight - 160)),
+  };
 }
 
 function useMediaQuery(query: string): boolean {
@@ -3703,6 +3735,14 @@ function ServerRail({
                 );
               }
             }}
+            onKeyDown={(event) => {
+              if (!isKeyboardContextMenu(event) || group.group_id === "local") {
+                return;
+              }
+              event.preventDefault();
+              const point = contextMenuPointFromElement(event.currentTarget);
+              onGroupContextMenu(group.group_id, point.x, point.y);
+            }}
             disabled={group.group_id === "local"}
             className={cn(
               "h-11 w-11 shrink-0 rounded-2xl text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5 disabled:cursor-default disabled:opacity-70 disabled:hover:translate-y-0",
@@ -3978,6 +4018,40 @@ function ChannelSidebar({
   const speaking = participants.filter(
     (participant) => participant.speaking && !participant.muted,
   ).length;
+  const [channelContextMenu, setChannelContextMenu] = useState<
+    (ContextMenuPoint & { channel: ChannelStateView }) | null
+  >(null);
+  const openChannelContextMenu = (
+    channel: ChannelStateView,
+    point: ContextMenuPoint,
+  ) => setChannelContextMenu({ channel, ...point });
+  const channelContextMenuItems: SharedContextMenuItem[] = channelContextMenu
+    ? [
+        {
+          id: "open-channel",
+          label:
+            channelContextMenu.channel.kind === "Voice"
+              ? "Join voice room"
+              : "Open text channel",
+          icon: channelContextMenu.channel.kind === "Voice" ? "🔊" : "#",
+          onSelect: () => {
+            if (channelContextMenu.channel.kind === "Voice") {
+              onSelectVoiceChannel(channelContextMenu.channel.channel_id);
+            } else {
+              onSelectTextChannel(channelContextMenu.channel.channel_id);
+            }
+          },
+        },
+        {
+          id: "channel-authority",
+          label: "Channel management unavailable",
+          icon: "ⓘ",
+          description:
+            "Rename and destructive actions stay disabled until backend authority is available.",
+          disabled: true,
+        },
+      ]
+    : [];
   return (
     <aside
       aria-label="Channel navigation"
@@ -4028,6 +4102,16 @@ function ChannelSidebar({
                 activeChannelId === channel.channel_id
               }
               onClick={() => onSelectTextChannel(channel.channel_id)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                openChannelContextMenu(channel, {
+                  x: event.clientX,
+                  y: event.clientY,
+                });
+              }}
+              onKeyboardContextMenu={(point) =>
+                openChannelContextMenu(channel, point)
+              }
               meta={channel.retention_status}
             >
               # {channel.name}
@@ -4062,6 +4146,16 @@ function ChannelSidebar({
                   active={focusedVoiceRoom}
                   ariaCurrent={focusedVoiceRoom ? "page" : undefined}
                   onClick={() => onSelectVoiceChannel(channel.channel_id)}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    openChannelContextMenu(channel, {
+                      x: event.clientX,
+                      y: event.clientY,
+                    });
+                  }}
+                  onKeyboardContextMenu={(point) =>
+                    openChannelContextMenu(channel, point)
+                  }
                   meta={
                     voiceJoined && focusedVoiceRoom
                       ? `${speaking} speaking`
@@ -4093,6 +4187,15 @@ function ChannelSidebar({
             />
           ) : null}
         </ScrollArea>
+        {channelContextMenu ? (
+          <SharedContextMenu
+            ariaLabel={`${channelContextMenu.channel.name} channel actions`}
+            position={channelContextMenu}
+            items={channelContextMenuItems}
+            onClose={() => setChannelContextMenu(null)}
+            testId="channel-context-menu"
+          />
+        ) : null}
         <SidebarVoiceStatus
           joined={voiceJoined}
           channelName={
@@ -4430,18 +4533,28 @@ function SidebarButton({
   meta,
   ariaCurrent,
   onClick,
+  onContextMenu,
+  onKeyboardContextMenu,
 }: {
   children: React.ReactNode;
   active?: boolean;
   meta?: string;
   ariaCurrent?: React.AriaAttributes["aria-current"];
   onClick?: () => void;
+  onContextMenu?: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  onKeyboardContextMenu?: (point: ContextMenuPoint) => void;
 }) {
   return (
     <Button
       variant="ghost"
       aria-current={ariaCurrent}
       onClick={onClick}
+      onContextMenu={onContextMenu}
+      onKeyDown={(event) => {
+        if (!onKeyboardContextMenu || !isKeyboardContextMenu(event)) return;
+        event.preventDefault();
+        onKeyboardContextMenu(contextMenuPointFromElement(event.currentTarget));
+      }}
       className={cn(
         "mb-1 h-auto w-full justify-start whitespace-normal rounded-xl px-3 py-2 text-left text-sm text-[hsl(var(--muted-foreground))]",
         active && "bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]",
@@ -5312,51 +5425,137 @@ function GroupContextMenu({
   onCreateInvite: (groupId: string) => void;
   onOpenConfig: (groupId: string) => void;
 }) {
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => onClose();
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("click", close);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [menu, onClose]);
-
   if (!menu) return null;
   const group = groups.find((candidate) => candidate.group_id === menu.groupId);
   return (
+    <SharedContextMenu
+      ariaLabel={`${group?.name ?? "Group"} actions`}
+      position={menu}
+      onClose={onClose}
+      testId="group-context-menu"
+      items={[
+        {
+          id: "create-invite",
+          label: "Create invite",
+          icon: "🔗",
+          onSelect: () => onCreateInvite(menu.groupId),
+        },
+        {
+          id: "group-configuration",
+          label: "Group configuration",
+          icon: "⚙",
+          onSelect: () => onOpenConfig(menu.groupId),
+        },
+      ]}
+    />
+  );
+}
+
+function SharedContextMenu({
+  ariaLabel,
+  position,
+  items,
+  onClose,
+  testId,
+}: {
+  ariaLabel: string;
+  position: ContextMenuPoint;
+  items: SharedContextMenuItem[];
+  onClose: () => void;
+  testId?: string;
+}) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const clamped = clampContextMenuPoint(position);
+
+  useEffect(() => {
+    const firstEnabledItem = menuRef.current?.querySelector<HTMLButtonElement>(
+      'button[role="menuitem"]:not(:disabled)',
+    );
+    (firstEnabledItem ?? menuRef.current)?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) onClose();
+    };
+    const onResize = () => onClose();
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [onClose]);
+
+  function focusMenuItem(delta: number) {
+    const enabledItems = Array.from(
+      menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        'button[role="menuitem"]:not(:disabled)',
+      ) ?? [],
+    );
+    if (enabledItems.length === 0) return;
+    const currentIndex = enabledItems.findIndex(
+      (item) => item === document.activeElement,
+    );
+    const nextIndex =
+      currentIndex === -1
+        ? 0
+        : (currentIndex + delta + enabledItems.length) % enabledItems.length;
+    enabledItems[nextIndex]?.focus();
+  }
+
+  return (
     <div
+      ref={menuRef}
       role="menu"
-      aria-label={`${group?.name ?? "Group"} actions`}
-      className="fixed z-[60] min-w-56 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--popover)/0.98)] p-1 text-sm text-[hsl(var(--popover-foreground))] shadow-2xl shadow-black/40 animate-[discrypt-scale-in_120ms_ease-out]"
-      style={{ left: menu.x, top: menu.y }}
+      tabIndex={-1}
+      aria-label={ariaLabel}
+      data-testid={testId}
+      className="fixed z-[60] min-w-56 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--popover)/0.98)] p-1 text-sm text-[hsl(var(--popover-foreground))] shadow-2xl shadow-black/40 outline-none animate-[discrypt-scale-in_120ms_ease-out]"
+      style={{ left: clamped.x, top: clamped.y }}
       onClick={(event) => event.stopPropagation()}
       onContextMenu={(event) => event.preventDefault()}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          onClose();
+        }
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          focusMenuItem(1);
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          focusMenuItem(-1);
+        }
+      }}
     >
-      <Button
-        type="button"
-        variant="ghost"
-        role="menuitem"
-        className="flex h-auto w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]"
-        onClick={() => onCreateInvite(menu.groupId)}
-      >
-        <Icon>🔗</Icon>
-        Create invite
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        role="menuitem"
-        className="flex h-auto w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]"
-        onClick={() => onOpenConfig(menu.groupId)}
-      >
-        <Icon>⚙</Icon>
-        Group configuration
-      </Button>
+      {items.map((item) => (
+        <Button
+          key={item.id}
+          type="button"
+          variant="ghost"
+          role="menuitem"
+          disabled={item.disabled}
+          aria-disabled={item.disabled || undefined}
+          className={cn(
+            "flex h-auto w-full items-start justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]",
+            item.danger && "text-red-200 hover:text-red-100",
+          )}
+          onClick={() => {
+            if (item.disabled || !item.onSelect) return;
+            onClose();
+            item.onSelect();
+          }}
+        >
+          {item.icon ? <Icon className="mt-0.5">{item.icon}</Icon> : null}
+          <span className="grid min-w-0 gap-0.5">
+            <span>{item.label}</span>
+            {item.description ? (
+              <span className="text-xs leading-4 text-[hsl(var(--muted-foreground))]">
+                {item.description}
+              </span>
+            ) : null}
+          </span>
+        </Button>
+      ))}
     </div>
   );
 }
@@ -5389,19 +5588,6 @@ function MemberPanel({
     x: number;
     y: number;
   } | null>(null);
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMenu(null);
-    };
-    window.addEventListener("click", close);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [menu]);
 
   const sortedMembers = [...members].sort((left, right) => {
     const roleDelta = roleRank(left.role) - roleRank(right.role);
@@ -5494,7 +5680,11 @@ function MemberSection({
   title: string;
   members: GroupMemberView[];
   localRole: string;
-  onContextMenu: (menu: { member: GroupMemberView; x: number; y: number }) => void;
+  onContextMenu: (menu: {
+    member: GroupMemberView;
+    x: number;
+    y: number;
+  }) => void;
 }) {
   return (
     <section className="grid gap-2">
@@ -5513,11 +5703,6 @@ function MemberSection({
           <MemberRow
             key={member.member_id}
             member={member}
-            actionable={
-              canPromoteFromUi(localRole, member) ||
-              canDemoteFromUi(localRole, member) ||
-              canRevokeFromUi(localRole, member)
-            }
             onContextMenu={onContextMenu}
           />
         ))
@@ -5528,23 +5713,33 @@ function MemberSection({
 
 function MemberRow({
   member,
-  actionable,
   onContextMenu,
 }: {
   member: GroupMemberView;
-  actionable: boolean;
-  onContextMenu: (menu: { member: GroupMemberView; x: number; y: number }) => void;
+  onContextMenu: (menu: {
+    member: GroupMemberView;
+    x: number;
+    y: number;
+  }) => void;
 }) {
   const online = isPresenceOnline(member);
   const status = member.status === "revoked" ? "revoked" : online ? "online" : "offline";
   return (
     <div
       className="group flex min-w-0 items-center gap-3 rounded-xl px-2 py-2 text-sm hover:bg-[hsl(var(--accent)/0.58)]"
+      tabIndex={0}
+      aria-label={`${member.display_name} member`}
       onContextMenu={(event) => {
         event.preventDefault();
-        if (actionable) onContextMenu({ member, x: event.clientX, y: event.clientY });
+        onContextMenu({ member, x: event.clientX, y: event.clientY });
       }}
-      title={actionable ? "Right-click for member actions" : `${member.role} · ${status}`}
+      onKeyDown={(event) => {
+        if (!isKeyboardContextMenu(event)) return;
+        event.preventDefault();
+        const point = contextMenuPointFromElement(event.currentTarget);
+        onContextMenu({ member, ...point });
+      }}
+      title="Right-click for member actions"
     >
       <Avatar className="h-8 w-8">
         <AvatarFallback>{member.display_name.slice(0, 2).toUpperCase()}</AvatarFallback>
@@ -5587,47 +5782,57 @@ function MemberContextMenu({
 }) {
   if (!menu) return null;
   const { member } = menu;
-  const actions = [
+  const actions: SharedContextMenuItem[] = [
     canPromoteFromUi(localRole, member)
-      ? { id: `promote:${member.member_id}`, label: "Make staff", run: () => onPromote(member) }
+      ? {
+          id: `promote:${member.member_id}`,
+          label: "Make staff",
+          icon: "↑",
+          onSelect: () => onPromote(member),
+        }
       : null,
     canDemoteFromUi(localRole, member)
-      ? { id: `demote:${member.member_id}`, label: "Demote to member", run: () => onDemote(member) }
+      ? {
+          id: `demote:${member.member_id}`,
+          label: "Demote to member",
+          icon: "↓",
+          onSelect: () => onDemote(member),
+        }
       : null,
     canRevokeFromUi(localRole, member)
-      ? { id: `revoke:${member.member_id}`, label: "Revoke access", run: () => onRevoke(member), danger: true }
+      ? {
+          id: `revoke:${member.member_id}`,
+          label: "Revoke access",
+          icon: "×",
+          onSelect: () => onRevoke(member),
+          danger: true,
+        }
       : null,
-  ].filter(Boolean) as Array<{ id: string; label: string; run: () => void; danger?: boolean }>;
-  if (actions.length === 0) return null;
+  ].filter(Boolean) as SharedContextMenuItem[];
+  const items =
+    actions.length > 0
+      ? actions.map((action) => ({
+          ...action,
+          disabled: actionInFlight === action.id,
+        }))
+      : [
+          {
+            id: "member-authority",
+            label: "No member actions available",
+            icon: "ⓘ",
+            description:
+              "Role changes require backend-governed owner or staff authority.",
+            disabled: true,
+          },
+        ];
   return (
-    <div
-      role="menu"
-      aria-label={`${member.display_name} member actions`}
-      className="fixed z-[60] min-w-56 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--popover)/0.98)] p-1 text-sm text-[hsl(var(--popover-foreground))] shadow-2xl shadow-black/40 animate-[discrypt-scale-in_120ms_ease-out]"
-      style={{ left: menu.x, top: menu.y }}
-      onClick={(event) => event.stopPropagation()}
-      onContextMenu={(event) => event.preventDefault()}
-    >
-      {actions.map((action) => (
-        <Button
-          key={action.id}
-          type="button"
-          variant="ghost"
-          role="menuitem"
-          disabled={actionInFlight === action.id}
-          className={cn(
-            "flex h-auto w-full items-center justify-start gap-2 rounded-lg px-3 py-2 text-left hover:bg-[hsl(var(--accent))]",
-            action.danger && "text-red-200 hover:text-red-100",
-          )}
-          onClick={() => {
-            onClose();
-            action.run();
-          }}
-        >
-          {action.label}
-        </Button>
-      ))}
-    </div>
+    <SharedContextMenu
+      ariaLabel={`${member.display_name} member actions`}
+      position={menu}
+      items={items}
+      onClose={onClose}
+      testId="member-context-menu"
+    />
   );
 }
 
