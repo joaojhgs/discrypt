@@ -25,6 +25,7 @@ rust-version = "1.89"
 [workspace.dependencies]
 anyhow = "1"
 aes-gcm = "0.10"
+argon2 = "0.5"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"

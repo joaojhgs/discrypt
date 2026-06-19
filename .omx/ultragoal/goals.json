@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-19T11:13:24.279Z",
+  "updatedAt": "2026-06-19T16:37:07.887Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -411,6 +411,17 @@
       "updatedAt": "2026-06-19T11:13:24.279Z",
       "evidence": "PER-20/P2-T08 implemented: backend and UI reject refused/revoked, expired, and max-used invite/admission paths before state promotion; added Rust regression coverage and focused Playwright fallback coverage. Verification: cargo fmt --check PASS; npm --prefix apps/ui run typecheck PASS; git diff --check PASS; env PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers npm --prefix apps/ui run test:e2e -- --grep 'expired revoked and max-used invites fail clearly' PASS; RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t08 cargo test -p discrypt-desktop refused_admission_request_is_retained_without_member_promotion -- --test-threads=1 compiled through source and failed only at final ld ENOSPC.",
       "completedAt": "2026-06-19T11:13:24.279Z"
+    },
+    {
+      "id": "G037-per-21-p2-t09-invite-password-pake-d",
+      "title": "PER-21/P2-T09 invite password PAKE decision",
+      "objective": "Implement PER-21/P2-T09 by shipping an Argon2id memory-hard online admission-helper password gate with rate-limit/brute-force tests, rejecting offline verifiers, documenting the OPAQUE/PAKE roadmap, and preserving final AuthorizedWelcome/OpenMLS admission requirements.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-19T16:31:53.456Z",
+      "updatedAt": "2026-06-19T16:37:07.887Z",
+      "evidence": "PER-21/P2-T09 implemented: OnlineAdmissionHelper now stores Argon2id PHC password hashes, attempts remain per-subject rate-limited with uniform PasswordRejected failures, offline verifiers remain rejected, final admission still requires AuthorizedWelcome/OpenMLS Welcome evidence, and docs/release/p2-t09-invite-password-pake-decision-2026-06-19.md records the security decision and OPAQUE/PAKE roadmap. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t09 cargo test -p discrypt-admission; RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; git diff --check. Independent code-review subagent lanes unavailable in this runtime; not self-approved.",
+      "completedAt": "2026-06-19T16:37:07.887Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",

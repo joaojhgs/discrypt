@@ -7,6 +7,10 @@
 //! feature matching the claimed runtime capability.
 
 pub mod production_status;
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use chrono::{DateTime, Utc};
 use discrypt_transport::{IceEndpointPolicy, IceServerConfig};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -49,6 +53,7 @@ impl AdmissionPasswordDecision {
         self.selected_protocol == AdmissionPasswordProtocol::OnlineAuthorizedHelper
             && self.no_offline_verifier.contains("OfflineVerifierRejected")
             && self.rate_limit_proof.contains("OnlineAdmissionHelper")
+            && self.rate_limit_proof.contains("Argon2id")
             && self.rate_limit_proof.contains("max_attempts")
             && self.final_admission_gate.contains("AuthorizedWelcome")
             && self.final_admission_gate.contains("MLS Welcome/add")
@@ -65,7 +70,7 @@ pub fn admission_password_decision() -> AdmissionPasswordDecision {
     AdmissionPasswordDecision {
         selected_protocol: AdmissionPasswordProtocol::OnlineAuthorizedHelper,
         no_offline_verifier: "PasswordGate::OfflineVerifier is rejected with InviteError::OfflineVerifierRejected; invite descriptors carry no offline-copyable verifier material.",
-        rate_limit_proof: "OnlineAdmissionHelper stores a private password commitment server-side, counts attempts per subject with max_attempts, and returns the same PasswordRejected error for wrong password and over-limit cases.",
+        rate_limit_proof: "OnlineAdmissionHelper stores a private Argon2id password hash server-side, counts attempts per subject with max_attempts, and returns the same PasswordRejected error for wrong password and over-limit cases.",
         final_admission_gate: "AdmissionController requires a valid AuthorizedHelperProof or PAKE result plus exact AuthorizedWelcome MLS Welcome/add authorization before invite consumption.",
         ux_error_states: &[
             "password_rejected",
@@ -1510,7 +1515,7 @@ impl AuthorizedHelperProof {
 #[derive(Clone, Debug)]
 pub struct OnlineAdmissionHelper {
     helper_id: String,
-    password_commitment: [u8; 32],
+    password_hash: String,
     signing_key: SigningKey,
     max_attempts: u32,
     proof_ttl_seconds: i64,
@@ -1527,9 +1532,14 @@ impl OnlineAdmissionHelper {
         max_attempts: u32,
         proof_ttl_seconds: i64,
     ) -> Self {
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = Argon2::default()
+            .hash_password(password_secret, &salt)
+            .map(|hash| hash.to_string())
+            .unwrap_or_else(|_| "$argon2id$unavailable$admission-helper-disabled".to_owned());
         Self {
             helper_id: helper_id.into(),
-            password_commitment: password_secret_commitment(password_secret),
+            password_hash,
             signing_key,
             max_attempts: max_attempts.max(1),
             proof_ttl_seconds: proof_ttl_seconds.max(1),
@@ -1559,9 +1569,7 @@ impl OnlineAdmissionHelper {
         let subject = subject.into();
         let attempts = self.attempts_by_subject.entry(subject.clone()).or_default();
         *attempts = attempts.saturating_add(1);
-        if *attempts > self.max_attempts
-            || password_secret_commitment(password_attempt) != self.password_commitment
-        {
+        if *attempts > self.max_attempts || !self.verify_password(password_attempt) {
             return Err(InviteError::PasswordRejected);
         }
         Ok(AuthorizedHelperProof::sign(
@@ -1572,9 +1580,19 @@ impl OnlineAdmissionHelper {
             &self.signing_key,
         ))
     }
+
+    fn verify_password(&self, password_attempt: &[u8]) -> bool {
+        let Ok(parsed_hash) = PasswordHash::new(&self.password_hash) else {
+            return false;
+        };
+        Argon2::default()
+            .verify_password(password_attempt, &parsed_hash)
+            .is_ok()
+    }
 }
 
-/// Domain-separated password commitment held by the online helper only.
+/// Domain-separated password policy commitment. This is not a verifier and is
+/// never sufficient for admission password verification.
 #[must_use]
 pub fn password_secret_commitment(password_secret: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1942,6 +1960,25 @@ mod tests {
             helper.authorize("mallory", b"correct horse", now),
             Err(InviteError::PasswordRejected)
         );
+    }
+
+    #[test]
+    fn online_helper_uses_memory_hard_hash_without_password_leakage() {
+        let now = Utc::now();
+        let raw_password = b"raw invite password";
+        let helper_key = SigningKey::generate(&mut OsRng);
+        let mut helper = OnlineAdmissionHelper::new("helper-a", raw_password, helper_key, 2, 60);
+
+        assert!(helper.password_hash.starts_with("$argon2id$"));
+        assert!(!helper.password_hash.contains("raw invite password"));
+        assert!(!format!("{helper:?}").contains("raw invite password"));
+        assert_ne!(
+            helper.password_hash,
+            hex::encode(password_secret_commitment(raw_password))
+        );
+
+        let proof = helper.authorize("alice-device", raw_password, now);
+        assert!(proof.is_ok());
     }
 
     #[test]
