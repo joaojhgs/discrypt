@@ -59,6 +59,13 @@ test("command failures log console errors and render dismissible notifications",
       ),
     )
     .toBe(true);
+  const loggedCommandError = commandErrors.find((entry) =>
+    entry.includes("[discrypt:command-error]"),
+  );
+  expect(loggedCommandError).toBe(
+    "[discrypt:command-error] command_error_reported",
+  );
+  expect(loggedCommandError).not.toContain("create_channel backend unavailable");
 
   await page.waitForTimeout(1_200);
   await expect(alert).toBeVisible();
