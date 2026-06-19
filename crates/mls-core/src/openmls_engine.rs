@@ -874,12 +874,25 @@ mod tests {
             bob.join_from_welcome("room-welcome", bob_package.signer_public_key(), welcome)?;
         assert_eq!(joined.epoch, added.state.epoch);
         assert_eq!(joined.confirmation_tag, added.state.confirmation_tag);
+        let alice_export = alice.export_secret("room-welcome", "discrypt/v1/text", b"room", 32)?;
+        let bob_export = bob.export_secret("room-welcome", "discrypt/v1/text", b"room", 32)?;
+        assert_eq!(bob_export, alice_export);
+        drop(bob);
+
+        let mut reloaded_bob = OpenMlsGroupEngine::open(&bob_path)?;
+        let reloaded_joined =
+            reloaded_bob.load_group("room-welcome", bob_package.signer_public_key())?;
+        assert_eq!(reloaded_joined.epoch, added.state.epoch);
         assert_eq!(
-            bob.export_secret("room-welcome", "discrypt/v1/text", b"room", 32)?,
-            alice.export_secret("room-welcome", "discrypt/v1/text", b"room", 32)?
+            reloaded_joined.confirmation_tag,
+            added.state.confirmation_tag
+        );
+        assert_eq!(
+            reloaded_bob.export_secret("room-welcome", "discrypt/v1/text", b"room", 32)?,
+            alice_export
         );
 
-        let charlie_package = bob.generate_member_package(b"charlie")?;
+        let charlie_package = reloaded_bob.generate_member_package(b"charlie")?;
         let charlie = alice.add_member_package("room-welcome", &charlie_package)?;
         let mut tampered = charlie.welcome.ok_or_else(|| {
             OpenMlsGroupError::OpenMls("OpenMLS add did not produce Charlie welcome".to_owned())
@@ -887,7 +900,7 @@ mod tests {
         if let Some(last) = tampered.last_mut() {
             *last ^= 0x01;
         }
-        assert!(bob
+        assert!(reloaded_bob
             .join_from_welcome(
                 "room-welcome",
                 charlie_package.signer_public_key(),

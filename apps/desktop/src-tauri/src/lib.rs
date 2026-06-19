@@ -19523,6 +19523,30 @@ mod tests {
             "Bob admission frame should be the fire-and-forget key package"
         );
         reload_global_app_service_from_path(&bob_path);
+        let bob_pre_approval_send = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id.clone()),
+                channel_id: Some(channel_id.clone()),
+            },
+            body: "g007 must wait for owner approval".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let bob_pre_approval_error = bob_pre_approval_send
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| {
+                "pending invite joiner send should fail before owner approval".to_owned()
+            })?;
+        assert_eq!(bob_pre_approval_error.code, "admission_pending");
+        assert!(
+            load_state_from_path(&bob_path).openmls_groups.is_empty(),
+            "invite parsing and key-package queuing must not create Bob's OpenMLS group handle"
+        );
+
+        reload_global_app_service_from_path(&bob_path);
         let admission_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
             TauriAppService::load_for_test_path(alice_path.clone()),
         ));
@@ -19643,6 +19667,23 @@ mod tests {
             .any(|member| member.status != "pending"));
 
         reload_global_app_service_from_path(&bob_path);
+        let bob_reloaded_after_welcome = load_state();
+        let bob_openmls_handle = bob_reloaded_after_welcome
+            .openmls_groups
+            .iter()
+            .find(|handle| handle.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "Bob OpenMLS handle missing after reload".to_owned())?;
+        let mut bob_engine =
+            OpenMlsGroupEngine::open(openmls_store_path_for_app_state_path(&bob_path))
+                .map_err(|error| format!("Bob OpenMLS provider reopen failed: {error}"))?;
+        bob_engine
+            .load_group(
+                &group_id,
+                &hex::decode(&bob_openmls_handle.signer_public_key_hex)
+                    .map_err(|error| format!("Bob signer handle was not hex: {error}"))?,
+            )
+            .map_err(|error| format!("Bob OpenMLS group reload failed: {error}"))?;
         let sent = send_message(SendMessageRequest {
             target: MessageTargetView {
                 kind: "channel".to_owned(),
