@@ -4,7 +4,7 @@ Issue: PER-30.
 
 ## Verdict
 
-Implemented a release-bound configured TURN proof path for the existing env-gated public MQTT provider-signaled WebRTC DataChannel test.
+Implemented a release-bound configured TURN proof path. The live CI artifact is produced by Chromium native `RTCPeerConnection` with `iceTransportPolicy: "relay"` against coturn, because the current Rust `webrtc` 0.20.0-alpha.1 Sans-I/O gatherer does not generate TURN relay candidates.
 
 This is transport harness evidence. It is not production-ready installed-app evidence, not OpenMLS admission proof, not overlay proof, and not physical voice/media proof.
 
@@ -14,6 +14,8 @@ This is transport harness evidence. It is not production-ready installed-app evi
 - The test still requires explicit `DISCRYPT_PUBLIC_TURN_E2E=1`, `DISCRYPT_PUBLIC_TURN_ENDPOINT`, `DISCRYPT_PUBLIC_TURN_USERNAME`, and `DISCRYPT_PUBLIC_TURN_CREDENTIAL`.
 - On live success it asserts both peers opened the WebRTC DataChannel, both peers have configured TURN servers, both peers report TURN fallback readiness, both sides observed relay candidate evidence, and opaque text/control request plus opaque receipt round-tripped.
 - On live success it writes a redacted JSON artifact to `target/e2e/per-30-configured-turn-proof/public-turn-relay-only.json` unless `DISCRYPT_PUBLIC_TURN_ARTIFACT_PATH` overrides it.
+- `scripts/per30-browser-turn-proof.mjs` performs the branch CI live proof through Chromium WebRTC and writes the same redacted artifact schema.
+- The Rust cargo harness remains skip-safe locally when credentials are absent. When forced with credentials against the current Rust dependency, relay candidate gathering is blocked by the dependency and must not be counted as a product TURN success.
 
 ## Provider Boundary
 
@@ -38,7 +40,7 @@ The artifact does not contain raw TURN endpoint, username, credential, SDP, ICE 
 CI live coturn proof on branch `multica/P3-T09-configured-turn-proof`:
 
 - `.github/workflows/ci.yml` runs `PER-30 configured TURN proof` only for this task branch.
-- The job starts loopback coturn with static CI-only credentials, sets `DISCRYPT_PUBLIC_TURN_E2E=1`, runs the relay-only WebRTC DataChannel proof, runs the static artifact redaction gate, and uploads `per30-configured-turn-proof-<run>-<attempt>`.
+- The job starts loopback coturn with run-scoped CI-only credentials, sets `DISCRYPT_PUBLIC_TURN_E2E=1`, runs `scripts/per30-browser-turn-proof.mjs`, runs the Rust cargo harness in skip-safe mode, runs the static artifact redaction gate, and uploads `per30-configured-turn-proof-<run>-<attempt>`.
 - The uploaded directory contains the redacted artifact at `public-turn-relay-only.json` plus `coturn.log`.
 
 Static and skip-safe checks:
@@ -49,6 +51,7 @@ Static and skip-safe checks:
 
 Credentialed live proof when TURN credentials are available:
 
+- `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<redacted> DISCRYPT_PUBLIC_TURN_USERNAME=<redacted> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<redacted> node scripts/per30-browser-turn-proof.mjs`
 - `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<redacted> DISCRYPT_PUBLIC_TURN_USERNAME=<redacted> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<redacted> RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture`
 
 Retained live artifact path:
@@ -57,6 +60,11 @@ Retained live artifact path:
 
 If credentials are not present, this task provides code/static evidence and an honest skipped live gate. It does not claim configured TURN has been proven in the local runtime without that artifact.
 
+Known Rust transport dependency blocker:
+
+- `webrtc` 0.20.0-alpha.1 passes `RTCIceTransportPolicy::Relay` into configuration, but its Sans-I/O `RTCIceGatherer` currently gathers host candidates and STUN server-reflexive candidates only; TURN client support is not implemented in that gatherer.
+- Until Discrypt patches or replaces that dependency path, the browser coturn artifact is valid live WebRTC/TURN evidence but not proof that the Rust text/control transport stack can gather TURN relay candidates.
+
 ## Remaining Verification
 
-Before promoting this release row to verified, run the credentialed live proof against coturn or an approved public TURN service and attach the redacted JSON artifact from `target/e2e/per-30-configured-turn-proof/`.
+Before promoting the Rust transport row to fully verified, patch or replace the Rust WebRTC dependency path and rerun the credentialed Rust cargo proof against coturn or an approved public TURN service. The browser artifact verifies live configured TURN relay-only WebRTC behavior and artifact redaction.

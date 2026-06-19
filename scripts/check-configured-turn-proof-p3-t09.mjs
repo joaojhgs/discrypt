@@ -60,9 +60,22 @@ for (const token of [
 requireText("apps/ui/package.json", "test:p3-t09-configured-turn-proof");
 
 for (const token of [
+  "RTCPeerConnection",
+  "iceTransportPolicy: \"relay\"",
+  "offerer_relay_candidates",
+  "answerer_relay_candidates",
+  "selected_candidate_pairs",
+  "not Rust webrtc dependency TURN-gathering support",
+]) {
+  requireText("scripts/per30-browser-turn-proof.mjs", token);
+}
+
+for (const token of [
   "per30-configured-turn-proof",
   "PER-30 configured TURN proof",
   "turnserver -c",
+  "playwright install --with-deps chromium",
+  "scripts/per30-browser-turn-proof.mjs",
   "DISCRYPT_PUBLIC_TURN_E2E: \"1\"",
   "DISCRYPT_PUBLIC_TURN_ARTIFACT_PATH",
   "actions/upload-artifact@v4",
@@ -103,6 +116,18 @@ if (existsSync(artifactPath)) {
   }
   if (artifact.route_policy?.direct_candidates_allowed !== false) {
     failures.push(`${artifactPath}: direct_candidates_allowed must be false`);
+  }
+  if (artifact.route_evidence?.offerer_relay_candidates < 1) {
+    failures.push(`${artifactPath}: offerer relay candidate count must be positive`);
+  }
+  if (artifact.route_evidence?.answerer_relay_candidates < 1) {
+    failures.push(`${artifactPath}: answerer relay candidate count must be positive`);
+  }
+  if (artifact.route_evidence?.text_control_frame_roundtrip !== true) {
+    failures.push(`${artifactPath}: text/control frame roundtrip must be true`);
+  }
+  if (artifact.route_evidence?.receipt_frame_roundtrip !== true) {
+    failures.push(`${artifactPath}: receipt frame roundtrip must be true`);
   }
   if (artifact.turn_credentials?.username_redacted !== true) {
     failures.push(`${artifactPath}: TURN username must be marked redacted`);

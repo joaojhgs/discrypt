@@ -397,9 +397,9 @@ jobs:
     env:
       DISCRYPT_PUBLIC_MQTT_ENDPOINT: mqtts://broker.emqx.io:8883
       DISCRYPT_PUBLIC_TURN_E2E: "1"
-      DISCRYPT_PUBLIC_TURN_ENDPOINT: turn:127.0.0.1:3478
+      DISCRYPT_PUBLIC_TURN_ENDPOINT: turn:127.0.0.1:3478?transport=udp
       DISCRYPT_PUBLIC_TURN_USERNAME: discrypt-ci
-      DISCRYPT_PUBLIC_TURN_CREDENTIAL: discrypt-ci-turn-secret
+      DISCRYPT_PUBLIC_TURN_CREDENTIAL: discrypt-ci-turn-${{ github.run_id }}-${{ github.run_attempt }}
       DISCRYPT_PUBLIC_TURN_ARTIFACT_PATH: target/e2e/per-30-configured-turn-proof/public-turn-relay-only.json
     steps:
       - uses: actions/checkout@v4
@@ -419,7 +419,7 @@ jobs:
           fingerprint
           lt-cred-mech
           realm=discrypt-ci.local
-          user=discrypt-ci:discrypt-ci-turn-secret
+          user=${DISCRYPT_PUBLIC_TURN_USERNAME}:${DISCRYPT_PUBLIC_TURN_CREDENTIAL}
           no-cli
           no-tcp
           no-tls
@@ -432,9 +432,19 @@ jobs:
           echo "$!" > "${RUNNER_TEMP}/discrypt-coturn.pid"
           sleep 3
           ps -p "$(cat "${RUNNER_TEMP}/discrypt-coturn.pid")"
-      - name: Run configured TURN relay-only proof
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+      - name: Install browser proof dependencies
         run: |
-          cargo test -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture
+          npm ci --prefix apps/ui
+          npm --prefix apps/ui exec playwright install --with-deps chromium
+      - name: Run configured TURN relay-only browser proof
+        run: |
+          node scripts/per30-browser-turn-proof.mjs
+          DISCRYPT_PUBLIC_TURN_E2E=0 cargo test -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture
           node scripts/check-configured-turn-proof-p3-t09.mjs
       - name: Capture coturn log
         if: always()
