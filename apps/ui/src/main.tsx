@@ -4763,6 +4763,7 @@ function WorkspaceOverlay({
     <Dialog>
       <DialogPortal>
         <div
+          data-state={closing ? "closed" : "open"}
           className={cn(
             "fixed inset-0 z-50 grid bg-black/55 p-3 backdrop-blur-sm md:p-6",
             closing
@@ -4771,6 +4772,7 @@ function WorkspaceOverlay({
           )}
         >
           <DialogOverlay
+            data-state={closing ? "closed" : "open"}
             className="fixed inset-0"
             aria-hidden="true"
             onClick={onClose}
@@ -4780,6 +4782,8 @@ function WorkspaceOverlay({
             aria-modal="true"
             aria-labelledby={titleId}
             aria-describedby={descriptionId}
+            data-state={closing ? "closed" : "open"}
+            onEscapeKeyDown={onClose}
             className={cn(
               "relative z-10 max-h-[calc(100dvh-1.5rem)] w-full overflow-y-auto border-[hsl(var(--border)/0.9)] bg-[hsl(var(--popover)/0.96)] p-0 shadow-2xl shadow-black/45 md:max-h-[calc(100dvh-3rem)]",
               copy.align === "side"
