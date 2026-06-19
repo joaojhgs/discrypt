@@ -1655,6 +1655,7 @@ function App() {
     activeDm?.connectivity ??
     appState.connectivity_defaults;
   const groupLabel = activeGroup?.name ?? "Local profile";
+  const topBarScopeLabel = workflow === "dm" ? "Direct messages" : groupLabel;
   const activePane = activePaneSummary(
     workflow,
     groupLabel,
@@ -2611,6 +2612,7 @@ function App() {
       <ServerRail
         groups={appState.groups}
         dms={appState.dms}
+        workflow={workflow}
         activeGroup={activeGroup}
         activeDm={activeDm}
         themeLabel={activeTheme.label}
@@ -2667,12 +2669,14 @@ function App() {
         className="flex h-full min-h-0 min-w-0 flex-col bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)]"
       >
         <TopBar
-          groupLabel={groupLabel}
+          groupLabel={topBarScopeLabel}
           activeTitle={activePane.title}
           activeSubtitle={activePane.subtitle}
           membersPanelOpen={membersPanelOpen}
           onToggleMembers={() => setMembersPanelOpen((open) => !open)}
-          membersPanelAvailable={workflow !== "setup" && hasActiveGroup}
+          membersPanelAvailable={
+            workflow !== "setup" && workflow !== "dm" && hasActiveGroup
+          }
           onOpenDiagnostics={() => {
             setInspectorOpen(true);
             setActiveOverlay("diagnostics");
@@ -3674,6 +3678,7 @@ function FirstRunPanel({
 function ServerRail({
   groups,
   dms,
+  workflow,
   activeGroup,
   activeDm,
   themeLabel,
@@ -3685,6 +3690,7 @@ function ServerRail({
 }: {
   groups: GroupView[];
   dms: DirectConversationView[];
+  workflow: Workflow;
   activeGroup: GroupView | null;
   activeDm: DirectConversationView | null;
   themeLabel: string;
@@ -3717,62 +3723,74 @@ function ServerRail({
                 channels: [],
               },
             ]
-        ).map((group) => (
-          <Button
-            key={group.group_id}
-            variant="outline"
-            size="icon"
-            title={`${group.name} · right-click for group actions`}
-            aria-label={`Open ${group.name} group`}
-            onClick={() => onSelectGroup(group.group_id)}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              if (group.group_id !== "local") {
-                onGroupContextMenu(
-                  group.group_id,
-                  event.clientX,
-                  event.clientY,
-                );
-              }
-            }}
-            onKeyDown={(event) => {
-              if (!isKeyboardContextMenu(event) || group.group_id === "local") {
-                return;
-              }
-              event.preventDefault();
-              const point = contextMenuPointFromElement(event.currentTarget);
-              onGroupContextMenu(group.group_id, point.x, point.y);
-            }}
-            disabled={group.group_id === "local"}
-            className={cn(
-              "h-11 w-11 shrink-0 rounded-2xl text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5 disabled:cursor-default disabled:opacity-70 disabled:hover:translate-y-0",
-              group.group_id === activeGroup?.group_id
-                ? "border-[hsl(var(--primary)/0.65)] bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]"
-                : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
-            )}
-          >
-            {group.name.slice(0, 2).toUpperCase()}
-          </Button>
-        ))}
+        ).map((group) => {
+          const active =
+            workflow !== "dm" && group.group_id === activeGroup?.group_id;
+          return (
+            <Button
+              key={group.group_id}
+              variant="outline"
+              size="icon"
+              title={`${group.name} · right-click for group actions`}
+              aria-label={`Open ${group.name} group`}
+              aria-current={active ? "page" : undefined}
+              onClick={() => onSelectGroup(group.group_id)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                if (group.group_id !== "local") {
+                  onGroupContextMenu(
+                    group.group_id,
+                    event.clientX,
+                    event.clientY,
+                  );
+                }
+              }}
+              onKeyDown={(event) => {
+                if (
+                  !isKeyboardContextMenu(event) ||
+                  group.group_id === "local"
+                ) {
+                  return;
+                }
+                event.preventDefault();
+                const point = contextMenuPointFromElement(event.currentTarget);
+                onGroupContextMenu(group.group_id, point.x, point.y);
+              }}
+              disabled={group.group_id === "local"}
+              className={cn(
+                "h-11 w-11 shrink-0 rounded-2xl text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5 disabled:cursor-default disabled:opacity-70 disabled:hover:translate-y-0",
+                active
+                  ? "border-[hsl(var(--primary)/0.65)] bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]"
+                  : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
+              )}
+            >
+              {group.name.slice(0, 2).toUpperCase()}
+            </Button>
+          );
+        })}
         {dms.length ? <div className="h-px w-9 rounded-full bg-[hsl(var(--border))]" /> : null}
-        {dms.map((dm) => (
-          <Button
-            key={dm.dm_id}
-            variant="outline"
-            size="icon"
-            title={dm.display_name}
-            aria-label={`Open ${dm.display_name} direct message`}
-            onClick={() => onSelectDm(dm.dm_id)}
-            className={cn(
-              "h-11 w-11 shrink-0 rounded-full text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5",
-              dm.dm_id === activeDm?.dm_id
-                ? "border-[hsl(var(--primary)/0.65)] bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]"
-                : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
-            )}
-          >
-            {dm.display_name.slice(0, 2).toUpperCase()}
-          </Button>
-        ))}
+        {dms.map((dm) => {
+          const active = workflow === "dm" && dm.dm_id === activeDm?.dm_id;
+          return (
+            <Button
+              key={dm.dm_id}
+              variant="outline"
+              size="icon"
+              title={dm.display_name}
+              aria-label={`Open ${dm.display_name} direct message`}
+              aria-current={active ? "page" : undefined}
+              onClick={() => onSelectDm(dm.dm_id)}
+              className={cn(
+                "h-11 w-11 shrink-0 rounded-full text-xs font-bold shadow-sm shadow-black/20 transition-transform hover:-translate-y-0.5",
+                active
+                  ? "border-[hsl(var(--primary)/0.65)] bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]"
+                  : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]",
+              )}
+            >
+              {dm.display_name.slice(0, 2).toUpperCase()}
+            </Button>
+          );
+        })}
       </div>
       <Button
         type="button"
