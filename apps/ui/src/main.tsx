@@ -146,6 +146,7 @@ type CommandNotification = {
   title: string;
   message: string;
   createdAt: string;
+  loggedToConsole: boolean;
 };
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 10_000;
@@ -1086,14 +1087,21 @@ function App() {
     eventCursorRef.current = cursor;
   }
 
-  function reportCommandError(message: string, title = "Command error") {
+  function reportCommandError(
+    message: string,
+    title = "Command error",
+    loggedToConsole = true,
+  ) {
     const notification: CommandNotification = {
       id: `command-error-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       title,
       message,
       createdAt: new Date().toLocaleTimeString(),
+      loggedToConsole,
     };
-    logSanitizedCommandError();
+    if (loggedToConsole) {
+      logSanitizedCommandError();
+    }
     setCommandError(message);
     setCommandNotifications((current) => [notification, ...current].slice(0, 6));
   }
@@ -1341,11 +1349,15 @@ function App() {
       setCommandState(nextState);
       if (nextState.last_command_error) {
         const action = commandErrorToAction(nextState.last_command_error);
+        const expectedInviteDenial =
+          nextState.last_command_error.command === "join_group" &&
+          nextState.last_command_error.code.startsWith("invite_");
         reportCommandError(
           action
             ? `${nextState.last_command_error.message} — ${action}`
             : nextState.last_command_error.message,
           nextState.last_command_error.command,
+          !expectedInviteDenial,
         );
       }
       success?.(nextState);
@@ -2595,6 +2607,7 @@ function App() {
         commandError={storageCommandError}
         onCreate={createCommandUser}
         onRecover={recoverCommandUser}
+        allowEmptyRecovery={appState.runtime_mode.mode !== "native"}
       />
     );
   }
@@ -2695,6 +2708,11 @@ function App() {
               <SetupPanel
                 onCreateGroup={() => setActiveOverlay("create-group")}
                 onJoinInvite={openLauncherOverlay}
+                verifyMessage={verifyMessage}
+                onVerifySafetyNumber={confirmSafetyNumber}
+                authorizedDeviceCount={appState.devices.filter(
+                  (device) => device.authorized,
+                ).length}
               />
             ) : workflow === "dm" ? (
               <DmPanel
@@ -2957,6 +2975,7 @@ function App() {
               }
               onSaveDm={activeDm ? () => saveConnectivityPolicy("dm") : null}
             />
+            <ConfigLogsExportPanel appState={appState} />
           </div>
         ) : null}
         {activeOverlay === "diagnostics" ? (
@@ -3394,6 +3413,7 @@ function FirstRunPanel({
   commandError,
   onCreate,
   onRecover,
+  allowEmptyRecovery,
 }: {
   themeStyle: React.CSSProperties;
   storage: AppState["storage_security"];
@@ -3412,6 +3432,7 @@ function FirstRunPanel({
   commandError: string | null;
   onCreate: () => void | Promise<void>;
   onRecover: () => void | Promise<void>;
+  allowEmptyRecovery: boolean;
 }) {
   const storageSetupRequired = storage.status !== "ready";
   const vaultSelected = selectedStorageMode === "passphrase_vault";
@@ -3421,6 +3442,12 @@ function FirstRunPanel({
     !storageSetupRequired ||
     selectedStorageMode === "keyring" ||
     (vaultSelected && passwordLongEnough && passwordsMatch);
+  const recoveryReadyForSubmit =
+    storageReadyForSubmit &&
+    (allowEmptyRecovery ||
+      Boolean(
+        displayName.trim() && deviceName.trim() && recoveryCode.trim(),
+      ));
   const passwordMessage = !vaultSelected
     ? null
     : !passwordLongEnough
@@ -3659,12 +3686,7 @@ function FirstRunPanel({
                   variant="outline"
                   className="mt-auto w-full"
                   onClick={onRecover}
-                  disabled={
-                    !displayName.trim() ||
-                    !deviceName.trim() ||
-                    !recoveryCode.trim() ||
-                    !storageReadyForSubmit
-                  }
+                  disabled={!recoveryReadyForSubmit}
                 >
                   Recover existing user
                 </Button>
@@ -3808,7 +3830,7 @@ function ServerRail({
         type="button"
         variant="outline"
         onClick={onOpenSettings}
-        aria-label="Open rail configuration"
+        aria-label="Open app configuration"
         className="grid h-10 w-10 place-items-center rounded-xl border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
         title={themeLabel}
       >
@@ -4527,7 +4549,10 @@ function CommandNotificationStack({
                 {notification.message}
               </p>
               <p className="mt-2 text-[11px] uppercase tracking-[0.14em] text-[hsl(var(--muted-foreground))]">
-                Logged to console · {notification.createdAt}
+                {notification.loggedToConsole
+                  ? "Logged to console"
+                  : "Handled in app"}{" "}
+                · {notification.createdAt}
               </p>
             </div>
             <Button
@@ -4745,7 +4770,7 @@ function overlayCopy(overlay: OverlayKind | null): {
       return {
         title: "Config",
         description:
-          "Manage theme, audio devices, volume, signaling, and ICE policy.",
+          "Manage theme, audio devices, volume, signaling, ICE policy, and diagnostic exports.",
         align: "side",
       };
     case "diagnostics":
@@ -4960,6 +4985,69 @@ function AudioSettingsPanel({
             <Slider aria-label="App output volume" value={[appOutputVolume]} min={0} max={100} step={1} onValueChange={(value) => onAppOutputVolumeChange(value[0] ?? 100)} />
           </label>
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
+  const [exportStatus, setExportStatus] = useState<string>("");
+  const copyDiagnostics = async () => {
+    try {
+      const log = await exportDiagnosticsLog();
+      await navigator.clipboard?.writeText(log);
+      setExportStatus("Diagnostic log copied to clipboard.");
+    } catch (error) {
+      logSanitizedCommandError();
+      setExportStatus(
+        error instanceof Error
+          ? `Diagnostics export failed: ${error.message}`
+          : "Diagnostics export failed.",
+      );
+    }
+  };
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle>Logs and export</CardTitle>
+            <CardDescription>
+              Export runtime diagnostics from the app command boundary for support and release checks.
+            </CardDescription>
+          </div>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={copyDiagnostics}
+            aria-label="Copy diagnostic log"
+          >
+            Copy diagnostic log
+          </Button>
+        </div>
+        {exportStatus ? (
+          <p className="text-xs text-[hsl(var(--muted-foreground))]">
+            {exportStatus}
+          </p>
+        ) : null}
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-3">
+        <InfoRow
+          title="Runtime"
+          copy={
+            appState.runtime_mode.mode === "native"
+              ? "Native Tauri commands"
+              : "Web runtime export"
+          }
+        />
+        <InfoRow
+          title="Events"
+          copy={`${appState.events.length} event${appState.events.length === 1 ? "" : "s"} available`}
+        />
+        <InfoRow
+          title="Transport proof"
+          copy={appState.transport_diagnostics.route_proof_status}
+        />
       </CardContent>
     </Card>
   );
@@ -5318,10 +5406,17 @@ function MobileWorkflowNav({
 function SetupPanel({
   onCreateGroup,
   onJoinInvite,
+  verifyMessage,
+  onVerifySafetyNumber,
+  authorizedDeviceCount,
 }: {
   onCreateGroup: () => void;
   onJoinInvite: () => void;
+  verifyMessage: string | null;
+  onVerifySafetyNumber: () => void;
+  authorizedDeviceCount: number;
 }) {
+  const verified = Boolean(verifyMessage);
   return (
     <div className="grid h-full min-h-0 place-items-center px-2 py-8">
       <Card className="w-full max-w-lg border-[hsl(var(--border)/0.9)] bg-[hsl(var(--card)/0.88)] shadow-xl shadow-black/20">
@@ -5335,8 +5430,36 @@ function SetupPanel({
           <CardDescription className="mx-auto max-w-sm text-sm leading-6">
             Create a group or open an invite to begin.
           </CardDescription>
+          {authorizedDeviceCount > 1 ? (
+            <p className="mx-auto max-w-sm text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+              {authorizedDeviceCount} authorized local devices available.
+            </p>
+          ) : null}
         </CardHeader>
         <CardContent className="grid gap-3 sm:grid-cols-2">
+          <div className="rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)] p-3 sm:col-span-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold">Contact safety</p>
+                <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                  {verified
+                    ? "Current safety number verified by command state."
+                    : "Verify the current contact safety number before sharing invites."}
+                </p>
+              </div>
+              <Badge variant={verified ? "success" : "secondary"}>
+                {verified ? "4/4" : "3/4"}
+              </Badge>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              className="mt-3 w-full justify-center"
+              onClick={onVerifySafetyNumber}
+            >
+              Mark as verified
+            </Button>
+          </div>
           <Button className="justify-center" onClick={onCreateGroup}>
             <Icon>+</Icon>Create group
           </Button>
@@ -6481,10 +6604,10 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <CardTitle className="text-base text-emerald-50">
-              Invite ready
+              Latest invite descriptor
             </CardTitle>
             <CardDescription className="text-emerald-50/75">
-              Share this link with the person joining this group.
+              Invite ready. Share this link with the person joining this group.
             </CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -6495,6 +6618,12 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
           </div>
         </div>
         <div className="grid gap-2 rounded-xl border border-emerald-300/20 bg-black/20 p-3">
+          <code
+            data-testid="invite-link-text"
+            className="block break-all rounded-lg border border-emerald-300/15 bg-black/20 p-2 font-mono text-xs leading-5 text-emerald-50/90"
+          >
+            {invite.code}
+          </code>
           <textarea
             readOnly
             value={invite.code}
@@ -6533,6 +6662,16 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             value={invite.endpoint_policy || "unknown"}
           />
           <InviteFact
+            label="Trust fingerprint"
+            value={invite.signaling_trust_fingerprint}
+            mono
+          />
+          <InviteFact
+            label="Room secret commitment"
+            value={invite.room_secret_hash}
+            mono
+          />
+          <InviteFact
             label="Expires"
             value={invite.expires_at || invite.expires || "not provided"}
           />
@@ -6554,6 +6693,14 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
           <InviteFact
             label="STUN/TURN"
             value={`${invite.ice_stun_servers.length} STUN · ${invite.ice_turn_servers.length} TURN`}
+          />
+          <InviteFact
+            label="TURN metadata"
+            value={
+              invite.ice_turn_servers.length > 0
+                ? `${invite.ice_turn_servers.length} redacted TURN endpoint${invite.ice_turn_servers.length === 1 ? "" : "s"}`
+                : "No TURN endpoints included"
+            }
           />
         </div>
       </CardContent>
