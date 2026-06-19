@@ -1,6 +1,34 @@
+import type { CSSProperties } from "react";
+
 export type ThemeId = "midnight-steel" | "graphite-calm" | "ocean-contrast";
 export type TemplateId = "command-center" | "compact-ops";
 export type CssVariableMap = Record<`--${string}`, string>;
+export const DEFAULT_THEME_ID: ThemeId = "graphite-calm";
+
+export const shadcnThemeTokenNames = [
+  "--background",
+  "--foreground",
+  "--card",
+  "--card-foreground",
+  "--popover",
+  "--popover-foreground",
+  "--primary",
+  "--primary-foreground",
+  "--secondary",
+  "--secondary-foreground",
+  "--muted",
+  "--muted-foreground",
+  "--accent",
+  "--accent-foreground",
+  "--destructive",
+  "--destructive-foreground",
+  "--border",
+  "--input",
+  "--ring",
+] as const;
+
+export type ShadcnThemeTokenName = (typeof shadcnThemeTokenNames)[number];
+export type ShadcnThemeCssVariables = Record<ShadcnThemeTokenName, string>;
 
 export type ShadcnComponentInventoryItem = {
   name: string;
@@ -14,7 +42,7 @@ export type ThemeDefinition = {
   id: ThemeId;
   label: string;
   description: string;
-  cssVars: CssVariableMap;
+  cssVars: ShadcnThemeCssVariables;
 };
 
 export type TemplateDefinition = {
@@ -143,7 +171,7 @@ export const shadcnComponentInventory = [
 ] as const satisfies readonly ShadcnComponentInventoryItem[];
 
 export const discryptUiConfig = {
-  activeTheme: "graphite-calm" as ThemeId,
+  activeTheme: DEFAULT_THEME_ID,
   activeTemplate: "command-center" as TemplateId,
   productName: "discrypt",
   accentIntent: "one calm cyan/steel accent; no neon/purple gradients",
@@ -260,6 +288,24 @@ export const discryptUiConfig = {
   ] satisfies TemplateDefinition[],
   shadcnComponentInventory,
 };
+
+export function getThemeDefinition(themeId: string): ThemeDefinition {
+  return (
+    discryptUiConfig.themes.find((theme) => theme.id === themeId) ??
+    discryptUiConfig.themes.find((theme) => theme.id === DEFAULT_THEME_ID) ??
+    discryptUiConfig.themes[0]
+  );
+}
+
+export function createThemeStyle(
+  theme: ThemeDefinition,
+  extraVars: CssVariableMap = {},
+): CSSProperties & CssVariableMap {
+  return {
+    ...theme.cssVars,
+    ...extraVars,
+  } as CSSProperties & CssVariableMap;
+}
 
 export const setupChecklist = [
   "Verify contact safety number",

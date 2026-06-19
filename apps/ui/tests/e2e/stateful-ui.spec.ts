@@ -1,4 +1,9 @@
 import { expect, test } from "playwright/test";
+import {
+  DEFAULT_THEME_ID,
+  discryptUiConfig,
+  shadcnThemeTokenNames,
+} from "../../src/app-config";
 
 const FIRST_RUN_STORAGE_E2E_KEY = "discrypt:e2e:first-run-storage-setup";
 
@@ -218,6 +223,69 @@ async function expectMainLayoutStable(page) {
   expect(boxes?.scrollHeight ?? 0).toBeGreaterThan(boxes?.scrollClientHeight ?? 0);
 }
 
+function themeById(themeId: string) {
+  const theme = discryptUiConfig.themes.find((candidate) => candidate.id === themeId);
+  expect(theme, `theme ${themeId} is registered`).toBeTruthy();
+  return theme!;
+}
+
+async function expectShellThemeTokens(page, themeId: string) {
+  const expectedTheme = themeById(themeId);
+  await expect(page.getByTestId("app-shell")).toHaveAttribute("data-theme", themeId);
+  const actualVars = await page.getByTestId("app-shell").evaluate(
+    (element, tokenNames) => {
+      const style = window.getComputedStyle(element);
+      return Object.fromEntries(
+        tokenNames.map((tokenName) => [
+          tokenName,
+          style.getPropertyValue(tokenName).trim(),
+        ]),
+      );
+    },
+    shadcnThemeTokenNames,
+  );
+  expect(actualVars).toEqual(expectedTheme.cssVars);
+}
+
+async function expectPrimitiveColorsFollowTokens(page) {
+  const colors = await page.evaluate(() => {
+    const shell = document.querySelector('[data-testid="app-shell"]');
+    const homeMark = document.querySelector('[title="discrypt home"]');
+    const addButton = document.querySelector(
+      'button[aria-label="Add group or direct message"]',
+    );
+
+    function resolveTokenColor(tokenName: string, property: "backgroundColor" | "color") {
+      const probe = document.createElement("div");
+      probe.style[property] = `hsl(var(${tokenName}))`;
+      (shell ?? document.body).appendChild(probe);
+      const color = window.getComputedStyle(probe)[property];
+      probe.remove();
+      return color;
+    }
+
+    return {
+      shellBackground: shell ? window.getComputedStyle(shell).backgroundColor : "",
+      expectedBackground: resolveTokenColor("--background", "backgroundColor"),
+      shellColor: shell ? window.getComputedStyle(shell).color : "",
+      expectedForeground: resolveTokenColor("--foreground", "color"),
+      homeBackground: homeMark
+        ? window.getComputedStyle(homeMark).backgroundColor
+        : "",
+      expectedPrimary: resolveTokenColor("--primary", "backgroundColor"),
+      addButtonBorder: addButton
+        ? window.getComputedStyle(addButton).borderTopColor
+        : "",
+    };
+  });
+
+  expect(colors.shellBackground).toBe(colors.expectedBackground);
+  expect(colors.shellColor).toBe(colors.expectedForeground);
+  expect(colors.homeBackground).toBe(colors.expectedPrimary);
+  expect(colors.addButtonBorder).not.toBe("");
+  expect(colors.addButtonBorder).not.toBe("rgba(0, 0, 0, 0)");
+}
+
 async function expectStorageLayoutStable(page) {
   await expect(page.getByTestId("first-run-storage")).toBeVisible();
   await expect(page.getByTestId("first-run-account-forms")).toBeVisible();
@@ -421,6 +489,36 @@ test("main chat layout keeps document fixed and message list scrollable at requi
       path: testInfo.outputPath(`main-layout-${viewport.name}.png`),
     });
   }
+});
+
+test("theme tokens default dark and drive shadcn shell surfaces", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expectShellThemeTokens(page, DEFAULT_THEME_ID);
+  await expectPrimitiveColorsFollowTokens(page);
+
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("theme-default-dark-desktop.png"),
+  });
+
+  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
+  const configDialog = page.getByRole("dialog", { name: "Config" });
+  await expect(configDialog.getByRole("heading", { name: "Appearance" })).toBeVisible();
+  await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
+  await expect(configDialog.getByLabel("Theme")).toHaveValue("ocean-contrast");
+  await expectShellThemeTokens(page, "ocean-contrast");
+  await expectPrimitiveColorsFollowTokens(page);
+  await page.getByRole("button", { name: /Close Config/i }).click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectShellThemeTokens(page, "ocean-contrast");
+  await expectNoDocumentHorizontalOverflow(page);
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("theme-ocean-contrast-narrow.png"),
+  });
 });
 
 test("message rows use compact Discord-like status tooltips", async ({
