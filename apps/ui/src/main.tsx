@@ -104,6 +104,7 @@ import { Select, SelectItem } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import "./styles.css";
 
@@ -7097,6 +7098,16 @@ function messageStateIcon(stateKey: string): string {
   return "✓";
 }
 
+function messageStateTone(stateKey: string): string {
+  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey))
+    return "border-[hsl(var(--destructive)/0.58)] bg-[hsl(var(--destructive)/0.12)] text-[hsl(var(--destructive-foreground))]";
+  if (["pending", "locked", "transport_probe_unavailable"].includes(stateKey))
+    return "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.58)] text-[hsl(var(--muted-foreground))]";
+  if (stateKey === "peer_receipt")
+    return "border-[hsl(var(--primary)/0.5)] bg-[hsl(var(--primary)/0.12)] text-[hsl(var(--accent-foreground))]";
+  return "border-[hsl(var(--primary)/0.42)] bg-[hsl(var(--primary)/0.08)] text-[hsl(var(--accent-foreground))]";
+}
+
 function MessageRow({
   message,
   diagnosticsEnabled,
@@ -7106,7 +7117,11 @@ function MessageRow({
 }) {
   const statusTitle = `${message.state_label}: ${message.state_detail || message.status}`;
   return (
-    <article className="group grid grid-cols-[2.25rem_minmax(0,1fr)_auto] gap-3 px-4 py-2.5 hover:bg-[hsl(var(--secondary)/0.32)]">
+    <article
+      data-testid="message-row"
+      data-message-state={message.state_key}
+      className="group grid grid-cols-[2.25rem_minmax(0,1fr)_auto] gap-3 px-4 py-2.5 transition-colors hover:bg-[hsl(var(--secondary)/0.32)]"
+    >
       <Avatar className="mt-0.5 h-9 w-9">
         <AvatarFallback>{message.author.slice(0, 2).toUpperCase()}</AvatarFallback>
       </Avatar>
@@ -7120,13 +7135,23 @@ function MessageRow({
           <p className="mt-1 text-[11px] leading-5 text-[hsl(var(--muted-foreground))]">{message.state_detail}</p>
         ) : null}
       </div>
-      <span
-        className="mt-1 grid h-7 w-7 place-items-center rounded-full border border-[hsl(var(--border))] text-xs text-[hsl(var(--muted-foreground))] opacity-70 transition-opacity group-hover:opacity-100"
-        title={statusTitle}
-        aria-label={statusTitle}
-      >
-        {messageStateIcon(message.state_key)}
-      </span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            data-testid="message-delivery-status"
+            className={cn(
+              "mt-1 grid h-7 w-7 place-items-center rounded-full border text-xs font-semibold opacity-75 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--card))] group-hover:opacity-100",
+              messageStateTone(message.state_key),
+            )}
+            aria-label={statusTitle}
+          >
+            {messageStateIcon(message.state_key)}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="left">{statusTitle}</TooltipContent>
+      </Tooltip>
     </article>
   );
 }

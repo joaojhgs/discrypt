@@ -423,6 +423,72 @@ test("main chat layout keeps document fixed and message list scrollable at requi
   }
 });
 
+test("message rows use compact Discord-like status tooltips", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Message Polish Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Message" }).fill("polished local message row");
+  await page.getByRole("button", { name: /^Send message$/ }).click();
+
+  const row = page.getByTestId("message-row").filter({
+    hasText: "polished local message row",
+  });
+  await expect(row).toHaveCount(1);
+  await expect(row).toHaveAttribute("data-message-state", "sent_local");
+  const rowLayout = await row.evaluate((element) => {
+    const rowStyle = window.getComputedStyle(element);
+    const messageText = Array.from(element.querySelectorAll("p")).find((node) =>
+      node.textContent?.includes("polished local message row"),
+    );
+    const textStyle = messageText ? window.getComputedStyle(messageText) : null;
+    return {
+      display: rowStyle.display,
+      gridTemplateColumns: rowStyle.gridTemplateColumns,
+      textBorderRadius: textStyle?.borderRadius ?? "",
+      textBackground: textStyle?.backgroundColor ?? "",
+      textPaddingLeft: textStyle?.paddingLeft ?? "",
+    };
+  });
+  expect(rowLayout.display).toBe("grid");
+  expect(rowLayout.gridTemplateColumns.split(" ").length).toBe(3);
+  expect(rowLayout.textBorderRadius).toBe("0px");
+  expect(rowLayout.textBackground).toBe("rgba(0, 0, 0, 0)");
+  expect(rowLayout.textPaddingLeft).toBe("0px");
+
+  const status = row.getByTestId("message-delivery-status");
+  await expect(status).toHaveAccessibleName(
+    /Sent locally: Message is in the local encrypted author log; peer receipt requires backend-state proof/i,
+  );
+  await expect(status).toHaveText("✓");
+  await status.hover();
+  await expect(row.getByRole("tooltip")).toBeVisible();
+  await expect(row.getByRole("tooltip")).toContainText("Sent locally");
+  await expect(row.getByRole("tooltip")).toContainText("peer receipt requires backend-state proof");
+
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("message-row-tooltip-desktop.png"),
+  });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(row).toBeVisible();
+  await status.focus();
+  await expect(row.getByRole("tooltip")).toBeVisible();
+  await expectNoDocumentHorizontalOverflow(page);
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("message-row-tooltip-mobile.png"),
+  });
+});
+
 test("direct message send stays command-backed", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
