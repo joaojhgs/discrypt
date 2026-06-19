@@ -421,6 +421,7 @@ jobs:
           realm=discrypt-ci.local
           user=discrypt-ci:discrypt-ci-turn-secret
           no-cli
+          no-tcp
           no-tls
           no-dtls
           allow-loopback-peers
