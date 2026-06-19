@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-19T06:53:51.845Z",
+  "updatedAt": "2026-06-19T08:18:01.816Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -390,6 +390,16 @@
       "createdAt": "2026-06-19T06:53:51.845Z",
       "updatedAt": "2026-06-19T06:53:51.845Z",
       "evidence": "Plan .omx/plans/P2-T06-approval-welcome-persistence-2026-06-19.md; tests passing for mls-core Welcome persistence and desktop admission gating."
+    },
+    {
+      "id": "G035-per-19-automatic-admission-mode",
+      "title": "PER-19 automatic admission mode",
+      "objective": "Implement P2-T07 automatic admission mode so new requests auto-approve only with online owner/staff evidence, old manual requests remain pending, and targeted multi-profile tests pass.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-19T08:18:01.816Z",
+      "updatedAt": "2026-06-19T08:18:01.816Z",
+      "evidence": "Plan: .omx/plans/P2-T07-automatic-admission-mode-2026-06-19.md; tests passed with CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07: g007_automatic_admission_requires_authorized_owner_or_staff_online and g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests; git diff --check passed."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",

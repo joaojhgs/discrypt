@@ -8170,6 +8170,47 @@ impl PersistedAppState {
         }
     }
 
+    fn local_online_admission_authority(&self, group_id: &str) -> Result<String, String> {
+        let local_member_id = self.local_user_id();
+        let now = Utc::now();
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "Group does not exist".to_owned())?;
+        let member = group
+            .members
+            .iter()
+            .find(|member| member.member_id == local_member_id)
+            .ok_or_else(|| "Local member is not in this group roster".to_owned())?;
+        if !member.role.can_manage_members() {
+            return Err("Only owner or staff can auto-approve admission requests".to_owned());
+        }
+        if matches!(member.status.as_str(), "pending" | "revoked") {
+            return Err(
+                "Pending or revoked members cannot auto-approve admission requests".to_owned(),
+            );
+        }
+        if member.status != "online" {
+            return Err(
+                "Automatic admission requires an online owner or staff heartbeat".to_owned(),
+            );
+        }
+        let expires_at = member
+            .presence_expires_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|expires| expires.with_timezone(&Utc))
+            .ok_or_else(|| {
+                "Automatic admission requires a non-expired owner/staff presence heartbeat"
+                    .to_owned()
+            })?;
+        if expires_at <= now {
+            return Err("Automatic admission owner/staff presence heartbeat expired".to_owned());
+        }
+        Ok(local_member_id)
+    }
+
     fn upsert_pending_group_admission_request(
         &mut self,
         group_id: &str,
@@ -10818,13 +10859,44 @@ impl PersistedAppState {
                     }
                     None
                 } else {
-                    match self.openmls_admission_welcome_from_frame(
+                    let request_id = match self.upsert_pending_group_admission_request(
                         &group_id,
                         &member_identity,
                         &signer_public_key_hex,
                         &key_package,
                     ) {
-                        Ok(frame) => Some(frame),
+                        Ok(request_id) => request_id,
+                        Err(error) => {
+                            self.push_command_error(
+                                "group.admission_request_rejected",
+                                "handle_text_control_frame",
+                                "admission_request_persist_failed",
+                                error,
+                                "Persist the pending request before any owner/staff approval can issue a Welcome",
+                            );
+                            return None;
+                        }
+                    };
+                    let decided_by = match self.local_online_admission_authority(&group_id) {
+                        Ok(member_id) => member_id,
+                        Err(error) => {
+                            self.push_event(
+                                "group.admission_request_pending",
+                                format!(
+                                    "Automatic admission deferred for {}: {error}",
+                                    redacted_observable_ref("group", &group_id)
+                                ),
+                            );
+                            return None;
+                        }
+                    };
+                    let welcome = match self.openmls_admission_welcome_from_frame(
+                        &group_id,
+                        &member_identity,
+                        &signer_public_key_hex,
+                        &key_package,
+                    ) {
+                        Ok(frame) => frame,
                         Err(error) => {
                             self.push_command_error(
                                 "mls.admission_rejected",
@@ -10833,9 +10905,38 @@ impl PersistedAppState {
                                 error,
                                 "Only admit joiners when the owner has persisted OpenMLS group state",
                             );
-                            None
+                            return None;
                         }
+                    };
+                    let decided_at = Utc::now().to_rfc3339();
+                    if let Err(error) = self.mark_group_admission_decision(
+                        &group_id,
+                        &request_id,
+                        true,
+                        &decided_by,
+                        &decided_at,
+                        Some(
+                            "Automatically approved while an authorized owner/staff member was online"
+                                .to_owned(),
+                        ),
+                    ) {
+                        self.push_command_error(
+                            "group.admission_decision_rejected",
+                            "handle_text_control_frame",
+                            "admission_request_update_failed",
+                            error,
+                            "Retry automatic admission after refreshing pending requests",
+                        );
+                        return None;
                     }
+                    self.push_event(
+                        "group.admission_request_auto_approved",
+                        format!(
+                            "Automatically approved admission request {}",
+                            redacted_observable_ref("request", &request_id)
+                        ),
+                    );
+                    Some(welcome)
                 }
             }
             TextControlFrameView::GroupAdmissionDecision {
@@ -19698,6 +19799,232 @@ mod tests {
         assert!(
             sent.last_command_error.is_none(),
             "approved invite join must not fail with missing OpenMLS state: {sent:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn g007_automatic_admission_requires_authorized_owner_or_staff_online() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("g007-auto-admission-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Auto".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created_group = create_group(CreateGroupRequest {
+            name: "G007 Auto Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::AutomaticWhenAuthorizedOnline),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(
+            created_group.last_command_error.is_none(),
+            "{created_group:?}"
+        );
+        let group = created_group.groups[0].clone();
+        let group_id = group.group_id.clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "automatic group text channel missing".to_owned())?;
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        assert!(
+            invite_state.last_command_error.is_none(),
+            "{invite_state:?}"
+        );
+        let invite = invite_state
+            .invites
+            .last()
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "automatic admission invite missing".to_owned())?;
+
+        let (bob_path, _) = join_group_invite_as_test_profile_with_optional_name(
+            "g007-auto-admission-bob",
+            "Bob Auto",
+            "Bob laptop",
+            invite.clone(),
+            None,
+        )?;
+        let bob_member_identity = load_state_from_path(&bob_path)
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "Bob profile id missing".to_owned())?;
+        reload_global_app_service_from_path(&bob_path);
+        let offline_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(alice_path.clone()),
+        ));
+        let offline_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g007-auto-admission-offline-owner".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(
+            offline_session.last_command_error.is_none(),
+            "{offline_session:?}"
+        );
+        let offline_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "Bob admission transport session missing".to_owned())?;
+        attach_text_control_transport_runtime_for_test(
+            offline_receiver.clone(),
+            offline_session_id,
+        );
+        let offline_report =
+            pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(250),
+            });
+        assert!(
+            offline_report.failures.is_empty(),
+            "offline automatic admission should defer without transport failures: {:?}",
+            offline_report.failures
+        );
+        assert_eq!(offline_report.frames_sent, 1);
+        assert_eq!(
+            offline_report.response_frames_received, 0,
+            "automatic mode must not return a Welcome until owner/staff presence is online"
+        );
+        clear_text_control_transport_runtime_for_test();
+        let alice_after_offline_request = load_state_from_path(&alice_path);
+        let offline_request = alice_after_offline_request
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|request| request.member_identity == bob_member_identity)
+            })
+            .ok_or_else(|| "offline automatic request was not persisted pending".to_owned())?;
+        assert_eq!(offline_request.status, "pending");
+        assert_eq!(
+            offline_request.admission_mode_at_request,
+            Some(GroupAdmissionModeView::AutomaticWhenAuthorizedOnline)
+        );
+        assert!(
+            load_state_from_path(&bob_path).openmls_groups.is_empty(),
+            "offline automatic admission must not install a joiner OpenMLS handle"
+        );
+
+        reload_global_app_service_from_path(&alice_path);
+        let present = publish_group_presence(PublishGroupPresenceRequest {
+            group_id: group_id.clone(),
+            member_id: None,
+            ttl_seconds: Some(300),
+        });
+        assert!(present.last_command_error.is_none(), "{present:?}");
+        assert_eq!(present.groups[0].members[0].status, "online");
+        assert!(present.groups[0].members[0].presence_expires_at.is_some());
+
+        let (charlie_path, _) = join_group_invite_as_test_profile_with_optional_name(
+            "g007-auto-admission-charlie",
+            "Charlie Auto",
+            "Charlie laptop",
+            invite,
+            None,
+        )?;
+        let charlie_member_identity = load_state_from_path(&charlie_path)
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "Charlie profile id missing".to_owned())?;
+        reload_global_app_service_from_path(&charlie_path);
+        let online_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(alice_path.clone()),
+        ));
+        let online_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g007-auto-admission-online-owner".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(
+            online_session.last_command_error.is_none(),
+            "{online_session:?}"
+        );
+        let online_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "Charlie admission transport session missing".to_owned())?;
+        attach_text_control_transport_runtime_for_test(online_receiver, online_session_id);
+        let online_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(8),
+            operation_timeout_ms: Some(250),
+        });
+        assert!(
+            online_report.failures.is_empty(),
+            "online automatic admission should return a Welcome without transport failures: {:?}",
+            online_report.failures
+        );
+        assert_eq!(online_report.frames_sent, 1);
+        assert_eq!(online_report.response_frames_received, 1);
+        clear_text_control_transport_runtime_for_test();
+
+        let alice_after_online_request = load_state_from_path(&alice_path);
+        let group_after_online = alice_after_online_request
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "Alice automatic group missing after online request".to_owned())?;
+        let old_manual_or_offline_request = group_after_online
+            .admission_requests
+            .iter()
+            .find(|request| request.member_identity == bob_member_identity)
+            .ok_or_else(|| "Bob pending request missing after Charlie auto-approval".to_owned())?;
+        assert_eq!(
+            old_manual_or_offline_request.status, "pending",
+            "requests received before owner/staff online proof must remain pending"
+        );
+        let approved_request = group_after_online
+            .admission_requests
+            .iter()
+            .find(|request| request.member_identity == charlie_member_identity)
+            .ok_or_else(|| "Charlie automatic request missing".to_owned())?;
+        assert_eq!(approved_request.status, "approved");
+        assert_eq!(
+            approved_request.admission_mode_at_request,
+            Some(GroupAdmissionModeView::AutomaticWhenAuthorizedOnline)
+        );
+
+        let charlie_after_welcome = load_state_from_path(&charlie_path);
+        assert!(
+            charlie_after_welcome
+                .openmls_groups
+                .iter()
+                .any(|handle| handle.group_id == group_id),
+            "online automatic approval must persist Charlie's OpenMLS group handle"
+        );
+        reload_global_app_service_from_path(&charlie_path);
+        let sent = send_message(SendMessageRequest {
+            target: MessageTargetView {
+                kind: "channel".to_owned(),
+                dm_id: None,
+                group_id: Some(group_id),
+                channel_id: Some(channel_id),
+            },
+            body: "g007 protected text after automatic approval".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(
+            sent.last_command_error.is_none(),
+            "auto-approved invite join must have real OpenMLS state before protected text: {sent:?}"
         );
         Ok(())
     }
