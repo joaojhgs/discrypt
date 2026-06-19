@@ -4563,6 +4563,16 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             .find(|invite| invite.code == invite_code)
             .cloned()
         {
+            if let Err(failure) = validate_local_invite_usable(&invite, Utc::now()) {
+                state.push_command_error(
+                    "invite.rejected",
+                    "join_group",
+                    failure.code,
+                    failure.message,
+                    failure.recovery_hint,
+                );
+                return;
+            }
             let group_name = state
                 .groups
                 .iter()
@@ -4585,6 +4595,18 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             return;
         }
         let parsed_invite = parse_invite_metadata(&invite_code);
+        if let Some(parsed) = parsed_invite.as_ref() {
+            if let Err(failure) = validate_parsed_invite_usable(parsed, Utc::now()) {
+                state.push_command_error(
+                    "invite.rejected",
+                    "join_group",
+                    failure.code,
+                    failure.message,
+                    failure.recovery_hint,
+                );
+                return;
+            }
+        }
         let name = invite_group_name_from_metadata(
             &invite_code,
             request.group_name.clone(),
@@ -6029,6 +6051,31 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
             );
             return;
         };
+        if let Some(local_invite) = state
+            .invites
+            .iter()
+            .find(|invite| invite.code == invite_code)
+        {
+            if let Err(failure) = validate_local_invite_usable(local_invite, Utc::now()) {
+                state.push_command_error(
+                    "invite.rejected",
+                    "accept_dm_invite",
+                    failure.code,
+                    failure.message,
+                    failure.recovery_hint,
+                );
+                return;
+            }
+        } else if let Err(failure) = validate_parsed_invite_usable(&parsed, Utc::now()) {
+            state.push_command_error(
+                "invite.rejected",
+                "accept_dm_invite",
+                failure.code,
+                failure.message,
+                failure.recovery_hint,
+            );
+            return;
+        }
         if parsed.connectivity.invite_kind != InviteKind::DmContact.canonical_name() {
             state.push_command_error(
                 "invite.rejected",
@@ -14159,6 +14206,79 @@ fn parse_max_uses(label: &str) -> u32 {
         .unwrap_or(5)
 }
 
+struct InviteUseFailure {
+    code: &'static str,
+    message: &'static str,
+    recovery_hint: &'static str,
+}
+
+fn invite_max_uses_from_label(label: &str) -> u32 {
+    parse_max_uses(label)
+}
+
+fn validate_local_invite_usable(
+    invite: &InviteView,
+    now: DateTime<Utc>,
+) -> Result<(), InviteUseFailure> {
+    if invite.revoked {
+        return Err(InviteUseFailure {
+            code: "invite_revoked",
+            message: "Invite was revoked before admission could proceed",
+            recovery_hint: "Request a fresh invite from an owner or staff member",
+        });
+    }
+    if DateTime::parse_from_rfc3339(&invite.expires_at)
+        .map(|expires_at| now > expires_at.with_timezone(&Utc))
+        .unwrap_or(false)
+    {
+        return Err(InviteUseFailure {
+            code: "invite_expired",
+            message: "Invite expired before admission could proceed",
+            recovery_hint: "Request a fresh invite from an owner or staff member",
+        });
+    }
+    let max_uses = invite_max_uses_from_label(&invite.max_use);
+    if invite.uses >= max_uses {
+        return Err(InviteUseFailure {
+            code: "invite_max_uses_exhausted",
+            message: "Invite maximum use count has already been reached",
+            recovery_hint: "Request a fresh invite with available uses",
+        });
+    }
+    Ok(())
+}
+
+fn validate_parsed_invite_usable(
+    invite: &ParsedInviteMetadata,
+    now: DateTime<Utc>,
+) -> Result<(), InviteUseFailure> {
+    if invite.revoked {
+        return Err(InviteUseFailure {
+            code: "invite_revoked",
+            message: "Invite was revoked before admission could proceed",
+            recovery_hint: "Request a fresh invite from an owner or staff member",
+        });
+    }
+    if DateTime::parse_from_rfc3339(&invite.expires_at)
+        .map(|expires_at| now > expires_at.with_timezone(&Utc))
+        .unwrap_or(false)
+    {
+        return Err(InviteUseFailure {
+            code: "invite_expired",
+            message: "Invite expired before admission could proceed",
+            recovery_hint: "Request a fresh invite from an owner or staff member",
+        });
+    }
+    if invite.consumed_uses >= invite.max_uses {
+        return Err(InviteUseFailure {
+            code: "invite_max_uses_exhausted",
+            message: "Invite maximum use count has already been reached",
+            recovery_hint: "Request a fresh invite with available uses",
+        });
+    }
+    Ok(())
+}
+
 fn default_signaling_endpoint() -> String {
     let configured = std::env::var("EXTERNAL_SIGNALING_PUBLIC_ENDPOINT")
         .ok()
@@ -16230,6 +16350,8 @@ struct ParsedInviteMetadata {
     password_policy: Option<InvitePasswordPolicy>,
     expires_at: String,
     max_uses: u32,
+    consumed_uses: u32,
+    revoked: bool,
 }
 
 fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
@@ -16249,6 +16371,8 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         .to_owned();
         let ice_stun_servers = ice_stun_server_views(&ice_config);
         let ice_turn_servers = ice_turn_server_views(&ice_config);
+        let consumed_uses = descriptor.consumed_uses;
+        let revoked = descriptor.revoked();
         let connectivity = descriptor
             .bootstrap_metadata
             .as_ref()
@@ -16282,6 +16406,8 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             password_policy: descriptor.password_policy,
             expires_at: descriptor.expires_at.to_rfc3339(),
             max_uses: descriptor.max_uses,
+            consumed_uses,
+            revoked,
         });
     }
     let endpoint = query_value(query, "endpoint")
@@ -16344,6 +16470,8 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         password_policy: None,
         expires_at,
         max_uses,
+        consumed_uses: 0,
+        revoked: false,
     })
 }
 
@@ -19074,6 +19202,144 @@ mod tests {
     }
 
     #[test]
+    fn local_refused_expired_and_max_used_group_invites_fail_without_state_promotion() {
+        struct InviteFailureCase {
+            label: &'static str,
+            expected_code: &'static str,
+            mutate: fn(&mut InviteView),
+        }
+
+        let cases = [
+            InviteFailureCase {
+                label: "revoked",
+                expected_code: "invite_revoked",
+                mutate: |invite| invite.revoked = true,
+            },
+            InviteFailureCase {
+                label: "expired",
+                expected_code: "invite_expired",
+                mutate: |invite| {
+                    invite.expires_at = "2000-01-01T00:00:00Z".to_owned();
+                },
+            },
+            InviteFailureCase {
+                label: "max-used",
+                expected_code: "invite_max_uses_exhausted",
+                mutate: |invite| {
+                    invite.max_use = "1 use".to_owned();
+                    invite.uses = 1;
+                },
+            },
+        ];
+
+        for case in cases {
+            let _guard = test_lock();
+            let _path = reset_with_temp_state(&format!("invite-fail-{}", case.label));
+            create_user(CreateUserRequest {
+                display_name: "Alice".to_owned(),
+                device_name: None,
+            });
+            let source_group = create_group(CreateGroupRequest {
+                name: format!("Source {}", case.label),
+                retention: "24 hours".to_owned(),
+                admission_mode: None,
+                adapter_kind: None,
+                signaling_endpoint: None,
+                ice_stun_servers: None,
+                ice_turn_servers: None,
+            });
+            let source_group_id = source_group.groups[0].group_id.clone();
+            let invite_state = create_invite(CreateInviteRequest {
+                group_id: Some(source_group_id.clone()),
+                expires: "1 day".to_owned(),
+                max_use: "1 use".to_owned(),
+                password_gate: None,
+            });
+            let invite_code = invite_state.invites[0].code.clone();
+            let anchor_group = create_group(CreateGroupRequest {
+                name: format!("Anchor {}", case.label),
+                retention: "24 hours".to_owned(),
+                admission_mode: None,
+                adapter_kind: None,
+                signaling_endpoint: None,
+                ice_stun_servers: None,
+                ice_turn_servers: None,
+            });
+            let anchor_group_id = anchor_group.groups[1].group_id.clone();
+            mutate_app_service(|state| {
+                let invite = state
+                    .invites
+                    .iter_mut()
+                    .find(|invite| invite.code == invite_code)
+                    .expect("invite row should exist");
+                (case.mutate)(invite);
+            });
+            let before = load_state().to_view();
+
+            let rejected = join_group(JoinGroupRequest {
+                invite_code: invite_code.clone(),
+                group_name: Some(format!("Rejected {}", case.label)),
+            });
+
+            assert_eq!(
+                rejected
+                    .last_command_error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some(case.expected_code),
+                "{} invite should fail with a clear command error",
+                case.label
+            );
+            assert_eq!(rejected.groups.len(), before.groups.len());
+            assert_eq!(
+                rejected
+                    .active_context
+                    .as_ref()
+                    .and_then(|context| context.group_id.as_deref()),
+                Some(anchor_group_id.as_str()),
+                "{} invite must not focus/open the rejected source group",
+                case.label
+            );
+            assert!(!rejected.groups.iter().any(|group| {
+                group.name == format!("Rejected {}", case.label) || group.role == "pending"
+            }));
+        }
+    }
+
+    #[test]
+    fn expired_parsed_invite_fails_before_pending_group_state() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("expired-parsed-invite-fail");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let expired_code = "discrypt://join/v1/invite-expired?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2000-01-01T00%3A00%3A00Z&max=3";
+
+        let rejected = join_group(JoinGroupRequest {
+            invite_code: expired_code.to_owned(),
+            group_name: Some("Should Not Exist".to_owned()),
+        });
+
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invite_expired")
+        );
+        assert!(rejected.groups.is_empty());
+        assert!(
+            rejected
+                .groups
+                .iter()
+                .all(|group| group.name != "Should Not Exist" && group.role != "pending"),
+            "expired parsed invite must not leave a pending compatibility group"
+        );
+        assert!(rejected.invites.is_empty());
+    }
+
+    #[test]
     fn production_invite_descriptor_parser_surfaces_redacted_ice_metadata() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("invite-ice-parse");
@@ -19528,6 +19794,83 @@ mod tests {
             .export_secret(&group_id, "discrypt/text", b"g012-openmls-foundation", 32)
             .map_err(|error| format!("OpenMLS exporter failed after rehydrate: {error}"))?;
         assert_eq!(exported.len(), 32);
+        Ok(())
+    }
+
+    #[test]
+    fn refused_admission_request_is_retained_without_member_promotion() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("admission-refusal-preserves-state");
+        create_user(CreateUserRequest {
+            display_name: "Alice Refusal".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created_group = create_group(CreateGroupRequest {
+            name: "Refusal Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(
+            created_group.last_command_error.is_none(),
+            "{created_group:?}"
+        );
+        let group_id = created_group.groups[0].group_id.clone();
+        let mut request_id = String::new();
+        mutate_app_service(|state| {
+            request_id = state
+                .upsert_pending_group_admission_request(
+                    &group_id,
+                    "bob-refused-user",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    b"bob-refused-key-package",
+                )
+                .expect("pending request should be queued")
+        });
+
+        let refused = refuse_group_admission_request(RefuseGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+            reason: Some("invite refused by owner".to_owned()),
+        });
+
+        assert_eq!(refused.last_command_error, None, "{refused:?}");
+        let group = refused
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "refusal group missing".to_owned())?;
+        let request = group
+            .admission_requests
+            .iter()
+            .find(|request| request.request_id == request_id)
+            .ok_or_else(|| "refused request should remain persisted".to_owned())?;
+        assert_eq!(request.status, "refused");
+        assert_eq!(
+            request.decision_reason.as_deref(),
+            Some("invite refused by owner")
+        );
+        assert!(
+            !group
+                .members
+                .iter()
+                .any(|member| member.member_id == "bob-refused-user"),
+            "refused admission must not promote a pending requester to member"
+        );
+        let persisted = load_state();
+        assert!(
+            persisted.text_control_outbox.iter().any(|record| matches!(
+                record.frame,
+                TextControlFrameView::GroupAdmissionDecision {
+                    approved: false,
+                    ..
+                }
+            )),
+            "refusal should enqueue a backend decision frame instead of silently dropping state"
+        );
         Ok(())
     }
 

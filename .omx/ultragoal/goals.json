@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-19T08:18:01.816Z",
+  "updatedAt": "2026-06-19T11:13:24.279Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -400,6 +400,17 @@
       "createdAt": "2026-06-19T08:18:01.816Z",
       "updatedAt": "2026-06-19T08:18:01.816Z",
       "evidence": "Plan: .omx/plans/P2-T07-automatic-admission-mode-2026-06-19.md; tests passed with CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07: g007_automatic_admission_requires_authorized_owner_or_staff_online and g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests; git diff --check passed."
+    },
+    {
+      "id": "G036-per-20-p2-t08-invite-failure-handlin",
+      "title": "PER-20/P2-T08 invite failure handling",
+      "objective": "Implement PER-20/P2-T08 refused, expired, revoked, and max-used invite handling so failed invite attempts surface typed errors and preserve existing group/profile state; verify with Rust and Playwright coverage.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-19T10:57:06.451Z",
+      "updatedAt": "2026-06-19T11:13:24.279Z",
+      "evidence": "PER-20/P2-T08 implemented: backend and UI reject refused/revoked, expired, and max-used invite/admission paths before state promotion; added Rust regression coverage and focused Playwright fallback coverage. Verification: cargo fmt --check PASS; npm --prefix apps/ui run typecheck PASS; git diff --check PASS; env PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers npm --prefix apps/ui run test:e2e -- --grep 'expired revoked and max-used invites fail clearly' PASS; RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t08 cargo test -p discrypt-desktop refused_admission_request_is_retained_without_member_promotion -- --test-threads=1 compiled through source and failed only at final ld ENOSPC.",
+      "completedAt": "2026-06-19T11:13:24.279Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
