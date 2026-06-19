@@ -142,16 +142,3 @@ code {
 [data-template] .rounded-2xl {
   border-radius: var(--template-panel-radius, 1rem);
 }
-
-@media (max-width: 1279px) {
-  main {
-    grid-template-columns: 72px minmax(0, 1fr) !important;
-  }
-}
-
-@media (max-width: 767px) {
-  main {
-    display: block !important;
-    padding-bottom: 7rem;
-  }
-}

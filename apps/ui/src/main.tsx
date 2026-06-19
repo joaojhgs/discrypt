@@ -2567,12 +2567,13 @@ function App() {
 
   return (
     <main
+      data-testid="app-shell"
       style={themeStyle}
       className={cn(
-        "grid min-h-dvh overflow-hidden bg-[hsl(var(--background))] text-[hsl(var(--foreground))]",
+        "grid h-dvh min-h-0 overflow-hidden bg-[hsl(var(--background))] text-[hsl(var(--foreground))]",
         showInspector
-          ? "grid-cols-1 lg:grid-cols-[var(--shell-grid-inspector)]"
-          : "grid-cols-1 lg:grid-cols-[var(--shell-grid)]",
+          ? "grid-cols-1 md:grid-cols-[72px_minmax(0,1fr)] lg:grid-cols-[var(--shell-grid-inspector)]"
+          : "grid-cols-1 md:grid-cols-[72px_minmax(0,1fr)] lg:grid-cols-[var(--shell-grid)]",
       )}
     >
       <ServerRail
@@ -2630,7 +2631,8 @@ function App() {
       ) : null}
       <section
         aria-label="Main chat pane"
-        className="flex h-dvh min-w-0 flex-col bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)]"
+        data-testid="main-chat-pane"
+        className="flex h-full min-h-0 min-w-0 flex-col bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.10),transparent_34rem)]"
       >
         <TopBar
           groupLabel={groupLabel}
@@ -2646,8 +2648,11 @@ function App() {
           inspectorOpen={diagnosticsUiEnabled && inspectorOpen}
           diagnosticsEnabled={diagnosticsUiEnabled}
         />
-        <div className="min-h-0 flex-1 overflow-hidden px-4 py-4 md:px-6">
-          <div className="flex h-full w-full flex-col">
+        <div
+          data-testid="main-chat-content"
+          className="min-h-0 flex-1 overflow-hidden px-4 pb-24 pt-4 md:px-6 lg:pb-4"
+        >
+          <div className="flex h-full min-h-0 w-full flex-col">
             {workflow === "setup" ? (
               <SetupPanel
                 onCreateGroup={() => setActiveOverlay("create-group")}
@@ -5275,7 +5280,7 @@ function DmPanel({
     );
   }
   return (
-    <div className="min-h-[70dvh]">
+    <div className="h-full min-h-0">
       <Timeline
         title={activeDm.display_name}
         description="Private conversation"
@@ -6752,13 +6757,16 @@ function Timeline({
   composerNotice?: string | null;
 }) {
   return (
-    <Card className="flex h-full min-h-0 flex-col overflow-hidden border-[hsl(var(--border)/0.74)] bg-[hsl(var(--card)/0.54)] shadow-none">
+    <Card
+      data-testid="message-timeline"
+      className="flex h-full min-h-0 flex-col overflow-hidden border-[hsl(var(--border)/0.74)] bg-[hsl(var(--card)/0.54)] shadow-none"
+    >
       <CardHeader className="border-b border-[hsl(var(--border))] px-4 py-3">
         <CardTitle className="text-lg">{title}</CardTitle>
         <CardDescription className="line-clamp-1">{description}</CardDescription>
       </CardHeader>
       {diagnosticsEnabled ? <TextStateLegend states={textStateLegend} /> : null}
-      <ScrollArea className="min-h-0 flex-1">
+      <ScrollArea data-testid="message-scroll" className="min-h-0 flex-1">
         <div className="py-3">
           {messages.length === 0 ? (
             <div className="px-4">

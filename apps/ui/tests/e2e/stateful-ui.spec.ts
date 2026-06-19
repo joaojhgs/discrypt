@@ -167,6 +167,57 @@ async function expectNoDocumentHorizontalOverflow(page) {
   expect(overflow).toBeLessThanOrEqual(1);
 }
 
+async function expectNoDocumentScrolling(page) {
+  const overflow = await page.evaluate(() => ({
+    x: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    y: document.documentElement.scrollHeight - document.documentElement.clientHeight,
+  }));
+  expect(overflow.x).toBeLessThanOrEqual(1);
+  expect(overflow.y).toBeLessThanOrEqual(1);
+}
+
+async function expectMainLayoutStable(page) {
+  await expect(page.getByTestId("app-shell")).toBeVisible();
+  await expect(page.getByTestId("main-chat-pane")).toBeVisible();
+  await expect(page.getByTestId("message-timeline")).toBeVisible();
+  await expect(page.getByTestId("message-scroll")).toBeVisible();
+  await expectNoDocumentScrolling(page);
+
+  const boxes = await page.evaluate(() => {
+    const shell = document.querySelector('[data-testid="app-shell"]');
+    const pane = document.querySelector('[data-testid="main-chat-pane"]');
+    const timeline = document.querySelector('[data-testid="message-timeline"]');
+    const scroll = document.querySelector('[data-testid="message-scroll"]');
+    const shellRect = shell?.getBoundingClientRect();
+    const paneRect = pane?.getBoundingClientRect();
+    const timelineRect = timeline?.getBoundingClientRect();
+    const scrollElement = scroll as HTMLElement | null;
+    const scrollRect = scrollElement?.getBoundingClientRect();
+    return shellRect && paneRect && timelineRect && scrollRect && scrollElement
+      ? {
+          shellTop: shellRect.top,
+          shellBottom: shellRect.bottom,
+          paneLeft: paneRect.left,
+          paneRight: paneRect.right,
+          timelineHeight: timelineRect.height,
+          scrollClientHeight: scrollElement.clientHeight,
+          scrollHeight: scrollElement.scrollHeight,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        }
+      : null;
+  });
+
+  expect(boxes).not.toBeNull();
+  expect(boxes?.shellTop ?? -1).toBeGreaterThanOrEqual(0);
+  expect(boxes?.shellBottom ?? 0).toBeLessThanOrEqual((boxes?.viewportHeight ?? 0) + 1);
+  expect(boxes?.paneLeft ?? -1).toBeGreaterThanOrEqual(0);
+  expect(boxes?.paneRight ?? 0).toBeLessThanOrEqual((boxes?.viewportWidth ?? 0) + 1);
+  expect(boxes?.timelineHeight ?? 0).toBeGreaterThan(360);
+  expect(boxes?.scrollClientHeight ?? 0).toBeGreaterThan(140);
+  expect(boxes?.scrollHeight ?? 0).toBeGreaterThan(boxes?.scrollClientHeight ?? 0);
+}
+
 async function expectStorageLayoutStable(page) {
   await expect(page.getByTestId("first-run-storage")).toBeVisible();
   await expect(page.getByTestId("first-run-account-forms")).toBeVisible();
@@ -330,6 +381,44 @@ test("first-run storage setup remains readable at required widths", async ({
     await page.screenshot({
       fullPage: true,
       path: testInfo.outputPath(`first-run-storage-${viewport.name}.png`),
+    });
+  }
+});
+
+test("main chat layout keeps document fixed and message list scrollable at required widths", async ({
+  page,
+}, testInfo) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Layout Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  for (let index = 1; index <= 34; index += 1) {
+    await page
+      .getByRole("textbox", { name: "Message" })
+      .fill(`layout regression message ${index.toString().padStart(2, "0")}`);
+    await page.getByRole("button", { name: /^Send message$/ }).click();
+  }
+  await expect(page.getByText("layout regression message 34")).toBeVisible();
+
+  for (const viewport of [
+    { name: "desktop", width: 1440, height: 900 },
+    { name: "narrow", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({
+      width: viewport.width,
+      height: viewport.height,
+    });
+    await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+    await expect(page.getByText(/Signaling and ICE settings/i)).toHaveCount(0);
+    await expect(page.getByText(/proof|checklist|template/i)).toHaveCount(0);
+    await expectMainLayoutStable(page);
+    await page.screenshot({
+      fullPage: true,
+      path: testInfo.outputPath(`main-layout-${viewport.name}.png`),
     });
   }
 });
