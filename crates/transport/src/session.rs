@@ -378,6 +378,55 @@ impl TransportSession {
         self.select_route(route, endpoint, Some(report))
     }
 
+    /// Mark a failed route attempt where direct ICE failed and TURN is required
+    /// but not configured. The stored report is diagnostic-only; connected()
+    /// remains false and no delivery route is active.
+    pub fn fail_direct_path_turn_required(
+        &mut self,
+        stun_endpoint: Endpoint,
+        turn_endpoint: Endpoint,
+    ) -> Result<TransportSessionSnapshot, TransportSessionError> {
+        self.require_state(
+            TransportSessionEvent::MarkFailed,
+            &[
+                TransportSessionState::Signaling,
+                TransportSessionState::IceGathering,
+                TransportSessionState::Checking,
+                TransportSessionState::Disconnected,
+                TransportSessionState::Reconnecting,
+            ],
+        )?;
+        let plan = ConnectivityPlan {
+            attempts: vec![
+                crate::ConnectionAttempt {
+                    leg: FallbackLeg::Stun,
+                    endpoint: stun_endpoint,
+                    carries_content: false,
+                    ciphertext_only: false,
+                    succeeded: false,
+                },
+                crate::ConnectionAttempt {
+                    leg: FallbackLeg::Turn,
+                    endpoint: turn_endpoint.clone(),
+                    carries_content: false,
+                    ciphertext_only: true,
+                    succeeded: false,
+                },
+            ],
+            selected: FallbackLeg::Turn,
+            endpoint: turn_endpoint.clone(),
+        };
+        self.route = Some(TransportRouteStatus {
+            route: TransportRoute::TurnRelay,
+            endpoint: turn_endpoint,
+            route_report: Some(plan.route_report()),
+        });
+        self.last_error =
+            Some("direct WebRTC failed and TURN is required but not configured".to_owned());
+        self.state = TransportSessionState::Failed;
+        Ok(self.snapshot())
+    }
+
     /// Mark an active route disconnected.
     pub fn mark_disconnected(
         &mut self,
@@ -622,6 +671,42 @@ mod tests {
             )),
             Some((TransportRoute::TurnRelay, Some(FallbackLeg::Turn)))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn turn_needed_fail_closed_snapshot_is_not_connected() -> Result<(), TransportSessionError> {
+        let mut session = ready_session()?;
+        let snapshot = session.fail_direct_path_turn_required(
+            Endpoint::new("stun:stun.l.google.com:19302"),
+            Endpoint::new(ConnectivityConfig::UNCONFIGURED_TURN_ENDPOINT),
+        )?;
+
+        assert_eq!(snapshot.state, TransportSessionState::Failed);
+        assert!(!snapshot.connected());
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("direct WebRTC failed and TURN is required but not configured")
+        );
+        let route = snapshot
+            .route
+            .ok_or(TransportSessionError::InvalidTransition {
+                from: TransportSessionState::Failed,
+                event: TransportSessionEvent::MarkFailed,
+            })?;
+        assert_eq!(route.route, TransportRoute::TurnRelay);
+        let report = route
+            .route_report
+            .ok_or(TransportSessionError::InvalidTransition {
+                from: TransportSessionState::Failed,
+                event: TransportSessionEvent::MarkFailed,
+            })?;
+        assert_eq!(report.selected, FallbackLeg::Turn);
+        assert_eq!(
+            report.attempted_legs,
+            vec![FallbackLeg::Stun, FallbackLeg::Turn]
+        );
+        assert!(report.ciphertext_only_relay_legs);
         Ok(())
     }
 
