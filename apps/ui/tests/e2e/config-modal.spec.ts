@@ -22,7 +22,7 @@ test("configuration modal exposes audio, theme, connectivity defaults, and logs 
   await page.setViewportSize({ width: 1440, height: 900 });
 
   await page
-    .getByRole("button", { name: "Open rail configuration", exact: true })
+    .getByRole("button", { name: "Open app configuration", exact: true })
     .click();
   const configDialog = page.getByRole("dialog", { name: "Config" });
   await expect(configDialog).toBeVisible();

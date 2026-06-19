@@ -503,7 +503,7 @@ test("theme tokens default dark and drive shadcn shell surfaces", async ({
     path: testInfo.outputPath("theme-default-dark-desktop.png"),
   });
 
-  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
   const configDialog = page.getByRole("dialog", { name: "Config" });
   await expect(configDialog.getByRole("heading", { name: "Appearance" })).toBeVisible();
   await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
@@ -563,13 +563,13 @@ test("message rows use compact Discord-like status tooltips", async ({
 
   const status = row.getByTestId("message-delivery-status");
   await expect(status).toHaveAccessibleName(
-    /Sent locally: Message is in the local encrypted author log; peer receipt requires backend-state proof/i,
+    /Sent locally: Message is in the local encrypted author log; peer receipt requires backend-state evidence/i,
   );
   await expect(status).toHaveText("✓");
   await status.hover();
   await expect(row.getByRole("tooltip")).toBeVisible();
   await expect(row.getByRole("tooltip")).toContainText("Sent locally");
-  await expect(row.getByRole("tooltip")).toContainText("peer receipt requires backend-state proof");
+  await expect(row.getByRole("tooltip")).toContainText("peer receipt requires backend-state evidence");
 
   await page.screenshot({
     fullPage: true,
@@ -789,7 +789,7 @@ test("group invite join text channel and voice controls work without fake member
   await page.getByRole("button", { name: /Open Private Lab group/i }).click();
   await expect(page.getByText(/Private Lab/i).first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
   const voiceConfig = page.getByRole("dialog", { name: "Config" });
   await voiceConfig.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
   await expect(voiceConfig.getByTestId("voice-mic-selector")).toHaveValue(
@@ -1002,7 +1002,7 @@ test("local-dev e2e persistence survives browser reload", async ({ page }) => {
     .getByRole("textbox", { name: "Message" })
     .fill("message survives reload");
   await page.getByRole("button", { name: /^Send message$/ }).click();
-  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
   const configDialog = page.getByRole("dialog", { name: "Config" });
   await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
   await expect(configDialog.getByLabel("Theme")).toHaveValue("ocean-contrast");
@@ -1013,7 +1013,7 @@ test("local-dev e2e persistence survives browser reload", async ({ page }) => {
   await expect(page.getByText(/Persistent Lab/i).first()).toBeVisible();
   await page.getByRole("button", { name: /\#general/ }).click();
   await expect(page.getByText(/message survives reload/i)).toBeVisible();
-  await page.getByRole("button", { name: "Open rail configuration", exact: true }).click();
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Config" }).getByLabel("Theme")).toHaveValue("ocean-contrast");
   await page.getByRole("button", { name: /Close Config/i }).click();
 });

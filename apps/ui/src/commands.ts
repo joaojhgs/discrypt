@@ -1763,14 +1763,14 @@ function textStateLegend(): TextStateView[] {
       label: "Sent locally",
       status: "current-send-state",
       detail:
-        "Message is in the local encrypted author log; peer receipt requires backend-state proof",
+        "Message is in the local encrypted author log; peer receipt requires backend-state evidence",
     },
     {
       key: "peer_receipt",
       label: "Peer receipt",
       status: "requires-signed-receipt",
       detail:
-        "Delivered to peer is shown only with backend-state signed receipt proof",
+        "Delivered to peer is shown only with backend-state signed receipt evidence",
     },
     {
       key: "received",
@@ -3894,7 +3894,7 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
           participant_id: participantId,
           display_name: displayName,
           local_only_copy:
-            "Local DM; remote delivery is not claimed until backend proof is available",
+            "Local DM; remote delivery is not claimed until backend evidence is available",
           runtime_peers: dmRuntimePeers(connectivity, "inviter"),
           connectivity,
         });
@@ -4009,7 +4009,7 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         const createdAt = new Date().toISOString();
         const role: GroupRoleView = "member";
         const localMember = initialGroupMember(state, role, createdAt);
-        localMember.status = "pending";
+        localMember.status = "unknown";
         state.groups.push({
           group_id: groupId,
           name,
@@ -4636,7 +4636,7 @@ export async function acceptDmInvite(
           participant_id: participantId,
           display_name: displayName,
           local_only_copy:
-            "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt proof",
+            "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt evidence",
           runtime_peers: dmRuntimePeers(parsedInvite.connectivity, "reply"),
           connectivity: parsedInvite.connectivity,
         });
@@ -5305,11 +5305,11 @@ export async function sendMessage(
           ? "transport_probe_unavailable"
           : "sent_local",
         state_label: request.transport_proof
-          ? "Transport proof unavailable"
+          ? "Transport check unavailable"
           : "Sent locally",
         state_detail: request.transport_proof
-          ? "Local fallback web runtime cannot run the Rust/Tauri provider-signaled WebRTC transport proof; native command path is required"
-          : "Message is in the local encrypted author log; peer receipt requires backend-state proof",
+          ? "Local fallback web runtime cannot run the Rust/Tauri provider-signaled WebRTC transport check; native command path is required"
+          : "Message is in the local encrypted author log; peer receipt requires backend-state evidence",
         peer_receipt: null,
         sent_at: `local-${state.messages.length + 1}`,
       });
