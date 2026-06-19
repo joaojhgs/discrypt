@@ -152,9 +152,6 @@ const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 10_000;
 const diagnosticsUiEnabled =
   import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
-const localDevFallbackEnabled =
-  import.meta.env.DEV ||
-  import.meta.env.VITE_DISCRYPT_LOCAL_DEV_FALLBACK === "1";
 type VoiceDeviceAccess = {
   stream: MediaStream | null;
   microphone_permission: "granted" | "denied" | "prompt" | "unknown";
@@ -2610,6 +2607,7 @@ function App() {
         commandError={storageCommandError}
         onCreate={createCommandUser}
         onRecover={recoverCommandUser}
+        allowEmptyRecovery={appState.runtime_mode.mode !== "native"}
       />
     );
   }
@@ -3415,6 +3413,7 @@ function FirstRunPanel({
   commandError,
   onCreate,
   onRecover,
+  allowEmptyRecovery,
 }: {
   themeStyle: React.CSSProperties;
   storage: AppState["storage_security"];
@@ -3433,6 +3432,7 @@ function FirstRunPanel({
   commandError: string | null;
   onCreate: () => void | Promise<void>;
   onRecover: () => void | Promise<void>;
+  allowEmptyRecovery: boolean;
 }) {
   const storageSetupRequired = storage.status !== "ready";
   const vaultSelected = selectedStorageMode === "passphrase_vault";
@@ -3444,7 +3444,7 @@ function FirstRunPanel({
     (vaultSelected && passwordLongEnough && passwordsMatch);
   const recoveryReadyForSubmit =
     storageReadyForSubmit &&
-    (localDevFallbackEnabled ||
+    (allowEmptyRecovery ||
       Boolean(
         displayName.trim() && deviceName.trim() && recoveryCode.trim(),
       ));
@@ -4998,7 +4998,7 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
       await navigator.clipboard?.writeText(log);
       setExportStatus("Diagnostic log copied to clipboard.");
     } catch (error) {
-      console.error("Diagnostics export failed", error);
+      logSanitizedCommandError();
       setExportStatus(
         error instanceof Error
           ? `Diagnostics export failed: ${error.message}`
@@ -5037,7 +5037,7 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
           copy={
             appState.runtime_mode.mode === "native"
               ? "Native Tauri commands"
-              : "Local-dev fallback export"
+              : "Web runtime export"
           }
         />
         <InfoRow
