@@ -76,6 +76,7 @@
     "test:provider-metadata-capture-g133": "node ../../scripts/check-provider-metadata-capture-g133.mjs",
     "test:g008-stun-turn-fallback": "node ../../scripts/check-g008-stun-turn-fallback.mjs",
     "test:p3-t05-provider-no-app-relay": "node ../../scripts/check-provider-no-app-relay-p3-t05.mjs",
+    "test:p3-t09-configured-turn-proof": "node ../../scripts/check-configured-turn-proof-p3-t09.mjs",
     "test:g009-security-privacy": "npm run test:security-privacy-g009",
     "test:security-privacy-g009": "node ../../scripts/check-security-privacy-g009.mjs",
     "test:g010-release-harness": "node ../../scripts/g010-release-harness.mjs --mode=local",

@@ -26,6 +26,12 @@ use discrypt_transport::{
     WebRtcIceTransportPolicy, WebRtcNegotiationConfig,
 };
 use rand::RngCore;
+#[cfg(feature = "mqtt-adapter")]
+use serde_json::json;
+#[cfg(feature = "mqtt-adapter")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "mqtt-adapter")]
+use std::path::PathBuf;
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0_u8; N];
@@ -326,6 +332,124 @@ fn public_turn_config_from_env() -> Result<WebRtcNegotiationConfig, TransportErr
     Ok(config)
 }
 
+#[cfg(feature = "mqtt-adapter")]
+fn public_turn_artifact_path() -> PathBuf {
+    std::env::var("DISCRYPT_PUBLIC_TURN_ARTIFACT_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from("target/e2e/per-30-configured-turn-proof/public-turn-relay-only.json")
+        })
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn sha256_hex_for_label(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt-public-turn-proof-redacted-label-v1");
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn redacted_turn_endpoint_label(endpoint: &str) -> String {
+    let scheme = endpoint
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("turn");
+    format!("{scheme}:sha256:{}", &sha256_hex_for_label(endpoint)[..16])
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn write_public_turn_proof_artifact(
+    probe: &discrypt_transport::ProviderWebRtcDataChannelProbe,
+    turn_endpoint: &str,
+) -> Result<PathBuf, TransportError> {
+    let path = public_turn_artifact_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            TransportError::Unavailable(format!(
+                "failed to create public TURN artifact directory: {error}"
+            ))
+        })?;
+    }
+    let offerer_relay_candidates = probe.offerer_local_relay_candidates_gathered
+        + probe.offerer_remote_relay_candidates_applied;
+    let answerer_relay_candidates = probe.answerer_local_relay_candidates_gathered
+        + probe.answerer_remote_relay_candidates_applied;
+    let artifact = json!({
+        "schema_version": "discrypt.p3_t09.configured_turn_proof.v1",
+        "issue": "PER-30 / P3-T09",
+        "status": "passed",
+        "proof_level": "env-gated public TURN relay-only provider-signaled WebRTC DataChannel harness",
+        "adapter": probe.kind.canonical_name(),
+        "provider_endpoint_label": probe.endpoint_label,
+        "provider_role": "signaling/rendezvous only",
+        "provider_visible_material": [
+            "adapter endpoint label",
+            "derived hashed rendezvous topic",
+            "sealed WebRTC offer/answer/candidate envelopes"
+        ],
+        "provider_application_relay_used": false,
+        "turn_endpoint_label": redacted_turn_endpoint_label(turn_endpoint),
+        "turn_credentials": {
+            "configured": true,
+            "username_redacted": true,
+            "credential_redacted": true
+        },
+        "route_policy": {
+            "ice_transport_policy": "relay_only",
+            "direct_candidates_allowed": false,
+            "configured_turn_required": true,
+            "turn_selected_by_policy": true
+        },
+        "route_evidence": {
+            "offerer_data_channel_open": probe.offerer_data_channel_open,
+            "answerer_data_channel_open": probe.answerer_data_channel_open,
+            "offerer_configured_turn_servers": probe.offerer_configured_turn_servers,
+            "answerer_configured_turn_servers": probe.answerer_configured_turn_servers,
+            "offerer_turn_fallback_ready": probe.offerer_turn_fallback_ready,
+            "answerer_turn_fallback_ready": probe.answerer_turn_fallback_ready,
+            "offerer_relay_candidates": offerer_relay_candidates,
+            "answerer_relay_candidates": answerer_relay_candidates,
+            "text_control_frame_roundtrip": probe.text_control_frame_roundtrip,
+            "receipt_frame_roundtrip": probe.receipt_frame_roundtrip,
+            "text_control_frame_sha256": probe.text_control_frame_sha256,
+            "receipt_frame_sha256": probe.receipt_frame_sha256
+        },
+        "redaction": {
+            "raw_turn_endpoint_logged": false,
+            "raw_turn_username_logged": false,
+            "raw_turn_credential_logged": false,
+            "raw_sdp_logged": false,
+            "raw_ice_candidate_logged": false,
+            "raw_text_control_payload_logged": false
+        },
+        "diagnostics": {
+            "offerer_timeline": probe.offerer_diagnostic_timeline,
+            "answerer_timeline": probe.answerer_diagnostic_timeline
+        },
+        "non_claims": [
+            "not installed Tauri app production readiness",
+            "not OpenMLS admission proof",
+            "not voice/media microphone proof",
+            "not provider application relay"
+        ]
+    });
+    let bytes = serde_json::to_vec_pretty(&artifact).map_err(|error| {
+        TransportError::Unavailable(format!("failed to serialize public TURN artifact: {error}"))
+    })?;
+    std::fs::write(&path, bytes).map_err(|error| {
+        TransportError::Unavailable(format!("failed to write public TURN artifact: {error}"))
+    })?;
+    eprintln!("public TURN relay-only proof artifact: {}", path.display());
+    Ok(path)
+}
+
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
@@ -575,6 +699,16 @@ async fn public_mqtt_relay_only_turn_fallback_roundtrip_when_configured(
     }
     let endpoint = std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
         .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned());
+    let turn_endpoint = std::env::var("DISCRYPT_PUBLIC_TURN_ENDPOINT").map_err(|_| {
+        TransportError::InvalidIcePolicy(
+            "set DISCRYPT_PUBLIC_TURN_ENDPOINT for public TURN relay-only E2E".to_owned(),
+        )
+    })?;
+    let turn_config = public_turn_config_from_env()?;
+    assert_eq!(
+        turn_config.ice_transport_policy,
+        WebRtcIceTransportPolicy::RelayOnly
+    );
     let scope_secret = random_bytes::<32>();
     let scope = ConversationScope::new(
         ConnectivityScopeLevel::Dm,
@@ -589,7 +723,7 @@ async fn public_mqtt_relay_only_turn_fallback_roundtrip_when_configured(
         scope,
         &random_bytes::<32>(),
         &random_bytes::<16>(),
-        public_turn_config_from_env()?,
+        turn_config,
         b"ciphertext:relay-only-turn-request".to_vec(),
         b"ciphertext:relay-only-turn-receipt".to_vec(),
     )
@@ -612,5 +746,6 @@ async fn public_mqtt_relay_only_turn_fallback_roundtrip_when_configured(
             + probe.answerer_remote_relay_candidates_applied
             > 0
     );
+    write_public_turn_proof_artifact(&probe, &turn_endpoint)?;
     Ok(())
 }
