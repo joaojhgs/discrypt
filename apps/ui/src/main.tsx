@@ -2957,6 +2957,7 @@ function App() {
               }
               onSaveDm={activeDm ? () => saveConnectivityPolicy("dm") : null}
             />
+            <ConfigLogsExportPanel appState={appState} />
           </div>
         ) : null}
         {activeOverlay === "diagnostics" ? (
@@ -4745,7 +4746,7 @@ function overlayCopy(overlay: OverlayKind | null): {
       return {
         title: "Config",
         description:
-          "Manage theme, audio devices, volume, signaling, and ICE policy.",
+          "Manage theme, audio devices, volume, signaling, ICE policy, and diagnostic exports.",
         align: "side",
       };
     case "diagnostics":
@@ -4960,6 +4961,69 @@ function AudioSettingsPanel({
             <Slider aria-label="App output volume" value={[appOutputVolume]} min={0} max={100} step={1} onValueChange={(value) => onAppOutputVolumeChange(value[0] ?? 100)} />
           </label>
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
+  const [exportStatus, setExportStatus] = useState<string>("");
+  const copyDiagnostics = async () => {
+    try {
+      const log = await exportDiagnosticsLog();
+      await navigator.clipboard?.writeText(log);
+      setExportStatus("Diagnostic log copied to clipboard.");
+    } catch (error) {
+      console.error("Diagnostics export failed", error);
+      setExportStatus(
+        error instanceof Error
+          ? `Diagnostics export failed: ${error.message}`
+          : "Diagnostics export failed.",
+      );
+    }
+  };
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle>Logs and export</CardTitle>
+            <CardDescription>
+              Export runtime diagnostics from the app command boundary for support and release checks.
+            </CardDescription>
+          </div>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={copyDiagnostics}
+            aria-label="Copy diagnostic log"
+          >
+            Copy diagnostic log
+          </Button>
+        </div>
+        {exportStatus ? (
+          <p className="text-xs text-[hsl(var(--muted-foreground))]">
+            {exportStatus}
+          </p>
+        ) : null}
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-3">
+        <InfoRow
+          title="Runtime"
+          copy={
+            appState.runtime_mode.mode === "native"
+              ? "Native Tauri commands"
+              : "Local-dev fallback export"
+          }
+        />
+        <InfoRow
+          title="Events"
+          copy={`${appState.events.length} event${appState.events.length === 1 ? "" : "s"} available`}
+        />
+        <InfoRow
+          title="Transport proof"
+          copy={appState.transport_diagnostics.route_proof_status}
+        />
       </CardContent>
     </Card>
   );
