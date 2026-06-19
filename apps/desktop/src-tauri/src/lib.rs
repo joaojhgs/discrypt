@@ -19203,26 +19203,44 @@ mod tests {
 
     #[test]
     fn local_refused_expired_and_max_used_group_invites_fail_without_state_promotion() {
-        let cases: [(&str, &str, fn(&mut InviteView)); 3] = [
-            ("revoked", "invite_revoked", |invite| invite.revoked = true),
-            ("expired", "invite_expired", |invite| {
-                invite.expires_at = "2000-01-01T00:00:00Z".to_owned();
-            }),
-            ("max-used", "invite_max_uses_exhausted", |invite| {
-                invite.max_use = "1 use".to_owned();
-                invite.uses = 1;
-            }),
+        struct InviteFailureCase {
+            label: &'static str,
+            expected_code: &'static str,
+            mutate: fn(&mut InviteView),
+        }
+
+        let cases = [
+            InviteFailureCase {
+                label: "revoked",
+                expected_code: "invite_revoked",
+                mutate: |invite| invite.revoked = true,
+            },
+            InviteFailureCase {
+                label: "expired",
+                expected_code: "invite_expired",
+                mutate: |invite| {
+                    invite.expires_at = "2000-01-01T00:00:00Z".to_owned();
+                },
+            },
+            InviteFailureCase {
+                label: "max-used",
+                expected_code: "invite_max_uses_exhausted",
+                mutate: |invite| {
+                    invite.max_use = "1 use".to_owned();
+                    invite.uses = 1;
+                },
+            },
         ];
 
-        for (label, expected_code, mutate_invite) in cases {
+        for case in cases {
             let _guard = test_lock();
-            let _path = reset_with_temp_state(&format!("invite-fail-{label}"));
+            let _path = reset_with_temp_state(&format!("invite-fail-{}", case.label));
             create_user(CreateUserRequest {
                 display_name: "Alice".to_owned(),
                 device_name: None,
             });
             let source_group = create_group(CreateGroupRequest {
-                name: format!("Source {label}"),
+                name: format!("Source {}", case.label),
                 retention: "24 hours".to_owned(),
                 admission_mode: None,
                 adapter_kind: None,
@@ -19239,7 +19257,7 @@ mod tests {
             });
             let invite_code = invite_state.invites[0].code.clone();
             let anchor_group = create_group(CreateGroupRequest {
-                name: format!("Anchor {label}"),
+                name: format!("Anchor {}", case.label),
                 retention: "24 hours".to_owned(),
                 admission_mode: None,
                 adapter_kind: None,
@@ -19254,13 +19272,13 @@ mod tests {
                     .iter_mut()
                     .find(|invite| invite.code == invite_code)
                     .expect("invite row should exist");
-                mutate_invite(invite);
+                (case.mutate)(invite);
             });
             let before = load_state().to_view();
 
             let rejected = join_group(JoinGroupRequest {
                 invite_code: invite_code.clone(),
-                group_name: Some(format!("Rejected {label}")),
+                group_name: Some(format!("Rejected {}", case.label)),
             });
 
             assert_eq!(
@@ -19268,8 +19286,9 @@ mod tests {
                     .last_command_error
                     .as_ref()
                     .map(|error| error.code.as_str()),
-                Some(expected_code),
-                "{label} invite should fail with a clear command error"
+                Some(case.expected_code),
+                "{} invite should fail with a clear command error",
+                case.label
             );
             assert_eq!(rejected.groups.len(), before.groups.len());
             assert_eq!(
@@ -19278,10 +19297,11 @@ mod tests {
                     .as_ref()
                     .and_then(|context| context.group_id.as_deref()),
                 Some(anchor_group_id.as_str()),
-                "{label} invite must not focus/open the rejected source group"
+                "{} invite must not focus/open the rejected source group",
+                case.label
             );
             assert!(!rejected.groups.iter().any(|group| {
-                group.name == format!("Rejected {label}") || group.role == "pending"
+                group.name == format!("Rejected {}", case.label) || group.role == "pending"
             }));
         }
     }
