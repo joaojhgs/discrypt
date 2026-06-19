@@ -20,7 +20,7 @@ use crate::{
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
     SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDiagnosticTimeline,
-    WebRtcIceTransportPolicy, WebRtcNegotiationConfig,
+    WebRtcNegotiationConfig,
 };
 #[cfg(any(
     test,
@@ -2739,7 +2739,7 @@ where
 
     let relay_only_probe = matches!(
         negotiation_config.ice_transport_policy,
-        WebRtcIceTransportPolicy::RelayOnly
+        crate::WebRtcIceTransportPolicy::RelayOnly
     );
     let alice_config = negotiation_config.clone();
     let bob_config = negotiation_config;
