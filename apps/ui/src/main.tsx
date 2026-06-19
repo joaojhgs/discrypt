@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  createThemeStyle,
   discryptUiConfig,
+  getThemeDefinition,
   ThemeId,
 } from "./app-config";
 import {
@@ -1724,12 +1726,8 @@ function App() {
   ];
 
 
-  const activeTheme =
-    discryptUiConfig.themes.find(
-      (theme) => theme.id === appState.preferences.theme_id,
-    ) ?? discryptUiConfig.themes[0];
-  const themeStyle = {
-    ...activeTheme.cssVars,
+  const activeTheme = getThemeDefinition(appState.preferences.theme_id);
+  const themeStyle = createThemeStyle(activeTheme, {
     "--shell-grid":
       workflow === "dm" || workflow === "setup" || !hasActiveGroup
         ? "72px minmax(0,1fr)"
@@ -1742,7 +1740,7 @@ function App() {
         : "72px 300px minmax(0,1fr) 280px",
     "--shell-font-size": "16px",
     "--shell-panel-radius": "1rem",
-  } as React.CSSProperties & Record<`--${string}`, string>;
+  });
   const showInspector =
     diagnosticsUiEnabled && inspectorOpen && workflow !== "setup";
 
@@ -2604,6 +2602,7 @@ function App() {
   return (
     <main
       data-testid="app-shell"
+      data-theme={activeTheme.id}
       style={themeStyle}
       className={cn(
         "grid h-dvh min-h-0 overflow-hidden bg-[hsl(var(--background))] text-[hsl(var(--foreground))]",
