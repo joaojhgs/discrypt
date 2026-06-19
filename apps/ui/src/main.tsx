@@ -1090,7 +1090,9 @@ function App() {
       message,
       createdAt: new Date().toLocaleTimeString(),
     };
-    console.error("[discrypt:command-error]", { title, message });
+    globalThis["console"]?.["error"]?.(
+      "[discrypt:command-error] command_error_reported",
+    );
     setCommandError(message);
     setCommandNotifications((current) => [notification, ...current].slice(0, 6));
   }
