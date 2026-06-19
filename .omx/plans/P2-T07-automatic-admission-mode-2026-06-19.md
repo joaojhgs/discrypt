@@ -34,3 +34,15 @@
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-desktop g007_automatic_admission_requires_authorized_owner_or_staff_online`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `git diff --check`
+
+## CI Recovery 2026-06-19
+
+- PR #27 CI failed in `tests::g012_two_profile_group_text_delivery_bidirectional_persists` because the test expected automatic admission to return an OpenMLS Welcome without first proving an online owner/staff heartbeat.
+- Recovery keeps the backend P2-T07 policy unchanged and updates the G012 harness to publish and assert Alice's owner presence TTL before pumping Bob's admission key package.
+- Fresh verification with `CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07`:
+  - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07 cargo test -p discrypt-desktop g012_two_profile_group_text_delivery_bidirectional_persists -- --test-threads=1`
+  - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07 cargo test -p discrypt-desktop g007_automatic_admission_requires_authorized_owner_or_staff_online -- --test-threads=1`
+  - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07 cargo test -p discrypt-desktop g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests -- --test-threads=1`
+  - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07 cargo fmt --check`
+  - `git diff --check`
+  - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p2t07 cargo test --workspace`

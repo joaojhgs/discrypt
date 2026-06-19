@@ -23432,6 +23432,34 @@ mod tests {
             old_style_name, "g012 text lab",
             "old signed invites without gname must recover a sane label from gid, not the invite uuid"
         );
+        let alice_online = publish_group_presence(PublishGroupPresenceRequest {
+            group_id: alice_group_id.clone(),
+            member_id: None,
+            ttl_seconds: Some(300),
+        });
+        assert!(
+            alice_online.last_command_error.is_none(),
+            "{alice_online:?}"
+        );
+        let alice_online_group = alice_online
+            .groups
+            .iter()
+            .find(|group| group.group_id == alice_group_id)
+            .ok_or_else(|| "alice online group missing".to_owned())?;
+        let alice_member_id = alice_online
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "alice profile missing for presence proof".to_owned())?;
+        assert!(
+            alice_online_group.members.iter().any(|member| {
+                member.member_id == alice_member_id
+                    && member.role == GroupRoleView::Owner
+                    && member.status == "online"
+                    && member.presence_expires_at.is_some()
+            }),
+            "default automatic admission requires online owner/staff presence proof before issuing a Welcome"
+        );
         let (bob_path, _) = join_group_invite_as_test_profile_with_optional_name(
             "g012-group-text-bob",
             "Bob G012",
