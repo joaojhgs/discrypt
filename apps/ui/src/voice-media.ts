@@ -554,7 +554,7 @@ function createVoiceSignalTransport({
       }
       if (!postLocalDevVoiceSignal(broadcast, signal)) {
         onStatus?.(
-          "Voice signaling unavailable: Tauri IPC is absent and local-dev/test BroadcastChannel fallback is disabled",
+          "Voice signaling unavailable: Tauri IPC is absent and local-dev BroadcastChannel fallback is disabled",
         );
       }
     },

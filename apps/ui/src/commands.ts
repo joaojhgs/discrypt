@@ -3126,7 +3126,7 @@ function invokeOrFallback<T>(
     if (!LOCAL_DEV_FALLBACK_ENABLED) {
       return Promise.reject(
         new Error(
-          `Tauri IPC unavailable for ${command}; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev/test harness`,
+          `Tauri IPC unavailable for ${command}; local fallback requires VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 in a local-dev harness`,
         ),
       );
     }
