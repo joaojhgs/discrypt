@@ -40,7 +40,7 @@ The artifact does not contain raw TURN endpoint, username, credential, SDP, ICE 
 CI live coturn proof on branch `multica/P3-T09-configured-turn-proof`:
 
 - `.github/workflows/ci.yml` runs `PER-30 configured TURN proof` only for this task branch.
-- The job starts loopback coturn with run-scoped CI-only credentials, sets `DISCRYPT_PUBLIC_TURN_E2E=1`, runs `scripts/per30-browser-turn-proof.mjs`, runs the Rust cargo harness in skip-safe mode, runs the static artifact redaction gate, and uploads `per30-configured-turn-proof-<run>-<attempt>`.
+- The job starts loopback coturn with run-scoped CI-only credentials, sets `DISCRYPT_PUBLIC_TURN_E2E=1`, runs `scripts/per30-browser-turn-proof.mjs`, runs the static artifact redaction gate, and uploads `per30-configured-turn-proof-<run>-<attempt>`.
 - The uploaded directory contains the redacted artifact at `public-turn-relay-only.json` plus `coturn.log`.
 
 Static and skip-safe checks:

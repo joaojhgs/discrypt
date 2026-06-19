@@ -28,7 +28,7 @@ Implementation steps:
 1. Update `crates/transport/tests/public_webrtc_datachannel_e2e.rs` to assert relay-only policy and write a redacted PER-30 artifact on live success.
 2. Add `docs/release/p3-t09-configured-turn-proof-2026-06-19.md` describing the proof, commands, artifact path, skipped-credential behavior, and claim boundary.
 3. Add `scripts/check-configured-turn-proof-p3-t09.mjs` plus an `apps/ui/package.json` wrapper to statically validate the test/report contract and any retained artifact.
-4. Add a task-branch CI job that starts loopback coturn with CI-only credentials, runs the env-gated Chromium relay-only proof, keeps the Rust harness skip-safe while the dependency lacks TURN gathering, validates the artifact redaction contract, and uploads `target/e2e/per-30-configured-turn-proof/`.
+4. Add a task-branch CI job that starts loopback coturn with CI-only credentials, runs the env-gated Chromium relay-only proof, validates the artifact redaction contract, and uploads `target/e2e/per-30-configured-turn-proof/`.
 5. Run static checks and targeted transport tests locally where available; local credentialed live TURN remains skipped unless TURN credentials are present.
 6. Commit, push, open/update PR, pin PR metadata, and hand off to QA with exactly one `@discrypt-qa-tester` mention.
 

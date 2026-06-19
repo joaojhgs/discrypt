@@ -444,7 +444,6 @@ jobs:
       - name: Run configured TURN relay-only browser proof
         run: |
           node scripts/per30-browser-turn-proof.mjs
-          DISCRYPT_PUBLIC_TURN_E2E=0 cargo test -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture
           node scripts/check-configured-turn-proof-p3-t09.mjs
       - name: Capture coturn log
         if: always()
