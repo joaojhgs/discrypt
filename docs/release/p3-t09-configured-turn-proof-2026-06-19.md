@@ -35,6 +35,12 @@ The artifact does not contain raw TURN endpoint, username, credential, SDP, ICE 
 
 ## Evidence
 
+CI live coturn proof on branch `multica/P3-T09-configured-turn-proof`:
+
+- `.github/workflows/ci.yml` runs `PER-30 configured TURN proof` only for this task branch.
+- The job starts loopback coturn with static CI-only credentials, sets `DISCRYPT_PUBLIC_TURN_E2E=1`, runs the relay-only WebRTC DataChannel proof, runs the static artifact redaction gate, and uploads `per30-configured-turn-proof-<run>-<attempt>`.
+- The uploaded directory contains the redacted artifact at `public-turn-relay-only.json` plus `coturn.log`.
+
 Static and skip-safe checks:
 
 - `node scripts/check-configured-turn-proof-p3-t09.mjs`

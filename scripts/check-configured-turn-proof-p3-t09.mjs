@@ -59,6 +59,17 @@ for (const token of [
 
 requireText("apps/ui/package.json", "test:p3-t09-configured-turn-proof");
 
+for (const token of [
+  "per30-configured-turn-proof",
+  "PER-30 configured TURN proof",
+  "turnserver -c",
+  "DISCRYPT_PUBLIC_TURN_E2E: \"1\"",
+  "DISCRYPT_PUBLIC_TURN_ARTIFACT_PATH",
+  "actions/upload-artifact@v4",
+]) {
+  requireText(".github/workflows/ci.yml", token);
+}
+
 forbid(
   "docs/release/p3-t09-configured-turn-proof-2026-06-19.md",
   /DISCRYPT_PUBLIC_TURN_(?:USERNAME|CREDENTIAL)=([^<\s][^\s]*)/,

@@ -27,8 +27,9 @@ Implementation steps:
 1. Update `crates/transport/tests/public_webrtc_datachannel_e2e.rs` to assert relay-only policy and write a redacted PER-30 artifact on live success.
 2. Add `docs/release/p3-t09-configured-turn-proof-2026-06-19.md` describing the proof, commands, artifact path, skipped-credential behavior, and claim boundary.
 3. Add `scripts/check-configured-turn-proof-p3-t09.mjs` plus an `apps/ui/package.json` wrapper to statically validate the test/report contract and any retained artifact.
-4. Run static checks and targeted transport tests locally where available; mark credentialed live TURN as skipped unless TURN credentials are present.
-5. Commit, push, open/update PR, pin PR metadata, and hand off to QA with exactly one `@discrypt-qa-tester` mention.
+4. Add a task-branch CI job that starts loopback coturn with CI-only credentials, runs the env-gated relay-only proof, validates the artifact redaction contract, and uploads `target/e2e/per-30-configured-turn-proof/`.
+5. Run static checks and targeted transport tests locally where available; local credentialed live TURN remains skipped unless TURN credentials are present.
+6. Commit, push, open/update PR, pin PR metadata, and hand off to QA with exactly one `@discrypt-qa-tester` mention.
 
 Failure modes and safety:
 - Missing TURN credentials must skip the live test or fail with a typed credential setup error; it must not fall back to direct-only evidence and claim configured TURN.
@@ -41,6 +42,7 @@ Verification:
 - `npm --prefix apps/ui run test:p3-t09-configured-turn-proof`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture` without TURN envs should skip honestly.
 - With credentials available: `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<redacted> DISCRYPT_PUBLIC_TURN_USERNAME=<redacted> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<redacted> RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture`
+- CI branch proof: `PER-30 configured TURN proof` in `.github/workflows/ci.yml` starts coturn, runs the same test with `DISCRYPT_PUBLIC_TURN_E2E=1`, validates the redacted artifact, and uploads `per30-configured-turn-proof-<run>-<attempt>`.
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `git diff --check`
 
