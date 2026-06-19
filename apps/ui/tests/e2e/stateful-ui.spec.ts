@@ -594,6 +594,47 @@ test("group invite join text channel and voice controls work without fake member
   expect(errors).toEqual([]);
 });
 
+test("channel section plus controls create inline drafts and blur persists only valid names", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(message.text());
+  });
+
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Inline Lab");
+  await page.getByRole("button", { name: /^Create group$/ }).last().click();
+  await expect(page.getByRole("heading", { name: /#general/i })).toBeVisible();
+
+  await page.getByRole("button", { name: /Add text channel/i }).click();
+  await expect(page.getByLabel("Text channel name")).toBeFocused();
+  await page.getByRole("heading", { name: "#general", exact: true }).click();
+  await expect(page.getByLabel("Text channel name")).toHaveCount(0);
+  await expect(page.getByText("#text-channel-name")).toHaveCount(0);
+
+  await page.getByRole("button", { name: /Add text channel/i }).click();
+  await page.getByLabel("Text channel name").fill("ops-blur");
+  await page.getByRole("heading", { name: "#general", exact: true }).click();
+  await expect(page.getByText("#ops-blur").first()).toBeVisible();
+
+  await page.getByRole("button", { name: /Add voice channel/i }).click();
+  await expect(page.getByLabel("Voice channel name")).toBeFocused();
+  await page.getByRole("heading", { name: "#ops-blur", exact: true }).click();
+  await expect(page.getByLabel("Voice channel name")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /voice-room-name/i })).toHaveCount(0);
+
+  await page.getByRole("button", { name: /Add voice channel/i }).click();
+  await page.getByLabel("Voice channel name").fill("Standup Room");
+  await page.getByRole("heading", { name: "#ops-blur", exact: true }).click();
+  await expect(page.getByRole("button", { name: /Standup Room/i })).toBeVisible();
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
+  await expect(page.getByText(/Joined backend voice session/i)).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
 test("expired revoked and max-used invites fail clearly without pending group state", async ({
   page,
 }) => {
