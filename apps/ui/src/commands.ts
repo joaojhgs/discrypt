@@ -147,6 +147,8 @@ export type SnapshotVoiceSessionView = {
 export type PreferencesView = {
   theme_id: string;
   template_id: string;
+  voice_input_device_id: string;
+  voice_output_device_id: string;
 };
 
 export type MessageView = {
@@ -842,6 +844,8 @@ export type CreateChannelRequest = {
 export type SavePreferencesRequest = {
   theme_id: string;
   template_id: string;
+  voice_input_device_id?: string | null;
+  voice_output_device_id?: string | null;
 };
 
 export type StartDmRequest = {
@@ -1278,7 +1282,12 @@ const fallbackSnapshot: AppSnapshot = {
       "Route copy is harness-backed until socket/media adapter E2E passes",
     permission_denied_copy: "",
   },
-  preferences: { theme_id: "graphite-calm", template_id: "command-center" },
+  preferences: {
+    theme_id: "graphite-calm",
+    template_id: "command-center",
+    voice_input_device_id: "default",
+    voice_output_device_id: "default",
+  },
   messages: [],
   activity_feed: [
     "Demo fallback active: packaged Tauri builds must use IPC-backed commands",
@@ -1594,6 +1603,8 @@ function persistFallbackState(): void {
 function syncSnapshot(state: AppState): AppState {
   normalizeVoiceSessionRuntime(state);
   ensureGroupGovernanceDefaults(state);
+  state.preferences.voice_input_device_id ||= "default";
+  state.preferences.voice_output_device_id ||= "default";
   state.snapshot.schema_version = state.schema_version;
   state.snapshot.preferences = state.preferences;
   state.snapshot.devices = state.devices;
@@ -3787,8 +3798,17 @@ export async function savePreferences(
   const normalized = normalizePreferences(request);
   return invokeOrFallback<AppState>("save_preferences", { request: normalized }, () =>
     mutateFallback((state) => {
-      state.preferences = normalized;
-      pushEvent(state, "preferences.saved", "Theme/template preferences saved");
+      state.preferences = {
+        theme_id: normalized.theme_id,
+        template_id: normalized.template_id,
+        voice_input_device_id:
+          normalized.voice_input_device_id ??
+          state.preferences.voice_input_device_id,
+        voice_output_device_id:
+          normalized.voice_output_device_id ??
+          state.preferences.voice_output_device_id,
+      };
+      pushEvent(state, "preferences.saved", "Preferences saved");
     }),
   );
 }
@@ -3796,7 +3816,11 @@ export async function savePreferences(
 function normalizePreferences(request: SavePreferencesRequest): SavePreferencesRequest {
   const themeIds = discryptUiConfig.themes.map((theme) => theme.id);
   const templateIds = discryptUiConfig.templates.map((template) => template.id);
-  return {
+  const normalizeDeviceId = (value: string | null | undefined) => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed.slice(0, 160) : "default";
+  };
+  const normalized: SavePreferencesRequest = {
     theme_id: themeIds.includes(request.theme_id as never)
       ? request.theme_id
       : discryptUiConfig.activeTheme,
@@ -3804,6 +3828,17 @@ function normalizePreferences(request: SavePreferencesRequest): SavePreferencesR
       ? request.template_id
       : discryptUiConfig.activeTemplate,
   };
+  if (request.voice_input_device_id !== undefined) {
+    normalized.voice_input_device_id = normalizeDeviceId(
+      request.voice_input_device_id,
+    );
+  }
+  if (request.voice_output_device_id !== undefined) {
+    normalized.voice_output_device_id = normalizeDeviceId(
+      request.voice_output_device_id,
+    );
+  }
+  return normalized;
 }
 
 export async function setConnectivityPolicy(

@@ -202,6 +202,12 @@ pub struct UiPreferencesView {
     pub theme_id: String,
     /// Active layout template identifier from the frontend template registry.
     pub template_id: String,
+    /// Preferred microphone/input device id, or `default`.
+    #[serde(default = "default_voice_device_preference_id")]
+    pub voice_input_device_id: String,
+    /// Preferred speaker/output device id, or `default`.
+    #[serde(default = "default_voice_device_preference_id")]
+    pub voice_output_device_id: String,
 }
 
 /// Local user profile created or recovered on first run.
@@ -1155,6 +1161,12 @@ pub struct SavePreferencesRequest {
     pub theme_id: String,
     /// Template identifier to persist.
     pub template_id: String,
+    /// Preferred microphone/input device id. Omitted by older clients to preserve the current value.
+    #[serde(default)]
+    pub voice_input_device_id: Option<String>,
+    /// Preferred speaker/output device id. Omitted by older clients to preserve the current value.
+    #[serde(default)]
+    pub voice_output_device_id: Option<String>,
 }
 
 /// Request to start a local DM.
@@ -1961,6 +1973,10 @@ pub struct SetSpeakerVolumeRequest {
 
 fn default_microphone_permission() -> String {
     "unknown".to_owned()
+}
+
+fn default_voice_device_preference_id() -> String {
+    "default".to_owned()
 }
 
 /// Command-surface health for local E2E/smoke execution.
@@ -4218,11 +4234,23 @@ pub fn verify_safety_number(request: SafetyVerificationRequest) -> SafetyVerific
 /// Tauri command: save theme/template preferences.
 pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
     mutate_app_service(|state| {
+        let voice_input_device_id = request
+            .voice_input_device_id
+            .clone()
+            .map(normalize_voice_device_preference_id)
+            .unwrap_or_else(|| state.preferences.voice_input_device_id.clone());
+        let voice_output_device_id = request
+            .voice_output_device_id
+            .clone()
+            .map(normalize_voice_device_preference_id)
+            .unwrap_or_else(|| state.preferences.voice_output_device_id.clone());
         state.preferences = UiPreferencesView {
             theme_id: normalize_theme_id(&request.theme_id),
             template_id: normalize_template_id(&request.template_id),
+            voice_input_device_id,
+            voice_output_device_id,
         };
-        state.push_event("preferences.saved", "Theme/template preferences saved");
+        state.push_event("preferences.saved", "Preferences saved");
     })
 }
 
@@ -8069,6 +8097,8 @@ impl PersistedAppState {
             preferences: UiPreferencesView {
                 theme_id: DEFAULT_THEME_ID.to_owned(),
                 template_id: DEFAULT_TEMPLATE_ID.to_owned(),
+                voice_input_device_id: default_voice_device_preference_id(),
+                voice_output_device_id: default_voice_device_preference_id(),
             },
             dms: Vec::new(),
             groups: Vec::new(),
@@ -17210,6 +17240,15 @@ fn normalize_template_id(value: &str) -> String {
     }
 }
 
+fn normalize_voice_device_preference_id(value: String) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default_voice_device_preference_id()
+    } else {
+        trimmed.chars().take(160).collect()
+    }
+}
+
 fn normalize_channel_name(value: &str, kind: ChannelKind) -> String {
     let trimmed = normalize_label(value.trim_start_matches('#'), "secure-room");
     match kind {
@@ -19543,6 +19582,8 @@ mod tests {
         let themed = save_preferences(SavePreferencesRequest {
             theme_id: "ocean-contrast".to_owned(),
             template_id: "compact-ops".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         assert_eq!(themed.preferences.theme_id, "ocean-contrast");
         assert_eq!(themed.preferences.template_id, "compact-ops");
@@ -20299,6 +20340,8 @@ mod tests {
         let alice_preferences = save_preferences(SavePreferencesRequest {
             theme_id: "ocean-contrast".to_owned(),
             template_id: "compact-ops".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         assert_eq!(alice_preferences.preferences.theme_id, "ocean-contrast");
 
@@ -20518,6 +20561,8 @@ mod tests {
             UiPreferencesView {
                 theme_id: "ocean-contrast".to_owned(),
                 template_id: "compact-ops".to_owned(),
+                voice_input_device_id: default_voice_device_preference_id(),
+                voice_output_device_id: default_voice_device_preference_id(),
             }
         );
         let reloaded_group = alice_reloaded_before_receipt
@@ -20597,6 +20642,8 @@ mod tests {
         save_preferences(SavePreferencesRequest {
             theme_id: "midnight-steel".to_owned(),
             template_id: "command-center".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         let accepted_dm = accept_dm_invite(AcceptDmInviteRequest {
             invite_code: dm_invite.code.clone(),
@@ -27562,6 +27609,8 @@ mod tests {
         let alice_preferences = save_preferences(SavePreferencesRequest {
             theme_id: "ocean-contrast".to_owned(),
             template_id: "compact-ops".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         assert!(alice_preferences.last_command_error.is_none());
 
@@ -27894,6 +27943,8 @@ mod tests {
         save_preferences(SavePreferencesRequest {
             theme_id: "midnight-steel".to_owned(),
             template_id: "command-center".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         reload_global_app_service_from_path(&bob_path);
         let bob_reloaded = app_state();
@@ -29913,18 +29964,45 @@ mod tests {
         let themed = save_preferences(SavePreferencesRequest {
             theme_id: "ocean-contrast".to_owned(),
             template_id: "compact-ops".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         assert_eq!(themed.preferences.theme_id, "ocean-contrast");
         assert_eq!(themed.preferences.template_id, "compact-ops");
+        assert_eq!(themed.preferences.voice_input_device_id, "default");
+        assert_eq!(themed.preferences.voice_output_device_id, "default");
+        let with_audio_devices = save_preferences(SavePreferencesRequest {
+            theme_id: "ocean-contrast".to_owned(),
+            template_id: "compact-ops".to_owned(),
+            voice_input_device_id: Some("studio-mic".to_owned()),
+            voice_output_device_id: Some("desk-speakers".to_owned()),
+        });
+        assert_eq!(
+            with_audio_devices.preferences.voice_input_device_id,
+            "studio-mic"
+        );
+        assert_eq!(
+            with_audio_devices.preferences.voice_output_device_id,
+            "desk-speakers"
+        );
         let reloaded = load_state().to_view();
         assert_eq!(reloaded.preferences.theme_id, "ocean-contrast");
         assert_eq!(reloaded.preferences.template_id, "compact-ops");
+        assert_eq!(reloaded.preferences.voice_input_device_id, "studio-mic");
+        assert_eq!(reloaded.preferences.voice_output_device_id, "desk-speakers");
         let normalized = save_preferences(SavePreferencesRequest {
             theme_id: "not-in-app-config".to_owned(),
             template_id: "also-invalid".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         assert_eq!(normalized.preferences.theme_id, DEFAULT_THEME_ID);
         assert_eq!(normalized.preferences.template_id, DEFAULT_TEMPLATE_ID);
+        assert_eq!(normalized.preferences.voice_input_device_id, "studio-mic");
+        assert_eq!(
+            normalized.preferences.voice_output_device_id,
+            "desk-speakers"
+        );
     }
 
     #[test]
@@ -30110,6 +30188,8 @@ mod tests {
         let themed = save_preferences(SavePreferencesRequest {
             theme_id: "graphite-calm".to_owned(),
             template_id: "command-center".to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
         });
         cursor = assert_cursor_advanced(cursor, &themed);
 
