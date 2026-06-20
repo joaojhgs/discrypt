@@ -1737,27 +1737,9 @@ function App() {
           volume: 82,
         }
       : null;
-  const remoteStreamParticipants: VoiceParticipant[] = Object.keys(
-    voiceRemoteStreams,
-  )
-    .filter(
-      (participantId) =>
-        !backendVoiceParticipants.some(
-          (participant) => participant.id === participantId,
-        ),
-    )
-    .map((participantId) => ({
-      id: participantId,
-      name: `Remote ${participantId}`,
-      role: "remote",
-      speaking: true,
-      muted: false,
-      volume: 82,
-    }));
   const participants = [
     ...(localVoiceParticipant ? [localVoiceParticipant] : []),
     ...backendVoiceParticipants,
-    ...remoteStreamParticipants,
   ];
 
 
