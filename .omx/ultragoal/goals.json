@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T06:38:20.751Z",
-  "updatedAt": "2026-06-20T07:14:37.411Z",
+  "updatedAt": "2026-06-20T07:51:14.463Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -315,6 +315,17 @@
       "updatedAt": "2026-06-20T07:14:37.411Z",
       "evidence": "PER-48/P5-T06 complete: plan .omx/plans/P5-T06-pending-request-reconciliation-2026-06-20.md; apps/desktop/src-tauri/src/lib.rs reducer now keeps first accepted admission decision terminal, logs later conflicts once as admission_request_decision_superseded, and avoids outbound stale refusal frames; tests passed: pending_request_reconciliation, g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests, discrypt-mls-core governance, cargo fmt --check, git diff --check. Evidence is local backend/Tauri harness only.",
       "completedAt": "2026-06-20T07:14:37.411Z"
+    },
+    {
+      "id": "G029-per-49-presence-heartbeat-and-expiry",
+      "title": "PER-49 presence heartbeat and expiry",
+      "objective": "Implement P5-T07 route-backed presence heartbeat and expiry using .omx/plans/P5-T07-presence-heartbeat-expiry-2026-06-20.md; verify no fake local-only online state and local two-profile heartbeat propagation/expiry evidence.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-20T07:42:22.096Z",
+      "updatedAt": "2026-06-20T07:51:14.463Z",
+      "evidence": "PER-49/P5-T07 complete: route-evidenced backend presence publishing fails closed before mutating state without connected text/control session/runtime evidence; UI fallback no longer fabricates online local presence; expiry projection requires presence_expires_at. Verification passed: cargo fmt --check, desktop presence tests, g007 admission presence path, g012 two-profile delivery path, npm typecheck, git diff --check.",
+      "completedAt": "2026-06-20T07:51:14.463Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

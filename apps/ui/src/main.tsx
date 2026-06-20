@@ -1602,8 +1602,10 @@ function App() {
           await syncTextRuntimeForState(latestState, false);
           return;
         }
+        const routedState = await syncTextRuntimeForState(latestState, false);
+        if (cancelled) return;
         const presenceState = await publishGroupPresence({
-          group_id: latestGroupId,
+          group_id: routedState?.active_context?.group_id ?? latestGroupId,
           member_id: null,
           status: "online",
           ttl_seconds: 120,
@@ -1611,7 +1613,6 @@ function App() {
         if (cancelled) return;
         setCommandState(presenceState);
         commandStateRef.current = presenceState;
-        await syncTextRuntimeForState(presenceState, false);
       } catch (_error) {
       } finally {
         groupPresenceInFlightRef.current = false;
@@ -3066,7 +3067,7 @@ function activePaneSummary(
 function isPresenceOnline(member: GroupMemberView): boolean {
   if (member.status === "revoked") return false;
   if (member.status === "offline" || member.status === "unknown") return false;
-  if (!member.presence_expires_at) return member.status === "online";
+  if (!member.presence_expires_at) return false;
   return Date.parse(member.presence_expires_at) > Date.now();
 }
 
@@ -3077,22 +3078,7 @@ function normalizedGroupMembers(
   if (!group) return [];
   const members = group.members ?? [];
   if (members.length > 0) return members;
-  const now = new Date().toISOString();
-  return [
-    {
-      member_id: state.profile?.user_id ?? "local-profile-pending",
-      display_name: state.profile?.display_name ?? "You",
-      device_id: state.profile?.device_name ?? null,
-      role: (group.role as GroupRoleView) || "member",
-      status: "online",
-      signer_public_key_hex: null,
-      joined_at: now,
-      last_seen_at: now,
-      presence_expires_at: new Date(Date.now() + 300_000).toISOString(),
-      revoked_at: null,
-      revoked_by: null,
-    },
-  ];
+  return [];
 }
 
 function localGroupRoleForUi(
