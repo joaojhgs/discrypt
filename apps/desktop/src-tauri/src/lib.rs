@@ -15921,51 +15921,62 @@ fn apply_group_member_revoked(
     let local_member_id = state.local_user_id();
     let local_display = profile_display_name(state);
     ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
-    let Some(group) = state
-        .groups
-        .iter_mut()
-        .find(|group| group.group_id == group_id)
-    else {
-        return;
-    };
-    if group
-        .governance_log
-        .iter()
-        .any(|entry| entry.event_id == event_id)
-    {
-        return;
+    if target_member_id == local_member_id {
+        state
+            .openmls_groups
+            .retain(|record| record.group_id != group_id);
+        state.push_event(
+            "mls.member_removed_local",
+            "Removed local OpenMLS group handle after local member revocation",
+        );
     }
-    let mut role_before = None;
-    if let Some(member) = group
-        .members
-        .iter_mut()
-        .find(|member| member.member_id == target_member_id)
     {
-        role_before = Some(member.role.clone());
-        member.status = "revoked".to_owned();
-        member.revoked_at = Some(created_at.to_owned());
-        member.revoked_by = Some(actor_member_id.to_owned());
-        member.last_seen_at = None;
-        member.presence_expires_at = None;
-        if target_member_id == local_member_id {
-            group.role = "revoked".to_owned();
+        let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+        else {
+            return;
+        };
+        if group
+            .governance_log
+            .iter()
+            .any(|entry| entry.event_id == event_id)
+        {
+            return;
         }
+        let mut role_before = None;
+        if let Some(member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == target_member_id)
+        {
+            role_before = Some(member.role.clone());
+            member.status = "revoked".to_owned();
+            member.revoked_at = Some(created_at.to_owned());
+            member.revoked_by = Some(actor_member_id.to_owned());
+            member.last_seen_at = None;
+            member.presence_expires_at = None;
+            if target_member_id == local_member_id {
+                group.role = "revoked".to_owned();
+            }
+        }
+        group.governance_log.push(governance_log_entry(
+            event_id,
+            group_id,
+            "member.revoked",
+            actor_member_id,
+            Some(target_member_id),
+            role_before,
+            None,
+            created_at,
+            if crypto_removal_status == "openmls_remove_member_commit_applied" {
+                "Applied replicated member revocation with OpenMLS remove-member commit"
+            } else {
+                "Applied replicated fail-closed member revocation without OpenMLS commit"
+            },
+        ));
     }
-    group.governance_log.push(governance_log_entry(
-        event_id,
-        group_id,
-        "member.revoked",
-        actor_member_id,
-        Some(target_member_id),
-        role_before,
-        None,
-        created_at,
-        if crypto_removal_status == "openmls_remove_member_commit_applied" {
-            "Applied replicated member revocation with OpenMLS remove-member commit"
-        } else {
-            "Applied replicated fail-closed member revocation without OpenMLS commit"
-        },
-    ));
 }
 
 struct GroupPresenceHeartbeatEvent<'a> {
@@ -18495,6 +18506,17 @@ mod tests {
             bob.state.handle_text_control_frame(notice_frame),
             Some(TextControlFrameView::GroupGovernanceAck { status, .. }) if status == "member_revoked_notice_applied"
         ));
+        assert!(
+            !bob.state
+                .openmls_groups
+                .iter()
+                .any(|handle| handle.group_id == group_id),
+            "revoked target must drop its local OpenMLS group handle after accepting its own revoke notice"
+        );
+        assert!(
+            bob.state.openmls_text_exporter_secret(&group_id).is_err(),
+            "revoked target must not retain text decrypt/exporter authority after local revoke"
+        );
         assert!(matches!(
             bob.state.handle_text_control_frame(frame),
             Some(TextControlFrameView::GroupGovernanceAck { status, .. }) if status == "member_revoked_commit_failed"
@@ -18503,7 +18525,7 @@ mod tests {
             .state
             .openmls_groups
             .iter()
-            .any(|handle| handle.group_id == group_id));
+            .all(|handle| handle.group_id != group_id));
         Ok(())
     }
 
