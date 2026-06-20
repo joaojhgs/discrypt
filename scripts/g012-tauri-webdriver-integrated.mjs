@@ -374,6 +374,13 @@ async function publishBackendNativeVoiceProof(profile) {
     session_id: session.session_id,
     local_peer_id: peers.local,
     remote_peer_id: peers.remote,
+    mic_gain_percent: nativeMedia.mic_gain_percent,
+    app_output_volume_percent: nativeMedia.app_output_volume_percent,
+    rms_i16: nativeMedia.rms_i16,
+    peak_i16: nativeMedia.peak_i16,
+    speaking: nativeMedia.speaking,
+    opus_payload_bytes: nativeMedia.opus_payload_bytes,
+    protected_payload_bytes: nativeMedia.protected_payload_bytes,
     protected_frames_count: nativeMedia.protected_frames_count,
     queued_signaling_status: queued?.voice_session?.signaling?.status_copy ?? null,
   };
@@ -439,6 +446,48 @@ async function acceptPendingNativeVoiceSignals(profile, label) {
 }
 async function appState(profile) {
   return invokeTauriCommand(profile, "app_state", {});
+}
+async function configureReleaseSmokeAudioPreferences(profiles) {
+  const targets = {
+    alice: { mic_gain_percent: 155, app_output_volume_percent: 37 },
+    bob: { mic_gain_percent: 120, app_output_volume_percent: 64 },
+  };
+  const reports = {};
+  for (const [name, profile] of Object.entries(profiles)) {
+    const before = await appState(profile);
+    const target = targets[name];
+    if (!target) continue;
+    const saved = await invokeTauriCommand(profile, "save_preferences", {
+      request: {
+        theme_id: before?.preferences?.theme_id || "midnight-mono",
+        template_id: before?.preferences?.template_id || "dense-chat",
+        voice_input_device_id: before?.preferences?.voice_input_device_id || "default",
+        voice_output_device_id: before?.preferences?.voice_output_device_id || "default",
+        mic_gain_percent: target.mic_gain_percent,
+        app_output_volume_percent: target.app_output_volume_percent,
+      },
+    });
+    reports[name] = {
+      target,
+      before: before?.preferences ?? null,
+      after: saved?.preferences ?? null,
+      persisted: saved?.preferences?.mic_gain_percent === target.mic_gain_percent &&
+        saved?.preferences?.app_output_volume_percent === target.app_output_volume_percent,
+    };
+  }
+  manifest.per59_audio_preferences = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
+}
+async function readReleaseSmokeAudioPreferences(profiles, label) {
+  const reports = {};
+  for (const [name, profile] of Object.entries(profiles)) {
+    const state = await appState(profile);
+    reports[name] = state?.preferences ?? null;
+  }
+  manifest[`per59_audio_preferences_${label.replace(/\W+/g, "_")}`] = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
 }
 function providerRuntimeProofed(state) {
   const diagnostics = state?.transport_diagnostics || {};
@@ -892,6 +941,44 @@ async function leaveVoice(profile) {
   await click(profile, "leave call");
   await waitUntil(profile, "left voice", "return /not joined/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackStopCount > 0;");
 }
+async function adjustRemoteParticipantVolume(profile, volume) {
+  const state = await appState(profile);
+  const session = state?.voice_session;
+  const participant = session?.participants?.find((item) => item?.role === "remote" && item?.id);
+  if (!session?.session_id || !participant?.id) {
+    return {
+      profile: profile.display_name,
+      volume,
+      changed: false,
+      reason: "No backend-admitted remote voice participant was visible",
+    };
+  }
+  const updated = await invokeTauriCommand(profile, "set_speaker_volume", {
+    request: {
+      session_id: session.session_id,
+      participant_id: participant.id,
+      volume,
+    },
+  });
+  const after = updated?.voice_session?.participants?.find((item) => item?.id === participant.id);
+  return {
+    profile: profile.display_name,
+    participant_id: participant.id,
+    volume,
+    changed: after?.volume === volume,
+    after_volume: after?.volume ?? null,
+    last_command_error: updated?.last_command_error ?? null,
+  };
+}
+async function adjustRemoteParticipantVolumes(profiles) {
+  const reports = {
+    alice: await adjustRemoteParticipantVolume(profiles.alice, 41),
+    bob: await adjustRemoteParticipantVolume(profiles.bob, 73),
+  };
+  manifest.per59_remote_participant_volume = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
+}
 async function voiceCallFlow(profiles) {
   await Promise.all([installVoiceHarness(profiles.alice), installVoiceHarness(profiles.bob)]);
   if (requireNativeVoice) {
@@ -931,8 +1018,10 @@ async function voiceCallFlow(profiles) {
     ]);
     if (observed.every(Boolean)) break;
   }
+  const remoteParticipantVolume = await adjustRemoteParticipantVolumes(profiles);
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
+  const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_reload");
   await Promise.all([
     waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
     waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
@@ -945,6 +1034,10 @@ async function voiceCallFlow(profiles) {
   };
   await click(profiles.alice, "mute my microphone");
   await waitUntil(profiles.alice, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
+  const afterMute = {
+    alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
+    bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
+  };
   await click(profiles.alice, "mute my microphone");
   await Promise.all([leaveVoice(profiles.alice), leaveVoice(profiles.bob)]);
   return {
@@ -952,7 +1045,10 @@ async function voiceCallFlow(profiles) {
     bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     backend_native_proofs: backendNativeProofs,
     per56_provider_runtime_voice_signaling: providerVoiceSignaling,
+    remote_participant_volume: remoteParticipantVolume,
+    reloaded_audio_preferences: reloadedAudioPreferences,
     before_leave: beforeLeave,
+    after_mute: afterMute,
   };
 }
 async function voiceFlow(profile) {
@@ -992,6 +1088,7 @@ try {
   writeManifest("sessions-ready", { sessions: Object.fromEntries(Object.entries(profiles).map(([k, p]) => [k, { session_id: p.session_id, capabilities: p.capabilities }])), });
   await setupProfile(profiles.alice);
   await setupProfile(profiles.bob);
+  const audioPreferences = await configureReleaseSmokeAudioPreferences(profiles);
   const invite = await createGroupInvite(profiles.alice);
   await joinGroup(profiles.bob, invite);
   await bridgeTextControlFramesBidirectional(profiles, "openmls-admission", 8);
@@ -1070,8 +1167,68 @@ try {
           nativeRTCPeerConnectionAvailable: Boolean(voice.bob.nativeRTCPeerConnectionAvailable),
           nativeGeneratedAudioTrackAvailable: Boolean(voice.bob.nativeGeneratedAudioTrackAvailable),
           fallbackReason: voice.bob.fallbackReason ?? null,
-        }
+      }
       : null,
+  };
+  const expectedAudioPreferences = {
+    alice: { mic_gain_percent: 155, app_output_volume_percent: 37 },
+    bob: { mic_gain_percent: 120, app_output_volume_percent: 64 },
+  };
+  const audioPreferencesPersisted = Object.entries(expectedAudioPreferences).every(([name, expected]) => {
+    const saved = audioPreferences?.[name]?.after;
+    const reloaded = voice?.reloaded_audio_preferences?.[name];
+    return saved?.mic_gain_percent === expected.mic_gain_percent &&
+      saved?.app_output_volume_percent === expected.app_output_volume_percent &&
+      reloaded?.mic_gain_percent === expected.mic_gain_percent &&
+      reloaded?.app_output_volume_percent === expected.app_output_volume_percent;
+  });
+  const nativeMediaUsesConfiguredAudio = Boolean(
+    Array.isArray(voice?.backend_native_proofs) &&
+      voice.backend_native_proofs.length >= 2 &&
+      voice.backend_native_proofs.every((proof) => {
+        const name = String(proof?.profile || "").toLowerCase();
+        const expected = expectedAudioPreferences[name];
+        return expected &&
+          proof.mic_gain_percent === expected.mic_gain_percent &&
+          proof.app_output_volume_percent === expected.app_output_volume_percent &&
+          proof.protected_frames_count > 0 &&
+          proof.opus_payload_bytes > 0 &&
+          proof.protected_payload_bytes > 0;
+      }),
+  );
+  const remoteParticipantVolumeChanged = Boolean(
+    voice?.remote_participant_volume?.alice?.changed &&
+      voice?.remote_participant_volume?.bob?.changed,
+  );
+  const muteObserved = Boolean(voice?.after_mute?.alice?.evidence?.trackEnabled === false);
+  const leaveCleanupObserved = Boolean(voice?.alice?.trackStopCount > 0 && voice?.bob?.trackStopCount > 0);
+  const speakingEvidenceObserved = Boolean(
+    Array.isArray(voice?.backend_native_proofs) &&
+      voice.backend_native_proofs.every((proof) => proof?.speaking && proof?.rms_i16 > 0 && proof?.peak_i16 > 0),
+  );
+  const per59ReleaseSmoke = {
+    issue: "PER-59 / P6-T08 human or loopback release smoke",
+    native_path_required: true,
+    browser_shim_or_raw_pulse_capture_counts_as_production: false,
+    join_proved: Boolean(voice?.backend_native_proofs?.length >= 2),
+    mute_proved: muteObserved,
+    speaking_vad_proved: speakingEvidenceObserved,
+    mic_gain_and_output_volume_proved: audioPreferencesPersisted && nativeMediaUsesConfiguredAudio,
+    per_peer_volume_surface_proved: remoteParticipantVolumeChanged,
+    native_loopback_proved: nativeVoiceLoopbackObserved,
+    leave_cleanup_proved: leaveCleanupObserved,
+    production_claim_allowed: Boolean(
+      nativeVoiceLoopbackObserved &&
+        audioPreferencesPersisted &&
+        nativeMediaUsesConfiguredAudio &&
+        remoteParticipantVolumeChanged &&
+        muteObserved &&
+        leaveCleanupObserved &&
+        speakingEvidenceObserved,
+    ),
+    configured_audio_preferences: audioPreferences,
+    reloaded_audio_preferences: voice?.reloaded_audio_preferences ?? null,
+    remote_participant_volume: voice?.remote_participant_volume ?? null,
   };
   const summary = {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",
@@ -1094,6 +1251,7 @@ try {
         ? "physical two-device microphone/speaker proof is still outside this automated native Rust/generated-audio harness"
         : "native RTCPeerConnection generated-audio loopback was not observed in both Tauri WebViews",
     },
+    per59_release_smoke: per59ReleaseSmoke,
     run_id: runId,
     artifact_root: rel(artifactRoot),
     invite_prefix: invite.slice(0, 48),
