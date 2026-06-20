@@ -31,6 +31,8 @@ pub use policy::{
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingProviderEndpoint,
 };
+#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+pub use provider_adapters::start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 pub use provider_adapters::IpfsPubsubProviderAdapter;
 #[cfg(feature = "mqtt-adapter")]
