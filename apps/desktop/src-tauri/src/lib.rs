@@ -8465,13 +8465,21 @@ impl PersistedAppState {
             .iter_mut()
             .find(|request| request.request_id == request_id)
             .ok_or_else(|| "Admission request does not exist".to_owned())?;
+        let decided_status = if approved { "approved" } else { "refused" };
         if request.status != "pending" {
+            if request.status == decided_status
+                && request.decided_by.as_deref() == Some(decided_by)
+                && request.decided_at.as_deref() == Some(decided_at)
+                && request.decision_reason == reason
+            {
+                return Ok(());
+            }
             return Err(format!(
                 "Admission request {request_id} is already {}",
                 request.status
             ));
         }
-        request.status = if approved { "approved" } else { "refused" }.to_owned();
+        request.status = decided_status.to_owned();
         request.decided_by = Some(decided_by.to_owned());
         request.decided_at = Some(decided_at.to_owned());
         request.decision_reason = reason.clone();
@@ -17340,6 +17348,36 @@ mod tests {
             .and_then(|member| member.signer_public_key_hex.clone())
     }
 
+    fn group_member_status(
+        state: &PersistedAppState,
+        group_id: &str,
+        member_id: &str,
+    ) -> Option<String> {
+        state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)?
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .map(|member| member.status.clone())
+    }
+
+    fn admission_request_status(
+        state: &PersistedAppState,
+        group_id: &str,
+        request_id: &str,
+    ) -> Option<String> {
+        state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)?
+            .admission_requests
+            .iter()
+            .find(|request| request.request_id == request_id)
+            .map(|request| request.status.clone())
+    }
+
     fn governance_log_count(state: &PersistedAppState, group_id: &str, event_id: &str) -> usize {
         state
             .groups
@@ -17350,6 +17388,29 @@ mod tests {
                     .governance_log
                     .iter()
                     .filter(|entry| entry.event_id == event_id)
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    fn governance_log_request_count(
+        state: &PersistedAppState,
+        group_id: &str,
+        request_id: &str,
+        event_kind: &str,
+    ) -> usize {
+        state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .map(|group| {
+                group
+                    .governance_log
+                    .iter()
+                    .filter(|entry| {
+                        entry.request_id.as_deref() == Some(request_id)
+                            && entry.event_kind == event_kind
+                    })
                     .count()
             })
             .unwrap_or_default()
@@ -18219,6 +18280,221 @@ mod tests {
                 Some(GroupRoleView::Staff)
             );
         }
+    }
+
+    #[test]
+    fn governance_frame_replication_reconciles_after_offline_reconnect() -> Result<(), String> {
+        let _lock = test_lock();
+        let owner_path = reset_with_temp_state("governance-replication-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice Governance".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Governance Replication Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert_eq!(created.last_command_error, None, "{created:?}");
+        let group_id = created.groups[0].group_id.clone();
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+        persist_current_test_state();
+
+        let owner_group = load_state_from_path(&owner_path)
+            .groups
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "owner group persisted".to_owned())?;
+        let bob_path = create_test_profile_state_with_group(
+            "governance-replication-bob",
+            "Bob Governance",
+            "member-bob",
+            GroupRoleView::Member,
+            owner_group,
+        );
+
+        let request_id = upsert_test_admission_request(&group_id, "joiner-replayed");
+        {
+            let mut offline_bob = TauriAppService::load_for_test_path(bob_path.clone());
+            offline_bob
+                .state
+                .upsert_pending_group_admission_request(
+                    &group_id,
+                    "joiner-replayed",
+                    "abababababababababababababababababababababababababababababababab",
+                    b"joiner-replayed-key-package",
+                )
+                .map_err(|error| format!("bob pending request setup failed: {error}"))?;
+            offline_bob.persist();
+        }
+
+        let refused = refuse_group_admission_request(RefuseGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+            reason: Some("owner refusal replicated".to_owned()),
+        });
+        assert_eq!(refused.last_command_error, None, "{refused:?}");
+        let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(promoted.last_command_error, None, "{promoted:?}");
+        let revoked = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+            reason: Some("policy".to_owned()),
+        });
+        assert_eq!(revoked.last_command_error, None, "{revoked:?}");
+
+        let owner_before_pump = load_state_from_path(&owner_path);
+        let queued_frames = owner_before_pump
+            .text_control_outbox
+            .iter()
+            .map(|record| record.frame.clone())
+            .collect::<Vec<_>>();
+        let decision_frame = queued_frames
+            .iter()
+            .find(|frame| matches!(frame, TextControlFrameView::GroupAdmissionDecision { .. }))
+            .cloned()
+            .ok_or_else(|| "queued admission decision frame missing".to_owned())?;
+        let role_frame = queued_frames
+            .iter()
+            .find(|frame| matches!(frame, TextControlFrameView::GroupMemberRoleChanged { .. }))
+            .cloned()
+            .ok_or_else(|| "queued role-change frame missing".to_owned())?;
+        let role_event_id = match &role_frame {
+            TextControlFrameView::GroupMemberRoleChanged { event_id, .. } => event_id.clone(),
+            _ => unreachable!("filtered role-change frame"),
+        };
+        let revoke_event_ids = queued_frames
+            .iter()
+            .filter_map(|frame| match frame {
+                TextControlFrameView::GroupMemberRevoked { event_id, .. } => Some(event_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !revoke_event_ids.is_empty(),
+            "revocation must queue at least one governance frame"
+        );
+
+        reload_global_app_service_from_path(&owner_path);
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("governance-replication-reconnect".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert_eq!(started.last_command_error, None, "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "text session should be active".to_owned())?;
+        let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(bob_path.clone()),
+        ));
+        attach_text_control_transport_runtime_for_test(bob_receiver.clone(), active_session_id);
+
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: None,
+        };
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: None,
+            operation_timeout_ms: None,
+        });
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.pending_before, queued_frames.len());
+        assert_eq!(report.frames_sent, queued_frames.len());
+        assert!(
+            report.response_frames_received >= 2,
+            "role and revoke governance frames should return acknowledgements: {report:?}"
+        );
+
+        let bob_after_reconnect = load_state_from_path(&bob_path);
+        assert_eq!(
+            admission_request_status(&bob_after_reconnect, &group_id, &request_id),
+            Some("refused".to_owned())
+        );
+        assert_eq!(
+            group_member_role(&bob_after_reconnect, &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+        assert_eq!(
+            group_member_status(&bob_after_reconnect, &group_id, "member-bob"),
+            Some("revoked".to_owned())
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &bob_after_reconnect,
+                &group_id,
+                &request_id,
+                "admission_request_refused"
+            ),
+            1
+        );
+        assert_eq!(
+            governance_log_count(&bob_after_reconnect, &group_id, &role_event_id),
+            1
+        );
+        for event_id in &revoke_event_ids {
+            assert_eq!(
+                governance_log_count(&bob_after_reconnect, &group_id, event_id),
+                1
+            );
+        }
+
+        let mut bob_replay = TauriAppService::load_for_test_path(bob_path.clone());
+        bob_replay.state.handle_text_control_frame(decision_frame);
+        bob_replay.state.handle_text_control_frame(role_frame);
+        for frame in queued_frames
+            .into_iter()
+            .filter(|frame| matches!(frame, TextControlFrameView::GroupMemberRevoked { .. }))
+        {
+            bob_replay.state.handle_text_control_frame(frame);
+        }
+        bob_replay.persist();
+        let bob_after_replay = load_state_from_path(&bob_path);
+        assert_eq!(
+            admission_request_status(&bob_after_replay, &group_id, &request_id),
+            Some("refused".to_owned())
+        );
+        assert_eq!(
+            group_member_role(&bob_after_replay, &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+        assert_eq!(
+            group_member_status(&bob_after_replay, &group_id, "member-bob"),
+            Some("revoked".to_owned())
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &bob_after_replay,
+                &group_id,
+                &request_id,
+                "admission_request_refused"
+            ),
+            1
+        );
+        assert_eq!(
+            governance_log_count(&bob_after_replay, &group_id, &role_event_id),
+            1
+        );
+        for event_id in &revoke_event_ids {
+            assert_eq!(
+                governance_log_count(&bob_after_replay, &group_id, event_id),
+                1
+            );
+        }
+        clear_text_control_transport_runtime_for_test();
+        Ok(())
     }
 
     #[test]
