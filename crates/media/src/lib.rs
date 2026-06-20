@@ -18,11 +18,12 @@ pub mod transform_bridge;
 pub mod transport;
 
 pub use capture::{
-    AudioCaptureFormat, CapturedAudioFrame, DecodedAudioFrame, EncodedOpusFrame, OpusAudioDecoder,
-    OpusAudioEncoder, PlaybackAudioSink, PlaybackVolumeMixer, ProtectedMediaFrameSink,
-    SpeakerPlaybackKey, VoiceActivityDetector, VoiceActivityLevel, VoiceActivitySource,
-    VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceCaptureSendReport, VoiceJitterBuffer,
-    VoiceReceiveSFramePipeline,
+    apply_app_output_volume_percent, apply_microphone_gain_percent, AudioCaptureFormat,
+    CapturedAudioFrame, DecodedAudioFrame, EncodedOpusFrame, OpusAudioDecoder, OpusAudioEncoder,
+    PlaybackAudioSink, PlaybackVolumeMixer, ProtectedMediaFrameSink, SpeakerPlaybackKey,
+    VoiceActivityDetector, VoiceActivityLevel, VoiceActivitySource, VoiceCaptureSFramePipeline,
+    VoiceCaptureSendOutcome, VoiceCaptureSendReport, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
+    APP_AUDIO_GAIN_UNITY_PERCENT, APP_OUTPUT_VOLUME_MAX_PERCENT, MIC_GAIN_MAX_PERCENT,
 };
 pub use sframe::{
     MediaError, MediaKeyRegistry, ProtectedFrame, ReplayWindow, SFrameKey, SFrameReceiver,

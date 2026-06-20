@@ -149,6 +149,8 @@ export type PreferencesView = {
   template_id: string;
   voice_input_device_id: string;
   voice_output_device_id: string;
+  mic_gain_percent: number;
+  app_output_volume_percent: number;
 };
 
 export type MessageView = {
@@ -846,6 +848,8 @@ export type SavePreferencesRequest = {
   template_id: string;
   voice_input_device_id?: string | null;
   voice_output_device_id?: string | null;
+  mic_gain_percent?: number | null;
+  app_output_volume_percent?: number | null;
 };
 
 export type StartDmRequest = {
@@ -961,6 +965,8 @@ export type NativeVoiceMediaSignalPayload = {
   protected_frames_count: number;
   opus_payload_bytes: number;
   protected_payload_bytes: number;
+  mic_gain_percent: number;
+  app_output_volume_percent: number;
   protected_frames: NativeVoiceProtectedFrameView[];
   created_at_ms: number;
 };
@@ -1287,6 +1293,8 @@ const fallbackSnapshot: AppSnapshot = {
     template_id: "command-center",
     voice_input_device_id: "default",
     voice_output_device_id: "default",
+    mic_gain_percent: 100,
+    app_output_volume_percent: 100,
   },
   messages: [],
   activity_feed: [
@@ -1605,6 +1613,18 @@ function syncSnapshot(state: AppState): AppState {
   ensureGroupGovernanceDefaults(state);
   state.preferences.voice_input_device_id ||= "default";
   state.preferences.voice_output_device_id ||= "default";
+  state.preferences.mic_gain_percent = clampPercent(
+    state.preferences.mic_gain_percent,
+    0,
+    200,
+    100,
+  );
+  state.preferences.app_output_volume_percent = clampPercent(
+    state.preferences.app_output_volume_percent,
+    0,
+    100,
+    100,
+  );
   state.snapshot.schema_version = state.schema_version;
   state.snapshot.preferences = state.preferences;
   state.snapshot.devices = state.devices;
@@ -3807,6 +3827,11 @@ export async function savePreferences(
         voice_output_device_id:
           normalized.voice_output_device_id ??
           state.preferences.voice_output_device_id,
+        mic_gain_percent:
+          normalized.mic_gain_percent ?? state.preferences.mic_gain_percent,
+        app_output_volume_percent:
+          normalized.app_output_volume_percent ??
+          state.preferences.app_output_volume_percent,
       };
       pushEvent(state, "preferences.saved", "Preferences saved");
     }),
@@ -3838,7 +3863,28 @@ function normalizePreferences(request: SavePreferencesRequest): SavePreferencesR
       request.voice_output_device_id,
     );
   }
+  if (request.mic_gain_percent !== undefined) {
+    normalized.mic_gain_percent = clampPercent(request.mic_gain_percent, 0, 200, 100);
+  }
+  if (request.app_output_volume_percent !== undefined) {
+    normalized.app_output_volume_percent = clampPercent(
+      request.app_output_volume_percent,
+      0,
+      100,
+      100,
+    );
+  }
   return normalized;
+}
+
+function clampPercent(
+  value: number | null | undefined,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(value)));
 }
 
 export async function setConnectivityPolicy(

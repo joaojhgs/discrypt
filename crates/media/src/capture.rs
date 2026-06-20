@@ -18,6 +18,12 @@ const MAX_OPUS_FRAME_DATA_BYTES: usize = 1_274;
 pub const SPEAKER_VOLUME_UNITY_MILLIPERCENT: u16 = 1_000;
 /// Keep local playback gain bounded to avoid clipping abuse or accidental runaway amplification.
 pub const SPEAKER_VOLUME_MAX_MILLIPERCENT: u16 = 2_000;
+/// Unity app audio gain expressed as a percentage.
+pub const APP_AUDIO_GAIN_UNITY_PERCENT: u16 = 100;
+/// Maximum app microphone gain. Output volume is intentionally capped separately at 100%.
+pub const MIC_GAIN_MAX_PERCENT: u16 = 200;
+/// Maximum app-owned output volume. This does not claim hardware/system volume control.
+pub const APP_OUTPUT_VOLUME_MAX_PERCENT: u16 = 100;
 
 /// PCM capture format accepted by the production voice send path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -385,6 +391,39 @@ fn apply_volume(sample: i16, volume_millipercent: u16) -> i16 {
     let scaled =
         sample as i32 * volume_millipercent as i32 / SPEAKER_VOLUME_UNITY_MILLIPERCENT as i32;
     scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Apply bounded app microphone gain to captured PCM before Opus/SFrame handling.
+pub fn apply_microphone_gain_percent(
+    pcm_i16: &mut [i16],
+    gain_percent: u16,
+) -> Result<(), MediaError> {
+    if gain_percent > MIC_GAIN_MAX_PERCENT {
+        return Err(MediaError::InvalidPlaybackVolume(gain_percent));
+    }
+    apply_percent_gain(pcm_i16, gain_percent);
+    Ok(())
+}
+
+/// Apply bounded app-owned output volume to decoded/playback PCM.
+///
+/// This is local app mixing only; it does not mutate the operating system or hardware volume.
+pub fn apply_app_output_volume_percent(
+    pcm_i16: &mut [i16],
+    volume_percent: u16,
+) -> Result<(), MediaError> {
+    if volume_percent > APP_OUTPUT_VOLUME_MAX_PERCENT {
+        return Err(MediaError::InvalidPlaybackVolume(volume_percent));
+    }
+    apply_percent_gain(pcm_i16, volume_percent);
+    Ok(())
+}
+
+fn apply_percent_gain(pcm_i16: &mut [i16], percent: u16) {
+    for sample in pcm_i16 {
+        let scaled = *sample as i32 * percent as i32 / APP_AUDIO_GAIN_UNITY_PERCENT as i32;
+        *sample = scaled.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
 }
 
 /// Source of a voice activity/audio-level event.
@@ -1056,6 +1095,36 @@ mod tests {
         assert_eq!(report.sequence, 0);
         let sink = pipeline.into_sink();
         assert_eq!(sink.sent.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn app_audio_gain_applies_microphone_and_output_mixing_bounds() -> Result<(), MediaError> {
+        let mut capture = vec![-20_000, -1_000, 0, 1_000, 20_000];
+        apply_microphone_gain_percent(&mut capture, 0)?;
+        assert_eq!(capture, vec![0, 0, 0, 0, 0]);
+
+        let mut capture = vec![-20_000, -1_000, 0, 1_000, 20_000];
+        apply_microphone_gain_percent(&mut capture, 150)?;
+        assert_eq!(capture, vec![-30_000, -1_500, 0, 1_500, 30_000]);
+
+        let mut capture = vec![20_000, i16::MAX, i16::MIN];
+        apply_microphone_gain_percent(&mut capture, MIC_GAIN_MAX_PERCENT)?;
+        assert_eq!(capture, vec![32_767, 32_767, -32_768]);
+        assert_eq!(
+            apply_microphone_gain_percent(&mut capture, MIC_GAIN_MAX_PERCENT + 1),
+            Err(MediaError::InvalidPlaybackVolume(MIC_GAIN_MAX_PERCENT + 1))
+        );
+
+        let mut playback = vec![-20_000, 10_000, i16::MAX];
+        apply_app_output_volume_percent(&mut playback, 50)?;
+        assert_eq!(playback, vec![-10_000, 5_000, 16_383]);
+        assert_eq!(
+            apply_app_output_volume_percent(&mut playback, APP_OUTPUT_VOLUME_MAX_PERCENT + 1),
+            Err(MediaError::InvalidPlaybackVolume(
+                APP_OUTPUT_VOLUME_MAX_PERCENT + 1
+            ))
+        );
         Ok(())
     }
 
