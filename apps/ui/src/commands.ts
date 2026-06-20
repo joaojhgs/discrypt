@@ -1400,11 +1400,11 @@ function ensureGroupGovernance(
       display_name: governanceDisplayName(state),
       device_id: state.profile?.device_name ?? null,
       role: localRole,
-      status: "online",
+      status: "unknown",
       signer_public_key_hex: null,
       joined_at: now,
-      last_seen_at: now,
-      presence_expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      last_seen_at: null,
+      presence_expires_at: null,
       revoked_at: null,
       revoked_by: null,
     });
@@ -4277,18 +4277,11 @@ export async function revokeGroupMemberAccess(
 export async function publishGroupPresence(
   request: PublishGroupPresenceRequest,
 ): Promise<AppState> {
-  return invokeOrFallback<AppState>("publish_group_presence", { request }, () =>
-    mutateFallback((state) => {
-      const group = findGovernedGroup(state, request.group_id);
-      const member = group.members?.find((item) => item.member_id === localMemberId(state));
-      if (!member || member.status === "revoked") return;
-      const now = isoNow();
-      member.status = request.status ?? "online";
-      member.last_seen_at = now;
-      member.presence_expires_at = new Date(Date.now() + Math.max(30, request.ttl_seconds ?? 300) * 1000).toISOString();
-      pushEvent(state, "group.presence", `Published ${request.status ?? "online"} presence for ${group.name}`);
-    }),
-  );
+  return invokeOrFallback<AppState>("publish_group_presence", { request }, () => {
+    throw new Error(
+      "publish_group_presence requires backend route evidence; browser fallback cannot claim online presence",
+    );
+  });
 }
 
 export async function setActiveGroup(

@@ -2714,6 +2714,68 @@ impl TauriAppService {
         }
     }
 
+    fn group_presence_route_evidence(
+        &self,
+        group_id: &str,
+    ) -> Result<(), (&'static str, String, String)> {
+        let Some(context) = self.state.active_context.as_ref() else {
+            return Err((
+                "active_group_missing",
+                "No active group context is selected for presence publication".to_owned(),
+                "Open the group and attach its backend text/control runtime before publishing online presence".to_owned(),
+            ));
+        };
+        if context.group_id.as_deref() != Some(group_id) {
+            return Err((
+                "active_group_mismatch",
+                format!(
+                    "Presence group {} is not the active backend group context",
+                    redacted_observable_ref("group", group_id)
+                ),
+                "Select the target group so presence can be bound to its backend route evidence"
+                    .to_owned(),
+            ));
+        }
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            return Err((
+                "text_session_missing",
+                "No text/control transport session exists for group presence".to_owned(),
+                "Start and attach the backend text/control runtime before publishing online presence".to_owned(),
+            ));
+        };
+        if !session.state().is_connected() {
+            return Err((
+                "text_session_not_connected",
+                format!(
+                    "Text/control transport session {} is {}",
+                    session.session_id,
+                    PersistedAppState::transport_state_label(session.state())
+                ),
+                "Complete route establishment before publishing online presence".to_owned(),
+            ));
+        }
+        let Some(runtime) = self.text_control_transport_runtime.as_ref() else {
+            return Err((
+                "text_runtime_not_attached",
+                "No backend-owned text/control runtime is attached for group presence".to_owned(),
+                "Attach the group text/control runtime before publishing online presence"
+                    .to_owned(),
+            ));
+        };
+        if runtime.session_id != session.session_id {
+            return Err((
+                "text_runtime_session_mismatch",
+                format!(
+                    "Attached text/control runtime {} does not match active text session {}",
+                    runtime.session_id, session.session_id
+                ),
+                "Restart or reattach the text/control runtime before publishing online presence"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn openmls_store_path(&self) -> PathBuf {
         #[cfg(test)]
@@ -5582,8 +5644,26 @@ pub fn revoke_group_member_access(request: RevokeGroupMemberAccessRequest) -> Ap
 
 /// Tauri command: publish a TTL-backed group presence heartbeat.
 pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateView {
-    mutate_app_service(|state| {
-        state.ensure_ready_profile();
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    guard.state.ensure_ready_profile();
+    if let Err((code, message, recovery_hint)) =
+        guard.group_presence_route_evidence(&request.group_id)
+    {
+        guard.state.push_command_error(
+            "group.presence_rejected",
+            "publish_group_presence",
+            code,
+            message,
+            recovery_hint,
+        );
+        guard.persist();
+        return guard.to_view();
+    }
+    guard.mutate(|state| {
         let member_id = request
             .member_id
             .clone()
@@ -17290,6 +17370,37 @@ mod tests {
         guard.attach_text_control_transport_runtime(transport, session_id);
     }
 
+    fn mark_active_text_session_direct_route_for_test() {
+        let synthetic_probe = ProviderWebRtcDataChannelProbeView {
+            kind: "unit-test".to_owned(),
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "unit-test-endpoint".to_owned(),
+            scope_commitment: "unit-test-scope".to_owned(),
+            rendezvous_topic: "unit-test-topic".to_owned(),
+            offerer_direct_path_ready: true,
+            answerer_direct_path_ready: true,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "b".repeat(64),
+            runtime_spec: None,
+        };
+        mutate_app_service(|state| {
+            state.latest_data_channel_probe = Some(synthetic_probe.clone());
+            state.mark_text_session_data_channel_route_proof(&synthetic_probe);
+        });
+    }
+
     fn clear_text_control_transport_runtime_for_test() {
         let service = app_service();
         let mut guard = service
@@ -18908,22 +19019,20 @@ mod tests {
         });
         let group_id = created.groups[0].group_id.clone();
         let channel_id = created.groups[0].channels[0].channel_id.clone();
-        let present = publish_group_presence(PublishGroupPresenceRequest {
+        let rejected_without_route = publish_group_presence(PublishGroupPresenceRequest {
             group_id: group_id.clone(),
             member_id: None,
-            ttl_seconds: Some(5),
+            ttl_seconds: Some(300),
         });
-        assert_eq!(present.last_command_error, None);
-        assert_eq!(present.groups[0].members[0].status, "online");
-        assert!(present.groups[0].members[0].presence_expires_at.is_some());
-        let presence_frame = load_state_from_path(&_path)
-            .text_control_outbox
-            .iter()
-            .find_map(|record| match &record.frame {
-                TextControlFrameView::GroupPresenceHeartbeat { .. } => Some(record.frame.clone()),
-                _ => None,
-            })
-            .expect("presence heartbeat frame queued");
+        assert_eq!(
+            rejected_without_route
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("text_session_missing"),
+            "online presence must not be accepted without backend route evidence"
+        );
+        assert_ne!(rejected_without_route.groups[0].members[0].status, "online");
         let other_path = reset_with_temp_state("g005-presence-receiver");
         create_user(CreateUserRequest {
             display_name: "Bob".to_owned(),
@@ -18938,14 +19047,42 @@ mod tests {
             ice_stun_servers: None,
             ice_turn_servers: None,
         });
-        {
-            let mut receiver = TauriAppService::load_for_test_path(other_path.clone());
-            assert_eq!(
-                receiver.state.handle_text_control_frame(presence_frame),
-                None
-            );
-            receiver.persist();
-        }
+        reload_global_app_service_from_path(&_path);
+        let transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(other_path.clone()),
+        ));
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g005-presence-route".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active for presence");
+        mark_active_text_session_direct_route_for_test();
+        attach_text_control_transport_runtime_for_test(transport, active_session_id);
+        let present = publish_group_presence(PublishGroupPresenceRequest {
+            group_id: group_id.clone(),
+            member_id: None,
+            ttl_seconds: Some(5),
+        });
+        assert_eq!(present.last_command_error, None);
+        assert_eq!(present.groups[0].members[0].status, "online");
+        assert!(present.groups[0].members[0].presence_expires_at.is_some());
+        let pump_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(4),
+            operation_timeout_ms: Some(1_000),
+        });
+        assert!(
+            pump_report.failures.is_empty(),
+            "presence heartbeat pump failed: {:?}",
+            pump_report.failures
+        );
+        assert_eq!(pump_report.frames_sent, 1);
         let receiver_state = load_state_from_path(&other_path);
         assert!(
             receiver_state.groups[0]
@@ -18953,6 +19090,24 @@ mod tests {
                 .iter()
                 .any(|member| member.display_name == "Alice" && member.status == "online"),
             "presence frames should replicate unknown roster members with display/role metadata"
+        );
+        {
+            let mut receiver = TauriAppService::load_for_test_path(other_path.clone());
+            let alice = receiver.state.groups[0]
+                .members
+                .iter_mut()
+                .find(|member| member.display_name == "Alice")
+                .expect("replicated Alice member missing");
+            alice.presence_expires_at = Some("2000-01-01T00:00:00Z".to_owned());
+            receiver.persist();
+        }
+        let receiver_expired = load_state_from_path(&other_path).to_view();
+        assert!(
+            receiver_expired.groups[0]
+                .members
+                .iter()
+                .any(|member| member.display_name == "Alice" && member.status == "offline"),
+            "remote profile must project stale heartbeat evidence as offline"
         );
         reload_global_app_service_from_path(&_path);
 
@@ -19004,6 +19159,7 @@ mod tests {
                 .map(|error| error.code.as_str()),
             Some("member_revoked")
         );
+        clear_text_control_transport_runtime_for_test();
     }
 
     #[test]
@@ -22093,6 +22249,27 @@ mod tests {
         );
 
         reload_global_app_service_from_path(&alice_path);
+        let presence_receiver_path = fresh_state_path("g007-auto-presence-route-receiver");
+        let _ = fs::remove_file(&presence_receiver_path);
+        let presence_transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(presence_receiver_path),
+        ));
+        let presence_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g007-auto-owner-presence-route".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(
+            presence_session.last_command_error.is_none(),
+            "{presence_session:?}"
+        );
+        let presence_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "owner presence transport session missing".to_owned())?;
+        mark_active_text_session_direct_route_for_test();
+        attach_text_control_transport_runtime_for_test(presence_transport, presence_session_id);
         let present = publish_group_presence(PublishGroupPresenceRequest {
             group_id: group_id.clone(),
             member_id: None,
@@ -22101,6 +22278,7 @@ mod tests {
         assert!(present.last_command_error.is_none(), "{present:?}");
         assert_eq!(present.groups[0].members[0].status, "online");
         assert!(present.groups[0].members[0].presence_expires_at.is_some());
+        clear_text_control_transport_runtime_for_test();
 
         let (charlie_path, _) = join_group_invite_as_test_profile_with_optional_name(
             "g007-auto-admission-charlie",
@@ -25603,6 +25781,27 @@ mod tests {
             old_style_name, "g012 text lab",
             "old signed invites without gname must recover a sane label from gid, not the invite uuid"
         );
+        let presence_receiver_path = fresh_state_path("g012-presence-route-receiver");
+        let _ = fs::remove_file(&presence_receiver_path);
+        let presence_transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(presence_receiver_path),
+        ));
+        let presence_session = start_text_session(StartTextSessionRequest {
+            scope_label: Some("g012-owner-presence-route".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(
+            presence_session.last_command_error.is_none(),
+            "{presence_session:?}"
+        );
+        let presence_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "presence text session missing".to_owned())?;
+        mark_active_text_session_direct_route_for_test();
+        attach_text_control_transport_runtime_for_test(presence_transport, presence_session_id);
         let alice_online = publish_group_presence(PublishGroupPresenceRequest {
             group_id: alice_group_id.clone(),
             member_id: None,
@@ -25631,6 +25830,7 @@ mod tests {
             }),
             "default automatic admission requires online owner/staff presence proof before issuing a Welcome"
         );
+        clear_text_control_transport_runtime_for_test();
         let (bob_path, _) = join_group_invite_as_test_profile_with_optional_name(
             "g012-group-text-bob",
             "Bob G012",
