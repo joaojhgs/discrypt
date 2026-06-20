@@ -40,4 +40,3 @@ This does not replace OpenMLS membership/admission checks and must not make invi
 - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p5t01 cargo test -p discrypt-storage governance -- --nocapture`
 - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p5t01 cargo test -p discrypt-storage migration -- --nocapture`
 - `git diff --check`
-
