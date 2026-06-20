@@ -24509,6 +24509,96 @@ mod tests {
     }
 
     #[test]
+    fn stale_persisted_joined_voice_session_is_cleared_on_restart() -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("stale-joined-voice-restart");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Desktop".to_owned()),
+        });
+        let group = create_group(CreateGroupRequest {
+            name: "Restart Voice Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "group created".to_owned())?;
+        let channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Runtime only voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel
+            .groups
+            .first()
+            .and_then(|group| group.channels.first())
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel created".to_owned())?;
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-restart".to_owned()),
+            input_device_label: Some("Restart microphone".to_owned()),
+            output_device_id: Some("speaker-restart".to_owned()),
+            output_device_label: Some("Restart speaker".to_owned()),
+        });
+        let stale_session = joined
+            .voice_session
+            .clone()
+            .ok_or_else(|| "joined voice session captured".to_owned())?;
+        assert!(stale_session.joined);
+        assert_eq!(
+            joined
+                .active_context
+                .as_ref()
+                .map(|context| context.kind.as_str()),
+            Some("voice_channel")
+        );
+
+        let mut stale_state = load_state_from_path(&path);
+        stale_state.voice_session = Some(stale_session);
+        stale_state.active_context = joined.active_context.clone();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&stale_state)
+                .map_err(|error| format!("stale state encodes: {error}"))?,
+        )
+        .map_err(|error| format!("write stale state: {error}"))?;
+
+        let raw_stale = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        assert!(raw_stale.contains("\"joined\": true"));
+        assert!(raw_stale.contains("\"kind\": \"voice_channel\""));
+
+        let mut store = FileAppStore::new(&path);
+        let reloaded = load_state_from_store(&mut store).to_view();
+        assert!(
+            reloaded.voice_session.is_none(),
+            "restart must not restore stale persisted voice_session as joined"
+        );
+        assert!(
+            reloaded.active_context.is_none(),
+            "restart must not reopen stale voice_channel active context"
+        );
+        assert!(
+            reloaded
+                .voice_states
+                .iter()
+                .all(|state| state.status != "joined" && state.status != "active"),
+            "voice diagnostics after restart must stay idle without backend media session"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn persisted_old_schema_version_migrates_to_current_schema() {
         let _guard = test_lock();
         let path = fresh_state_path("old-schema-version-state");
