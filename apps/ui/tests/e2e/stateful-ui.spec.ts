@@ -1048,6 +1048,77 @@ test("voice channel membership is runtime-only across browser reload", async ({
   await expect(page.getByText(/Voice idle/i)).toBeVisible();
 });
 
+test("voice sidebar anchors participants and leave controls to backend joined room", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Voice Rooms Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /Add voice channel/i }).click();
+  await page.getByLabel("Voice channel name").fill("Standup Room");
+  await page.getByLabel("Voice channel name").press("Enter");
+  await expect(page.getByRole("button", { name: /Standup Room/i })).toBeVisible();
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(
+    page.getByLabel("Voice Lobby participants").getByTestId("voice-local-participant"),
+  ).toHaveCount(1);
+  await expect(page.getByLabel("Standup Room participants")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Leave voice call/i })).toBeVisible();
+
+  await page.getByRole("button", { name: /Standup Room/ }).click();
+  await expect(
+    page.getByLabel("Standup Room participants").getByTestId("voice-local-participant"),
+  ).toHaveCount(1);
+  await expect(page.getByLabel("Voice Lobby participants")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: /Standup Room/ }).first(),
+  ).toHaveAttribute("aria-current", "page");
+
+  await page.getByRole("button", { name: /Leave voice call/i }).click();
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
+  await expect(page.getByTestId("voice-channel-participants")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Leave voice call/i })).toHaveCount(0);
+});
+
+test("voice channel click fails closed when microphone permission is denied", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Voice Permission Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        ...navigator.mediaDevices,
+        getUserMedia: async () => {
+          throw new DOMException("Permission denied", "NotAllowedError");
+        },
+      },
+    });
+  });
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(page.getByText(/Voice idle/i)).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
+  await expect(page.getByTestId("voice-channel-participants")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Leave voice call/i })).toHaveCount(0);
+  await expect(
+    page.getByText(/Microphone permission\/input device required/i),
+  ).toBeVisible();
+});
+
 // Coverage note: transport status surfaces signaling not-ready state before invite metadata when the diagnostics inspector is explicitly enabled; production default keeps it hidden.
 test("production UX hides diagnostics and manual transport controls by default", async ({
   page,
