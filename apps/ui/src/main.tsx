@@ -1695,6 +1695,11 @@ function App() {
   );
   const backendVoiceParticipants = appState.voice_session?.participants ?? [];
   const voiceJoined = appState.voice_session?.joined ?? false;
+  const joinedVoiceChannelId = voiceJoined
+    ? (appState.voice_session?.channel_id ?? null)
+    : null;
+  const displayedVoiceChannelId =
+    joinedVoiceChannelId ?? activeVoiceChannel?.channel_id ?? null;
   const selfMuted =
     appState.voice_session?.self_muted ??
     backendVoiceParticipants.find(
@@ -2659,7 +2664,7 @@ function App() {
           textChannels={textChannels}
           voiceChannels={voiceChannels}
           activeChannelId={activeTextChannel?.channel_id ?? null}
-          activeVoiceChannelId={activeVoiceChannel?.channel_id ?? null}
+          activeVoiceChannelId={displayedVoiceChannelId}
           selectedWorkflow={workflow}
           inlineTextDraft={inlineTextDraft}
           setInlineTextDraft={setInlineTextDraft}
@@ -2746,7 +2751,7 @@ function App() {
               <MobileVoicePanel
                 group={activeGroup}
                 voiceChannels={voiceChannels}
-                activeVoiceChannelId={activeVoiceChannel?.channel_id ?? null}
+                activeVoiceChannelId={displayedVoiceChannelId}
                 voiceJoined={voiceJoined}
                 participants={participants}
                 localUserId={appState.profile?.user_id ?? null}
@@ -4291,14 +4296,19 @@ function ChannelSidebar({
                   🔊 {channel.name}
                 </SidebarButton>
                 {voiceJoined && focusedVoiceRoom ? (
-                  <VoiceParticipantList
-                    participants={participants}
-                    localUserId={localUserId}
-                    remoteAudio={remoteAudio}
-                    remoteStreams={remoteStreams}
-                    outputVolume={appOutputVolume}
-                    outputDeviceId={selectedOutputDeviceId}
-                  />
+                  <div
+                    aria-label={`${channel.name} participants`}
+                    data-testid="voice-channel-participants"
+                  >
+                    <VoiceParticipantList
+                      participants={participants}
+                      localUserId={localUserId}
+                      remoteAudio={remoteAudio}
+                      remoteStreams={remoteStreams}
+                      outputVolume={appOutputVolume}
+                      outputDeviceId={selectedOutputDeviceId}
+                    />
+                  </div>
                 ) : null}
               </div>
             );
