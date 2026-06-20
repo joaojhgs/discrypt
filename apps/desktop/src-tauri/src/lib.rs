@@ -2448,6 +2448,13 @@ struct OpenMlsMemberRemoval {
     status_copy: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionDecisionApplyStatus {
+    Applied,
+    Duplicate,
+    Superseded,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
     #[serde(default = "default_app_state_schema_version")]
@@ -4974,7 +4981,7 @@ pub fn refuse_group_admission_request(request: RefuseGroupAdmissionRequest) -> A
             .reason
             .clone()
             .filter(|value| !value.trim().is_empty());
-        if let Err(error) = state.mark_group_admission_decision(
+        let apply_status = match state.mark_group_admission_decision(
             &request.group_id,
             &request.request_id,
             false,
@@ -4982,12 +4989,25 @@ pub fn refuse_group_admission_request(request: RefuseGroupAdmissionRequest) -> A
             &decided_at,
             reason.clone(),
         ) {
-            state.push_command_error(
-                "group.admission_decision_rejected",
-                "refuse_group_admission_request",
-                "admission_request_update_failed",
-                error,
-                "Refresh pending requests before refusing",
+            Ok(status) => status,
+            Err(error) => {
+                state.push_command_error(
+                    "group.admission_decision_rejected",
+                    "refuse_group_admission_request",
+                    "admission_request_update_failed",
+                    error,
+                    "Refresh pending requests before refusing",
+                );
+                return;
+            }
+        };
+        if apply_status != AdmissionDecisionApplyStatus::Applied {
+            state.push_event(
+                "group.admission_request_refusal_superseded",
+                format!(
+                    "Ignored stale refusal for admission request {}",
+                    redacted_observable_ref("request", &request.request_id)
+                ),
             );
             return;
         }
@@ -8454,7 +8474,7 @@ impl PersistedAppState {
         decided_by: &str,
         decided_at: &str,
         reason: Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<AdmissionDecisionApplyStatus, String> {
         let group = self
             .groups
             .iter_mut()
@@ -8466,55 +8486,89 @@ impl PersistedAppState {
             .find(|request| request.request_id == request_id)
             .ok_or_else(|| "Admission request does not exist".to_owned())?;
         let decided_status = if approved { "approved" } else { "refused" };
+        let accepted_event_id = admission_decision_event_id(
+            group_id,
+            request_id,
+            decided_status,
+            decided_by,
+            decided_at,
+        );
         if request.status != "pending" {
             if request.status == decided_status
                 && request.decided_by.as_deref() == Some(decided_by)
                 && request.decided_at.as_deref() == Some(decided_at)
                 && request.decision_reason == reason
             {
-                return Ok(());
+                return Ok(AdmissionDecisionApplyStatus::Duplicate);
             }
-            return Err(format!(
-                "Admission request {request_id} is already {}",
-                request.status
-            ));
+            let retained_status = request.status.clone();
+            let superseded_event_id = admission_decision_superseded_event_id(
+                group_id,
+                request_id,
+                decided_status,
+                decided_by,
+                decided_at,
+            );
+            if !group
+                .governance_log
+                .iter()
+                .any(|entry| entry.event_id == superseded_event_id)
+            {
+                group.governance_log.push(GroupGovernanceLogEntryView {
+                    event_id: superseded_event_id,
+                    group_id: group_id.to_owned(),
+                    event_kind: "admission_request_decision_superseded".to_owned(),
+                    actor_member_id: decided_by.to_owned(),
+                    target_member_id: None,
+                    request_id: Some(request_id.to_owned()),
+                    role_before: None,
+                    role_after: None,
+                    created_at: decided_at.to_owned(),
+                    summary: format!(
+                        "Ignored {decided_status} admission decision because request was already {retained_status}"
+                    ),
+                });
+            }
+            return Ok(AdmissionDecisionApplyStatus::Superseded);
         }
         request.status = decided_status.to_owned();
         request.decided_by = Some(decided_by.to_owned());
         request.decided_at = Some(decided_at.to_owned());
         request.decision_reason = reason.clone();
-        group.governance_log.push(GroupGovernanceLogEntryView {
-            event_id: stable_id(
-                "governance",
-                &format!("{group_id}:{request_id}:decision"),
-                self.next_sequence,
-            ),
-            group_id: group_id.to_owned(),
-            event_kind: if approved {
-                "admission_request_approved"
-            } else {
-                "admission_request_refused"
-            }
-            .to_owned(),
-            actor_member_id: decided_by.to_owned(),
-            target_member_id: None,
-            request_id: Some(request_id.to_owned()),
-            role_before: None,
-            role_after: if approved {
-                Some(GroupRoleView::Member)
-            } else {
-                None
-            },
-            created_at: decided_at.to_owned(),
-            summary: reason.unwrap_or_else(|| {
-                if approved {
-                    "Approved pending invite admission request".to_owned()
+        if !group
+            .governance_log
+            .iter()
+            .any(|entry| entry.event_id == accepted_event_id)
+        {
+            group.governance_log.push(GroupGovernanceLogEntryView {
+                event_id: accepted_event_id,
+                group_id: group_id.to_owned(),
+                event_kind: if approved {
+                    "admission_request_approved"
                 } else {
-                    "Refused pending invite admission request".to_owned()
+                    "admission_request_refused"
                 }
-            }),
-        });
-        Ok(())
+                .to_owned(),
+                actor_member_id: decided_by.to_owned(),
+                target_member_id: None,
+                request_id: Some(request_id.to_owned()),
+                role_before: None,
+                role_after: if approved {
+                    Some(GroupRoleView::Member)
+                } else {
+                    None
+                },
+                created_at: decided_at.to_owned(),
+                summary: reason.unwrap_or_else(|| {
+                    if approved {
+                        "Approved pending invite admission request".to_owned()
+                    } else {
+                        "Refused pending invite admission request".to_owned()
+                    }
+                }),
+            });
+        }
+        Ok(AdmissionDecisionApplyStatus::Applied)
     }
 
     fn queue_openmls_admission_key_package(&mut self, group_id: &str) -> Result<(), String> {
@@ -17012,6 +17066,36 @@ fn stable_id(prefix: &str, label: &str, sequence: u64) -> String {
     format!("{prefix}-{}-{sequence}", slugify(label))
 }
 
+fn admission_decision_event_id(
+    group_id: &str,
+    request_id: &str,
+    decided_status: &str,
+    decided_by: &str,
+    decided_at: &str,
+) -> String {
+    stable_id(
+        "governance",
+        &format!("{group_id}:{request_id}:decision:{decided_status}:{decided_by}:{decided_at}"),
+        0,
+    )
+}
+
+fn admission_decision_superseded_event_id(
+    group_id: &str,
+    request_id: &str,
+    decided_status: &str,
+    decided_by: &str,
+    decided_at: &str,
+) -> String {
+    stable_id(
+        "governance",
+        &format!(
+            "{group_id}:{request_id}:decision-superseded:{decided_status}:{decided_by}:{decided_at}"
+        ),
+        0,
+    )
+}
+
 fn stable_voice_session_id(group_id: &str, channel_id: &str) -> String {
     stable_id("voice", &format!("{group_id}:{channel_id}"), 0)
 }
@@ -21390,6 +21474,231 @@ mod tests {
             )),
             "refusal should enqueue a backend decision frame instead of silently dropping state"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_request_reconciliation_staff_replicas_share_pending_list() -> Result<(), String> {
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("pending-request-reconciliation-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice Pending".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created_group = create_group(CreateGroupRequest {
+            name: "Pending Reconciliation Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(
+            created_group.last_command_error.is_none(),
+            "{created_group:?}"
+        );
+        let group_id = created_group.groups[0].group_id.clone();
+        add_test_member(&group_id, "staff-beth", GroupRoleView::Staff);
+
+        let staff_path = fresh_state_path("pending-request-reconciliation-staff");
+        persist_state_to_path(&staff_path, &load_state())
+            .map_err(|error| format!("staff replica setup failed: {error:?}"))?;
+        let frame = TextControlFrameView::OpenMlsAdmissionKeyPackage {
+            group_id: group_id.clone(),
+            member_identity: "joiner-pending-shared".to_owned(),
+            signer_public_key_hex:
+                "abababababababababababababababababababababababababababababababab".to_owned(),
+            key_package: b"joiner-pending-shared-key-package".to_vec(),
+        };
+
+        for path in [&owner_path, &staff_path] {
+            let mut service = TauriAppService::load_for_test_path(path.clone());
+            service.state.handle_text_control_frame(frame.clone());
+            service.persist();
+        }
+
+        let owner_state = load_state_from_path(&owner_path);
+        let staff_state = load_state_from_path(&staff_path);
+        let owner_request = owner_state.groups[0]
+            .admission_requests
+            .iter()
+            .find(|request| request.member_identity == "joiner-pending-shared")
+            .ok_or_else(|| "owner pending request missing".to_owned())?;
+        let staff_request = staff_state.groups[0]
+            .admission_requests
+            .iter()
+            .find(|request| request.member_identity == "joiner-pending-shared")
+            .ok_or_else(|| "staff pending request missing".to_owned())?;
+
+        assert_eq!(owner_request.request_id, staff_request.request_id);
+        assert_eq!(owner_request.status, "pending");
+        assert_eq!(staff_request.status, "pending");
+        assert_eq!(
+            owner_request.signer_public_key_hex,
+            staff_request.signer_public_key_hex
+        );
+        assert_eq!(owner_request.key_package, staff_request.key_package);
+        assert_eq!(
+            governance_log_request_count(
+                &owner_state,
+                &group_id,
+                &owner_request.request_id,
+                "admission_request_pending"
+            ),
+            1
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &staff_state,
+                &group_id,
+                &staff_request.request_id,
+                "admission_request_pending"
+            ),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_request_reconciliation_conflicting_decisions_retain_first_valid_decision(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let first_path = reset_with_temp_state("pending-request-reconciliation-first");
+        create_user(CreateUserRequest {
+            display_name: "Alice Decision".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created_group = create_group(CreateGroupRequest {
+            name: "Decision Reconciliation Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(
+            created_group.last_command_error.is_none(),
+            "{created_group:?}"
+        );
+        let group_id = created_group.groups[0].group_id.clone();
+        add_test_member(&group_id, "staff-approve", GroupRoleView::Staff);
+        add_test_member(&group_id, "staff-refuse", GroupRoleView::Staff);
+        let request_id = upsert_test_admission_request(&group_id, "joiner-concurrent-decision");
+        let second_path = fresh_state_path("pending-request-reconciliation-second");
+        persist_state_to_path(&second_path, &load_state())
+            .map_err(|error| format!("second replica setup failed: {error:?}"))?;
+
+        let approval = TextControlFrameView::GroupAdmissionDecision {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+            approved: true,
+            reason: None,
+            decided_by: "staff-approve".to_owned(),
+            decided_at: "2026-06-20T08:00:00+00:00".to_owned(),
+        };
+        let refusal = TextControlFrameView::GroupAdmissionDecision {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+            approved: false,
+            reason: Some("capacity full".to_owned()),
+            decided_by: "staff-refuse".to_owned(),
+            decided_at: "2026-06-20T08:00:01+00:00".to_owned(),
+        };
+
+        let mut first_service = TauriAppService::load_for_test_path(first_path.clone());
+        first_service
+            .state
+            .handle_text_control_frame(approval.clone());
+        first_service
+            .state
+            .handle_text_control_frame(refusal.clone());
+        first_service
+            .state
+            .handle_text_control_frame(approval.clone());
+        first_service
+            .state
+            .handle_text_control_frame(refusal.clone());
+        first_service.persist();
+        let first_state = load_state_from_path(&first_path);
+        assert_eq!(
+            admission_request_status(&first_state, &group_id, &request_id),
+            Some("approved".to_owned())
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &first_state,
+                &group_id,
+                &request_id,
+                "admission_request_approved"
+            ),
+            1
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &first_state,
+                &group_id,
+                &request_id,
+                "admission_request_refused"
+            ),
+            0
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &first_state,
+                &group_id,
+                &request_id,
+                "admission_request_decision_superseded"
+            ),
+            1
+        );
+
+        let mut second_service = TauriAppService::load_for_test_path(second_path.clone());
+        second_service.state.handle_text_control_frame(refusal);
+        second_service.state.handle_text_control_frame(approval);
+        second_service.persist();
+        let second_state = load_state_from_path(&second_path);
+        assert_eq!(
+            admission_request_status(&second_state, &group_id, &request_id),
+            Some("refused".to_owned())
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &second_state,
+                &group_id,
+                &request_id,
+                "admission_request_approved"
+            ),
+            0
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &second_state,
+                &group_id,
+                &request_id,
+                "admission_request_refused"
+            ),
+            1
+        );
+        assert_eq!(
+            governance_log_request_count(
+                &second_state,
+                &group_id,
+                &request_id,
+                "admission_request_decision_superseded"
+            ),
+            1
+        );
+        for state in [&first_state, &second_state] {
+            assert!(
+                !state.groups[0]
+                    .members
+                    .iter()
+                    .any(|member| member.member_id == "joiner-concurrent-decision"),
+                "decision reconciliation must not promote a requester without OpenMLS Welcome"
+            );
+        }
         Ok(())
     }
 
