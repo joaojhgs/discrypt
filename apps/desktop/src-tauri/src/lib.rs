@@ -28,11 +28,11 @@ use discrypt_core::{
     VOICE_SESSION_NOT_JOINED_COPY, VOICE_SESSION_ROUTE_GATED_COPY,
 };
 use discrypt_media::{
-    AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, MediaKeyRegistry,
-    MicrophonePermissionState, OpusAudioEncoder, ProtectedFrame, ProtectedMediaFrameSink,
-    ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender, SenderBinding,
-    VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceDeviceDescriptor, VoiceDeviceKind,
-    VoiceDeviceSelection,
+    apply_microphone_gain_percent, AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame,
+    MediaKeyRegistry, MicrophonePermissionState, OpusAudioEncoder, ProtectedFrame,
+    ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender,
+    SenderBinding, VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceDeviceDescriptor,
+    VoiceDeviceKind, VoiceDeviceSelection, APP_OUTPUT_VOLUME_MAX_PERCENT, MIC_GAIN_MAX_PERCENT,
 };
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
@@ -208,6 +208,12 @@ pub struct UiPreferencesView {
     /// Preferred speaker/output device id, or `default`.
     #[serde(default = "default_voice_device_preference_id")]
     pub voice_output_device_id: String,
+    /// App microphone gain applied before native/Rust media encode, 0-200%.
+    #[serde(default = "default_app_audio_percent")]
+    pub mic_gain_percent: u16,
+    /// App-owned output volume applied to Discrypt playback, 0-100%.
+    #[serde(default = "default_app_audio_percent")]
+    pub app_output_volume_percent: u16,
 }
 
 /// Local user profile created or recovered on first run.
@@ -1167,6 +1173,12 @@ pub struct SavePreferencesRequest {
     /// Preferred speaker/output device id. Omitted by older clients to preserve the current value.
     #[serde(default)]
     pub voice_output_device_id: Option<String>,
+    /// App microphone gain. Omitted by older clients to preserve the current value.
+    #[serde(default)]
+    pub mic_gain_percent: Option<u16>,
+    /// App-owned output volume. Omitted by older clients to preserve the current value.
+    #[serde(default)]
+    pub app_output_volume_percent: Option<u16>,
 }
 
 /// Request to start a local DM.
@@ -1746,6 +1758,12 @@ pub struct NativeVoiceMediaSignalPayload {
     pub opus_payload_bytes: usize,
     /// Total protected bytes after SFrame protection.
     pub protected_payload_bytes: usize,
+    /// Persisted microphone gain consumed before Opus/SFrame proof generation.
+    #[serde(default = "default_app_audio_percent")]
+    pub mic_gain_percent: u16,
+    /// Persisted app-owned output volume active for local playback.
+    #[serde(default = "default_app_audio_percent")]
+    pub app_output_volume_percent: u16,
     /// Protected frames carried over the backend text/control signaling route.
     pub protected_frames: Vec<NativeVoiceProtectedFrameView>,
     /// Evidence timestamp in milliseconds.
@@ -1977,6 +1995,18 @@ fn default_microphone_permission() -> String {
 
 fn default_voice_device_preference_id() -> String {
     "default".to_owned()
+}
+
+fn default_app_audio_percent() -> u16 {
+    100
+}
+
+fn normalize_mic_gain_percent(percent: u16) -> u16 {
+    percent.min(MIC_GAIN_MAX_PERCENT)
+}
+
+fn normalize_app_output_volume_percent(percent: u16) -> u16 {
+    percent.min(APP_OUTPUT_VOLUME_MAX_PERCENT)
 }
 
 /// Command-surface health for local E2E/smoke execution.
@@ -4249,6 +4279,14 @@ pub fn save_preferences(request: SavePreferencesRequest) -> AppStateView {
             template_id: normalize_template_id(&request.template_id),
             voice_input_device_id,
             voice_output_device_id,
+            mic_gain_percent: request
+                .mic_gain_percent
+                .map(normalize_mic_gain_percent)
+                .unwrap_or(state.preferences.mic_gain_percent),
+            app_output_volume_percent: request
+                .app_output_volume_percent
+                .map(normalize_app_output_volume_percent)
+                .unwrap_or(state.preferences.app_output_volume_percent),
         };
         state.push_event("preferences.saved", "Preferences saved");
     })
@@ -8109,6 +8147,8 @@ impl PersistedAppState {
                 template_id: DEFAULT_TEMPLATE_ID.to_owned(),
                 voice_input_device_id: default_voice_device_preference_id(),
                 voice_output_device_id: default_voice_device_preference_id(),
+                mic_gain_percent: default_app_audio_percent(),
+                app_output_volume_percent: default_app_audio_percent(),
             },
             dms: Vec::new(),
             groups: Vec::new(),
@@ -14226,7 +14266,9 @@ fn build_native_voice_media_signal_with_peer_boundary(
         NativeVoiceProofSink::default(),
     );
     pipeline.set_muted(request.muted);
-    let pcm = generated_native_voice_pcm(format, &request.local_peer_id);
+    let mut pcm = generated_native_voice_pcm(format, &request.local_peer_id);
+    apply_microphone_gain_percent(&mut pcm, state.preferences.mic_gain_percent)
+        .map_err(|error| error.to_string())?;
     let frame = CapturedAudioFrame::new(pcm, format, request.created_at_ms)
         .map_err(|error| error.to_string())?;
     let outcome = pipeline
@@ -14269,6 +14311,8 @@ fn build_native_voice_media_signal_with_peer_boundary(
         protected_frames_count: protected_frames.len() as u16,
         opus_payload_bytes: report.opus_payload_len,
         protected_payload_bytes,
+        mic_gain_percent: state.preferences.mic_gain_percent,
+        app_output_volume_percent: state.preferences.app_output_volume_percent,
         protected_frames,
         created_at_ms: request.created_at_ms,
     })
@@ -19627,6 +19671,8 @@ mod tests {
             template_id: "compact-ops".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         assert_eq!(themed.preferences.theme_id, "ocean-contrast");
         assert_eq!(themed.preferences.template_id, "compact-ops");
@@ -20385,6 +20431,8 @@ mod tests {
             template_id: "compact-ops".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         assert_eq!(alice_preferences.preferences.theme_id, "ocean-contrast");
 
@@ -20606,6 +20654,8 @@ mod tests {
                 template_id: "compact-ops".to_owned(),
                 voice_input_device_id: default_voice_device_preference_id(),
                 voice_output_device_id: default_voice_device_preference_id(),
+                mic_gain_percent: default_app_audio_percent(),
+                app_output_volume_percent: default_app_audio_percent(),
             }
         );
         let reloaded_group = alice_reloaded_before_receipt
@@ -20687,6 +20737,8 @@ mod tests {
             template_id: "command-center".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         let accepted_dm = accept_dm_invite(AcceptDmInviteRequest {
             invite_code: dm_invite.code.clone(),
@@ -24484,6 +24536,11 @@ mod tests {
         assert_eq!(local_media.protected_frames_count, 1);
         assert!(local_media.opus_payload_bytes > 0);
         assert!(local_media.protected_payload_bytes > 0);
+        assert_eq!(local_media.mic_gain_percent, default_app_audio_percent());
+        assert_eq!(
+            local_media.app_output_volume_percent,
+            default_app_audio_percent()
+        );
         assert!(started
             .state
             .events
@@ -24547,6 +24604,85 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == "voice.native_media_received"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_voice_media_uses_persisted_microphone_gain() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("native-rust-voice-media-gain");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let preferences = save_preferences(SavePreferencesRequest {
+            theme_id: DEFAULT_THEME_ID.to_owned(),
+            template_id: DEFAULT_TEMPLATE_ID.to_owned(),
+            voice_input_device_id: None,
+            voice_output_device_id: None,
+            mic_gain_percent: Some(0),
+            app_output_volume_percent: Some(44),
+        });
+        assert_eq!(preferences.preferences.mic_gain_percent, 0);
+        assert_eq!(preferences.preferences.app_output_volume_percent, 44);
+        let group_state = create_group(CreateGroupRequest {
+            name: "Native Gain Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let (local_peer_id, remote_peer_id) =
+            backend_group_runtime_peer_ids(&group_state.groups[0])?;
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("gain-mic".to_owned()),
+            input_device_label: Some("Gain microphone".to_owned()),
+            output_device_id: Some("gain-speaker".to_owned()),
+            output_device_label: Some("Gain speaker".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        let started = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
+            session_id,
+            local_peer_id,
+            remote_peer_id,
+            muted: false,
+            created_at_ms: 4_200,
+        });
+        let media = started
+            .native_media
+            .ok_or_else(|| "native media proof missing".to_owned())?;
+        assert_eq!(media.mic_gain_percent, 0);
+        assert_eq!(media.app_output_volume_percent, 44);
+        assert_eq!(media.rms_i16, 0);
+        assert_eq!(media.peak_i16, 0);
+        assert!(!media.speaking);
+        assert!(media.opus_payload_bytes > 0);
+        assert!(media.protected_payload_bytes > 0);
+        let reloaded = load_state().to_view();
+        assert_eq!(reloaded.preferences.mic_gain_percent, 0);
+        assert_eq!(reloaded.preferences.app_output_volume_percent, 44);
         Ok(())
     }
 
@@ -28009,6 +28145,8 @@ mod tests {
             template_id: "compact-ops".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         assert!(alice_preferences.last_command_error.is_none());
 
@@ -28343,6 +28481,8 @@ mod tests {
             template_id: "command-center".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         reload_global_app_service_from_path(&bob_path);
         let bob_reloaded = app_state();
@@ -30364,6 +30504,8 @@ mod tests {
             template_id: "compact-ops".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         assert_eq!(themed.preferences.theme_id, "ocean-contrast");
         assert_eq!(themed.preferences.template_id, "compact-ops");
@@ -30374,6 +30516,8 @@ mod tests {
             template_id: "compact-ops".to_owned(),
             voice_input_device_id: Some("studio-mic".to_owned()),
             voice_output_device_id: Some("desk-speakers".to_owned()),
+            mic_gain_percent: Some(155),
+            app_output_volume_percent: Some(37),
         });
         assert_eq!(
             with_audio_devices.preferences.voice_input_device_id,
@@ -30383,16 +30527,22 @@ mod tests {
             with_audio_devices.preferences.voice_output_device_id,
             "desk-speakers"
         );
+        assert_eq!(with_audio_devices.preferences.mic_gain_percent, 155);
+        assert_eq!(with_audio_devices.preferences.app_output_volume_percent, 37);
         let reloaded = load_state().to_view();
         assert_eq!(reloaded.preferences.theme_id, "ocean-contrast");
         assert_eq!(reloaded.preferences.template_id, "compact-ops");
         assert_eq!(reloaded.preferences.voice_input_device_id, "studio-mic");
         assert_eq!(reloaded.preferences.voice_output_device_id, "desk-speakers");
+        assert_eq!(reloaded.preferences.mic_gain_percent, 155);
+        assert_eq!(reloaded.preferences.app_output_volume_percent, 37);
         let normalized = save_preferences(SavePreferencesRequest {
             theme_id: "not-in-app-config".to_owned(),
             template_id: "also-invalid".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: Some(250),
+            app_output_volume_percent: Some(125),
         });
         assert_eq!(normalized.preferences.theme_id, DEFAULT_THEME_ID);
         assert_eq!(normalized.preferences.template_id, DEFAULT_TEMPLATE_ID);
@@ -30400,6 +30550,14 @@ mod tests {
         assert_eq!(
             normalized.preferences.voice_output_device_id,
             "desk-speakers"
+        );
+        assert_eq!(
+            normalized.preferences.mic_gain_percent,
+            MIC_GAIN_MAX_PERCENT
+        );
+        assert_eq!(
+            normalized.preferences.app_output_volume_percent,
+            APP_OUTPUT_VOLUME_MAX_PERCENT
         );
     }
 
@@ -30588,6 +30746,8 @@ mod tests {
             template_id: "command-center".to_owned(),
             voice_input_device_id: None,
             voice_output_device_id: None,
+            mic_gain_percent: None,
+            app_output_volume_percent: None,
         });
         cursor = assert_cursor_advanced(cursor, &themed);
 

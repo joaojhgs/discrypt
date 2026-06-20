@@ -949,6 +949,16 @@ function clampContextMenuPoint(point: ContextMenuPoint): ContextMenuPoint {
   };
 }
 
+function clampPercent(
+  value: number | null | undefined,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(() =>
     typeof window !== "undefined" && "matchMedia" in window
@@ -1256,9 +1266,15 @@ function App() {
     if (!preferences) return;
     setSelectedVoiceInputId(preferences.voice_input_device_id || "default");
     setSelectedVoiceOutputId(preferences.voice_output_device_id || "default");
+    setLocalMicGain(clampPercent(preferences.mic_gain_percent, 0, 200, 100));
+    setAppOutputVolume(
+      clampPercent(preferences.app_output_volume_percent, 0, 100, 100),
+    );
   }, [
     commandState?.preferences.voice_input_device_id,
     commandState?.preferences.voice_output_device_id,
+    commandState?.preferences.mic_gain_percent,
+    commandState?.preferences.app_output_volume_percent,
   ]);
 
   useEffect(() => {
@@ -2509,6 +2525,25 @@ function App() {
         template_id: appState.preferences.template_id,
         voice_input_device_id: inputDeviceId,
         voice_output_device_id: outputDeviceId,
+        mic_gain_percent: appState.preferences.mic_gain_percent,
+        app_output_volume_percent: appState.preferences.app_output_volume_percent,
+      }),
+    );
+  }
+
+  function persistAppAudioPreferences(micGain: number, outputVolume: number) {
+    const nextMicGain = clampPercent(micGain, 0, 200, 100);
+    const nextOutputVolume = clampPercent(outputVolume, 0, 100, 100);
+    setLocalMicGain(nextMicGain);
+    setAppOutputVolume(nextOutputVolume);
+    void applyCommand(
+      savePreferences({
+        theme_id: appState.preferences.theme_id,
+        template_id: appState.preferences.template_id,
+        voice_input_device_id: selectedVoiceInputId,
+        voice_output_device_id: selectedVoiceOutputId,
+        mic_gain_percent: nextMicGain,
+        app_output_volume_percent: nextOutputVolume,
       }),
     );
   }
@@ -2521,6 +2556,14 @@ function App() {
   function chooseVoiceOutputDevice(deviceId: string) {
     setSelectedVoiceOutputId(deviceId);
     persistVoiceDevicePreferences(selectedVoiceInputId, deviceId);
+  }
+
+  function chooseMicGain(value: number) {
+    persistAppAudioPreferences(value, appOutputVolume);
+  }
+
+  function chooseAppOutputVolume(value: number) {
+    persistAppAudioPreferences(localMicGain, value);
   }
 
   function resetCommandState() {
@@ -2708,8 +2751,8 @@ function App() {
           appOutputVolume={appOutputVolume}
           selectedOutputDeviceId={selectedVoiceOutputId}
           localMicGain={localMicGain}
-          onAppOutputVolumeChange={setAppOutputVolume}
-          onLocalMicGainChange={setLocalMicGain}
+          onAppOutputVolumeChange={chooseAppOutputVolume}
+          onLocalMicGainChange={chooseMicGain}
           onToggleSelfMute={toggleSelfMute}
           onLeaveVoice={() => void toggleVoiceJoin(false)}
         />
@@ -2787,8 +2830,8 @@ function App() {
                   focusCommandChannel(channelId, "Voice")
                 }
                 onOpenCreateChannel={() => setInlineVoiceDraft("")}
-                onAppOutputVolumeChange={setAppOutputVolume}
-                onLocalMicGainChange={setLocalMicGain}
+                onAppOutputVolumeChange={chooseAppOutputVolume}
+                onLocalMicGainChange={chooseMicGain}
                 onToggleSelfMute={toggleSelfMute}
                 onLeaveVoice={() =>
                   void toggleVoiceJoin(false, null, null, "voice")
@@ -2992,8 +3035,8 @@ function App() {
               onSelectInputDevice={chooseVoiceInputDevice}
               onSelectOutputDevice={chooseVoiceOutputDevice}
               onRefreshDevices={() => void refreshVoiceInputDevices(true)}
-              onLocalMicGainChange={setLocalMicGain}
-              onAppOutputVolumeChange={setAppOutputVolume}
+              onLocalMicGainChange={chooseMicGain}
+              onAppOutputVolumeChange={chooseAppOutputVolume}
             />
             <ConnectivitySettingsPanel
               policy={activeConnectivity}

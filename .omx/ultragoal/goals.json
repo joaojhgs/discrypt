@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-20T12:03:38.324Z",
+  "updatedAt": "2026-06-20T22:13:08.123Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -70,6 +70,17 @@
       "updatedAt": "2026-06-20T12:03:38.324Z",
       "evidence": "Implemented PER-57 fail-closed self-mute and backend-evidence-only speaking UI boundaries. Changed apps/desktop/src-tauri/src/lib.rs, apps/ui/src/main.tsx, apps/ui/tests/e2e/stateful-ui.spec.ts, and .omx/plans/P6-T06-mute-vad-speaking-2026-06-20.md. Passed cargo fmt --check, git diff --check, jq goals validation, and targeted discrypt-media mute_control and voice_activity_detector tests; desktop/UI integration commands are blocked in this runtime by disk and missing node_modules.",
       "completedAt": "2026-06-20T12:03:38.324Z"
+    },
+    {
+      "id": "G007-per-58-output-and-mic-volume",
+      "title": "PER-58 output and mic volume",
+      "objective": "Implement PER-58 P6-T07 output/mic volume: persisted app-wide microphone gain and app output volume must survive reload, drive native/Rust media proof generation and UI voice/sound output paths, and be covered by deterministic media/audio harness tests. Preserve backend-derived voice truth, provider-as-signaling-only, and do not expand into group voice, overlay relay, release smoke, or hardware-level volume claims.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-20T21:58:26.324Z",
+      "updatedAt": "2026-06-20T22:13:08.123Z",
+      "evidence": "Implemented PER-58 persisted app-wide mic gain and output volume. Verification passed: cargo fmt --check with CARGO_TARGET_DIR=target/per58; cargo test -p discrypt-media app_audio_gain; desktop preferences_use_app_config_ids_and_persist_across_reload; desktop native_voice_media_uses_persisted_microphone_gain; npm --prefix apps/ui run typecheck after npm ci with workspace cache. Evidence is local media/Tauri/UI contract evidence, not production two-machine proof.",
+      "completedAt": "2026-06-20T22:13:08.123Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
