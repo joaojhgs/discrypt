@@ -25,7 +25,6 @@ use crate::{
 #[cfg(any(
     test,
     feature = "harness",
-    feature = "local-dev",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -58,7 +57,6 @@ use tokio::time::timeout;
 #[cfg(any(
     test,
     feature = "harness",
-    feature = "local-dev",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -68,7 +66,6 @@ use tokio::time::Duration;
 #[cfg(any(
     test,
     feature = "harness",
-    feature = "local-dev",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -1264,13 +1261,13 @@ where
     .await
 }
 
-/// Start a harness/local-dev provider-signaled WebRTC text/control runtime pair.
+/// Start a harness provider-signaled WebRTC text/control runtime pair.
 ///
 /// This uses the in-process conformance provider as the signaling substrate so
 /// native harnesses can prove text/control frames traverse the same sealed
 /// provider-negotiated DataChannel path without contacting public providers or
 /// treating those providers as application relays.
-#[cfg(any(test, feature = "harness", feature = "local-dev"))]
+#[cfg(any(test, feature = "harness"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer<
     F,
@@ -2029,7 +2026,6 @@ where
 #[cfg(any(
     test,
     feature = "harness",
-    feature = "local-dev",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",

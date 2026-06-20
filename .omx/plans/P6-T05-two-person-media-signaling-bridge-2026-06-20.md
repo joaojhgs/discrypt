@@ -21,7 +21,7 @@ Relevant code paths:
 
 ## Implementation Steps
 
-1. Add a harness/local-dev-only transport constructor that starts a live provider-signaled WebRTC text/control runtime pair over `LocalConformanceProviderAdapter`, with explicit offerer/answerer peer ids and an answerer callback.
+1. Add a harness-only transport constructor that starts a live provider-signaled WebRTC text/control runtime pair over `LocalConformanceProviderAdapter`, with explicit offerer/answerer peer ids and an answerer callback.
 2. Ensure the desktop harness feature enables the transport harness path without changing production feature gates.
 3. Add a Tauri backend regression that:
    - creates two isolated profiles and joins the same voice channel,
@@ -49,8 +49,8 @@ Relevant code paths:
 
 ## Verification
 
-- `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-per56 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness voice_native_media_signal_traverses_provider_signaled_text_control_runtime --lib -- --test-threads=1`
-- `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-per56 cargo test -p discrypt-transport --features harness provider_signaled_text_control_runtime_pair`
+- `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-per56 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness native_voice_signal_traverses_provider_signaled_text_control_runtime --lib -- --test-threads=1`
+- `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-per56 cargo test -p discrypt-transport --features harness live_provider_text_control_runtime_pair_carries_multiple_opaque_frames -- --test-threads=1`
 - `RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-per56 cargo fmt --check`
 - Attempt: `DISCRYPT_G012_REQUIRE_NATIVE_VOICE=1 RUSTUP_TOOLCHAIN=1.89.0 node scripts/g012-tauri-webdriver-integrated.mjs --run --require-native-voice --artifact-dir target/per56-g012-native-voice`
 

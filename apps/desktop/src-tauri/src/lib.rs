@@ -17538,6 +17538,7 @@ mod tests {
         guard.clear_text_control_transport_runtime();
     }
 
+    #[cfg(feature = "harness")]
     fn seal_native_voice_media_for_test(
         media: &NativeVoiceMediaSignalPayload,
     ) -> Result<String, String> {
@@ -24543,6 +24544,7 @@ mod tests {
         not(target_os = "linux"),
         ignore = "provider-signaled WebRTC loopback media proof is runner-dependent outside Linux CI"
     )]
+    #[cfg(feature = "harness")]
     #[test]
     fn native_voice_signal_traverses_provider_signaled_text_control_runtime() -> Result<(), String>
     {
@@ -24836,22 +24838,25 @@ mod tests {
             let mut bob = bob_answerer
                 .lock()
                 .map_err(|_| "bob provider answerer service lock poisoned".to_owned())?;
-            let delivered = bob.state.take_pending_voice_signaling_messages(
+            let backend_proof_signals = bob.state.take_pending_voice_signaling_messages(
                 TakePendingVoiceSignalingMessagesRequest {
                     session_id: Some(session_id.clone()),
                     limit: Some(10),
                 },
             );
-            assert_eq!(delivered.len(), 1, "{delivered:?}");
-            assert_eq!(delivered[0].signal_id, "per56-native-voice-signal");
-            assert_eq!(delivered[0].signal_kind, "candidate");
-            assert_eq!(delivered[0].sender_peer_id, alice_peer_id);
-            assert_eq!(delivered[0].recipient_peer_id, bob_peer_id);
-            let remote_media = native_voice_media_from_sealed_signal(&delivered[0])?;
+            assert_eq!(backend_proof_signals.len(), 1, "{backend_proof_signals:?}");
+            assert_eq!(
+                backend_proof_signals[0].signal_id,
+                "per56-native-voice-signal"
+            );
+            assert_eq!(backend_proof_signals[0].signal_kind, "candidate");
+            assert_eq!(backend_proof_signals[0].sender_peer_id, alice_peer_id);
+            assert_eq!(backend_proof_signals[0].recipient_peer_id, bob_peer_id);
+            let remote_media = native_voice_media_from_sealed_signal(&backend_proof_signals[0])?;
             accept_native_voice_media_signal_frame(
                 &mut bob.state,
                 AcceptNativeVoiceMediaFrameRequest {
-                    session_id: delivered[0].session_id.clone(),
+                    session_id: backend_proof_signals[0].session_id.clone(),
                     native_media: remote_media,
                     attached_at_ms: 1_700_000_000_058,
                 },

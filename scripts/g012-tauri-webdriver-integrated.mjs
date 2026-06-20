@@ -415,6 +415,126 @@ async function acceptNativeVoiceSignalPayload(profile, signal) {
     }
   `, [signal]);
 }
+async function acceptPendingNativeVoiceSignals(profile, label) {
+  const pending = await invokeTauriCommand(profile, "take_pending_voice_signaling_messages", {
+    request: { limit: 50 },
+  });
+  const signals = Array.isArray(pending?.messages) ? pending.messages : [];
+  const report = {
+    label,
+    profile: profile.display_name,
+    pending: signals.length,
+    accepted: 0,
+    errors: [],
+  };
+  for (const signal of signals) {
+    const accepted = await acceptNativeVoiceSignalPayload(profile, signal).catch((error) => ({
+      accepted: false,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    if (accepted?.accepted) report.accepted += 1;
+    else if (accepted?.error) report.errors.push(accepted.error);
+  }
+  return report;
+}
+async function appState(profile) {
+  return invokeTauriCommand(profile, "app_state", {});
+}
+function providerRuntimeProofed(state) {
+  const diagnostics = state?.transport_diagnostics || {};
+  const probe = diagnostics.data_channel_probe || {};
+  return diagnostics.data_channel_probe_status === "webrtc-datachannel-proofed" &&
+    Boolean(probe.offerer_data_channel_open) &&
+    Boolean(probe.answerer_data_channel_open) &&
+    Boolean(probe.text_control_frame_roundtrip);
+}
+async function waitForProviderRuntime(profile, label, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const state = await appState(profile);
+    last = {
+      status: state?.transport_diagnostics?.data_channel_probe_status ?? null,
+      detail: state?.transport_diagnostics?.data_channel_probe_detail ?? null,
+      last_command_error: state?.last_command_error ?? null,
+    };
+    if (providerRuntimeProofed(state)) return state;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  throw new Error(`${profile.display_name} timed out waiting for provider text/control runtime ${label}; last=${JSON.stringify(last)}`);
+}
+async function startProviderTextControlRuntimePair(profiles, label) {
+  const request = { scope_label: `g012-provider-runtime-${label}`, data_channel_probe: true, adapter_kind: "mqtt" };
+  const starts = await Promise.all([
+    invokeTauriCommand(profiles.alice, "start_text_session", { request }),
+    invokeTauriCommand(profiles.bob, "start_text_session", { request }),
+  ]);
+  const attaches = await Promise.all([
+    invokeTauriCommand(profiles.alice, "attach_text_control_transport_runtime", { request: { derive_from_state: true } }),
+    invokeTauriCommand(profiles.bob, "attach_text_control_transport_runtime", { request: { derive_from_state: true } }),
+  ]);
+  const ready = await Promise.all([
+    waitForProviderRuntime(profiles.alice, `${label}-alice`),
+    waitForProviderRuntime(profiles.bob, `${label}-bob`),
+  ]);
+  const report = {
+    label,
+    starts: starts.map((state) => state?.transport_diagnostics ?? null),
+    attaches: attaches.map((state) => state?.transport_diagnostics ?? null),
+    ready: ready.map((state) => state?.transport_diagnostics ?? null),
+  };
+  manifest[`provider_text_control_runtime_${label.replace(/\W+/g, "_")}`] = report;
+  writeManifest(manifest.status || "running", {});
+  return report;
+}
+async function pumpProviderTextControlFramesOnce(profile, label) {
+  const report = await invokeTauriCommand(profile, "pump_text_control_transport_once", {
+    request: { limit: 50, operation_timeout_ms: 10_000 },
+  });
+  return {
+    label,
+    profile: profile.display_name,
+    pending_before: report?.pending_before ?? 0,
+    frames_sent: report?.frames_sent ?? 0,
+    response_frames_received: report?.response_frames_received ?? 0,
+    receipts_applied: report?.receipts_applied ?? 0,
+    failures: Array.isArray(report?.failures) ? report.failures : [],
+    metrics: report?.metrics ?? null,
+    diagnostics: report?.state?.transport_diagnostics ?? null,
+  };
+}
+async function pumpProviderTextControlFramesBidirectional(profiles, label, rounds = 6) {
+  const runtime = await startProviderTextControlRuntimePair(profiles, label);
+  const reports = [];
+  for (let round = 0; round < rounds; round += 1) {
+    const aliceToBob = await pumpProviderTextControlFramesOnce(profiles.alice, `${label}-a2b-${round}`);
+    const bobAccepted = await acceptPendingNativeVoiceSignals(profiles.bob, `${label}-bob-accept-${round}`);
+    const bobToAlice = await pumpProviderTextControlFramesOnce(profiles.bob, `${label}-b2a-${round}`);
+    const aliceAccepted = await acceptPendingNativeVoiceSignals(profiles.alice, `${label}-alice-accept-${round}`);
+    reports.push(aliceToBob, bobAccepted, bobToAlice, aliceAccepted);
+    if (
+      aliceToBob.frames_sent === 0 &&
+      bobToAlice.frames_sent === 0 &&
+      bobAccepted.accepted === 0 &&
+      aliceAccepted.accepted === 0
+    ) {
+      break;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  }
+  const evidence = {
+    label,
+    runtime,
+    reports,
+    provider_runtime_used: true,
+    frames_sent: reports.reduce((sum, report) => sum + (report.frames_sent || 0), 0),
+    native_voice_signals_accepted: reports.reduce((sum, report) => sum + (report.accepted || 0), 0),
+    manual_command_bridge_used: false,
+  };
+  manifest[`provider_text_control_pump_${label.replace(/\W+/g, "_")}`] = evidence;
+  writeManifest(manifest.status || "running", {});
+  return evidence;
+}
 async function bridgeTextControlFramesOnce(fromProfile, toProfile, label) {
   const pending = await invokeTauriCommand(fromProfile, "list_pending_text_control_frames", { request: { limit: 50, operation_timeout_ms: 1000 } });
   const frames = Array.isArray(pending?.frames) ? pending.frames : [];
@@ -456,6 +576,7 @@ async function bridgeTextControlFramesBidirectional(profiles, label, rounds = 6)
     await new Promise((resolveWait) => setTimeout(resolveWait, 250));
   }
   manifest[`text_control_bridge_${label.replace(/\W+/g, "_")}`] = reports;
+  manifest[`text_control_bridge_${label.replace(/\W+/g, "_")}_classification`] = "manual_command_bridge_not_per56_provider_runtime_evidence";
   writeManifest(manifest.status || "running", {});
   return reports;
 }
@@ -788,8 +909,22 @@ async function voiceCallFlow(profiles) {
   }
   await Promise.all([joinVoice(profiles.alice), joinVoice(profiles.bob)]);
   const backendNativeProofs = await publishBackendNativeVoiceProofs(profiles);
+  let providerVoiceSignaling = null;
+  try {
+    providerVoiceSignaling = await pumpProviderTextControlFramesBidirectional(profiles, "voice-signaling-provider-runtime", 8);
+  } catch (error) {
+    providerVoiceSignaling = {
+      provider_runtime_used: false,
+      manual_command_bridge_used: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+    manifest.per56_provider_runtime_voice_signaling = providerVoiceSignaling;
+    writeManifest(manifest.status || "running", {});
+  }
   for (let round = 0; round < 12; round += 1) {
-    await bridgeTextControlFramesBidirectional(profiles, `voice-signaling-${round}`, 4);
+    if (!providerVoiceSignaling?.provider_runtime_used || providerVoiceSignaling.frames_sent === 0) {
+      await bridgeTextControlFramesBidirectional(profiles, `voice-signaling-${round}`, 4);
+    }
     const observed = await Promise.all([
       waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
       waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
@@ -816,6 +951,7 @@ async function voiceCallFlow(profiles) {
     alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     backend_native_proofs: backendNativeProofs,
+    per56_provider_runtime_voice_signaling: providerVoiceSignaling,
     before_leave: beforeLeave,
   };
 }
@@ -963,7 +1099,8 @@ try {
     invite_prefix: invite.slice(0, 48),
     setup: { alice: true, bob: true },
     group_invite_join: { invite_created: invite.startsWith("discrypt://join/v1/"), bob_joined: /Two Profile WebDriver Lab/i.test(bobBody) },
-    text_control_transport_bridge: "WebDriver moved signed backend text/control frames between isolated Tauri processes when the live provider/WebRTC runtime could not attach in this CI display; this is backend-frame E2E evidence, not a public-network transport proof.",
+    text_control_transport_bridge: "Manual WebDriver command bridge may move signed backend text/control frames only as fallback evidence; it is not PER-56 provider-runtime evidence.",
+    per56_provider_runtime_voice_signaling: voice?.per56_provider_runtime_voice_signaling ?? null,
     native_voice_capability: nativeVoiceCapability,
     text: {
       alice_sent_visible_on_alice: aliceTextEvidence.local_plaintext_visible || aliceBody.includes(aliceMessage),

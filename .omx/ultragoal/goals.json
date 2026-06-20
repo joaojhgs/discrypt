@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-20T10:42:02.171Z",
+  "updatedAt": "2026-06-20T11:02:53.732Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -46,9 +46,9 @@
       "status": "complete",
       "attempt": 0,
       "createdAt": "2026-06-20T10:23:15.922Z",
-      "updatedAt": "2026-06-20T10:42:02.171Z",
-      "evidence": "Implemented provider-signaled PER-56 voice media proof: added harness/local-dev local conformance provider WebRTC text/control runtime constructor; desktop harness proves Alice sealed native voice candidate traverses provider-signaled DataChannel to Bob after OpenMLS Welcome/admission, provider-visible material excludes voice/native media markers, and Bob accepts native SFrame media on the live voice session. Verification: cargo fmt --check; git diff --check; RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness native_voice_signal_traverses_provider_signaled_text_control_runtime -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness voice_signaling_uses_provider_text_control_outbox_and_inbox -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness native_rust_voice_media_proof_attaches_remote_without_webview_rtc -- --test-threads=1.",
-      "completedAt": "2026-06-20T10:42:02.171Z"
+      "updatedAt": "2026-06-20T11:02:53.732Z",
+      "evidence": "QA rejection fixes: normal all-targets/clippy compile passes without transport harness export leakage; production-copy/honesty/G128 gates pass; PER-56 plan verification command corrected; WebDriver script now records provider-runtime pump evidence path and classifies manual command bridge as non-PER56 fallback; WebDriver run remains blocked by missing DISPLAY/WAYLAND_DISPLAY with manifest at target/per56-g012-native-voice/tauri-webdriver-integrated-manifest.json.",
+      "completedAt": "2026-06-20T11:02:53.732Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
