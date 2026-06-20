@@ -11731,6 +11731,63 @@ impl PersistedAppState {
         )
     }
 
+    fn native_voice_runtime_peer_attachment(
+        &self,
+        session: &VoiceSessionView,
+    ) -> Result<TextControlRuntimePeerAttachment, String> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == session.group_id)
+            .ok_or_else(|| {
+                "Active voice session group is missing for native Rust media runtime peers"
+                    .to_owned()
+            })?;
+        if !group.channels.iter().any(|channel| {
+            channel.channel_id == session.channel_id && channel.kind == ChannelKind::Voice
+        }) {
+            return Err(
+                "Active voice session channel is missing for native Rust media runtime peers"
+                    .to_owned(),
+            );
+        }
+        let local_role = runtime_role_for_group(group, &self.local_user_id())
+            .cloned()
+            .ok_or_else(|| {
+                "Active voice session has no backend-governed local member role for native Rust media"
+                    .to_owned()
+            })?;
+        let runtime_peers =
+            group_runtime_peers(group.connectivity.as_ref(), group_role_label(&local_role));
+        if runtime_peers.len() != 2 {
+            return Err(
+                "Active voice session has no signed group bootstrap peer ids for native Rust media"
+                    .to_owned(),
+            );
+        }
+        let local = runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| {
+                "Active voice session has no local runtime peer from signed bootstrap metadata"
+                    .to_owned()
+            })?;
+        let remote = runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| {
+                "Active voice session has no remote runtime peer from signed bootstrap metadata"
+                    .to_owned()
+            })?;
+        Ok(TextControlRuntimePeerAttachment {
+            role: group_text_control_runtime_role(&local_role, &local.peer_id, &remote.peer_id)?,
+            local_peer_id: SignalingPeerId::new(local.peer_id.clone())
+                .map_err(|error| error.to_string())?,
+            remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
     fn select_signaling_profile(
         &self,
         connectivity: &ConnectivityPolicyView,
@@ -14061,6 +14118,14 @@ fn build_native_voice_media_signal(
     state: &PersistedAppState,
     request: &StartNativeVoiceMediaSessionRequest,
 ) -> Result<NativeVoiceMediaSignalPayload, String> {
+    build_native_voice_media_signal_with_peer_boundary(state, request, true)
+}
+
+fn build_native_voice_media_signal_with_peer_boundary(
+    state: &PersistedAppState,
+    request: &StartNativeVoiceMediaSessionRequest,
+    enforce_backend_peer_boundary: bool,
+) -> Result<NativeVoiceMediaSignalPayload, String> {
     let session = state
         .voice_session
         .as_ref()
@@ -14078,6 +14143,17 @@ fn build_native_voice_media_signal(
         return Err(
             "Native Rust voice media requires distinct provider-derived peer ids".to_owned(),
         );
+    }
+    if enforce_backend_peer_boundary {
+        let runtime_attachment = state.native_voice_runtime_peer_attachment(session)?;
+        if runtime_attachment.local_peer_id.0 != request.local_peer_id
+            || runtime_attachment.remote_peer_id.0 != request.remote_peer_id
+        {
+            return Err(
+                "Native Rust voice media peer ids must match the backend-derived voice runtime peers"
+                    .to_owned(),
+            );
+        }
     }
 
     let (epoch_secret, current_epoch) = state.openmls_media_exporter_secret(
@@ -17278,6 +17354,20 @@ mod tests {
             speaking: true,
             attached_at_ms: 1_700_000_000_000,
         })
+    }
+
+    fn backend_group_runtime_peer_ids(group: &GroupView) -> Result<(String, String), String> {
+        let local = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "local backend runtime peer missing".to_owned())?;
+        let remote = group
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "remote backend runtime peer missing".to_owned())?;
+        Ok((local.peer_id.clone(), remote.peer_id.clone()))
     }
 
     fn reload_global_app_service_from_path(path: &std::path::Path) {
@@ -23734,7 +23824,12 @@ mod tests {
             kind: ChannelKind::Voice,
             retention_status: "session".to_owned(),
         });
-        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
         let joined = join_voice(JoinVoiceRequest {
             group_id,
             channel_id,
@@ -23913,7 +24008,12 @@ mod tests {
             kind: ChannelKind::Voice,
             retention_status: "session".to_owned(),
         });
-        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
         let joined = join_voice(JoinVoiceRequest {
             group_id,
             channel_id,
@@ -23988,7 +24088,12 @@ mod tests {
             kind: ChannelKind::Voice,
             retention_status: "session".to_owned(),
         });
-        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
         let joined = join_voice(JoinVoiceRequest {
             group_id: group_id.clone(),
             channel_id: channel_id.clone(),
@@ -24068,6 +24173,166 @@ mod tests {
     }
 
     #[test]
+    fn native_rust_voice_media_start_rejects_missing_or_unjoined_backend_session(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("native-rust-voice-media-requires-session");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let missing = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
+            session_id: "voice-missing".to_owned(),
+            local_peer_id: "peer-local".to_owned(),
+            remote_peer_id: "peer-remote".to_owned(),
+            muted: false,
+            created_at_ms: 40,
+        });
+        assert!(missing.native_media.is_none());
+        assert_eq!(
+            missing
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("native_voice_media_start_failed")
+        );
+        assert!(missing.state.voice_session.is_none());
+
+        let group_state = create_group(CreateGroupRequest {
+            name: "Native Voice Boundary".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let (local_peer_id, remote_peer_id) =
+            backend_group_runtime_peer_ids(&group_state.groups[0])?;
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let denied = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "denied".to_owned(),
+            input_device_id: Some("native-rust-default-capture".to_owned()),
+            input_device_label: Some("Native Rust capture source".to_owned()),
+            output_device_id: Some("native-rust-default-playback".to_owned()),
+            output_device_label: Some("Native Rust playback sink".to_owned()),
+        });
+        let session_id = denied
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "unjoined voice session missing".to_owned())?;
+        assert!(!denied
+            .voice_session
+            .as_ref()
+            .map(|session| session.joined)
+            .unwrap_or(true));
+        let unjoined = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
+            session_id,
+            local_peer_id,
+            remote_peer_id,
+            muted: false,
+            created_at_ms: 41,
+        });
+        assert!(unjoined.native_media.is_none());
+        assert!(unjoined
+            .state
+            .last_command_error
+            .as_ref()
+            .map(|error| error.message.contains("requires a joined voice session"))
+            .unwrap_or(false));
+        assert!(!unjoined
+            .state
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.native_media_started"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_rust_voice_media_start_rejects_non_backend_runtime_peers() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("native-rust-voice-media-backend-peers");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Native Voice Peer Boundary".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        let channel_state = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Ops Voice".to_owned(),
+            kind: ChannelKind::Voice,
+            retention_status: "session".to_owned(),
+        });
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let joined = join_voice(JoinVoiceRequest {
+            group_id,
+            channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("native-rust-default-capture".to_owned()),
+            input_device_label: Some("Native Rust capture source".to_owned()),
+            output_device_id: Some("native-rust-default-playback".to_owned()),
+            output_device_label: Some("Native Rust playback sink".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        let rejected = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
+            session_id,
+            local_peer_id: "peer-ui-supplied-local".to_owned(),
+            remote_peer_id: "peer-ui-supplied-remote".to_owned(),
+            muted: false,
+            created_at_ms: 42,
+        });
+        assert!(rejected.native_media.is_none());
+        assert!(rejected
+            .state
+            .last_command_error
+            .as_ref()
+            .map(|error| error
+                .message
+                .contains("must match the backend-derived voice runtime peers"))
+            .unwrap_or(false));
+        assert!(!rejected
+            .state
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.native_media_started"));
+        Ok(())
+    }
+
+    #[test]
     fn native_rust_voice_media_proof_attaches_remote_without_webview_rtc() -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("native-rust-voice-media");
@@ -24084,6 +24349,8 @@ mod tests {
             ice_stun_servers: None,
             ice_turn_servers: None,
         });
+        let (local_peer_id, remote_peer_id) =
+            backend_group_runtime_peer_ids(&group_state.groups[0])?;
         let group_id = group_state.groups[0].group_id.clone();
         let channel_state = create_channel(CreateChannelRequest {
             group_id: group_id.clone(),
@@ -24091,7 +24358,12 @@ mod tests {
             kind: ChannelKind::Voice,
             retention_status: "session".to_owned(),
         });
-        let channel_id = channel_state.groups[0].channels[0].channel_id.clone();
+        let channel_id = channel_state.groups[0]
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
         let joined = join_voice(JoinVoiceRequest {
             group_id,
             channel_id,
@@ -24108,8 +24380,8 @@ mod tests {
             .ok_or_else(|| "voice session missing".to_owned())?;
         let started = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
             session_id: session_id.clone(),
-            local_peer_id: "peer-alice".to_owned(),
-            remote_peer_id: "peer-bob".to_owned(),
+            local_peer_id: local_peer_id.clone(),
+            remote_peer_id: remote_peer_id.clone(),
             muted: false,
             created_at_ms: 42,
         });
@@ -24117,6 +24389,8 @@ mod tests {
             .native_media
             .ok_or_else(|| "native media proof missing".to_owned())?;
         assert_eq!(local_media.media_path, "native_rust_webrtc_datachannel");
+        assert_eq!(local_media.from_peer_id, local_peer_id);
+        assert_eq!(local_media.to_peer_id, remote_peer_id);
         assert_eq!(local_media.protected_frames_count, 1);
         assert!(local_media.opus_payload_bytes > 0);
         assert!(local_media.protected_payload_bytes > 0);
@@ -24140,21 +24414,25 @@ mod tests {
                 .as_ref()
                 .map(|error| error.message.contains("KID")
                     || error.message.contains("authentication")
-                    || error.message.contains("sender binding"))
+                    || error.message.contains("sender binding")
+                    || error
+                        .message
+                        .contains("addressed to a different provider peer"))
                 .unwrap_or(false),
-            "relabeled protected frame must fail authentication/binding"
+            "relabeled protected frame must fail peer boundary or authentication/binding"
         );
 
         let remote_media = with_state(|state| {
-            build_native_voice_media_signal(
+            build_native_voice_media_signal_with_peer_boundary(
                 state,
                 &StartNativeVoiceMediaSessionRequest {
                     session_id: session_id.clone(),
-                    local_peer_id: "peer-bob".to_owned(),
-                    remote_peer_id: "peer-alice".to_owned(),
+                    local_peer_id: remote_peer_id,
+                    remote_peer_id: local_peer_id,
                     muted: false,
                     created_at_ms: 43,
                 },
+                false,
             )
         })?;
         let accepted = accept_native_voice_media_frame(AcceptNativeVoiceMediaFrameRequest {
