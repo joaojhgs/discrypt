@@ -1,0 +1,50 @@
+[
+  {
+    "event_id": "audit-approved-priya",
+    "group_id": "$GROUP_ID",
+    "event_kind": "admission_request_approved",
+    "actor_member_id": "owner-governance",
+    "target_member_id": null,
+    "request_id": "request-approved-panel",
+    "role_before": null,
+    "role_after": "member",
+    "created_at": "2026-06-20T08:45:00.000Z",
+    "summary": "Approved Priya Pending admission"
+  },
+  {
+    "event_id": "audit-refused-riley",
+    "group_id": "$GROUP_ID",
+    "event_kind": "admission_request_refused",
+    "actor_member_id": "staff-governance",
+    "target_member_id": null,
+    "request_id": "request-refused-panel",
+    "role_before": null,
+    "role_after": null,
+    "created_at": "2026-06-20T08:46:00.000Z",
+    "summary": "Refused Riley Request admission"
+  },
+  {
+    "event_id": "audit-promoted-mira",
+    "group_id": "$GROUP_ID",
+    "event_kind": "member.promoted",
+    "actor_member_id": "owner-governance",
+    "target_member_id": "member-governance",
+    "request_id": null,
+    "role_before": "member",
+    "role_after": "staff",
+    "created_at": "2026-06-20T08:47:00.000Z",
+    "summary": "Promoted Mira Member to staff"
+  },
+  {
+    "event_id": "audit-revoked-owen",
+    "group_id": "$GROUP_ID",
+    "event_kind": "member.revoked",
+    "actor_member_id": "owner-governance",
+    "target_member_id": "offline-governance",
+    "request_id": null,
+    "role_before": "member",
+    "role_after": null,
+    "created_at": "2026-06-20T08:48:00.000Z",
+    "summary": "Revoked Owen Offline access"
+  }
+]

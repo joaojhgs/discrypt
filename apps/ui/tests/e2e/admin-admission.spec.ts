@@ -1,4 +1,12 @@
+import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "playwright/test";
+
+const auditLogCommandSnapshot = JSON.parse(
+  readFileSync(
+    new URL("./support/p5-t09-audit-log-command-snapshot.json", import.meta.url),
+    "utf8",
+  ),
+) as Array<Record<string, unknown>>;
 
 async function bootReadyShell(page) {
   await page.goto("/");
@@ -25,7 +33,7 @@ async function openCreateGroupModal(page) {
 }
 
 async function seedGovernancePanelState(page: Page, groupName: string) {
-  await page.evaluate((name) => {
+  await page.evaluate(({ name, auditLog }) => {
     const key = "discrypt.local-dev.app-state.v1";
     const stored = window.localStorage.getItem(key);
     if (!stored) throw new Error("Missing fallback command state");
@@ -35,6 +43,7 @@ async function seedGovernancePanelState(page: Page, groupName: string) {
         name: string;
         members?: Array<Record<string, unknown>>;
         admission_requests?: Array<Record<string, unknown>>;
+        governance_log?: Array<Record<string, unknown>>;
         role_policy?: Record<string, unknown>;
       }>;
     };
@@ -119,9 +128,47 @@ async function seedGovernancePanelState(page: Page, groupName: string) {
         policy_epoch_at_request: 1,
         admission_mode_at_request: "manual_approval",
       },
+      {
+        request_id: "request-approved-panel",
+        group_id: group.group_id,
+        invite_id: "invite-panel",
+        display_name: "Priya Pending",
+        device_name: "Pending Laptop",
+        member_identity: "pending-governance",
+        signer_public_key_hex: "pending-key",
+        key_package: [1, 2, 3],
+        status: "approved",
+        requested_at: past,
+        decided_by: "owner-governance",
+        decided_at: "2026-06-20T08:45:00.000Z",
+        decision_reason: null,
+        policy_epoch_at_request: 1,
+        admission_mode_at_request: "manual_approval",
+      },
+      {
+        request_id: "request-refused-panel",
+        group_id: group.group_id,
+        invite_id: "invite-panel",
+        display_name: "Riley Request",
+        device_name: "Request Phone",
+        member_identity: "refused-governance",
+        signer_public_key_hex: "refused-key",
+        key_package: [4, 5, 6],
+        status: "refused",
+        requested_at: past,
+        decided_by: "staff-governance",
+        decided_at: "2026-06-20T08:46:00.000Z",
+        decision_reason: "Owner/staff refused request",
+        policy_epoch_at_request: 1,
+        admission_mode_at_request: "manual_approval",
+      },
     ];
+    group.governance_log = auditLog.map((entry) => ({
+      ...entry,
+      group_id: group.group_id,
+    }));
     window.localStorage.setItem(key, JSON.stringify(state));
-  }, groupName);
+  }, { name: groupName, auditLog: auditLogCommandSnapshot });
   await page.reload();
 }
 
@@ -216,4 +263,92 @@ test("right member panel sections backend governance and manual admission state"
     fullPage: true,
     path: testInfo.outputPath("right-member-panel-governance-sections.png"),
   });
+});
+
+test("governance audit log summarizes and expands backend command history", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Audit Lab");
+  await page.getByLabel("Invite admission mode").selectOption("manual_approval");
+  await page.getByRole("button", { name: /^Create group$/ }).last().click();
+  await seedGovernancePanelState(page, "Audit Lab");
+
+  await page
+    .getByLabel("Channel navigation")
+    .getByRole("button", { name: /Audit log/i })
+    .click();
+
+  const auditPane = page.getByTestId("main-chat-content");
+  await expect(
+    auditPane.getByRole("heading", { name: /Governance audit log/i }),
+  ).toBeVisible();
+  await expect(auditPane.getByText("owner").first()).toBeVisible();
+  await expect(auditPane.getByText("4 events")).toBeVisible();
+  await expect(auditPane.getByText("Approved").first()).toBeVisible();
+  await expect(auditPane.getByText("Refused").first()).toBeVisible();
+  await expect(auditPane.getByText("Promoted").first()).toBeVisible();
+  await expect(auditPane.getByText("Revoked").first()).toBeVisible();
+
+  const approvedEntry = page
+    .locator("article")
+    .filter({ hasText: "Approved Priya Pending admission" });
+  await expect(approvedEntry).toBeVisible();
+  await expect(approvedEntry.getByText("Priya Pending (approved)")).toBeVisible();
+  await expect(
+    page.locator("article").filter({ hasText: "Refused Riley Request admission" }),
+  ).toBeVisible();
+  await expect(
+    page.locator("article").filter({ hasText: "Promoted Mira Member to staff" }),
+  ).toBeVisible();
+  await expect(
+    page.locator("article").filter({ hasText: "Revoked Owen Offline access" }),
+  ).toBeVisible();
+
+  await auditPane.getByText("Approved history").click();
+  await expect(approvedEntry).toBeHidden();
+  await auditPane.getByText("Approved history").click();
+  await expect(approvedEntry).toBeVisible();
+
+  await page.screenshot({
+    fullPage: true,
+    path: testInfo.outputPath("governance-audit-log-history.png"),
+  });
+});
+
+test("governance audit log shows empty and degraded mobile states without fabricating events", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 820 });
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Empty Audit Lab");
+  await page.getByRole("button", { name: /^Create group$/ }).last().click();
+
+  await page.getByRole("button", { name: "Audit" }).click();
+  const auditPane = page.getByTestId("main-chat-content");
+  await expect(
+    auditPane.getByRole("heading", { name: /Governance audit log/i }),
+  ).toBeVisible();
+  await expect(auditPane.getByText("No audit events yet")).toBeVisible();
+  await expect(
+    auditPane.getByText(/backend governance commands record them/i),
+  ).toBeVisible();
+
+  await page.evaluate(() => {
+    const key = "discrypt.local-dev.app-state.v1";
+    const stored = window.localStorage.getItem(key);
+    if (!stored) throw new Error("Missing fallback command state");
+    const state = JSON.parse(stored) as {
+      groups?: Array<Record<string, unknown>>;
+    };
+    const group = state.groups?.find((item) => item.name === "Empty Audit Lab");
+    if (!group) throw new Error("Missing Empty Audit Lab");
+    group.governance_log = "malformed-audit-snapshot";
+    window.localStorage.setItem(key, JSON.stringify(state));
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "Audit" }).click();
+  await expect(auditPane.getByText("Audit snapshot unavailable")).toBeVisible();
+  await expect(auditPane.getByText(/not making audit claims/i)).toBeVisible();
 });
