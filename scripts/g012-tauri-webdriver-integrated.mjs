@@ -653,6 +653,60 @@ function hasOpenMlsAdmission(state) {
   return Boolean(handle) || { group_id: groupId, handles: handles.map((entry) => ({ group_id: entry?.group_id, epoch: entry?.epoch })), joined: events.some((event) => event?.kind === "mls.admission_welcome_joined") };
 }
 
+function pendingAdmissionRequest(state) {
+  const groups = Array.isArray(state?.groups) ? state.groups : [];
+  const group = groups.find((candidate) => candidate?.name === "Two Profile WebDriver Lab");
+  const request = group?.admission_requests?.find((candidate) => candidate?.status === "pending");
+  if (!group || !request) {
+    return {
+      group_id: group?.group_id ?? null,
+      pending_count: group?.admission_requests?.filter((candidate) => candidate?.status === "pending").length ?? 0,
+    };
+  }
+  return {
+    group_id: group.group_id,
+    request_id: request.request_id,
+    display_name: request.display_name,
+    key_package_bytes: Array.isArray(request.key_package) ? request.key_package.length : 0,
+  };
+}
+
+async function approvePendingAdmission(profile) {
+  const deadline = Date.now() + 60_000;
+  let pending = null;
+  while (Date.now() < deadline) {
+    const state = readJsonIfExists(profile.state_path);
+    pending = pendingAdmissionRequest(state);
+    if (pending?.group_id && pending?.request_id) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  if (!pending?.group_id || !pending?.request_id) {
+    manifest.openmls_admission_owner_approval = { approved: false, pending };
+    throw new Error(`${profile.display_name} did not persist a pending OpenMLS admission request; last=${JSON.stringify(pending)}`);
+  }
+  const approvedState = await invokeTauriCommand(profile, "approve_group_admission_request", {
+    request: {
+      group_id: pending.group_id,
+      request_id: pending.request_id,
+    },
+  });
+  const error = approvedState?.last_command_error ?? null;
+  const approved = !error && approvedState?.groups?.some((group) =>
+    group?.group_id === pending.group_id &&
+    group?.admission_requests?.some((request) => request?.request_id === pending.request_id && request?.status === "approved")
+  );
+  manifest.openmls_admission_owner_approval = {
+    approved,
+    pending,
+    last_command_error: error,
+    command: "approve_group_admission_request",
+  };
+  writeManifest(manifest.status || "running", {});
+  if (!approved) {
+    throw new Error(`${profile.display_name} failed to approve OpenMLS admission; result=${JSON.stringify(manifest.openmls_admission_owner_approval)}`);
+  }
+}
+
 async function waitForMaybe(profile, label, script, args = [], timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
   let last = false;
@@ -1124,6 +1178,8 @@ try {
   const audioPreferences = await configureReleaseSmokeAudioPreferences(profiles);
   const invite = await createGroupInvite(profiles.alice);
   await joinGroup(profiles.bob, invite);
+  await bridgeTextControlFramesBidirectional(profiles, "openmls-admission-request", 4);
+  await approvePendingAdmission(profiles.alice);
   await bridgeTextControlFramesBidirectional(profiles, "openmls-admission", 8);
   await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
   await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);

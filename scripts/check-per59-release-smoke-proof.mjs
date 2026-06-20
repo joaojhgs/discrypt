@@ -33,6 +33,10 @@ for (const token of [
   "Create invite for Two Profile WebDriver Lab",
   "Join with invite",
   "Local label",
+  "approvePendingAdmission",
+  "approve_group_admission_request",
+  "openmls-admission-request",
+  "openmls_admission_owner_approval",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }
