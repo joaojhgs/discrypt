@@ -27,6 +27,9 @@ for (const token of [
   "adjustRemoteParticipantVolumes",
   "profile ready or trust setup screen",
   "local profile ready|start a private space",
+  "contextClickText",
+  "Open Two Profile WebDriver Lab group",
+  "Create invite for Two Profile WebDriver Lab",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }

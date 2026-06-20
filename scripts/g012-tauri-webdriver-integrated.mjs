@@ -755,6 +755,29 @@ const clickText = (pattern, flags = 'i') => {
   el.click();
   return true;
 };
+const contextClickText = (pattern, flags = 'i') => {
+  const candidates = [...document.querySelectorAll('button, [role="button"], a, [tabindex], [data-testid]')]
+    .filter((el) => visible(el) && textMatches(accessibleText(el), pattern, flags));
+  const el = candidates[0];
+  if (!el) return false;
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  const rect = el.getBoundingClientRect();
+  const options = {
+    bubbles: true,
+    cancelable: true,
+    button: 2,
+    buttons: 2,
+    clientX: Math.round(rect.left + rect.width / 2),
+    clientY: Math.round(rect.top + rect.height / 2),
+  };
+  const PointerCtor = window.PointerEvent || MouseEvent;
+  el.dispatchEvent(new PointerCtor('pointerdown', options));
+  el.dispatchEvent(new MouseEvent('mousedown', options));
+  el.dispatchEvent(new MouseEvent('contextmenu', options));
+  el.dispatchEvent(new MouseEvent('mouseup', options));
+  el.dispatchEvent(new PointerCtor('pointerup', options));
+  return true;
+};
 const debugVisibleActions = () => [...document.querySelectorAll('button, [role="button"], a, [tabindex], [data-testid]')]
   .filter((el) => visible(el))
   .map((el) => accessibleText(el) + (el.disabled ? ' [disabled]' : '') + (el.getAttribute('aria-disabled') === 'true' ? ' [aria-disabled]' : ''))
@@ -782,6 +805,10 @@ async function clickText(profile, pattern) {
   const ok = await exec(profile, `${domHelpers}; return clickText(arguments[0], 'i');`, [pattern]);
   if (!ok) throw new Error(`${profile.display_name} could not click text matching ${pattern}; visible actions=${JSON.stringify(await visibleActions(profile))}`);
 }
+async function contextClickText(profile, pattern) {
+  const ok = await exec(profile, `${domHelpers}; return contextClickText(arguments[0], 'i');`, [pattern]);
+  if (!ok) throw new Error(`${profile.display_name} could not context-click text matching ${pattern}; visible actions=${JSON.stringify(await visibleActions(profile))}`);
+}
 async function fill(profile, label, value) {
   const ok = await exec(profile, `${domHelpers}; return setControlValue(arguments[0], arguments[1]);`, [label, value]);
   if (!ok) throw new Error(`${profile.display_name} could not fill ${label}`);
@@ -802,7 +829,9 @@ async function createGroupInvite(profile) {
   await fill(profile, "Group name", "Two Profile WebDriver Lab");
   await click(profile, "^Create group$", { last: true });
   await waitUntil(profile, "created group", "return /Two Profile WebDriver Lab/i.test(document.body.innerText)");
-  await click(profile, "Create invite");
+  await contextClickText(profile, "Open Two Profile WebDriver Lab group");
+  await click(profile, "^Create invite$");
+  await click(profile, "Create invite for Two Profile WebDriver Lab");
   return waitUntil(profile, "invite URL", "const m = document.body.innerText.match(new RegExp('discrypt:\\\\/\\\\/join\\\\/v1\\\\/\\\\S+')); return m && m[0];");
 }
 async function joinGroup(profile, invite) {
