@@ -78,7 +78,7 @@ use discrypt_transport::{
     TransportError, TransportRoute, TransportSession, TransportSessionSnapshot,
     TransportSessionState, TurnServerConfig,
 };
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1473,10 +1473,14 @@ pub enum TextControlFrameView {
         group_id: String,
         event_id: String,
         actor_member_id: String,
+        #[serde(default)]
+        actor_signer_public_key_hex: Option<String>,
         target_member_id: String,
         role_before: GroupRoleView,
         role_after: GroupRoleView,
         created_at: String,
+        #[serde(default)]
+        signature_hex: Option<String>,
     },
     /// MLS-protected governance event indicating a member was fail-closed revoked.
     GroupMemberRevoked {
@@ -4352,24 +4356,29 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
                 .as_ref()
                 .map(|profile| profile.display_name.clone())
                 .unwrap_or_else(|| "Owner".to_owned());
+            let owner_signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+            let owner_signer_public_key_hex =
+                hex::encode(owner_signing_key.verifying_key().as_bytes());
             let device_id = state
                 .devices
                 .iter()
                 .find(|device| device.local)
                 .map(|device| device.device_id.clone());
             let role = GroupRoleView::Owner;
+            let mut owner_member = initial_group_member(
+                &local_member_id,
+                &display_name,
+                device_id,
+                role.clone(),
+                &created_at,
+            );
+            owner_member.signer_public_key_hex = Some(owner_signer_public_key_hex);
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "owner".to_owned(),
                 channels: default_group_channels(state.next_sequence),
-                members: vec![initial_group_member(
-                    &local_member_id,
-                    &display_name,
-                    device_id,
-                    role.clone(),
-                    &created_at,
-                )],
+                members: vec![owner_member],
                 role_policy: initial_group_role_policy(
                     request.admission_mode.clone().unwrap_or_default(),
                     &local_member_id,
@@ -5033,10 +5042,12 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
         state.ensure_ready_profile();
         let actor = state.local_user_id();
         let now = Utc::now().to_rfc3339();
-        let Some(group) = state
+        let actor_signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+        let actor_signer_public_key_hex = hex::encode(actor_signing_key.verifying_key().as_bytes());
+        let Some(group_index) = state
             .groups
-            .iter_mut()
-            .find(|group| group.group_id == request.group_id)
+            .iter()
+            .position(|group| group.group_id == request.group_id)
         else {
             state.push_command_error(
                 "group.member_promote_rejected",
@@ -5047,12 +5058,22 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             );
             return;
         };
-        let actor_role = group
+        let group = &state.groups[group_index];
+        let Some(actor_member) = group
             .members
             .iter()
             .find(|member| member.member_id == actor && member.status != "revoked")
-            .map(|member| member.role.clone());
-        if actor_role != Some(GroupRoleView::Owner) {
+        else {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "owner_required",
+                "Only the group owner can promote staff",
+                "Ask the owner to promote this member",
+            );
+            return;
+        };
+        if actor_member.role != GroupRoleView::Owner {
             state.push_command_error(
                 "group.member_promote_rejected",
                 "promote_group_member_to_staff",
@@ -5062,10 +5083,32 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             );
             return;
         }
-        let Some(member) = group
+        let Some(persisted_actor_signer_public_key_hex) =
+            actor_member.signer_public_key_hex.as_deref()
+        else {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "actor_signer_missing",
+                "Owner roster signer is missing for this group",
+                "Refresh or recreate the authorized group membership before changing member roles",
+            );
+            return;
+        };
+        if persisted_actor_signer_public_key_hex != actor_signer_public_key_hex {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "actor_signer_mismatch",
+                "Owner roster signer does not match the local profile signing key",
+                "Use the owner profile that created or admitted this group before changing member roles",
+            );
+            return;
+        }
+        let Some(member_index) = group
             .members
-            .iter_mut()
-            .find(|member| member.member_id == request.member_id)
+            .iter()
+            .position(|member| member.member_id == request.member_id)
         else {
             state.push_command_error(
                 "group.member_promote_rejected",
@@ -5076,6 +5119,7 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             );
             return;
         };
+        let member = &group.members[member_index];
         if member.status == "revoked" {
             state.push_command_error(
                 "group.member_promote_rejected",
@@ -5096,35 +5140,45 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             );
             return;
         }
-        let before = member.role.clone();
-        if before != GroupRoleView::Staff {
-            member.role = GroupRoleView::Staff;
+        if member.role == GroupRoleView::Staff {
+            state.push_event(
+                "group.member_promote_noop",
+                format!(
+                    "{} is already staff",
+                    redacted_observable_ref("member", &request.member_id)
+                ),
+            );
+            return;
         }
+        let before = member.role.clone();
         let id = governance_event_id(
             &request.group_id,
             "member.promoted",
             &request.member_id,
             state.next_sequence,
         );
-        group.governance_log.push(governance_log_entry(
-            &id,
-            &request.group_id,
-            "member.promoted",
-            &actor,
-            Some(&request.member_id),
-            Some(before.clone()),
-            Some(GroupRoleView::Staff),
-            &now,
-            "Promoted member to staff",
-        ));
         let frame = TextControlFrameView::GroupMemberRoleChanged {
             group_id: request.group_id.clone(),
             event_id: id.clone(),
             actor_member_id: actor.clone(),
+            actor_signer_public_key_hex: Some(actor_signer_public_key_hex.clone()),
             target_member_id: request.member_id.clone(),
-            role_before: before,
+            role_before: before.clone(),
             role_after: GroupRoleView::Staff,
-            created_at: now,
+            created_at: now.clone(),
+            signature_hex: Some(sign_group_member_role_change(
+                &actor_signing_key,
+                GroupMemberRoleChangeSignaturePayload {
+                    group_id: &request.group_id,
+                    event_id: &id,
+                    actor_member_id: &actor,
+                    actor_signer_public_key_hex: &actor_signer_public_key_hex,
+                    target_member_id: &request.member_id,
+                    role_before: &before,
+                    role_after: &GroupRoleView::Staff,
+                    created_at: &now,
+                },
+            )),
         };
         if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
             state.push_command_error(
@@ -5136,6 +5190,20 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             );
             return;
         }
+        let group = &mut state.groups[group_index];
+        let member = &mut group.members[member_index];
+        member.role = GroupRoleView::Staff;
+        group.governance_log.push(governance_log_entry(
+            &id,
+            &request.group_id,
+            "member.promoted",
+            &actor,
+            Some(&request.member_id),
+            Some(before.clone()),
+            Some(GroupRoleView::Staff),
+            &now,
+            "Promoted member to staff",
+        ));
         state.push_event(
             "group.member_promoted",
             format!(
@@ -5152,10 +5220,12 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
         state.ensure_ready_profile();
         let actor = state.local_user_id();
         let now = Utc::now().to_rfc3339();
-        let Some(group) = state
+        let actor_signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+        let actor_signer_public_key_hex = hex::encode(actor_signing_key.verifying_key().as_bytes());
+        let Some(group_index) = state
             .groups
-            .iter_mut()
-            .find(|group| group.group_id == request.group_id)
+            .iter()
+            .position(|group| group.group_id == request.group_id)
         else {
             state.push_command_error(
                 "group.member_demote_rejected",
@@ -5166,12 +5236,22 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
             );
             return;
         };
-        let actor_role = group
+        let group = &state.groups[group_index];
+        let Some(actor_member) = group
             .members
             .iter()
             .find(|member| member.member_id == actor && member.status != "revoked")
-            .map(|member| member.role.clone());
-        if actor_role != Some(GroupRoleView::Owner) {
+        else {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "owner_required",
+                "Only the group owner can demote staff",
+                "Ask the owner to demote this staff member",
+            );
+            return;
+        };
+        if actor_member.role != GroupRoleView::Owner {
             state.push_command_error(
                 "group.member_demote_rejected",
                 "demote_group_staff_to_member",
@@ -5181,10 +5261,32 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
             );
             return;
         }
-        let Some(member) = group
+        let Some(persisted_actor_signer_public_key_hex) =
+            actor_member.signer_public_key_hex.as_deref()
+        else {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "actor_signer_missing",
+                "Owner roster signer is missing for this group",
+                "Refresh or recreate the authorized group membership before changing member roles",
+            );
+            return;
+        };
+        if persisted_actor_signer_public_key_hex != actor_signer_public_key_hex {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "actor_signer_mismatch",
+                "Owner roster signer does not match the local profile signing key",
+                "Use the owner profile that created or admitted this group before changing member roles",
+            );
+            return;
+        }
+        let Some(member_index) = group
             .members
-            .iter_mut()
-            .find(|member| member.member_id == request.member_id)
+            .iter()
+            .position(|member| member.member_id == request.member_id)
         else {
             state.push_command_error(
                 "group.member_demote_rejected",
@@ -5195,36 +5297,39 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
             );
             return;
         };
+        let member = &group.members[member_index];
         if member.role != GroupRoleView::Staff {
             return;
         }
         let before = member.role.clone();
-        member.role = GroupRoleView::Member;
         let id = governance_event_id(
             &request.group_id,
             "member.demoted",
             &request.member_id,
             state.next_sequence,
         );
-        group.governance_log.push(governance_log_entry(
-            &id,
-            &request.group_id,
-            "member.demoted",
-            &actor,
-            Some(&request.member_id),
-            Some(before.clone()),
-            Some(GroupRoleView::Member),
-            &now,
-            "Demoted staff to member",
-        ));
         let frame = TextControlFrameView::GroupMemberRoleChanged {
             group_id: request.group_id.clone(),
             event_id: id.clone(),
             actor_member_id: actor.clone(),
+            actor_signer_public_key_hex: Some(actor_signer_public_key_hex.clone()),
             target_member_id: request.member_id.clone(),
-            role_before: before,
+            role_before: before.clone(),
             role_after: GroupRoleView::Member,
-            created_at: now,
+            created_at: now.clone(),
+            signature_hex: Some(sign_group_member_role_change(
+                &actor_signing_key,
+                GroupMemberRoleChangeSignaturePayload {
+                    group_id: &request.group_id,
+                    event_id: &id,
+                    actor_member_id: &actor,
+                    actor_signer_public_key_hex: &actor_signer_public_key_hex,
+                    target_member_id: &request.member_id,
+                    role_before: &before,
+                    role_after: &GroupRoleView::Member,
+                    created_at: &now,
+                },
+            )),
         };
         if let Err(error) = queue_group_governance_frame(state, &request.group_id, &id, frame) {
             state.push_command_error(
@@ -5236,6 +5341,20 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
             );
             return;
         }
+        let group = &mut state.groups[group_index];
+        let member = &mut group.members[member_index];
+        member.role = GroupRoleView::Member;
+        group.governance_log.push(governance_log_entry(
+            &id,
+            &request.group_id,
+            "member.demoted",
+            &actor,
+            Some(&request.member_id),
+            Some(before.clone()),
+            Some(GroupRoleView::Member),
+            &now,
+            "Demoted staff to member",
+        ));
         state.push_event(
             "group.member_demoted",
             format!(
@@ -11064,28 +11183,44 @@ impl PersistedAppState {
                 group_id,
                 event_id,
                 actor_member_id,
+                actor_signer_public_key_hex,
                 target_member_id,
                 role_before,
                 role_after,
                 created_at,
+                signature_hex,
             } => {
-                apply_group_member_role_changed(
+                let status = match apply_group_member_role_changed(
                     self,
                     GroupMemberRoleChangedEvent {
                         group_id: &group_id,
                         event_id: &event_id,
                         actor_member_id: &actor_member_id,
+                        actor_signer_public_key_hex: actor_signer_public_key_hex.as_deref(),
                         target_member_id: &target_member_id,
                         role_before,
                         role_after,
                         created_at: &created_at,
+                        signature_hex: signature_hex.as_deref(),
                     },
-                );
+                ) {
+                    Ok(()) => "role_changed_applied",
+                    Err((code, message, hint)) => {
+                        self.push_command_error(
+                            "group.member_role_change_rejected",
+                            "handle_text_control_frame",
+                            code,
+                            message,
+                            hint,
+                        );
+                        "role_changed_rejected"
+                    }
+                };
                 Some(TextControlFrameView::GroupGovernanceAck {
                     group_id,
                     event_id,
                     applied_by_member_id: self.local_user_id(),
-                    status: "role_changed_applied".to_owned(),
+                    status: status.to_owned(),
                     created_at: Utc::now().to_rfc3339(),
                 })
             }
@@ -11209,8 +11344,8 @@ impl PersistedAppState {
                 member_id,
                 display_name,
                 device_id,
-                role,
-                signer_public_key_hex,
+                role: _,
+                signer_public_key_hex: _,
                 last_seen_at,
                 presence_expires_at,
             } => {
@@ -11222,8 +11357,6 @@ impl PersistedAppState {
                         member_id: &member_id,
                         display_name,
                         device_id,
-                        role,
-                        signer_public_key_hex,
                         last_seen_at: &last_seen_at,
                         presence_expires_at: &presence_expires_at,
                     },
@@ -12430,6 +12563,66 @@ fn text_control_frame_sha256(frame: &TextControlFrameView) -> Result<String, Str
     let mut hasher = Sha256::new();
     hasher.update(encoded);
     Ok(hex::encode(hasher.finalize()))
+}
+
+struct GroupMemberRoleChangeSignaturePayload<'a> {
+    group_id: &'a str,
+    event_id: &'a str,
+    actor_member_id: &'a str,
+    actor_signer_public_key_hex: &'a str,
+    target_member_id: &'a str,
+    role_before: &'a GroupRoleView,
+    role_after: &'a GroupRoleView,
+    created_at: &'a str,
+}
+
+fn group_member_role_change_signature_payload(
+    payload: GroupMemberRoleChangeSignaturePayload<'_>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"discrypt:group-member-role-change:v1");
+    bytes.push(0);
+    bytes.extend_from_slice(payload.group_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.event_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.actor_member_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.actor_signer_public_key_hex.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.target_member_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.role_before.as_str().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.role_after.as_str().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.created_at.as_bytes());
+    bytes
+}
+
+fn sign_group_member_role_change(
+    signing_key: &SigningKey,
+    payload: GroupMemberRoleChangeSignaturePayload<'_>,
+) -> String {
+    let payload = group_member_role_change_signature_payload(payload);
+    hex::encode(signing_key.sign(&payload).to_bytes())
+}
+
+fn verify_group_member_role_change_signature(
+    verifying_key_hex: &str,
+    signature_hex: &str,
+    payload: GroupMemberRoleChangeSignaturePayload<'_>,
+) -> Result<(), String> {
+    let verifying_key = verifying_key_from_hex(verifying_key_hex)
+        .ok_or_else(|| "Role-change governance signer key is invalid".to_owned())?;
+    let signature_bytes = hex::decode(signature_hex)
+        .map_err(|error| format!("Role-change governance signature is invalid hex: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("Role-change governance signature is malformed: {error}"))?;
+    let payload = group_member_role_change_signature_payload(payload);
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|error| format!("Role-change governance signature verification failed: {error}"))
 }
 
 fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> {
@@ -15556,16 +15749,18 @@ struct GroupMemberRoleChangedEvent<'a> {
     group_id: &'a str,
     event_id: &'a str,
     actor_member_id: &'a str,
+    actor_signer_public_key_hex: Option<&'a str>,
     target_member_id: &'a str,
     role_before: GroupRoleView,
     role_after: GroupRoleView,
     created_at: &'a str,
+    signature_hex: Option<&'a str>,
 }
 
 fn apply_group_member_role_changed(
     state: &mut PersistedAppState,
     event: GroupMemberRoleChangedEvent<'_>,
-) {
+) -> Result<(), (&'static str, String, &'static str)> {
     let local_member_id = state.local_user_id();
     let local_display = profile_display_name(state);
     ensure_group_governance_defaults(state, event.group_id, &local_member_id, local_display);
@@ -15574,26 +15769,131 @@ fn apply_group_member_role_changed(
         .iter_mut()
         .find(|group| group.group_id == event.group_id)
     else {
-        return;
+        return Err((
+            "group_not_found",
+            "Role-change governance frame targets an unknown group".to_owned(),
+            "Ignore the frame and refresh group membership from an authorized peer",
+        ));
     };
     if group
         .governance_log
         .iter()
         .any(|entry| entry.event_id == event.event_id)
     {
-        return;
+        return Ok(());
     }
-    if let Some(member) = group
+    let Some(actor_index) = group
         .members
-        .iter_mut()
-        .find(|member| member.member_id == event.target_member_id)
-    {
-        if member.status != "revoked" {
-            member.role = event.role_after.clone();
-            if event.target_member_id == local_member_id {
-                group.role = event.role_after.as_str().to_owned();
-            }
-        }
+        .iter()
+        .position(|member| member.member_id == event.actor_member_id)
+    else {
+        return Err((
+            "actor_not_found",
+            "Role-change governance frame actor is missing from this group".to_owned(),
+            "Accept staff role changes only from known owner members",
+        ));
+    };
+    let actor = &group.members[actor_index];
+    let actor_is_owner = actor.role == GroupRoleView::Owner
+        && actor.status != "revoked"
+        && actor.status != "pending";
+    if !actor_is_owner {
+        return Err((
+            "owner_required",
+            "Role-change governance frame was not authored by the active group owner".to_owned(),
+            "Accept staff role changes only from owner-authored governance events",
+        ));
+    }
+    let Some(expected_actor_signer_public_key_hex) = actor.signer_public_key_hex.as_deref() else {
+        return Err((
+            "actor_signer_missing",
+            "Role-change governance frame actor has no persisted signing key".to_owned(),
+            "Refresh group membership from an authorized admission source before accepting signed role-change events",
+        ));
+    };
+    let Some(actor_signer_public_key_hex) = event.actor_signer_public_key_hex else {
+        return Err((
+            "frame_signer_missing",
+            "Role-change governance frame is missing the actor signing key".to_owned(),
+            "Accept only signed role-change governance frames",
+        ));
+    };
+    if actor_signer_public_key_hex != expected_actor_signer_public_key_hex {
+        return Err((
+            "actor_signer_mismatch",
+            "Role-change governance frame signer does not match the actor roster key".to_owned(),
+            "Refresh group membership before accepting signed role-change events",
+        ));
+    }
+    let Some(signature_hex) = event.signature_hex else {
+        return Err((
+            "signature_missing",
+            "Role-change governance frame is missing its signature".to_owned(),
+            "Accept only signed role-change governance frames",
+        ));
+    };
+    verify_group_member_role_change_signature(
+        actor_signer_public_key_hex,
+        signature_hex,
+        GroupMemberRoleChangeSignaturePayload {
+            group_id: event.group_id,
+            event_id: event.event_id,
+            actor_member_id: event.actor_member_id,
+            actor_signer_public_key_hex,
+            target_member_id: event.target_member_id,
+            role_before: &event.role_before,
+            role_after: &event.role_after,
+            created_at: event.created_at,
+        },
+    )
+    .map_err(|error| {
+        (
+            "signature_invalid",
+            error,
+            "Accept only role-change governance frames signed by the owner roster key",
+        )
+    })?;
+    let valid_transition = matches!(
+        (&event.role_before, &event.role_after),
+        (GroupRoleView::Member, GroupRoleView::Staff)
+            | (GroupRoleView::Staff, GroupRoleView::Member)
+    );
+    if !valid_transition {
+        return Err((
+            "unsupported_role_transition",
+            "Role-change governance frame requested an unsupported role transition".to_owned(),
+            "Use the owner promotion or demotion flow for staff/member role changes",
+        ));
+    }
+    let Some(target_index) = group
+        .members
+        .iter()
+        .position(|member| member.member_id == event.target_member_id)
+    else {
+        return Err((
+            "member_not_found",
+            "Role-change governance frame targets a member missing from this group".to_owned(),
+            "Refresh group membership before applying the role-change event",
+        ));
+    };
+    let member = &group.members[target_index];
+    if member.status == "revoked" || member.status == "pending" {
+        return Err((
+            "member_not_active",
+            "Role-change governance frame targets a member who is not active".to_owned(),
+            "Only admitted, non-revoked members can receive staff role changes",
+        ));
+    }
+    if member.role != event.role_before {
+        return Err((
+            "role_before_mismatch",
+            "Role-change governance frame does not match the local member role".to_owned(),
+            "Refresh group governance state before accepting the role-change event",
+        ));
+    }
+    group.members[target_index].role = event.role_after.clone();
+    if event.target_member_id == local_member_id {
+        group.role = event.role_after.as_str().to_owned();
     }
     group.governance_log.push(governance_log_entry(
         event.event_id,
@@ -15606,6 +15906,7 @@ fn apply_group_member_role_changed(
         event.created_at,
         "Applied replicated group member role change",
     ));
+    Ok(())
 }
 
 fn apply_group_member_revoked(
@@ -15673,8 +15974,6 @@ struct GroupPresenceHeartbeatEvent<'a> {
     member_id: &'a str,
     display_name: Option<String>,
     device_id: Option<String>,
-    role: Option<GroupRoleView>,
-    signer_public_key_hex: Option<String>,
     last_seen_at: &'a str,
     presence_expires_at: &'a str,
 }
@@ -15716,12 +16015,6 @@ fn apply_group_presence_heartbeat(
             if event.device_id.is_some() {
                 member.device_id = event.device_id.clone();
             }
-            if let Some(role) = event.role.as_ref() {
-                member.role = role.clone();
-            }
-            if event.signer_public_key_hex.is_some() {
-                member.signer_public_key_hex = event.signer_public_key_hex.clone();
-            }
             member.status = "online".to_owned();
             member.last_seen_at = Some(event.last_seen_at.to_owned());
             member.presence_expires_at = Some(event.presence_expires_at.to_owned());
@@ -15734,9 +16027,9 @@ fn apply_group_presence_heartbeat(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| redacted_observable_ref("member", event.member_id)),
             device_id: event.device_id,
-            role: event.role.unwrap_or(GroupRoleView::Member),
+            role: GroupRoleView::Member,
             status: "online".to_owned(),
-            signer_public_key_hex: event.signer_public_key_hex,
+            signer_public_key_hex: None,
             joined_at: event.last_seen_at.to_owned(),
             last_seen_at: Some(event.last_seen_at.to_owned()),
             presence_expires_at: Some(event.presence_expires_at.to_owned()),
@@ -16971,6 +17264,119 @@ mod tests {
         guard.persist();
     }
 
+    fn persist_current_test_state() {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.persist();
+    }
+
+    fn create_test_profile_state_with_group(
+        profile_name: &str,
+        display_name: &str,
+        member_id: &str,
+        role: GroupRoleView,
+        mut group: GroupView,
+    ) -> PathBuf {
+        let path = fresh_state_path(profile_name);
+        let _ = fs::remove_file(&path);
+        let mut service = TauriAppService::load_for_test_path(path.clone());
+        service.state.create_user(
+            CreateUserRequest {
+                display_name: display_name.to_owned(),
+                device_name: Some(format!("{display_name} laptop")),
+            },
+            false,
+        );
+        if let Some(profile) = service.state.profile.as_mut() {
+            profile.user_id = member_id.to_owned();
+        }
+        group.role = group_role_label(&role).to_owned();
+        group.runtime_peers = group_runtime_peers(group.connectivity.as_ref(), &group.role);
+        service.state.groups = vec![group];
+        service.persist();
+        path
+    }
+
+    fn group_member_role(
+        state: &PersistedAppState,
+        group_id: &str,
+        member_id: &str,
+    ) -> Option<GroupRoleView> {
+        state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)?
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .map(|member| member.role.clone())
+    }
+
+    fn group_member_signer(
+        state: &PersistedAppState,
+        group_id: &str,
+        member_id: &str,
+    ) -> Option<String> {
+        state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)?
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .and_then(|member| member.signer_public_key_hex.clone())
+    }
+
+    fn governance_log_count(state: &PersistedAppState, group_id: &str, event_id: &str) -> usize {
+        state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .map(|group| {
+                group
+                    .governance_log
+                    .iter()
+                    .filter(|entry| entry.event_id == event_id)
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    fn resign_role_change_frame(frame: &mut TextControlFrameView, signing_key: &SigningKey) {
+        let TextControlFrameView::GroupMemberRoleChanged {
+            group_id,
+            event_id,
+            actor_member_id,
+            actor_signer_public_key_hex,
+            target_member_id,
+            role_before,
+            role_after,
+            created_at,
+            signature_hex,
+        } = frame
+        else {
+            panic!("expected role-change frame");
+        };
+        let signer = actor_signer_public_key_hex
+            .as_deref()
+            .expect("role-change frame signer key");
+        *signature_hex = Some(sign_group_member_role_change(
+            signing_key,
+            GroupMemberRoleChangeSignaturePayload {
+                group_id,
+                event_id,
+                actor_member_id,
+                actor_signer_public_key_hex: signer,
+                target_member_id,
+                role_before,
+                role_after,
+                created_at,
+            },
+        ));
+    }
+
     fn upsert_test_admission_request(group_id: &str, member_identity: &str) -> String {
         let mut request_id = String::new();
         mutate_app_service(|state| {
@@ -17397,6 +17803,411 @@ mod tests {
                 TextControlFrameView::GroupMemberRoleChanged { .. }
             )
         }));
+    }
+
+    #[test]
+    fn staff_promotion_governance_frame_converges_three_profiles() {
+        let _lock = test_lock();
+        let owner_path = reset_with_temp_state("staff-promotion-sync-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Staff Sync Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert_eq!(created.last_command_error, None, "{created:?}");
+        let group_id = created.groups[0].group_id.clone();
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+        add_test_member(&group_id, "observer-cara", GroupRoleView::Member);
+        persist_current_test_state();
+
+        let owner_group = load_state_from_path(&owner_path)
+            .groups
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .expect("owner group persisted");
+        let owner_member = owner_group
+            .members
+            .iter()
+            .find(|member| member.role == GroupRoleView::Owner)
+            .expect("owner member exists");
+        let owner_member_id = owner_member.member_id.clone();
+        let owner_signer_public_key_hex = owner_member
+            .signer_public_key_hex
+            .clone()
+            .expect("owner signer key persisted");
+        let bob_path = create_test_profile_state_with_group(
+            "staff-promotion-sync-bob",
+            "Bob Member",
+            "member-bob",
+            GroupRoleView::Member,
+            owner_group.clone(),
+        );
+        let observer_path = create_test_profile_state_with_group(
+            "staff-promotion-sync-observer",
+            "Cara Observer",
+            "observer-cara",
+            GroupRoleView::Member,
+            owner_group,
+        );
+
+        {
+            let mut legacy_owner = TauriAppService::load_for_test_path(owner_path.clone());
+            let owner_member = legacy_owner.state.groups[0]
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == owner_member_id)
+                .expect("owner member exists");
+            owner_member.signer_public_key_hex = None;
+            legacy_owner.persist();
+        }
+        reload_global_app_service_from_path(&owner_path);
+        let missing_local_signer_rejected =
+            promote_group_member_to_staff(PromoteGroupMemberRequest {
+                group_id: group_id.clone(),
+                member_id: "member-bob".to_owned(),
+            });
+        assert_eq!(
+            missing_local_signer_rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("actor_signer_missing")
+        );
+        assert_eq!(
+            group_member_role(&load_state_from_path(&owner_path), &group_id, "member-bob"),
+            Some(GroupRoleView::Member)
+        );
+        assert!(!load_state_from_path(&owner_path)
+            .text_control_outbox
+            .iter()
+            .any(|record| matches!(
+                record.frame,
+                TextControlFrameView::GroupMemberRoleChanged { .. }
+            )));
+        {
+            let mut restored_owner = TauriAppService::load_for_test_path(owner_path.clone());
+            let owner_member = restored_owner.state.groups[0]
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == owner_member_id)
+                .expect("owner member exists");
+            owner_member.signer_public_key_hex = Some(owner_signer_public_key_hex.clone());
+            restored_owner.persist();
+        }
+        reload_global_app_service_from_path(&owner_path);
+        let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(promoted.last_command_error, None, "{promoted:?}");
+        assert_eq!(
+            group_member_role(&load_state_from_path(&owner_path), &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+
+        let owner_state = load_state_from_path(&owner_path);
+        let role_frame = owner_state
+            .text_control_outbox
+            .iter()
+            .find_map(|record| match &record.frame {
+                TextControlFrameView::GroupMemberRoleChanged { .. } => Some(record.frame.clone()),
+                _ => None,
+            })
+            .expect("promotion queues role-change governance frame");
+        let event_id = match &role_frame {
+            TextControlFrameView::GroupMemberRoleChanged { event_id, .. } => event_id.clone(),
+            _ => unreachable!("filtered role-change frame"),
+        };
+        let mut owner_signing_state = load_state_from_path(&owner_path);
+        let owner_signing_key = SigningKey::from_bytes(&owner_signing_state.identity_seed_bytes());
+
+        reload_global_app_service_from_path(&observer_path);
+        let malicious_signer_public_key_hex =
+            hex::encode(SigningKey::generate(&mut OsRng).verifying_key().as_bytes());
+        let poison_seen_at = Utc::now().to_rfc3339();
+        let poison_presence = TextControlFrameView::GroupPresenceHeartbeat {
+            group_id: group_id.clone(),
+            event_id: "poison-owner-signer-presence".to_owned(),
+            member_id: owner_member_id.clone(),
+            display_name: Some("Mallory Owner".to_owned()),
+            device_id: None,
+            role: Some(GroupRoleView::Member),
+            signer_public_key_hex: Some(malicious_signer_public_key_hex.clone()),
+            last_seen_at: poison_seen_at.clone(),
+            presence_expires_at: poison_seen_at,
+        };
+        let _ = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: poison_presence,
+        });
+        let observer_after_poison = load_state_from_path(&observer_path);
+        assert_eq!(
+            group_member_role(&observer_after_poison, &group_id, &owner_member_id),
+            Some(GroupRoleView::Owner)
+        );
+        assert_eq!(
+            group_member_signer(&observer_after_poison, &group_id, &owner_member_id),
+            Some(owner_signer_public_key_hex.clone())
+        );
+        assert_ne!(
+            group_member_signer(&observer_after_poison, &group_id, &owner_member_id),
+            Some(malicious_signer_public_key_hex)
+        );
+
+        let mut non_owner_frame = role_frame.clone();
+        if let TextControlFrameView::GroupMemberRoleChanged {
+            event_id,
+            actor_member_id,
+            ..
+        } = &mut non_owner_frame
+        {
+            *event_id = "non-owner-role-change".to_owned();
+            *actor_member_id = "observer-cara".to_owned();
+        }
+        let non_owner_rejected = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: non_owner_frame,
+        });
+        assert!(matches!(
+            non_owner_rejected.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "role_changed_rejected"
+        ));
+        assert_eq!(
+            non_owner_rejected
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("owner_required")
+        );
+        assert_eq!(
+            group_member_role(
+                &load_state_from_path(&observer_path),
+                &group_id,
+                "member-bob"
+            ),
+            Some(GroupRoleView::Member)
+        );
+
+        let mut forged_owner_frame = role_frame.clone();
+        if let TextControlFrameView::GroupMemberRoleChanged {
+            event_id,
+            signature_hex,
+            ..
+        } = &mut forged_owner_frame
+        {
+            *event_id = "forged-owner-role-change".to_owned();
+            *signature_hex = Some(hex::encode(
+                SigningKey::generate(&mut OsRng).sign(b"forged").to_bytes(),
+            ));
+        }
+        let forged_owner_rejected = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: forged_owner_frame,
+        });
+        assert!(matches!(
+            forged_owner_rejected.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "role_changed_rejected"
+        ));
+        assert_eq!(
+            forged_owner_rejected
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("signature_invalid")
+        );
+        assert_eq!(
+            group_member_role(
+                &load_state_from_path(&observer_path),
+                &group_id,
+                "member-bob"
+            ),
+            Some(GroupRoleView::Member)
+        );
+
+        reload_global_app_service_from_path(&bob_path);
+        let bob_applied = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: role_frame.clone(),
+        });
+        assert!(matches!(
+            bob_applied.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { event_id: ref ack_event_id, ref status, .. })
+                if ack_event_id == &event_id && status == "role_changed_applied"
+        ));
+        let bob_state = load_state_from_path(&bob_path);
+        assert_eq!(
+            group_member_role(&bob_state, &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+        assert_eq!(
+            bob_state
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .map(|group| group.role.as_str()),
+            Some("staff")
+        );
+        assert_eq!(governance_log_count(&bob_state, &group_id, &event_id), 1);
+
+        let bob_duplicate = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: role_frame.clone(),
+        });
+        assert!(matches!(
+            bob_duplicate.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { event_id: ref ack_event_id, ref status, .. })
+                if ack_event_id == &event_id && status == "role_changed_applied"
+        ));
+        let bob_after_duplicate = load_state_from_path(&bob_path);
+        assert_eq!(
+            governance_log_count(&bob_after_duplicate, &group_id, &event_id),
+            1
+        );
+
+        let mut stale_role_before_frame = role_frame.clone();
+        if let TextControlFrameView::GroupMemberRoleChanged { event_id, .. } =
+            &mut stale_role_before_frame
+        {
+            *event_id = "stale-role-before-change".to_owned();
+        }
+        resign_role_change_frame(&mut stale_role_before_frame, &owner_signing_key);
+        let stale_role_before_rejected = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: stale_role_before_frame,
+        });
+        assert!(matches!(
+            stale_role_before_rejected.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "role_changed_rejected"
+        ));
+        assert_eq!(
+            stale_role_before_rejected
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("role_before_mismatch")
+        );
+        assert_eq!(
+            group_member_role(&load_state_from_path(&bob_path), &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+
+        let mut owner_role_frame = role_frame.clone();
+        if let TextControlFrameView::GroupMemberRoleChanged {
+            event_id,
+            role_before,
+            role_after,
+            ..
+        } = &mut owner_role_frame
+        {
+            *event_id = "unsupported-owner-role-change".to_owned();
+            *role_before = GroupRoleView::Staff;
+            *role_after = GroupRoleView::Owner;
+        }
+        resign_role_change_frame(&mut owner_role_frame, &owner_signing_key);
+        let owner_role_rejected = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: owner_role_frame,
+        });
+        assert!(matches!(
+            owner_role_rejected.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "role_changed_rejected"
+        ));
+        assert_eq!(
+            owner_role_rejected
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("unsupported_role_transition")
+        );
+        assert_eq!(
+            group_member_role(&load_state_from_path(&bob_path), &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+
+        reload_global_app_service_from_path(&observer_path);
+        {
+            let mut observer_legacy = TauriAppService::load_for_test_path(observer_path.clone());
+            let owner_member = observer_legacy.state.groups[0]
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == owner_member_id)
+                .expect("observer owner member exists");
+            owner_member.signer_public_key_hex = None;
+            observer_legacy.persist();
+        }
+        reload_global_app_service_from_path(&observer_path);
+        let legacy_missing_signer_rejected =
+            handle_text_control_frame(HandleTextControlFrameRequest {
+                frame: role_frame.clone(),
+            });
+        assert!(matches!(
+            legacy_missing_signer_rejected.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "role_changed_rejected"
+        ));
+        assert_eq!(
+            legacy_missing_signer_rejected
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("actor_signer_missing")
+        );
+        assert_eq!(
+            group_member_role(
+                &load_state_from_path(&observer_path),
+                &group_id,
+                "member-bob"
+            ),
+            Some(GroupRoleView::Member)
+        );
+        {
+            let mut observer_restored = TauriAppService::load_for_test_path(observer_path.clone());
+            let owner_member = observer_restored.state.groups[0]
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == owner_member_id)
+                .expect("observer owner member exists");
+            owner_member.signer_public_key_hex = Some(owner_signer_public_key_hex.clone());
+            observer_restored.persist();
+        }
+        reload_global_app_service_from_path(&observer_path);
+        let observer_applied =
+            handle_text_control_frame(HandleTextControlFrameRequest { frame: role_frame });
+        assert!(matches!(
+            observer_applied.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { event_id: ref ack_event_id, ref status, .. })
+                if ack_event_id == &event_id && status == "role_changed_applied"
+        ));
+        let observer_state = load_state_from_path(&observer_path);
+        assert_eq!(
+            group_member_role(&observer_state, &group_id, "member-bob"),
+            Some(GroupRoleView::Staff)
+        );
+        assert_eq!(
+            group_member_signer(&observer_state, &group_id, &owner_member_id),
+            Some(owner_signer_public_key_hex)
+        );
+        assert_eq!(
+            governance_log_count(&observer_state, &group_id, &event_id),
+            1
+        );
+
+        for path in [&owner_path, &bob_path, &observer_path] {
+            assert_eq!(
+                group_member_role(&load_state_from_path(path), &group_id, "member-bob"),
+                Some(GroupRoleView::Staff)
+            );
+        }
     }
 
     #[test]
@@ -17842,8 +18653,6 @@ mod tests {
                     member_id: "member-charlie",
                     display_name: Some("Charlie".to_owned()),
                     device_id: Some("Charlie laptop".to_owned()),
-                    role: None,
-                    signer_public_key_hex: None,
                     last_seen_at: "2026-06-05T00:00:00Z",
                     presence_expires_at: "2026-06-05T00:05:00Z",
                 },
