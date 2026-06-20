@@ -7007,6 +7007,16 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
         let local_user_id = state.local_user_id();
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
+                if !session.joined {
+                    state.push_command_error(
+                        "voice.self_mute_rejected",
+                        "set_self_mute",
+                        "voice_not_joined",
+                        "Mute request was ignored because the voice session is not joined",
+                        "Join a voice channel before muting yourself",
+                    );
+                    return;
+                }
                 session.self_muted = request.muted;
                 for participant in &mut session.participants {
                     if participant.id == local_user_id {
@@ -24928,6 +24938,22 @@ mod tests {
             .participants
             .iter()
             .all(|participant| !participant.speaking));
+        let rejected_mute = set_self_mute(SetSelfMuteRequest {
+            session_id: session.session_id.clone(),
+            muted: true,
+        });
+        assert_eq!(
+            rejected_mute
+                .last_command_error
+                .as_ref()
+                .map(|error| (error.command.as_str(), error.code.as_str())),
+            Some(("set_self_mute", "voice_not_joined"))
+        );
+        assert!(!rejected_mute
+            .voice_session
+            .as_ref()
+            .map(|session| session.self_muted)
+            .unwrap_or(true));
         assert!(denied
             .events
             .iter()

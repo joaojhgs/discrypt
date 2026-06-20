@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-20T11:21:40.961Z",
+  "updatedAt": "2026-06-20T12:03:38.324Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -59,6 +59,17 @@
       "createdAt": "2026-06-20T11:21:40.961Z",
       "updatedAt": "2026-06-20T11:21:40.961Z",
       "evidence": "QA re-test on 2026-06-20 confirms code gates and CI are green, but QA rejected because required native WebDriver proof remains unavailable. Engineer fresh attempt wrote target/per56-g012-native-voice-engineer-retest/tauri-webdriver-integrated-manifest.json with status failed-preflight: no DISPLAY/WAYLAND_DISPLAY, missing WebKitGTK/JSC 4.1 pkg-config packages, missing native WebDriver binary, and no built app binary before preflight."
+    },
+    {
+      "id": "G006-per-57-mute-vad-speaking",
+      "title": "PER-57 mute VAD speaking",
+      "objective": "Implement PER-57 P6-T06 mute/VAD/speaking: backend self-mute must toggle only an active voice session; speaking indicators must derive from media-level/VAD events or backend remote-media evidence, not UI optimism. Preserve provider-as-signaling-only and do not expand into volume controls, loopback release smoke, group overlay, or broader release gates.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-20T11:54:50.961Z",
+      "updatedAt": "2026-06-20T12:03:38.324Z",
+      "evidence": "Implemented PER-57 fail-closed self-mute and backend-evidence-only speaking UI boundaries. Changed apps/desktop/src-tauri/src/lib.rs, apps/ui/src/main.tsx, apps/ui/tests/e2e/stateful-ui.spec.ts, and .omx/plans/P6-T06-mute-vad-speaking-2026-06-20.md. Passed cargo fmt --check, git diff --check, jq goals validation, and targeted discrypt-media mute_control and voice_activity_detector tests; desktop/UI integration commands are blocked in this runtime by disk and missing node_modules.",
+      "completedAt": "2026-06-20T12:03:38.324Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

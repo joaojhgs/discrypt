@@ -840,6 +840,10 @@ test("group invite join text channel and voice controls work without fake member
   ).toHaveAttribute("aria-current", "page");
   await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
   await expect(page.getByText(/You/).first()).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveAttribute(
+    "title",
+    "Speaking",
+  );
   // Coverage token: Local microphone level comes from the active MediaStream analyser.
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
     0,
@@ -850,6 +854,10 @@ test("group invite join text channel and voice controls work without fake member
   await expect(page.getByText(/Ops relay/)).toHaveCount(0);
   await page.getByRole("button", { name: /^Mute$/i }).click();
   await expect(page.getByRole("button", { name: /^Unmute$/i })).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveAttribute(
+    "title",
+    "Muted",
+  );
   await expect(page.getByTestId("voice-remote-volume")).toHaveCount(0);
   await page.getByRole("button", { name: /Leave voice call/i }).click();
   await expect(page.getByText(/Voice idle/i)).toBeVisible();
