@@ -2842,12 +2842,12 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_persists_canonical_governance_state() {
+    fn current_schema_persists_canonical_governance_state() -> Result<(), String> {
         let schema = AppDbSchema::current();
 
         let role_policy = schema
             .table("group_role_policy")
-            .expect("role policy table exists");
+            .ok_or_else(|| "role policy table exists".to_owned())?;
         assert_columns(
             role_policy,
             [
@@ -2859,7 +2859,9 @@ mod tests {
             ],
         );
 
-        let members = schema.table("group_members").expect("members table exists");
+        let members = schema
+            .table("group_members")
+            .ok_or_else(|| "members table exists".to_owned())?;
         assert_columns(
             members,
             [
@@ -2880,7 +2882,7 @@ mod tests {
 
         let requests = schema
             .table("group_admission_requests")
-            .expect("admission request table exists");
+            .ok_or_else(|| "admission request table exists".to_owned())?;
         assert_columns(
             requests,
             [
@@ -2904,7 +2906,7 @@ mod tests {
 
         let governance_log = schema
             .table("group_governance_log")
-            .expect("governance log table exists");
+            .ok_or_else(|| "governance log table exists".to_owned())?;
         assert_columns(
             governance_log,
             [
@@ -2926,7 +2928,7 @@ mod tests {
 
         let presence = schema
             .table("group_member_presence")
-            .expect("presence table exists");
+            .ok_or_else(|| "presence table exists".to_owned())?;
         assert_columns(
             presence,
             [
@@ -2939,6 +2941,7 @@ mod tests {
                 "evidence_source",
             ],
         );
+        Ok(())
     }
 
     #[test]
