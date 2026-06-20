@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-16T02:41:31.847Z",
-  "updatedAt": "2026-06-19T22:48:55.654Z",
+  "updatedAt": "2026-06-20T03:11:12.580Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -433,6 +433,16 @@
       "updatedAt": "2026-06-19T22:48:55.654Z",
       "evidence": "PER-43/P5-T01 local implementation complete: app DB schema v2 adds canonical group_role_policy, group_members, group_admission_requests, group_governance_log, and group_member_presence tables; v1->v2 and 0->2 migrations plus rollback paths are covered. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p5t01 cargo test -p discrypt-storage governance -- --nocapture; RUSTUP_TOOLCHAIN=1.89.0 CARGO_TARGET_DIR=/tmp/discrypt-target-p5t01 cargo test -p discrypt-storage migration -- --nocapture; git diff --check. Scoped ai-slop scan found no new fallback-like code in changed schema paths. Independent code-review lanes unavailable: no .codex/agents in checkout.",
       "completedAt": "2026-06-19T22:48:55.654Z"
+    },
+    {
+      "id": "G039-per-44-p5-t02-authorization-matrix",
+      "title": "PER-44/P5-T02 authorization matrix",
+      "objective": "Implement and verify PER-44/P5-T02 backend authorization matrix: members cannot approve/refuse/promote/revoke; staff can approve/refuse/revoke members only; owner can promote/revoke staff/member; unauthorized Tauri/backend commands return explicit denial without mutating backend-governed role/admission/revocation state.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-20T03:11:12.580Z",
+      "updatedAt": "2026-06-20T03:11:12.580Z",
+      "evidence": ".omx/plans/P5-T02-authorization-matrix-2026-06-20.md created from PER-44 issue metadata and Phase 5 acceptance criteria."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",

@@ -8199,17 +8199,17 @@ impl PersistedAppState {
             .iter()
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| "Group does not exist".to_owned())?;
-        let role = group
+        let member = group
             .members
             .iter()
-            .find(|member| {
-                member.member_id == local_member_id
-                    && member.status != "revoked"
-                    && member.status != "pending"
-            })
-            .map(|member| member.role.clone())
-            .unwrap_or_else(|| group_role_from_legacy_label(&group.role));
-        match role {
+            .find(|member| member.member_id == local_member_id)
+            .ok_or_else(|| {
+                "Local member is not in this group roster; refusing legacy role fallback".to_owned()
+            })?;
+        if matches!(member.status.as_str(), "pending" | "revoked") {
+            return Err("Pending or revoked members cannot decide admission requests".to_owned());
+        }
+        match member.role {
             GroupRoleView::Owner | GroupRoleView::Staff => Ok(()),
             GroupRoleView::Member => {
                 Err("Only owner or staff can decide admission requests".to_owned())
@@ -16926,6 +16926,418 @@ mod tests {
             revoked_at: None,
             revoked_by: None,
         });
+    }
+
+    fn set_local_test_member_role(group_id: &str, role: GroupRoleView) {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_member_id = guard.state.local_user_id();
+        let group = guard
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .expect("test group exists");
+        let member = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == local_member_id)
+            .expect("local member exists");
+        member.role = role;
+        member.status = "offline".to_owned();
+        member.revoked_at = None;
+        member.revoked_by = None;
+        guard.persist();
+    }
+
+    fn remove_local_test_member_row(group_id: &str) {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_member_id = guard.state.local_user_id();
+        let group = guard
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .expect("test group exists");
+        group
+            .members
+            .retain(|member| member.member_id != local_member_id);
+        group.role = "owner".to_owned();
+        guard.persist();
+    }
+
+    fn upsert_test_admission_request(group_id: &str, member_identity: &str) -> String {
+        let mut request_id = String::new();
+        mutate_app_service(|state| {
+            request_id = state
+                .upsert_pending_group_admission_request(
+                    group_id,
+                    member_identity,
+                    "abababababababababababababababababababababababababababababababab",
+                    format!("{member_identity}-key-package").as_bytes(),
+                )
+                .expect("pending request should be queued");
+        });
+        request_id
+    }
+
+    fn upsert_openmls_test_admission_request(
+        group_id: &str,
+        profile_label: &str,
+    ) -> Result<String, String> {
+        let path = fresh_state_path(profile_label);
+        let _ = fs::remove_file(&path);
+        let mut joiner = TauriAppService::load_for_test_path(path);
+        joiner.state.create_user(
+            CreateUserRequest {
+                display_name: profile_label.to_owned(),
+                device_name: Some(format!("{profile_label} laptop")),
+            },
+            false,
+        );
+        joiner.persist();
+        let key_package = joiner.request_openmls_admission_key_package(group_id)?;
+        let key_package_bytes = key_package
+            .package
+            .key_package_bytes()
+            .map_err(|error| format!("OpenMLS key package serialization failed: {error}"))?;
+        let mut request_id = String::new();
+        mutate_app_service(|state| {
+            request_id = state
+                .upsert_pending_group_admission_request(
+                    group_id,
+                    &key_package.member_identity,
+                    &key_package.signer_public_key_hex,
+                    &key_package_bytes,
+                )
+                .expect("OpenMLS pending request should be queued");
+        });
+        Ok(request_id)
+    }
+
+    fn create_authorization_matrix_group(test_name: &str) -> String {
+        reset_with_temp_state(test_name);
+        create_user(CreateUserRequest {
+            display_name: "Alice Authorization".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Authorization Matrix Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        created.groups[0].group_id.clone()
+    }
+
+    #[test]
+    fn authorization_matrix_member_cannot_approve_refuse_promote_or_revoke() {
+        let _lock = test_lock();
+        let group_id = create_authorization_matrix_group("authorization-matrix-member-denied");
+        set_local_test_member_role(&group_id, GroupRoleView::Member);
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+        let approve_request_id = upsert_test_admission_request(&group_id, "joiner-approve");
+        let refuse_request_id = upsert_test_admission_request(&group_id, "joiner-refuse");
+        let before = load_state();
+        let before_log_len = before.groups[0].governance_log.len();
+        let before_outbox_len = before.text_control_outbox.len();
+
+        let approved = approve_group_admission_request(ApproveGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: approve_request_id.clone(),
+        });
+        assert_eq!(
+            approved
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("admission_decision_unauthorized")
+        );
+        let refused = refuse_group_admission_request(RefuseGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: refuse_request_id.clone(),
+            reason: Some("member cannot refuse".to_owned()),
+        });
+        assert_eq!(
+            refused
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("admission_decision_unauthorized")
+        );
+        let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(
+            promoted
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("owner_required")
+        );
+        let revoked = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+            reason: Some("member cannot revoke".to_owned()),
+        });
+        assert_eq!(
+            revoked
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("unauthorized_revoke")
+        );
+
+        let state = load_state();
+        let group = state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("group exists");
+        assert_eq!(group.governance_log.len(), before_log_len);
+        assert_eq!(state.text_control_outbox.len(), before_outbox_len);
+        assert!(group.admission_requests.iter().all(|request| {
+            request.status == "pending"
+                && request.decided_by.is_none()
+                && request.decided_at.is_none()
+        }));
+        let bob = group
+            .members
+            .iter()
+            .find(|member| member.member_id == "member-bob")
+            .expect("bob exists");
+        assert_eq!(bob.role, GroupRoleView::Member);
+        assert_eq!(bob.status, "offline");
+    }
+
+    #[test]
+    fn authorization_matrix_staff_can_decide_admission_and_revoke_members_only(
+    ) -> Result<(), String> {
+        let _lock = test_lock();
+        let group_id = create_authorization_matrix_group("authorization-matrix-staff");
+        set_local_test_member_role(&group_id, GroupRoleView::Staff);
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+        add_test_member(&group_id, "staff-charlie", GroupRoleView::Staff);
+        add_test_member(&group_id, "owner-dana", GroupRoleView::Owner);
+
+        let approve_request_id =
+            upsert_openmls_test_admission_request(&group_id, "authorization-staff-approve")?;
+        let approved = approve_group_admission_request(ApproveGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: approve_request_id.clone(),
+        });
+        assert_eq!(approved.last_command_error, None, "{approved:?}");
+        let approved_request = approved.groups[0]
+            .admission_requests
+            .iter()
+            .find(|request| request.request_id == approve_request_id)
+            .expect("approved request exists");
+        assert_eq!(approved_request.status, "approved");
+
+        let refuse_request_id = upsert_test_admission_request(&group_id, "joiner-refused-by-staff");
+        let refused = refuse_group_admission_request(RefuseGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: refuse_request_id.clone(),
+            reason: Some("staff refusal".to_owned()),
+        });
+        assert_eq!(refused.last_command_error, None, "{refused:?}");
+        let refused_request = refused.groups[0]
+            .admission_requests
+            .iter()
+            .find(|request| request.request_id == refuse_request_id)
+            .expect("refused request exists");
+        assert_eq!(refused_request.status, "refused");
+
+        let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(
+            promoted
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("owner_required")
+        );
+        let revoked_staff = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "staff-charlie".to_owned(),
+            reason: Some("staff cannot revoke staff".to_owned()),
+        });
+        assert_eq!(
+            revoked_staff
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("unauthorized_revoke")
+        );
+        let revoked_owner = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "owner-dana".to_owned(),
+            reason: Some("staff cannot revoke owner".to_owned()),
+        });
+        assert_eq!(
+            revoked_owner
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("unauthorized_revoke")
+        );
+
+        let revoked_member = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+            reason: Some("staff can revoke members".to_owned()),
+        });
+        assert_eq!(
+            revoked_member.last_command_error, None,
+            "{revoked_member:?}"
+        );
+        let group = revoked_member
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("group exists");
+        assert_eq!(
+            group
+                .members
+                .iter()
+                .find(|member| member.member_id == "member-bob")
+                .expect("bob exists")
+                .status,
+            "revoked"
+        );
+        assert_eq!(
+            group
+                .members
+                .iter()
+                .find(|member| member.member_id == "staff-charlie")
+                .expect("charlie exists")
+                .status,
+            "offline"
+        );
+        assert_eq!(
+            group
+                .members
+                .iter()
+                .find(|member| member.member_id == "owner-dana")
+                .expect("dana exists")
+                .status,
+            "offline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authorization_matrix_owner_can_promote_and_revoke_staff_or_members() {
+        let _lock = test_lock();
+        let group_id = create_authorization_matrix_group("authorization-matrix-owner");
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+        add_test_member(&group_id, "staff-charlie", GroupRoleView::Staff);
+
+        let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+        });
+        assert_eq!(promoted.last_command_error, None, "{promoted:?}");
+        assert_eq!(
+            promoted.groups[0]
+                .members
+                .iter()
+                .find(|member| member.member_id == "member-bob")
+                .expect("bob exists")
+                .role,
+            GroupRoleView::Staff
+        );
+
+        let revoked_staff = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "staff-charlie".to_owned(),
+            reason: Some("owner can revoke staff".to_owned()),
+        });
+        assert_eq!(revoked_staff.last_command_error, None, "{revoked_staff:?}");
+        assert_eq!(
+            revoked_staff.groups[0]
+                .members
+                .iter()
+                .find(|member| member.member_id == "staff-charlie")
+                .expect("charlie exists")
+                .status,
+            "revoked"
+        );
+
+        let revoked_member = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: "member-bob".to_owned(),
+            reason: Some("owner can revoke promoted staff".to_owned()),
+        });
+        assert_eq!(
+            revoked_member.last_command_error, None,
+            "{revoked_member:?}"
+        );
+        assert_eq!(
+            revoked_member.groups[0]
+                .members
+                .iter()
+                .find(|member| member.member_id == "member-bob")
+                .expect("bob exists")
+                .status,
+            "revoked"
+        );
+    }
+
+    #[test]
+    fn authorization_matrix_admission_decision_requires_backend_roster_role() {
+        let _lock = test_lock();
+        let group_id = create_authorization_matrix_group("authorization-matrix-no-legacy-fallback");
+        let approve_request_id = upsert_test_admission_request(&group_id, "joiner-approve");
+        let refuse_request_id = upsert_test_admission_request(&group_id, "joiner-refuse");
+        remove_local_test_member_row(&group_id);
+        let before = load_state();
+        assert_eq!(before.groups[0].role, "owner");
+
+        let approved = approve_group_admission_request(ApproveGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: approve_request_id,
+        });
+        assert_eq!(
+            approved
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("admission_decision_unauthorized")
+        );
+        let refused = refuse_group_admission_request(RefuseGroupAdmissionRequest {
+            group_id: group_id.clone(),
+            request_id: refuse_request_id,
+            reason: Some("legacy role must not authorize".to_owned()),
+        });
+        assert_eq!(
+            refused
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("admission_decision_unauthorized")
+        );
+        let group = load_state()
+            .groups
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .expect("group exists");
+        assert!(group
+            .admission_requests
+            .iter()
+            .all(|request| request.status == "pending"));
     }
 
     #[test]

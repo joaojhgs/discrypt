@@ -752,6 +752,126 @@ mod tests {
     }
 
     #[test]
+    fn governance_authorization_matrix_enforces_member_admin_owner_boundaries() {
+        let owner = SigningKey::generate(&mut OsRng);
+        let admin = SigningKey::generate(&mut OsRng);
+        let member = SigningKey::generate(&mut OsRng);
+        let mut state = GovernanceState::new(20, 1);
+
+        for (target, role) in [(2, Role::Admin), (3, Role::Member), (4, Role::Member)] {
+            assert_eq!(
+                state.apply_event(GovernanceEvent::signed_by(
+                    20,
+                    1,
+                    GovernanceAction::SetRole { target, role },
+                    &owner,
+                )),
+                Ok(())
+            );
+        }
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                3,
+                GovernanceAction::RevokeInvite {
+                    invite_id: "member-cannot-refuse".into(),
+                },
+                &member,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                3,
+                GovernanceAction::SetRole {
+                    target: 4,
+                    role: Role::Admin,
+                },
+                &member,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                3,
+                GovernanceAction::Ban { target: 4 },
+                &member,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                2,
+                GovernanceAction::RevokeInvite {
+                    invite_id: "staff-can-refuse".into(),
+                },
+                &admin,
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                2,
+                GovernanceAction::SetRole {
+                    target: 4,
+                    role: Role::Admin,
+                },
+                &admin,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                2,
+                GovernanceAction::Ban { target: 1 },
+                &admin,
+            )),
+            Err(GovernanceError::Unauthorized)
+        );
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                2,
+                GovernanceAction::Ban { target: 4 },
+                &admin,
+            )),
+            Ok(())
+        );
+        assert!(state.is_banned(4));
+
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                1,
+                GovernanceAction::SetRole {
+                    target: 3,
+                    role: Role::Admin,
+                },
+                &owner,
+            )),
+            Ok(())
+        );
+        assert_eq!(state.role(3), Some(Role::Admin));
+        assert_eq!(
+            state.apply_event(GovernanceEvent::signed_by(
+                20,
+                1,
+                GovernanceAction::Ban { target: 2 },
+                &owner,
+            )),
+            Ok(())
+        );
+        assert!(state.is_banned(2));
+    }
+
+    #[test]
     fn banned_leaf_cannot_regain_role_or_devices() {
         let owner = SigningKey::generate(&mut OsRng);
         let mut state = GovernanceState::new(15, 1);
