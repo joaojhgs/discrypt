@@ -835,9 +835,9 @@ async function createGroupInvite(profile) {
   return waitUntil(profile, "invite URL", "const m = document.body.innerText.match(new RegExp('discrypt:\\\\/\\\\/join\\\\/v1\\\\/\\\\S+')); return m && m[0];");
 }
 async function joinGroup(profile, invite) {
-  await click(profile, "Join group");
+  await click(profile, "Join with invite");
   await fill(profile, "Invite URL or code", invite);
-  await fill(profile, "Joined group/contact label", "Two Profile WebDriver Lab");
+  await fill(profile, "Local label", "Two Profile WebDriver Lab");
   await click(profile, "join/open group");
   await waitUntil(profile, "joined group", "return /Two Profile WebDriver Lab/i.test(document.body.innerText)");
 }

@@ -31,6 +31,8 @@ for (const token of [
   "Open Two Profile WebDriver Lab group",
   "await click(profile, \"Create invite\");",
   "Create invite for Two Profile WebDriver Lab",
+  "Join with invite",
+  "Local label",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }
