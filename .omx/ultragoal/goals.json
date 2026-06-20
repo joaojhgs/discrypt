@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T06:38:20.751Z",
-  "updatedAt": "2026-06-20T06:45:52.816Z",
+  "updatedAt": "2026-06-20T07:14:37.411Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -304,6 +304,17 @@
       "createdAt": "2026-06-20T06:45:52.816Z",
       "updatedAt": "2026-06-20T06:45:52.816Z",
       "evidence": "Final local verification passed: cargo fmt --check, git diff --check, desktop governance_frame_replication test, desktop staff_promotion_governance_frame_converges_three_profiles test, and discrypt-mls-core governance tests. AI slop cleanup changed-file review found no new masking fallback; the idempotent replay branch preserves duplicate evidence and still rejects contradictory decisions. Blocker: this Codex session exposes no native task(agent_type=code-reviewer|architect) tool, omx has no code-review CLI command, and tool discovery exposed GitHub/agentmemory tools only. Per Ultragoal final gate, independent review unavailable blocks marking the aggregate goal complete."
+    },
+    {
+      "id": "G028-per-48-pending-request-reconciliatio",
+      "title": "PER-48 pending request reconciliation",
+      "objective": "Implement PER-48/P5-T06 pending request reconciliation: multiple staff replicas share pending admission requests; first accepted approval/refusal remains terminal; later conflicts are retained as superseded audit logs; protected membership still requires OpenMLS Welcome/add.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-20T07:14:15.663Z",
+      "updatedAt": "2026-06-20T07:14:37.411Z",
+      "evidence": "PER-48/P5-T06 complete: plan .omx/plans/P5-T06-pending-request-reconciliation-2026-06-20.md; apps/desktop/src-tauri/src/lib.rs reducer now keeps first accepted admission decision terminal, logs later conflicts once as admission_request_decision_superseded, and avoids outbound stale refusal frames; tests passed: pending_request_reconciliation, g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests, discrypt-mls-core governance, cargo fmt --check, git diff --check. Evidence is local backend/Tauri harness only.",
+      "completedAt": "2026-06-20T07:14:37.411Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
