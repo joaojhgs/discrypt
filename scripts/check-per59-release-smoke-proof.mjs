@@ -29,6 +29,7 @@ for (const token of [
   "local profile ready|start a private space",
   "contextClickText",
   "Open Two Profile WebDriver Lab group",
+  "await click(profile, \"Create invite\");",
   "Create invite for Two Profile WebDriver Lab",
 ]) {
   requireText("G012 WebDriver harness", harness, token);

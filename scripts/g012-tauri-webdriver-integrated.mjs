@@ -830,7 +830,7 @@ async function createGroupInvite(profile) {
   await click(profile, "^Create group$", { last: true });
   await waitUntil(profile, "created group", "return /Two Profile WebDriver Lab/i.test(document.body.innerText)");
   await contextClickText(profile, "Open Two Profile WebDriver Lab group");
-  await click(profile, "^Create invite$");
+  await click(profile, "Create invite");
   await click(profile, "Create invite for Two Profile WebDriver Lab");
   return waitUntil(profile, "invite URL", "const m = document.body.innerText.match(new RegExp('discrypt:\\\\/\\\\/join\\\\/v1\\\\/\\\\S+')); return m && m[0];");
 }
