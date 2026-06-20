@@ -25,6 +25,8 @@ for (const token of [
   "nativeMedia.mic_gain_percent",
   "nativeMedia.app_output_volume_percent",
   "adjustRemoteParticipantVolumes",
+  "profile ready or trust setup screen",
+  "local profile ready|start a private space",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }

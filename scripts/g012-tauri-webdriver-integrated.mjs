@@ -791,7 +791,11 @@ async function setupProfile(profile) {
   await fill(profile, "Display name", profile.display_name);
   await fill(profile, "Device name", profile.device_name);
   await click(profile, "create new user");
-  await waitUntil(profile, "trust setup screen", "return /finish the local trust setup/i.test(document.body.innerText)");
+  await waitUntil(
+    profile,
+    "profile ready or trust setup screen",
+    "return /finish the local trust setup|local profile ready|start a private space/i.test(document.body.innerText)",
+  );
 }
 async function createGroupInvite(profile) {
   await click(profile, "Create (a )?group");
