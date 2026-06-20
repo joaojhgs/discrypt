@@ -2645,6 +2645,10 @@ function App() {
           groupLabel={groupLabel}
           role={localGroupRole || activeGroup?.role || "local profile"}
           pendingAdmissionCount={canReviewAdmissions ? pendingAdmissionRequests.length : 0}
+          pendingAdmissionEnabled={
+            canReviewAdmissions &&
+            activeGroup?.role_policy?.admission_mode === "manual_approval"
+          }
           textChannels={textChannels}
           voiceChannels={voiceChannels}
           activeChannelId={activeTextChannel?.channel_id ?? null}
@@ -3110,6 +3114,59 @@ function canRevokeFromUi(localRole: string, member: GroupMemberView): boolean {
   if (member.status === "revoked" || member.role === "owner") return false;
   if (localRole === "owner") return true;
   return localRole === "staff" && member.role === "member";
+}
+
+function memberDisplayStatus(member: GroupMemberView): "online" | "offline" | "revoked" {
+  if (member.status === "revoked") return "revoked";
+  return isPresenceOnline(member) ? "online" : "offline";
+}
+
+function sortedMembersForPanel(members: GroupMemberView[]): GroupMemberView[] {
+  return [...members].sort((left, right) => {
+    const statusDelta =
+      Number(memberDisplayStatus(right) === "online") -
+      Number(memberDisplayStatus(left) === "online");
+    if (statusDelta !== 0) return statusDelta;
+    const roleDelta = roleRank(left.role) - roleRank(right.role);
+    if (roleDelta !== 0) return roleDelta;
+    return left.display_name.localeCompare(right.display_name);
+  });
+}
+
+function memberPanelSections(members: GroupMemberView[]): Array<{
+  title: "Owner" | "Staff" | "Members" | "Offline";
+  members: GroupMemberView[];
+  emptyCopy: string;
+}> {
+  const sortedMembers = sortedMembersForPanel(members);
+  const activeMembers = sortedMembers.filter(
+    (member) => memberDisplayStatus(member) === "online",
+  );
+  const offlineMembers = sortedMembers.filter(
+    (member) => memberDisplayStatus(member) !== "online",
+  );
+  return [
+    {
+      title: "Owner",
+      members: activeMembers.filter((member) => member.role === "owner"),
+      emptyCopy: "No owner is online.",
+    },
+    {
+      title: "Staff",
+      members: activeMembers.filter((member) => member.role === "staff"),
+      emptyCopy: "No staff are online.",
+    },
+    {
+      title: "Members",
+      members: activeMembers.filter((member) => member.role === "member"),
+      emptyCopy: "No members are online.",
+    },
+    {
+      title: "Offline",
+      members: offlineMembers,
+      emptyCopy: "No offline members.",
+    },
+  ];
 }
 
 function getActiveTextChannel(
@@ -3982,6 +4039,7 @@ function ChannelSidebar({
   groupLabel,
   role,
   pendingAdmissionCount,
+  pendingAdmissionEnabled,
   textChannels,
   voiceChannels,
   activeChannelId,
@@ -4014,6 +4072,7 @@ function ChannelSidebar({
   groupLabel: string;
   role: string;
   pendingAdmissionCount: number;
+  pendingAdmissionEnabled: boolean;
   textChannels: ChannelStateView[];
   voiceChannels: ChannelStateView[];
   activeChannelId: string | null;
@@ -4102,13 +4161,19 @@ function ChannelSidebar({
           </div>
         </div>
         <ScrollArea className="min-h-0 flex-1 p-3">
-          {pendingAdmissionCount > 0 ? (
+          {pendingAdmissionEnabled ? (
             <SidebarButton
               active={selectedWorkflow === "admission_requests"}
-              meta={`${pendingAdmissionCount} waiting for owner/staff review`}
+              meta={
+                pendingAdmissionCount > 0
+                  ? `${pendingAdmissionCount} waiting for owner/staff review`
+                  : "Manual approval enabled"
+              }
               onClick={onReviewPendingAdmissions}
             >
-              Pending requests · {pendingAdmissionCount}
+              {pendingAdmissionCount > 0
+                ? `Pending requests · ${pendingAdmissionCount}`
+                : "Pending requests"}
             </SidebarButton>
           ) : null}
           <SectionLabel
@@ -5721,17 +5786,10 @@ function MemberPanel({
     x: number;
     y: number;
   } | null>(null);
-
-  const sortedMembers = [...members].sort((left, right) => {
-    const roleDelta = roleRank(left.role) - roleRank(right.role);
-    if (roleDelta !== 0) return roleDelta;
-    const onlineDelta = Number(isPresenceOnline(right)) - Number(isPresenceOnline(left));
-    if (onlineDelta !== 0) return onlineDelta;
-    return left.display_name.localeCompare(right.display_name);
-  });
-  const section = (role: "owner" | "staff" | "member", title: string) =>
-    sortedMembers.filter((member) => member.role === role && member.status !== "revoked");
-  const revoked = sortedMembers.filter((member) => member.status === "revoked");
+  const sections = memberPanelSections(members);
+  const manualAdmissionEnabled =
+    group?.role_policy?.admission_mode === "manual_approval";
+  const canReviewPending = manualAdmissionEnabled && ["owner", "staff"].includes(localRole);
 
   return (
     <aside
@@ -5752,43 +5810,46 @@ function MemberPanel({
               Role and presence are read from backend governance state with TTL-backed online status.
             </p>
           </div>
-          {pendingCount > 0 && ["owner", "staff"].includes(localRole) ? (
-            <Button
-              type="button"
-              variant="secondary"
-              className="justify-between rounded-xl"
-              onClick={onReviewPendingAdmissions}
+          {manualAdmissionEnabled ? (
+            <section
+              aria-label="Manual admission"
+              className="grid gap-2 rounded-xl border border-[hsl(var(--border))] bg-black/10 p-3"
             >
-              Pending requests
-              <Badge variant="warning">{pendingCount}</Badge>
-            </Button>
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">Manual admission</p>
+                  <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                    Pending requests stay in backend governance state until owner/staff review.
+                  </p>
+                </div>
+                <Badge variant={pendingCount > 0 ? "warning" : "secondary"}>
+                  {pendingCount} pending
+                </Badge>
+              </div>
+              {canReviewPending ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="justify-between rounded-xl"
+                  onClick={onReviewPendingAdmissions}
+                >
+                  Review requests
+                  <Badge variant={pendingCount > 0 ? "warning" : "outline"}>
+                    {pendingCount}
+                  </Badge>
+                </Button>
+              ) : null}
+            </section>
           ) : null}
-          <MemberSection
-            title="Owner"
-            members={section("owner", "Owner")}
-            localRole={localRole}
-            onContextMenu={setMenu}
-          />
-          <MemberSection
-            title="Staff"
-            members={section("staff", "Staff")}
-            localRole={localRole}
-            onContextMenu={setMenu}
-          />
-          <MemberSection
-            title="Members"
-            members={section("member", "Members")}
-            localRole={localRole}
-            onContextMenu={setMenu}
-          />
-          {revoked.length > 0 ? (
+          {sections.map((section) => (
             <MemberSection
-              title="Revoked"
-              members={revoked}
-              localRole={localRole}
+              key={section.title}
+              title={section.title}
+              emptyCopy={section.emptyCopy}
+              members={section.members}
               onContextMenu={setMenu}
             />
-          ) : null}
+          ))}
         </div>
       </ScrollArea>
       <MemberContextMenu
@@ -5806,13 +5867,13 @@ function MemberPanel({
 
 function MemberSection({
   title,
+  emptyCopy,
   members,
-  localRole,
   onContextMenu,
 }: {
   title: string;
+  emptyCopy: string;
   members: GroupMemberView[];
-  localRole: string;
   onContextMenu: (menu: {
     member: GroupMemberView;
     x: number;
@@ -5820,7 +5881,7 @@ function MemberSection({
   }) => void;
 }) {
   return (
-    <section className="grid gap-2">
+    <section aria-label={`${title} member section`} className="grid gap-2">
       <div className="flex items-center justify-between gap-2">
         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
           {title}
@@ -5829,7 +5890,7 @@ function MemberSection({
       </div>
       {members.length === 0 ? (
         <p className="rounded-xl border border-dashed border-[hsl(var(--border))] p-3 text-xs text-[hsl(var(--muted-foreground))]">
-          No {title.toLowerCase()} yet.
+          {emptyCopy}
         </p>
       ) : (
         members.map((member) => (
@@ -5855,8 +5916,7 @@ function MemberRow({
     y: number;
   }) => void;
 }) {
-  const online = isPresenceOnline(member);
-  const status = member.status === "revoked" ? "revoked" : online ? "online" : "offline";
+  const status = memberDisplayStatus(member);
   return (
     <div
       className="group flex min-w-0 items-center gap-3 rounded-xl px-2 py-2 text-sm hover:bg-[hsl(var(--accent)/0.58)]"
