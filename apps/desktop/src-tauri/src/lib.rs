@@ -5059,11 +5059,21 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             return;
         };
         let group = &state.groups[group_index];
-        let actor_member = group
+        let Some(actor_member) = group
             .members
             .iter()
-            .find(|member| member.member_id == actor && member.status != "revoked");
-        if !actor_member.is_some_and(|member| member.role == GroupRoleView::Owner) {
+            .find(|member| member.member_id == actor && member.status != "revoked")
+        else {
+            state.push_command_error(
+                "group.member_promote_rejected",
+                "promote_group_member_to_staff",
+                "owner_required",
+                "Only the group owner can promote staff",
+                "Ask the owner to promote this member",
+            );
+            return;
+        };
+        if actor_member.role != GroupRoleView::Owner {
             state.push_command_error(
                 "group.member_promote_rejected",
                 "promote_group_member_to_staff",
@@ -5073,7 +5083,6 @@ pub fn promote_group_member_to_staff(request: PromoteGroupMemberRequest) -> AppS
             );
             return;
         }
-        let actor_member = actor_member.expect("actor owner checked above");
         let Some(persisted_actor_signer_public_key_hex) =
             actor_member.signer_public_key_hex.as_deref()
         else {
@@ -5228,11 +5237,21 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
             return;
         };
         let group = &state.groups[group_index];
-        let actor_member = group
+        let Some(actor_member) = group
             .members
             .iter()
-            .find(|member| member.member_id == actor && member.status != "revoked");
-        if !actor_member.is_some_and(|member| member.role == GroupRoleView::Owner) {
+            .find(|member| member.member_id == actor && member.status != "revoked")
+        else {
+            state.push_command_error(
+                "group.member_demote_rejected",
+                "demote_group_staff_to_member",
+                "owner_required",
+                "Only the group owner can demote staff",
+                "Ask the owner to demote this staff member",
+            );
+            return;
+        };
+        if actor_member.role != GroupRoleView::Owner {
             state.push_command_error(
                 "group.member_demote_rejected",
                 "demote_group_staff_to_member",
@@ -5242,7 +5261,6 @@ pub fn demote_group_staff_to_member(request: DemoteGroupStaffRequest) -> AppStat
             );
             return;
         }
-        let actor_member = actor_member.expect("actor owner checked above");
         let Some(persisted_actor_signer_public_key_hex) =
             actor_member.signer_public_key_hex.as_deref()
         else {
