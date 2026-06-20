@@ -17,6 +17,7 @@ import {
   DirectConversationView,
   GroupAdmissionModeView,
   GroupAdmissionRequestView,
+  GroupGovernanceLogEntryView,
   GroupMemberView,
   GroupRoleView,
   GroupView,
@@ -118,7 +119,8 @@ type Workflow =
   | "create-group"
   | "channel"
   | "voice"
-  | "admission_requests";
+  | "admission_requests"
+  | "audit_log";
 type OverlayKind =
   | "launcher"
   | "create-group"
@@ -1917,6 +1919,10 @@ function App() {
     setWorkflow("admission_requests");
   }
 
+  function openAuditLog() {
+    setWorkflow("audit_log");
+  }
+
   function runMemberAction(actionId: string, command: Promise<AppState>) {
     setMemberActionInFlight(actionId);
     void applyCommand(command, () => setMemberActionInFlight(null)).finally(() =>
@@ -2649,6 +2655,7 @@ function App() {
             canReviewAdmissions &&
             activeGroup?.role_policy?.admission_mode === "manual_approval"
           }
+          auditEventCount={auditableGovernanceLog(activeGroup).length}
           textChannels={textChannels}
           voiceChannels={voiceChannels}
           activeChannelId={activeTextChannel?.channel_id ?? null}
@@ -2666,6 +2673,7 @@ function App() {
             focusCommandChannel(channelId, "Voice")
           }
           onReviewPendingAdmissions={reviewPendingAdmissions}
+          onOpenAuditLog={openAuditLog}
           voiceJoined={voiceJoined}
           participants={participants}
           localUserId={appState.profile?.user_id ?? null}
@@ -2771,6 +2779,11 @@ function App() {
                 onApprove={approveAdmission}
                 onRefuse={refuseAdmission}
                 actionInFlight={memberActionInFlight}
+              />
+            ) : workflow === "audit_log" ? (
+              <AuditLogPanel
+                group={activeGroup}
+                localRole={localGroupRole}
               />
             ) : (
               <ChannelPanel
@@ -3041,6 +3054,11 @@ function activePaneSummary(
       return {
         title: "Pending admission requests",
         subtitle: `${groupLabel} · owner/staff review queue`,
+      };
+    case "audit_log":
+      return {
+        title: "Governance audit log",
+        subtitle: `${groupLabel} · approved, refused, promoted, revoked`,
       };
     case "voice":
       return {
@@ -4040,6 +4058,7 @@ function ChannelSidebar({
   role,
   pendingAdmissionCount,
   pendingAdmissionEnabled,
+  auditEventCount,
   textChannels,
   voiceChannels,
   activeChannelId,
@@ -4053,6 +4072,7 @@ function ChannelSidebar({
   onSelectTextChannel,
   onSelectVoiceChannel,
   onReviewPendingAdmissions,
+  onOpenAuditLog,
   voiceJoined,
   participants,
   localUserId,
@@ -4073,6 +4093,7 @@ function ChannelSidebar({
   role: string;
   pendingAdmissionCount: number;
   pendingAdmissionEnabled: boolean;
+  auditEventCount: number;
   textChannels: ChannelStateView[];
   voiceChannels: ChannelStateView[];
   activeChannelId: string | null;
@@ -4086,6 +4107,7 @@ function ChannelSidebar({
   onSelectTextChannel: (channelId: string) => void;
   onSelectVoiceChannel: (channelId: string) => void;
   onReviewPendingAdmissions: () => void;
+  onOpenAuditLog: () => void;
   voiceJoined: boolean;
   participants: VoiceParticipant[];
   localUserId: string | null;
@@ -4173,9 +4195,20 @@ function ChannelSidebar({
             >
               {pendingAdmissionCount > 0
                 ? `Pending requests · ${pendingAdmissionCount}`
-                : "Pending requests"}
+              : "Pending requests"}
             </SidebarButton>
           ) : null}
+          <SidebarButton
+            active={selectedWorkflow === "audit_log"}
+            meta={
+              auditEventCount > 0
+                ? `${auditEventCount} backend event${auditEventCount === 1 ? "" : "s"}`
+                : "No governance events recorded"
+            }
+            onClick={onOpenAuditLog}
+          >
+            Audit log
+          </SidebarButton>
           <SectionLabel
             actionLabel="Add text channel"
             onAction={() => setInlineTextDraft("")}
@@ -5433,6 +5466,7 @@ function MobileWorkflowNav({
     { id: "channel", label: "Text" },
     { id: "voice", label: "Voice" },
     { id: "admission_requests", label: "Requests" },
+    { id: "audit_log", label: "Audit" },
   ];
   return (
     <nav
@@ -6027,6 +6061,277 @@ function MemberContextMenu({
       testId="member-context-menu"
     />
   );
+}
+
+type AuditEventCategory = "approved" | "refused" | "promoted" | "revoked";
+
+const auditEventLabels: Record<
+  AuditEventCategory,
+  { title: string; empty: string; badge: "success" | "secondary" | "warning" }
+> = {
+  approved: {
+    title: "Approved",
+    empty: "No approved admission events are recorded.",
+    badge: "success",
+  },
+  refused: {
+    title: "Refused",
+    empty: "No refused admission events are recorded.",
+    badge: "secondary",
+  },
+  promoted: {
+    title: "Promoted",
+    empty: "No staff promotion events are recorded.",
+    badge: "warning",
+  },
+  revoked: {
+    title: "Revoked",
+    empty: "No access revocation events are recorded.",
+    badge: "warning",
+  },
+};
+
+function auditCategoryForEntry(
+  entry: GroupGovernanceLogEntryView,
+): AuditEventCategory | null {
+  const kind = entry.event_kind.replace(/_/g, ".");
+  if (kind === "admission.request.approved" || kind === "admission.approved") {
+    return "approved";
+  }
+  if (kind === "admission.request.refused" || kind === "admission.refused") {
+    return "refused";
+  }
+  if (kind === "member.promoted") {
+    return "promoted";
+  }
+  if (
+    kind === "member.revoked" ||
+    (kind === "member.role.changed" && entry.role_after === "staff")
+  ) {
+    return kind === "member.revoked" ? "revoked" : "promoted";
+  }
+  return null;
+}
+
+function auditableGovernanceLog(group: GroupView | null): GroupGovernanceLogEntryView[] {
+  const log = group?.governance_log;
+  if (!Array.isArray(log)) return [];
+  return log
+    .filter((entry) => auditCategoryForEntry(entry) !== null)
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at));
+}
+
+function AuditLogPanel({
+  group,
+  localRole,
+}: {
+  group: GroupView | null;
+  localRole: string;
+}) {
+  const rawLog = group?.governance_log;
+  const logAvailable = Boolean(group) && Array.isArray(rawLog);
+  const entries = auditableGovernanceLog(group);
+  const groupedEntries = entries.reduce(
+    (groups, entry) => {
+      const category = auditCategoryForEntry(entry);
+      if (category) groups[category].push(entry);
+      return groups;
+    },
+    {
+      approved: [],
+      refused: [],
+      promoted: [],
+      revoked: [],
+    } as Record<AuditEventCategory, GroupGovernanceLogEntryView[]>,
+  );
+  const categoryOrder: AuditEventCategory[] = [
+    "approved",
+    "refused",
+    "promoted",
+    "revoked",
+  ];
+
+  return (
+    <Card className="flex h-full min-h-0 flex-col overflow-hidden">
+      <CardHeader className="border-b border-[hsl(var(--border))]">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle>Governance audit log</CardTitle>
+            <CardDescription>
+              {group?.name ?? "No group"} · read-only history from backend governance events.
+            </CardDescription>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="outline">{localRole || "unknown role"}</Badge>
+            <Badge variant={entries.length > 0 ? "secondary" : "outline"}>
+              {entries.length} event{entries.length === 1 ? "" : "s"}
+            </Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <ScrollArea className="min-h-0 flex-1">
+        <CardContent className="grid gap-4 p-4">
+          {!group ? (
+            <EmptyState
+              title="No group selected"
+              copy="Open a group to load its backend governance audit snapshot."
+            />
+          ) : !logAvailable ? (
+            <EmptyState
+              title="Audit snapshot unavailable"
+              copy="The selected group did not include a governance_log array in command state, so the UI is not making audit claims."
+            />
+          ) : entries.length === 0 ? (
+            <EmptyState
+              title="No audit events yet"
+              copy="Approved, refused, promoted, and revoked events will appear here after backend governance commands record them."
+            />
+          ) : (
+            <>
+              <section
+                aria-label="Audit event summary"
+                className="grid gap-3 md:grid-cols-4"
+              >
+                {categoryOrder.map((category) => {
+                  const label = auditEventLabels[category];
+                  return (
+                    <div
+                      key={category}
+                      className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4"
+                    >
+                      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+                        {label.title}
+                      </p>
+                      <p className="mt-3 text-2xl font-semibold">
+                        {groupedEntries[category].length}
+                      </p>
+                    </div>
+                  );
+                })}
+              </section>
+              <section aria-label="Audit event history" className="grid gap-3">
+                {categoryOrder.map((category) => (
+                  <AuditCategorySection
+                    key={category}
+                    category={category}
+                    entries={groupedEntries[category]}
+                    group={group}
+                  />
+                ))}
+              </section>
+            </>
+          )}
+        </CardContent>
+      </ScrollArea>
+    </Card>
+  );
+}
+
+function AuditCategorySection({
+  category,
+  entries,
+  group,
+}: {
+  category: AuditEventCategory;
+  entries: GroupGovernanceLogEntryView[];
+  group: GroupView;
+}) {
+  const label = auditEventLabels[category];
+  return (
+    <details
+      className="group rounded-2xl border border-[hsl(var(--border))] bg-black/10"
+      open={entries.length > 0}
+    >
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3">
+        <span className="font-medium">{label.title} history</span>
+        <Badge variant={label.badge}>{entries.length}</Badge>
+      </summary>
+      <div className="grid gap-2 border-t border-[hsl(var(--border))] p-3">
+        {entries.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-[hsl(var(--border))] p-3 text-sm text-[hsl(var(--muted-foreground))]">
+            {label.empty}
+          </p>
+        ) : (
+          entries.map((entry) => (
+            <AuditLogEntryRow
+              key={entry.event_id}
+              entry={entry}
+              category={category}
+              group={group}
+            />
+          ))
+        )}
+      </div>
+    </details>
+  );
+}
+
+function AuditLogEntryRow({
+  entry,
+  category,
+  group,
+}: {
+  entry: GroupGovernanceLogEntryView;
+  category: AuditEventCategory;
+  group: GroupView;
+}) {
+  const target =
+    memberNameForAudit(group, entry.target_member_id) ??
+    requestNameForAudit(group, entry.request_id) ??
+    "target not recorded";
+  return (
+    <article className="rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.18)] p-3 text-sm">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="font-medium">{entry.summary}</p>
+          <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+            {auditEventLabels[category].title} · {entry.created_at}
+          </p>
+        </div>
+        <Badge variant={auditEventLabels[category].badge}>
+          {entry.event_kind}
+        </Badge>
+      </div>
+      <div className="mt-3 grid gap-2 text-xs text-[hsl(var(--muted-foreground))] md:grid-cols-2">
+        <AuditMeta label="Actor" value={memberNameForAudit(group, entry.actor_member_id) ?? entry.actor_member_id} />
+        <AuditMeta label="Target" value={target} />
+        <AuditMeta label="Request" value={entry.request_id ?? "not linked"} />
+        <AuditMeta
+          label="Role change"
+          value={
+            entry.role_before || entry.role_after
+              ? `${entry.role_before ?? "none"} -> ${entry.role_after ?? "none"}`
+              : "not applicable"
+          }
+        />
+      </div>
+    </article>
+  );
+}
+
+function AuditMeta({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-lg bg-black/10 px-3 py-2">
+      <p className="font-medium text-[hsl(var(--foreground))]">{label}</p>
+      <p className="mt-1 truncate" title={value}>
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function memberNameForAudit(group: GroupView, memberId?: string | null): string | null {
+  if (!memberId) return null;
+  const member = group.members?.find((candidate) => candidate.member_id === memberId);
+  return member ? `${member.display_name} (${member.role})` : memberId;
+}
+
+function requestNameForAudit(group: GroupView, requestId?: string | null): string | null {
+  if (!requestId) return null;
+  const request = group.admission_requests?.find(
+    (candidate) => candidate.request_id === requestId,
+  );
+  return request ? `${request.display_name} (${request.status})` : requestId;
 }
 
 function AdmissionRequestsPanel({
