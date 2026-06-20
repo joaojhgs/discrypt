@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-20T09:59:21.599Z",
+  "updatedAt": "2026-06-20T11:21:40.961Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -38,6 +38,27 @@
       "createdAt": "2026-06-20T09:59:21.599Z",
       "updatedAt": "2026-06-20T09:59:21.599Z",
       "evidence": "Multica PER-53 assigned scope: audio device selection; metadata requires enumeration, input/output preference persistence, fail-closed unavailable behavior, Rust/Tauri/media tests, and Playwright or harness smoke."
+    },
+    {
+      "id": "G004-per-56-provider-signaled-voice-media",
+      "title": "PER-56 provider-signaled voice media bridge",
+      "objective": "Implement PER-56 P6-T05 two-person media signaling bridge: sealed voice offer/candidate/native media proof signals must traverse a provider-signaled WebRTC text/control runtime, not manual copy. Preserve provider-as-signaling-only and do not expand into mute/VAD, volume, group overlay, or broader release gates.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-20T10:23:15.922Z",
+      "updatedAt": "2026-06-20T11:02:53.732Z",
+      "evidence": "QA rejection fixes: normal all-targets/clippy compile passes without transport harness export leakage; production-copy/honesty/G128 gates pass; PER-56 plan verification command corrected; WebDriver script now records provider-runtime pump evidence path and classifies manual command bridge as non-PER56 fallback; WebDriver run remains blocked by missing DISPLAY/WAYLAND_DISPLAY with manifest at target/per56-g012-native-voice/tauri-webdriver-integrated-manifest.json.",
+      "completedAt": "2026-06-20T11:02:53.732Z"
+    },
+    {
+      "id": "G005-per-56-native-webdriver-evidence-or",
+      "title": "PER-56 native WebDriver evidence or waiver",
+      "objective": "Resolve PER-56 final verification blocker after QA re-test: provide a display-capable Tauri WebDriver/two-profile native proof for PR head 8e0a29a36c9320573a76f7837b30337d6b1294e3 showing provider-signaled runtime traversal for voice signaling, or obtain architect-level waiver/reclassification that the green Rust/Tauri harness plus CI evidence is sufficient despite the original WebDriver requirement.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-20T11:21:40.961Z",
+      "updatedAt": "2026-06-20T11:21:40.961Z",
+      "evidence": "QA re-test on 2026-06-20 confirms code gates and CI are green, but QA rejected because required native WebDriver proof remains unavailable. Engineer fresh attempt wrote target/per56-g012-native-voice-engineer-retest/tauri-webdriver-integrated-manifest.json with status failed-preflight: no DISPLAY/WAYLAND_DISPLAY, missing WebKitGTK/JSC 4.1 pkg-config packages, missing native WebDriver binary, and no built app binary before preflight."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

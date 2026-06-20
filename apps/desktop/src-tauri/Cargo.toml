@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 default = []
-harness = ["discrypt-core/harness", "discrypt-media/harness", "discrypt-storage/harness"]
+harness = ["discrypt-core/harness", "discrypt-media/harness", "discrypt-storage/harness", "discrypt-transport/harness"]
 local-dev = ["discrypt-core/local-dev", "discrypt-media/local-dev", "discrypt-storage/local-dev"]
 production-network = ["discrypt-core/production-network", "discrypt-media/production-network", "discrypt-storage/production-network", "discrypt-transport/production-network"]
 production-media = ["discrypt-core/production-media", "discrypt-media/production-media", "discrypt-storage/production-media"]

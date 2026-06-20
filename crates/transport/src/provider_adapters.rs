@@ -24,6 +24,7 @@ use crate::{
 };
 #[cfg(any(
     test,
+    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -55,6 +56,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 #[cfg(any(
     test,
+    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -63,6 +65,7 @@ use tokio::time::timeout;
 use tokio::time::Duration;
 #[cfg(any(
     test,
+    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -1258,6 +1261,54 @@ where
     .await
 }
 
+/// Start a harness provider-signaled WebRTC text/control runtime pair.
+///
+/// This uses the in-process conformance provider as the signaling substrate so
+/// native harnesses can prove text/control frames traverse the same sealed
+/// provider-negotiated DataChannel path without contacting public providers or
+/// treating those providers as application relays.
+#[cfg(any(test, feature = "harness"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer<
+    F,
+>(
+    kind: SignalingAdapterKind,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    negotiation_config: WebRtcNegotiationConfig,
+    offerer_peer_id: SignalingPeerId,
+    answerer_peer_id: SignalingPeerId,
+    answerer: F,
+) -> Result<(ProviderTextControlRuntimePair, LocalConformanceProviderBus), TransportError>
+where
+    F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
+{
+    if profile.kind != kind {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "local conformance profile kind {} does not match requested {}",
+            profile.kind.canonical_name(),
+            kind.canonical_name()
+        )));
+    }
+    let bus = LocalConformanceProviderBus::default();
+    let adapter = LocalConformanceProviderAdapter::new(kind, bus.clone());
+    let runtime = start_provider_webrtc_text_control_runtime_pair_with_adapter(
+        adapter,
+        profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        negotiation_config,
+        offerer_peer_id,
+        answerer_peer_id,
+        answerer,
+    )
+    .await?;
+    Ok((runtime, bus))
+}
+
 /// Start the offerer side of a provider-backed WebRTC text/control runtime.
 ///
 /// The matching answerer must be running in the same scope with the same
@@ -1974,6 +2025,7 @@ where
 
 #[cfg(any(
     test,
+    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",

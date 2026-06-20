@@ -17538,6 +17538,39 @@ mod tests {
         guard.clear_text_control_transport_runtime();
     }
 
+    #[cfg(feature = "harness")]
+    fn seal_native_voice_media_for_test(
+        media: &NativeVoiceMediaSignalPayload,
+    ) -> Result<String, String> {
+        let mut peers = [media.from_peer_id.as_str(), media.to_peer_id.as_str()];
+        peers.sort_unstable();
+        let mut digest = Sha256::new();
+        digest.update(b"discrypt-voice-signal-seal-v1:");
+        digest.update(media.session_id.as_bytes());
+        digest.update(b":");
+        digest.update(media.group_id.as_bytes());
+        digest.update(b":");
+        digest.update(media.channel_id.as_bytes());
+        digest.update(b":");
+        digest.update(peers[0].as_bytes());
+        digest.update(b":");
+        digest.update(peers[1].as_bytes());
+        let key = digest.finalize();
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|error| format!("test voice seal key rejected: {error}"))?;
+        let nonce = [0x56; 12];
+        let plaintext = serde_json::to_vec(&serde_json::json!({ "native_media": media }))
+            .map_err(|error| format!("test voice seal JSON failed: {error}"))?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|error| format!("test voice seal failed: {error}"))?;
+        Ok(format!(
+            "voice-signal-sealed:v1:{}.{}",
+            URL_SAFE_NO_PAD.encode(nonce),
+            URL_SAFE_NO_PAD.encode(ciphertext)
+        ))
+    }
+
     fn add_test_member(group_id: &str, member_id: &str, role: GroupRoleView) {
         let service = app_service();
         let mut guard = service
@@ -24500,6 +24533,345 @@ mod tests {
         assert_eq!(runtime.boundary, "native-rust-webrtc-datachannel");
         assert!(runtime.remote_transport_active);
         assert_eq!(runtime.remote_audio.len(), 1);
+        assert!(accepted
+            .events
+            .iter()
+            .any(|event| event.kind == "voice.native_media_received"));
+        Ok(())
+    }
+
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "provider-signaled WebRTC loopback media proof is runner-dependent outside Linux CI"
+    )]
+    #[cfg(feature = "harness")]
+    #[test]
+    fn native_voice_signal_traverses_provider_signaled_text_control_runtime() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("per56-provider-voice-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice PER56".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "PER56 Voice Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtt://127.0.0.1:1883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:127.0.0.1:3478".to_owned()]),
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let alice_group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "alice group missing".to_owned())?;
+        let (alice_peer_id, bob_peer_id) = backend_group_runtime_peer_ids(&alice_group)?;
+        let group_id = alice_group.group_id.clone();
+        let channel_id = alice_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let invited = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "2".to_owned(),
+            password_gate: None,
+        });
+        assert!(invited.last_command_error.is_none(), "{invited:?}");
+        let invite_code = invited
+            .invites
+            .iter()
+            .find(|invite| invite.group_id == group_id)
+            .map(|invite| invite.code.clone())
+            .ok_or_else(|| "group invite missing".to_owned())?;
+
+        let (bob_path, mut bob_service) = join_group_invite_as_test_profile(
+            "per56-provider-voice-bob",
+            "Bob PER56",
+            "Bob laptop",
+            invite_code,
+            "PER56 Voice Lab",
+        )?;
+        let bob_package = bob_service.request_openmls_admission_key_package(&group_id)?;
+        let mut alice_admission_service = TauriAppService::load_for_test_path(alice_path.clone());
+        let bob_welcome = alice_admission_service.issue_openmls_admission_welcome(&bob_package)?;
+        bob_service.join_openmls_group_from_welcome(&bob_welcome)?;
+        bob_service.state.upsert_admitted_group_member(
+            &group_id,
+            &bob_package.member_identity,
+            &bob_package.signer_public_key_hex,
+        );
+        bob_service.persist();
+        reload_global_app_service_from_path(&bob_path);
+        let bob_joined = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("native-rust-default-capture".to_owned()),
+            input_device_label: Some("Native Rust capture source".to_owned()),
+            output_device_id: Some("native-rust-default-playback".to_owned()),
+            output_device_label: Some("Native Rust playback sink".to_owned()),
+        });
+        assert!(bob_joined.last_command_error.is_none(), "{bob_joined:?}");
+        let bob_session_id = bob_joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "bob voice session missing".to_owned())?;
+        let bob_live_service = {
+            let service = app_service();
+            let guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            TauriAppService {
+                state: guard.state.clone(),
+                text_control_transport_runtime: None,
+                pending_text_control_transport_runtime: None,
+                state_path_override: Some(bob_path.clone()),
+            }
+        };
+
+        reload_global_app_service_from_path(&alice_path);
+        let alice_joined = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("native-rust-default-capture".to_owned()),
+            input_device_label: Some("Native Rust capture source".to_owned()),
+            output_device_id: Some("native-rust-default-playback".to_owned()),
+            output_device_label: Some("Native Rust playback sink".to_owned()),
+        });
+        assert!(
+            alice_joined.last_command_error.is_none(),
+            "{alice_joined:?}"
+        );
+        let session_id = alice_joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "alice voice session missing".to_owned())?;
+        assert_eq!(session_id, bob_session_id);
+        let started_native =
+            start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
+                session_id: session_id.clone(),
+                local_peer_id: alice_peer_id.clone(),
+                remote_peer_id: bob_peer_id.clone(),
+                muted: false,
+                created_at_ms: 1_700_000_000_056,
+            });
+        assert!(
+            started_native.state.last_command_error.is_none(),
+            "{started_native:?}"
+        );
+        let native_media = started_native
+            .native_media
+            .ok_or_else(|| "native media proof missing".to_owned())?;
+        let sealed_payload = seal_native_voice_media_for_test(&native_media)?;
+        let queued = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
+            session_id: session_id.clone(),
+            signal_kind: "candidate".to_owned(),
+            sealed_payload,
+            signal_id: Some("per56-native-voice-signal".to_owned()),
+            created_at_ms: 1_700_000_000_057,
+        });
+        assert!(queued.last_command_error.is_none(), "{queued:?}");
+        assert_eq!(
+            queued
+                .voice_session
+                .as_ref()
+                .map(|session| session.signaling.pending_local_signals),
+            Some(1)
+        );
+
+        let text_started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("per56-provider-voice-route".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: Some("mqtt".to_owned()),
+        });
+        assert!(
+            text_started.last_command_error.is_none(),
+            "{text_started:?}"
+        );
+        let text_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "alice text session missing".to_owned())?;
+        let mut alice_sender = load_state();
+        let (scope_level, connectivity) =
+            alice_sender.active_connectivity_policy().ok_or_else(|| {
+                "alice active connectivity policy missing for provider runtime".to_owned()
+            })?;
+        let profile_view = alice_sender
+            .select_signaling_profile(&connectivity, Some(SignalingAdapterKind::Mqtt))
+            .ok_or_else(|| "alice mqtt signaling profile missing".to_owned())?;
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let ice_config =
+            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
+        let mut negotiation_config =
+            discrypt_transport::WebRtcNegotiationConfig::new(ice_config).host_only();
+        negotiation_config.udp_addrs = vec!["127.0.0.1:0".to_owned()];
+        let bootstrap_secret = shared_runtime_material(
+            "discrypt-per56-local-provider-runtime-bootstrap-v1",
+            &connectivity,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = shared_runtime_material(
+            "discrypt-per56-local-provider-runtime-entropy-v1",
+            &connectivity,
+            &profile.profile_id,
+            16,
+        );
+        let alice_peer =
+            SignalingPeerId::new(alice_peer_id.clone()).map_err(|error| error.to_string())?;
+        let bob_peer =
+            SignalingPeerId::new(bob_peer_id.clone()).map_err(|error| error.to_string())?;
+        let bob_answerer = Arc::new(Mutex::new(bob_live_service));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| format!("per56 provider runtime failed to start: {error}"))?;
+        let (report, evidence, provider_visible_material) = runtime.block_on(async {
+            let answerer_service = bob_answerer.clone();
+            let (provider_runtime, bus) =
+                discrypt_transport::start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
+                    SignalingAdapterKind::Mqtt,
+                    profile,
+                    scope,
+                    &bootstrap_secret,
+                    &random_entropy,
+                    negotiation_config,
+                    alice_peer,
+                    bob_peer,
+                    move |received| {
+                        let frame: TextControlFrameView = serde_json::from_slice(&received)
+                            .map_err(|error| {
+                                TransportError::Unavailable(format!(
+                                    "bob could not decode PER56 provider text/control frame: {error}"
+                                ))
+                            })?;
+                        let mut response_frame = None;
+                        answerer_service
+                            .lock()
+                            .map_err(|_| {
+                                TransportError::Unavailable(
+                                    "bob provider answerer service lock poisoned".to_owned(),
+                                )
+                            })?
+                            .mutate(|state| {
+                                response_frame = state.handle_text_control_frame(frame);
+                            });
+                        let Some(response_frame) = response_frame else {
+                            return Ok(Vec::new());
+                        };
+                        serde_json::to_vec(&response_frame).map_err(|error| {
+                            TransportError::Unavailable(format!(
+                                "bob could not encode PER56 provider response frame: {error}"
+                            ))
+                        })
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let evidence = provider_runtime.evidence().clone();
+            let report = alice_sender
+                .pump_text_control_transport_once(
+                    provider_runtime.transport().as_ref(),
+                    ListPendingTextControlFramesRequest {
+                        target: Some(MessageTargetView {
+                            kind: "channel".to_owned(),
+                            dm_id: None,
+                            group_id: Some(group_id.clone()),
+                            channel_id: Some(channel_id.clone()),
+                        }),
+                        limit: Some(1),
+                        operation_timeout_ms: Some(10_000),
+                    },
+                    text_session_id.clone(),
+                )
+                .await;
+            let provider_visible_material = bus.relay_visible_material_for_tests();
+            provider_runtime
+                .close()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((report, evidence, provider_visible_material))
+        })?;
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 0);
+        assert!(report.metrics.open, "{report:?}");
+        assert!(evidence.offerer_direct_path_ready);
+        assert!(evidence.answerer_direct_path_ready);
+        assert!(evidence.offerer_data_channel_open);
+        assert!(evidence.answerer_data_channel_open);
+        for material in provider_visible_material {
+            for forbidden in [
+                b"per56-native-voice-signal".as_slice(),
+                b"voice-signal-sealed".as_slice(),
+                b"native_rust_webrtc_datachannel".as_slice(),
+                b"rust-opus-sframe".as_slice(),
+                b"candidate".as_slice(),
+                b"v=0".as_slice(),
+            ] {
+                assert!(
+                    !material
+                        .windows(forbidden.len())
+                        .any(|window| window == forbidden),
+                    "provider-visible material leaked voice/media marker"
+                );
+            }
+        }
+
+        let accepted = {
+            let mut bob = bob_answerer
+                .lock()
+                .map_err(|_| "bob provider answerer service lock poisoned".to_owned())?;
+            let backend_proof_signals = bob.state.take_pending_voice_signaling_messages(
+                TakePendingVoiceSignalingMessagesRequest {
+                    session_id: Some(session_id.clone()),
+                    limit: Some(10),
+                },
+            );
+            assert_eq!(backend_proof_signals.len(), 1, "{backend_proof_signals:?}");
+            assert_eq!(
+                backend_proof_signals[0].signal_id,
+                "per56-native-voice-signal"
+            );
+            assert_eq!(backend_proof_signals[0].signal_kind, "candidate");
+            assert_eq!(backend_proof_signals[0].sender_peer_id, alice_peer_id);
+            assert_eq!(backend_proof_signals[0].recipient_peer_id, bob_peer_id);
+            let remote_media = native_voice_media_from_sealed_signal(&backend_proof_signals[0])?;
+            accept_native_voice_media_signal_frame(
+                &mut bob.state,
+                AcceptNativeVoiceMediaFrameRequest {
+                    session_id: backend_proof_signals[0].session_id.clone(),
+                    native_media: remote_media,
+                    attached_at_ms: 1_700_000_000_058,
+                },
+            )?;
+            bob.persist();
+            bob.state.to_view()
+        };
+        let media_runtime = accepted
+            .voice_session
+            .as_ref()
+            .map(|session| session.media_runtime.clone())
+            .ok_or_else(|| "bob accepted voice session missing".to_owned())?;
+        assert_eq!(media_runtime.boundary, "native-rust-webrtc-datachannel");
+        assert!(media_runtime.remote_transport_active);
+        assert_eq!(media_runtime.remote_audio.len(), 1);
         assert!(accepted
             .events
             .iter()
