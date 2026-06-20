@@ -340,6 +340,43 @@ test.beforeEach(async ({ page }) => {
   await bootReadyShell(page);
 });
 
+test("audio device selectors enumerate and persist preferences", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+
+  const microphoneSelector = page.getByTestId("voice-mic-selector");
+  const outputSelector = page.getByTestId("voice-output-selector");
+  await expect(microphoneSelector).toBeVisible();
+  await expect(outputSelector).toBeVisible();
+  await expect(microphoneSelector.locator("option")).toContainText([
+    "System default microphone",
+    "E2E microphone",
+    "Backup E2E microphone",
+  ]);
+  await expect(outputSelector.locator("option")).toContainText([
+    "System default output",
+    "E2E speaker",
+  ]);
+
+  await microphoneSelector.selectOption("backup-e2e-mic");
+  await outputSelector.selectOption("e2e-speaker");
+  await expect(microphoneSelector).toHaveValue("backup-e2e-mic");
+  await expect(outputSelector).toHaveValue("e2e-speaker");
+
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: /Start a private space/i }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+  await expect(page.getByTestId("voice-mic-selector")).toHaveValue(
+    "backup-e2e-mic",
+  );
+  await expect(page.getByTestId("voice-output-selector")).toHaveValue(
+    "e2e-speaker",
+  );
+});
+
 test("first run creates user and empty shell does not blank", async ({
   page,
 }) => {

@@ -1235,16 +1235,31 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void enumerateVoiceInputDevices(false)
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    void navigator.mediaDevices
+      .enumerateDevices()
       .then((devices) => {
-        if (cancelled || devices.length === 0) return;
-        setVoiceInputDevices(devices);
+        if (cancelled) return;
+        const inputDevices = voiceInputDeviceOptions(devices);
+        const outputDevices = voiceOutputDeviceOptions(devices);
+        if (inputDevices.length > 0) setVoiceInputDevices(inputDevices);
+        if (outputDevices.length > 0) setVoiceOutputDevices(outputDevices);
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    const preferences = commandState?.preferences;
+    if (!preferences) return;
+    setSelectedVoiceInputId(preferences.voice_input_device_id || "default");
+    setSelectedVoiceOutputId(preferences.voice_output_device_id || "default");
+  }, [
+    commandState?.preferences.voice_input_device_id,
+    commandState?.preferences.voice_output_device_id,
+  ]);
 
   useEffect(() => {
     if (!commandState?.voice_session?.joined) {
@@ -2505,6 +2520,27 @@ function App() {
     );
   }
 
+  function persistVoiceDevicePreferences(inputDeviceId: string, outputDeviceId: string) {
+    void applyCommand(
+      savePreferences({
+        theme_id: appState.preferences.theme_id,
+        template_id: appState.preferences.template_id,
+        voice_input_device_id: inputDeviceId,
+        voice_output_device_id: outputDeviceId,
+      }),
+    );
+  }
+
+  function chooseVoiceInputDevice(deviceId: string) {
+    setSelectedVoiceInputId(deviceId);
+    persistVoiceDevicePreferences(deviceId, selectedVoiceOutputId);
+  }
+
+  function chooseVoiceOutputDevice(deviceId: string) {
+    setSelectedVoiceOutputId(deviceId);
+    persistVoiceDevicePreferences(selectedVoiceInputId, deviceId);
+  }
+
   function resetCommandState() {
     void applyCommand(resetAppState({ confirmation: resetPhrase }), (state) => {
       if (!state.last_command_error) {
@@ -2971,8 +3007,8 @@ function App() {
               voiceDeviceStatus={voiceDeviceStatus}
               localMicGain={localMicGain}
               appOutputVolume={appOutputVolume}
-              onSelectInputDevice={setSelectedVoiceInputId}
-              onSelectOutputDevice={setSelectedVoiceOutputId}
+              onSelectInputDevice={chooseVoiceInputDevice}
+              onSelectOutputDevice={chooseVoiceOutputDevice}
               onRefreshDevices={() => void refreshVoiceInputDevices(true)}
               onLocalMicGainChange={setLocalMicGain}
               onAppOutputVolumeChange={setAppOutputVolume}
