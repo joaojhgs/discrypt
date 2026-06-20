@@ -19030,7 +19030,7 @@ mod tests {
                 .as_ref()
                 .map(|error| error.code.as_str()),
             Some("text_session_missing"),
-            "online presence must not be local-only without backend route evidence"
+            "online presence must not be accepted without backend route evidence"
         );
         assert_ne!(rejected_without_route.groups[0].members[0].status, "online");
         let other_path = reset_with_temp_state("g005-presence-receiver");
