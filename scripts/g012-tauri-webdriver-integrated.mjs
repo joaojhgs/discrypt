@@ -1112,23 +1112,47 @@ async function installVoiceHarness(profile) {
 
 const alreadyJoinedVoiceUiPredicate = `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`;
 
+async function readAlreadyJoinedNativeVoice(profile) {
+  const state = await appState(profile);
+  const nativeMediaStarted = state?.events?.some((event) => event?.kind === "voice.native_media_started");
+  const nativeMediaReceived = state?.events?.some((event) => event?.kind === "voice.native_media_received");
+  const joinedUi = await exec(profile, alreadyJoinedVoiceUiPredicate);
+  return {
+    ok: Boolean(requireNativeVoice && nativeMediaStarted && nativeMediaReceived && !state?.last_command_error && joinedUi),
+    state,
+    nativeMediaStarted,
+    nativeMediaReceived,
+    joinedUi,
+  };
+}
+
+async function waitForAlreadyJoinedNativeVoice(profile, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await readAlreadyJoinedNativeVoice(profile);
+    if (last.ok) {
+      await waitUntil(profile, "already joined native voice media", alreadyJoinedVoiceUiPredicate);
+      return true;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  manifest[`${profile.display_name.toLowerCase()}_already_joined_native_voice_last`] = {
+    native_media_started: Boolean(last?.nativeMediaStarted),
+    native_media_received: Boolean(last?.nativeMediaReceived),
+    joined_ui: Boolean(last?.joinedUi),
+    last_command_error: last?.state?.last_command_error ?? null,
+  };
+  writeManifest(manifest.status || "running", {});
+  return false;
+}
+
 async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
-  const before = await appState(profile);
-  const nativeMediaStarted = before?.events?.some((event) => event?.kind === "voice.native_media_started");
-  const nativeMediaReceived = before?.events?.some((event) => event?.kind === "voice.native_media_received");
-  if (
-    requireNativeVoice &&
-    nativeMediaStarted &&
-    nativeMediaReceived &&
-    !before?.last_command_error
-  ) {
-    const joinedUi = await exec(profile, alreadyJoinedVoiceUiPredicate);
-    if (joinedUi) {
-      await waitUntil(profile, "already joined native voice media", alreadyJoinedVoiceUiPredicate);
-      return;
-    }
+  if (requireNativeVoice && await waitForAlreadyJoinedNativeVoice(profile)) {
+    return;
   }
+  const before = await appState(profile);
   if (before?.voice_session?.joined) {
     if (
       requireNativeVoice &&
@@ -1138,6 +1162,17 @@ async function joinVoice(profile) {
       throw new Error(`${profile.display_name} native voice media failed after join; ${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`);
     }
     if (before?.voice_session?.media_runtime?.local_capture_active) {
+      if (requireNativeVoice) {
+        if (await waitForAlreadyJoinedNativeVoice(profile, 45_000)) {
+          return;
+        }
+        const after = await appState(profile);
+        const commandError = after?.last_command_error;
+        const detail = commandError
+          ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
+          : "native media start/receive evidence did not settle";
+        throw new Error(`${profile.display_name} is already joined locally but native voice media is not active; ${detail}`);
+      }
       await waitUntil(profile, "already joined local voice participant", alreadyJoinedVoiceUiPredicate);
       return;
     }
@@ -1151,6 +1186,14 @@ async function joinVoice(profile) {
   }
   await click(profile, "join call");
   await waitUntil(profile, "local voice participant", `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`);
+  if (requireNativeVoice && !await waitForAlreadyJoinedNativeVoice(profile, 45_000)) {
+    const after = await appState(profile);
+    const commandError = after?.last_command_error;
+    const detail = commandError
+      ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
+      : "native media start/receive evidence did not settle";
+    throw new Error(`${profile.display_name} joined voice but native voice media is not active; ${detail}`);
+  }
 }
 async function leaveVoice(profile) {
   await click(profile, "leave call");

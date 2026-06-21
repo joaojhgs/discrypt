@@ -55,6 +55,8 @@ for (const token of [
   "native voice media failed after join",
   "already joined native voice media",
   "alreadyJoinedVoiceUiPredicate",
+  "waitForAlreadyJoinedNativeVoice",
+  "already_joined_native_voice_last",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
