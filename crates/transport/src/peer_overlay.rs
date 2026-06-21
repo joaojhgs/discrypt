@@ -730,7 +730,7 @@ pub enum PeerOverlaySelectedRoute {
         /// Candidate rank score.
         score: i64,
         /// Two live route legs proving the relay can forward.
-        evidence: PeerOverlayRelayRouteEvidence,
+        evidence: Box<PeerOverlayRelayRouteEvidence>,
     },
 }
 
@@ -899,7 +899,7 @@ fn try_peer_relay(
             relay: ranked.relay.clone(),
             authorization: ranked.authorization.clone(),
             score: ranked.score,
-            evidence,
+            evidence: Box::new(evidence),
         },
     ))
 }
@@ -1678,7 +1678,11 @@ mod tests {
                 assert_eq!(evidence.relay_to_destination.from, peer(2, epoch)?);
                 assert_eq!(evidence.relay_to_destination.to, peer(3, epoch)?);
             }
-            other => panic!("unexpected selection: {other:?}"),
+            other => {
+                return Err(overlay_policy_error(format!(
+                    "unexpected route selection in test: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
