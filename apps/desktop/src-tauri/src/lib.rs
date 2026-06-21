@@ -82,7 +82,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::{
@@ -2361,7 +2361,7 @@ struct TextControlRuntimeAttachInputs {
     ice_config: IceServerConfig,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TextControlRuntimePeerAttachment {
     role: ProviderTextControlRuntimePeerRole,
     local_peer_id: SignalingPeerId,
@@ -3892,12 +3892,12 @@ pub fn attach_text_control_transport_runtime(
         return guard.to_view();
     }
 
-    let derived_attachment = if request.derive_from_state {
+    let derived_attachments = if request.derive_from_state {
         match guard
             .state
-            .active_runtime_peer_attachment_for_text_control()
+            .active_runtime_peer_attachments_for_text_control()
         {
-            Ok(attachment) => Some(attachment),
+            Ok(attachments) => Some(attachments),
             Err(error) => {
                 guard.state.push_command_error(
                     "transport.text_runtime_attach_rejected",
@@ -3988,7 +3988,7 @@ pub fn attach_text_control_transport_runtime(
         None
     };
 
-    if let Some(attachment) = explicit_attachment.or(derived_attachment) {
+    if let Some(attachment) = explicit_attachment {
         let key = TextControlRuntimeMapKey::for_attachment(
             active_session_id.clone(),
             &attachment.remote_peer_id,
@@ -4027,6 +4027,53 @@ pub fn attach_text_control_transport_runtime(
         let view = guard.to_view();
         drop(guard);
         spawn_text_control_runtime_attach(job);
+        return view;
+    }
+
+    if let Some(attachments) = derived_attachments {
+        let runtime_inputs = match guard
+            .state
+            .text_control_runtime_inputs_for_active_scope(None)
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                guard.state.push_command_error(
+                    "transport.text_runtime_attach_rejected",
+                    "attach_text_control_transport_runtime",
+                    "text_runtime_scope_unavailable",
+                    error,
+                    "Open a DM/group/invite context with a configured signaling profile before attaching runtime",
+                );
+                guard.persist();
+                return guard.to_view();
+            }
+        };
+        let mut jobs = Vec::new();
+        for attachment in attachments {
+            let key = TextControlRuntimeMapKey::for_attachment(
+                active_session_id.clone(),
+                &attachment.remote_peer_id,
+            );
+            if guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &key,
+            ) {
+                continue;
+            }
+            jobs.push(prepare_text_control_runtime_attach_job(
+                &mut guard,
+                "attach_text_control_transport_runtime",
+                active_session_id.clone(),
+                runtime_inputs.clone(),
+                attachment,
+            ));
+        }
+        let view = guard.to_view();
+        drop(guard);
+        for job in jobs {
+            spawn_text_control_runtime_attach(job);
+        }
         return view;
     }
 
@@ -11970,6 +12017,89 @@ impl PersistedAppState {
         )
     }
 
+    fn active_runtime_peer_attachments_for_text_control(
+        &self,
+    ) -> Result<Vec<TextControlRuntimePeerAttachment>, String> {
+        let context = self.active_context.as_ref().ok_or_else(|| {
+            "No active DM/group context is available for text/control runtime peer attachment"
+                .to_owned()
+        })?;
+        if context.dm_id.is_some() {
+            return Ok(vec![self.active_runtime_peer_attachment_for_text_control()?]);
+        }
+        let Some(group_id) = &context.group_id else {
+            return Err(
+                "Active context is not a DM or group for text/control runtime peer attachment"
+                    .to_owned(),
+            );
+        };
+        let group = self
+            .groups
+            .iter()
+            .find(|group| &group.group_id == group_id)
+            .ok_or_else(|| {
+                format!(
+                    "Active group {group_id} is missing for text/control runtime peer attachment"
+                )
+            })?;
+        let local_member_id = self.local_user_id();
+        let local_member = group
+            .members
+            .iter()
+            .find(|member| {
+                member.member_id == local_member_id
+                    && member.status != "pending"
+                    && member.status != "revoked"
+                    && member.status != "migration_default"
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Active group {group_id} has no admitted local member for per-peer text/control runtime attach"
+                )
+            })?;
+        let local_peer_id = group_member_runtime_peer_id(group_id, local_member)?;
+        let local_peer_id =
+            SignalingPeerId::new(local_peer_id).map_err(|error| error.to_string())?;
+        let mut remote_peer_ids = BTreeSet::new();
+        let mut attachments = Vec::new();
+        for remote in group.members.iter().filter(|member| {
+            member.member_id != local_member_id
+                && member.status != "pending"
+                && member.status != "revoked"
+                && member.status != "migration_default"
+        }) {
+            let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
+            if remote_peer_id == local_peer_id.0 {
+                return Err(format!(
+                    "Active group {group_id} remote member runtime peer id matches the local peer"
+                ));
+            }
+            if !remote_peer_ids.insert(remote_peer_id.clone()) {
+                return Err(format!(
+                    "Active group {group_id} has duplicate admitted runtime peer ids"
+                ));
+            }
+            let role = group_text_control_runtime_role_for_edge(
+                &local_member.role,
+                &local_peer_id.0,
+                &remote.role,
+                &remote_peer_id,
+            )?;
+            attachments.push(TextControlRuntimePeerAttachment {
+                role,
+                local_peer_id: local_peer_id.clone(),
+                remote_peer_id: SignalingPeerId::new(remote_peer_id)
+                    .map_err(|error| error.to_string())?,
+            });
+        }
+        if attachments.is_empty() {
+            return Err(format!(
+                "Active group {group_id} has no admitted remote peers for per-peer text/control runtime attach"
+            ));
+        }
+        Ok(attachments)
+    }
+
     fn native_voice_runtime_peer_attachment(
         &self,
         session: &VoiceSessionView,
@@ -15244,6 +15374,55 @@ fn group_text_control_runtime_role(
         GroupRoleView::Owner | GroupRoleView::Staff => ProviderTextControlRuntimePeerRole::Offerer,
         GroupRoleView::Member => ProviderTextControlRuntimePeerRole::Answerer,
     })
+}
+
+fn group_member_runtime_peer_id(
+    group_id: &str,
+    member: &GroupMemberView,
+) -> Result<String, String> {
+    if member.status == "pending"
+        || member.status == "revoked"
+        || member.status == "migration_default"
+    {
+        return Err(format!(
+            "Group member {} is not admitted for text/control runtime attach",
+            redacted_observable_ref("member", &member.member_id)
+        ));
+    }
+    let commitment = member
+        .signer_public_key_hex
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&member.member_id);
+    Ok(runtime_peer_id_from_commitment(
+        "group-admitted-member-runtime-peer",
+        &format!("{group_id}:{commitment}"),
+    ))
+}
+
+fn group_text_control_runtime_role_for_edge(
+    local_role: &GroupRoleView,
+    local_peer_id: &str,
+    remote_role: &GroupRoleView,
+    remote_peer_id: &str,
+) -> Result<ProviderTextControlRuntimePeerRole, String> {
+    if local_peer_id == remote_peer_id {
+        return Err(
+            "Text/control runtime role is ambiguous because local and remote peer ids match"
+                .to_owned(),
+        );
+    }
+    if local_role.can_manage_members() && !remote_role.can_manage_members() {
+        return Ok(ProviderTextControlRuntimePeerRole::Offerer);
+    }
+    if !local_role.can_manage_members() && remote_role.can_manage_members() {
+        return Ok(ProviderTextControlRuntimePeerRole::Answerer);
+    }
+    if local_peer_id < remote_peer_id {
+        Ok(ProviderTextControlRuntimePeerRole::Offerer)
+    } else {
+        Ok(ProviderTextControlRuntimePeerRole::Answerer)
+    }
 }
 
 fn prepare_text_control_runtime_attach_job(
@@ -23690,6 +23869,274 @@ mod tests {
         );
         assert_eq!(attachment.local_peer_id.0, member_peer);
         assert_eq!(attachment.remote_peer_id.0, owner_peer);
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachments_derive_three_profile_full_mesh_remotes() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-runtime-peer-contract-full-mesh");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Full Mesh Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "carol-member",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
+            guard.persist();
+        }
+
+        let state = load_state_from_path(&path);
+        let attachments = state.active_runtime_peer_attachments_for_text_control()?;
+        assert_eq!(
+            attachments.len(),
+            2,
+            "three admitted profiles should create two remote attach edges"
+        );
+        let remote_peers = attachments
+            .iter()
+            .map(|attachment| attachment.remote_peer_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(remote_peers.len(), 2);
+        assert!(attachments
+            .iter()
+            .all(|attachment| attachment.role == ProviderTextControlRuntimePeerRole::Offerer));
+        assert!(attachments
+            .iter()
+            .all(|attachment| attachment.local_peer_id != attachment.remote_peer_id));
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_runtime_attachments_fail_closed_for_unadmitted_and_duplicate_peers(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-runtime-peer-contract-fail-closed");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Fail Closed Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let local_user_id = guard.state.local_user_id();
+            let group = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .ok_or_else(|| "active group missing".to_owned())?;
+            let now = Utc::now().to_rfc3339();
+            group.members.push(GroupMemberView {
+                member_id: "pending-member".to_owned(),
+                display_name: "Pending".to_owned(),
+                device_id: None,
+                role: GroupRoleView::Member,
+                status: "pending".to_owned(),
+                signer_public_key_hex: Some(
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+                ),
+                joined_at: now.clone(),
+                last_seen_at: None,
+                presence_expires_at: None,
+                revoked_at: None,
+                revoked_by: None,
+            });
+            group.members.push(GroupMemberView {
+                member_id: "revoked-member".to_owned(),
+                display_name: "Revoked".to_owned(),
+                device_id: None,
+                role: GroupRoleView::Member,
+                status: "revoked".to_owned(),
+                signer_public_key_hex: Some(
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+                ),
+                joined_at: now,
+                last_seen_at: None,
+                presence_expires_at: None,
+                revoked_at: Some(Utc::now().to_rfc3339()),
+                revoked_by: Some(local_user_id),
+            });
+            guard.persist();
+        }
+
+        let no_admitted_remote = load_state_from_path(&path)
+            .active_runtime_peer_attachments_for_text_control()
+            .expect_err("pending/revoked peers must not create attach edges");
+        assert!(
+            no_admitted_remote.contains("no admitted remote peers"),
+            "{no_admitted_remote}"
+        );
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            );
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "carol-member",
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            );
+            guard.persist();
+        }
+
+        let duplicate = load_state_from_path(&path)
+            .active_runtime_peer_attachments_for_text_control()
+            .expect_err("duplicate remote peer ids must fail closed");
+        assert!(
+            duplicate.contains("duplicate admitted runtime peer ids"),
+            "{duplicate}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn per_peer_group_runtime_attach_prepares_independent_pending_entries() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("group-runtime-peer-contract-independent-pending");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Pending Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("per-peer-full-mesh-pending".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "text session should be active after start_text_session".to_owned())?;
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.state.upsert_admitted_group_member(
+            &group_id,
+            "bob-member",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        guard.state.upsert_admitted_group_member(
+            &group_id,
+            "carol-member",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        let attachments = guard
+            .state
+            .active_runtime_peer_attachments_for_text_control()?;
+        let (scope_level, connectivity) = guard
+            .state
+            .active_connectivity_policy()
+            .ok_or_else(|| "active connectivity policy missing".to_owned())?;
+        let profile_view = connectivity
+            .signaling_profiles
+            .first()
+            .cloned()
+            .ok_or_else(|| "active signaling profile missing".to_owned())?;
+        let runtime_inputs = TextControlRuntimeAttachInputs {
+            profile: transport_profile_from_view(&profile_view)?,
+            scope: ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+                .map_err(|error| error.to_string())?,
+            bootstrap_secret: vec![7; 32],
+            random_entropy: vec![9; 16],
+            ice_config: ice_config_from_connectivity(&connectivity)
+                .map_err(|error| error.to_string())?,
+        };
+        for attachment in attachments.clone() {
+            prepare_text_control_runtime_attach_job(
+                &mut guard,
+                "attach_text_control_transport_runtime",
+                active_session_id.clone(),
+                runtime_inputs.clone(),
+                attachment,
+            );
+        }
+
+        assert_eq!(guard.pending_text_control_transport_runtimes.len(), 2);
+        for attachment in attachments {
+            let key = TextControlRuntimeMapKey::for_attachment(
+                &active_session_id,
+                &attachment.remote_peer_id,
+            );
+            assert!(
+                guard
+                    .pending_text_control_transport_runtimes
+                    .contains_key(&key),
+                "missing pending runtime for remote {}",
+                attachment.remote_peer_id.0
+            );
+        }
         Ok(())
     }
 
