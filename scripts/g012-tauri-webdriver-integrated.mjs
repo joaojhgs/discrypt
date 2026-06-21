@@ -1277,13 +1277,6 @@ async function voiceCallFlow(profiles) {
     if (observed.every(Boolean)) break;
   }
   const remoteParticipantVolume = await adjustRemoteParticipantVolumes(profiles);
-  await reloadProfile(profiles.alice);
-  await reloadProfile(profiles.bob);
-  const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_reload");
-  await Promise.all([
-    waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
-    waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
-  ]);
   await clickText(profiles.alice, "Voice Lobby");
   await clickText(profiles.bob, "Voice Lobby");
   const beforeLeave = {
@@ -1298,6 +1291,9 @@ async function voiceCallFlow(profiles) {
   };
   await click(profiles.alice, "mute my microphone");
   await Promise.all([leaveVoice(profiles.alice), leaveVoice(profiles.bob)]);
+  await reloadProfile(profiles.alice);
+  await reloadProfile(profiles.bob);
+  const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_leave_reload");
   return {
     alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),

@@ -57,6 +57,7 @@ for (const token of [
   "alreadyJoinedVoiceUiPredicate",
   "waitForAlreadyJoinedNativeVoice",
   "already_joined_native_voice_last",
+  "after_voice_leave_reload",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
