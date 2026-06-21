@@ -58,6 +58,8 @@ for (const token of [
   "waitForAlreadyJoinedNativeVoice",
   "already_joined_native_voice_last",
   "after_voice_leave_reload",
+  "await click(profiles.alice, \"^Mute$\");",
+  "await click(profiles.alice, \"^Unmute$\");",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {

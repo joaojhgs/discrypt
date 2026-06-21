@@ -1283,13 +1283,13 @@ async function voiceCallFlow(profiles) {
     alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
     bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
   };
-  await click(profiles.alice, "mute my microphone");
-  await waitUntil(profiles.alice, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
+  await click(profiles.alice, "^Mute$");
+  await waitUntil(profiles.alice, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
   const afterMute = {
     alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
     bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
   };
-  await click(profiles.alice, "mute my microphone");
+  await click(profiles.alice, "^Unmute$");
   await Promise.all([leaveVoice(profiles.alice), leaveVoice(profiles.bob)]);
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
@@ -1308,9 +1308,9 @@ async function voiceCallFlow(profiles) {
 async function voiceFlow(profile) {
   await installVoiceHarness(profile);
   await joinVoice(profile);
-  await click(profile, "mute my microphone");
-  await waitUntil(profile, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
-  await click(profile, "mute my microphone");
+  await click(profile, "^Mute$");
+  await waitUntil(profile, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
+  await click(profile, "^Unmute$");
   await leaveVoice(profile);
   return exec(profile, "return window.__discryptG012WebDriverVoiceEvidence || null;");
 }
