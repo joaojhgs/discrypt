@@ -40,6 +40,9 @@ for (const token of [
   "waitForAdmissionUnlockedUi",
   "post-admission unlocked composer",
   "Waiting for owner\\/staff approval before protected messages can be sent",
+  "Local profile ready|Start a private space|Two Profile WebDriver Lab",
+  "assertNoAdmissionDecisionApplyFailure",
+  "admission_decision_apply_failed",
   "await click(profile, \"Send message\");",
 ]) {
   requireText("G012 WebDriver harness", harness, token);

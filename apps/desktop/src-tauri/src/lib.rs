@@ -11343,13 +11343,31 @@ impl PersistedAppState {
                     &decided_at,
                     reason,
                 ) {
-                    self.push_command_error(
-                        "group.admission_decision_rejected",
-                        "handle_text_control_frame",
-                        "admission_decision_apply_failed",
-                        error,
-                        "Refresh pending admission state before applying duplicate decisions",
-                    );
+                    let local_role = self
+                        .groups
+                        .iter()
+                        .find(|group| group.group_id == group_id)
+                        .map(|group| group.role.as_str());
+                    let joiner_side_decision_before_welcome = approved
+                        && error == "Admission request does not exist"
+                        && matches!(local_role, Some("pending" | "member"));
+                    if joiner_side_decision_before_welcome {
+                        self.push_event(
+                            "group.admission_decision_deferred_to_welcome",
+                            format!(
+                                "Deferred replicated admission decision to OpenMLS Welcome for {}",
+                                redacted_observable_ref("group", &group_id)
+                            ),
+                        );
+                    } else {
+                        self.push_command_error(
+                            "group.admission_decision_rejected",
+                            "handle_text_control_frame",
+                            "admission_decision_apply_failed",
+                            error,
+                            "Refresh pending admission state before applying duplicate decisions",
+                        );
+                    }
                 }
                 None
             }
@@ -22864,6 +22882,14 @@ mod tests {
             .find(|group| group.name == "Admission Lab")
             .map(|group| group.group_id.clone())
             .ok_or_else(|| "created group missing".to_owned())?;
+        let mut pending_joiner_group = created
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .cloned()
+            .ok_or_else(|| "created group missing for pending joiner fixture".to_owned())?;
+        pending_joiner_group.role = "pending".to_owned();
+        pending_joiner_group.admission_requests.clear();
 
         let bob_path = fresh_state_path("openmls-admission-bob");
         let _ = fs::remove_file(&bob_path);
@@ -22875,6 +22901,7 @@ mod tests {
             },
             false,
         );
+        bob.state.groups.push(pending_joiner_group);
         bob.persist();
         let bob_package = bob.request_openmls_admission_key_package(&group_id)?;
         assert_eq!(bob_package.group_id, group_id);
@@ -22891,6 +22918,29 @@ mod tests {
         );
         assert!(!welcome.owner_signer_public_key_hex.is_empty());
         assert!(!welcome.welcome_bytes.is_empty());
+
+        bob.state
+            .handle_text_control_frame(TextControlFrameView::GroupAdmissionDecision {
+                group_id: group_id.clone(),
+                request_id: "owner-replica-request".to_owned(),
+                approved: true,
+                reason: None,
+                decided_by: alice.state.local_user_id(),
+                decided_at: Utc::now().to_rfc3339(),
+            });
+        assert_ne!(
+            bob.state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("admission_decision_apply_failed"),
+            "joiner-side approval decision must not poison the Welcome admission path"
+        );
+        assert!(bob
+            .state
+            .events
+            .iter()
+            .any(|event| { event.kind == "group.admission_decision_deferred_to_welcome" }));
 
         bob.join_openmls_group_from_welcome(&welcome)?;
         let bob_handle = bob

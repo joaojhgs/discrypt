@@ -725,7 +725,22 @@ async function waitForMaybe(profile, label, script, args = [], timeoutMs = 90_00
 }
 async function reloadProfile(profile) {
   await exec(profile, "location.reload(); return true;");
-  await waitUntil(profile, "post-reload app shell", "return /Local-first workspace|Set up your local discrypt profile/i.test(document.body.innerText)", [], 30_000);
+  await waitUntil(profile, "post-reload app shell", "return /Local-first workspace|Set up your local discrypt profile|Local profile ready|Start a private space|Two Profile WebDriver Lab/i.test(document.body.innerText)", [], 30_000);
+}
+
+async function assertNoAdmissionDecisionApplyFailure(profile, label) {
+  const state = await appState(profile);
+  const error = state?.last_command_error ?? null;
+  const failed = error?.command === "handle_text_control_frame" && error?.code === "admission_decision_apply_failed";
+  manifest[`admission_decision_apply_failure_${label}`] = {
+    profile: profile.display_name,
+    failed,
+    last_command_error: error,
+  };
+  writeManifest(manifest.status || "running", {});
+  if (failed) {
+    throw new Error(`${profile.display_name} failed to apply admission decision before Welcome unlock: ${JSON.stringify(error)}`);
+  }
 }
 
 async function waitForAdmissionUnlockedUi(profile) {
@@ -1201,10 +1216,14 @@ try {
   await bridgeTextControlFramesBidirectional(profiles, "openmls-admission-request", 4);
   await approvePendingAdmission(profiles.alice);
   await bridgeTextControlFramesBidirectional(profiles, "openmls-admission", 8);
+  await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_openmls_admission_bridge");
+  await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_openmls_admission_bridge");
   await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
   await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
+  await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_admission_reload");
+  await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_admission_reload");
   await waitForAdmissionUnlockedUi(profiles.alice);
   await waitForAdmissionUnlockedUi(profiles.bob);
   const aliceMessage = "alice webdriver group text proof";
