@@ -414,7 +414,11 @@ mod tests {
         assert_eq!(graph.edge_count(), 2);
         assert_eq!(graph.schema_version, ROUTE_GRAPH_SCHEMA_VERSION);
         for remote in remotes(3)? {
-            let edge = graph.edge_for(&remote).expect("remote edge");
+            let edge = graph.edge_for(&remote).ok_or_else(|| {
+                TransportError::InvalidConnectivityPolicy(
+                    "route graph missing admitted remote edge".to_owned(),
+                )
+            })?;
             assert_eq!(edge.local_peer_id, peer(0)?);
             assert_eq!(edge.remote_peer_id, remote);
             assert!(!edge.intent.is_connectable());
