@@ -22915,7 +22915,7 @@ mod tests {
             .iter()
             .find(|group| group.group_id == group_id)
             .cloned()
-            .ok_or_else(|| "created group missing for pending joiner fixture".to_owned())?;
+            .ok_or_else(|| "created group missing for pending joiner admission setup".to_owned())?;
         pending_joiner_group.role = "pending".to_owned();
         pending_joiner_group.admission_requests.clear();
 
