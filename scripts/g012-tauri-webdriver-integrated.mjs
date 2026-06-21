@@ -1113,6 +1113,20 @@ async function installVoiceHarness(profile) {
 async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
   const before = await appState(profile);
+  const nativeMediaStarted = before?.events?.some((event) => event?.kind === "voice.native_media_started");
+  const nativeMediaReceived = before?.events?.some((event) => event?.kind === "voice.native_media_received");
+  if (
+    requireNativeVoice &&
+    nativeMediaStarted &&
+    nativeMediaReceived &&
+    !before?.last_command_error
+  ) {
+    const joinedUi = await exec(profile, `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && /Native Rust (peer|remote voice frame accepted)/i.test(document.body.innerText);`);
+    if (joinedUi) {
+      await waitUntil(profile, "already joined native voice media", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && /Native Rust (peer|remote voice frame accepted)/i.test(document.body.innerText);`);
+      return;
+    }
+  }
   if (before?.voice_session?.joined) {
     if (
       requireNativeVoice &&

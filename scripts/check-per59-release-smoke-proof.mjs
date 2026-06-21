@@ -53,6 +53,9 @@ for (const token of [
   "admission_decision_apply_failed",
   "await click(profile, \"Send message\");",
   "native voice media failed after join",
+  "already joined native voice media",
+  "voice.native_media_started",
+  "voice.native_media_received",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }
