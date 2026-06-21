@@ -15,6 +15,7 @@ pub mod ice;
 pub mod policy;
 pub mod production_status;
 pub mod provider_adapters;
+pub mod route_graph;
 pub mod session;
 pub mod signaling;
 pub mod webrtc_negotiation;
@@ -64,6 +65,9 @@ pub use provider_adapters::{
     TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
     TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE, TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE,
     TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE,
+};
+pub use route_graph::{
+    GroupRouteGraph, RouteGraphEdge, RouteGraphScope, RouteIntent, ROUTE_GRAPH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 pub use session::{
