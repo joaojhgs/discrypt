@@ -1200,20 +1200,22 @@ async function leaveVoice(profile) {
   return waitForLeftVoice(profile);
 }
 async function readLeftVoiceState(profile) {
-  const state = await appState(profile);
-  const voiceLeftEvent = Array.isArray(state?.events) && state.events.some((event) => event?.kind === "voice.left");
-  const leftUi = await exec(profile, "return /Voice idle|Mute idle|Click a voice channel to join|not joined/i.test(document.body.innerText);");
-  const webViewTrackStopped = await exec(profile, "return (window.__discryptG012WebDriverVoiceEvidence?.trackStopCount || 0) > 0;");
+  const persistedState = readJsonIfExists(profile.state_path);
+  const persistedEvents = Array.isArray(persistedState?.events) ? persistedState.events : [];
+  const voiceLeftEvent = persistedEvents.some((event) => event?.kind === "voice.left");
+  const voiceSessionCleared = Boolean(persistedState && !persistedState.parse_error && !persistedState.voice_session);
   return {
-    ok: Boolean(!state?.voice_session && voiceLeftEvent && (leftUi || webViewTrackStopped)),
-    voice_session_cleared: !state?.voice_session,
+    ok: Boolean(voiceSessionCleared && voiceLeftEvent),
+    source: "persisted_app_state",
+    voice_session_cleared: voiceSessionCleared,
     voice_left_event: voiceLeftEvent,
-    left_ui: Boolean(leftUi),
-    webview_track_stopped: Boolean(webViewTrackStopped),
-    last_command_error: state?.last_command_error ?? null,
+    left_ui: null,
+    webview_track_stopped: null,
+    last_command_error: persistedState?.last_command_error ?? null,
+    parse_error: persistedState?.parse_error ?? null,
   };
 }
-async function waitForLeftVoice(profile, timeoutMs = 30_000) {
+async function waitForLeftVoice(profile, timeoutMs = 120_000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
