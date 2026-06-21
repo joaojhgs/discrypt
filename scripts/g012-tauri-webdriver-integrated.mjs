@@ -747,19 +747,19 @@ async function waitForAdmissionUnlockedUi(profile) {
   await waitUntil(profile, "post-admission unlocked composer", String.raw`
     const text = document.body.innerText || '';
     const waiting = /Waiting for owner\/staff approval before protected messages can be sent/i.test(text);
-    const buttons = [...document.querySelectorAll('button, [role="button"]')];
-    const sendEnabled = buttons.some((el) => {
+    const messageInputs = [...document.querySelectorAll('input, textarea')];
+    const messageEditable = messageInputs.some((el) => {
       const style = window.getComputedStyle(el);
       const rect = el.getBoundingClientRect();
       const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-      const label = [el.textContent, el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('data-testid')]
+      const label = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('data-testid')]
         .filter(Boolean)
         .join(' ')
         .replace(/\s+/g, ' ')
         .trim();
-      return visible && !el.disabled && /Send message/i.test(label);
+      return visible && !el.disabled && !el.readOnly && /Message|Send a message/i.test(label);
     });
-    return /Two Profile WebDriver Lab/i.test(text) && !waiting && sendEnabled;
+    return /Two Profile WebDriver Lab/i.test(text) && !waiting && messageEditable;
   `, [], 60_000);
 }
 
