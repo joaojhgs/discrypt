@@ -9709,18 +9709,24 @@ impl PersistedAppState {
 
     fn join_openmls_from_admission_welcome_frame(
         &mut self,
-        group_id: &str,
-        owner_member_id: Option<&str>,
-        owner_signer_public_key_hex: &str,
-        member_signer_public_key_hex: &str,
-        welcome_bytes: &[u8],
-        epoch: u64,
-        confirmation_tag_sha256: &str,
+        frame: &TextControlFrameView,
     ) -> Result<(), String> {
+        let TextControlFrameView::OpenMlsAdmissionWelcome {
+            group_id,
+            owner_member_id,
+            owner_signer_public_key_hex,
+            member_signer_public_key_hex,
+            welcome_bytes,
+            epoch,
+            confirmation_tag_sha256,
+        } = frame
+        else {
+            return Err("OpenMLS admission join requires a Welcome frame".to_owned());
+        };
         if self
             .openmls_groups
             .iter()
-            .any(|handle| handle.group_id == group_id)
+            .any(|handle| handle.group_id == *group_id)
         {
             return Ok(());
         }
@@ -9734,7 +9740,7 @@ impl PersistedAppState {
         let mut confirmation_hash = Sha256::new();
         confirmation_hash.update(&snapshot.confirmation_tag);
         let joined_confirmation = hex::encode(confirmation_hash.finalize());
-        if joined_confirmation != confirmation_tag_sha256 {
+        if joined_confirmation != *confirmation_tag_sha256 {
             return Err(
                 "OpenMLS joined confirmation tag did not match owner Welcome state".to_owned(),
             );
@@ -9744,7 +9750,7 @@ impl PersistedAppState {
             OpenMlsGroupHandleRecord {
                 group_id: group_id.to_owned(),
                 signer_public_key_hex: member_signer_public_key_hex.to_owned(),
-                epoch: snapshot.epoch.max(epoch),
+                epoch: snapshot.epoch.max(*epoch),
                 local_leaf: 1,
                 confirmation_tag_sha256: joined_confirmation,
                 openmls_store_path: Some(app_openmls_store_path().display().to_string()),
@@ -9753,14 +9759,15 @@ impl PersistedAppState {
         );
         let local_member_id = self.local_user_id();
         self.upsert_admitted_group_member(group_id, &local_member_id, member_signer_public_key_hex);
-        if let Some(owner_member_id) =
-            owner_member_id.filter(|member_id| *member_id != local_member_id)
+        if let Some(owner_member_id) = owner_member_id
+            .as_deref()
+            .filter(|member_id| *member_id != local_member_id)
         {
             let created_at = Utc::now().to_rfc3339();
             if let Some(group) = self
                 .groups
                 .iter_mut()
-                .find(|group| group.group_id == group_id)
+                .find(|group| group.group_id == *group_id)
             {
                 if let Some(owner_member) = group
                     .members
@@ -12619,24 +12626,8 @@ impl PersistedAppState {
                 }
                 None
             }
-            TextControlFrameView::OpenMlsAdmissionWelcome {
-                group_id,
-                owner_member_id,
-                owner_signer_public_key_hex,
-                member_signer_public_key_hex,
-                welcome_bytes,
-                epoch,
-                confirmation_tag_sha256,
-            } => {
-                if let Err(error) = self.join_openmls_from_admission_welcome_frame(
-                    &group_id,
-                    owner_member_id.as_deref(),
-                    &owner_signer_public_key_hex,
-                    &member_signer_public_key_hex,
-                    &welcome_bytes,
-                    epoch,
-                    &confirmation_tag_sha256,
-                ) {
+            frame @ TextControlFrameView::OpenMlsAdmissionWelcome { .. } => {
+                if let Err(error) = self.join_openmls_from_admission_welcome_frame(&frame) {
                     self.push_command_error(
                         "mls.admission_rejected",
                         "handle_text_control_frame",
@@ -34661,7 +34652,7 @@ mod tests {
         let source = include_str!("lib.rs");
         assert!(source.contains("static APP_SERVICE"));
         assert!(!source.contains(&["static", "APP_STATE"].join(" ")));
-        assert!(!source.contains(&["get_or_init(||", "Mutex::new(load_state()))",].join(" ")));
+        assert!(!source.contains(&["get_or_init(||", "Mutex::new(load_state()))"].join(" ")));
         assert!(source.matches("mutate_app_service(").count() >= 16);
     }
 }
