@@ -12,6 +12,7 @@
 //! feature matching the claimed runtime capability.
 
 pub mod ice;
+pub mod peer_overlay;
 pub mod policy;
 pub mod production_status;
 pub mod provider_adapters;
@@ -24,6 +25,13 @@ use async_trait::async_trait;
 pub use ice::{
     turn_stun_credential_decision, IceEndpointPolicy, IceServerConfig, TurnCredentialIssuer,
     TurnCredentialIssuerConfig, TurnCredentialMode, TurnServerConfig, TurnStunCredentialDecision,
+};
+pub use peer_overlay::{
+    PeerOverlayAckId, PeerOverlayAckMode, PeerOverlayAdmittedSet, PeerOverlayAuth,
+    PeerOverlayCarrier, PeerOverlayDelivery, PeerOverlayFrame, PeerOverlayLoopId,
+    PeerOverlayOpaquePayload, PeerOverlayPayloadKind, PeerOverlayPeerRef, PeerOverlayRedelivery,
+    PeerOverlayRoute, PeerOverlayTtl, PEER_OVERLAY_FRAME_SCHEMA_VERSION,
+    PEER_OVERLAY_MAX_RELAY_HOPS,
 };
 pub use policy::{
     derive_scope_commitment, AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityPolicy,
