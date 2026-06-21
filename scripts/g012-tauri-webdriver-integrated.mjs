@@ -1114,6 +1114,13 @@ async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
   const before = await appState(profile);
   if (before?.voice_session?.joined) {
+    if (
+      requireNativeVoice &&
+      before?.last_command_error?.command === "start_native_voice_media_session"
+    ) {
+      const commandError = before.last_command_error;
+      throw new Error(`${profile.display_name} native voice media failed after join; ${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`);
+    }
     if (before?.voice_session?.media_runtime?.local_capture_active) {
       await waitUntil(profile, "already joined local voice participant", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`);
       return;

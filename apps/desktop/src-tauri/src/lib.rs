@@ -6957,6 +6957,34 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             dm_id: None,
         });
         if capture_allowed {
+            let voice_runtime_attachment = state
+                .voice_session
+                .clone()
+                .and_then(|session| match state.native_voice_runtime_peer_attachment(&session) {
+                    Ok(attachment) => Some(attachment),
+                    Err(error) => {
+                        state.push_command_error(
+                            "voice.signaling_rejected",
+                            "join_voice",
+                            "voice_runtime_peer_boundary_missing",
+                            error,
+                            "Join voice only after backend-derived runtime peers are available for the authorized group role",
+                        );
+                        None
+                    }
+                });
+            if let (Some(session), Some(attachment)) =
+                (&mut state.voice_session, voice_runtime_attachment)
+            {
+                session.signaling = VoiceSignalingStateView {
+                    session_id: session.session_id.clone(),
+                    local_peer_id: attachment.local_peer_id.0,
+                    remote_peer_id: attachment.remote_peer_id.0,
+                    role: runtime_role_label(Some(attachment.role)).to_owned(),
+                    status_copy: "Voice signaling is ready with backend-derived runtime peer ids before SDP/ICE exchange".to_owned(),
+                    ..VoiceSignalingStateView::default()
+                };
+            }
             state.push_event(
                 "voice.joined",
                 format!(
@@ -24570,6 +24598,12 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "voice session missing".to_owned())?;
+        let joined_session = joined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        assert_eq!(joined_session.signaling.local_peer_id, local_peer_id);
+        assert_eq!(joined_session.signaling.remote_peer_id, remote_peer_id);
         let started = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
             session_id: session_id.clone(),
             local_peer_id: local_peer_id.clone(),

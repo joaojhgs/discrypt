@@ -7,6 +7,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const harness = read("scripts/g012-tauri-webdriver-integrated.mjs");
 const ui = read("apps/ui/src/main.tsx");
+const desktop = read("apps/desktop/src-tauri/src/lib.rs");
 const releaseNote = read("docs/release/per59-human-loopback-release-smoke-2026-06-20.md");
 const plan = read(".omx/plans/P6-T08-human-loopback-release-smoke-2026-06-20.md");
 const failures = [];
@@ -51,6 +52,7 @@ for (const token of [
   "assertNoAdmissionDecisionApplyFailure",
   "admission_decision_apply_failed",
   "await click(profile, \"Send message\");",
+  "native voice media failed after join",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }
@@ -63,6 +65,14 @@ for (const token of [
   "startNativeRustVoiceMediaSession",
 ]) {
   requireText("Discrypt UI native voice peer selection", ui, token);
+}
+
+for (const token of [
+  "voice_runtime_peer_boundary_missing",
+  "Voice signaling is ready with backend-derived runtime peer ids before SDP/ICE exchange",
+  "joined_session.signaling.local_peer_id",
+]) {
+  requireText("Discrypt backend native voice peer seeding", desktop, token);
 }
 
 for (const token of [
