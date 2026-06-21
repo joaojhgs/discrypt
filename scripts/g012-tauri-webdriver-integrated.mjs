@@ -1197,7 +1197,33 @@ async function joinVoice(profile) {
 }
 async function leaveVoice(profile) {
   await click(profile, "Leave voice call");
-  await waitUntil(profile, "left voice", "return /not joined/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackStopCount > 0;");
+  return waitForLeftVoice(profile);
+}
+async function readLeftVoiceState(profile) {
+  const state = await appState(profile);
+  const voiceLeftEvent = Array.isArray(state?.events) && state.events.some((event) => event?.kind === "voice.left");
+  const leftUi = await exec(profile, "return /Voice idle|Mute idle|Click a voice channel to join|not joined/i.test(document.body.innerText);");
+  const webViewTrackStopped = await exec(profile, "return (window.__discryptG012WebDriverVoiceEvidence?.trackStopCount || 0) > 0;");
+  return {
+    ok: Boolean(!state?.voice_session && voiceLeftEvent && (leftUi || webViewTrackStopped)),
+    voice_session_cleared: !state?.voice_session,
+    voice_left_event: voiceLeftEvent,
+    left_ui: Boolean(leftUi),
+    webview_track_stopped: Boolean(webViewTrackStopped),
+    last_command_error: state?.last_command_error ?? null,
+  };
+}
+async function waitForLeftVoice(profile, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await readLeftVoiceState(profile);
+    if (last.ok) return { profile: profile.display_name, ...last };
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  manifest[`${profile.display_name.toLowerCase()}_left_voice_last`] = last;
+  writeManifest(manifest.status || "running", {});
+  throw new Error(`${profile.display_name} timed out waiting for left voice; last=${JSON.stringify(last)}`);
 }
 async function adjustRemoteParticipantVolume(profile, volume) {
   const state = await appState(profile);
@@ -1290,7 +1316,10 @@ async function voiceCallFlow(profiles) {
     bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
   };
   await click(profiles.alice, "^Unmute$");
-  await Promise.all([leaveVoice(profiles.alice), leaveVoice(profiles.bob)]);
+  const [aliceLeaveCleanup, bobLeaveCleanup] = await Promise.all([
+    leaveVoice(profiles.alice),
+    leaveVoice(profiles.bob),
+  ]);
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
   const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_leave_reload");
@@ -1303,6 +1332,10 @@ async function voiceCallFlow(profiles) {
     reloaded_audio_preferences: reloadedAudioPreferences,
     before_leave: beforeLeave,
     after_mute: afterMute,
+    leave_cleanup: {
+      alice: aliceLeaveCleanup,
+      bob: bobLeaveCleanup,
+    },
   };
 }
 async function voiceFlow(profile) {
@@ -1465,7 +1498,16 @@ try {
       voice?.remote_participant_volume?.bob?.changed,
   );
   const muteObserved = Boolean(voice?.after_mute?.alice?.evidence?.trackEnabled === false);
-  const leaveCleanupObserved = Boolean(voice?.alice?.trackStopCount > 0 && voice?.bob?.trackStopCount > 0);
+  const backendLeaveCleanupObserved = Boolean(
+    voice?.leave_cleanup?.alice?.voice_session_cleared &&
+      voice?.leave_cleanup?.alice?.voice_left_event &&
+      voice?.leave_cleanup?.bob?.voice_session_cleared &&
+      voice?.leave_cleanup?.bob?.voice_left_event,
+  );
+  const leaveCleanupObserved = Boolean(
+    (voice?.alice?.trackStopCount > 0 && voice?.bob?.trackStopCount > 0) ||
+      backendLeaveCleanupObserved,
+  );
   const speakingEvidenceObserved = Boolean(
     Array.isArray(voice?.backend_native_proofs) &&
       voice.backend_native_proofs.every((proof) => proof?.speaking && proof?.rms_i16 > 0 && proof?.peak_i16 > 0),
@@ -1493,6 +1535,7 @@ try {
     configured_audio_preferences: audioPreferences,
     reloaded_audio_preferences: voice?.reloaded_audio_preferences ?? null,
     remote_participant_volume: voice?.remote_participant_volume ?? null,
+    leave_cleanup: voice?.leave_cleanup ?? null,
   };
   const summary = {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",

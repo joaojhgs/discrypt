@@ -61,6 +61,12 @@ for (const token of [
   "await click(profiles.alice, \"^Mute$\");",
   "await click(profiles.alice, \"^Unmute$\");",
   "await click(profile, \"Leave voice call\");",
+  "waitForLeftVoice",
+  "voice_session_cleared",
+  "voice_left_event",
+  "Voice idle|Mute idle|Click a voice channel to join|not joined",
+  "backendLeaveCleanupObserved",
+  "leave_cleanup",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
