@@ -1468,6 +1468,9 @@ pub enum TextControlFrameView {
     OpenMlsAdmissionWelcome {
         /// Target group id from the signed invite.
         group_id: String,
+        /// Owner/staff actor member id that issued the Welcome, when present.
+        #[serde(default)]
+        owner_member_id: Option<String>,
         /// Owner signer public key handle.
         owner_signer_public_key_hex: String,
         /// Joiner signer public key handle expected to apply the Welcome.
@@ -9695,6 +9698,7 @@ impl PersistedAppState {
         );
         Ok(TextControlFrameView::OpenMlsAdmissionWelcome {
             group_id: group_id.to_owned(),
+            owner_member_id: Some(self.local_user_id()),
             owner_signer_public_key_hex: owner_record.signer_public_key_hex,
             member_signer_public_key_hex: signer_public_key_hex.to_owned(),
             welcome_bytes,
@@ -9706,6 +9710,8 @@ impl PersistedAppState {
     fn join_openmls_from_admission_welcome_frame(
         &mut self,
         group_id: &str,
+        owner_member_id: Option<&str>,
+        owner_signer_public_key_hex: &str,
         member_signer_public_key_hex: &str,
         welcome_bytes: &[u8],
         epoch: u64,
@@ -9747,6 +9753,43 @@ impl PersistedAppState {
         );
         let local_member_id = self.local_user_id();
         self.upsert_admitted_group_member(group_id, &local_member_id, member_signer_public_key_hex);
+        if let Some(owner_member_id) =
+            owner_member_id.filter(|member_id| *member_id != local_member_id)
+        {
+            let created_at = Utc::now().to_rfc3339();
+            if let Some(group) = self
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+            {
+                if let Some(owner_member) = group
+                    .members
+                    .iter_mut()
+                    .find(|member| member.member_id == owner_member_id)
+                {
+                    owner_member.role = GroupRoleView::Owner;
+                    owner_member.status = "unknown".to_owned();
+                    owner_member.signer_public_key_hex =
+                        Some(owner_signer_public_key_hex.to_owned());
+                    owner_member.revoked_at = None;
+                    owner_member.revoked_by = None;
+                } else {
+                    group.members.push(GroupMemberView {
+                        member_id: owner_member_id.to_owned(),
+                        display_name: redacted_observable_ref("member", owner_member_id),
+                        device_id: None,
+                        role: GroupRoleView::Owner,
+                        status: "unknown".to_owned(),
+                        signer_public_key_hex: Some(owner_signer_public_key_hex.to_owned()),
+                        joined_at: created_at,
+                        last_seen_at: None,
+                        presence_expires_at: None,
+                        revoked_at: None,
+                        revoked_by: None,
+                    });
+                }
+            }
+        }
         self.push_event(
             "mls.admission_welcome_joined",
             format!(
@@ -11301,7 +11344,7 @@ impl PersistedAppState {
             .iter()
             .find(|member| member.signer_public_key_hex.as_deref() == Some(signer_public_key_hex))
         {
-            self.validate_admitted_group_route_member(group_id, group, member)?;
+            self.validate_current_remote_group_route_sender(group_id, member)?;
             return Ok(());
         }
         if let Some(member) = group
@@ -11309,17 +11352,12 @@ impl PersistedAppState {
             .iter()
             .find(|member| member.member_id == sender_device_id)
         {
-            self.validate_admitted_group_route_member(group_id, group, member)?;
+            self.validate_current_remote_group_route_sender(group_id, member)?;
             return Ok(());
         }
-        if group.members.iter().any(|member| {
-            member.member_id != self.local_user_id() && member.signer_public_key_hex.is_some()
-        }) {
-            return Err(
-                "No current group member matches the text/control sender signing key".to_owned(),
-            );
-        }
-        Ok(())
+        Err(format!(
+            "Group {group_id} has no current member {sender_device_id} for text/control sender route authority"
+        ))
     }
 
     fn validate_group_route_member_id(
@@ -11341,6 +11379,29 @@ impl PersistedAppState {
             })?;
         self.validate_admitted_group_route_member(group_id, group, member)?;
         group_member_runtime_peer_id(group_id, member)
+    }
+
+    fn validate_current_remote_group_route_sender(
+        &self,
+        group_id: &str,
+        member: &GroupMemberView,
+    ) -> Result<(), String> {
+        if member.member_id == self.local_user_id() {
+            return Err(format!(
+                "Group {group_id} route sender {} is local, not a remote sender",
+                member.member_id
+            ));
+        }
+        if matches!(
+            member.status.as_str(),
+            "pending" | "revoked" | "migration_default" | "offline"
+        ) {
+            return Err(format!(
+                "Group {group_id} route sender {} is not currently admitted/online for text route authority (status={})",
+                member.member_id, member.status
+            ));
+        }
+        Ok(())
     }
 
     fn validate_admitted_group_route_member(
@@ -12560,7 +12621,8 @@ impl PersistedAppState {
             }
             TextControlFrameView::OpenMlsAdmissionWelcome {
                 group_id,
-                owner_signer_public_key_hex: _,
+                owner_member_id,
+                owner_signer_public_key_hex,
                 member_signer_public_key_hex,
                 welcome_bytes,
                 epoch,
@@ -12568,6 +12630,8 @@ impl PersistedAppState {
             } => {
                 if let Err(error) = self.join_openmls_from_admission_welcome_frame(
                     &group_id,
+                    owner_member_id.as_deref(),
+                    &owner_signer_public_key_hex,
                     &member_signer_public_key_hex,
                     &welcome_bytes,
                     epoch,
@@ -21405,6 +21469,12 @@ mod tests {
             .into_iter()
             .find(|record| record.message_id == message_id)
             .ok_or_else(|| "persisted envelope missing for group message".to_owned())?;
+        add_legacy_route_member_without_signer_to_state_for_test(
+            &mut bob.state,
+            &group_id,
+            &alice_user_id,
+            "Alice",
+        )?;
         let (receipt, recipient_key_hex) =
             bob.state
                 .receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
@@ -21739,6 +21809,11 @@ mod tests {
             joined_group.last_command_error.is_none(),
             "{joined_group:?}"
         );
+        add_legacy_route_member_without_signer_for_test(
+            &alice_group_id,
+            &alice_profile_id,
+            "Alice G010",
+        )?;
         let bob_group = joined_group
             .groups
             .iter()
@@ -22244,6 +22319,11 @@ mod tests {
             joined_group.last_command_error.is_none(),
             "{joined_group:?}"
         );
+        add_legacy_route_member_without_signer_for_test(
+            &group_id,
+            &alice_profile_id,
+            "Alice G004",
+        )?;
         let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target: target.clone(),
             envelope: envelope_record.envelope.clone(),
@@ -27861,6 +27941,11 @@ mod tests {
             &text_exporter_secret,
             &sender,
         )?;
+        add_legacy_route_member_without_signer_for_test(
+            &group_id,
+            "remote-device",
+            "Legacy Remote",
+        )?;
 
         let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target,
@@ -27882,6 +27967,92 @@ mod tests {
         assert!(message
             .status
             .contains("decrypted through TextInboundPipeline"));
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_command_rejects_unknown_group_sender_without_signer_roster() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("receive-openmls-unknown-sender");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "OpenMLS Unknown Sender Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .iter()
+            .find(|group| group.name == "OpenMLS Unknown Sender Lab")
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| matches!(channel.kind, ChannelKind::Text))
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id),
+            channel_id: Some(channel_id),
+        };
+        let delivery_group_id = text_delivery_group_id(&target)?;
+        let unknown_sender = SigningKey::generate(&mut OsRng);
+        let envelope = TextMessageEnvelope::sign(
+            &delivery_group_id,
+            TextMessageEnvelopeInput {
+                epoch: 1,
+                sender_leaf: 9,
+                sender_device_id: "removed-unknown-sender".to_owned(),
+                sequence: 1,
+                message_id: "msg-unknown-removed-sender".to_owned(),
+                retention: TextRetentionMetadata {
+                    policy: "app-default".to_owned(),
+                    created_at_ms: 1,
+                    expires_at_ms: None,
+                    delete_after_read: false,
+                },
+                content_ciphertext: b"unknown sender should not be accepted".to_vec(),
+            },
+            &unknown_sender,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target,
+            envelope,
+            sender_verifying_key_hex: hex::encode(unknown_sender.verifying_key().as_bytes()),
+            recipient_leaf: Some(2),
+        });
+
+        assert!(response.receipt.is_none(), "{response:?}");
+        assert_eq!(
+            response
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("text_envelope_verification_failed")
+        );
+        assert!(response
+            .state
+            .messages
+            .iter()
+            .all(|message| message.message_id != "msg-unknown-removed-sender"));
+        let persisted = load_state();
+        assert!(persisted
+            .text_delivery_receipts
+            .iter()
+            .all(|receipt| receipt.message_id != "msg-unknown-removed-sender"));
         Ok(())
     }
 
@@ -27923,6 +28094,11 @@ mod tests {
             group_id: Some(group_id.clone()),
             channel_id: Some(channel_id.clone()),
         };
+        add_legacy_route_member_without_signer_for_test(
+            &group_id,
+            "remote-device",
+            "Legacy Remote",
+        )?;
         let invalid_signer_envelope = openmls_text_envelope_for_test(
             &group_id,
             &channel_id,
@@ -28609,6 +28785,62 @@ mod tests {
             .find(|member| member.member_id == member_id)
             .ok_or_else(|| "member missing for route lookup".to_owned())?;
         group_member_runtime_peer_id(group_id, member)
+    }
+
+    fn add_legacy_route_member_without_signer_for_test(
+        group_id: &str,
+        member_id: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        add_legacy_route_member_without_signer_to_state_for_test(
+            &mut guard.state,
+            group_id,
+            member_id,
+            display_name,
+        )?;
+        guard.persist();
+        Ok(())
+    }
+
+    fn add_legacy_route_member_without_signer_to_state_for_test(
+        state: &mut PersistedAppState,
+        group_id: &str,
+        member_id: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
+        let local_user_id = state.local_user_id();
+        let group = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing for legacy route member insert".to_owned())?;
+        if member_id == local_user_id {
+            return Err("legacy route member must be remote".to_owned());
+        }
+        if !group
+            .members
+            .iter()
+            .any(|member| member.member_id == member_id)
+        {
+            group.members.push(GroupMemberView {
+                member_id: member_id.to_owned(),
+                display_name: display_name.to_owned(),
+                device_id: None,
+                role: GroupRoleView::Member,
+                status: "unknown".to_owned(),
+                signer_public_key_hex: None,
+                joined_at: Utc::now().to_rfc3339(),
+                last_seen_at: None,
+                presence_expires_at: None,
+                revoked_at: None,
+                revoked_by: None,
+            });
+        }
+        Ok(())
     }
 
     fn set_group_member_status_for_test(
