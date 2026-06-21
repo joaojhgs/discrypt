@@ -1,8 +1,8 @@
 //! Peer-assisted encrypted overlay protocol contract.
 //!
 //! This module is intentionally data-only. It validates the shape of future
-//! relay frames without selecting routes, authorizing relay candidates,
-//! forwarding bytes, or exposing any decrypt/key path.
+//! relay frames and local route-selection evidence without forwarding bytes or
+//! exposing any decrypt/key path.
 
 use crate::{SignalingPeerId, TransportError};
 use serde::{Deserialize, Serialize};
@@ -554,6 +554,369 @@ pub struct PeerOverlayRankedRelayCandidate {
     pub diagnostics: PeerOverlayRelayCandidateDiagnostics,
 }
 
+/// Explicit policy for where configured TURN sits after direct WebRTC fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerOverlayConfiguredTurnOrder {
+    /// Try configured TURN before considering peer-assisted relay.
+    BeforePeerRelay,
+    /// Try peer-assisted relay before configured TURN.
+    AfterPeerRelay,
+}
+
+/// Route-selection policy for the local overlay planner model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRouteSelectionPolicy {
+    /// Explicit configured-TURN position after direct failure.
+    pub configured_turn_order: PeerOverlayConfiguredTurnOrder,
+}
+
+impl Default for PeerOverlayRouteSelectionPolicy {
+    fn default() -> Self {
+        Self {
+            configured_turn_order: PeerOverlayConfiguredTurnOrder::BeforePeerRelay,
+        }
+    }
+}
+
+/// Backend/runtime-observed route leg evidence used by the route selector.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRouteLegEvidence {
+    /// Source peer for this observed leg.
+    pub from: PeerOverlayPeerRef,
+    /// Destination peer for this observed leg.
+    pub to: PeerOverlayPeerRef,
+    /// Carrier used by this leg.
+    pub carrier: PeerOverlayCarrier,
+    /// Redacted route/session label from backend route evidence.
+    pub route_label: String,
+    /// True only when the backend/runtime currently observes this leg as live.
+    pub live: bool,
+}
+
+impl PeerOverlayRouteLegEvidence {
+    fn validate_pair(
+        &self,
+        admitted: &PeerOverlayAdmittedSet,
+        from: &PeerOverlayPeerRef,
+        to: &PeerOverlayPeerRef,
+        expected_carrier: PeerOverlayCarrier,
+        label: &str,
+    ) -> Result<(), TransportError> {
+        admitted.validate_ref(&self.from)?;
+        admitted.validate_ref(&self.to)?;
+        self.carrier.validate()?;
+        validate_label(&self.route_label, label)?;
+        if self.from != *from || self.to != *to {
+            return Err(overlay_policy_error(format!(
+                "{label} must bind the expected peer pair"
+            )));
+        }
+        if self.carrier != expected_carrier {
+            return Err(overlay_policy_error(format!(
+                "{label} carrier does not match route-selection policy"
+            )));
+        }
+        if !self.live {
+            return Err(overlay_policy_error(format!(
+                "{label} must be backed by a live route"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_relay_leg(
+        &self,
+        admitted: &PeerOverlayAdmittedSet,
+        from: &PeerOverlayPeerRef,
+        to: &PeerOverlayPeerRef,
+        label: &str,
+    ) -> Result<(), TransportError> {
+        admitted.validate_ref(&self.from)?;
+        admitted.validate_ref(&self.to)?;
+        self.carrier.validate()?;
+        validate_label(&self.route_label, label)?;
+        if self.from != *from || self.to != *to {
+            return Err(overlay_policy_error(format!(
+                "{label} must bind the expected peer pair"
+            )));
+        }
+        if matches!(
+            self.carrier,
+            PeerOverlayCarrier::PeerAssistedOverlay | PeerOverlayCarrier::ProviderApplicationRelay
+        ) {
+            return Err(overlay_policy_error(format!(
+                "{label} must use a direct or configured TURN WebRTC leg"
+            )));
+        }
+        if !self.live {
+            return Err(overlay_policy_error(format!(
+                "{label} must be backed by a live route"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Two live route legs needed for one peer-assisted relay path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayRouteEvidence {
+    /// Ranked relay peer this evidence belongs to.
+    pub relay: PeerOverlayPeerRef,
+    /// Live source-to-relay leg.
+    pub source_to_relay: PeerOverlayRouteLegEvidence,
+    /// Live relay-to-destination leg.
+    pub relay_to_destination: PeerOverlayRouteLegEvidence,
+}
+
+impl PeerOverlayRelayRouteEvidence {
+    fn validate_for(
+        &self,
+        admitted: &PeerOverlayAdmittedSet,
+        source: &PeerOverlayPeerRef,
+        destination: &PeerOverlayPeerRef,
+    ) -> Result<(), TransportError> {
+        admitted.validate_ref(&self.relay)?;
+        if self.relay.peer_id == source.peer_id || self.relay.peer_id == destination.peer_id {
+            return Err(overlay_policy_error(
+                "peer overlay relay route evidence cannot use source or destination as relay",
+            ));
+        }
+        self.source_to_relay.validate_relay_leg(
+            admitted,
+            source,
+            &self.relay,
+            "peer overlay source-to-relay leg",
+        )?;
+        self.relay_to_destination.validate_relay_leg(
+            admitted,
+            &self.relay,
+            destination,
+            "peer overlay relay-to-destination leg",
+        )?;
+        Ok(())
+    }
+}
+
+/// Ordered route-selection attempt evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRouteSelectionAttempt {
+    /// Carrier considered by this attempt.
+    pub carrier: PeerOverlayCarrier,
+    /// True when the attempt had live validated route evidence.
+    pub selected: bool,
+}
+
+/// Selected route from the local overlay route-selection model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PeerOverlaySelectedRoute {
+    /// Direct WebRTC pair won.
+    DirectWebRtc {
+        /// Live direct pair evidence.
+        evidence: PeerOverlayRouteLegEvidence,
+    },
+    /// Configured TURN-backed WebRTC pair won.
+    ConfiguredTurnBackedWebRtc {
+        /// Live configured TURN pair evidence.
+        evidence: PeerOverlayRouteLegEvidence,
+    },
+    /// Peer-assisted relay won after direct failure.
+    PeerAssistedOverlay {
+        /// Top-ranked relay candidate selected.
+        relay: PeerOverlayPeerRef,
+        /// Explicit authorization used for the relay.
+        authorization: PeerOverlayRelayAuthorization,
+        /// Candidate rank score.
+        score: i64,
+        /// Two live route legs proving the relay can forward.
+        evidence: PeerOverlayRelayRouteEvidence,
+    },
+}
+
+/// Route-selection result with backend-derived attempt evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRouteSelection {
+    /// Attempts in the explicit policy order.
+    pub attempts: Vec<PeerOverlayRouteSelectionAttempt>,
+    /// Selected route evidence.
+    pub selected: PeerOverlaySelectedRoute,
+    /// Honest limitation for release evidence and UI consumers.
+    pub limitation: String,
+}
+
+/// Inputs to the local peer-overlay route selector.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRouteSelectionInput {
+    /// Current-epoch source peer.
+    pub source: PeerOverlayPeerRef,
+    /// Current-epoch destination peer.
+    pub destination: PeerOverlayPeerRef,
+    /// Direct pair route evidence. Must be live to select direct.
+    pub direct_pair: Option<PeerOverlayRouteLegEvidence>,
+    /// Configured TURN pair route evidence. Must be live to select TURN.
+    pub configured_turn_pair: Option<PeerOverlayRouteLegEvidence>,
+    /// Ranked relay candidates from `rank_relay_candidates`.
+    pub ranked_relays: Vec<PeerOverlayRankedRelayCandidate>,
+    /// Two-leg relay route evidence keyed by relay peer.
+    pub relay_routes: Vec<PeerOverlayRelayRouteEvidence>,
+}
+
+/// Select direct, configured TURN, or a safe peer-assisted relay route.
+pub fn select_peer_overlay_route(
+    admitted: &PeerOverlayAdmittedSet,
+    auth: &PeerOverlayAuth,
+    policy: &PeerOverlayRouteSelectionPolicy,
+    input: PeerOverlayRouteSelectionInput,
+) -> Result<PeerOverlayRouteSelection, TransportError> {
+    auth.validate(admitted)?;
+    admitted.validate_ref(&input.source)?;
+    admitted.validate_ref(&input.destination)?;
+    if input.source.peer_id == input.destination.peer_id {
+        return Err(overlay_policy_error(
+            "peer overlay route selection source and destination must differ",
+        ));
+    }
+
+    let mut attempts = Vec::new();
+    attempts.push(PeerOverlayRouteSelectionAttempt {
+        carrier: PeerOverlayCarrier::DirectWebRtcDataChannel,
+        selected: false,
+    });
+    if let Some(direct) = input.direct_pair.clone() {
+        direct.validate_pair(
+            admitted,
+            &input.source,
+            &input.destination,
+            PeerOverlayCarrier::DirectWebRtcDataChannel,
+            "peer overlay direct route evidence",
+        )?;
+        attempts[0].selected = true;
+        return Ok(route_selection_result(
+            attempts,
+            PeerOverlaySelectedRoute::DirectWebRtc { evidence: direct },
+        ));
+    }
+
+    match policy.configured_turn_order {
+        PeerOverlayConfiguredTurnOrder::BeforePeerRelay => {
+            if let Some(selection) = try_configured_turn(
+                admitted,
+                &input,
+                &mut attempts,
+                input.configured_turn_pair.clone(),
+            )? {
+                return Ok(selection);
+            }
+            try_peer_relay(admitted, auth, &input, attempts)
+        }
+        PeerOverlayConfiguredTurnOrder::AfterPeerRelay => {
+            let configured_turn_pair = input.configured_turn_pair.clone();
+            match try_peer_relay(admitted, auth, &input, attempts.clone()) {
+                Ok(selection) => Ok(selection),
+                Err(TransportError::NoViablePath) => {
+                    try_configured_turn(admitted, &input, &mut attempts, configured_turn_pair)?
+                        .ok_or(TransportError::NoViablePath)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn try_configured_turn(
+    admitted: &PeerOverlayAdmittedSet,
+    input: &PeerOverlayRouteSelectionInput,
+    attempts: &mut Vec<PeerOverlayRouteSelectionAttempt>,
+    configured_turn_pair: Option<PeerOverlayRouteLegEvidence>,
+) -> Result<Option<PeerOverlayRouteSelection>, TransportError> {
+    attempts.push(PeerOverlayRouteSelectionAttempt {
+        carrier: PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+        selected: false,
+    });
+    if let Some(turn) = configured_turn_pair {
+        turn.validate_pair(
+            admitted,
+            &input.source,
+            &input.destination,
+            PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+            "peer overlay configured TURN route evidence",
+        )?;
+        let last = attempts.last_mut().ok_or_else(|| {
+            overlay_policy_error("peer overlay route selection attempt list is empty")
+        })?;
+        last.selected = true;
+        Ok(Some(route_selection_result(
+            attempts.clone(),
+            PeerOverlaySelectedRoute::ConfiguredTurnBackedWebRtc { evidence: turn },
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_peer_relay(
+    admitted: &PeerOverlayAdmittedSet,
+    auth: &PeerOverlayAuth,
+    input: &PeerOverlayRouteSelectionInput,
+    mut attempts: Vec<PeerOverlayRouteSelectionAttempt>,
+) -> Result<PeerOverlayRouteSelection, TransportError> {
+    attempts.push(PeerOverlayRouteSelectionAttempt {
+        carrier: PeerOverlayCarrier::PeerAssistedOverlay,
+        selected: false,
+    });
+    let ranked = input
+        .ranked_relays
+        .first()
+        .ok_or(TransportError::NoViablePath)?;
+    admitted.validate_ref(&ranked.relay)?;
+    ranked.authorization.validate_for(&ranked.relay, auth)?;
+    if ranked.relay.peer_id == input.source.peer_id
+        || ranked.relay.peer_id == input.destination.peer_id
+    {
+        return Err(overlay_policy_error(
+            "peer overlay selected relay cannot be source or destination",
+        ));
+    }
+    let evidence = input
+        .relay_routes
+        .iter()
+        .find(|route| route.relay.peer_id == ranked.relay.peer_id)
+        .cloned()
+        .ok_or_else(|| {
+            overlay_policy_error(
+                "peer overlay selected relay requires source and destination live route legs",
+            )
+        })?;
+    evidence.validate_for(admitted, &input.source, &input.destination)?;
+    let last = attempts.last_mut().ok_or_else(|| {
+        overlay_policy_error("peer overlay route selection attempt list is empty")
+    })?;
+    last.selected = true;
+    Ok(route_selection_result(
+        attempts,
+        PeerOverlaySelectedRoute::PeerAssistedOverlay {
+            relay: ranked.relay.clone(),
+            authorization: ranked.authorization.clone(),
+            score: ranked.score,
+            evidence,
+        },
+    ))
+}
+
+fn route_selection_result(
+    attempts: Vec<PeerOverlayRouteSelectionAttempt>,
+    selected: PeerOverlaySelectedRoute,
+) -> PeerOverlayRouteSelection {
+    PeerOverlayRouteSelection {
+        attempts,
+        selected,
+        limitation:
+            "local model route-selection evidence only; not runtime forwarding or production route proof"
+                .to_owned(),
+    }
+}
+
 /// Rank relay candidates after admission, authorization, health, and policy gates.
 pub fn rank_relay_candidates(
     admitted: &PeerOverlayAdmittedSet,
@@ -1077,6 +1440,56 @@ mod tests {
         })
     }
 
+    fn route_leg(
+        from: u8,
+        to: u8,
+        epoch: u64,
+        carrier: PeerOverlayCarrier,
+        live: bool,
+    ) -> Result<PeerOverlayRouteLegEvidence, TransportError> {
+        Ok(PeerOverlayRouteLegEvidence {
+            from: peer(from, epoch)?,
+            to: peer(to, epoch)?,
+            carrier,
+            route_label: format!("route-{from}-{to}"),
+            live,
+        })
+    }
+
+    fn relay_route(relay: u8, epoch: u64) -> Result<PeerOverlayRelayRouteEvidence, TransportError> {
+        Ok(PeerOverlayRelayRouteEvidence {
+            relay: peer(relay, epoch)?,
+            source_to_relay: route_leg(
+                1,
+                relay,
+                epoch,
+                PeerOverlayCarrier::DirectWebRtcDataChannel,
+                true,
+            )?,
+            relay_to_destination: route_leg(
+                relay,
+                3,
+                epoch,
+                PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+                true,
+            )?,
+        })
+    }
+
+    fn ranked_relay(
+        epoch: u64,
+        admitted: &PeerOverlayAdmittedSet,
+    ) -> Result<Vec<PeerOverlayRankedRelayCandidate>, TransportError> {
+        let authority = relay_authority_for(admitted, [peer(2, epoch)?])?;
+        rank_relay_candidates(
+            admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [candidate(2, epoch, 12, 10, 0, 96_000, 8_000, 100, 0)?],
+        )
+    }
+
     fn frame(epoch: u64) -> Result<PeerOverlayFrame, TransportError> {
         let route = PeerOverlayRoute {
             source: peer(1, epoch)?,
@@ -1119,6 +1532,195 @@ mod tests {
             delivery,
             payload,
         ))
+    }
+
+    #[test]
+    fn overlay_route_selection_prefers_live_direct_pair() -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+        let ranked_relays = ranked_relay(epoch, &admitted)?;
+
+        let selection = select_peer_overlay_route(
+            &admitted,
+            &auth(epoch),
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            PeerOverlayRouteSelectionInput {
+                source: peer(1, epoch)?,
+                destination: peer(3, epoch)?,
+                direct_pair: Some(route_leg(
+                    1,
+                    3,
+                    epoch,
+                    PeerOverlayCarrier::DirectWebRtcDataChannel,
+                    true,
+                )?),
+                configured_turn_pair: Some(route_leg(
+                    1,
+                    3,
+                    epoch,
+                    PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+                    true,
+                )?),
+                ranked_relays,
+                relay_routes: vec![relay_route(2, epoch)?],
+            },
+        )?;
+
+        assert!(matches!(
+            selection.selected,
+            PeerOverlaySelectedRoute::DirectWebRtc { .. }
+        ));
+        assert_eq!(selection.attempts.len(), 1);
+        assert!(selection.limitation.contains("local model"));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_turn_order_can_precede_or_follow_peer_relay() -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+        let input = PeerOverlayRouteSelectionInput {
+            source: peer(1, epoch)?,
+            destination: peer(3, epoch)?,
+            direct_pair: None,
+            configured_turn_pair: Some(route_leg(
+                1,
+                3,
+                epoch,
+                PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+                true,
+            )?),
+            ranked_relays: ranked_relay(epoch, &admitted)?,
+            relay_routes: vec![relay_route(2, epoch)?],
+        };
+
+        let turn_first = select_peer_overlay_route(
+            &admitted,
+            &auth(epoch),
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::BeforePeerRelay,
+            },
+            input.clone(),
+        )?;
+        assert!(matches!(
+            turn_first.selected,
+            PeerOverlaySelectedRoute::ConfiguredTurnBackedWebRtc { .. }
+        ));
+        assert_eq!(
+            turn_first
+                .attempts
+                .iter()
+                .map(|attempt| attempt.carrier)
+                .collect::<Vec<_>>(),
+            vec![
+                PeerOverlayCarrier::DirectWebRtcDataChannel,
+                PeerOverlayCarrier::ConfiguredTurnBackedWebRtc
+            ]
+        );
+
+        let relay_first = select_peer_overlay_route(
+            &admitted,
+            &auth(epoch),
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            input,
+        )?;
+        assert!(matches!(
+            relay_first.selected,
+            PeerOverlaySelectedRoute::PeerAssistedOverlay { .. }
+        ));
+        assert_eq!(
+            relay_first
+                .attempts
+                .iter()
+                .map(|attempt| attempt.carrier)
+                .collect::<Vec<_>>(),
+            vec![
+                PeerOverlayCarrier::DirectWebRtcDataChannel,
+                PeerOverlayCarrier::PeerAssistedOverlay
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_relay_selection_requires_top_ranked_relay_with_two_live_legs(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+
+        let selection = select_peer_overlay_route(
+            &admitted,
+            &auth(epoch),
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            PeerOverlayRouteSelectionInput {
+                source: peer(1, epoch)?,
+                destination: peer(3, epoch)?,
+                direct_pair: None,
+                configured_turn_pair: None,
+                ranked_relays: ranked_relay(epoch, &admitted)?,
+                relay_routes: vec![relay_route(2, epoch)?],
+            },
+        )?;
+
+        match selection.selected {
+            PeerOverlaySelectedRoute::PeerAssistedOverlay {
+                relay, evidence, ..
+            } => {
+                assert_eq!(relay, peer(2, epoch)?);
+                assert_eq!(evidence.source_to_relay.from, peer(1, epoch)?);
+                assert_eq!(evidence.source_to_relay.to, peer(2, epoch)?);
+                assert_eq!(evidence.relay_to_destination.from, peer(2, epoch)?);
+                assert_eq!(evidence.relay_to_destination.to, peer(3, epoch)?);
+            }
+            other => panic!("unexpected selection: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn peer_relay_selection_fails_closed_for_missing_or_provider_legs() -> Result<(), TransportError>
+    {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+        let base_input = PeerOverlayRouteSelectionInput {
+            source: peer(1, epoch)?,
+            destination: peer(3, epoch)?,
+            direct_pair: None,
+            configured_turn_pair: None,
+            ranked_relays: ranked_relay(epoch, &admitted)?,
+            relay_routes: vec![],
+        };
+
+        assert!(select_peer_overlay_route(
+            &admitted,
+            &auth(epoch),
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            base_input.clone(),
+        )
+        .is_err());
+
+        let mut provider_route = relay_route(2, epoch)?;
+        provider_route.source_to_relay.carrier = PeerOverlayCarrier::ProviderApplicationRelay;
+        let mut provider_input = base_input;
+        provider_input.relay_routes = vec![provider_route];
+        assert!(select_peer_overlay_route(
+            &admitted,
+            &auth(epoch),
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            provider_input,
+        )
+        .is_err());
+        Ok(())
     }
 
     #[test]

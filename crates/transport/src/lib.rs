@@ -27,12 +27,15 @@ pub use ice::{
     TurnCredentialIssuerConfig, TurnCredentialMode, TurnServerConfig, TurnStunCredentialDecision,
 };
 pub use peer_overlay::{
-    rank_relay_candidates, PeerOverlayAckId, PeerOverlayAckMode, PeerOverlayAdmittedSet,
-    PeerOverlayAuth, PeerOverlayCarrier, PeerOverlayDelivery, PeerOverlayFrame, PeerOverlayLoopId,
-    PeerOverlayOpaquePayload, PeerOverlayPayloadKind, PeerOverlayPeerRef,
-    PeerOverlayRankedRelayCandidate, PeerOverlayRedelivery, PeerOverlayRelayAuthoritySet,
-    PeerOverlayRelayAuthoritySource, PeerOverlayRelayAuthorization, PeerOverlayRelayCandidate,
-    PeerOverlayRelayCandidateDiagnostics, PeerOverlayRelayCandidatePolicy, PeerOverlayRoute,
+    rank_relay_candidates, select_peer_overlay_route, PeerOverlayAckId, PeerOverlayAckMode,
+    PeerOverlayAdmittedSet, PeerOverlayAuth, PeerOverlayCarrier, PeerOverlayConfiguredTurnOrder,
+    PeerOverlayDelivery, PeerOverlayFrame, PeerOverlayLoopId, PeerOverlayOpaquePayload,
+    PeerOverlayPayloadKind, PeerOverlayPeerRef, PeerOverlayRankedRelayCandidate,
+    PeerOverlayRedelivery, PeerOverlayRelayAuthoritySet, PeerOverlayRelayAuthoritySource,
+    PeerOverlayRelayAuthorization, PeerOverlayRelayCandidate, PeerOverlayRelayCandidateDiagnostics,
+    PeerOverlayRelayCandidatePolicy, PeerOverlayRelayRouteEvidence, PeerOverlayRoute,
+    PeerOverlayRouteLegEvidence, PeerOverlayRouteSelection, PeerOverlayRouteSelectionAttempt,
+    PeerOverlayRouteSelectionInput, PeerOverlayRouteSelectionPolicy, PeerOverlaySelectedRoute,
     PeerOverlayTtl, PEER_OVERLAY_FRAME_SCHEMA_VERSION, PEER_OVERLAY_MAX_RELAY_HOPS,
 };
 pub use policy::{

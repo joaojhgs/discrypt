@@ -159,7 +159,11 @@ PER-67 adds local Rust model/unit evidence for explicit relay authorization.
 PER-68 adds local candidate ranking that first requires current admitted-peer
 state and explicit relay authority, then ranks content-blind diagnostics by
 latency, health stability, spare capacity, energy cost, and freeload penalty
-with deterministic peer-identity ties. Production evidence will require later
-runtime tasks that prove explicit route evidence, ciphertext-only forwarding,
-fail-closed revocation under live group state, and no provider application
-relay.
+with deterministic peer-identity ties. PER-69 adds local route-selection model
+evidence: direct WebRTC is preferred; configured TURN can be ordered before or
+after peer-assisted relay by explicit policy; and relay selection requires the
+top ranked authorized current-epoch relay plus two live non-provider route legs
+for source-to-relay and relay-to-destination. Production evidence will require
+later runtime tasks that prove explicit route evidence, ciphertext-only
+forwarding, fail-closed revocation under live group state, and no provider
+application relay.

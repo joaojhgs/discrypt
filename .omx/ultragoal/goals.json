@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-21T08:29:25.429Z",
+  "updatedAt": "2026-06-21T15:31:36.625Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -179,6 +179,16 @@
       "createdAt": "2026-06-21T08:29:25.429Z",
       "updatedAt": "2026-06-21T08:29:25.429Z",
       "evidence": "Multica PER-67 metadata requires focused Rust/OpenMLS-governance/transport model proof for relay authorization after PER-66 protocol skeleton."
+    },
+    {
+      "id": "G017-per-69-overlay-route-selection",
+      "title": "PER-69 overlay route selection",
+      "objective": "Implement P8-T04 overlay route selection as a local transport planner model with direct preference, explicit configured-TURN/relay ordering, safe relay two-leg evidence, tests, docs, PR, and QA handoff.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-21T15:31:36.625Z",
+      "updatedAt": "2026-06-21T15:31:36.625Z",
+      "evidence": "Multica PER-69 issue metadata and local plan .omx/plans/P8-T04-overlay-route-selection-2026-06-21.md"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
