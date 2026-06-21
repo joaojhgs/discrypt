@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-21T05:17:00.120Z",
+  "updatedAt": "2026-06-21T05:47:11.794Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -136,6 +136,17 @@
       "updatedAt": "2026-06-21T05:17:00.120Z",
       "evidence": "PER-63 implementation verified locally: cargo fmt --check; cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --lib; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib -- --test-threads=1 (144 passed); git diff --check. Ready for PR/QA; aggregate goal remains open for unrelated pending/review-blocked stories.",
       "completedAt": "2026-06-21T05:17:00.120Z"
+    },
+    {
+      "id": "G013-per-64-route-diagnostics-export",
+      "title": "PER-64 route diagnostics export",
+      "objective": "Implement PER-64/P7-T05 route diagnostics export: support bundle includes redacted group route graph edges, per-peer runtime edge state, ICE/DTLS/DataChannel/TURN usage, and fanout/dedup route evidence without provider application relay.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-21T05:39:48.111Z",
+      "updatedAt": "2026-06-21T05:47:11.794Z",
+      "evidence": "PER-64 route diagnostics export implemented in apps/desktop/src-tauri/src/lib.rs with support-bundle route_graph_diagnostics, redacted peer/member refs, attached/pending/missing edge state, ICE/DTLS/DataChannel/TURN summaries, and fanout route counts. Verification passed: cargo fmt --check; targeted desktop support-bundle test; full desktop lib suite 145 tests; git diff --check. Evidence is local Rust/Tauri backend support-bundle evidence, not split-machine production route evidence.",
+      "completedAt": "2026-06-21T05:47:11.794Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
