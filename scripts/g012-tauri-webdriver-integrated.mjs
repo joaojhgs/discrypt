@@ -1428,10 +1428,17 @@ try {
       voice.backend_native_proofs.length >= 2 &&
       voice.backend_native_proofs.every((proof) => proof?.protected_frames_count > 0),
   );
+  const nativeRustWebDriverEvidenceObserved = Boolean(
+    voice?.alice?.mode === "native_rust_webrtc_datachannel" &&
+      voice?.bob?.mode === "native_rust_webrtc_datachannel" &&
+      voice?.alice?.remoteTrackEvents > 0 &&
+      voice?.bob?.remoteTrackEvents > 0 &&
+      voice?.alice?.iceConnected &&
+      voice?.bob?.iceConnected,
+  );
   const nativeRustBackendMediaObserved = Boolean(
-    voice?.before_leave?.alice?.remoteBoundaries > 0 &&
-    voice?.before_leave?.bob?.remoteBoundaries > 0 &&
-      backendNativeProofObserved,
+    backendNativeProofObserved &&
+      nativeRustWebDriverEvidenceObserved,
   );
   const voiceLoopbackObserved = browserVoiceLoopbackObserved || nativeRustBackendMediaObserved;
   const nativeVoiceLoopbackObserved = Boolean(
@@ -1558,7 +1565,7 @@ try {
       production_claim_allowed: nativeVoiceLoopbackObserved,
       blocker: nativeVoiceLoopbackObserved
         ? "physical two-device microphone/speaker proof is still outside this automated native Rust/generated-audio harness"
-        : "native RTCPeerConnection generated-audio loopback was not observed in both Tauri WebViews",
+        : "native Rust Opus/SFrame media proof or generated-audio loopback was not observed in both Tauri profiles",
     },
     per59_release_smoke: per59ReleaseSmoke,
     run_id: runId,

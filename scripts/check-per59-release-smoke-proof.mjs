@@ -69,6 +69,10 @@ for (const token of [
   "voice_left_event",
   "backendLeaveCleanupObserved",
   "leave_cleanup",
+  "nativeRustWebDriverEvidenceObserved",
+  "mode === \"native_rust_webrtc_datachannel\"",
+  "remoteTrackEvents > 0",
+  "native Rust Opus/SFrame media proof or generated-audio loopback",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
