@@ -61,9 +61,10 @@ Each `PeerOverlayPeerRef` includes:
 - `epoch`: group epoch for which this peer is admitted.
 
 Validation fails closed if any ref is not in the supplied admitted peer set,
-has a stale epoch, is revoked, or appears in a structurally unsafe position:
-source equals destination, a relay equals source/destination, or a relay appears
-twice in the loop path.
+has a stale epoch, is revoked, lacks explicit relay authority when acting as a
+relay hop, or appears in a structurally unsafe position: source equals
+destination, a relay equals source/destination, or a relay appears twice in the
+loop path.
 
 ## Epoch And Auth Binding
 
@@ -119,6 +120,9 @@ Revocation is fail-closed:
 - A revoked source cannot create an accepted frame.
 - A revoked destination cannot be named for delivery.
 - A revoked relay cannot be named as a forwarder.
+- A stale route graph edge or invite-derived peer ref cannot authorize relay
+  forwarding without a current backend/OpenMLS relay authority set or an
+  already-verified signed governance relay grant.
 - Frames from prior epochs are rejected unless a future task adds an explicit,
   audited catch-up mode tied to OpenMLS state. This spec does not define such a
   catch-up mode.
@@ -143,7 +147,6 @@ negotiation/control. It is never overlay application relay evidence.
 
 This issue intentionally does not implement:
 
-- relay authorization or signed capability grants,
 - candidate ranking,
 - route selection,
 - runtime forwarding,
@@ -152,7 +155,7 @@ This issue intentionally does not implement:
 - UI route claims,
 - split-machine or release-gate proof.
 
-The evidence from PER-66 is documentation plus local Rust model/unit evidence.
+PER-67 adds local Rust model/unit evidence for explicit relay authorization.
 Production evidence will require later runtime tasks that prove explicit route
-evidence, relay authority, ciphertext-only forwarding, fail-closed revocation,
-and no provider application relay.
+evidence, ciphertext-only forwarding, fail-closed revocation under live group
+state, and no provider application relay.

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-21T07:43:30.096Z",
+  "updatedAt": "2026-06-21T08:29:25.429Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -169,6 +169,16 @@
       "updatedAt": "2026-06-21T07:43:30.096Z",
       "evidence": "Implemented PER-66 relay protocol spec and transport skeleton. Files: docs/phase-8-relay-protocol-spec.md, crates/transport/src/peer_overlay.rs, crates/transport/src/lib.rs, .omx/plans/P8-T01-relay-protocol-spec-2026-06-21.md. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport peer_overlay -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter peer_overlay -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; git diff --check. Evidence is documentation and local Rust model/unit evidence only, not runtime relay authorization/forwarding or production route evidence.",
       "completedAt": "2026-06-21T07:43:30.096Z"
+    },
+    {
+      "id": "G016-per-67-relay-authorization",
+      "title": "PER-67 relay authorization",
+      "objective": "Implement PER-67/P8-T02 relay authorization in discrypt-transport: explicit backend/OpenMLS or signed-governance relay authority must be required for peer-assisted overlay relay hops; only admitted current-epoch peers can relay, revoked/stale/non-member peers fail closed, providers remain signaling-only, and this must not implement candidate ranking, route selection, forwarding runtime, voice fanout, overlay UI, or release gates.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-21T08:29:25.429Z",
+      "updatedAt": "2026-06-21T08:29:25.429Z",
+      "evidence": "Multica PER-67 metadata requires focused Rust/OpenMLS-governance/transport model proof for relay authorization after PER-66 protocol skeleton."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
