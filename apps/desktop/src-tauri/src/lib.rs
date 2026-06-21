@@ -82,7 +82,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -2319,6 +2318,32 @@ struct TextControlTransportRuntime {
     remote_peer_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TextControlRuntimeMapKey {
+    session_id: String,
+    remote_peer_id: Option<String>,
+}
+
+impl TextControlRuntimeMapKey {
+    fn legacy(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            remote_peer_id: None,
+        }
+    }
+
+    fn for_remote(session_id: impl Into<String>, remote_peer_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            remote_peer_id: Some(remote_peer_id.into()),
+        }
+    }
+
+    fn for_attachment(session_id: impl Into<String>, remote_peer_id: &SignalingPeerId) -> Self {
+        Self::for_remote(session_id, remote_peer_id.0.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingTextControlTransportRuntime {
     session_id: String,
@@ -2575,8 +2600,10 @@ static TAURI_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 #[derive(Debug)]
 struct TauriAppService {
     state: PersistedAppState,
-    text_control_transport_runtime: Option<TextControlTransportRuntime>,
-    pending_text_control_transport_runtime: Option<PendingTextControlTransportRuntime>,
+    text_control_transport_runtimes:
+        BTreeMap<TextControlRuntimeMapKey, TextControlTransportRuntime>,
+    pending_text_control_transport_runtimes:
+        BTreeMap<TextControlRuntimeMapKey, PendingTextControlTransportRuntime>,
     #[cfg(test)]
     state_path_override: Option<PathBuf>,
 }
@@ -2610,8 +2637,8 @@ impl TauriAppService {
     fn load() -> Self {
         Self {
             state: load_state(),
-            text_control_transport_runtime: None,
-            pending_text_control_transport_runtime: None,
+            text_control_transport_runtimes: BTreeMap::new(),
+            pending_text_control_transport_runtimes: BTreeMap::new(),
             #[cfg(test)]
             state_path_override: None,
         }
@@ -2621,8 +2648,8 @@ impl TauriAppService {
     fn load_for_test_path(path: PathBuf) -> Self {
         Self {
             state: load_state_from_path(&path),
-            text_control_transport_runtime: None,
-            pending_text_control_transport_runtime: None,
+            text_control_transport_runtimes: BTreeMap::new(),
+            pending_text_control_transport_runtimes: BTreeMap::new(),
             state_path_override: Some(path),
         }
     }
@@ -2661,10 +2688,10 @@ impl TauriAppService {
         &self,
         request: &ListPendingTextControlFramesRequest,
     ) -> bool {
-        let Some(runtime) = &self.text_control_transport_runtime else {
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
             return false;
         };
-        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+        let Some(runtime) = self.text_control_runtime_for_session(&session.session_id) else {
             return false;
         };
         if runtime.session_id != session.session_id {
@@ -2685,6 +2712,24 @@ impl TauriAppService {
             .is_empty()
     }
 
+    fn text_control_runtime_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<&TextControlTransportRuntime> {
+        self.text_control_transport_runtimes
+            .values()
+            .find(|runtime| runtime.session_id == session_id)
+    }
+
+    fn text_control_runtime_for_pump(&self) -> Option<&TextControlTransportRuntime> {
+        if let Some(session) = self.state.transport_session(BackendTransportMode::Text) {
+            if let Some(runtime) = self.text_control_runtime_for_session(&session.session_id) {
+                return Some(runtime);
+            }
+        }
+        self.text_control_transport_runtimes.values().next()
+    }
+
     fn text_control_runtime_status_row(&self) -> TransportStatusView {
         let Some(session) = &self.state.text_session else {
             return TransportStatusView {
@@ -2701,25 +2746,34 @@ impl TauriAppService {
                 | TransportSessionState::Failed
                 | TransportSessionState::Cancelled
         );
-        if let Some(pending) = &self.pending_text_control_transport_runtime {
-            if session_active && pending.session_id == session.session_id {
-                return TransportStatusView {
-                    label: "text/control runtime".to_owned(),
-                    status: "attaching".to_owned(),
-                    detail: format!(
-                        "Backend is starting provider-backed runtime session {} role={} local_peer={} remote_peer={}; no delivery claim is made until the DataChannel attaches",
-                        pending.session_id,
-                        runtime_role_label(Some(pending.role)),
-                        pending.local_peer_id,
-                        pending.remote_peer_id
-                    ),
-                };
-            }
+        let pending_for_session = self
+            .pending_text_control_transport_runtimes
+            .values()
+            .filter(|pending| pending.session_id == session.session_id)
+            .collect::<Vec<_>>();
+        if session_active && !pending_for_session.is_empty() {
+            let pending = pending_for_session[0];
+            return TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "attaching".to_owned(),
+                detail: format!(
+                    "Backend is starting {} provider-backed runtime(s) for session {} including role={} local_peer={} remote_peer={}; no delivery claim is made until the DataChannel attaches",
+                    pending_for_session.len(),
+                    pending.session_id,
+                    runtime_role_label(Some(pending.role)),
+                    pending.local_peer_id,
+                    pending.remote_peer_id
+                ),
+            };
         }
 
-        match (&self.text_control_transport_runtime, session_active) {
-            (Some(runtime), true) if runtime.session_id == session.session_id => {
-                TransportStatusView {
+        let current_runtimes = self
+            .text_control_transport_runtimes
+            .values()
+            .filter(|runtime| runtime.session_id == session.session_id)
+            .collect::<Vec<_>>();
+        match (current_runtimes.as_slice(), session_active) {
+            ([runtime], true) => TransportStatusView {
                     label: "text/control runtime".to_owned(),
                     status: "attached".to_owned(),
                     detail: format!(
@@ -2729,17 +2783,25 @@ impl TauriAppService {
                         runtime.local_peer_id.as_deref().unwrap_or("test-harness"),
                         runtime.remote_peer_id.as_deref().unwrap_or("test-harness")
                     ),
-                }
-            }
-            (Some(runtime), true) => TransportStatusView {
+                },
+            (runtimes @ [_, _, ..], true) => TransportStatusView {
+                label: "text/control runtime".to_owned(),
+                status: "attached".to_owned(),
+                detail: format!(
+                    "App-service text/control pump owns {} peer runtime(s) for session {}; peer-scoped delivery remains gated by backend runtime evidence",
+                    runtimes.len(),
+                    session.session_id
+                ),
+            },
+            ([], true) if !self.text_control_transport_runtimes.is_empty() => TransportStatusView {
                 label: "text/control runtime".to_owned(),
                 status: "stale-runtime".to_owned(),
                 detail: format!(
-                    "Attached runtime session {} does not match active text session {}; restart text transport before claiming delivery",
-                    runtime.session_id, session.session_id
+                    "Attached text/control runtime map has no entry for active text session {}; restart text transport before claiming delivery",
+                    session.session_id
                 ),
             },
-            (None, true) => TransportStatusView {
+            ([], true) => TransportStatusView {
                 label: "text/control runtime".to_owned(),
                 status: "not-attached".to_owned(),
                 detail: format!(
@@ -2800,7 +2862,7 @@ impl TauriAppService {
                 "Complete route establishment before publishing online presence".to_owned(),
             ));
         }
-        let Some(runtime) = self.text_control_transport_runtime.as_ref() else {
+        let Some(runtime) = self.text_control_runtime_for_session(&session.session_id) else {
             return Err((
                 "text_runtime_not_attached",
                 "No backend-owned text/control runtime is attached for group presence".to_owned(),
@@ -3008,16 +3070,20 @@ impl TauriAppService {
         transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
         session_id: impl Into<String>,
     ) {
-        self.pending_text_control_transport_runtime = None;
-        self.text_control_transport_runtime = Some(TextControlTransportRuntime {
+        let session_id = session_id.into();
+        let runtime = TextControlTransportRuntime {
             transport,
             owned_runtime: None,
             executor: None,
-            session_id: session_id.into(),
+            session_id: session_id.clone(),
             role: None,
             local_peer_id: None,
             remote_peer_id: None,
-        });
+        };
+        self.pending_text_control_transport_runtimes
+            .retain(|key, _| key.session_id != session_id);
+        self.text_control_transport_runtimes
+            .insert(TextControlRuntimeMapKey::legacy(session_id), runtime);
     }
 
     fn attach_owned_text_control_transport_runtime(
@@ -3040,55 +3106,52 @@ impl TauriAppService {
                 session_id.clone(),
             );
         }
-        self.pending_text_control_transport_runtime = None;
-        self.text_control_transport_runtime = Some(TextControlTransportRuntime {
+        let runtime = TextControlTransportRuntime {
             transport,
             owned_runtime: Some(owned_runtime),
             executor: Some(executor),
-            session_id,
+            session_id: session_id.clone(),
             role: Some(role),
             local_peer_id: Some(local_peer_id),
-            remote_peer_id: Some(remote_peer_id),
-        });
+            remote_peer_id: Some(remote_peer_id.clone()),
+        };
+        let key = TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id);
+        self.pending_text_control_transport_runtimes.remove(&key);
+        self.text_control_transport_runtimes.insert(key, runtime);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn clear_text_control_transport_runtime(&mut self) {
-        self.text_control_transport_runtime = None;
-        self.pending_text_control_transport_runtime = None;
+        self.text_control_transport_runtimes.clear();
+        self.pending_text_control_transport_runtimes.clear();
     }
 
     fn clear_text_control_transport_runtime_if_session_mismatch(
         &mut self,
         active_session_id: Option<&str>,
     ) {
-        let Some(runtime) = &self.text_control_transport_runtime else {
-            if self
-                .pending_text_control_transport_runtime
-                .as_ref()
-                .is_some_and(|pending| Some(pending.session_id.as_str()) != active_session_id)
-            {
-                self.pending_text_control_transport_runtime = None;
-            }
-            return;
-        };
-        if Some(runtime.session_id.as_str()) != active_session_id {
-            self.text_control_transport_runtime = None;
-            self.pending_text_control_transport_runtime = None;
-        }
+        self.text_control_transport_runtimes
+            .retain(|_, runtime| Some(runtime.session_id.as_str()) == active_session_id);
+        self.pending_text_control_transport_runtimes
+            .retain(|_, pending| Some(pending.session_id.as_str()) == active_session_id);
     }
 
     fn text_control_runtime_attach_already_active(
         &mut self,
         command_name: &'static str,
         active_session_id: &str,
+        key: &TextControlRuntimeMapKey,
     ) -> bool {
-        if let Some(pending) = &self.pending_text_control_transport_runtime {
-            if pending.session_id == active_session_id {
+        if key.remote_peer_id.is_none() {
+            if let Some(pending) = self
+                .pending_text_control_transport_runtimes
+                .values()
+                .find(|pending| pending.session_id == active_session_id)
+            {
                 self.state.push_event(
                     "transport.text_runtime_attach_deduped",
                     format!(
-                        "Text/control runtime attach for session {} is already pending as {} local_peer={} remote_peer={}; duplicate request was ignored",
+                        "Text/control runtime attach for session {} is already pending as {} local_peer={} remote_peer={}; legacy duplicate request was ignored",
                         active_session_id,
                         runtime_role_label(Some(pending.role)),
                         pending.local_peer_id,
@@ -3098,19 +3161,46 @@ impl TauriAppService {
                 self.persist();
                 return true;
             }
-        }
-        if let Some(runtime) = &self.text_control_transport_runtime {
-            if runtime.session_id == active_session_id {
+            if self
+                .text_control_transport_runtimes
+                .values()
+                .any(|runtime| runtime.session_id == active_session_id)
+            {
                 self.state.push_event(
                     "transport.text_runtime_attach_deduped",
                     format!(
-                        "Text/control runtime session {} is already attached for {}; duplicate request was ignored",
+                        "Text/control runtime session {} is already attached for {}; legacy duplicate request was ignored",
                         active_session_id, command_name
                     ),
                 );
                 self.persist();
                 return true;
             }
+        }
+        if let Some(pending) = self.pending_text_control_transport_runtimes.get(key) {
+            self.state.push_event(
+                "transport.text_runtime_attach_deduped",
+                format!(
+                    "Text/control runtime attach for session {} is already pending as {} local_peer={} remote_peer={}; duplicate request was ignored",
+                    active_session_id,
+                    runtime_role_label(Some(pending.role)),
+                    pending.local_peer_id,
+                    pending.remote_peer_id
+                ),
+            );
+            self.persist();
+            return true;
+        }
+        if self.text_control_transport_runtimes.contains_key(key) {
+            self.state.push_event(
+                "transport.text_runtime_attach_deduped",
+                format!(
+                    "Text/control runtime session {} peer {:?} is already attached for {}; duplicate request was ignored",
+                    active_session_id, key.remote_peer_id, command_name
+                ),
+            );
+            self.persist();
+            return true;
         }
         false
     }
@@ -3133,7 +3223,8 @@ impl TauriAppService {
                 session.session_id
             ));
         }
-        let Some(pending) = &self.pending_text_control_transport_runtime else {
+        let key = TextControlRuntimeMapKey::for_attachment(active_session_id, remote_peer_id);
+        let Some(pending) = self.pending_text_control_transport_runtimes.get(&key) else {
             return Err(format!(
                 "text/control runtime attach for session {active_session_id} finished after pending attach state was cleared"
             ));
@@ -3175,7 +3266,16 @@ impl TauriAppService {
             }
         }
 
-        if let Some(pending) = self.pending_text_control_transport_runtime.clone() {
+        if let Some(pending) = self
+            .pending_text_control_transport_runtimes
+            .values()
+            .find(|pending| {
+                self.state
+                    .transport_session(BackendTransportMode::Text)
+                    .is_some_and(|session| pending.session_id == session.session_id)
+            })
+            .cloned()
+        {
             let report = TextControlTransportPumpReportView {
                 pending_before: self.state.list_pending_text_control_frames(&request).len(),
                 frames_sent: 0,
@@ -3203,7 +3303,7 @@ impl TauriAppService {
             return report;
         }
 
-        let Some(runtime) = self.text_control_transport_runtime.clone() else {
+        let Some(runtime) = self.text_control_runtime_for_pump().cloned() else {
             let message = "text/control direct data-channel runtime is not attached; provider signaling is not a message relay".to_owned();
             self.state.push_command_error(
                 "message.transport_pump_unavailable",
@@ -3677,8 +3777,8 @@ pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
             .state
             .transport_session(BackendTransportMode::Text)
             .is_some_and(|session| session.state().is_connected())
-        && guard.text_control_transport_runtime.is_none()
-        && guard.pending_text_control_transport_runtime.is_none()
+        && guard.text_control_transport_runtimes.is_empty()
+        && guard.pending_text_control_transport_runtimes.is_empty()
     {
         if let Ok(attachment) = guard
             .state
@@ -3775,13 +3875,6 @@ pub fn attach_text_control_transport_runtime(
             guard.persist();
             return guard.to_view();
         }
-    }
-
-    if guard.text_control_runtime_attach_already_active(
-        "attach_text_control_transport_runtime",
-        &active_session_id,
-    ) {
-        return guard.to_view();
     }
 
     let has_explicit_runtime_attachment = request.runtime_role.is_some()
@@ -3896,6 +3989,17 @@ pub fn attach_text_control_transport_runtime(
     };
 
     if let Some(attachment) = explicit_attachment.or(derived_attachment) {
+        let key = TextControlRuntimeMapKey::for_attachment(
+            active_session_id.clone(),
+            &attachment.remote_peer_id,
+        );
+        if guard.text_control_runtime_attach_already_active(
+            "attach_text_control_transport_runtime",
+            &active_session_id,
+            &key,
+        ) {
+            return guard.to_view();
+        }
         let runtime_inputs = match guard
             .state
             .text_control_runtime_inputs_for_active_scope(None)
@@ -3924,6 +4028,15 @@ pub fn attach_text_control_transport_runtime(
         drop(guard);
         spawn_text_control_runtime_attach(job);
         return view;
+    }
+
+    let key = TextControlRuntimeMapKey::legacy(active_session_id.clone());
+    if guard.text_control_runtime_attach_already_active(
+        "attach_text_control_transport_runtime",
+        &active_session_id,
+        &key,
+    ) {
+        return guard.to_view();
     }
 
     if !active_session_state.is_connected() {
@@ -15146,7 +15259,13 @@ fn prepare_text_control_runtime_attach_job(
         local_peer_id: attachment.local_peer_id.0.clone(),
         remote_peer_id: attachment.remote_peer_id.0.clone(),
     };
-    guard.pending_text_control_transport_runtime = Some(pending.clone());
+    guard.pending_text_control_transport_runtimes.insert(
+        TextControlRuntimeMapKey::for_attachment(
+            active_session_id.clone(),
+            &attachment.remote_peer_id,
+        ),
+        pending.clone(),
+    );
     guard.state.push_event(
         "transport.text_runtime_attach_started",
         format!(
@@ -15208,7 +15327,11 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
                 let mut guard = service
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.pending_text_control_transport_runtime = None;
+                let key = TextControlRuntimeMapKey::for_attachment(
+                    job.active_session_id.clone(),
+                    &job.remote_peer_id,
+                );
+                guard.pending_text_control_transport_runtimes.remove(&key);
                 guard.state.push_command_error(
                     "transport.text_runtime_attach_unavailable",
                     job.command_name,
@@ -15278,13 +15401,11 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
                 );
             }
             Err(error) => {
-                if guard
-                    .pending_text_control_transport_runtime
-                    .as_ref()
-                    .is_some_and(|pending| pending.session_id == job.active_session_id)
-                {
-                    guard.pending_text_control_transport_runtime = None;
-                }
+                let key = TextControlRuntimeMapKey::for_attachment(
+                    job.active_session_id.clone(),
+                    &job.remote_peer_id,
+                );
+                guard.pending_text_control_transport_runtimes.remove(&key);
                 guard.state.push_command_error(
                     "transport.text_runtime_attach_unavailable",
                     job.command_name,
@@ -17516,8 +17637,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.state = load_state_from_path(path);
-        guard.text_control_transport_runtime = None;
-        guard.pending_text_control_transport_runtime = None;
+        guard.text_control_transport_runtimes.clear();
+        guard.pending_text_control_transport_runtimes.clear();
     }
 
     fn accept_dm_invite_as_test_profile(
@@ -17597,6 +17718,27 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.attach_text_control_transport_runtime(transport, session_id);
+    }
+
+    fn insert_pending_text_control_transport_runtime_for_test(
+        session_id: &str,
+        local_peer_id: &str,
+        remote_peer_id: &str,
+    ) {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending = PendingTextControlTransportRuntime {
+            session_id: session_id.to_owned(),
+            role: ProviderTextControlRuntimePeerRole::Offerer,
+            local_peer_id: local_peer_id.to_owned(),
+            remote_peer_id: remote_peer_id.to_owned(),
+        };
+        guard.pending_text_control_transport_runtimes.insert(
+            TextControlRuntimeMapKey::for_remote(session_id.to_owned(), remote_peer_id.to_owned()),
+            pending,
+        );
     }
 
     fn mark_active_text_session_direct_route_for_test() {
@@ -24861,8 +25003,8 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             TauriAppService {
                 state: guard.state.clone(),
-                text_control_transport_runtime: None,
-                pending_text_control_transport_runtime: None,
+                text_control_transport_runtimes: BTreeMap::new(),
+                pending_text_control_transport_runtimes: BTreeMap::new(),
                 state_path_override: Some(bob_path.clone()),
             }
         };
@@ -27594,7 +27736,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
-            guard.text_control_transport_runtime.is_none(),
+            guard.text_control_transport_runtimes.is_empty(),
             "attach rejection must not create runtime state"
         );
         assert_ne!(
@@ -27626,19 +27768,11 @@ mod tests {
             .map(|session| session.session_id.clone())
             .expect("text session should be active after start_text_session");
 
-        let service = app_service();
-        {
-            let mut guard = service
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.pending_text_control_transport_runtime =
-                Some(PendingTextControlTransportRuntime {
-                    session_id: active_session_id.clone(),
-                    role: ProviderTextControlRuntimePeerRole::Offerer,
-                    local_peer_id: "alice-runtime-peer".to_owned(),
-                    remote_peer_id: "bob-runtime-peer".to_owned(),
-                });
-        }
+        insert_pending_text_control_transport_runtime_for_test(
+            &active_session_id,
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+        );
 
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
@@ -27650,13 +27784,116 @@ mod tests {
             event.kind == "transport.text_runtime_attach_deduped"
                 && event.summary.contains(&active_session_id)
         }));
+        let service = app_service();
         let guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(guard
-            .pending_text_control_transport_runtime
+            .pending_text_control_transport_runtimes
+            .values()
+            .any(|pending| pending.session_id == active_session_id));
+    }
+
+    #[test]
+    fn text_control_runtime_map_preserves_legacy_two_person_attachment() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-runtime-map-legacy-two-person");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("legacy-two-person-runtime-map".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
             .as_ref()
-            .is_some_and(|pending| pending.session_id == active_session_id));
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        let receiver_path = fresh_state_path("text-control-runtime-map-legacy-bob");
+        let _ = fs::remove_file(&receiver_path);
+        let transport = Arc::new(ReceiverBackedTextControlTransport::new(
+            TauriAppService::load_for_test_path(receiver_path),
+        ));
+
+        attach_text_control_transport_runtime_for_test(transport, active_session_id.clone());
+
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = TextControlRuntimeMapKey::legacy(active_session_id.clone());
+        assert!(
+            guard.text_control_transport_runtimes.contains_key(&key),
+            "legacy two-person attach should migrate into the session-only runtime map key"
+        );
+        assert!(
+            guard
+                .text_control_runtime_for_session(&active_session_id)
+                .is_some(),
+            "legacy two-person runtime must remain selectable by active session"
+        );
+    }
+
+    #[test]
+    fn text_control_runtime_attach_dedupe_is_remote_peer_scoped() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-peer-scoped-dedupe");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("peer-scoped-runtime-map".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        insert_pending_text_control_transport_runtime_for_test(
+            &active_session_id,
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+        );
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bob_key =
+            TextControlRuntimeMapKey::for_remote(active_session_id.clone(), "bob-runtime-peer");
+        let carol_key =
+            TextControlRuntimeMapKey::for_remote(active_session_id.clone(), "carol-runtime-peer");
+
+        assert!(
+            guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &bob_key,
+            ),
+            "same remote peer should dedupe against the pending attach"
+        );
+        assert!(
+            !guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &carol_key,
+            ),
+            "different admitted remote peers need independent runtime map entries"
+        );
     }
 
     #[test]
@@ -27681,19 +27918,11 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .expect("first text session should be active");
-        {
-            let service = app_service();
-            let mut guard = service
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.pending_text_control_transport_runtime =
-                Some(PendingTextControlTransportRuntime {
-                    session_id: first_session_id.clone(),
-                    role: ProviderTextControlRuntimePeerRole::Offerer,
-                    local_peer_id: "alice-runtime-peer".to_owned(),
-                    remote_peer_id: "bob-runtime-peer".to_owned(),
-                });
-        }
+        insert_pending_text_control_transport_runtime_for_test(
+            &first_session_id,
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+        );
 
         let second = start_text_session(StartTextSessionRequest {
             scope_label: Some("rapid-restart-second".to_owned()),
@@ -27732,11 +27961,11 @@ mod tests {
             "late attach completion should be rejected after rapid restart: {stale:?}"
         );
         assert!(
-            guard.pending_text_control_transport_runtime.is_none(),
+            guard.pending_text_control_transport_runtimes.is_empty(),
             "rapid restart must clear pending runtime for the old text session"
         );
         assert!(
-            guard.text_control_transport_runtime.is_none(),
+            guard.text_control_transport_runtimes.is_empty(),
             "stale completion validation must not install a runtime"
         );
     }
@@ -27777,19 +28006,11 @@ mod tests {
             .map(|session| session.session_id.clone())
             .expect("text session should be active after start_text_session");
 
-        let service = app_service();
-        {
-            let mut guard = service
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.pending_text_control_transport_runtime =
-                Some(PendingTextControlTransportRuntime {
-                    session_id: active_session_id,
-                    role: ProviderTextControlRuntimePeerRole::Offerer,
-                    local_peer_id: "alice-runtime-peer".to_owned(),
-                    remote_peer_id: "bob-runtime-peer".to_owned(),
-                });
-        }
+        insert_pending_text_control_transport_runtime_for_test(
+            &active_session_id,
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+        );
 
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
@@ -27929,7 +28150,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
-            guard.text_control_transport_runtime.is_none(),
+            guard.text_control_transport_runtimes.is_empty(),
             "unsupported attach path must remain fail-closed"
         );
     }
@@ -28025,7 +28246,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
-            guard.text_control_transport_runtime.is_none(),
+            guard.text_control_transport_runtimes.is_empty(),
             "missing provider implementation must not attach runtime state"
         );
         let active_session_id = guard
@@ -28658,7 +28879,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
-            guard.text_control_transport_runtime.is_none(),
+            guard.text_control_transport_runtimes.is_empty(),
             "stopping a text session must drop the owned runtime"
         );
         let runtime_status = guard.text_control_runtime_status_row();
@@ -28704,7 +28925,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
-            guard.text_control_transport_runtime.is_none(),
+            guard.text_control_transport_runtimes.is_empty(),
             "starting a different text session must drop the stale runtime"
         );
         let runtime_status = guard.text_control_runtime_status_row();
