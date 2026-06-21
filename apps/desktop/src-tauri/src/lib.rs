@@ -2952,16 +2952,6 @@ impl TauriAppService {
             .unwrap_or_else(|| "missing".to_owned());
         let text_session_id = text_session.map(|session| session.session_id.as_str());
         let latest_probe = self.state.latest_data_channel_probe.as_ref();
-        let configured_turn_server_count = self
-            .state
-            .active_connectivity_policy()
-            .map(|(_, connectivity)| connectivity.ice_turn_servers.len() as u64)
-            .unwrap_or_default();
-        let configured_turn_endpoint = self
-            .state
-            .active_connectivity_policy()
-            .map(|(_, connectivity)| configured_turn_endpoint(&connectivity).is_some())
-            .unwrap_or(false);
         let mut graphs = Vec::new();
         let mut unavailable_reasons = Vec::new();
 
@@ -3014,6 +3004,14 @@ impl TauriAppService {
             }
 
             for channel in text_channels {
+                let graph_connectivity = channel
+                    .connectivity
+                    .clone()
+                    .or_else(|| group.connectivity.clone())
+                    .unwrap_or_else(|| group_connectivity_policy(&group.group_id));
+                let configured_turn_server_count = graph_connectivity.ice_turn_servers.len() as u64;
+                let configured_turn_endpoint =
+                    configured_turn_endpoint(&graph_connectivity).is_some();
                 let mut edges = Vec::new();
                 let mut seen_remote_peers = BTreeSet::new();
                 for remote in &admitted_remotes {
@@ -28820,6 +28818,111 @@ mod tests {
                 && edge["fanout"]["expected_messages"] == 1
         }));
         clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn route_diagnostics_export_uses_each_graph_connectivity_policy() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("p7-t05-route-diagnostics-policy-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Route Policy".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let turn_group = create_group(CreateGroupRequest {
+            name: "Route Policy Turn".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.graph-a.example.invalid:5349".to_owned(),
+                credential_declared: true,
+                credential_expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+            }]),
+        })
+        .groups
+        .first()
+        .cloned()
+        .ok_or_else(|| "turn group missing".to_owned())?;
+        let direct_group = create_group(CreateGroupRequest {
+            name: "Route Policy Direct".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: Some(Vec::new()),
+        })
+        .groups
+        .iter()
+        .find(|group| group.name == "Route Policy Direct")
+        .cloned()
+        .ok_or_else(|| "direct group missing".to_owned())?;
+        let turn_channel_id = turn_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "turn group text channel missing".to_owned())?;
+        let direct_channel_id = direct_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "direct group text channel missing".to_owned())?;
+        let (_bob_path, _bob_service, bob_id) =
+            create_text_receiver_profile("p7-t05-route-diagnostics-policy-bob", "Bob Policy")?;
+        reload_global_app_service_from_path(&alice_path);
+        seed_group_text_outbox_for_routes(
+            &turn_group.group_id,
+            &turn_channel_id,
+            &[(&bob_id, "Bob Policy")],
+            "p7-t05 policy turn graph body must not leak",
+        )?;
+        seed_group_text_outbox_for_routes(
+            &direct_group.group_id,
+            &direct_channel_id,
+            &[(&bob_id, "Bob Policy")],
+            "p7-t05 policy direct graph body must not leak",
+        )?;
+
+        let diagnostics = export_diagnostics_log();
+        assert!(
+            !diagnostics.contains("turn.graph-a.example.invalid"),
+            "route diagnostics leaked raw TURN endpoint: {diagnostics}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|error| error.to_string())?;
+        let graphs = parsed["route_graph_diagnostics"]["graphs"]
+            .as_array()
+            .ok_or_else(|| "route graph diagnostics missing graphs".to_owned())?;
+        assert_eq!(graphs.len(), 2, "{graphs:?}");
+
+        let turn_group_ref = redacted_observable_ref("group", &turn_group.group_id);
+        let direct_group_ref = redacted_observable_ref("group", &direct_group.group_id);
+        let turn_graph = graphs
+            .iter()
+            .find(|graph| graph["group_ref"] == turn_group_ref)
+            .ok_or_else(|| "turn graph missing".to_owned())?;
+        let direct_graph = graphs
+            .iter()
+            .find(|graph| graph["group_ref"] == direct_group_ref)
+            .ok_or_else(|| "direct graph missing".to_owned())?;
+        let turn_edge = turn_graph["edges"]
+            .as_array()
+            .and_then(|edges| edges.first())
+            .ok_or_else(|| "turn graph edge missing".to_owned())?;
+        let direct_edge = direct_graph["edges"]
+            .as_array()
+            .and_then(|edges| edges.first())
+            .ok_or_else(|| "direct graph edge missing".to_owned())?;
+
+        assert_eq!(turn_edge["turn"]["configured"], true);
+        assert_eq!(turn_edge["turn"]["configured_server_count"], 1);
+        assert_eq!(direct_edge["turn"]["configured"], false);
+        assert_eq!(direct_edge["turn"]["configured_server_count"], 0);
         Ok(())
     }
 

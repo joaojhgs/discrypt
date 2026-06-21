@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-21T05:47:11.794Z",
+  "updatedAt": "2026-06-21T06:13:14.651Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -144,9 +144,9 @@
       "status": "complete",
       "attempt": 0,
       "createdAt": "2026-06-21T05:39:48.111Z",
-      "updatedAt": "2026-06-21T05:47:11.794Z",
-      "evidence": "PER-64 route diagnostics export implemented in apps/desktop/src-tauri/src/lib.rs with support-bundle route_graph_diagnostics, redacted peer/member refs, attached/pending/missing edge state, ICE/DTLS/DataChannel/TURN summaries, and fanout route counts. Verification passed: cargo fmt --check; targeted desktop support-bundle test; full desktop lib suite 145 tests; git diff --check. Evidence is local Rust/Tauri backend support-bundle evidence, not split-machine production route evidence.",
-      "completedAt": "2026-06-21T05:47:11.794Z"
+      "updatedAt": "2026-06-21T06:13:14.651Z",
+      "evidence": "QA rejection fixed: route diagnostics now derives TURN configured/effective inputs from each graph's channel policy when present, otherwise its group policy, instead of active_context. Added route_diagnostics_export_uses_each_graph_connectivity_policy regression for two exported group graphs with different TURN policies. Verification passed: cargo fmt --check; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib route_diagnostics_export -- --test-threads=1 (2 passed); cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib -- --test-threads=1 (146 passed); npm --prefix apps/ui run test:production-copy; git diff --check.",
+      "completedAt": "2026-06-21T06:13:14.651Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
