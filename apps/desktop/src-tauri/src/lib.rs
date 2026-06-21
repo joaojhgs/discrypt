@@ -1468,6 +1468,9 @@ pub enum TextControlFrameView {
     OpenMlsAdmissionWelcome {
         /// Target group id from the signed invite.
         group_id: String,
+        /// Owner/staff actor member id that issued the Welcome, when present.
+        #[serde(default)]
+        owner_member_id: Option<String>,
         /// Owner signer public key handle.
         owner_signer_public_key_hex: String,
         /// Joiner signer public key handle expected to apply the Welcome.
@@ -2962,6 +2965,7 @@ impl TauriAppService {
                     && member.status != "pending"
                     && member.status != "revoked"
                     && member.status != "migration_default"
+                    && member.status != "offline"
             }) else {
                 unavailable_reasons.push(format!(
                     "{}: local admitted member missing",
@@ -2985,6 +2989,7 @@ impl TauriAppService {
                         && member.status != "pending"
                         && member.status != "revoked"
                         && member.status != "migration_default"
+                        && member.status != "offline"
                 })
                 .collect::<Vec<_>>();
             if admitted_remotes.is_empty() {
@@ -3564,6 +3569,60 @@ impl TauriAppService {
             .retain(|_, pending| Some(pending.session_id.as_str()) == active_session_id);
     }
 
+    fn cleanup_text_control_routes_for_target(
+        &mut self,
+        active_session_id: &str,
+        target: &MessageTargetView,
+    ) -> Result<(), String> {
+        if target.kind != "channel" {
+            return Ok(());
+        }
+        let current_route_peer_ids = self.state.route_peer_ids_for_text_target(target)?;
+        let current_route_peer_ids = current_route_peer_ids.into_iter().collect::<BTreeSet<_>>();
+        let mut closed_runtime_routes = Vec::new();
+        self.text_control_transport_runtimes.retain(|key, runtime| {
+            let stale = key.session_id == active_session_id
+                && key
+                    .remote_peer_id
+                    .as_ref()
+                    .is_some_and(|peer_id| !current_route_peer_ids.contains(peer_id));
+            if stale {
+                if let Some(peer_id) = key.remote_peer_id.as_ref() {
+                    closed_runtime_routes.push(peer_id.clone());
+                }
+            }
+            !stale || runtime.remote_peer_id.is_none()
+        });
+        self.pending_text_control_transport_runtimes
+            .retain(|key, _| {
+                let stale = key.session_id == active_session_id
+                    && key
+                        .remote_peer_id
+                        .as_ref()
+                        .is_some_and(|peer_id| !current_route_peer_ids.contains(peer_id));
+                if stale {
+                    if let Some(peer_id) = key.remote_peer_id.as_ref() {
+                        closed_runtime_routes.push(peer_id.clone());
+                    }
+                }
+                !stale
+            });
+        let closed_outbox_routes = self
+            .state
+            .cleanup_text_control_outbox_routes_for_target(target, &current_route_peer_ids);
+        if !closed_runtime_routes.is_empty() || closed_outbox_routes > 0 {
+            self.state.push_event(
+                "transport.route_cleanup",
+                format!(
+                    "Closed {} stale text/control runtime route(s) and pruned {} stale outbox route(s) for current group membership",
+                    closed_runtime_routes.len(),
+                    closed_outbox_routes
+                ),
+            );
+        }
+        Ok(())
+    }
+
     fn text_control_runtime_attach_already_active(
         &mut self,
         command_name: &'static str,
@@ -3732,6 +3791,19 @@ impl TauriAppService {
         }
 
         let transport_session_id = session.session_id.clone();
+        if let Some(target) = request.target.as_ref() {
+            if let Err(error) =
+                self.cleanup_text_control_routes_for_target(&transport_session_id, target)
+            {
+                self.state.push_command_error(
+                    "message.transport_route_cleanup_failed",
+                    "pump_text_control_transport_once",
+                    "text_route_cleanup_failed",
+                    error,
+                    "Refresh backend group membership before retrying text transport",
+                );
+            }
+        }
         let pending_frames = self.state.list_pending_text_control_frames(&request);
         let mut route_peer_ids = BTreeSet::new();
         for frame in &pending_frames {
@@ -9626,6 +9698,7 @@ impl PersistedAppState {
         );
         Ok(TextControlFrameView::OpenMlsAdmissionWelcome {
             group_id: group_id.to_owned(),
+            owner_member_id: Some(self.local_user_id()),
             owner_signer_public_key_hex: owner_record.signer_public_key_hex,
             member_signer_public_key_hex: signer_public_key_hex.to_owned(),
             welcome_bytes,
@@ -9637,6 +9710,8 @@ impl PersistedAppState {
     fn join_openmls_from_admission_welcome_frame(
         &mut self,
         group_id: &str,
+        owner_member_id: Option<&str>,
+        owner_signer_public_key_hex: &str,
         member_signer_public_key_hex: &str,
         welcome_bytes: &[u8],
         epoch: u64,
@@ -9678,6 +9753,43 @@ impl PersistedAppState {
         );
         let local_member_id = self.local_user_id();
         self.upsert_admitted_group_member(group_id, &local_member_id, member_signer_public_key_hex);
+        if let Some(owner_member_id) =
+            owner_member_id.filter(|member_id| *member_id != local_member_id)
+        {
+            let created_at = Utc::now().to_rfc3339();
+            if let Some(group) = self
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+            {
+                if let Some(owner_member) = group
+                    .members
+                    .iter_mut()
+                    .find(|member| member.member_id == owner_member_id)
+                {
+                    owner_member.role = GroupRoleView::Owner;
+                    owner_member.status = "unknown".to_owned();
+                    owner_member.signer_public_key_hex =
+                        Some(owner_signer_public_key_hex.to_owned());
+                    owner_member.revoked_at = None;
+                    owner_member.revoked_by = None;
+                } else {
+                    group.members.push(GroupMemberView {
+                        member_id: owner_member_id.to_owned(),
+                        display_name: redacted_observable_ref("member", owner_member_id),
+                        device_id: None,
+                        role: GroupRoleView::Owner,
+                        status: "unknown".to_owned(),
+                        signer_public_key_hex: Some(owner_signer_public_key_hex.to_owned()),
+                        joined_at: created_at,
+                        last_seen_at: None,
+                        presence_expires_at: None,
+                        revoked_at: None,
+                        revoked_by: None,
+                    });
+                }
+            }
+        }
         self.push_event(
             "mls.admission_welcome_joined",
             format!(
@@ -11150,6 +11262,7 @@ impl PersistedAppState {
                     && member.status != "pending"
                     && member.status != "revoked"
                     && member.status != "migration_default"
+                    && member.status != "offline"
             })
             .ok_or_else(|| {
                 format!("Group {group_id} has no admitted local member for text fanout")
@@ -11161,6 +11274,7 @@ impl PersistedAppState {
                 && member.status != "pending"
                 && member.status != "revoked"
                 && member.status != "migration_default"
+                && member.status != "offline"
         }) {
             let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
             if remote_peer_id == local_peer_id {
@@ -11175,6 +11289,164 @@ impl PersistedAppState {
             }
         }
         Ok(route_peer_ids.into_iter().collect())
+    }
+
+    fn cleanup_text_control_outbox_routes_for_target(
+        &mut self,
+        target: &MessageTargetView,
+        current_route_peer_ids: &BTreeSet<String>,
+    ) -> usize {
+        let mut closed_routes = 0;
+        for record in self
+            .text_control_outbox
+            .iter_mut()
+            .filter(|record| record.target == *target && !record.route_peer_ids.is_empty())
+        {
+            let before = record.route_peer_ids.len();
+            record
+                .route_peer_ids
+                .retain(|peer_id| current_route_peer_ids.contains(peer_id));
+            closed_routes += before.saturating_sub(record.route_peer_ids.len());
+            record
+                .sent_route_peer_ids
+                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            record
+                .receipted_route_peer_ids
+                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            if record.route_peer_ids.is_empty() {
+                record.state_key = "closed_route".to_owned();
+            } else if record
+                .route_peer_ids
+                .iter()
+                .all(|peer_id| record.receipted_route_peer_ids.contains(peer_id))
+            {
+                record.state_key = "receipted".to_owned();
+            } else {
+                record.state_key = "pending".to_owned();
+            }
+        }
+        closed_routes
+    }
+
+    fn validate_group_route_sender(
+        &self,
+        group_id: &str,
+        signer_public_key_hex: &str,
+        sender_device_id: &str,
+    ) -> Result<(), String> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| format!("Group {group_id} is missing for route membership check"))?;
+        if let Some(member) = group
+            .members
+            .iter()
+            .find(|member| member.signer_public_key_hex.as_deref() == Some(signer_public_key_hex))
+        {
+            self.validate_current_remote_group_route_sender(group_id, member)?;
+            return Ok(());
+        }
+        if let Some(member) = group
+            .members
+            .iter()
+            .find(|member| member.member_id == sender_device_id)
+        {
+            self.validate_current_remote_group_route_sender(group_id, member)?;
+            return Ok(());
+        }
+        Err(format!(
+            "Group {group_id} has no current member {sender_device_id} for text/control sender route authority"
+        ))
+    }
+
+    fn validate_group_route_member_id(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<String, String> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| format!("Group {group_id} is missing for route membership check"))?;
+        let member = group
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| {
+                format!("Group {group_id} has no current member {member_id} for route receipt")
+            })?;
+        self.validate_admitted_group_route_member(group_id, group, member)?;
+        group_member_runtime_peer_id(group_id, member)
+    }
+
+    fn validate_current_remote_group_route_sender(
+        &self,
+        group_id: &str,
+        member: &GroupMemberView,
+    ) -> Result<(), String> {
+        if member.member_id == self.local_user_id() {
+            return Err(format!(
+                "Group {group_id} route sender {} is local, not a remote sender",
+                member.member_id
+            ));
+        }
+        if matches!(
+            member.status.as_str(),
+            "pending" | "revoked" | "migration_default" | "offline"
+        ) {
+            return Err(format!(
+                "Group {group_id} route sender {} is not currently admitted/online for text route authority (status={})",
+                member.member_id, member.status
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_admitted_group_route_member(
+        &self,
+        group_id: &str,
+        group: &GroupView,
+        member: &GroupMemberView,
+    ) -> Result<(), String> {
+        if member.member_id == self.local_user_id() {
+            return Err(format!(
+                "Group {group_id} route member {} is local, not a remote route peer",
+                member.member_id
+            ));
+        }
+        if matches!(
+            member.status.as_str(),
+            "pending" | "revoked" | "migration_default" | "offline"
+        ) {
+            return Err(format!(
+                "Group {group_id} route member {} is not currently admitted/online for text route cleanup (status={})",
+                member.member_id, member.status
+            ));
+        }
+        let local_member = group
+            .members
+            .iter()
+            .find(|candidate| {
+                candidate.member_id == self.local_user_id()
+                    && !matches!(
+                        candidate.status.as_str(),
+                        "pending" | "revoked" | "migration_default" | "offline"
+                    )
+            })
+            .ok_or_else(|| {
+                format!("Group {group_id} has no current admitted local member for route cleanup")
+            })?;
+        let local_peer_id = group_member_runtime_peer_id(group_id, local_member)?;
+        let remote_peer_id = group_member_runtime_peer_id(group_id, member)?;
+        if remote_peer_id == local_peer_id {
+            return Err(format!(
+                "Group {group_id} route member {} resolves to the local runtime peer",
+                member.member_id
+            ));
+        }
+        Ok(())
     }
 
     fn enqueue_voice_signaling_outbox(
@@ -11484,6 +11756,25 @@ impl PersistedAppState {
         &mut self,
         request: MarkTextControlFrameSentRequest,
     ) -> Result<(), String> {
+        let outbox_target = self
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == request.message_id)
+            .map(|record| record.target.clone())
+            .ok_or_else(|| "no persisted outbox frame for message id".to_owned())?;
+        if let Some(route_peer_id) = request.route_peer_id.as_ref() {
+            if outbox_target.kind == "channel" {
+                let current_route_peer_ids = self
+                    .route_peer_ids_for_text_target(&outbox_target)?
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                if !current_route_peer_ids.contains(route_peer_id) {
+                    return Err(format!(
+                        "route peer {route_peer_id} is no longer a current admitted text/control route"
+                    ));
+                }
+            }
+        }
         let frame_sha256 = {
             let outbox = self
                 .text_control_outbox
@@ -11575,6 +11866,11 @@ impl PersistedAppState {
         else {
             return Ok(None);
         };
+        if delivery_group_id.starts_with("group:") {
+            return self
+                .validate_group_route_member_id(group_id, recipient_device_id)
+                .map(Some);
+        }
         Ok(Some(group_member_runtime_peer_id(group_id, member)?))
     }
 
@@ -11926,6 +12222,27 @@ impl PersistedAppState {
         let result = sender_key
             .and_then(|sender_key| {
                 let group_id = group_id?;
+                if request.target.kind == "channel" {
+                    let openmls_group_id = request
+                        .target
+                        .group_id
+                        .as_deref()
+                        .ok_or_else(|| {
+                            "channel target is missing group_id for route membership check"
+                                .to_owned()
+                        })?;
+                    if self
+                        .groups
+                        .iter()
+                        .any(|group| group.group_id == openmls_group_id)
+                    {
+                        self.validate_group_route_sender(
+                            openmls_group_id,
+                            &request.sender_verifying_key_hex,
+                            &request.envelope.sender_device_id,
+                        )?;
+                    }
+                }
                 request
                     .envelope
                     .verify(&group_id, &sender_key)
@@ -12304,7 +12621,8 @@ impl PersistedAppState {
             }
             TextControlFrameView::OpenMlsAdmissionWelcome {
                 group_id,
-                owner_signer_public_key_hex: _,
+                owner_member_id,
+                owner_signer_public_key_hex,
                 member_signer_public_key_hex,
                 welcome_bytes,
                 epoch,
@@ -12312,6 +12630,8 @@ impl PersistedAppState {
             } => {
                 if let Err(error) = self.join_openmls_from_admission_welcome_frame(
                     &group_id,
+                    owner_member_id.as_deref(),
+                    &owner_signer_public_key_hex,
                     &member_signer_public_key_hex,
                     &welcome_bytes,
                     epoch,
@@ -12481,6 +12801,35 @@ impl PersistedAppState {
                     &created_at,
                     &crypto_removal_status,
                 );
+                let targets = self
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == group_id)
+                    .map(|group| {
+                        group
+                            .channels
+                            .iter()
+                            .filter(|channel| channel.kind == ChannelKind::Text)
+                            .map(|channel| MessageTargetView {
+                                kind: "channel".to_owned(),
+                                dm_id: None,
+                                group_id: Some(group_id.clone()),
+                                channel_id: Some(channel.channel_id.clone()),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for target in targets {
+                    if let Ok(current_route_peer_ids) = self.route_peer_ids_for_text_target(&target)
+                    {
+                        let current_route_peer_ids =
+                            current_route_peer_ids.into_iter().collect::<BTreeSet<_>>();
+                        let _ = self.cleanup_text_control_outbox_routes_for_target(
+                            &target,
+                            &current_route_peer_ids,
+                        );
+                    }
+                }
                 Some(TextControlFrameView::GroupGovernanceAck {
                     group_id,
                     event_id,
@@ -12794,6 +13143,7 @@ impl PersistedAppState {
                     && member.status != "pending"
                     && member.status != "revoked"
                     && member.status != "migration_default"
+                    && member.status != "offline"
             })
             .ok_or_else(|| {
                 format!(
@@ -12810,6 +13160,7 @@ impl PersistedAppState {
                 && member.status != "pending"
                 && member.status != "revoked"
                 && member.status != "migration_default"
+                && member.status != "offline"
         }) {
             let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
             if remote_peer_id == local_peer_id.0 {
@@ -21118,6 +21469,12 @@ mod tests {
             .into_iter()
             .find(|record| record.message_id == message_id)
             .ok_or_else(|| "persisted envelope missing for group message".to_owned())?;
+        add_legacy_route_member_without_signer_to_state_for_test(
+            &mut bob.state,
+            &group_id,
+            &alice_user_id,
+            "Alice",
+        )?;
         let (receipt, recipient_key_hex) =
             bob.state
                 .receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
@@ -21452,6 +21809,11 @@ mod tests {
             joined_group.last_command_error.is_none(),
             "{joined_group:?}"
         );
+        add_legacy_route_member_without_signer_for_test(
+            &alice_group_id,
+            &alice_profile_id,
+            "Alice G010",
+        )?;
         let bob_group = joined_group
             .groups
             .iter()
@@ -21957,6 +22319,11 @@ mod tests {
             joined_group.last_command_error.is_none(),
             "{joined_group:?}"
         );
+        add_legacy_route_member_without_signer_for_test(
+            &group_id,
+            &alice_profile_id,
+            "Alice G004",
+        )?;
         let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target: target.clone(),
             envelope: envelope_record.envelope.clone(),
@@ -27574,6 +27941,11 @@ mod tests {
             &text_exporter_secret,
             &sender,
         )?;
+        add_legacy_route_member_without_signer_for_test(
+            &group_id,
+            "remote-device",
+            "Legacy Remote",
+        )?;
 
         let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target,
@@ -27595,6 +27967,92 @@ mod tests {
         assert!(message
             .status
             .contains("decrypted through TextInboundPipeline"));
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_command_rejects_unknown_group_sender_without_signer_roster() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("receive-openmls-unknown-sender");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "OpenMLS Unknown Sender Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .iter()
+            .find(|group| group.name == "OpenMLS Unknown Sender Lab")
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| matches!(channel.kind, ChannelKind::Text))
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id),
+            channel_id: Some(channel_id),
+        };
+        let delivery_group_id = text_delivery_group_id(&target)?;
+        let unknown_sender = SigningKey::generate(&mut OsRng);
+        let envelope = TextMessageEnvelope::sign(
+            &delivery_group_id,
+            TextMessageEnvelopeInput {
+                epoch: 1,
+                sender_leaf: 9,
+                sender_device_id: "removed-unknown-sender".to_owned(),
+                sequence: 1,
+                message_id: "msg-unknown-removed-sender".to_owned(),
+                retention: TextRetentionMetadata {
+                    policy: "app-default".to_owned(),
+                    created_at_ms: 1,
+                    expires_at_ms: None,
+                    delete_after_read: false,
+                },
+                content_ciphertext: b"unknown sender should not be accepted".to_vec(),
+            },
+            &unknown_sender,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target,
+            envelope,
+            sender_verifying_key_hex: hex::encode(unknown_sender.verifying_key().as_bytes()),
+            recipient_leaf: Some(2),
+        });
+
+        assert!(response.receipt.is_none(), "{response:?}");
+        assert_eq!(
+            response
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("text_envelope_verification_failed")
+        );
+        assert!(response
+            .state
+            .messages
+            .iter()
+            .all(|message| message.message_id != "msg-unknown-removed-sender"));
+        let persisted = load_state();
+        assert!(persisted
+            .text_delivery_receipts
+            .iter()
+            .all(|receipt| receipt.message_id != "msg-unknown-removed-sender"));
         Ok(())
     }
 
@@ -27636,6 +28094,11 @@ mod tests {
             group_id: Some(group_id.clone()),
             channel_id: Some(channel_id.clone()),
         };
+        add_legacy_route_member_without_signer_for_test(
+            &group_id,
+            "remote-device",
+            "Legacy Remote",
+        )?;
         let invalid_signer_envelope = openmls_text_envelope_for_test(
             &group_id,
             &channel_id,
@@ -28230,7 +28693,7 @@ mod tests {
                     display_name: (*display_name).to_owned(),
                     device_id: None,
                     role: GroupRoleView::Member,
-                    status: "offline".to_owned(),
+                    status: "online".to_owned(),
                     signer_public_key_hex: None,
                     joined_at: now.clone(),
                     last_seen_at: None,
@@ -28322,6 +28785,364 @@ mod tests {
             .find(|member| member.member_id == member_id)
             .ok_or_else(|| "member missing for route lookup".to_owned())?;
         group_member_runtime_peer_id(group_id, member)
+    }
+
+    fn add_legacy_route_member_without_signer_for_test(
+        group_id: &str,
+        member_id: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        add_legacy_route_member_without_signer_to_state_for_test(
+            &mut guard.state,
+            group_id,
+            member_id,
+            display_name,
+        )?;
+        guard.persist();
+        Ok(())
+    }
+
+    fn add_legacy_route_member_without_signer_to_state_for_test(
+        state: &mut PersistedAppState,
+        group_id: &str,
+        member_id: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
+        let local_user_id = state.local_user_id();
+        let group = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing for legacy route member insert".to_owned())?;
+        if member_id == local_user_id {
+            return Err("legacy route member must be remote".to_owned());
+        }
+        if !group
+            .members
+            .iter()
+            .any(|member| member.member_id == member_id)
+        {
+            group.members.push(GroupMemberView {
+                member_id: member_id.to_owned(),
+                display_name: display_name.to_owned(),
+                device_id: None,
+                role: GroupRoleView::Member,
+                status: "unknown".to_owned(),
+                signer_public_key_hex: None,
+                joined_at: Utc::now().to_rfc3339(),
+                last_seen_at: None,
+                presence_expires_at: None,
+                revoked_at: None,
+                revoked_by: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn set_group_member_status_for_test(
+        group_id: &str,
+        member_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_user_id = guard.state.local_user_id();
+        let group = guard
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing for status update".to_owned())?;
+        let member = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| "member missing for status update".to_owned())?;
+        member.status = status.to_owned();
+        if status == "revoked" {
+            member.revoked_at = Some(Utc::now().to_rfc3339());
+            member.revoked_by = Some(local_user_id);
+        }
+        guard.persist();
+        Ok(())
+    }
+
+    fn set_group_member_signer_for_test(
+        group_id: &str,
+        member_id: &str,
+        signer_public_key_hex: &str,
+    ) -> Result<(), String> {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let group = guard
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing for signer update".to_owned())?;
+        let member = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| "member missing for signer update".to_owned())?;
+        member.signer_public_key_hex = Some(signer_public_key_hex.to_owned());
+        guard.persist();
+        Ok(())
+    }
+
+    #[test]
+    fn route_cleanup_closes_revoked_peer_routes_and_preserves_valid_peer() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("p7-t06-route-cleanup-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Cleanup".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Cleanup Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (_bob_path, bob_service, _bob_id) =
+            create_text_receiver_profile("p7-t06-cleanup-bob", "Bob Cleanup")?;
+        let (_carol_path, carol_service, _carol_id) =
+            create_text_receiver_profile("p7-t06-cleanup-carol", "Carol Cleanup")?;
+        reload_global_app_service_from_path(&alice_path);
+        let bob_member_id = "bob-cleanup-route-member";
+        let carol_member_id = "carol-cleanup-route-member";
+        let (target, message_id, _route_peer_ids, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[
+                (bob_member_id, "Bob Cleanup"),
+                (carol_member_id, "Carol Cleanup"),
+            ],
+            "p7-t06 cleanup keeps valid route",
+        )?;
+        let loaded = load_state();
+        let local_peer_id = loaded
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group.group_id)
+            .and_then(|candidate| {
+                candidate
+                    .members
+                    .iter()
+                    .find(|member| member.role == GroupRoleView::Owner)
+                    .and_then(|member| group_member_runtime_peer_id(&group.group_id, member).ok())
+            })
+            .ok_or_else(|| "local runtime peer id missing".to_owned())?;
+        let bob_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, bob_member_id)?;
+        let carol_route =
+            route_peer_id_for_member_in_state(&loaded, &group.group_id, carol_member_id)?;
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("p7-t06-route-cleanup".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(ReceiverBackedTextControlTransport::new(bob_service)),
+            active_session_id.clone(),
+            local_peer_id.clone(),
+            bob_route.clone(),
+        );
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(ReceiverBackedTextControlTransport::new(carol_service)),
+            active_session_id.clone(),
+            local_peer_id,
+            carol_route.clone(),
+        );
+        set_group_member_status_for_test(&group.group_id, carol_member_id, "revoked")?;
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.cleanup_text_control_routes_for_target(&active_session_id, &target)?;
+        assert!(guard.text_control_transport_runtimes.contains_key(
+            &TextControlRuntimeMapKey::for_remote(active_session_id.clone(), bob_route.clone())
+        ));
+        assert!(!guard.text_control_transport_runtimes.contains_key(
+            &TextControlRuntimeMapKey::for_remote(active_session_id, carol_route.clone())
+        ));
+        let outbox = guard
+            .state
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing after cleanup".to_owned())?;
+        assert_eq!(outbox.route_peer_ids, vec![bob_route]);
+        assert_eq!(outbox.state_key, "pending");
+        drop(guard);
+        clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn route_cleanup_rejects_stale_receipt_from_revoked_peer() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("p7-t06-stale-receipt-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Receipt Cleanup".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Receipt Cleanup Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (_carol_path, mut carol_service, carol_id) =
+            create_text_receiver_profile("p7-t06-stale-receipt-carol", "Carol Stale")?;
+        reload_global_app_service_from_path(&alice_path);
+        let (_target, message_id, _route_peer_ids, frame) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(&carol_id, "Carol Stale")],
+            "p7-t06 stale receipt",
+        )?;
+        let receipt_frame = carol_service
+            .state
+            .handle_text_control_frame(frame)
+            .ok_or_else(|| "carol should generate receipt before revoke".to_owned())?;
+        set_group_member_status_for_test(&group.group_id, &carol_id, "revoked")?;
+
+        mutate_app_service_with_result(|state| state.handle_text_control_frame(receipt_frame));
+        let alice_after = load_state_from_path(&alice_path);
+        let error = alice_after
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "stale receipt should be rejected".to_owned())?;
+        assert_eq!(error.code, "receipt_frame_verification_failed");
+        let outbox = alice_after
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing after stale receipt".to_owned())?;
+        assert_ne!(outbox.state_key, "receipted");
+        assert!(outbox.receipted_route_peer_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn route_cleanup_rejects_inbound_envelope_from_revoked_sender() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("p7-t06-stale-envelope-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Stale Envelope".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Envelope Cleanup Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (_carol_path, mut carol_service, carol_id) =
+            create_text_receiver_profile("p7-t06-stale-envelope-carol", "Carol Envelope")?;
+        reload_global_app_service_from_path(&alice_path);
+        let (target, _message_id, _route_peer_ids, _frame) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(&carol_id, "Carol Envelope")],
+            "p7-t06 stale inbound envelope",
+        )?;
+        let carol_signing_key = SigningKey::from_bytes(&carol_service.state.identity_seed_bytes());
+        let carol_signer = hex::encode(carol_signing_key.verifying_key().as_bytes());
+        set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer)?;
+        let delivery_group_id = text_delivery_group_id(&target)?;
+        let stale_envelope = TextMessageEnvelope::sign(
+            &delivery_group_id,
+            TextMessageEnvelopeInput {
+                epoch: 1,
+                sender_leaf: 2,
+                sender_device_id: carol_id.clone(),
+                sequence: 99,
+                message_id: "p7-t06-stale-revoked-envelope".to_owned(),
+                retention: TextRetentionMetadata {
+                    policy: "test".to_owned(),
+                    created_at_ms: 99,
+                    expires_at_ms: None,
+                    delete_after_read: false,
+                },
+                content_ciphertext: b"stale-revoked-route-frame".to_vec(),
+            },
+            &carol_signing_key,
+        )
+        .map_err(|error| error.to_string())?;
+        let stale_frame = TextControlFrameView::Envelope {
+            target,
+            envelope: stale_envelope,
+            sender_verifying_key_hex: carol_signer,
+            recipient_leaf: Some(2),
+        };
+        set_group_member_status_for_test(&group.group_id, &carol_id, "revoked")?;
+
+        mutate_app_service_with_result(|state| state.handle_text_control_frame(stale_frame));
+        let alice_after = load_state_from_path(&alice_path);
+        let error = alice_after
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "stale envelope should be rejected".to_owned())?;
+        assert_eq!(error.code, "text_envelope_verification_failed");
+        Ok(())
     }
 
     #[test]

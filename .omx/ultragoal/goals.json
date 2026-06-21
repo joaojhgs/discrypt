@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-21T06:13:14.651Z",
+  "updatedAt": "2026-06-21T07:18:44.194Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -147,6 +147,17 @@
       "updatedAt": "2026-06-21T06:13:14.651Z",
       "evidence": "QA rejection fixed: route diagnostics now derives TURN configured/effective inputs from each graph's channel policy when present, otherwise its group policy, instead of active_context. Added route_diagnostics_export_uses_each_graph_connectivity_policy regression for two exported group graphs with different TURN policies. Verification passed: cargo fmt --check; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib route_diagnostics_export -- --test-threads=1 (2 passed); cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib -- --test-threads=1 (146 passed); npm --prefix apps/ui run test:production-copy; git diff --check.",
       "completedAt": "2026-06-21T06:13:14.651Z"
+    },
+    {
+      "id": "G014-per-65-route-cleanup-on-leave-revoke",
+      "title": "PER-65 route cleanup on leave/revoke",
+      "objective": "Implement PER-65/P7-T06 route cleanup on leave/revoke: close pending and attached per-peer direct/TURN WebRTC routes for removed/offline/revoked peers, reject stale outbound retries and inbound frames from no-longer-admitted route peers, preserve valid admitted peer routes, and keep providers signaling-only with no application relay fallback.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-21T06:34:18.764Z",
+      "updatedAt": "2026-06-21T07:18:44.194Z",
+      "evidence": "Second QA rejection fixed: validate_group_route_sender now fails closed when no current remote member matches sender_device_id even if the roster has no signer metadata, while legacy/OpenMLS valid receive paths seed explicit current sender membership evidence. OpenMLS admission Welcome frames now carry owner_member_id and persist owner signer/member evidence on join. Added receiver_command_rejects_unknown_group_sender_without_signer_roster regression proving no receipt/message is recorded and text_envelope_verification_failed is surfaced for an unknown removed sender. Verification passed: g012 two-profile delivery, receiver OpenMLS plaintext, unknown no-signer sender regression, pending-runtime attach, route_cleanup (3), group fanout (1), route diagnostics (2), full desktop backend lib suite 150/150, cargo fmt --check, git diff --check.",
+      "completedAt": "2026-06-21T07:18:44.194Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
