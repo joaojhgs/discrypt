@@ -1110,6 +1110,8 @@ async function installVoiceHarness(profile) {
   `, [profile.display_name.toLowerCase(), requireNativeVoice || disableSyntheticVoiceFallback]);
 }
 
+const alreadyJoinedVoiceUiPredicate = `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`;
+
 async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
   const before = await appState(profile);
@@ -1121,9 +1123,9 @@ async function joinVoice(profile) {
     nativeMediaReceived &&
     !before?.last_command_error
   ) {
-    const joinedUi = await exec(profile, `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && /Native Rust (peer|remote voice frame accepted)/i.test(document.body.innerText);`);
+    const joinedUi = await exec(profile, alreadyJoinedVoiceUiPredicate);
     if (joinedUi) {
-      await waitUntil(profile, "already joined native voice media", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && /Native Rust (peer|remote voice frame accepted)/i.test(document.body.innerText);`);
+      await waitUntil(profile, "already joined native voice media", alreadyJoinedVoiceUiPredicate);
       return;
     }
   }
@@ -1136,7 +1138,7 @@ async function joinVoice(profile) {
       throw new Error(`${profile.display_name} native voice media failed after join; ${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`);
     }
     if (before?.voice_session?.media_runtime?.local_capture_active) {
-      await waitUntil(profile, "already joined local voice participant", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`);
+      await waitUntil(profile, "already joined local voice participant", alreadyJoinedVoiceUiPredicate);
       return;
     }
     if (requireNativeVoice) {

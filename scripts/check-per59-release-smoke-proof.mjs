@@ -54,6 +54,7 @@ for (const token of [
   "await click(profile, \"Send message\");",
   "native voice media failed after join",
   "already joined native voice media",
+  "alreadyJoinedVoiceUiPredicate",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
