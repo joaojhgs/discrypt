@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const harness = read("scripts/g012-tauri-webdriver-integrated.mjs");
+const ui = read("apps/ui/src/main.tsx");
 const releaseNote = read("docs/release/per59-human-loopback-release-smoke-2026-06-20.md");
 const plan = read(".omx/plans/P6-T08-human-loopback-release-smoke-2026-06-20.md");
 const failures = [];
@@ -25,6 +26,10 @@ for (const token of [
   "nativeMedia.mic_gain_percent",
   "nativeMedia.app_output_volume_percent",
   "adjustRemoteParticipantVolumes",
+  "backendRuntimePeerIdFromCommitment",
+  "backend-derived-signed-group-bootstrap",
+  "voice-session-signaling",
+  "media_runtime?.local_capture_active",
   "profile ready or trust setup screen",
   "local profile ready|start a private space",
   "contextClickText",
@@ -48,6 +53,15 @@ for (const token of [
   "await click(profile, \"Send message\");",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
+}
+
+for (const token of [
+  "localGovernedGroupRole",
+  "groupRuntimePeers.find",
+  "peer.role === localGroupPeerRole",
+  "startNativeRustVoiceMediaSession",
+]) {
+  requireText("Discrypt UI native voice peer selection", ui, token);
 }
 
 for (const token of [

@@ -315,18 +315,72 @@ function sealVoiceSignalPayloadNode({ session_id, group_id, channel_id, from_pee
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
   return `voice-signal-sealed:v1:${base64Url(nonce)}.${base64Url(encrypted)}`;
 }
+function backendHashCommitment(domain, parts) {
+  const hash = createHash("sha256");
+  hash.update(domain);
+  for (const part of parts) {
+    hash.update(Buffer.from([0]));
+    hash.update(String(part));
+  }
+  return hash.digest("hex");
+}
+function backendRuntimePeerIdFromCommitment(label, commitment) {
+  return `peer-${backendHashCommitment("discrypt-runtime-peer-id-v1", [label, commitment]).slice(0, 16)}`;
+}
+function backendGroupRuntimePeers(group, localRole) {
+  const bootstrap = group?.connectivity?.group_bootstrap;
+  if (!bootstrap) return null;
+  const owner = backendRuntimePeerIdFromCommitment("group-owner-runtime-peer", bootstrap.group_identity_commitment);
+  const memberCommitment = `${bootstrap.role_admission_policy_commitment}:${bootstrap.channel_policy_commitment}`;
+  const member = backendRuntimePeerIdFromCommitment("group-member-runtime-peer", memberCommitment);
+  const localIsOwner = /^(owner|staff)$/i.test(localRole || "");
+  return {
+    local: localIsOwner ? owner : member,
+    remote: localIsOwner ? member : owner,
+    local_role: localRole,
+    source: "backend-derived-signed-group-bootstrap",
+  };
+}
+function localGovernedGroupRole(state, group) {
+  const localUserId = state?.profile?.user_id;
+  const member = group?.members?.find((item) =>
+    item?.member_id === localUserId &&
+    item?.status !== "revoked" &&
+    item?.status !== "migration_default"
+  );
+  if (!member?.role) return null;
+  const hasRoleEvidence = group?.governance_log?.some((entry) =>
+    entry?.target_member_id === localUserId &&
+    entry?.role_after === member.role &&
+    entry?.event_kind !== "group_governance_initialized" &&
+    entry?.event_kind !== "governance.defaults_restored"
+  );
+  return hasRoleEvidence ? member.role : null;
+}
 function runtimePeersFromAppState(state) {
+  const session = state?.voice_session ?? {};
+  if (session.signaling?.local_peer_id && session.signaling?.remote_peer_id) {
+    return {
+      local: session.signaling.local_peer_id,
+      remote: session.signaling.remote_peer_id,
+      source: "voice-session-signaling",
+    };
+  }
   const active = state?.active_context ?? {};
-  const group = active.group_id
-    ? state.groups?.find((item) => item.group_id === active.group_id)
+  const groupId = session.group_id || active.group_id;
+  const group = groupId
+    ? state.groups?.find((item) => item.group_id === groupId)
     : state.groups?.[0];
+  const governedRole = localGovernedGroupRole(state, group);
+  const backendPeers = backendGroupRuntimePeers(group, governedRole);
+  if (backendPeers?.local && backendPeers?.remote) return backendPeers;
   const peers = group?.runtime_peers ?? [];
   const local = peers.find((peer) => peer.is_local);
   const remote = peers.find((peer) => !peer.is_local);
   if (!local?.peer_id || !remote?.peer_id) {
-    throw new Error(`Could not derive runtime peers from app_state for ${active.group_id || "active group"}`);
+    throw new Error(`Could not derive runtime peers from app_state for ${groupId || "active group"}`);
   }
-  return { local: local.peer_id, remote: remote.peer_id };
+  return { local: local.peer_id, remote: remote.peer_id, source: "persisted-runtime-peers" };
 }
 async function publishBackendNativeVoiceProof(profile) {
   const state = await invokeTauriCommand(profile, "app_state");
@@ -374,6 +428,8 @@ async function publishBackendNativeVoiceProof(profile) {
     session_id: session.session_id,
     local_peer_id: peers.local,
     remote_peer_id: peers.remote,
+    peer_source: peers.source ?? null,
+    local_role: peers.local_role ?? null,
     mic_gain_percent: nativeMedia.mic_gain_percent,
     app_output_volume_percent: nativeMedia.app_output_volume_percent,
     rms_i16: nativeMedia.rms_i16,
@@ -1056,6 +1112,11 @@ async function installVoiceHarness(profile) {
 
 async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
+  const before = await appState(profile);
+  if (before?.voice_session?.joined && before?.voice_session?.media_runtime?.local_capture_active) {
+    await waitUntil(profile, "already joined local voice participant", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`);
+    return;
+  }
   await click(profile, "join call");
   await waitUntil(profile, "local voice participant", `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`);
 }
