@@ -6,6 +6,7 @@
 
 use crate::{SignalingPeerId, TransportError};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Serializable schema version for peer overlay protocol frames.
@@ -402,6 +403,223 @@ impl PeerOverlayRelayAuthoritySet {
             })
             .collect()
     }
+}
+
+/// Runtime/backend evidence used to rank one relay candidate.
+///
+/// These diagnostics are intentionally content-blind. They describe transport
+/// health and relay contribution only; they do not include message, media, key,
+/// provider payload, or group-content data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayCandidateDiagnostics {
+    /// Recent round-trip latency estimate in milliseconds.
+    pub latency_ms: u32,
+    /// Successful health probes in the current ranking window.
+    pub successful_health_probes: u32,
+    /// Failed health probes in the current ranking window.
+    pub failed_health_probes: u32,
+    /// Advertised relay egress capacity.
+    pub egress_capacity_bytes_per_second: u64,
+    /// Current relay load estimate.
+    pub current_load_bytes_per_second: u64,
+    /// Local estimate of battery/CPU/network cost in basis points.
+    pub energy_cost_bps: u16,
+    /// Anti-freeload penalty in basis points.
+    pub freeload_penalty_bps: u16,
+}
+
+impl PeerOverlayRelayCandidateDiagnostics {
+    fn validate(&self, policy: &PeerOverlayRelayCandidatePolicy) -> Result<(), TransportError> {
+        if self.successful_health_probes == 0 {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate requires a successful health probe",
+            ));
+        }
+        if self
+            .successful_health_probes
+            .saturating_add(self.failed_health_probes)
+            == 0
+        {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate requires health probe evidence",
+            ));
+        }
+        if self.stability_bps() < policy.min_stability_bps {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate is below stability policy",
+            ));
+        }
+        if self.energy_cost_bps > policy.max_energy_cost_bps {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate exceeds energy policy",
+            ));
+        }
+        if self.egress_capacity_bytes_per_second < policy.min_egress_capacity_bytes_per_second {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate lacks required egress capacity",
+            ));
+        }
+        if self.current_load_bytes_per_second >= self.egress_capacity_bytes_per_second {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate has no spare relay capacity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn stability_bps(&self) -> u32 {
+        let total = self
+            .successful_health_probes
+            .saturating_add(self.failed_health_probes)
+            .max(1);
+        self.successful_health_probes.saturating_mul(10_000) / total
+    }
+
+    fn spare_capacity_bytes_per_second(&self) -> u64 {
+        self.egress_capacity_bytes_per_second
+            .saturating_sub(self.current_load_bytes_per_second)
+    }
+}
+
+/// One relay candidate with current admitted-peer and diagnostic evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayCandidate {
+    /// Candidate relay peer.
+    pub relay: PeerOverlayPeerRef,
+    /// Content-blind ranking diagnostics.
+    pub diagnostics: PeerOverlayRelayCandidateDiagnostics,
+}
+
+/// Policy gate applied before relay candidate ranking.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayCandidatePolicy {
+    /// Carrier being ranked. Must be peer-assisted overlay, never provider relay.
+    pub carrier: PeerOverlayCarrier,
+    /// Minimum relay egress capacity required by the caller.
+    pub min_egress_capacity_bytes_per_second: u64,
+    /// Minimum health stability in basis points.
+    pub min_stability_bps: u32,
+    /// Maximum allowed energy cost in basis points.
+    pub max_energy_cost_bps: u16,
+}
+
+impl Default for PeerOverlayRelayCandidatePolicy {
+    fn default() -> Self {
+        Self {
+            carrier: PeerOverlayCarrier::PeerAssistedOverlay,
+            min_egress_capacity_bytes_per_second: 1_024,
+            min_stability_bps: 1,
+            max_energy_cost_bps: 10_000,
+        }
+    }
+}
+
+impl PeerOverlayRelayCandidatePolicy {
+    fn validate(&self) -> Result<(), TransportError> {
+        self.carrier.validate()?;
+        if self.carrier != PeerOverlayCarrier::PeerAssistedOverlay {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate ranking requires peer-assisted overlay carrier",
+            ));
+        }
+        if self.min_egress_capacity_bytes_per_second == 0 {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate policy requires non-zero capacity",
+            ));
+        }
+        if self.min_stability_bps > 10_000 {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate policy stability must be <= 10000 bps",
+            ));
+        }
+        if self.max_energy_cost_bps > 10_000 {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidate policy energy cost must be <= 10000 bps",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ranked relay candidate plus the explicit authority proof used for ranking.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRankedRelayCandidate {
+    /// Candidate relay peer.
+    pub relay: PeerOverlayPeerRef,
+    /// Explicit current-epoch relay authorization.
+    pub authorization: PeerOverlayRelayAuthorization,
+    /// Deterministic score. Higher is better.
+    pub score: i64,
+    /// Content-blind diagnostics used to produce the score.
+    pub diagnostics: PeerOverlayRelayCandidateDiagnostics,
+}
+
+/// Rank relay candidates after admission, authorization, health, and policy gates.
+pub fn rank_relay_candidates(
+    admitted: &PeerOverlayAdmittedSet,
+    relay_authority: &PeerOverlayRelayAuthoritySet,
+    auth: &PeerOverlayAuth,
+    policy: &PeerOverlayRelayCandidatePolicy,
+    candidates: impl IntoIterator<Item = PeerOverlayRelayCandidate>,
+) -> Result<Vec<PeerOverlayRankedRelayCandidate>, TransportError> {
+    policy.validate()?;
+    auth.validate(admitted)?;
+    if relay_authority.current_epoch != admitted.current_epoch {
+        return Err(overlay_policy_error(
+            "peer overlay relay candidate authority epoch must match admitted epoch",
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut ranked = Vec::new();
+    for candidate in candidates {
+        admitted.validate_ref(&candidate.relay)?;
+        if !seen.insert(candidate.relay.peer_id.clone()) {
+            return Err(overlay_policy_error(
+                "peer overlay relay candidates must be unique",
+            ));
+        }
+        candidate.diagnostics.validate(policy)?;
+        let authorization = relay_authority.authorize_relay(&candidate.relay, auth)?;
+        let score = score_relay_candidate(&candidate.diagnostics);
+        ranked.push(PeerOverlayRankedRelayCandidate {
+            relay: candidate.relay,
+            authorization,
+            score,
+            diagnostics: candidate.diagnostics,
+        });
+    }
+    if ranked.is_empty() {
+        return Err(overlay_policy_error(
+            "peer overlay relay candidate ranking requires at least one candidate",
+        ));
+    }
+    ranked.sort_by(compare_ranked_relay_candidates);
+    Ok(ranked)
+}
+
+fn score_relay_candidate(diagnostics: &PeerOverlayRelayCandidateDiagnostics) -> i64 {
+    let latency_penalty = i64::from(diagnostics.latency_ms.max(1)) * 100;
+    let stability_bonus = i64::from(diagnostics.stability_bps()) * 100;
+    let capped_capacity = diagnostics
+        .spare_capacity_bytes_per_second()
+        .min(10_000_000);
+    let capacity_bonus = i64::try_from(capped_capacity / 1_024).unwrap_or(i64::MAX);
+    let energy_penalty = i64::from(diagnostics.energy_cost_bps) * 10;
+    let freeload_penalty = i64::from(diagnostics.freeload_penalty_bps) * 10;
+
+    stability_bonus + capacity_bonus - latency_penalty - energy_penalty - freeload_penalty
+}
+
+fn compare_ranked_relay_candidates(
+    a: &PeerOverlayRankedRelayCandidate,
+    b: &PeerOverlayRankedRelayCandidate,
+) -> Ordering {
+    b.score
+        .cmp(&a.score)
+        .then_with(|| a.relay.peer_id.cmp(&b.relay.peer_id))
+        .then_with(|| a.relay.member_id.cmp(&b.relay.member_id))
+        .then_with(|| a.relay.device_id.cmp(&b.relay.device_id))
 }
 
 /// Peer overlay route refs and loop controls.
@@ -811,6 +1029,54 @@ mod tests {
         )
     }
 
+    fn relay_authority_for(
+        admitted: &PeerOverlayAdmittedSet,
+        relays: impl IntoIterator<Item = PeerOverlayPeerRef>,
+    ) -> Result<PeerOverlayRelayAuthoritySet, TransportError> {
+        PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            admitted,
+            nonzero_32(1),
+            nonzero_32(2),
+            relays,
+        )
+    }
+
+    fn auth(epoch: u64) -> PeerOverlayAuth {
+        PeerOverlayAuth {
+            group_id_commitment: nonzero_32(1),
+            epoch,
+            sender_leaf_index: 5,
+            confirmation_tag_commitment: nonzero_32(2),
+            frame_auth_tag: vec![3; 16],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn candidate(
+        index: u8,
+        epoch: u64,
+        latency_ms: u32,
+        successful_health_probes: u32,
+        failed_health_probes: u32,
+        capacity: u64,
+        load: u64,
+        energy_cost_bps: u16,
+        freeload_penalty_bps: u16,
+    ) -> Result<PeerOverlayRelayCandidate, TransportError> {
+        Ok(PeerOverlayRelayCandidate {
+            relay: peer(index, epoch)?,
+            diagnostics: PeerOverlayRelayCandidateDiagnostics {
+                latency_ms,
+                successful_health_probes,
+                failed_health_probes,
+                egress_capacity_bytes_per_second: capacity,
+                current_load_bytes_per_second: load,
+                energy_cost_bps,
+                freeload_penalty_bps,
+            },
+        })
+    }
+
     fn frame(epoch: u64) -> Result<PeerOverlayFrame, TransportError> {
         let route = PeerOverlayRoute {
             source: peer(1, epoch)?,
@@ -880,6 +1146,171 @@ mod tests {
         assert_eq!(authorizations.len(), 1);
         assert_eq!(authorizations[0].relay, peer(2, 9)?);
         assert_eq!(authorizations[0].epoch, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn ranks_authorized_current_epoch_candidates_by_health_capacity_and_penalties(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = PeerOverlayAdmittedSet::new(
+            epoch,
+            [
+                peer(1, epoch)?,
+                peer(2, epoch)?,
+                peer(3, epoch)?,
+                peer(4, epoch)?,
+            ],
+            [],
+        )?;
+        let authority = relay_authority_for(&admitted, [peer(2, epoch)?, peer(4, epoch)?])?;
+
+        let ranked = rank_relay_candidates(
+            &admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [
+                candidate(2, epoch, 12, 10, 0, 96_000, 8_000, 100, 8_000)?,
+                candidate(4, epoch, 20, 10, 0, 192_000, 8_000, 100, 0)?,
+            ],
+        )?;
+
+        assert_eq!(ranked[0].relay.peer_id.0, "peer-4");
+        assert!(ranked[0].score > ranked[1].score);
+        assert_eq!(ranked[0].authorization.relay, peer(4, epoch)?);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_candidate_ties_are_deterministic_by_peer_identity() -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = PeerOverlayAdmittedSet::new(
+            epoch,
+            [
+                peer(1, epoch)?,
+                peer(2, epoch)?,
+                peer(3, epoch)?,
+                peer(4, epoch)?,
+            ],
+            [],
+        )?;
+        let authority = relay_authority_for(&admitted, [peer(4, epoch)?, peer(2, epoch)?])?;
+
+        let ranked = rank_relay_candidates(
+            &admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [
+                candidate(4, epoch, 25, 8, 0, 64_000, 4_000, 100, 0)?,
+                candidate(2, epoch, 25, 8, 0, 64_000, 4_000, 100, 0)?,
+            ],
+        )?;
+
+        assert_eq!(ranked[0].relay.peer_id.0, "peer-2");
+        assert_eq!(ranked[1].relay.peer_id.0, "peer-4");
+        Ok(())
+    }
+
+    #[test]
+    fn relay_candidate_ranking_rejects_revoked_stale_and_non_member_candidates(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let active = admitted(epoch)?;
+        let active_authority = relay_authority(&active, epoch)?;
+        let revoked = PeerOverlayAdmittedSet::new(
+            epoch,
+            [peer(1, epoch)?, peer(3, epoch)?],
+            [SignalingPeerId::new("peer-2")?],
+        )?;
+
+        assert!(rank_relay_candidates(
+            &revoked,
+            &active_authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [candidate(2, epoch, 20, 5, 0, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
+
+        assert!(rank_relay_candidates(
+            &active,
+            &active_authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [candidate(2, epoch - 1, 20, 5, 0, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
+
+        assert!(rank_relay_candidates(
+            &active,
+            &active_authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [candidate(4, epoch, 20, 5, 0, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn relay_candidate_ranking_rejects_missing_authority_unhealthy_and_policy_disallowed(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = PeerOverlayAdmittedSet::new(
+            epoch,
+            [
+                peer(1, epoch)?,
+                peer(2, epoch)?,
+                peer(3, epoch)?,
+                peer(4, epoch)?,
+            ],
+            [],
+        )?;
+        let authority = relay_authority(&admitted, epoch)?;
+
+        assert!(rank_relay_candidates(
+            &admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [candidate(4, epoch, 20, 5, 0, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
+
+        assert!(rank_relay_candidates(
+            &admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            [candidate(2, epoch, 20, 0, 5, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
+
+        assert!(rank_relay_candidates(
+            &admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy {
+                min_egress_capacity_bytes_per_second: 128_000,
+                ..PeerOverlayRelayCandidatePolicy::default()
+            },
+            [candidate(2, epoch, 20, 5, 0, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
+
+        assert!(rank_relay_candidates(
+            &admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy {
+                carrier: PeerOverlayCarrier::ProviderApplicationRelay,
+                ..PeerOverlayRelayCandidatePolicy::default()
+            },
+            [candidate(2, epoch, 20, 5, 0, 64_000, 0, 0, 0)?],
+        )
+        .is_err());
         Ok(())
     }
 

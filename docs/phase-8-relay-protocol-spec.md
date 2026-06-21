@@ -156,6 +156,10 @@ This issue intentionally does not implement:
 - split-machine or release-gate proof.
 
 PER-67 adds local Rust model/unit evidence for explicit relay authorization.
-Production evidence will require later runtime tasks that prove explicit route
-evidence, ciphertext-only forwarding, fail-closed revocation under live group
-state, and no provider application relay.
+PER-68 adds local candidate ranking that first requires current admitted-peer
+state and explicit relay authority, then ranks content-blind diagnostics by
+latency, health stability, spare capacity, energy cost, and freeload penalty
+with deterministic peer-identity ties. Production evidence will require later
+runtime tasks that prove explicit route evidence, ciphertext-only forwarding,
+fail-closed revocation under live group state, and no provider application
+relay.
