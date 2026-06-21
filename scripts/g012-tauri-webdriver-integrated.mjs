@@ -1196,7 +1196,7 @@ async function joinVoice(profile) {
   }
 }
 async function leaveVoice(profile) {
-  await click(profile, "leave call");
+  await click(profile, "Leave voice call");
   await waitUntil(profile, "left voice", "return /not joined/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackStopCount > 0;");
 }
 async function adjustRemoteParticipantVolume(profile, volume) {

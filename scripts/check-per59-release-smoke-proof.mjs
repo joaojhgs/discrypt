@@ -60,6 +60,7 @@ for (const token of [
   "after_voice_leave_reload",
   "await click(profiles.alice, \"^Mute$\");",
   "await click(profiles.alice, \"^Unmute$\");",
+  "await click(profile, \"Leave voice call\");",
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
