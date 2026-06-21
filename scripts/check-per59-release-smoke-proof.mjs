@@ -37,6 +37,10 @@ for (const token of [
   "approve_group_admission_request",
   "openmls-admission-request",
   "openmls_admission_owner_approval",
+  "waitForAdmissionUnlockedUi",
+  "post-admission unlocked composer",
+  "Waiting for owner\\/staff approval before protected messages can be sent",
+  "await click(profile, \"Send message\");",
 ]) {
   requireText("G012 WebDriver harness", harness, token);
 }
