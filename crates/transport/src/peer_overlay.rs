@@ -158,6 +158,252 @@ impl PeerOverlayAdmittedSet {
     }
 }
 
+/// Source of relay authority after backend/OpenMLS or governance verification.
+///
+/// This enum records which already-verified authority path produced a relay
+/// authorization set. It does not verify OpenMLS commits or governance
+/// signatures itself; callers must do that before constructing the set.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PeerOverlayRelayAuthoritySource {
+    /// Authority derived from current persisted OpenMLS/backend group state.
+    OpenMlsCurrentEpoch,
+    /// Authority derived from a signed governance grant that the caller has verified.
+    SignedGovernanceGrant {
+        /// Backend/OpenMLS-governed signer member id.
+        signer_member_id: String,
+        /// Backend/OpenMLS-governed signer device id.
+        signer_device_id: String,
+    },
+}
+
+impl PeerOverlayRelayAuthoritySource {
+    fn validate(&self) -> Result<(), TransportError> {
+        match self {
+            Self::OpenMlsCurrentEpoch => Ok(()),
+            Self::SignedGovernanceGrant {
+                signer_member_id,
+                signer_device_id,
+            } => {
+                validate_label(
+                    signer_member_id,
+                    "peer overlay relay authority signer member id",
+                )?;
+                validate_label(
+                    signer_device_id,
+                    "peer overlay relay authority signer device id",
+                )
+            }
+        }
+    }
+}
+
+/// Explicit relay authorization for one admitted current-epoch relay peer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayAuthorization {
+    /// Authority source that produced this relay grant.
+    pub source: PeerOverlayRelayAuthoritySource,
+    /// Commitment to the OpenMLS group id.
+    pub group_id_commitment: [u8; 32],
+    /// Current OpenMLS/backend epoch.
+    pub epoch: u64,
+    /// Commitment to the current OpenMLS confirmation tag.
+    pub confirmation_tag_commitment: [u8; 32],
+    /// Authorized admitted relay peer.
+    pub relay: PeerOverlayPeerRef,
+}
+
+impl PeerOverlayRelayAuthorization {
+    fn validate_for(
+        &self,
+        relay: &PeerOverlayPeerRef,
+        auth: &PeerOverlayAuth,
+    ) -> Result<(), TransportError> {
+        self.source.validate()?;
+        validate_nonzero_32(
+            self.group_id_commitment,
+            "peer overlay relay authority group id commitment",
+        )?;
+        validate_nonzero_32(
+            self.confirmation_tag_commitment,
+            "peer overlay relay authority confirmation commitment",
+        )?;
+        if self.epoch != auth.epoch {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority epoch must match frame auth epoch",
+            ));
+        }
+        if self.group_id_commitment != auth.group_id_commitment {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority group commitment must match frame auth",
+            ));
+        }
+        if self.confirmation_tag_commitment != auth.confirmation_tag_commitment {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority confirmation commitment must match frame auth",
+            ));
+        }
+        if self.relay != *relay {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority does not match route relay ref",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Current relay authority set supplied by backend/OpenMLS state or signed governance evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayAuthoritySet {
+    /// Authority source that produced the relay set.
+    pub source: PeerOverlayRelayAuthoritySource,
+    /// Current group epoch for relay authority.
+    pub current_epoch: u64,
+    /// Commitment to the OpenMLS group id.
+    pub group_id_commitment: [u8; 32],
+    /// Commitment to the current OpenMLS confirmation tag.
+    pub confirmation_tag_commitment: [u8; 32],
+    authorized_relays: BTreeMap<SignalingPeerId, PeerOverlayPeerRef>,
+}
+
+impl PeerOverlayRelayAuthoritySet {
+    /// Build a relay authority set from already-verified OpenMLS/backend state.
+    pub fn from_openmls_current_epoch(
+        admitted: &PeerOverlayAdmittedSet,
+        group_id_commitment: [u8; 32],
+        confirmation_tag_commitment: [u8; 32],
+        relays: impl IntoIterator<Item = PeerOverlayPeerRef>,
+    ) -> Result<Self, TransportError> {
+        Self::new(
+            PeerOverlayRelayAuthoritySource::OpenMlsCurrentEpoch,
+            admitted,
+            group_id_commitment,
+            confirmation_tag_commitment,
+            relays,
+        )
+    }
+
+    /// Build a relay authority set from already-verified signed governance evidence.
+    pub fn from_signed_governance_grant(
+        signer_member_id: impl Into<String>,
+        signer_device_id: impl Into<String>,
+        admitted: &PeerOverlayAdmittedSet,
+        group_id_commitment: [u8; 32],
+        confirmation_tag_commitment: [u8; 32],
+        relays: impl IntoIterator<Item = PeerOverlayPeerRef>,
+    ) -> Result<Self, TransportError> {
+        Self::new(
+            PeerOverlayRelayAuthoritySource::SignedGovernanceGrant {
+                signer_member_id: signer_member_id.into(),
+                signer_device_id: signer_device_id.into(),
+            },
+            admitted,
+            group_id_commitment,
+            confirmation_tag_commitment,
+            relays,
+        )
+    }
+
+    fn new(
+        source: PeerOverlayRelayAuthoritySource,
+        admitted: &PeerOverlayAdmittedSet,
+        group_id_commitment: [u8; 32],
+        confirmation_tag_commitment: [u8; 32],
+        relays: impl IntoIterator<Item = PeerOverlayPeerRef>,
+    ) -> Result<Self, TransportError> {
+        source.validate()?;
+        validate_nonzero_32(
+            group_id_commitment,
+            "peer overlay relay authority group id commitment",
+        )?;
+        validate_nonzero_32(
+            confirmation_tag_commitment,
+            "peer overlay relay authority confirmation commitment",
+        )?;
+        let mut authorized_relays = BTreeMap::new();
+        for relay in relays {
+            admitted.validate_ref(&relay)?;
+            if authorized_relays
+                .insert(relay.peer_id.clone(), relay)
+                .is_some()
+            {
+                return Err(overlay_policy_error(
+                    "peer overlay relay authority peers must be unique",
+                ));
+            }
+        }
+        if authorized_relays.is_empty() {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority requires at least one relay peer",
+            ));
+        }
+        Ok(Self {
+            source,
+            current_epoch: admitted.current_epoch,
+            group_id_commitment,
+            confirmation_tag_commitment,
+            authorized_relays,
+        })
+    }
+
+    /// Return an explicit authorization proof for one relay ref.
+    pub fn authorize_relay(
+        &self,
+        relay: &PeerOverlayPeerRef,
+        auth: &PeerOverlayAuth,
+    ) -> Result<PeerOverlayRelayAuthorization, TransportError> {
+        if self.current_epoch != auth.epoch {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority set epoch must match frame auth epoch",
+            ));
+        }
+        if self.group_id_commitment != auth.group_id_commitment {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority set group commitment must match frame auth",
+            ));
+        }
+        if self.confirmation_tag_commitment != auth.confirmation_tag_commitment {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority set confirmation commitment must match frame auth",
+            ));
+        }
+        let authorized = self.authorized_relays.get(&relay.peer_id).ok_or_else(|| {
+            overlay_policy_error(
+                "peer overlay relay ref lacks explicit current-epoch relay authority",
+            )
+        })?;
+        if authorized != relay {
+            return Err(overlay_policy_error(
+                "peer overlay relay authority does not match admitted member/device binding",
+            ));
+        }
+        Ok(PeerOverlayRelayAuthorization {
+            source: self.source.clone(),
+            group_id_commitment: self.group_id_commitment,
+            epoch: self.current_epoch,
+            confirmation_tag_commitment: self.confirmation_tag_commitment,
+            relay: authorized.clone(),
+        })
+    }
+
+    /// Validate every relay hop in a route against explicit relay authority.
+    pub fn validate_route_authority(
+        &self,
+        route: &PeerOverlayRoute,
+        auth: &PeerOverlayAuth,
+    ) -> Result<Vec<PeerOverlayRelayAuthorization>, TransportError> {
+        route
+            .relay_path
+            .iter()
+            .map(|relay| {
+                let authorization = self.authorize_relay(relay, auth)?;
+                authorization.validate_for(relay, auth)?;
+                Ok(authorization)
+            })
+            .collect()
+    }
+}
+
 /// Peer overlay route refs and loop controls.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PeerOverlayRoute {
@@ -264,16 +510,11 @@ impl PeerOverlayAuth {
                 "peer overlay auth epoch must match current admitted epoch",
             ));
         }
-        if self.group_id_commitment == [0; 32] {
-            return Err(overlay_policy_error(
-                "peer overlay group id commitment must not be all zero",
-            ));
-        }
-        if self.confirmation_tag_commitment == [0; 32] {
-            return Err(overlay_policy_error(
-                "peer overlay confirmation commitment must not be all zero",
-            ));
-        }
+        validate_nonzero_32(self.group_id_commitment, "peer overlay group id commitment")?;
+        validate_nonzero_32(
+            self.confirmation_tag_commitment,
+            "peer overlay confirmation commitment",
+        )?;
         if self.frame_auth_tag.len() < 16 {
             return Err(overlay_policy_error(
                 "peer overlay frame auth tag must be at least 16 bytes",
@@ -497,12 +738,32 @@ impl PeerOverlayFrame {
         self.delivery.validate(&self.route.ttl)?;
         self.payload.validate()
     }
+
+    /// Validate a frame and require explicit relay authorization for every relay hop.
+    pub fn validate_relay_authorized(
+        &self,
+        admitted: &PeerOverlayAdmittedSet,
+        relay_authority: &PeerOverlayRelayAuthoritySet,
+    ) -> Result<Vec<PeerOverlayRelayAuthorization>, TransportError> {
+        self.validate(admitted)?;
+        relay_authority.validate_route_authority(&self.route, &self.auth)
+    }
 }
 
 fn validate_label(value: &str, label: &str) -> Result<(), TransportError> {
     if value.trim().is_empty() || value.trim() != value || value.len() > 128 {
         Err(overlay_policy_error(format!(
             "{label} must be non-empty trimmed text up to 128 bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_nonzero_32(value: [u8; 32], label: &str) -> Result<(), TransportError> {
+    if value == [0; 32] {
+        Err(overlay_policy_error(format!(
+            "{label} must not be all zero"
         )))
     } else {
         Ok(())
@@ -536,6 +797,18 @@ mod tests {
 
     fn nonzero_32(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    fn relay_authority(
+        admitted: &PeerOverlayAdmittedSet,
+        epoch: u64,
+    ) -> Result<PeerOverlayRelayAuthoritySet, TransportError> {
+        PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            admitted,
+            nonzero_32(1),
+            nonzero_32(2),
+            [peer(2, epoch)?],
+        )
     }
 
     fn frame(epoch: u64) -> Result<PeerOverlayFrame, TransportError> {
@@ -597,6 +870,52 @@ mod tests {
     }
 
     #[test]
+    fn relay_authorization_accepts_only_explicit_current_epoch_relays() -> Result<(), TransportError>
+    {
+        let admitted = admitted(9)?;
+        let frame = frame(9)?;
+        let authority = relay_authority(&admitted, 9)?;
+
+        let authorizations = frame.validate_relay_authorized(&admitted, &authority)?;
+        assert_eq!(authorizations.len(), 1);
+        assert_eq!(authorizations[0].relay, peer(2, 9)?);
+        assert_eq!(authorizations[0].epoch, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn signed_governance_relay_authority_binds_group_epoch_and_confirmation(
+    ) -> Result<(), TransportError> {
+        let admitted = admitted(9)?;
+        let frame = frame(9)?;
+        let authority = PeerOverlayRelayAuthoritySet::from_signed_governance_grant(
+            "owner-member",
+            "owner-device",
+            &admitted,
+            nonzero_32(1),
+            nonzero_32(2),
+            [peer(2, 9)?],
+        )?;
+
+        assert!(frame
+            .validate_relay_authorized(&admitted, &authority)
+            .is_ok());
+
+        let wrong_group = PeerOverlayRelayAuthoritySet::from_signed_governance_grant(
+            "owner-member",
+            "owner-device",
+            &admitted,
+            nonzero_32(8),
+            nonzero_32(2),
+            [peer(2, 9)?],
+        )?;
+        assert!(frame
+            .validate_relay_authorized(&admitted, &wrong_group)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn rejects_provider_application_relay_carrier() -> Result<(), TransportError> {
         let admitted = admitted(9)?;
         let mut frame = frame(9)?;
@@ -618,6 +937,57 @@ mod tests {
             [SignalingPeerId::new("peer-2")?],
         )?;
         assert!(frame(9)?.validate(&revoked_set).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn revoked_non_member_and_stale_relays_lack_relay_authority() -> Result<(), TransportError> {
+        let active = admitted(9)?;
+        let revoked = PeerOverlayAdmittedSet::new(
+            9,
+            [peer(1, 9)?, peer(3, 9)?],
+            [SignalingPeerId::new("peer-2")?],
+        )?;
+        assert!(PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            &revoked,
+            nonzero_32(1),
+            nonzero_32(2),
+            [peer(2, 9)?],
+        )
+        .is_err());
+
+        assert!(PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            &active,
+            nonzero_32(1),
+            nonzero_32(2),
+            [peer(4, 9)?],
+        )
+        .is_err());
+
+        assert!(PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            &active,
+            nonzero_32(1),
+            nonzero_32(2),
+            [peer(2, 8)?],
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn route_graph_membership_alone_is_not_relay_authority() -> Result<(), TransportError> {
+        let admitted = PeerOverlayAdmittedSet::new(
+            9,
+            [peer(1, 9)?, peer(2, 9)?, peer(3, 9)?, peer(4, 9)?],
+            [],
+        )?;
+        let mut frame = frame(9)?;
+        frame.route.relay_path = vec![peer(4, 9)?];
+        let authority = relay_authority(&admitted, 9)?;
+
+        assert!(frame
+            .validate_relay_authorized(&admitted, &authority)
+            .is_err());
         Ok(())
     }
 

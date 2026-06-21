@@ -30,6 +30,7 @@ pub use peer_overlay::{
     PeerOverlayAckId, PeerOverlayAckMode, PeerOverlayAdmittedSet, PeerOverlayAuth,
     PeerOverlayCarrier, PeerOverlayDelivery, PeerOverlayFrame, PeerOverlayLoopId,
     PeerOverlayOpaquePayload, PeerOverlayPayloadKind, PeerOverlayPeerRef, PeerOverlayRedelivery,
+    PeerOverlayRelayAuthoritySet, PeerOverlayRelayAuthoritySource, PeerOverlayRelayAuthorization,
     PeerOverlayRoute, PeerOverlayTtl, PEER_OVERLAY_FRAME_SCHEMA_VERSION,
     PEER_OVERLAY_MAX_RELAY_HOPS,
 };
