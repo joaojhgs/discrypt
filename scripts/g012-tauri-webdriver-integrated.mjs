@@ -315,18 +315,72 @@ function sealVoiceSignalPayloadNode({ session_id, group_id, channel_id, from_pee
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
   return `voice-signal-sealed:v1:${base64Url(nonce)}.${base64Url(encrypted)}`;
 }
+function backendHashCommitment(domain, parts) {
+  const hash = createHash("sha256");
+  hash.update(domain);
+  for (const part of parts) {
+    hash.update(Buffer.from([0]));
+    hash.update(String(part));
+  }
+  return hash.digest("hex");
+}
+function backendRuntimePeerIdFromCommitment(label, commitment) {
+  return `peer-${backendHashCommitment("discrypt-runtime-peer-id-v1", [label, commitment]).slice(0, 16)}`;
+}
+function backendGroupRuntimePeers(group, localRole) {
+  const bootstrap = group?.connectivity?.group_bootstrap;
+  if (!bootstrap) return null;
+  const owner = backendRuntimePeerIdFromCommitment("group-owner-runtime-peer", bootstrap.group_identity_commitment);
+  const memberCommitment = `${bootstrap.role_admission_policy_commitment}:${bootstrap.channel_policy_commitment}`;
+  const member = backendRuntimePeerIdFromCommitment("group-member-runtime-peer", memberCommitment);
+  const localIsOwner = /^(owner|staff)$/i.test(localRole || "");
+  return {
+    local: localIsOwner ? owner : member,
+    remote: localIsOwner ? member : owner,
+    local_role: localRole,
+    source: "backend-derived-signed-group-bootstrap",
+  };
+}
+function localGovernedGroupRole(state, group) {
+  const localUserId = state?.profile?.user_id;
+  const member = group?.members?.find((item) =>
+    item?.member_id === localUserId &&
+    item?.status !== "revoked" &&
+    item?.status !== "migration_default"
+  );
+  if (!member?.role) return null;
+  const hasRoleEvidence = group?.governance_log?.some((entry) =>
+    entry?.target_member_id === localUserId &&
+    entry?.role_after === member.role &&
+    entry?.event_kind !== "group_governance_initialized" &&
+    entry?.event_kind !== "governance.defaults_restored"
+  );
+  return hasRoleEvidence ? member.role : null;
+}
 function runtimePeersFromAppState(state) {
+  const session = state?.voice_session ?? {};
+  if (session.signaling?.local_peer_id && session.signaling?.remote_peer_id) {
+    return {
+      local: session.signaling.local_peer_id,
+      remote: session.signaling.remote_peer_id,
+      source: "voice-session-signaling",
+    };
+  }
   const active = state?.active_context ?? {};
-  const group = active.group_id
-    ? state.groups?.find((item) => item.group_id === active.group_id)
+  const groupId = session.group_id || active.group_id;
+  const group = groupId
+    ? state.groups?.find((item) => item.group_id === groupId)
     : state.groups?.[0];
+  const governedRole = localGovernedGroupRole(state, group);
+  const backendPeers = backendGroupRuntimePeers(group, governedRole);
+  if (backendPeers?.local && backendPeers?.remote) return backendPeers;
   const peers = group?.runtime_peers ?? [];
   const local = peers.find((peer) => peer.is_local);
   const remote = peers.find((peer) => !peer.is_local);
   if (!local?.peer_id || !remote?.peer_id) {
-    throw new Error(`Could not derive runtime peers from app_state for ${active.group_id || "active group"}`);
+    throw new Error(`Could not derive runtime peers from app_state for ${groupId || "active group"}`);
   }
-  return { local: local.peer_id, remote: remote.peer_id };
+  return { local: local.peer_id, remote: remote.peer_id, source: "persisted-runtime-peers" };
 }
 async function publishBackendNativeVoiceProof(profile) {
   const state = await invokeTauriCommand(profile, "app_state");
@@ -374,6 +428,15 @@ async function publishBackendNativeVoiceProof(profile) {
     session_id: session.session_id,
     local_peer_id: peers.local,
     remote_peer_id: peers.remote,
+    peer_source: peers.source ?? null,
+    local_role: peers.local_role ?? null,
+    mic_gain_percent: nativeMedia.mic_gain_percent,
+    app_output_volume_percent: nativeMedia.app_output_volume_percent,
+    rms_i16: nativeMedia.rms_i16,
+    peak_i16: nativeMedia.peak_i16,
+    speaking: nativeMedia.speaking,
+    opus_payload_bytes: nativeMedia.opus_payload_bytes,
+    protected_payload_bytes: nativeMedia.protected_payload_bytes,
     protected_frames_count: nativeMedia.protected_frames_count,
     queued_signaling_status: queued?.voice_session?.signaling?.status_copy ?? null,
   };
@@ -439,6 +502,48 @@ async function acceptPendingNativeVoiceSignals(profile, label) {
 }
 async function appState(profile) {
   return invokeTauriCommand(profile, "app_state", {});
+}
+async function configureReleaseSmokeAudioPreferences(profiles) {
+  const targets = {
+    alice: { mic_gain_percent: 155, app_output_volume_percent: 37 },
+    bob: { mic_gain_percent: 120, app_output_volume_percent: 64 },
+  };
+  const reports = {};
+  for (const [name, profile] of Object.entries(profiles)) {
+    const before = await appState(profile);
+    const target = targets[name];
+    if (!target) continue;
+    const saved = await invokeTauriCommand(profile, "save_preferences", {
+      request: {
+        theme_id: before?.preferences?.theme_id || "midnight-mono",
+        template_id: before?.preferences?.template_id || "dense-chat",
+        voice_input_device_id: before?.preferences?.voice_input_device_id || "default",
+        voice_output_device_id: before?.preferences?.voice_output_device_id || "default",
+        mic_gain_percent: target.mic_gain_percent,
+        app_output_volume_percent: target.app_output_volume_percent,
+      },
+    });
+    reports[name] = {
+      target,
+      before: before?.preferences ?? null,
+      after: saved?.preferences ?? null,
+      persisted: saved?.preferences?.mic_gain_percent === target.mic_gain_percent &&
+        saved?.preferences?.app_output_volume_percent === target.app_output_volume_percent,
+    };
+  }
+  manifest.per59_audio_preferences = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
+}
+async function readReleaseSmokeAudioPreferences(profiles, label) {
+  const reports = {};
+  for (const [name, profile] of Object.entries(profiles)) {
+    const state = await appState(profile);
+    reports[name] = state?.preferences ?? null;
+  }
+  manifest[`per59_audio_preferences_${label.replace(/\W+/g, "_")}`] = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
 }
 function providerRuntimeProofed(state) {
   const diagnostics = state?.transport_diagnostics || {};
@@ -604,6 +709,60 @@ function hasOpenMlsAdmission(state) {
   return Boolean(handle) || { group_id: groupId, handles: handles.map((entry) => ({ group_id: entry?.group_id, epoch: entry?.epoch })), joined: events.some((event) => event?.kind === "mls.admission_welcome_joined") };
 }
 
+function pendingAdmissionRequest(state) {
+  const groups = Array.isArray(state?.groups) ? state.groups : [];
+  const group = groups.find((candidate) => candidate?.name === "Two Profile WebDriver Lab");
+  const request = group?.admission_requests?.find((candidate) => candidate?.status === "pending");
+  if (!group || !request) {
+    return {
+      group_id: group?.group_id ?? null,
+      pending_count: group?.admission_requests?.filter((candidate) => candidate?.status === "pending").length ?? 0,
+    };
+  }
+  return {
+    group_id: group.group_id,
+    request_id: request.request_id,
+    display_name: request.display_name,
+    key_package_bytes: Array.isArray(request.key_package) ? request.key_package.length : 0,
+  };
+}
+
+async function approvePendingAdmission(profile) {
+  const deadline = Date.now() + 60_000;
+  let pending = null;
+  while (Date.now() < deadline) {
+    const state = readJsonIfExists(profile.state_path);
+    pending = pendingAdmissionRequest(state);
+    if (pending?.group_id && pending?.request_id) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  if (!pending?.group_id || !pending?.request_id) {
+    manifest.openmls_admission_owner_approval = { approved: false, pending };
+    throw new Error(`${profile.display_name} did not persist a pending OpenMLS admission request; last=${JSON.stringify(pending)}`);
+  }
+  const approvedState = await invokeTauriCommand(profile, "approve_group_admission_request", {
+    request: {
+      group_id: pending.group_id,
+      request_id: pending.request_id,
+    },
+  });
+  const error = approvedState?.last_command_error ?? null;
+  const approved = !error && approvedState?.groups?.some((group) =>
+    group?.group_id === pending.group_id &&
+    group?.admission_requests?.some((request) => request?.request_id === pending.request_id && request?.status === "approved")
+  );
+  manifest.openmls_admission_owner_approval = {
+    approved,
+    pending,
+    last_command_error: error,
+    command: "approve_group_admission_request",
+  };
+  writeManifest(manifest.status || "running", {});
+  if (!approved) {
+    throw new Error(`${profile.display_name} failed to approve OpenMLS admission; result=${JSON.stringify(manifest.openmls_admission_owner_approval)}`);
+  }
+}
+
 async function waitForMaybe(profile, label, script, args = [], timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
   let last = false;
@@ -622,7 +781,42 @@ async function waitForMaybe(profile, label, script, args = [], timeoutMs = 90_00
 }
 async function reloadProfile(profile) {
   await exec(profile, "location.reload(); return true;");
-  await waitUntil(profile, "post-reload app shell", "return /Local-first workspace|Set up your local discrypt profile/i.test(document.body.innerText)", [], 30_000);
+  await waitUntil(profile, "post-reload app shell", "return /Local-first workspace|Set up your local discrypt profile|Local profile ready|Start a private space|Two Profile WebDriver Lab/i.test(document.body.innerText)", [], 30_000);
+}
+
+async function assertNoAdmissionDecisionApplyFailure(profile, label) {
+  const state = await appState(profile);
+  const error = state?.last_command_error ?? null;
+  const failed = error?.command === "handle_text_control_frame" && error?.code === "admission_decision_apply_failed";
+  manifest[`admission_decision_apply_failure_${label}`] = {
+    profile: profile.display_name,
+    failed,
+    last_command_error: error,
+  };
+  writeManifest(manifest.status || "running", {});
+  if (failed) {
+    throw new Error(`${profile.display_name} failed to apply admission decision before Welcome unlock: ${JSON.stringify(error)}`);
+  }
+}
+
+async function waitForAdmissionUnlockedUi(profile) {
+  await waitUntil(profile, "post-admission unlocked composer", String.raw`
+    const text = document.body.innerText || '';
+    const waiting = /Waiting for owner\/staff approval before protected messages can be sent/i.test(text);
+    const messageInputs = [...document.querySelectorAll('input, textarea')];
+    const messageEditable = messageInputs.some((el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      const label = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('data-testid')]
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return visible && !el.disabled && !el.readOnly && /Message|Send a message/i.test(label);
+    });
+    return /Two Profile WebDriver Lab/i.test(text) && !waiting && messageEditable;
+  `, [], 60_000);
 }
 
 async function waitUntil(profile, label, script, args = [], timeoutMs = 30_000) {
@@ -706,6 +900,29 @@ const clickText = (pattern, flags = 'i') => {
   el.click();
   return true;
 };
+const contextClickText = (pattern, flags = 'i') => {
+  const candidates = [...document.querySelectorAll('button, [role="button"], a, [tabindex], [data-testid]')]
+    .filter((el) => visible(el) && textMatches(accessibleText(el), pattern, flags));
+  const el = candidates[0];
+  if (!el) return false;
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  const rect = el.getBoundingClientRect();
+  const options = {
+    bubbles: true,
+    cancelable: true,
+    button: 2,
+    buttons: 2,
+    clientX: Math.round(rect.left + rect.width / 2),
+    clientY: Math.round(rect.top + rect.height / 2),
+  };
+  const PointerCtor = window.PointerEvent || MouseEvent;
+  el.dispatchEvent(new PointerCtor('pointerdown', options));
+  el.dispatchEvent(new MouseEvent('mousedown', options));
+  el.dispatchEvent(new MouseEvent('contextmenu', options));
+  el.dispatchEvent(new MouseEvent('mouseup', options));
+  el.dispatchEvent(new PointerCtor('pointerup', options));
+  return true;
+};
 const debugVisibleActions = () => [...document.querySelectorAll('button, [role="button"], a, [tabindex], [data-testid]')]
   .filter((el) => visible(el))
   .map((el) => accessibleText(el) + (el.disabled ? ' [disabled]' : '') + (el.getAttribute('aria-disabled') === 'true' ? ' [aria-disabled]' : ''))
@@ -733,6 +950,10 @@ async function clickText(profile, pattern) {
   const ok = await exec(profile, `${domHelpers}; return clickText(arguments[0], 'i');`, [pattern]);
   if (!ok) throw new Error(`${profile.display_name} could not click text matching ${pattern}; visible actions=${JSON.stringify(await visibleActions(profile))}`);
 }
+async function contextClickText(profile, pattern) {
+  const ok = await exec(profile, `${domHelpers}; return contextClickText(arguments[0], 'i');`, [pattern]);
+  if (!ok) throw new Error(`${profile.display_name} could not context-click text matching ${pattern}; visible actions=${JSON.stringify(await visibleActions(profile))}`);
+}
 async function fill(profile, label, value) {
   const ok = await exec(profile, `${domHelpers}; return setControlValue(arguments[0], arguments[1]);`, [label, value]);
   if (!ok) throw new Error(`${profile.display_name} could not fill ${label}`);
@@ -742,20 +963,26 @@ async function setupProfile(profile) {
   await fill(profile, "Display name", profile.display_name);
   await fill(profile, "Device name", profile.device_name);
   await click(profile, "create new user");
-  await waitUntil(profile, "trust setup screen", "return /finish the local trust setup/i.test(document.body.innerText)");
+  await waitUntil(
+    profile,
+    "profile ready or trust setup screen",
+    "return /finish the local trust setup|local profile ready|start a private space/i.test(document.body.innerText)",
+  );
 }
 async function createGroupInvite(profile) {
   await click(profile, "Create (a )?group");
   await fill(profile, "Group name", "Two Profile WebDriver Lab");
   await click(profile, "^Create group$", { last: true });
   await waitUntil(profile, "created group", "return /Two Profile WebDriver Lab/i.test(document.body.innerText)");
+  await contextClickText(profile, "Open Two Profile WebDriver Lab group");
   await click(profile, "Create invite");
+  await click(profile, "Create invite for Two Profile WebDriver Lab");
   return waitUntil(profile, "invite URL", "const m = document.body.innerText.match(new RegExp('discrypt:\\\\/\\\\/join\\\\/v1\\\\/\\\\S+')); return m && m[0];");
 }
 async function joinGroup(profile, invite) {
-  await click(profile, "Join group");
+  await click(profile, "Join with invite");
   await fill(profile, "Invite URL or code", invite);
-  await fill(profile, "Joined group/contact label", "Two Profile WebDriver Lab");
+  await fill(profile, "Local label", "Two Profile WebDriver Lab");
   await click(profile, "join/open group");
   await waitUntil(profile, "joined group", "return /Two Profile WebDriver Lab/i.test(document.body.innerText)");
 }
@@ -763,7 +990,7 @@ async function sendGroupMessage(profile, message) {
   await clickText(profile, "#general");
   await waitUntil(profile, "general channel", "return /#general/i.test(document.body.innerText)");
   await fill(profile, "Message", message);
-  await click(profile, "^Send message$");
+  await click(profile, "Send message");
   await waitUntil(profile, `message ${message}`, "return document.body.innerText.includes(arguments[0]);", [message]);
 }
 async function installVoiceHarness(profile) {
@@ -883,14 +1110,160 @@ async function installVoiceHarness(profile) {
   `, [profile.display_name.toLowerCase(), requireNativeVoice || disableSyntheticVoiceFallback]);
 }
 
+const alreadyJoinedVoiceUiPredicate = `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`;
+
+async function readAlreadyJoinedNativeVoice(profile) {
+  const state = await appState(profile);
+  const nativeMediaStarted = state?.events?.some((event) => event?.kind === "voice.native_media_started");
+  const nativeMediaReceived = state?.events?.some((event) => event?.kind === "voice.native_media_received");
+  const joinedUi = await exec(profile, alreadyJoinedVoiceUiPredicate);
+  return {
+    ok: Boolean(requireNativeVoice && nativeMediaStarted && nativeMediaReceived && !state?.last_command_error && joinedUi),
+    state,
+    nativeMediaStarted,
+    nativeMediaReceived,
+    joinedUi,
+  };
+}
+
+async function waitForAlreadyJoinedNativeVoice(profile, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await readAlreadyJoinedNativeVoice(profile);
+    if (last.ok) {
+      await waitUntil(profile, "already joined native voice media", alreadyJoinedVoiceUiPredicate);
+      return true;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  manifest[`${profile.display_name.toLowerCase()}_already_joined_native_voice_last`] = {
+    native_media_started: Boolean(last?.nativeMediaStarted),
+    native_media_received: Boolean(last?.nativeMediaReceived),
+    joined_ui: Boolean(last?.joinedUi),
+    last_command_error: last?.state?.last_command_error ?? null,
+  };
+  writeManifest(manifest.status || "running", {});
+  return false;
+}
+
 async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
+  if (requireNativeVoice && await waitForAlreadyJoinedNativeVoice(profile)) {
+    return;
+  }
+  const before = await appState(profile);
+  if (before?.voice_session?.joined) {
+    if (
+      requireNativeVoice &&
+      before?.last_command_error?.command === "start_native_voice_media_session"
+    ) {
+      const commandError = before.last_command_error;
+      throw new Error(`${profile.display_name} native voice media failed after join; ${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`);
+    }
+    if (before?.voice_session?.media_runtime?.local_capture_active) {
+      if (requireNativeVoice) {
+        if (await waitForAlreadyJoinedNativeVoice(profile, 45_000)) {
+          return;
+        }
+        const after = await appState(profile);
+        const commandError = after?.last_command_error;
+        const detail = commandError
+          ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
+          : "native media start/receive evidence did not settle";
+        throw new Error(`${profile.display_name} is already joined locally but native voice media is not active; ${detail}`);
+      }
+      await waitUntil(profile, "already joined local voice participant", alreadyJoinedVoiceUiPredicate);
+      return;
+    }
+    if (requireNativeVoice) {
+      const commandError = before?.last_command_error;
+      const detail = commandError
+        ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
+        : "no backend command error was recorded";
+      throw new Error(`${profile.display_name} is already joined but native voice media is not active; ${detail}`);
+    }
+  }
   await click(profile, "join call");
   await waitUntil(profile, "local voice participant", `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`);
+  if (requireNativeVoice && !await waitForAlreadyJoinedNativeVoice(profile, 45_000)) {
+    const after = await appState(profile);
+    const commandError = after?.last_command_error;
+    const detail = commandError
+      ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
+      : "native media start/receive evidence did not settle";
+    throw new Error(`${profile.display_name} joined voice but native voice media is not active; ${detail}`);
+  }
 }
 async function leaveVoice(profile) {
-  await click(profile, "leave call");
-  await waitUntil(profile, "left voice", "return /not joined/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackStopCount > 0;");
+  await click(profile, "Leave voice call");
+  return waitForLeftVoice(profile);
+}
+async function readLeftVoiceState(profile) {
+  const persistedState = readJsonIfExists(profile.state_path);
+  const persistedEvents = Array.isArray(persistedState?.events) ? persistedState.events : [];
+  const voiceLeftEvent = persistedEvents.some((event) => event?.kind === "voice.left");
+  const voiceSessionCleared = Boolean(persistedState && !persistedState.parse_error && !persistedState.voice_session);
+  return {
+    ok: Boolean(voiceSessionCleared && voiceLeftEvent),
+    source: "persisted_app_state",
+    voice_session_cleared: voiceSessionCleared,
+    voice_left_event: voiceLeftEvent,
+    left_ui: null,
+    webview_track_stopped: null,
+    last_command_error: persistedState?.last_command_error ?? null,
+    parse_error: persistedState?.parse_error ?? null,
+  };
+}
+async function waitForLeftVoice(profile, timeoutMs = 120_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await readLeftVoiceState(profile);
+    if (last.ok) return { profile: profile.display_name, ...last };
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  manifest[`${profile.display_name.toLowerCase()}_left_voice_last`] = last;
+  writeManifest(manifest.status || "running", {});
+  throw new Error(`${profile.display_name} timed out waiting for left voice; last=${JSON.stringify(last)}`);
+}
+async function adjustRemoteParticipantVolume(profile, volume) {
+  const state = await appState(profile);
+  const session = state?.voice_session;
+  const participant = session?.participants?.find((item) => item?.role === "remote" && item?.id);
+  if (!session?.session_id || !participant?.id) {
+    return {
+      profile: profile.display_name,
+      volume,
+      changed: false,
+      reason: "No backend-admitted remote voice participant was visible",
+    };
+  }
+  const updated = await invokeTauriCommand(profile, "set_speaker_volume", {
+    request: {
+      session_id: session.session_id,
+      participant_id: participant.id,
+      volume,
+    },
+  });
+  const after = updated?.voice_session?.participants?.find((item) => item?.id === participant.id);
+  return {
+    profile: profile.display_name,
+    participant_id: participant.id,
+    volume,
+    changed: after?.volume === volume,
+    after_volume: after?.volume ?? null,
+    last_command_error: updated?.last_command_error ?? null,
+  };
+}
+async function adjustRemoteParticipantVolumes(profiles) {
+  const reports = {
+    alice: await adjustRemoteParticipantVolume(profiles.alice, 41),
+    bob: await adjustRemoteParticipantVolume(profiles.bob, 73),
+  };
+  manifest.per59_remote_participant_volume = reports;
+  writeManifest(manifest.status || "running", {});
+  return reports;
 }
 async function voiceCallFlow(profiles) {
   await Promise.all([installVoiceHarness(profiles.alice), installVoiceHarness(profiles.bob)]);
@@ -931,36 +1304,48 @@ async function voiceCallFlow(profiles) {
     ]);
     if (observed.every(Boolean)) break;
   }
-  await reloadProfile(profiles.alice);
-  await reloadProfile(profiles.bob);
-  await Promise.all([
-    waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
-    waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 45_000),
-  ]);
+  const remoteParticipantVolume = await adjustRemoteParticipantVolumes(profiles);
   await clickText(profiles.alice, "Voice Lobby");
   await clickText(profiles.bob, "Voice Lobby");
   const beforeLeave = {
     alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
     bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
   };
-  await click(profiles.alice, "mute my microphone");
-  await waitUntil(profiles.alice, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
-  await click(profiles.alice, "mute my microphone");
-  await Promise.all([leaveVoice(profiles.alice), leaveVoice(profiles.bob)]);
+  await click(profiles.alice, "^Mute$");
+  await waitUntil(profiles.alice, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
+  const afterMute = {
+    alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
+    bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
+  };
+  await click(profiles.alice, "^Unmute$");
+  const [aliceLeaveCleanup, bobLeaveCleanup] = await Promise.all([
+    leaveVoice(profiles.alice),
+    leaveVoice(profiles.bob),
+  ]);
+  await reloadProfile(profiles.alice);
+  await reloadProfile(profiles.bob);
+  const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_leave_reload");
   return {
     alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     backend_native_proofs: backendNativeProofs,
     per56_provider_runtime_voice_signaling: providerVoiceSignaling,
+    remote_participant_volume: remoteParticipantVolume,
+    reloaded_audio_preferences: reloadedAudioPreferences,
     before_leave: beforeLeave,
+    after_mute: afterMute,
+    leave_cleanup: {
+      alice: aliceLeaveCleanup,
+      bob: bobLeaveCleanup,
+    },
   };
 }
 async function voiceFlow(profile) {
   await installVoiceHarness(profile);
   await joinVoice(profile);
-  await click(profile, "mute my microphone");
-  await waitUntil(profile, "muted microphone", "return /muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
-  await click(profile, "mute my microphone");
+  await click(profile, "^Mute$");
+  await waitUntil(profile, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
+  await click(profile, "^Unmute$");
   await leaveVoice(profile);
   return exec(profile, "return window.__discryptG012WebDriverVoiceEvidence || null;");
 }
@@ -992,11 +1377,22 @@ try {
   writeManifest("sessions-ready", { sessions: Object.fromEntries(Object.entries(profiles).map(([k, p]) => [k, { session_id: p.session_id, capabilities: p.capabilities }])), });
   await setupProfile(profiles.alice);
   await setupProfile(profiles.bob);
+  const audioPreferences = await configureReleaseSmokeAudioPreferences(profiles);
   const invite = await createGroupInvite(profiles.alice);
   await joinGroup(profiles.bob, invite);
+  await bridgeTextControlFramesBidirectional(profiles, "openmls-admission-request", 4);
+  await approvePendingAdmission(profiles.alice);
   await bridgeTextControlFramesBidirectional(profiles, "openmls-admission", 8);
+  await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_openmls_admission_bridge");
+  await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_openmls_admission_bridge");
   await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
   await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);
+  await reloadProfile(profiles.alice);
+  await reloadProfile(profiles.bob);
+  await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_admission_reload");
+  await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_admission_reload");
+  await waitForAdmissionUnlockedUi(profiles.alice);
+  await waitForAdmissionUnlockedUi(profiles.bob);
   const aliceMessage = "alice webdriver group text proof";
   const bobMessage = "bob webdriver group text proof";
   await sendGroupMessage(profiles.alice, aliceMessage);
@@ -1019,6 +1415,8 @@ try {
   const remotePlaintextObserved = aliceTextEvidence.remote_plaintext_visible && bobTextEvidence.remote_plaintext_visible;
   const remoteEncryptedEnvelopeObserved = aliceTextEvidence.remote_envelope_visible && bobTextEvidence.remote_envelope_visible;
   const peerReceiptsObserved = aliceTextEvidence.sender_peer_receipt_visible && bobTextEvidence.sender_peer_receipt_visible;
+  const aliceRetainedNativeVoiceEvidence = voice?.before_leave?.alice?.evidence ?? voice?.alice ?? null;
+  const bobRetainedNativeVoiceEvidence = voice?.before_leave?.bob?.evidence ?? voice?.bob ?? null;
   const browserVoiceLoopbackObserved = Boolean(
     voice?.before_leave?.alice?.remoteBoundaries > 0 &&
     voice?.before_leave?.bob?.remoteBoundaries > 0 &&
@@ -1032,17 +1430,28 @@ try {
       voice.backend_native_proofs.length >= 2 &&
       voice.backend_native_proofs.every((proof) => proof?.protected_frames_count > 0),
   );
+  const nativeRustWebDriverEvidenceObserved = Boolean(
+    aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" &&
+      bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" &&
+      aliceRetainedNativeVoiceEvidence?.remoteTrackEvents > 0 &&
+      bobRetainedNativeVoiceEvidence?.remoteTrackEvents > 0 &&
+      aliceRetainedNativeVoiceEvidence?.iceConnected &&
+      bobRetainedNativeVoiceEvidence?.iceConnected &&
+      aliceRetainedNativeVoiceEvidence?.nativeRustVoiceRuntimeAvailable &&
+      bobRetainedNativeVoiceEvidence?.nativeRustVoiceRuntimeAvailable &&
+      aliceRetainedNativeVoiceEvidence?.syntheticFallback === false &&
+      bobRetainedNativeVoiceEvidence?.syntheticFallback === false,
+  );
   const nativeRustBackendMediaObserved = Boolean(
-    voice?.before_leave?.alice?.remoteBoundaries > 0 &&
-    voice?.before_leave?.bob?.remoteBoundaries > 0 &&
-      backendNativeProofObserved,
+    backendNativeProofObserved &&
+      nativeRustWebDriverEvidenceObserved,
   );
   const voiceLoopbackObserved = browserVoiceLoopbackObserved || nativeRustBackendMediaObserved;
   const nativeVoiceLoopbackObserved = Boolean(
     voiceLoopbackObserved &&
       (nativeRustBackendMediaObserved ||
-        ((voice?.alice?.mode === "native_rtc_generated_audio" || voice?.alice?.mode === "native_rust_webrtc_datachannel") &&
-          (voice?.bob?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rust_webrtc_datachannel") &&
+        ((voice?.alice?.mode === "native_rtc_generated_audio" || aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel") &&
+          (voice?.bob?.mode === "native_rtc_generated_audio" || bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel") &&
           voice?.alice?.getUserMediaCalls > 0 &&
           voice?.bob?.getUserMediaCalls > 0 &&
           voice?.alice?.iceConnected &&
@@ -1070,8 +1479,78 @@ try {
           nativeRTCPeerConnectionAvailable: Boolean(voice.bob.nativeRTCPeerConnectionAvailable),
           nativeGeneratedAudioTrackAvailable: Boolean(voice.bob.nativeGeneratedAudioTrackAvailable),
           fallbackReason: voice.bob.fallbackReason ?? null,
-        }
+      }
       : null,
+  };
+  const expectedAudioPreferences = {
+    alice: { mic_gain_percent: 155, app_output_volume_percent: 37 },
+    bob: { mic_gain_percent: 120, app_output_volume_percent: 64 },
+  };
+  const audioPreferencesPersisted = Object.entries(expectedAudioPreferences).every(([name, expected]) => {
+    const saved = audioPreferences?.[name]?.after;
+    const reloaded = voice?.reloaded_audio_preferences?.[name];
+    return saved?.mic_gain_percent === expected.mic_gain_percent &&
+      saved?.app_output_volume_percent === expected.app_output_volume_percent &&
+      reloaded?.mic_gain_percent === expected.mic_gain_percent &&
+      reloaded?.app_output_volume_percent === expected.app_output_volume_percent;
+  });
+  const nativeMediaUsesConfiguredAudio = Boolean(
+    Array.isArray(voice?.backend_native_proofs) &&
+      voice.backend_native_proofs.length >= 2 &&
+      voice.backend_native_proofs.every((proof) => {
+        const name = String(proof?.profile || "").toLowerCase();
+        const expected = expectedAudioPreferences[name];
+        return expected &&
+          proof.mic_gain_percent === expected.mic_gain_percent &&
+          proof.app_output_volume_percent === expected.app_output_volume_percent &&
+          proof.protected_frames_count > 0 &&
+          proof.opus_payload_bytes > 0 &&
+          proof.protected_payload_bytes > 0;
+      }),
+  );
+  const remoteParticipantVolumeChanged = Boolean(
+    voice?.remote_participant_volume?.alice?.changed &&
+      voice?.remote_participant_volume?.bob?.changed,
+  );
+  const muteObserved = Boolean(voice?.after_mute?.alice?.evidence?.trackEnabled === false);
+  const backendLeaveCleanupObserved = Boolean(
+    voice?.leave_cleanup?.alice?.voice_session_cleared &&
+      voice?.leave_cleanup?.alice?.voice_left_event &&
+      voice?.leave_cleanup?.bob?.voice_session_cleared &&
+      voice?.leave_cleanup?.bob?.voice_left_event,
+  );
+  const leaveCleanupObserved = Boolean(
+    (voice?.alice?.trackStopCount > 0 && voice?.bob?.trackStopCount > 0) ||
+      backendLeaveCleanupObserved,
+  );
+  const speakingEvidenceObserved = Boolean(
+    Array.isArray(voice?.backend_native_proofs) &&
+      voice.backend_native_proofs.every((proof) => proof?.speaking && proof?.rms_i16 > 0 && proof?.peak_i16 > 0),
+  );
+  const per59ReleaseSmoke = {
+    issue: "PER-59 / P6-T08 human or loopback release smoke",
+    native_path_required: true,
+    browser_shim_or_raw_pulse_capture_counts_as_production: false,
+    join_proved: Boolean(voice?.backend_native_proofs?.length >= 2),
+    mute_proved: muteObserved,
+    speaking_vad_proved: speakingEvidenceObserved,
+    mic_gain_and_output_volume_proved: audioPreferencesPersisted && nativeMediaUsesConfiguredAudio,
+    per_peer_volume_surface_proved: remoteParticipantVolumeChanged,
+    native_loopback_proved: nativeVoiceLoopbackObserved,
+    leave_cleanup_proved: leaveCleanupObserved,
+    production_claim_allowed: Boolean(
+      nativeVoiceLoopbackObserved &&
+        audioPreferencesPersisted &&
+        nativeMediaUsesConfiguredAudio &&
+        remoteParticipantVolumeChanged &&
+        muteObserved &&
+        leaveCleanupObserved &&
+        speakingEvidenceObserved,
+    ),
+    configured_audio_preferences: audioPreferences,
+    reloaded_audio_preferences: voice?.reloaded_audio_preferences ?? null,
+    remote_participant_volume: voice?.remote_participant_volume ?? null,
+    leave_cleanup: voice?.leave_cleanup ?? null,
   };
   const summary = {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",
@@ -1079,7 +1558,7 @@ try {
     status: "completed_with_truthful_delivery_boundary",
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
     voice_remote_media_status: nativeVoiceLoopbackObserved
-      ? (nativeRustBackendMediaObserved || voice?.alice?.mode === "native_rust_webrtc_datachannel" || voice?.bob?.mode === "native_rust_webrtc_datachannel"
+      ? (nativeRustBackendMediaObserved || aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" || bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel"
         ? "native_rust_webrtc_datachannel_loopback"
         : "native_rtc_generated_audio_loopback")
       : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
@@ -1087,13 +1566,15 @@ try {
     voice_proof: {
       loopback_observed: voiceLoopbackObserved,
       native_generated_audio_observed: nativeVoiceLoopbackObserved && (voice?.alice?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rtc_generated_audio"),
-      native_rust_webrtc_datachannel_observed: nativeVoiceLoopbackObserved && (nativeRustBackendMediaObserved || voice?.alice?.mode === "native_rust_webrtc_datachannel" || voice?.bob?.mode === "native_rust_webrtc_datachannel"),
+      native_rust_webrtc_datachannel_observed: nativeVoiceLoopbackObserved && nativeRustBackendMediaObserved,
+      native_rust_evidence_source: nativeRustBackendMediaObserved ? "voice.before_leave.*.evidence" : null,
       synthetic_fallback_observed: syntheticVoiceFallbackObserved,
       production_claim_allowed: nativeVoiceLoopbackObserved,
       blocker: nativeVoiceLoopbackObserved
         ? "physical two-device microphone/speaker proof is still outside this automated native Rust/generated-audio harness"
-        : "native RTCPeerConnection generated-audio loopback was not observed in both Tauri WebViews",
+        : "native Rust Opus/SFrame media proof or generated-audio loopback was not observed in both Tauri profiles",
     },
+    per59_release_smoke: per59ReleaseSmoke,
     run_id: runId,
     artifact_root: rel(artifactRoot),
     invite_prefix: invite.slice(0, 48),

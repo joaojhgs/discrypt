@@ -375,6 +375,25 @@ function runtimePeerIdFromCommitment(
   return `peer-${stableUiHash(`${label}:${commitment}`)}`;
 }
 
+function localGovernedGroupRole(state: AppState, group: AppState["groups"][number] | undefined): string | null {
+  const localUserId = state.profile?.user_id;
+  const member = group?.members?.find(
+    (item) =>
+      item.member_id === localUserId &&
+      item.status !== "revoked" &&
+      item.status !== "migration_default",
+  );
+  if (!member?.role) return null;
+  const hasRoleEvidence = group?.governance_log?.some(
+    (entry) =>
+      entry.target_member_id === localUserId &&
+      entry.role_after === member.role &&
+      entry.event_kind !== "group_governance_initialized" &&
+      entry.event_kind !== "governance.defaults_restored",
+  );
+  return hasRoleEvidence ? member.role : null;
+}
+
 function textRuntimePeerDefaults(state: AppState): {
   local: string;
   remote: string;
@@ -393,6 +412,13 @@ function textRuntimePeerDefaults(state: AppState): {
         (group) => group.group_id === state.active_context?.group_id,
       )
     : state.groups[0];
+  const voiceSignaling = state.voice_session?.signaling;
+  if (voiceSignaling?.local_peer_id && voiceSignaling.remote_peer_id) {
+    return {
+      local: voiceSignaling.local_peer_id,
+      remote: voiceSignaling.remote_peer_id,
+    };
+  }
   const activeInvite = state.active_context?.dm_id
     ? state.invites
         .slice()
@@ -415,6 +441,26 @@ function textRuntimePeerDefaults(state: AppState): {
   }
 
   const groupRuntimePeers = activeGroup?.runtime_peers ?? [];
+  const localGroupRole = localGovernedGroupRole(state, activeGroup);
+  const localGroupPeerRole = localGroupRole === "owner" || localGroupRole === "staff"
+    ? "owner"
+    : localGroupRole === "member"
+      ? "member"
+      : null;
+  if (localGroupPeerRole) {
+    const backendLocalGroupPeer = groupRuntimePeers.find(
+      (peer) => peer.role === localGroupPeerRole,
+    );
+    const backendRemoteGroupPeer = groupRuntimePeers.find(
+      (peer) => peer.role !== localGroupPeerRole,
+    );
+    if (backendLocalGroupPeer && backendRemoteGroupPeer) {
+      return {
+        local: backendLocalGroupPeer.peer_id,
+        remote: backendRemoteGroupPeer.peer_id,
+      };
+    }
+  }
   const backendLocalGroupPeer = groupRuntimePeers.find((peer) => peer.is_local);
   const backendRemoteGroupPeer = groupRuntimePeers.find(
     (peer) => !peer.is_local,
@@ -458,6 +504,7 @@ function textRuntimePeerDefaults(state: AppState): {
       `${groupBootstrap.role_admission_policy_commitment}:${groupBootstrap.channel_policy_commitment}`,
     );
     const joinedFromInvite =
+      localGroupRole === "member" ||
       activeGroup?.role !== "owner" ||
       state.events.some((event) => event.kind === "group.joined");
     return joinedFromInvite
