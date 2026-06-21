@@ -1415,6 +1415,8 @@ try {
   const remotePlaintextObserved = aliceTextEvidence.remote_plaintext_visible && bobTextEvidence.remote_plaintext_visible;
   const remoteEncryptedEnvelopeObserved = aliceTextEvidence.remote_envelope_visible && bobTextEvidence.remote_envelope_visible;
   const peerReceiptsObserved = aliceTextEvidence.sender_peer_receipt_visible && bobTextEvidence.sender_peer_receipt_visible;
+  const aliceRetainedNativeVoiceEvidence = voice?.before_leave?.alice?.evidence ?? voice?.alice ?? null;
+  const bobRetainedNativeVoiceEvidence = voice?.before_leave?.bob?.evidence ?? voice?.bob ?? null;
   const browserVoiceLoopbackObserved = Boolean(
     voice?.before_leave?.alice?.remoteBoundaries > 0 &&
     voice?.before_leave?.bob?.remoteBoundaries > 0 &&
@@ -1429,12 +1431,16 @@ try {
       voice.backend_native_proofs.every((proof) => proof?.protected_frames_count > 0),
   );
   const nativeRustWebDriverEvidenceObserved = Boolean(
-    voice?.alice?.mode === "native_rust_webrtc_datachannel" &&
-      voice?.bob?.mode === "native_rust_webrtc_datachannel" &&
-      voice?.alice?.remoteTrackEvents > 0 &&
-      voice?.bob?.remoteTrackEvents > 0 &&
-      voice?.alice?.iceConnected &&
-      voice?.bob?.iceConnected,
+    aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" &&
+      bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" &&
+      aliceRetainedNativeVoiceEvidence?.remoteTrackEvents > 0 &&
+      bobRetainedNativeVoiceEvidence?.remoteTrackEvents > 0 &&
+      aliceRetainedNativeVoiceEvidence?.iceConnected &&
+      bobRetainedNativeVoiceEvidence?.iceConnected &&
+      aliceRetainedNativeVoiceEvidence?.nativeRustVoiceRuntimeAvailable &&
+      bobRetainedNativeVoiceEvidence?.nativeRustVoiceRuntimeAvailable &&
+      aliceRetainedNativeVoiceEvidence?.syntheticFallback === false &&
+      bobRetainedNativeVoiceEvidence?.syntheticFallback === false,
   );
   const nativeRustBackendMediaObserved = Boolean(
     backendNativeProofObserved &&
@@ -1444,8 +1450,8 @@ try {
   const nativeVoiceLoopbackObserved = Boolean(
     voiceLoopbackObserved &&
       (nativeRustBackendMediaObserved ||
-        ((voice?.alice?.mode === "native_rtc_generated_audio" || voice?.alice?.mode === "native_rust_webrtc_datachannel") &&
-          (voice?.bob?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rust_webrtc_datachannel") &&
+        ((voice?.alice?.mode === "native_rtc_generated_audio" || aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel") &&
+          (voice?.bob?.mode === "native_rtc_generated_audio" || bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel") &&
           voice?.alice?.getUserMediaCalls > 0 &&
           voice?.bob?.getUserMediaCalls > 0 &&
           voice?.alice?.iceConnected &&
@@ -1552,7 +1558,7 @@ try {
     status: "completed_with_truthful_delivery_boundary",
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
     voice_remote_media_status: nativeVoiceLoopbackObserved
-      ? (nativeRustBackendMediaObserved || voice?.alice?.mode === "native_rust_webrtc_datachannel" || voice?.bob?.mode === "native_rust_webrtc_datachannel"
+      ? (nativeRustBackendMediaObserved || aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" || bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel"
         ? "native_rust_webrtc_datachannel_loopback"
         : "native_rtc_generated_audio_loopback")
       : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
@@ -1560,7 +1566,8 @@ try {
     voice_proof: {
       loopback_observed: voiceLoopbackObserved,
       native_generated_audio_observed: nativeVoiceLoopbackObserved && (voice?.alice?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rtc_generated_audio"),
-      native_rust_webrtc_datachannel_observed: nativeVoiceLoopbackObserved && (nativeRustBackendMediaObserved || voice?.alice?.mode === "native_rust_webrtc_datachannel" || voice?.bob?.mode === "native_rust_webrtc_datachannel"),
+      native_rust_webrtc_datachannel_observed: nativeVoiceLoopbackObserved && nativeRustBackendMediaObserved,
+      native_rust_evidence_source: nativeRustBackendMediaObserved ? "voice.before_leave.*.evidence" : null,
       synthetic_fallback_observed: syntheticVoiceFallbackObserved,
       production_claim_allowed: nativeVoiceLoopbackObserved,
       blocker: nativeVoiceLoopbackObserved
