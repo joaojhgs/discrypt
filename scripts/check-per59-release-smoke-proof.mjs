@@ -57,6 +57,7 @@ for (const token of [
 
 for (const token of [
   "localGovernedGroupRole",
+  "voiceSignaling?.local_peer_id",
   "groupRuntimePeers.find",
   "peer.role === localGroupPeerRole",
   "startNativeRustVoiceMediaSession",

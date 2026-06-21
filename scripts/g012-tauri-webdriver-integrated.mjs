@@ -1113,9 +1113,18 @@ async function installVoiceHarness(profile) {
 async function joinVoice(profile) {
   await click(profile, "Voice Lobby");
   const before = await appState(profile);
-  if (before?.voice_session?.joined && before?.voice_session?.media_runtime?.local_capture_active) {
-    await waitUntil(profile, "already joined local voice participant", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`);
-    return;
+  if (before?.voice_session?.joined) {
+    if (before?.voice_session?.media_runtime?.local_capture_active) {
+      await waitUntil(profile, "already joined local voice participant", `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`);
+      return;
+    }
+    if (requireNativeVoice) {
+      const commandError = before?.last_command_error;
+      const detail = commandError
+        ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
+        : "no backend command error was recorded";
+      throw new Error(`${profile.display_name} is already joined but native voice media is not active; ${detail}`);
+    }
   }
   await click(profile, "join call");
   await waitUntil(profile, "local voice participant", `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`);

@@ -412,6 +412,13 @@ function textRuntimePeerDefaults(state: AppState): {
         (group) => group.group_id === state.active_context?.group_id,
       )
     : state.groups[0];
+  const voiceSignaling = state.voice_session?.signaling;
+  if (voiceSignaling?.local_peer_id && voiceSignaling.remote_peer_id) {
+    return {
+      local: voiceSignaling.local_peer_id,
+      remote: voiceSignaling.remote_peer_id,
+    };
+  }
   const activeInvite = state.active_context?.dm_id
     ? state.invites
         .slice()
