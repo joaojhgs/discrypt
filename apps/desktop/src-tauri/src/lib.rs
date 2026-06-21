@@ -3571,6 +3571,9 @@ impl TauriAppService {
         active_session_id: &str,
         target: &MessageTargetView,
     ) -> Result<(), String> {
+        if target.kind != "channel" {
+            return Ok(());
+        }
         let current_route_peer_ids = self.state.route_peer_ids_for_text_target(target)?;
         let current_route_peer_ids = current_route_peer_ids.into_iter().collect::<BTreeSet<_>>();
         let mut closed_runtime_routes = Vec::new();
@@ -11282,25 +11285,41 @@ impl PersistedAppState {
         closed_routes
     }
 
-    fn admitted_group_route_member_for_signer(
+    fn validate_group_route_sender(
         &self,
         group_id: &str,
         signer_public_key_hex: &str,
-    ) -> Result<&GroupMemberView, String> {
+        sender_device_id: &str,
+    ) -> Result<(), String> {
         let group = self
             .groups
             .iter()
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| format!("Group {group_id} is missing for route membership check"))?;
-        let member = group
+        if let Some(member) = group
             .members
             .iter()
             .find(|member| member.signer_public_key_hex.as_deref() == Some(signer_public_key_hex))
-            .ok_or_else(|| {
-                "No current group member matches the text/control sender signing key".to_owned()
-            })?;
-        self.validate_admitted_group_route_member(group_id, group, member)?;
-        Ok(member)
+        {
+            self.validate_admitted_group_route_member(group_id, group, member)?;
+            return Ok(());
+        }
+        if let Some(member) = group
+            .members
+            .iter()
+            .find(|member| member.member_id == sender_device_id)
+        {
+            self.validate_admitted_group_route_member(group_id, group, member)?;
+            return Ok(());
+        }
+        if group.members.iter().any(|member| {
+            member.member_id != self.local_user_id() && member.signer_public_key_hex.is_some()
+        }) {
+            return Err(
+                "No current group member matches the text/control sender signing key".to_owned(),
+            );
+        }
+        Ok(())
     }
 
     fn validate_group_route_member_id(
@@ -12156,9 +12175,10 @@ impl PersistedAppState {
                         .iter()
                         .any(|group| group.group_id == openmls_group_id)
                     {
-                        self.admitted_group_route_member_for_signer(
+                        self.validate_group_route_sender(
                             openmls_group_id,
                             &request.sender_verifying_key_hex,
+                            &request.envelope.sender_device_id,
                         )?;
                     }
                 }
@@ -28846,31 +28866,40 @@ mod tests {
         let (_carol_path, mut carol_service, carol_id) =
             create_text_receiver_profile("p7-t06-stale-envelope-carol", "Carol Envelope")?;
         reload_global_app_service_from_path(&alice_path);
-        let (_target, _message_id, _route_peer_ids, frame) = seed_group_text_outbox_for_routes(
+        let (target, _message_id, _route_peer_ids, _frame) = seed_group_text_outbox_for_routes(
             &group.group_id,
             &channel_id,
             &[(&carol_id, "Carol Envelope")],
             "p7-t06 stale inbound envelope",
         )?;
-        let carol_signer = hex::encode(
-            SigningKey::from_bytes(&carol_service.state.identity_seed_bytes())
-                .verifying_key()
-                .as_bytes(),
-        );
+        let carol_signing_key = SigningKey::from_bytes(&carol_service.state.identity_seed_bytes());
+        let carol_signer = hex::encode(carol_signing_key.verifying_key().as_bytes());
         set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer)?;
-        let stale_frame = match frame {
-            TextControlFrameView::Envelope {
-                target,
-                envelope,
-                recipient_leaf,
-                ..
-            } => TextControlFrameView::Envelope {
-                target,
-                envelope,
-                sender_verifying_key_hex: carol_signer,
-                recipient_leaf,
+        let delivery_group_id = text_delivery_group_id(&target)?;
+        let stale_envelope = TextMessageEnvelope::sign(
+            &delivery_group_id,
+            TextMessageEnvelopeInput {
+                epoch: 1,
+                sender_leaf: 2,
+                sender_device_id: carol_id.clone(),
+                sequence: 99,
+                message_id: "p7-t06-stale-revoked-envelope".to_owned(),
+                retention: TextRetentionMetadata {
+                    policy: "test".to_owned(),
+                    created_at_ms: 99,
+                    expires_at_ms: None,
+                    delete_after_read: false,
+                },
+                content_ciphertext: b"stale-revoked-route-frame".to_vec(),
             },
-            _ => return Err("seeded frame was not an envelope".to_owned()),
+            &carol_signing_key,
+        )
+        .map_err(|error| error.to_string())?;
+        let stale_frame = TextControlFrameView::Envelope {
+            target,
+            envelope: stale_envelope,
+            sender_verifying_key_hex: carol_signer,
+            recipient_leaf: Some(2),
         };
         set_group_member_status_for_test(&group.group_id, &carol_id, "revoked")?;
 

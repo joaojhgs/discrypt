@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-21T06:51:07.687Z",
+  "updatedAt": "2026-06-21T07:02:50.524Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -155,9 +155,9 @@
       "status": "complete",
       "attempt": 0,
       "createdAt": "2026-06-21T06:34:18.764Z",
-      "updatedAt": "2026-06-21T06:51:07.687Z",
-      "evidence": "Implemented backend route cleanup on revoked/offline membership, stale receipt/envelope rejection, and route diagnostics filtering. Verified with route_cleanup, group fanout, route diagnostics, cargo fmt --check, and git diff --check.",
-      "completedAt": "2026-06-21T06:51:07.687Z"
+      "updatedAt": "2026-06-21T07:02:50.524Z",
+      "evidence": "QA rejection fixed: route cleanup now skips non-channel DM targets so pending-runtime attach remains observable; inbound route sender validation now accepts admitted sender identity fallback when legacy/OpenMLS roster lacks signer metadata while still rejecting known revoked/offline signer/member routes. Verification passed: route_cleanup (3), group fanout (1), route diagnostics (2), representative QA regressions g012/openmls/pending-runtime, full desktop backend lib suite 149/149, cargo fmt --check, git diff --check.",
+      "completedAt": "2026-06-21T07:02:50.524Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
