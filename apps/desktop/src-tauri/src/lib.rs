@@ -2087,6 +2087,109 @@ pub struct TransportDiagnosticsView {
     pub data_channel_probe: Option<ProviderWebRtcDataChannelProbeView>,
 }
 
+/// Support-bundle-only route graph diagnostics derived from backend route state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphDiagnosticsExportView {
+    /// Versioned route diagnostics schema for support tooling.
+    pub schema_version: u16,
+    /// Diagnostic source boundary.
+    pub source: String,
+    /// Redacted graph snapshots for group/channel text routes.
+    pub graphs: Vec<RouteGraphDiagnosticsView>,
+    /// Export-level safety policy reminder.
+    pub provider_application_relay_used: bool,
+    /// Reasons no graph could be exported for otherwise relevant state.
+    pub unavailable_reasons: Vec<String>,
+}
+
+/// One redacted group/channel route graph in the support bundle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphDiagnosticsView {
+    /// Redacted group reference.
+    pub group_ref: String,
+    /// Redacted channel reference.
+    pub channel_ref: String,
+    /// Redacted local admitted route peer reference.
+    pub local_peer_ref: String,
+    /// Active backend text session, redacted when present.
+    pub text_session_ref: Option<String>,
+    /// Active backend text session state label.
+    pub text_session_state: String,
+    /// Redacted directed edges to admitted remote peers.
+    pub edges: Vec<RouteGraphEdgeDiagnosticsView>,
+}
+
+/// Redacted diagnostics for one local -> remote group text route edge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphEdgeDiagnosticsView {
+    /// Redacted member reference for support correlation.
+    pub member_ref: String,
+    /// Redacted route-peer reference; raw runtime peer ids are not exported.
+    pub remote_peer_ref: String,
+    /// Backend-derived edge state.
+    pub edge_state: String,
+    /// Route intent inferred from backend evidence.
+    pub route_intent: String,
+    /// Runtime role when attached or pending.
+    pub runtime_role: String,
+    /// Redacted ICE state summary.
+    pub ice: RouteGraphIceDiagnosticsView,
+    /// Redacted DTLS state summary.
+    pub dtls: RouteGraphDtlsDiagnosticsView,
+    /// Redacted DataChannel state summary.
+    pub data_channel: RouteGraphDataChannelDiagnosticsView,
+    /// TURN usage summary without endpoints or credentials.
+    pub turn: RouteGraphTurnDiagnosticsView,
+    /// Fanout/dedup route evidence from the signed text/control outbox.
+    pub fanout: RouteGraphFanoutDiagnosticsView,
+}
+
+/// ICE diagnostics for one edge without raw candidates or credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphIceDiagnosticsView {
+    pub connection_state: String,
+    pub gathering_state: String,
+    pub direct_path_ready: bool,
+    pub local_candidates_gathered: Option<u64>,
+    pub remote_candidates_applied: Option<u64>,
+}
+
+/// DTLS diagnostics for one edge without keying material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphDtlsDiagnosticsView {
+    pub state: String,
+}
+
+/// DataChannel diagnostics for one edge without frame payloads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphDataChannelDiagnosticsView {
+    pub state: String,
+    pub open: bool,
+    pub frames_sent: Option<u64>,
+    pub frames_received: Option<u64>,
+    pub bytes_sent: Option<u64>,
+    pub bytes_received: Option<u64>,
+}
+
+/// TURN diagnostics for one edge without endpoints or credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphTurnDiagnosticsView {
+    pub configured: bool,
+    pub configured_server_count: u64,
+    pub relay_candidates_gathered: Option<u64>,
+    pub relay_candidates_applied: Option<u64>,
+    pub turn_fallback_ready: bool,
+}
+
+/// Message fanout and dedup diagnostics for one edge.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteGraphFanoutDiagnosticsView {
+    pub expected_messages: u64,
+    pub sent_messages: u64,
+    pub receipted_messages: u64,
+    pub pending_receipts: u64,
+}
+
 /// Readiness and selection metadata for a fallback signaling adapter attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignalingAdapterFallbackAttemptView {
@@ -2840,6 +2943,313 @@ impl TauriAppService {
         }
     }
 
+    fn route_graph_diagnostics_export(&self) -> RouteGraphDiagnosticsExportView {
+        let text_session = self.state.transport_session(BackendTransportMode::Text);
+        let text_session_ref = text_session
+            .map(|session| redacted_observable_ref("text_session", &session.session_id));
+        let text_session_state = text_session
+            .map(|session| PersistedAppState::transport_state_label(session.state()).to_owned())
+            .unwrap_or_else(|| "missing".to_owned());
+        let text_session_id = text_session.map(|session| session.session_id.as_str());
+        let latest_probe = self.state.latest_data_channel_probe.as_ref();
+        let mut graphs = Vec::new();
+        let mut unavailable_reasons = Vec::new();
+
+        for group in &self.state.groups {
+            let local_member_id = self.state.local_user_id();
+            let Some(local_member) = group.members.iter().find(|member| {
+                member.member_id == local_member_id
+                    && member.status != "pending"
+                    && member.status != "revoked"
+                    && member.status != "migration_default"
+            }) else {
+                unavailable_reasons.push(format!(
+                    "{}: local admitted member missing",
+                    redacted_observable_ref("group", &group.group_id)
+                ));
+                continue;
+            };
+            let Ok(local_peer_id) = group_member_runtime_peer_id(&group.group_id, local_member)
+            else {
+                unavailable_reasons.push(format!(
+                    "{}: local admitted runtime peer id unavailable",
+                    redacted_observable_ref("group", &group.group_id)
+                ));
+                continue;
+            };
+            let admitted_remotes = group
+                .members
+                .iter()
+                .filter(|member| {
+                    member.member_id != local_member_id
+                        && member.status != "pending"
+                        && member.status != "revoked"
+                        && member.status != "migration_default"
+                })
+                .collect::<Vec<_>>();
+            if admitted_remotes.is_empty() {
+                continue;
+            }
+            let text_channels = group
+                .channels
+                .iter()
+                .filter(|channel| channel.kind == ChannelKind::Text)
+                .collect::<Vec<_>>();
+            if text_channels.is_empty() {
+                unavailable_reasons.push(format!(
+                    "{}: no text channel scope available",
+                    redacted_observable_ref("group", &group.group_id)
+                ));
+                continue;
+            }
+
+            for channel in text_channels {
+                let graph_connectivity = channel
+                    .connectivity
+                    .clone()
+                    .or_else(|| group.connectivity.clone())
+                    .unwrap_or_else(|| group_connectivity_policy(&group.group_id));
+                let configured_turn_server_count = graph_connectivity.ice_turn_servers.len() as u64;
+                let configured_turn_endpoint =
+                    configured_turn_endpoint(&graph_connectivity).is_some();
+                let mut edges = Vec::new();
+                let mut seen_remote_peers = BTreeSet::new();
+                for remote in &admitted_remotes {
+                    let remote_peer_id = match group_member_runtime_peer_id(&group.group_id, remote)
+                    {
+                        Ok(peer_id) if peer_id != local_peer_id => peer_id,
+                        Ok(_) => {
+                            edges.push(unavailable_route_graph_edge(
+                                remote,
+                                "local_loopback_rejected",
+                                configured_turn_server_count,
+                                configured_turn_endpoint,
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            let mut edge = unavailable_route_graph_edge(
+                                remote,
+                                "remote_peer_id_unavailable",
+                                configured_turn_server_count,
+                                configured_turn_endpoint,
+                            );
+                            edge.ice.connection_state = redact_sensitive_observable_copy(error);
+                            edges.push(edge);
+                            continue;
+                        }
+                    };
+                    if !seen_remote_peers.insert(remote_peer_id.clone()) {
+                        edges.push(unavailable_route_graph_edge(
+                            remote,
+                            "duplicate_remote_peer_id_rejected",
+                            configured_turn_server_count,
+                            configured_turn_endpoint,
+                        ));
+                        continue;
+                    }
+                    edges.push(self.route_graph_edge_diagnostics(
+                        remote,
+                        &remote_peer_id,
+                        text_session_id,
+                        latest_probe,
+                        configured_turn_server_count,
+                        configured_turn_endpoint,
+                    ));
+                }
+                graphs.push(RouteGraphDiagnosticsView {
+                    group_ref: redacted_observable_ref("group", &group.group_id),
+                    channel_ref: redacted_observable_ref("channel", &channel.channel_id),
+                    local_peer_ref: redacted_observable_ref("route_peer", &local_peer_id),
+                    text_session_ref: text_session_ref.clone(),
+                    text_session_state: text_session_state.clone(),
+                    edges,
+                });
+            }
+        }
+
+        RouteGraphDiagnosticsExportView {
+            schema_version: 1,
+            source: "tauri_support_bundle_route_graph_v1".to_owned(),
+            graphs,
+            provider_application_relay_used: false,
+            unavailable_reasons,
+        }
+    }
+
+    fn route_graph_edge_diagnostics(
+        &self,
+        member: &GroupMemberView,
+        remote_peer_id: &str,
+        text_session_id: Option<&str>,
+        latest_probe: Option<&ProviderWebRtcDataChannelProbeView>,
+        configured_turn_server_count: u64,
+        configured_turn_endpoint: bool,
+    ) -> RouteGraphEdgeDiagnosticsView {
+        let key = text_session_id.map(|session_id| {
+            TextControlRuntimeMapKey::for_remote(session_id.to_owned(), remote_peer_id.to_owned())
+        });
+        let pending = key
+            .as_ref()
+            .and_then(|key| self.pending_text_control_transport_runtimes.get(key));
+        let runtime = key
+            .as_ref()
+            .and_then(|key| self.text_control_transport_runtimes.get(key));
+        let fanout = self.route_graph_fanout_diagnostics(remote_peer_id);
+        let runtime_role = runtime
+            .and_then(|runtime| runtime.role)
+            .or_else(|| pending.map(|pending| pending.role));
+        let metrics = runtime.and_then(text_control_runtime_metrics_snapshot);
+        let owned_evidence = runtime
+            .and_then(|runtime| runtime.owned_runtime.as_ref())
+            .map(|runtime| runtime.evidence().clone());
+        let direct_path_ready = owned_evidence
+            .as_ref()
+            .map(|evidence| evidence.direct_path_ready)
+            .unwrap_or_else(|| {
+                metrics
+                    .as_ref()
+                    .map(|metrics| metrics.open)
+                    .unwrap_or(false)
+            });
+        let data_channel_open = owned_evidence
+            .as_ref()
+            .map(|evidence| evidence.data_channel_open)
+            .unwrap_or_else(|| {
+                metrics
+                    .as_ref()
+                    .map(|metrics| metrics.open)
+                    .unwrap_or(false)
+            });
+        let turn_fallback_ready = latest_probe
+            .map(|probe| {
+                data_channel_probe_configured_turn_ready(
+                    probe,
+                    configured_turn_endpoint.then_some("configured-turn-redacted"),
+                )
+            })
+            .unwrap_or(false);
+        let (edge_state, route_intent) = if runtime.is_some() {
+            let intent = if turn_fallback_ready {
+                "configured_turn_webrtc"
+            } else {
+                "direct_webrtc"
+            };
+            ("attached_runtime", intent)
+        } else if pending.is_some() {
+            ("pending_runtime", "pending")
+        } else if text_session_id.is_none() {
+            ("missing_text_session", "unavailable")
+        } else {
+            ("missing_runtime", "unavailable")
+        };
+        RouteGraphEdgeDiagnosticsView {
+            member_ref: redacted_observable_ref("member", &member.member_id),
+            remote_peer_ref: redacted_observable_ref("route_peer", remote_peer_id),
+            edge_state: edge_state.to_owned(),
+            route_intent: route_intent.to_owned(),
+            runtime_role: runtime_role_label(runtime_role).to_owned(),
+            ice: RouteGraphIceDiagnosticsView {
+                connection_state: if direct_path_ready {
+                    "connected_or_completed".to_owned()
+                } else if runtime.is_some() {
+                    "not_ready".to_owned()
+                } else {
+                    "not_observed".to_owned()
+                },
+                gathering_state: if runtime.is_some() {
+                    "not_exported_without_raw_candidates".to_owned()
+                } else {
+                    "not_observed".to_owned()
+                },
+                direct_path_ready,
+                local_candidates_gathered: latest_probe.map(|probe| {
+                    probe.offerer_local_relay_candidates_gathered
+                        + probe.answerer_local_relay_candidates_gathered
+                }),
+                remote_candidates_applied: latest_probe.map(|probe| {
+                    probe.offerer_remote_relay_candidates_applied
+                        + probe.answerer_remote_relay_candidates_applied
+                }),
+            },
+            dtls: RouteGraphDtlsDiagnosticsView {
+                state: if data_channel_open {
+                    "backend_datachannel_open"
+                } else if runtime.is_some() {
+                    "not_ready"
+                } else {
+                    "not_observed"
+                }
+                .to_owned(),
+            },
+            data_channel: RouteGraphDataChannelDiagnosticsView {
+                state: metrics
+                    .as_ref()
+                    .map(|metrics| metrics.last_state.clone())
+                    .unwrap_or_else(|| {
+                        if pending.is_some() {
+                            "pending_attach".to_owned()
+                        } else {
+                            "not_observed".to_owned()
+                        }
+                    }),
+                open: data_channel_open,
+                frames_sent: metrics.as_ref().map(|metrics| metrics.frames_sent),
+                frames_received: metrics.as_ref().map(|metrics| metrics.frames_received),
+                bytes_sent: metrics.as_ref().map(|metrics| metrics.bytes_sent),
+                bytes_received: metrics.as_ref().map(|metrics| metrics.bytes_received),
+            },
+            turn: RouteGraphTurnDiagnosticsView {
+                configured: configured_turn_endpoint || configured_turn_server_count > 0,
+                configured_server_count: configured_turn_server_count,
+                relay_candidates_gathered: latest_probe.map(|probe| {
+                    probe.offerer_local_relay_candidates_gathered
+                        + probe.answerer_local_relay_candidates_gathered
+                }),
+                relay_candidates_applied: latest_probe.map(|probe| {
+                    probe.offerer_remote_relay_candidates_applied
+                        + probe.answerer_remote_relay_candidates_applied
+                }),
+                turn_fallback_ready,
+            },
+            fanout,
+        }
+    }
+
+    fn route_graph_fanout_diagnostics(
+        &self,
+        remote_peer_id: &str,
+    ) -> RouteGraphFanoutDiagnosticsView {
+        let mut fanout = RouteGraphFanoutDiagnosticsView::default();
+        for record in &self.state.text_control_outbox {
+            if !record
+                .route_peer_ids
+                .iter()
+                .any(|peer_id| peer_id == remote_peer_id)
+            {
+                continue;
+            }
+            fanout.expected_messages += 1;
+            if record
+                .sent_route_peer_ids
+                .iter()
+                .any(|peer_id| peer_id == remote_peer_id)
+            {
+                fanout.sent_messages += 1;
+            }
+            if record
+                .receipted_route_peer_ids
+                .iter()
+                .any(|peer_id| peer_id == remote_peer_id)
+            {
+                fanout.receipted_messages += 1;
+            } else {
+                fanout.pending_receipts += 1;
+            }
+        }
+        fanout
+    }
+
     fn group_presence_route_evidence(
         &self,
         group_id: &str,
@@ -3534,6 +3944,7 @@ pub fn export_diagnostics_log() -> String {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let view = guard.to_view();
+    let route_graph_diagnostics = guard.route_graph_diagnostics_export();
     let groups = view
         .groups
         .iter()
@@ -3596,6 +4007,7 @@ pub fn export_diagnostics_log() -> String {
         "active_context": &view.active_context,
         "transport_status": &view.transport_status,
         "transport_diagnostics": &view.transport_diagnostics,
+        "route_graph_diagnostics": route_graph_diagnostics,
         "last_command_error": &view.last_command_error,
         "events": &view.events,
         "groups": groups,
@@ -15672,6 +16084,66 @@ fn runtime_role_label(role: Option<ProviderTextControlRuntimePeerRole>) -> &'sta
         Some(ProviderTextControlRuntimePeerRole::Offerer) => "offerer",
         Some(ProviderTextControlRuntimePeerRole::Answerer) => "answerer",
         None => "test-harness",
+    }
+}
+
+fn text_control_runtime_metrics_snapshot(
+    runtime: &TextControlTransportRuntime,
+) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
+    if let Some(executor) = &runtime.executor {
+        return Some(executor.block_on(runtime.transport.text_control_transport_metrics()));
+    }
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    Some(executor.block_on(runtime.transport.text_control_transport_metrics()))
+}
+
+fn unavailable_route_graph_edge(
+    member: &GroupMemberView,
+    edge_state: &str,
+    configured_turn_server_count: u64,
+    configured_turn_endpoint: bool,
+) -> RouteGraphEdgeDiagnosticsView {
+    RouteGraphEdgeDiagnosticsView {
+        member_ref: redacted_observable_ref("member", &member.member_id),
+        remote_peer_ref: redacted_observable_ref(
+            "route_peer",
+            member
+                .signer_public_key_hex
+                .as_deref()
+                .unwrap_or(member.member_id.as_str()),
+        ),
+        edge_state: edge_state.to_owned(),
+        route_intent: "unavailable".to_owned(),
+        runtime_role: "not_applicable".to_owned(),
+        ice: RouteGraphIceDiagnosticsView {
+            connection_state: "not_observed".to_owned(),
+            gathering_state: "not_observed".to_owned(),
+            direct_path_ready: false,
+            local_candidates_gathered: None,
+            remote_candidates_applied: None,
+        },
+        dtls: RouteGraphDtlsDiagnosticsView {
+            state: "not_observed".to_owned(),
+        },
+        data_channel: RouteGraphDataChannelDiagnosticsView {
+            state: "not_observed".to_owned(),
+            open: false,
+            frames_sent: None,
+            frames_received: None,
+            bytes_sent: None,
+            bytes_received: None,
+        },
+        turn: RouteGraphTurnDiagnosticsView {
+            configured: configured_turn_endpoint || configured_turn_server_count > 0,
+            configured_server_count: configured_turn_server_count,
+            relay_candidates_gathered: None,
+            relay_candidates_applied: None,
+            turn_fallback_ready: false,
+        },
+        fanout: RouteGraphFanoutDiagnosticsView::default(),
     }
 }
 
@@ -28181,6 +28653,276 @@ mod tests {
             .iter()
             .any(|message| message.message_id == message_id));
         clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn route_diagnostics_export_redacts_group_graph_edges_and_runtime_state() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("p7-t05-route-diagnostics-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Route Diagnostics".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Route Diagnostics Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.secret.example.invalid:5349".to_owned(),
+                credential_declared: true,
+                credential_expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+            }]),
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (_bob_path, bob_service, bob_id) =
+            create_text_receiver_profile("p7-t05-route-diagnostics-bob", "Bob Diagnostics")?;
+        let (_carol_path, _carol_service, carol_id) =
+            create_text_receiver_profile("p7-t05-route-diagnostics-carol", "Carol Diagnostics")?;
+        reload_global_app_service_from_path(&alice_path);
+        let (_target, _message_id, route_peer_ids, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[
+                (&bob_id, "Bob Diagnostics"),
+                (&carol_id, "Carol Diagnostics"),
+            ],
+            "p7-t05 diagnostics support bundle body must not leak",
+        )?;
+        let loaded = load_state();
+        let local_peer_id = loaded
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group.group_id)
+            .and_then(|candidate| {
+                candidate
+                    .members
+                    .iter()
+                    .find(|member| member.role == GroupRoleView::Owner)
+                    .and_then(|member| group_member_runtime_peer_id(&group.group_id, member).ok())
+            })
+            .ok_or_else(|| "local runtime peer id missing".to_owned())?;
+        let bob_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, &bob_id)?;
+        let carol_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, &carol_id)?;
+        assert!(route_peer_ids.contains(&bob_route));
+        assert!(route_peer_ids.contains(&carol_route));
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("p7-t05-route-diagnostics".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(ReceiverBackedTextControlTransport::new(bob_service)),
+            active_session_id.clone(),
+            local_peer_id.clone(),
+            bob_route.clone(),
+        );
+        insert_pending_text_control_transport_runtime_for_test(
+            &active_session_id,
+            &local_peer_id,
+            &carol_route,
+        );
+
+        let diagnostics = export_diagnostics_log();
+        for forbidden in [
+            "turn.secret.example.invalid",
+            "p7-t05 diagnostics support bundle body must not leak",
+            "candidate:",
+            "ice-ufrag",
+            "ice-pwd",
+        ] {
+            assert!(
+                !diagnostics.contains(forbidden),
+                "route diagnostics leaked {forbidden}: {diagnostics}"
+            );
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|error| error.to_string())?;
+        let route_graph = parsed
+            .get("route_graph_diagnostics")
+            .ok_or_else(|| "route_graph_diagnostics missing".to_owned())?;
+        let route_graph_json = route_graph.to_string();
+        for forbidden in [
+            group.group_id.as_str(),
+            channel_id.as_str(),
+            bob_id.as_str(),
+            carol_id.as_str(),
+            bob_route.as_str(),
+            carol_route.as_str(),
+        ] {
+            assert!(
+                !route_graph_json.contains(forbidden),
+                "route graph diagnostics leaked {forbidden}: {route_graph_json}"
+            );
+        }
+        assert_eq!(route_graph["schema_version"], 1);
+        assert_eq!(route_graph["provider_application_relay_used"], false);
+        let graphs = route_graph["graphs"]
+            .as_array()
+            .ok_or_else(|| "graphs missing".to_owned())?;
+        assert_eq!(graphs.len(), 1);
+        let graph = &graphs[0];
+        assert_ne!(graph["text_session_state"], "missing");
+        assert!(
+            graph["group_ref"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("group_ref="),
+            "{graph:?}"
+        );
+        assert!(
+            graph["channel_ref"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("channel_ref="),
+            "{graph:?}"
+        );
+        let edges = graph["edges"]
+            .as_array()
+            .ok_or_else(|| "edges missing".to_owned())?;
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            edge["edge_state"] == "attached_runtime"
+                && edge["route_intent"] == "direct_webrtc"
+                && edge["data_channel"]["open"] == true
+                && edge["data_channel"]["state"] == "open"
+                && edge["turn"]["configured"] == true
+                && edge["turn"]["configured_server_count"] == 1
+                && edge["fanout"]["expected_messages"] == 1
+                && edge["fanout"]["pending_receipts"] == 1
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge["edge_state"] == "pending_runtime"
+                && edge["route_intent"] == "pending"
+                && edge["data_channel"]["state"] == "pending_attach"
+                && edge["fanout"]["expected_messages"] == 1
+        }));
+        clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn route_diagnostics_export_uses_each_graph_connectivity_policy() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("p7-t05-route-diagnostics-policy-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Route Policy".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let turn_group = create_group(CreateGroupRequest {
+            name: "Route Policy Turn".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: Some(vec![IceTurnServerView {
+                endpoint: "turns:turn.graph-a.example.invalid:5349".to_owned(),
+                credential_declared: true,
+                credential_expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+            }]),
+        })
+        .groups
+        .first()
+        .cloned()
+        .ok_or_else(|| "turn group missing".to_owned())?;
+        let direct_group = create_group(CreateGroupRequest {
+            name: "Route Policy Direct".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: Some(Vec::new()),
+        })
+        .groups
+        .iter()
+        .find(|group| group.name == "Route Policy Direct")
+        .cloned()
+        .ok_or_else(|| "direct group missing".to_owned())?;
+        let turn_channel_id = turn_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "turn group text channel missing".to_owned())?;
+        let direct_channel_id = direct_group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "direct group text channel missing".to_owned())?;
+        let (_bob_path, _bob_service, bob_id) =
+            create_text_receiver_profile("p7-t05-route-diagnostics-policy-bob", "Bob Policy")?;
+        reload_global_app_service_from_path(&alice_path);
+        seed_group_text_outbox_for_routes(
+            &turn_group.group_id,
+            &turn_channel_id,
+            &[(&bob_id, "Bob Policy")],
+            "p7-t05 policy turn graph body must not leak",
+        )?;
+        seed_group_text_outbox_for_routes(
+            &direct_group.group_id,
+            &direct_channel_id,
+            &[(&bob_id, "Bob Policy")],
+            "p7-t05 policy direct graph body must not leak",
+        )?;
+
+        let diagnostics = export_diagnostics_log();
+        assert!(
+            !diagnostics.contains("turn.graph-a.example.invalid"),
+            "route diagnostics leaked raw TURN endpoint: {diagnostics}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|error| error.to_string())?;
+        let graphs = parsed["route_graph_diagnostics"]["graphs"]
+            .as_array()
+            .ok_or_else(|| "route graph diagnostics missing graphs".to_owned())?;
+        assert_eq!(graphs.len(), 2, "{graphs:?}");
+
+        let turn_group_ref = redacted_observable_ref("group", &turn_group.group_id);
+        let direct_group_ref = redacted_observable_ref("group", &direct_group.group_id);
+        let turn_graph = graphs
+            .iter()
+            .find(|graph| graph["group_ref"] == turn_group_ref)
+            .ok_or_else(|| "turn graph missing".to_owned())?;
+        let direct_graph = graphs
+            .iter()
+            .find(|graph| graph["group_ref"] == direct_group_ref)
+            .ok_or_else(|| "direct graph missing".to_owned())?;
+        let turn_edge = turn_graph["edges"]
+            .as_array()
+            .and_then(|edges| edges.first())
+            .ok_or_else(|| "turn graph edge missing".to_owned())?;
+        let direct_edge = direct_graph["edges"]
+            .as_array()
+            .and_then(|edges| edges.first())
+            .ok_or_else(|| "direct graph edge missing".to_owned())?;
+
+        assert_eq!(turn_edge["turn"]["configured"], true);
+        assert_eq!(turn_edge["turn"]["configured_server_count"], 1);
+        assert_eq!(direct_edge["turn"]["configured"], false);
+        assert_eq!(direct_edge["turn"]["configured_server_count"], 0);
         Ok(())
     }
 
