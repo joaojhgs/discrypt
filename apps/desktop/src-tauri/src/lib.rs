@@ -3176,7 +3176,7 @@ impl TauriAppService {
             },
             dtls: RouteGraphDtlsDiagnosticsView {
                 state: if data_channel_open {
-                    "connected"
+                    "backend_datachannel_open"
                 } else if runtime.is_some() {
                     "not_ready"
                 } else {
