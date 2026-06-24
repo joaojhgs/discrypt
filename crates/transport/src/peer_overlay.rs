@@ -1787,9 +1787,19 @@ mod tests {
         let mut frame = frame(9)?;
         frame.payload.opaque_ciphertext = b"plaintext message accidentally unsealed".to_vec();
 
-        let error =
-            build_peer_overlay_forwarding_plan(&admitted, &authority, &forwarding_policy(), &frame)
-                .expect_err("plaintext marker must fail before forwarding");
+        let error = match build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &frame,
+        ) {
+            Ok(plan) => {
+                return Err(overlay_policy_error(format!(
+                    "plaintext marker unexpectedly forwarded: {plan:?}"
+                )));
+            }
+            Err(error) => error,
+        };
 
         assert_eq!(error, TransportError::PlaintextLeak);
         Ok(())
