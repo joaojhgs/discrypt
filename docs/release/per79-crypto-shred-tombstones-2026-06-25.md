@@ -24,4 +24,5 @@ Current app state uses `EncryptedAppDb`, an encrypted envelope with a SQLite-com
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check` — passed.
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-content-keys --lib -- -D warnings` — passed.
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-storage --lib -- -D warnings` — passed.
+- `RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-storage --all-targets -- -D warnings` — passed after removing `expect()` from the new negative-decrypt test.
 - `git diff --check` — passed.

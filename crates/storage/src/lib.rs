@@ -1421,10 +1421,8 @@ mod tests {
         ));
 
         assert_eq!(
-            store
-                .decrypt_cached_message_for_harness("m-shred")
-                .expect("cached key should decrypt"),
-            plaintext
+            store.decrypt_cached_message_for_harness("m-shred"),
+            Ok(plaintext.to_vec())
         );
         store.cooperative_shred_message("m-shred");
 
