@@ -27,6 +27,13 @@ test("approved production smoke covers setup, text, invites, config, text, invit
   const configDialog = page.getByRole("dialog", { name: "Config" });
   await configDialog.getByLabel("Theme").selectOption("ocean-contrast");
   await expect(configDialog.getByLabel("Theme")).toHaveValue("ocean-contrast");
+  await expect(
+    configDialog.getByRole("heading", { name: "Logs and export" }),
+  ).toBeVisible();
+  await expect(configDialog.getByLabel("Include support bundle data")).toBeVisible();
+  await expect(
+    configDialog.getByRole("button", { name: "Load support bundle" }),
+  ).toBeVisible();
   await configDialog.getByTestId("voice-mic-selector").selectOption("backup-e2e-mic");
   await expect(configDialog.getByTestId("voice-mic-selector")).toHaveValue("backup-e2e-mic");
   await configDialog.getByLabel("App output device").selectOption("default");

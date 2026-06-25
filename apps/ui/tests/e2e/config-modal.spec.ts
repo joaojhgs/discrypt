@@ -79,9 +79,22 @@ test("configuration modal exposes audio, theme, connectivity defaults, and logs 
   );
   await expect(configDialog.getByText(/Action failed/i)).toHaveCount(0);
 
-  await configDialog.getByRole("button", { name: "Copy diagnostic log" }).click();
+  await configDialog.getByRole("button", { name: "Copy support bundle" }).click();
   await expect(
-    configDialog.getByText("Diagnostic log copied to clipboard."),
+    configDialog.getByText("Support bundle export denied until consent is enabled."),
+  ).toBeVisible();
+  await configDialog.getByLabel("Include support bundle data").click();
+  await expect(
+    configDialog.getByText("Consent enabled. Load the support bundle to preview or export."),
+  ).toBeVisible();
+  await configDialog.getByRole("button", { name: "Load support bundle" }).click();
+  await expect(
+    configDialog.getByText("Support bundle loaded from backend diagnostics."),
+  ).toBeVisible();
+  await expect(configDialog.getByText("Schema", { exact: true })).toBeVisible();
+  await configDialog.getByRole("button", { name: "Copy support bundle" }).click();
+  await expect(
+    configDialog.getByText("Support bundle copied to clipboard."),
   ).toBeVisible();
   const copiedLog = await page.evaluate(
     () => (window as Window & { __discryptCopiedDiagnosticLog?: string })
@@ -89,9 +102,118 @@ test("configuration modal exposes audio, theme, connectivity defaults, and logs 
   );
   expect(copiedLog).toContain('"schema_version": 1');
   expect(copiedLog).toContain('"provider_role": "signaling only for SDP/candidates"');
+  await configDialog.getByRole("button", { name: "Export support bundle" }).click();
+  await expect(configDialog.getByText("Support bundle export started.")).toBeVisible();
 
   await page.screenshot({
     fullPage: true,
     path: testInfo.outputPath("configuration-modal-sections.png"),
   });
+});
+
+test("support bundle export reports loading, empty, command failure, and clipboard unavailable states", async ({
+  page,
+}) => {
+  await bootReadyShell(page);
+
+  await page
+    .getByRole("button", { name: "Open app configuration", exact: true })
+    .click();
+  const configDialog = page.getByRole("dialog", { name: "Config" });
+  await configDialog.getByLabel("Include support bundle data").click();
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "__TAURI__", {
+      configurable: true,
+      value: {
+        core: {
+          invoke: async (command: string) => {
+            if (command !== "export_diagnostics_log") throw new Error(command);
+            await new Promise((resolve) => window.setTimeout(resolve, 150));
+            return JSON.stringify({
+              schema_version: 1,
+              generated_at: "2026-06-25T00:00:00.000Z",
+              app_version: "e2e-delayed",
+              group_count: 0,
+              events: [],
+              transport_diagnostics: { route_proof_status: "not_started" },
+              structured_logs: { last_command_error: null },
+            });
+          },
+        },
+      },
+    });
+  });
+  await configDialog.getByRole("button", { name: "Load support bundle" }).click();
+  await expect(
+    configDialog.getByRole("button", { name: "Loading support bundle" }),
+  ).toBeVisible();
+  await expect(
+    configDialog.getByText("Support bundle loaded from backend diagnostics."),
+  ).toBeVisible();
+  await expect(configDialog.getByTestId("support-bundle-preview")).toContainText(
+    "e2e-delayed",
+  );
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "__TAURI__", {
+      configurable: true,
+      value: {
+        core: {
+          invoke: async (command: string) => {
+            if (command !== "export_diagnostics_log") throw new Error(command);
+            return "";
+          },
+        },
+      },
+    });
+  });
+  await configDialog.getByRole("button", { name: "Load support bundle" }).click();
+  await expect(
+    configDialog.getByText("Backend returned an empty support bundle."),
+  ).toBeVisible();
+  await expect(configDialog.getByTestId("support-bundle-preview")).toContainText(
+    "No support bundle loaded.",
+  );
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "__TAURI__", {
+      configurable: true,
+      value: {
+        core: {
+          invoke: async (command: string) => {
+            if (command !== "export_diagnostics_log") throw new Error(command);
+            throw new Error("diagnostics backend unavailable");
+          },
+        },
+      },
+    });
+  });
+  await configDialog.getByRole("button", { name: "Load support bundle" }).click();
+  await expect(
+    configDialog.getByText(
+      "Diagnostics export failed: diagnostics backend unavailable",
+    ),
+  ).toBeVisible();
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "__TAURI__", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  await configDialog.getByRole("button", { name: "Load support bundle" }).click();
+  await expect(
+    configDialog.getByText("Support bundle loaded from backend diagnostics."),
+  ).toBeVisible();
+  await configDialog.getByRole("button", { name: "Copy support bundle" }).click();
+  await expect(
+    configDialog.getByText(
+      "Diagnostics copy unavailable: Clipboard is unavailable in this WebView.",
+    ),
+  ).toBeVisible();
 });
