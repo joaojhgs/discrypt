@@ -277,6 +277,26 @@ impl SignalingAdapterFactory {
         }
     }
 
+    /// Build a concrete adapter entry for a validated registry-backed profile.
+    pub fn for_profile(profile: &SignalingAdapterProfile) -> Result<Self, TransportError> {
+        profile.validate()?;
+        let registry_entry =
+            required_provider_adapter_registry_entry(profile.kind).ok_or_else(|| {
+                TransportError::InvalidConnectivityPolicy(format!(
+                    "signaling adapter kind {} is not present in the required adapter registry",
+                    profile.kind.canonical_name()
+                ))
+            })?;
+        let factory_boundary = adapter_boundary_for_kind(profile.kind);
+        if factory_boundary != registry_entry.boundary {
+            return Err(TransportError::InvalidConnectivityPolicy(format!(
+                "signaling adapter registry boundary for {} does not match factory boundary",
+                profile.kind.canonical_name()
+            )));
+        }
+        Ok(Self::for_kind(profile.kind))
+    }
+
     /// Registry boundary for this entry.
     #[must_use]
     pub const fn boundary(self) -> ProviderAdapterBoundary {
@@ -325,6 +345,16 @@ impl SignalingAdapterFactory {
     pub fn selectable(self) -> bool {
         self.readiness_state().selectable()
     }
+}
+
+/// Return the required registry entry for one adapter kind.
+#[must_use]
+pub fn required_provider_adapter_registry_entry(
+    kind: SignalingAdapterKind,
+) -> Option<SignalingAdapterRegistryEntry> {
+    required_provider_adapter_registry()
+        .into_iter()
+        .find(|entry| entry.kind == kind)
 }
 
 /// Ordered registry of all required adapter boundaries.
@@ -949,9 +979,8 @@ pub async fn probe_provider_adapter_roundtrip(
     bootstrap_secret: &[u8],
     random_entropy: &[u8],
 ) -> Result<ProviderAdapterRoundtripProbe, TransportError> {
-    profile.validate()?;
     scope.validate()?;
-    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    let factory = SignalingAdapterFactory::for_profile(&profile)?;
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
@@ -1155,12 +1184,11 @@ where
             "text/control proof frame must be non-empty opaque bytes".to_owned(),
         ));
     }
-    profile.validate()?;
     scope.validate()?;
     negotiation_config
         .ice_servers
         .validate_credentials_at(chrono::Utc::now())?;
-    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    let factory = SignalingAdapterFactory::for_profile(&profile)?;
     #[cfg(not(any(
         feature = "mqtt-adapter",
         feature = "nostr-adapter",
@@ -1236,7 +1264,6 @@ pub async fn start_provider_webrtc_text_control_runtime_pair_between_peers_with_
 where
     F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
 {
-    profile.validate()?;
     scope.validate()?;
     negotiation_config
         .ice_servers
@@ -1246,7 +1273,7 @@ where
             "text/control runtime peer ids must be distinct".to_owned(),
         ));
     }
-    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    let factory = SignalingAdapterFactory::for_profile(&profile)?;
     start_provider_webrtc_text_control_runtime_pair_with_factory(
         factory,
         profile,
@@ -1332,7 +1359,7 @@ pub async fn start_provider_webrtc_text_control_offer_runtime(
         &local_peer_id,
         &remote_peer_id,
     )?;
-    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    let factory = SignalingAdapterFactory::for_profile(&profile)?;
     start_provider_webrtc_text_control_offer_runtime_with_factory(
         factory,
         profile,
@@ -1372,7 +1399,7 @@ where
         &local_peer_id,
         &remote_peer_id,
     )?;
-    let factory = SignalingAdapterFactory::for_kind(profile.kind);
+    let factory = SignalingAdapterFactory::for_profile(&profile)?;
     start_provider_webrtc_text_control_answer_runtime_with_factory(
         factory,
         profile,
@@ -6616,10 +6643,18 @@ mod tests {
     }
 
     #[test]
-    fn required_provider_adapter_registry_is_stable_and_matches_boundaries_and_factory() {
+    fn required_provider_adapter_registry_is_stable_and_matches_boundaries_and_factory(
+    ) -> Result<(), TransportError> {
         let registry = required_provider_adapter_registry();
         let boundaries = required_provider_adapter_boundaries();
         assert_eq!(registry.len(), boundaries.len());
+        assert_eq!(
+            registry
+                .iter()
+                .map(|entry| entry.kind.canonical_name())
+                .collect::<Vec<_>>(),
+            vec!["mqtt", "nostr", "ipfs_pubsub", "discrypt_quic_rendezvous"]
+        );
 
         for entry in registry {
             let boundary = adapter_boundary_for_kind(entry.kind);
@@ -6630,7 +6665,28 @@ mod tests {
             );
             let factory = SignalingAdapterFactory::for_kind(entry.kind);
             assert_eq!(factory.boundary(), boundary);
+            assert_eq!(
+                SignalingAdapterFactory::for_profile(&valid_profile(entry.kind)?)?.boundary(),
+                boundary
+            );
+            assert_eq!(
+                required_provider_adapter_registry_entry(entry.kind),
+                Some(entry)
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn signaling_adapter_factory_rejects_misconfigured_profiles_before_connect() {
+        let mut profile = valid_profile(SignalingAdapterKind::Mqtt).expect("valid profile");
+        profile.endpoints.clear();
+        let error = SignalingAdapterFactory::for_profile(&profile)
+            .expect_err("empty profile endpoints must fail before provider connect");
+        assert!(matches!(
+            error,
+            TransportError::InvalidConnectivityPolicy(_)
+        ));
     }
 
     #[test]
