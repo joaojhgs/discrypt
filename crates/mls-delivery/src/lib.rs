@@ -2813,8 +2813,10 @@ mod tests {
         );
 
         let histories = vec![low_leaf_history.clone(), high_leaf_history.clone()];
-        let winner = comparator_maximal_history(&histories).expect("winner");
-        assert_eq!(winner.summary, high_leaf_history.summary);
+        assert_eq!(
+            comparator_maximal_history(&histories).map(|history| history.summary.clone()),
+            Some(high_leaf_history.summary.clone())
+        );
         assert!(high_leaf_history.key() > low_leaf_history.key());
 
         let plan = plan_repair_from_histories(
@@ -2829,34 +2831,42 @@ mod tests {
                     b"still-valid-ciphertext".to_vec(),
                 ),
             ],
-        )
-        .expect("repair plan");
+        );
 
         assert_eq!(
-            plan.action,
-            RepairAction::RejoinAndReproposal {
+            plan.as_ref().map(|plan| &plan.action),
+            Some(&RepairAction::RejoinAndReproposal {
                 coordinator_leaf: 7
-            }
+            })
         );
-        assert_eq!(plan.winner, high_leaf_history.summary);
         assert_eq!(
-            event_ids(&plan.reproposed_events),
-            BTreeSet::from(["losing-app-event-reproposed".into()])
+            plan.as_ref().map(|plan| plan.winner.clone()),
+            Some(high_leaf_history.summary.clone())
         );
-        assert!(!plan.replays_divergent_mls_commits);
+        assert_eq!(
+            plan.as_ref().map(|plan| event_ids(&plan.reproposed_events)),
+            Some(BTreeSet::from(["losing-app-event-reproposed".into()]))
+        );
+        assert_eq!(
+            plan.as_ref().map(|plan| plan.replays_divergent_mls_commits),
+            Some(false)
+        );
 
-        let mut partition_a = DeliveryState::new(low_leaf_history.summary);
-        let mut partition_b = DeliveryState::new(high_leaf_history.summary.clone());
-        assert_eq!(partition_a.apply_repair_plan(plan.clone()), Ok(()));
-        assert_eq!(partition_b.apply_repair_plan(plan.clone()), Ok(()));
-        let repaired = repair_to_winner(2, &plan);
+        assert!(plan.is_some());
+        if let Some(plan) = plan {
+            let mut partition_a = DeliveryState::new(low_leaf_history.summary);
+            let mut partition_b = DeliveryState::new(high_leaf_history.summary.clone());
+            assert_eq!(partition_a.apply_repair_plan(plan.clone()), Ok(()));
+            assert_eq!(partition_b.apply_repair_plan(plan.clone()), Ok(()));
+            let repaired = repair_to_winner(2, &plan);
 
-        assert_eq!(partition_a.summary(), &high_leaf_history.summary);
-        assert_eq!(partition_b.summary(), &high_leaf_history.summary);
-        assert_eq!(repaired, vec![high_leaf_history.summary; 2]);
-        assert!(equal_confirmation_tags(&repaired));
-        assert_eq!(partition_a.accepted_events(), partition_b.accepted_events());
-        assert_ne!(partition_a.summary(), &common);
+            assert_eq!(partition_a.summary(), &high_leaf_history.summary);
+            assert_eq!(partition_b.summary(), &high_leaf_history.summary);
+            assert_eq!(repaired, vec![high_leaf_history.summary; 2]);
+            assert!(equal_confirmation_tags(&repaired));
+            assert_eq!(partition_a.accepted_events(), partition_b.accepted_events());
+            assert_ne!(partition_a.summary(), &common);
+        }
     }
 
     #[test]
