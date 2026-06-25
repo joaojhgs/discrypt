@@ -8977,6 +8977,27 @@ mod tests {
     #[tokio::test]
     async fn local_conformance_adapters_deliver_opaque_dm_payloads_without_plaintext_leaks(
     ) -> Result<(), TransportError> {
+        #[derive(Serialize)]
+        struct ProviderCaptureEvidence {
+            adapter_kind: &'static str,
+            entries: usize,
+            total_provider_visible_bytes: usize,
+            provider_visible_sha256: Vec<String>,
+            forbidden_field_scan: &'static str,
+            raw_payloads_retained: bool,
+        }
+
+        #[derive(Serialize)]
+        struct ProviderCaptureArtifact {
+            issue: &'static str,
+            evidence_level: &'static str,
+            signaling_only_boundary: bool,
+            forbidden_fields_scanned: Vec<&'static str>,
+            captures: Vec<ProviderCaptureEvidence>,
+            external_host_packet_capture_required_for_release: bool,
+        }
+
+        let mut captures = Vec::new();
         for kind in [
             SignalingAdapterKind::Mqtt,
             SignalingAdapterKind::Nostr,
@@ -9104,12 +9125,67 @@ mod tests {
             assert_provider_app_payload_relay_disabled(bob_room.take_control_payloads().await);
 
             assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
+            let material = bus.relay_visible_material_for_tests();
+            captures.push(ProviderCaptureEvidence {
+                adapter_kind: kind.canonical_name(),
+                entries: material.len(),
+                total_provider_visible_bytes: material.iter().map(Vec::len).sum(),
+                provider_visible_sha256: material
+                    .iter()
+                    .map(|bytes| sha256_hex(bytes))
+                    .collect::<Vec<_>>(),
+                forbidden_field_scan: "passed",
+                raw_payloads_retained: false,
+            });
             let observability = format!(
                 "{:?}{:?}",
                 adapter.observability_redacted(),
                 adapter.connect(local_profile(kind)?).await?.health().await
             );
             assert_no_forbidden_text(&observability);
+        }
+        if let Ok(path) = std::env::var("DISCRYPT_PROVIDER_METADATA_CAPTURE_OUT") {
+            let artifact = ProviderCaptureArtifact {
+                issue: "PER-88/P10-T07",
+                evidence_level: "repository-local deterministic provider-visible capture",
+                signaling_only_boundary: true,
+                forbidden_fields_scanned: vec![
+                    "display_names",
+                    "group_names",
+                    "channel_names",
+                    "raw_sdp",
+                    "ice_ufrag",
+                    "ice_pwd",
+                    "ice_candidates",
+                    "turn_credentials",
+                    "private_keys",
+                    "message_plaintext",
+                    "media_payloads",
+                    "mls_exporter_material",
+                    "sframe_keys",
+                    "content_keys",
+                    "sensitive_auth_tokens",
+                ],
+                captures,
+                external_host_packet_capture_required_for_release: true,
+            };
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    TransportError::Unavailable(format!(
+                        "failed to create provider capture artifact directory: {error}"
+                    ))
+                })?;
+            }
+            let json = serde_json::to_string_pretty(&artifact).map_err(|error| {
+                TransportError::Unavailable(format!(
+                    "failed to serialize provider capture artifact: {error}"
+                ))
+            })?;
+            std::fs::write(&path, format!("{json}\n")).map_err(|error| {
+                TransportError::Unavailable(format!(
+                    "failed to write provider capture artifact {path}: {error}"
+                ))
+            })?;
         }
         Ok(())
     }
