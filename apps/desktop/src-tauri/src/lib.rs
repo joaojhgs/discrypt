@@ -72,11 +72,14 @@ use discrypt_transport::{
     start_provider_webrtc_text_control_offer_runtime, AdapterFallbackBehavior, AdapterTrustLabel,
     ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel, ConversationScope, Endpoint,
     FallbackLeg, IceEndpointPolicy, IceServerConfig, ProviderMetadataPosture,
-    ProviderTextControlRuntimeAttachment, ProviderTextControlRuntimePeerRole,
-    ProviderTextControlRuntimeSpec, SignalingAdapterCapabilities, SignalingAdapterKind,
-    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint,
-    TransportError, TransportRoute, TransportSession, TransportSessionSnapshot,
-    TransportSessionState, TurnServerConfig,
+    ProviderRetryBackoffPolicy, ProviderTextControlRuntimeAttachment,
+    ProviderTextControlRuntimePeerRole, ProviderTextControlRuntimeSpec,
+    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
+    SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
+    TransportRoute, TransportSession, TransportSessionSnapshot, TransportSessionState,
+    TurnServerConfig, DEFAULT_PROVIDER_BACKOFF_INITIAL_MS, DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
+    DEFAULT_PROVIDER_BACKOFF_MAX_MS, DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
+    DEFAULT_PROVIDER_MAX_MESSAGE_BYTES,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
@@ -582,6 +585,21 @@ pub struct SignalingProfileView {
     pub metadata_posture: String,
     /// Abuse/rate-limit policy hint surfaced to UI/backend.
     pub rate_limit_policy: String,
+    /// Provider message cap enforced before publishing sealed envelopes.
+    #[serde(default)]
+    pub max_message_bytes: Option<u32>,
+    /// First provider retry delay in milliseconds.
+    #[serde(default = "default_provider_backoff_initial_ms")]
+    pub backoff_initial_ms: u32,
+    /// Maximum provider retry delay in milliseconds.
+    #[serde(default = "default_provider_backoff_max_ms")]
+    pub backoff_max_ms: u32,
+    /// Exponential provider retry multiplier.
+    #[serde(default = "default_provider_backoff_multiplier")]
+    pub backoff_multiplier: u8,
+    /// Maximum provider attempts before surfacing failure.
+    #[serde(default = "default_provider_backoff_max_attempts")]
+    pub backoff_max_attempts: u8,
     /// Adapter capabilities asserted by this profile.
     pub capabilities: Vec<String>,
     /// Provider policy schema version for allowlist and rotation semantics.
@@ -16315,6 +16333,22 @@ fn default_provider_policy_version() -> u32 {
     INVITE_PROVIDER_POLICY_VERSION
 }
 
+fn default_provider_backoff_initial_ms() -> u32 {
+    DEFAULT_PROVIDER_BACKOFF_INITIAL_MS
+}
+
+fn default_provider_backoff_max_ms() -> u32 {
+    DEFAULT_PROVIDER_BACKOFF_MAX_MS
+}
+
+fn default_provider_backoff_multiplier() -> u8 {
+    DEFAULT_PROVIDER_BACKOFF_MULTIPLIER
+}
+
+fn default_provider_backoff_max_attempts() -> u8 {
+    DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS
+}
+
 fn default_provider_rotation_policy() -> String {
     "rotate by issuing a fresh signed invite/connectivity policy when endpoint trust, rate limits, or availability changes".to_owned()
 }
@@ -16341,6 +16375,21 @@ fn validate_provider_policy(profile: &SignalingProfileView) -> Result<(), String
     if profile.endpoint_allowlist_commitments.is_empty() {
         return Err("Provider endpoint allowlist commitments must not be empty".to_owned());
     }
+    if let Some(max_message_bytes) = profile.max_message_bytes {
+        if max_message_bytes == 0 || max_message_bytes > DEFAULT_PROVIDER_MAX_MESSAGE_BYTES {
+            return Err(format!(
+                "Provider max_message_bytes must be between 1 and {DEFAULT_PROVIDER_MAX_MESSAGE_BYTES}"
+            ));
+        }
+    }
+    ProviderRetryBackoffPolicy {
+        initial_ms: profile.backoff_initial_ms,
+        max_ms: profile.backoff_max_ms,
+        multiplier: profile.backoff_multiplier,
+        max_attempts: profile.backoff_max_attempts,
+    }
+    .validate()
+    .map_err(|error| error.to_string())?;
     let allowed = profile
         .endpoints
         .iter()
@@ -16374,6 +16423,13 @@ fn transport_profile_from_view(
                 endpoint_security_for_probe(endpoint),
             );
             provider.trust_fingerprint = Some(profile.trust_fingerprint.clone());
+            provider.max_message_bytes = profile.max_message_bytes;
+            provider.retry_backoff = ProviderRetryBackoffPolicy {
+                initial_ms: profile.backoff_initial_ms,
+                max_ms: profile.backoff_max_ms,
+                multiplier: profile.backoff_multiplier,
+                max_attempts: profile.backoff_max_attempts,
+            };
             provider.retained_presence = profile
                 .capabilities
                 .iter()
@@ -17061,6 +17117,11 @@ fn signaling_profile_for_endpoint(
         ttl_seconds: 300,
         metadata_posture: "hashed_topic".to_owned(),
         rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
+        max_message_bytes: Some(DEFAULT_PROVIDER_MAX_MESSAGE_BYTES),
+        backoff_initial_ms: DEFAULT_PROVIDER_BACKOFF_INITIAL_MS,
+        backoff_max_ms: DEFAULT_PROVIDER_BACKOFF_MAX_MS,
+        backoff_multiplier: DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
+        backoff_max_attempts: DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
         provider_policy_version: INVITE_PROVIDER_POLICY_VERSION,
         endpoint_allowlist_commitments: vec![endpoint_allowlist_commitment(
             &adapter_kind,
@@ -18253,6 +18314,11 @@ fn profile_from_admission(profile: &InviteSignalingProfile) -> SignalingProfileV
         ttl_seconds: profile.ttl_seconds,
         metadata_posture: profile.metadata_posture.clone(),
         rate_limit_policy: profile.rate_limit_policy.clone(),
+        max_message_bytes: Some(DEFAULT_PROVIDER_MAX_MESSAGE_BYTES),
+        backoff_initial_ms: DEFAULT_PROVIDER_BACKOFF_INITIAL_MS,
+        backoff_max_ms: DEFAULT_PROVIDER_BACKOFF_MAX_MS,
+        backoff_multiplier: DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
+        backoff_max_attempts: DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
         capabilities: profile.capabilities.clone(),
         provider_policy_version: profile.provider_policy_version,
         endpoint_allowlist_commitments: profile.endpoint_allowlist_commitments.clone(),

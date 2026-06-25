@@ -53,9 +53,12 @@ pub use peer_overlay::{
 pub use policy::{
     derive_scope_commitment, AdapterFallbackBehavior, AdapterTrustLabel, ConnectivityPolicy,
     ConnectivityPolicySource, ConnectivityPolicyStore, ConnectivityScopeLevel, ConversationScope,
-    EffectiveConnectivityPolicy, IceProfile, ProviderMetadataPosture, RendezvousCapability,
-    SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
-    SignalingEndpointSecurity, SignalingProviderEndpoint,
+    EffectiveConnectivityPolicy, IceProfile, ProviderMetadataPosture, ProviderRetryBackoffPolicy,
+    RendezvousCapability, SignalingAdapterCapabilities, SignalingAdapterKind,
+    SignalingAdapterProfile, SignalingEndpointSecurity, SignalingProviderEndpoint,
+    DEFAULT_PROVIDER_BACKOFF_INITIAL_MS, DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
+    DEFAULT_PROVIDER_BACKOFF_MAX_MS, DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
+    DEFAULT_PROVIDER_MAX_MESSAGE_BYTES,
 };
 #[cfg(any(test, feature = "harness"))]
 pub use provider_adapters::start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer;

@@ -408,6 +408,11 @@ export type SignalingProfileView = {
   ttl_seconds: number;
   metadata_posture: string;
   rate_limit_policy: string;
+  max_message_bytes?: number | null;
+  backoff_initial_ms: number;
+  backoff_max_ms: number;
+  backoff_multiplier: number;
+  backoff_max_attempts: number;
   capabilities: string[];
   provider_policy_version: number;
   endpoint_allowlist_commitments: string[];
@@ -2686,6 +2691,11 @@ function signalingProfileForEndpoint(
     ttl_seconds: 300,
     metadata_posture: "hashed_topic",
     rate_limit_policy: "bounded publish/take with provider backoff",
+    max_message_bytes: 64 * 1024,
+    backoff_initial_ms: 250,
+    backoff_max_ms: 5000,
+    backoff_multiplier: 2,
+    backoff_max_attempts: 5,
     provider_policy_version: 1,
     endpoint_allowlist_commitments: [
       hashCommitment("discrypt-provider-endpoint-allowlist-v1", [
