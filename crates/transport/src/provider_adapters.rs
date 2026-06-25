@@ -3584,6 +3584,7 @@ pub struct MqttProviderRoom {
     rendezvous_topic: String,
     topics: MqttTopics,
     inbox: AsyncMutex<MqttInbox>,
+    max_message_bytes: u32,
 }
 
 #[cfg(feature = "mqtt-adapter")]
@@ -3981,19 +3982,21 @@ fn mqtt_client_id(topic: &str, _peer: &SignalingPeerId) -> String {
 
 #[cfg(feature = "mqtt-adapter")]
 fn mqtt_options_from_endpoint(
-    endpoint: &str,
+    endpoint: &SignalingProviderEndpoint,
     client_id: &str,
 ) -> Result<rumqttc::MqttOptions, TransportError> {
     let _ = rumqttc::tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (parse_endpoint, secure_transport) = if let Some(rest) = endpoint.strip_prefix("mqtts://") {
-        (format!("mqtt://{rest}"), Some("tls"))
-    } else if let Some(rest) = endpoint.strip_prefix("ssl://") {
-        (format!("mqtt://{rest}"), Some("tls"))
-    } else if let Some(rest) = endpoint.strip_prefix("wss://") {
-        (format!("ws://{rest}"), Some("wss"))
-    } else {
-        (endpoint.to_owned(), None)
-    };
+    let endpoint_value = endpoint.endpoint.0.as_str();
+    let (parse_endpoint, secure_transport) =
+        if let Some(rest) = endpoint_value.strip_prefix("mqtts://") {
+            (format!("mqtt://{rest}"), Some("tls"))
+        } else if let Some(rest) = endpoint_value.strip_prefix("ssl://") {
+            (format!("mqtt://{rest}"), Some("tls"))
+        } else if let Some(rest) = endpoint_value.strip_prefix("wss://") {
+            (format!("ws://{rest}"), Some("wss"))
+        } else {
+            (endpoint_value.to_owned(), None)
+        };
     let separator = if parse_endpoint.contains('?') {
         '&'
     } else {
@@ -4009,8 +4012,25 @@ fn mqtt_options_from_endpoint(
     };
     options.set_keep_alive(10);
     options.set_clean_start(true);
-    options.set_max_packet_size(Some(64 * 1024));
+    options.set_max_packet_size(Some(
+        endpoint
+            .max_message_bytes
+            .unwrap_or(crate::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES),
+    ));
     Ok(options)
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_validate_publish_bytes(bytes: &[u8], max_message_bytes: u32) -> Result<(), TransportError> {
+    if bytes.len() > max_message_bytes as usize {
+        return Err(TransportError::SignalingAdapter(format!(
+            "mqtt provider message too large: payload_bytes={} max_message_bytes={} failure_class={}",
+            bytes.len(),
+            max_message_bytes,
+            AdapterReadinessState::ProviderMessageTooLarge.failure_class()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "mqtt-adapter")]
@@ -5609,6 +5629,7 @@ impl MqttProviderRoom {
         let bytes =
             serde_json::to_vec(&envelope).map_err(|err| mqtt_err("wire envelope encode", err))?;
         reject_forbidden_plaintext(&bytes)?;
+        mqtt_validate_publish_bytes(&bytes, self.max_message_bytes)?;
         self.client
             .publish(topic, rumqttc::QoS::AtLeastOnce, false, bytes)
             .await
@@ -6055,7 +6076,7 @@ impl AdapterSession for MqttProviderSession {
         }
         let endpoint = mqtt_endpoint_for_profile(&self.profile)?;
         let client_id = mqtt_client_id(&rendezvous.topic, &local_peer_id);
-        let options = mqtt_options_from_endpoint(&endpoint.endpoint.0, &client_id)?;
+        let options = mqtt_options_from_endpoint(endpoint, &client_id)?;
         let topics = mqtt_topics(&rendezvous, &local_peer_id);
         let (client, mut eventloop) = rumqttc::AsyncClient::builder(options).capacity(64).build();
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
@@ -6111,6 +6132,9 @@ impl AdapterSession for MqttProviderSession {
             rendezvous_topic: rendezvous.topic,
             topics,
             inbox: AsyncMutex::new(MqttInbox::default()),
+            max_message_bytes: endpoint
+                .max_message_bytes
+                .unwrap_or(crate::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES),
         };
         room.wait_for_subscription_acks(3, Duration::from_secs(5))
             .await?;
@@ -6640,6 +6664,22 @@ mod tests {
             SignalingAdapterKind::IpfsPubsub,
             SignalingAdapterKind::Mqtt,
         ]
+    }
+
+    #[cfg(feature = "mqtt-adapter")]
+    #[test]
+    fn mqtt_publish_payload_limit_maps_to_typed_provider_failure() {
+        let error = mqtt_validate_publish_bytes(&vec![7_u8; 17], 16)
+            .expect_err("oversized MQTT provider envelope must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("failure_class=provider_message_too_large"),
+            "expected typed payload failure, got {message}"
+        );
+        assert!(
+            !message.contains("7777"),
+            "payload-limit diagnostics must not echo provider-visible bytes"
+        );
     }
 
     #[test]

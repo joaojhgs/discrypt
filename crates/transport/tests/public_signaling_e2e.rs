@@ -38,13 +38,22 @@ use tokio::time::{sleep, Duration, Instant};
 
 #[cfg(feature = "mqtt-adapter")]
 fn public_mqtt_profile(endpoint: String) -> Result<SignalingAdapterProfile, TransportError> {
+    let security = if endpoint.starts_with("mqtt://127.0.0.1")
+        || endpoint.starts_with("mqtt://[::1]")
+        || endpoint.starts_with("ws://127.0.0.1")
+        || endpoint.starts_with("ws://[::1]")
+    {
+        SignalingEndpointSecurity::LocalDevLoopback
+    } else {
+        SignalingEndpointSecurity::ProductionTls
+    };
+    let mut provider_endpoint = SignalingProviderEndpoint::new(Endpoint::new(endpoint), security);
+    provider_endpoint.max_message_bytes =
+        Some(discrypt_transport::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES);
     Ok(SignalingAdapterProfile {
         profile_id: "public-mqtt-e2e".to_owned(),
         kind: SignalingAdapterKind::Mqtt,
-        endpoints: vec![SignalingProviderEndpoint::new(
-            Endpoint::new(endpoint),
-            SignalingEndpointSecurity::ProductionTls,
-        )],
+        endpoints: vec![provider_endpoint],
         metadata_posture: ProviderMetadataPosture::HashedTopic,
         capabilities: SignalingAdapterCapabilities::production_required(),
         trust_label: AdapterTrustLabel::new("public mqtt", "public broker; opaque envelopes only")?,
@@ -235,8 +244,10 @@ where
 #[cfg(feature = "mqtt-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_mqtt_two_peer_presence_and_signal_roundtrip() -> Result<(), TransportError> {
-    if std::env::var("DISCRYPT_PUBLIC_SIGNALING_E2E").as_deref() != Ok("1") {
-        eprintln!("skipping public MQTT E2E; set DISCRYPT_PUBLIC_SIGNALING_E2E=1 to run");
+    if std::env::var("DISCRYPT_PUBLIC_MQTT_E2E").as_deref() != Ok("1")
+        && std::env::var("DISCRYPT_PUBLIC_SIGNALING_E2E").as_deref() != Ok("1")
+    {
+        eprintln!("skipping public MQTT E2E; set DISCRYPT_PUBLIC_MQTT_E2E=1 or legacy DISCRYPT_PUBLIC_SIGNALING_E2E=1 to run");
         return Ok(());
     }
 

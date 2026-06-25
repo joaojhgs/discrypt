@@ -150,6 +150,58 @@ pub enum SignalingEndpointSecurity {
     SelfHostedExplicit,
 }
 
+/// Default bounded provider payload cap for public signaling envelopes.
+pub const DEFAULT_PROVIDER_MAX_MESSAGE_BYTES: u32 = 64 * 1024;
+/// Default initial retry delay for provider publish/take attempts.
+pub const DEFAULT_PROVIDER_BACKOFF_INITIAL_MS: u32 = 250;
+/// Default maximum retry delay for provider publish/take attempts.
+pub const DEFAULT_PROVIDER_BACKOFF_MAX_MS: u32 = 5_000;
+/// Default exponential retry multiplier for provider publish/take attempts.
+pub const DEFAULT_PROVIDER_BACKOFF_MULTIPLIER: u8 = 2;
+/// Default bounded retry count for provider publish/take attempts.
+pub const DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS: u8 = 5;
+
+/// Bounded retry/backoff policy for public provider publish/take attempts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRetryBackoffPolicy {
+    /// First retry delay in milliseconds.
+    pub initial_ms: u32,
+    /// Maximum retry delay in milliseconds.
+    pub max_ms: u32,
+    /// Exponential multiplier applied between retries.
+    pub multiplier: u8,
+    /// Maximum attempts before surfacing a typed provider failure.
+    pub max_attempts: u8,
+}
+
+impl Default for ProviderRetryBackoffPolicy {
+    fn default() -> Self {
+        Self {
+            initial_ms: DEFAULT_PROVIDER_BACKOFF_INITIAL_MS,
+            max_ms: DEFAULT_PROVIDER_BACKOFF_MAX_MS,
+            multiplier: DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
+            max_attempts: DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
+        }
+    }
+}
+
+impl ProviderRetryBackoffPolicy {
+    /// Validate that retry behavior is bounded and monotonic.
+    pub fn validate(&self) -> Result<(), TransportError> {
+        if self.initial_ms == 0
+            || self.max_ms < self.initial_ms
+            || self.multiplier < 1
+            || self.max_attempts == 0
+            || self.max_attempts > 10
+        {
+            return Err(TransportError::InvalidConnectivityPolicy(
+                "provider retry backoff must be bounded and monotonic".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Redacted trust label surfaced to UI/diagnostic surfaces.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AdapterTrustLabel {
@@ -200,6 +252,9 @@ pub struct SignalingProviderEndpoint {
     /// Optional endpoint identity/fingerprint commitment.
     #[serde(default)]
     pub trust_fingerprint: Option<String>,
+    /// Bounded provider retry/backoff policy for publish/take operations.
+    #[serde(default)]
+    pub retry_backoff: ProviderRetryBackoffPolicy,
 }
 
 impl SignalingProviderEndpoint {
@@ -213,6 +268,7 @@ impl SignalingProviderEndpoint {
             max_message_bytes: None,
             retained_presence: false,
             trust_fingerprint: None,
+            retry_backoff: ProviderRetryBackoffPolicy::default(),
         }
     }
 
@@ -230,6 +286,14 @@ impl SignalingProviderEndpoint {
         if let Some(fingerprint) = &self.trust_fingerprint {
             validate_commitment(fingerprint)?;
         }
+        if let Some(max_message_bytes) = self.max_message_bytes {
+            if max_message_bytes == 0 || max_message_bytes > DEFAULT_PROVIDER_MAX_MESSAGE_BYTES {
+                return Err(TransportError::InvalidConnectivityPolicy(
+                    "provider max_message_bytes must be non-zero and no larger than the production cap".to_owned(),
+                ));
+            }
+        }
+        self.retry_backoff.validate()?;
 
         match self.security {
             SignalingEndpointSecurity::ProductionTls => {
@@ -766,6 +830,40 @@ mod tests {
             capabilities: SignalingAdapterCapabilities::production_required(),
             trust_label: trust(kind.canonical_name())?,
         })
+    }
+
+    #[test]
+    fn provider_endpoint_defaults_payload_cap_and_bounded_backoff() -> Result<(), TransportError> {
+        let endpoint = SignalingProviderEndpoint::new(
+            Endpoint::new("mqtts://broker.emqx.io:8883"),
+            SignalingEndpointSecurity::ProductionTls,
+        );
+        assert_eq!(endpoint.max_message_bytes, None);
+        assert_eq!(
+            endpoint.retry_backoff,
+            ProviderRetryBackoffPolicy::default()
+        );
+        endpoint.validate_for_kind(SignalingAdapterKind::Mqtt)?;
+
+        let mut invalid_backoff = endpoint.clone();
+        invalid_backoff.retry_backoff = ProviderRetryBackoffPolicy {
+            initial_ms: 5_000,
+            max_ms: 250,
+            multiplier: 2,
+            max_attempts: 5,
+        };
+        assert!(matches!(
+            invalid_backoff.validate_for_kind(SignalingAdapterKind::Mqtt),
+            Err(TransportError::InvalidConnectivityPolicy(_))
+        ));
+
+        let mut invalid_cap = endpoint;
+        invalid_cap.max_message_bytes = Some(DEFAULT_PROVIDER_MAX_MESSAGE_BYTES + 1);
+        assert!(matches!(
+            invalid_cap.validate_for_kind(SignalingAdapterKind::Mqtt),
+            Err(TransportError::InvalidConnectivityPolicy(_))
+        ));
+        Ok(())
     }
 
     fn ice_profile(id: &str) -> Result<IceProfile, TransportError> {
