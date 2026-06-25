@@ -33651,6 +33651,33 @@ mod tests {
     }
 
     #[test]
+    fn default_ipfs_profile_requires_explicit_direct_topic_peer_endpoint() {
+        let _guard = test_lock();
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS",
+            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+        );
+        std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
+        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
+        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
+
+        let profiles = default_signaling_profiles("ipfs-default-block");
+        let ipfs = profiles
+            .iter()
+            .find(|profile| profile.adapter_kind == "ipfs_pubsub")
+            .expect("configured IPFS profile is surfaced for validation");
+        let error =
+            transport_profile_from_view(ipfs).expect_err("DNS/bootstrap IPFS defaults must fail");
+        assert!(
+            error.contains("production endpoint scheme is invalid")
+                || error.contains("Invalid connectivity policy"),
+            "expected IPFS direct topic-peer validation failure, got: {error}"
+        );
+
+        std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
+    }
+
+    #[test]
     #[cfg(all(feature = "mqtt-adapter", feature = "nostr-adapter"))]
     fn active_connectivity_policy_drives_selected_adapter_order() {
         let _guard = test_lock();
