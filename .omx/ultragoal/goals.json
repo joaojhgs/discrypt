@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T04:30:32.069Z",
+  "updatedAt": "2026-06-25T13:37:35.566Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -263,6 +263,17 @@
       "createdAt": "2026-06-25T04:30:32.069Z",
       "updatedAt": "2026-06-25T04:30:32.069Z",
       "evidence": "Multica PER-77 issue 2489ff86-1ee5-4f5b-ae2a-91f0b61a6793 acceptance requires total order comparator for commits/governance/events and AC-MLS-FORK adversarial harness; current mls-delivery orders app events but commit/history winner selection needs hardening."
+    },
+    {
+      "id": "G025-per-78-p9-t04-retention-windows",
+      "title": "PER-78 P9-T04 retention windows",
+      "objective": "Implement PER-78/P9-T04 retention windows: presets/custom/unlimited policy, shorten-retroactive and lengthen-future-only semantics, no resurrection of expired/deleted plaintext or keys, persisted policy restart evidence, and backend-proven UI/Tauri retention state. Scope is local Rust backend/core/storage/content-key evidence plus minimal UI contract; do not implement crypto-shred/tombstones, multi-device identity, backup/recovery, adapter registry, release-gate matrix, or autopilot retrigger.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T13:28:31.367Z",
+      "updatedAt": "2026-06-25T13:37:35.566Z",
+      "evidence": "PER-78 retention windows implemented and verified. Files: crates/content-keys/src/lib.rs, crates/content-keys/Cargo.toml, crates/storage/src/lib.rs, crates/core/src/lib.rs, apps/ui/src/commands.ts, .omx/plans/P9-T04-retention-windows-2026-06-25.md, docs/release/per78-retention-windows-2026-06-25.md. Passed: cargo fmt --check; cargo test -p discrypt-content-keys retention; cargo test -p discrypt-content-keys; cargo test -p discrypt-storage retention_policy; cargo test -p discrypt-core retention_policy_surface; clippy for content-keys/storage/core; npm --prefix apps/ui ci; npm --prefix apps/ui run typecheck; git diff --check.",
+      "completedAt": "2026-06-25T13:37:35.566Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

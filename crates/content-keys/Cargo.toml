@@ -27,4 +27,5 @@ ed25519-dalek = { workspace = true }
 mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 uuid = { workspace = true }

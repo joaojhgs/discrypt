@@ -9,6 +9,7 @@
 pub mod production_status;
 pub mod services;
 use admission::Invite;
+use content_keys::{RetentionPolicy, RetentionPolicySource, RetentionWindow};
 use mls_core::{verifying_key_from_hex, DeviceSet, GroupState, Identity, SafetyNumber};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -126,6 +127,10 @@ pub struct RetentionSettingsView {
     pub presets: Vec<String>,
     /// Current default setting.
     pub selected: String,
+    /// Selected finite window in seconds; `None` means warned unlimited.
+    pub selected_window_seconds: Option<u64>,
+    /// Backend evidence source for the displayed policy.
+    pub policy_source: String,
     /// Warning for unlimited/never-lock.
     pub unlimited_warning: String,
     /// Shorten/lengthen semantic copy.
@@ -465,7 +470,8 @@ impl<S: AppStore> AppService<S> {
                 },
             );
         }
-        self.state.snapshot.retention.selected = normalize_label(&request.retention, "7 days");
+        let policy = retention_policy_from_label(&request.retention);
+        apply_retention_policy_to_snapshot(&mut self.state.snapshot, policy);
         self.push_activity(format!(
             "Created local-first group '{name}' through persisted AppService command"
         ));
@@ -924,6 +930,8 @@ fn seed_state() -> AppState {
                     "warned unlimited / never-lock".to_owned(),
                 ],
                 selected: "7 days".to_owned(),
+                selected_window_seconds: Some(604800),
+                policy_source: "UserDefault".to_owned(),
                 unlimited_warning: "Unlimited keeps local keys longer and weakens lock behavior; opt in explicitly".to_owned(),
                 transition_copy: "Shortening re-locks older messages retroactively; lengthening applies only to future messages".to_owned(),
             },
@@ -1064,6 +1072,19 @@ fn retention_status(selected: &str) -> String {
     format!("{selected}; older messages lock, not vanish")
 }
 
+fn retention_policy_from_label(label: &str) -> RetentionPolicy {
+    RetentionPolicy::new(
+        RetentionWindow::from_label(label).unwrap_or_default(),
+        RetentionPolicySource::UserDefault,
+    )
+}
+
+fn apply_retention_policy_to_snapshot(snapshot: &mut AppSnapshot, policy: RetentionPolicy) {
+    snapshot.retention.selected = policy.label();
+    snapshot.retention.selected_window_seconds = policy.seconds();
+    snapshot.retention.policy_source = format!("{:?}", policy.source);
+}
+
 #[allow(dead_code)]
 fn _invite_boundary(_: &Invite) {}
 
@@ -1176,10 +1197,37 @@ mod tests {
         let reloaded_snapshot = reloaded.snapshot();
         assert!(reloaded_snapshot.friend.verified);
         assert_eq!(reloaded_snapshot.preferences.theme_id, "ocean-contrast");
+        assert_eq!(reloaded_snapshot.retention.selected, "7 days");
+        assert_eq!(
+            reloaded_snapshot.retention.selected_window_seconds,
+            Some(604800)
+        );
+        assert_eq!(reloaded_snapshot.retention.policy_source, "UserDefault");
         assert!(reloaded_snapshot.servers[0]
             .channels
             .iter()
             .any(|channel| channel.name == "#secure-room"));
+        Ok(())
+    }
+
+    #[test]
+    fn retention_policy_surface_is_backend_computed_and_restart_safe() -> Result<(), AppServiceError>
+    {
+        let store = MemoryAppStore::default();
+        let mut service = AppService::load_or_seed(store.clone())?;
+
+        service.create_group(CreateGroupRequest {
+            name: "retention lab".to_owned(),
+            retention: "custom 43200 seconds".to_owned(),
+        })?;
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.retention.selected, "custom 43200 seconds");
+        assert_eq!(snapshot.retention.selected_window_seconds, Some(43_200));
+        assert_eq!(snapshot.retention.policy_source, "UserDefault");
+
+        let reloaded = AppService::load_or_seed(store)?;
+        let reloaded_snapshot = reloaded.snapshot();
+        assert_eq!(reloaded_snapshot.retention, snapshot.retention);
         Ok(())
     }
 
