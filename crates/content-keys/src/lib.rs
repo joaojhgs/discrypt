@@ -310,12 +310,18 @@ impl CrossDeviceShredState {
     /// Register an own device.
     pub fn register_device(&mut self, device_id: impl Into<String>, online: bool) {
         let device_id = device_id.into();
+        let mut seen_tombstones = Tombstones::default();
+        if online {
+            for id in self.global_tombstones.ids() {
+                seen_tombstones.shred(id);
+            }
+        }
         self.devices.insert(
             device_id.clone(),
             DeviceShredStatus {
                 device_id,
                 online,
-                seen_tombstones: Tombstones::default(),
+                seen_tombstones,
             },
         );
     }
@@ -327,6 +333,28 @@ impl CrossDeviceShredState {
         for device in self.devices.values_mut().filter(|device| device.online) {
             device.seen_tombstones.shred(message_id.clone());
         }
+    }
+
+    /// Merge tombstones learned from another own device and sync online devices.
+    pub fn merge_tombstones<I, S>(&mut self, message_ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for message_id in message_ids {
+            self.global_tombstones.shred(message_id);
+        }
+        for device in self.devices.values_mut().filter(|device| device.online) {
+            for id in self.global_tombstones.ids() {
+                device.seen_tombstones.shred(id);
+            }
+        }
+    }
+
+    /// Ordered global tombstone ids for persistence/sync.
+    #[must_use]
+    pub fn tombstone_ids(&self) -> Vec<String> {
+        self.global_tombstones.ids()
     }
 
     /// Mark a device online/offline; online devices sync current tombstones.
@@ -934,6 +962,22 @@ mod tests {
         shred.set_online("phone", true);
         assert!(!shred.pending_on_device("phone", "m1"));
         assert!(!shred.device_may_serve("phone", "m1"));
+    }
+
+    #[test]
+    fn shred_tombstones_merge_and_sync_new_online_devices() {
+        let mut shred = CrossDeviceShredState::default();
+        shred.register_device("laptop", true);
+        shred.shred("m1");
+        shred.merge_tombstones(["m2"]);
+        shred.register_device("tablet", true);
+
+        assert_eq!(
+            shred.tombstone_ids(),
+            vec!["m1".to_owned(), "m2".to_owned()]
+        );
+        assert!(!shred.device_may_serve("tablet", "m1"));
+        assert!(!shred.device_may_serve("tablet", "m2"));
     }
 
     #[test]
