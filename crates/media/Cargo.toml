@@ -25,4 +25,5 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 libopus-rs = { workspace = true }
 mls_core = { package = "discrypt-mls-core", path = "../mls-core", version = "0.1.0" }
+discrypt_transport = { package = "discrypt-transport", path = "../transport", version = "0.1.0" }
 zeroize = { workspace = true }

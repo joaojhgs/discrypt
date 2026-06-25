@@ -33,7 +33,8 @@ pub use transform_bridge::{
     BridgeClearFrame, BridgeProtectedFrame, BridgeVerifiedFrame, RustTransformBridge,
 };
 pub use transport::{
-    AndroidVoiceContingency, MediaTransportPath, MicrophonePermissionState,
-    NativeWebRtcRsContingency, NativeWebRtcRsContingencyError, VoiceDeviceDescriptor,
-    VoiceDeviceKind, VoiceDeviceSelection,
+    build_voice_overlay_fanout, AndroidVoiceContingency, MediaTransportPath,
+    MicrophonePermissionState, NativeWebRtcRsContingency, NativeWebRtcRsContingencyError,
+    VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection, VoiceFanoutDelivery,
+    VoiceFanoutRouteKind, VoiceOverlayFanoutInput, VoiceOverlayFanoutPlan,
 };

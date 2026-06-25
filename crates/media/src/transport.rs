@@ -1,6 +1,17 @@
-//! Media transport path selection and native Android WebRTC contingency configuration.
+//! Media transport path selection, voice fanout, and native Android WebRTC contingency configuration.
 
+use crate::{BridgeProtectedFrame, MediaError};
+use discrypt_transport::{
+    build_peer_overlay_forwarding_plan, PeerOverlayAckMode, PeerOverlayAdmittedSet,
+    PeerOverlayAuth, PeerOverlayCarrier, PeerOverlayDelivery, PeerOverlayForwardingPlan,
+    PeerOverlayForwardingPolicy, PeerOverlayFrame, PeerOverlayLoopId, PeerOverlayOpaquePayload,
+    PeerOverlayPayloadKind, PeerOverlayPeerRef, PeerOverlayRelayAuthoritySet, PeerOverlayRoute,
+    PeerOverlayRouteLegEvidence, PeerOverlayRouteSelection, PeerOverlaySelectedRoute,
+    PeerOverlayTtl, TransportError,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 /// Phase-1 media transport path decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,6 +50,374 @@ pub enum VoiceCodecBackend {
     RustLibopusRs,
     /// WebRTC runtime supplies already-encoded Opus frames to the keyless transform bridge.
     WebRtcRuntimeOpus,
+}
+
+/// Route kind selected for one protected voice fanout delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceFanoutRouteKind {
+    /// Direct WebRTC media/data route between admitted peers.
+    DirectWebRtc,
+    /// Configured TURN-backed WebRTC route carrying end-to-end SFrame ciphertext.
+    ConfiguredTurnBackedWebRtc,
+    /// Peer-assisted overlay route carrying opaque SFrame ciphertext through admitted relays.
+    PeerAssistedOverlay,
+}
+
+/// One destination delivery for an already SFrame-protected voice frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceFanoutDelivery {
+    /// Current-epoch admitted destination peer.
+    pub destination: PeerOverlayPeerRef,
+    /// Selected route kind for this destination.
+    pub route_kind: VoiceFanoutRouteKind,
+    /// Redacted live route label from backend/transport evidence.
+    pub route_label: String,
+    /// SFrame-protected frame handed to the direct/TURN/overlay carrier.
+    pub protected_frame: BridgeProtectedFrame,
+    /// Overlay forwarding proof for peer-assisted deliveries.
+    pub overlay_forwarding: Option<PeerOverlayForwardingPlan>,
+    /// Evidence flag: no provider application relay was selected.
+    pub provider_application_relay_used: bool,
+    /// Evidence flag: relay forwarding did not expose a decrypt/key path.
+    pub decrypt_path_exposed: bool,
+    /// Evidence flag: relays only receive SFrame ciphertext plus non-secret commitments/metadata.
+    pub relay_observed_sframe_ciphertext_only: bool,
+}
+
+/// Inputs for building voice fanout over direct plus peer-assisted overlay routes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceOverlayFanoutInput {
+    /// Current-epoch admitted source peer.
+    pub source: PeerOverlayPeerRef,
+    /// Already SFrame-protected encoded audio frame.
+    pub protected_frame: BridgeProtectedFrame,
+    /// Route selections for every intended destination.
+    pub route_selections: Vec<PeerOverlayRouteSelection>,
+    /// OpenMLS/backend auth binding for overlay media frames.
+    pub auth: PeerOverlayAuth,
+    /// Ack/redelivery contract for overlay media frames.
+    pub delivery: PeerOverlayDelivery,
+    /// TTL for overlay media frames.
+    pub ttl: PeerOverlayTtl,
+    /// Loop id for duplicate/loop suppression.
+    pub loop_id: PeerOverlayLoopId,
+    /// Optional forbidden relay-visible markers, usually known plaintext/key bytes in tests.
+    #[serde(default)]
+    pub forbidden_relay_visible_markers: Vec<Vec<u8>>,
+}
+
+/// Fanout plan for one protected voice frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VoiceOverlayFanoutPlan {
+    /// Current-epoch admitted source peer.
+    pub source: PeerOverlayPeerRef,
+    /// Per-destination deliveries.
+    pub deliveries: Vec<VoiceFanoutDelivery>,
+    /// Evidence flag: at least one direct or configured TURN delivery is present.
+    pub direct_or_turn_delivery_present: bool,
+    /// Evidence flag: at least one peer-assisted overlay relay delivery is present.
+    pub peer_relay_delivery_present: bool,
+    /// Evidence flag: no public signaling provider was selected as a media relay.
+    pub provider_application_relay_used: bool,
+    /// Honest limitation for release evidence and UI consumers.
+    pub limitation: String,
+}
+
+/// Build a media fanout plan from already-selected transport routes.
+///
+/// The planner is intentionally keyless and content-blind after SFrame protection.
+/// It never decrypts media for relays, never exposes raw SFrame keys, and never
+/// converts provider signaling into an application/media relay fallback.
+pub fn build_voice_overlay_fanout(
+    admitted: &PeerOverlayAdmittedSet,
+    relay_authority: &PeerOverlayRelayAuthoritySet,
+    input: VoiceOverlayFanoutInput,
+) -> Result<VoiceOverlayFanoutPlan, MediaError> {
+    admitted
+        .validate_ref(&input.source)
+        .map_err(media_transport_error)?;
+    input
+        .auth
+        .validate(admitted)
+        .map_err(media_transport_error)?;
+    input
+        .delivery
+        .validate(&input.ttl)
+        .map_err(media_transport_error)?;
+    if input.delivery.ack_mode != PeerOverlayAckMode::AckRequired {
+        return Err(MediaError::MediaTransportFailed(
+            "voice overlay fanout requires destination acknowledgements".to_owned(),
+        ));
+    }
+    if input.route_selections.is_empty() {
+        return Err(MediaError::MediaTransportFailed(
+            "voice overlay fanout requires at least one route selection".to_owned(),
+        ));
+    }
+
+    let forwarding_policy = PeerOverlayForwardingPolicy {
+        carrier: PeerOverlayCarrier::PeerAssistedOverlay,
+        forbidden_relay_visible_markers: input.forbidden_relay_visible_markers.clone(),
+    };
+    let mut seen_destinations = BTreeSet::new();
+    let mut deliveries = Vec::with_capacity(input.route_selections.len());
+
+    for selection in input.route_selections.clone() {
+        let delivery = delivery_for_selection(
+            admitted,
+            relay_authority,
+            &forwarding_policy,
+            &input,
+            selection,
+        )?;
+        if !seen_destinations.insert(delivery.destination.peer_id.clone()) {
+            return Err(MediaError::MediaTransportFailed(
+                "voice overlay fanout destination routes must be unique".to_owned(),
+            ));
+        }
+        deliveries.push(delivery);
+    }
+
+    let direct_or_turn_delivery_present = deliveries.iter().any(|delivery| {
+        matches!(
+            delivery.route_kind,
+            VoiceFanoutRouteKind::DirectWebRtc | VoiceFanoutRouteKind::ConfiguredTurnBackedWebRtc
+        )
+    });
+    let peer_relay_delivery_present = deliveries
+        .iter()
+        .any(|delivery| delivery.route_kind == VoiceFanoutRouteKind::PeerAssistedOverlay);
+    Ok(VoiceOverlayFanoutPlan {
+        source: input.source,
+        deliveries,
+        direct_or_turn_delivery_present,
+        peer_relay_delivery_present,
+        provider_application_relay_used: false,
+        limitation:
+            "local 3-member media fanout harness/model evidence only; not split-machine production audio"
+                .to_owned(),
+    })
+}
+
+fn delivery_for_selection(
+    admitted: &PeerOverlayAdmittedSet,
+    relay_authority: &PeerOverlayRelayAuthoritySet,
+    forwarding_policy: &PeerOverlayForwardingPolicy,
+    input: &VoiceOverlayFanoutInput,
+    selection: PeerOverlayRouteSelection,
+) -> Result<VoiceFanoutDelivery, MediaError> {
+    match selection.selected {
+        PeerOverlaySelectedRoute::DirectWebRtc { evidence } => direct_delivery(
+            admitted,
+            &input.source,
+            &input.protected_frame,
+            evidence,
+            VoiceFanoutRouteKind::DirectWebRtc,
+            PeerOverlayCarrier::DirectWebRtcDataChannel,
+        ),
+        PeerOverlaySelectedRoute::ConfiguredTurnBackedWebRtc { evidence } => direct_delivery(
+            admitted,
+            &input.source,
+            &input.protected_frame,
+            evidence,
+            VoiceFanoutRouteKind::ConfiguredTurnBackedWebRtc,
+            PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+        ),
+        PeerOverlaySelectedRoute::PeerAssistedOverlay {
+            relay, evidence, ..
+        } => {
+            relay_authority
+                .authorize_relay(&relay, &input.auth)
+                .map_err(media_transport_error)?;
+            validate_relay_route_evidence(admitted, &input.source, &evidence)
+                .map_err(media_transport_error)?;
+            if evidence.relay != relay {
+                return Err(MediaError::MediaTransportFailed(
+                    "voice overlay fanout relay selection and route evidence differ".to_owned(),
+                ));
+            }
+            let destination = evidence.relay_to_destination.to.clone();
+            let overlay_frame = voice_overlay_frame(input, relay, destination.clone())?;
+            let forwarding = build_peer_overlay_forwarding_plan(
+                admitted,
+                relay_authority,
+                forwarding_policy,
+                &overlay_frame,
+            )
+            .map_err(media_transport_error)?;
+            let relay_observed_sframe_ciphertext_only = forwarding.hops.iter().all(|hop| {
+                !forwarding.decrypt_path_exposed
+                    && hop.payload_kind == PeerOverlayPayloadKind::Media
+                    && hop
+                        .relay_visible_bytes
+                        .windows(input.protected_frame.bytes.len())
+                        .any(|window| window == input.protected_frame.bytes.as_slice())
+            });
+            Ok(VoiceFanoutDelivery {
+                destination,
+                route_kind: VoiceFanoutRouteKind::PeerAssistedOverlay,
+                route_label: evidence.relay_to_destination.route_label.clone(),
+                protected_frame: input.protected_frame.clone(),
+                overlay_forwarding: Some(forwarding),
+                provider_application_relay_used: false,
+                decrypt_path_exposed: false,
+                relay_observed_sframe_ciphertext_only,
+            })
+        }
+    }
+}
+
+fn direct_delivery(
+    admitted: &PeerOverlayAdmittedSet,
+    source: &PeerOverlayPeerRef,
+    protected_frame: &BridgeProtectedFrame,
+    evidence: PeerOverlayRouteLegEvidence,
+    route_kind: VoiceFanoutRouteKind,
+    expected_carrier: PeerOverlayCarrier,
+) -> Result<VoiceFanoutDelivery, MediaError> {
+    validate_route_leg(
+        admitted,
+        &evidence,
+        source,
+        &evidence.to,
+        expected_carrier,
+        "voice overlay direct fanout route evidence",
+    )
+    .map_err(media_transport_error)?;
+    Ok(VoiceFanoutDelivery {
+        destination: evidence.to,
+        route_kind,
+        route_label: evidence.route_label,
+        protected_frame: protected_frame.clone(),
+        overlay_forwarding: None,
+        provider_application_relay_used: false,
+        decrypt_path_exposed: false,
+        relay_observed_sframe_ciphertext_only: true,
+    })
+}
+
+fn voice_overlay_frame(
+    input: &VoiceOverlayFanoutInput,
+    relay: PeerOverlayPeerRef,
+    destination: PeerOverlayPeerRef,
+) -> Result<PeerOverlayFrame, MediaError> {
+    Ok(PeerOverlayFrame::new(
+        PeerOverlayCarrier::PeerAssistedOverlay,
+        PeerOverlayRoute {
+            source: input.source.clone(),
+            relay_path: vec![relay],
+            destination,
+            ttl: input.ttl.clone(),
+            loop_id: input.loop_id,
+        },
+        input.auth.clone(),
+        input.delivery.clone(),
+        PeerOverlayOpaquePayload {
+            kind: PeerOverlayPayloadKind::Media,
+            key_id: input.protected_frame.kid.clone(),
+            sequence: input.protected_frame.counter,
+            aad_commitment: voice_frame_aad_commitment(&input.protected_frame),
+            opaque_ciphertext: input.protected_frame.bytes.clone(),
+        },
+    ))
+}
+
+fn validate_relay_route_evidence(
+    admitted: &PeerOverlayAdmittedSet,
+    source: &PeerOverlayPeerRef,
+    evidence: &discrypt_transport::PeerOverlayRelayRouteEvidence,
+) -> Result<(), TransportError> {
+    admitted.validate_ref(&evidence.relay)?;
+    if evidence.relay.peer_id == source.peer_id
+        || evidence.relay.peer_id == evidence.relay_to_destination.to.peer_id
+    {
+        return Err(TransportError::InvalidConnectivityPolicy(
+            "voice overlay relay cannot be source or destination".to_owned(),
+        ));
+    }
+    validate_relay_leg(
+        admitted,
+        &evidence.source_to_relay,
+        source,
+        &evidence.relay,
+        "voice overlay source-to-relay route evidence",
+    )?;
+    validate_relay_leg(
+        admitted,
+        &evidence.relay_to_destination,
+        &evidence.relay,
+        &evidence.relay_to_destination.to,
+        "voice overlay relay-to-destination route evidence",
+    )
+}
+
+fn validate_route_leg(
+    admitted: &PeerOverlayAdmittedSet,
+    evidence: &PeerOverlayRouteLegEvidence,
+    from: &PeerOverlayPeerRef,
+    to: &PeerOverlayPeerRef,
+    expected_carrier: PeerOverlayCarrier,
+    label: &str,
+) -> Result<(), TransportError> {
+    admitted.validate_ref(&evidence.from)?;
+    admitted.validate_ref(&evidence.to)?;
+    evidence.carrier.validate()?;
+    if evidence.route_label.trim().is_empty() || evidence.route_label.trim() != evidence.route_label
+    {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "{label} must have a non-empty trimmed route label"
+        )));
+    }
+    if evidence.from != *from || evidence.to != *to {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "{label} must bind the expected peer pair"
+        )));
+    }
+    if evidence.carrier != expected_carrier {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "{label} carrier does not match route selection"
+        )));
+    }
+    if !evidence.live {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "{label} must be backed by a live route"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relay_leg(
+    admitted: &PeerOverlayAdmittedSet,
+    evidence: &PeerOverlayRouteLegEvidence,
+    from: &PeerOverlayPeerRef,
+    to: &PeerOverlayPeerRef,
+    label: &str,
+) -> Result<(), TransportError> {
+    if matches!(
+        evidence.carrier,
+        PeerOverlayCarrier::PeerAssistedOverlay | PeerOverlayCarrier::ProviderApplicationRelay
+    ) {
+        return Err(TransportError::InvalidConnectivityPolicy(format!(
+            "{label} must use a direct or configured TURN WebRTC leg"
+        )));
+    }
+    validate_route_leg(admitted, evidence, from, to, evidence.carrier, label)
+}
+
+fn voice_frame_aad_commitment(frame: &BridgeProtectedFrame) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"discrypt-voice-overlay-fanout-v1");
+    h.update((frame.kid.len() as u64).to_be_bytes());
+    h.update(&frame.kid);
+    h.update(frame.counter.to_be_bytes());
+    h.update((frame.bytes.len() as u64).to_be_bytes());
+    h.update(&frame.bytes);
+    h.finalize().into()
+}
+
+fn media_transport_error(error: TransportError) -> MediaError {
+    MediaError::MediaTransportFailed(error.to_string())
 }
 
 /// Auditable ADR-001 media path decision exported to UI/ops evidence.
@@ -591,5 +970,324 @@ mod tests {
         );
         assert_eq!(decision.codec_backend, VoiceCodecBackend::RustLibopusRs);
         assert!(decision.preserves_rust_sframe_boundary());
+    }
+
+    fn peer(index: u8, epoch: u64) -> Result<PeerOverlayPeerRef, TransportError> {
+        Ok(PeerOverlayPeerRef::new(
+            discrypt_transport::SignalingPeerId::new(format!("voice-peer-{index}"))?,
+            format!("member-{index}"),
+            format!("device-{index}"),
+            epoch,
+        ))
+    }
+
+    fn admitted(epoch: u64) -> Result<PeerOverlayAdmittedSet, TransportError> {
+        PeerOverlayAdmittedSet::new(
+            epoch,
+            [peer(1, epoch)?, peer(2, epoch)?, peer(3, epoch)?],
+            [],
+        )
+    }
+
+    fn auth(epoch: u64) -> PeerOverlayAuth {
+        PeerOverlayAuth {
+            group_id_commitment: [9; 32],
+            epoch,
+            sender_leaf_index: 1,
+            confirmation_tag_commitment: [8; 32],
+            frame_auth_tag: vec![7; 16],
+        }
+    }
+
+    fn delivery() -> PeerOverlayDelivery {
+        PeerOverlayDelivery {
+            ack_id: discrypt_transport::PeerOverlayAckId([6; 16]),
+            ack_mode: PeerOverlayAckMode::AckRequired,
+            redelivery: discrypt_transport::PeerOverlayRedelivery {
+                max_attempts: 2,
+                max_relay_fanout: 1,
+                deadline_ms: 1_500,
+            },
+        }
+    }
+
+    fn ttl() -> PeerOverlayTtl {
+        PeerOverlayTtl {
+            remaining_hops: 1,
+            created_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }
+    }
+
+    fn leg(
+        from: PeerOverlayPeerRef,
+        to: PeerOverlayPeerRef,
+        carrier: PeerOverlayCarrier,
+        label: &str,
+    ) -> PeerOverlayRouteLegEvidence {
+        PeerOverlayRouteLegEvidence {
+            from,
+            to,
+            carrier,
+            route_label: label.to_owned(),
+            live: true,
+        }
+    }
+
+    fn selected_direct(epoch: u64) -> Result<PeerOverlayRouteSelection, TransportError> {
+        Ok(PeerOverlayRouteSelection {
+            attempts: vec![discrypt_transport::PeerOverlayRouteSelectionAttempt {
+                carrier: PeerOverlayCarrier::DirectWebRtcDataChannel,
+                selected: true,
+            }],
+            selected: PeerOverlaySelectedRoute::DirectWebRtc {
+                evidence: leg(
+                    peer(1, epoch)?,
+                    peer(2, epoch)?,
+                    PeerOverlayCarrier::DirectWebRtcDataChannel,
+                    "alice-to-bob-direct-voice",
+                ),
+            },
+            limitation: "unit route selection fixture".to_owned(),
+        })
+    }
+
+    fn selected_relay(
+        admitted: &PeerOverlayAdmittedSet,
+        authority: &PeerOverlayRelayAuthoritySet,
+        epoch: u64,
+    ) -> Result<PeerOverlayRouteSelection, TransportError> {
+        let relay = peer(2, epoch)?;
+        Ok(PeerOverlayRouteSelection {
+            attempts: vec![
+                discrypt_transport::PeerOverlayRouteSelectionAttempt {
+                    carrier: PeerOverlayCarrier::DirectWebRtcDataChannel,
+                    selected: false,
+                },
+                discrypt_transport::PeerOverlayRouteSelectionAttempt {
+                    carrier: PeerOverlayCarrier::PeerAssistedOverlay,
+                    selected: true,
+                },
+            ],
+            selected: PeerOverlaySelectedRoute::PeerAssistedOverlay {
+                relay: relay.clone(),
+                authorization: authority.authorize_relay(&relay, &auth(epoch))?,
+                score: 42,
+                evidence: Box::new(discrypt_transport::PeerOverlayRelayRouteEvidence {
+                    relay,
+                    source_to_relay: leg(
+                        peer(1, epoch)?,
+                        peer(2, epoch)?,
+                        PeerOverlayCarrier::DirectWebRtcDataChannel,
+                        "alice-to-bob-direct-voice",
+                    ),
+                    relay_to_destination: leg(
+                        peer(2, epoch)?,
+                        peer(3, epoch)?,
+                        PeerOverlayCarrier::ConfiguredTurnBackedWebRtc,
+                        "bob-to-carol-turn-voice",
+                    ),
+                }),
+            },
+            limitation: format!(
+                "unit route selection fixture with {} admitted peers",
+                [peer(1, epoch)?, peer(2, epoch)?, peer(3, epoch)?]
+                    .iter()
+                    .filter(|candidate| admitted.validate_ref(candidate).is_ok())
+                    .count()
+            ),
+        })
+    }
+
+    fn protected_voice_frame() -> Result<
+        (
+            BridgeProtectedFrame,
+            crate::SFrameReceiver,
+            crate::SFrameReceiver,
+            Vec<u8>,
+        ),
+        MediaError,
+    > {
+        let epoch_secret = [55; 32];
+        let plaintext = b"opus-20ms-audio-frame-per74".to_vec();
+        let binding = crate::SenderBinding::derive_for_epoch(
+            &epoch_secret,
+            "per74-voice-group",
+            44,
+            1,
+            "alice-device",
+        )?;
+        let mut sender = crate::SFrameSender::new(&epoch_secret, binding.clone())?;
+
+        let mut bob_registry = crate::MediaKeyRegistry::new();
+        bob_registry.register_sender(&epoch_secret, binding.clone())?;
+        let bob = crate::SFrameReceiver::new(bob_registry, crate::ReplayWindow::default());
+
+        let mut carol_registry = crate::MediaKeyRegistry::new();
+        carol_registry.register_sender(&epoch_secret, binding)?;
+        let carol = crate::SFrameReceiver::new(carol_registry, crate::ReplayWindow::default());
+
+        let frame: BridgeProtectedFrame = sender.protect(&plaintext)?.into();
+        Ok((frame, bob, carol, plaintext))
+    }
+
+    #[test]
+    fn voice_overlay_fanout_three_member_direct_plus_relay_ciphertext_only(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let epoch = 44;
+        let admitted = admitted(epoch)?;
+        let authority = PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            &admitted,
+            [9; 32],
+            [8; 32],
+            [peer(2, epoch)?],
+        )?;
+        let (protected_frame, mut bob_receiver, mut carol_receiver, plaintext) =
+            protected_voice_frame()?;
+
+        let plan = build_voice_overlay_fanout(
+            &admitted,
+            &authority,
+            VoiceOverlayFanoutInput {
+                source: peer(1, epoch)?,
+                protected_frame: protected_frame.clone(),
+                route_selections: vec![
+                    selected_direct(epoch)?,
+                    selected_relay(&admitted, &authority, epoch)?,
+                ],
+                auth: auth(epoch),
+                delivery: delivery(),
+                ttl: ttl(),
+                loop_id: PeerOverlayLoopId([5; 16]),
+                forbidden_relay_visible_markers: vec![plaintext.clone(), b"raw-media-key".to_vec()],
+            },
+        )?;
+
+        assert!(plan.direct_or_turn_delivery_present);
+        assert!(plan.peer_relay_delivery_present);
+        assert!(!plan.provider_application_relay_used);
+        assert_eq!(plan.deliveries.len(), 2);
+
+        let bob_delivery = plan
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.destination == peer(2, epoch).unwrap())
+            .ok_or("missing direct bob delivery")?;
+        assert_eq!(bob_delivery.route_kind, VoiceFanoutRouteKind::DirectWebRtc);
+        assert_eq!(
+            bob_receiver
+                .open(&bob_delivery.protected_frame.clone().into())?
+                .plaintext,
+            plaintext
+        );
+
+        let carol_delivery = plan
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.destination == peer(3, epoch).unwrap())
+            .ok_or("missing relay carol delivery")?;
+        assert_eq!(
+            carol_delivery.route_kind,
+            VoiceFanoutRouteKind::PeerAssistedOverlay
+        );
+        assert!(carol_delivery.relay_observed_sframe_ciphertext_only);
+        let forwarding = carol_delivery
+            .overlay_forwarding
+            .as_ref()
+            .ok_or("missing overlay forwarding proof")?;
+        assert_eq!(forwarding.hops.len(), 2);
+        assert!(!forwarding.decrypt_path_exposed);
+        assert!(!forwarding.provider_application_relay_used);
+        for hop in &forwarding.hops {
+            assert!(hop
+                .relay_visible_bytes
+                .windows(protected_frame.bytes.len())
+                .any(|window| window == protected_frame.bytes.as_slice()));
+            assert!(!hop
+                .relay_visible_bytes
+                .windows(plaintext.len())
+                .any(|window| window == plaintext.as_slice()));
+        }
+        assert_eq!(
+            carol_receiver
+                .open(&carol_delivery.protected_frame.clone().into())?
+                .plaintext,
+            plaintext
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn voice_overlay_fanout_rejects_provider_relay_route() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let epoch = 44;
+        let admitted = admitted(epoch)?;
+        let authority = PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            &admitted,
+            [9; 32],
+            [8; 32],
+            [peer(2, epoch)?],
+        )?;
+        let (protected_frame, _, _, _) = protected_voice_frame()?;
+        let mut route = selected_direct(epoch)?;
+        if let PeerOverlaySelectedRoute::DirectWebRtc { evidence } = &mut route.selected {
+            evidence.carrier = PeerOverlayCarrier::ProviderApplicationRelay;
+        }
+
+        let error = build_voice_overlay_fanout(
+            &admitted,
+            &authority,
+            VoiceOverlayFanoutInput {
+                source: peer(1, epoch)?,
+                protected_frame,
+                route_selections: vec![route],
+                auth: auth(epoch),
+                delivery: delivery(),
+                ttl: ttl(),
+                loop_id: PeerOverlayLoopId([5; 16]),
+                forbidden_relay_visible_markers: Vec::new(),
+            },
+        )
+        .expect_err("provider relay route must fail closed");
+        assert!(error
+            .to_string()
+            .contains("peer overlay frames must not use providers"));
+        Ok(())
+    }
+
+    #[test]
+    fn voice_overlay_fanout_rejects_relay_visible_plaintext_marker(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let epoch = 44;
+        let admitted = admitted(epoch)?;
+        let authority = PeerOverlayRelayAuthoritySet::from_openmls_current_epoch(
+            &admitted,
+            [9; 32],
+            [8; 32],
+            [peer(2, epoch)?],
+        )?;
+        let (mut protected_frame, _, _, _) = protected_voice_frame()?;
+        protected_frame.bytes = b"leaked plaintext audio".to_vec();
+
+        let error = build_voice_overlay_fanout(
+            &admitted,
+            &authority,
+            VoiceOverlayFanoutInput {
+                source: peer(1, epoch)?,
+                protected_frame,
+                route_selections: vec![selected_relay(&admitted, &authority, epoch)?],
+                auth: auth(epoch),
+                delivery: delivery(),
+                ttl: ttl(),
+                loop_id: PeerOverlayLoopId([5; 16]),
+                forbidden_relay_visible_markers: vec![b"plaintext audio".to_vec()],
+            },
+        )
+        .expect_err("relay-visible plaintext marker must fail closed");
+        assert_eq!(
+            error,
+            MediaError::MediaTransportFailed(TransportError::PlaintextLeak.to_string())
+        );
+        Ok(())
     }
 }
