@@ -1048,7 +1048,7 @@ mod tests {
                     "alice-to-bob-direct-voice",
                 ),
             },
-            limitation: "unit route selection fixture".to_owned(),
+            limitation: "voice fanout direct route evidence".to_owned(),
         })
     }
 
@@ -1090,7 +1090,7 @@ mod tests {
                 }),
             },
             limitation: format!(
-                "unit route selection fixture with {} admitted peers",
+                "voice fanout relay route evidence with {} admitted peers",
                 [peer(1, epoch)?, peer(2, epoch)?, peer(3, epoch)?]
                     .iter()
                     .filter(|candidate| admitted.validate_ref(candidate).is_ok())
@@ -1144,6 +1144,8 @@ mod tests {
         )?;
         let (protected_frame, mut bob_receiver, mut carol_receiver, plaintext) =
             protected_voice_frame()?;
+        let bob_peer = peer(2, epoch)?;
+        let carol_peer = peer(3, epoch)?;
 
         let plan = build_voice_overlay_fanout(
             &admitted,
@@ -1171,7 +1173,7 @@ mod tests {
         let bob_delivery = plan
             .deliveries
             .iter()
-            .find(|delivery| delivery.destination == peer(2, epoch).unwrap())
+            .find(|delivery| delivery.destination == bob_peer)
             .ok_or("missing direct bob delivery")?;
         assert_eq!(bob_delivery.route_kind, VoiceFanoutRouteKind::DirectWebRtc);
         assert_eq!(
@@ -1184,7 +1186,7 @@ mod tests {
         let carol_delivery = plan
             .deliveries
             .iter()
-            .find(|delivery| delivery.destination == peer(3, epoch).unwrap())
+            .find(|delivery| delivery.destination == carol_peer)
             .ok_or("missing relay carol delivery")?;
         assert_eq!(
             carol_delivery.route_kind,
@@ -1234,7 +1236,7 @@ mod tests {
             evidence.carrier = PeerOverlayCarrier::ProviderApplicationRelay;
         }
 
-        let error = build_voice_overlay_fanout(
+        let result = build_voice_overlay_fanout(
             &admitted,
             &authority,
             VoiceOverlayFanoutInput {
@@ -1247,8 +1249,10 @@ mod tests {
                 loop_id: PeerOverlayLoopId([5; 16]),
                 forbidden_relay_visible_markers: Vec::new(),
             },
-        )
-        .expect_err("provider relay route must fail closed");
+        );
+        let Err(error) = result else {
+            return Err("provider relay route must fail closed".into());
+        };
         assert!(error
             .to_string()
             .contains("peer overlay frames must not use providers"));
@@ -1269,7 +1273,7 @@ mod tests {
         let (mut protected_frame, _, _, _) = protected_voice_frame()?;
         protected_frame.bytes = b"leaked plaintext audio".to_vec();
 
-        let error = build_voice_overlay_fanout(
+        let result = build_voice_overlay_fanout(
             &admitted,
             &authority,
             VoiceOverlayFanoutInput {
@@ -1282,8 +1286,10 @@ mod tests {
                 loop_id: PeerOverlayLoopId([5; 16]),
                 forbidden_relay_visible_markers: vec![b"plaintext audio".to_vec()],
             },
-        )
-        .expect_err("relay-visible plaintext marker must fail closed");
+        );
+        let Err(error) = result else {
+            return Err("relay-visible plaintext marker must fail closed".into());
+        };
         assert_eq!(
             error,
             MediaError::MediaTransportFailed(TransportError::PlaintextLeak.to_string())
