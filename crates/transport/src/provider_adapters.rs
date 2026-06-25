@@ -4898,41 +4898,41 @@ async fn spawn_ipfs_pubsub_room(
             libp2p::yamux::Config::default,
         )
         .map_err(|err| ipfs_err("tcp transport", err))?
-        .with_behaviour(|keypair| {
-            let local_peer_id = libp2p::PeerId::from(keypair.public());
-            let gossipsub = libp2p::gossipsub::Behaviour::<
-                libp2p::gossipsub::IdentityTransform,
-                libp2p::gossipsub::AllowAllSubscriptionFilter,
-            >::new(
-                libp2p::gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-                gossipsub_config,
-            )
-            .unwrap_or_else(|error| {
-                panic!("validated ipfs_pubsub gossipsub config failed: {error}")
-            });
-            let mut kad_config = libp2p::kad::Config::new(libp2p::kad::PROTOCOL_NAME);
-            kad_config
-                .set_query_timeout(Duration::from_secs(IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS))
-                .set_replication_factor(NonZeroUsize::new(3).expect("non-zero replication"));
-            let kademlia = libp2p::kad::Behaviour::with_config(
-                local_peer_id,
-                libp2p::kad::store::MemoryStore::new(local_peer_id),
-                kad_config,
-            );
-            let identify = libp2p::identify::Behaviour::new(
-                libp2p::identify::Config::new(
-                    "/discrypt/ipfs-pubsub/1.0.0".to_owned(),
-                    keypair.public(),
-                )
-                .with_agent_version("discrypt-ipfs-pubsub/0.1.0".to_owned())
-                .with_push_listen_addr_updates(true),
-            );
-            IpfsPubsubBehaviour {
-                gossipsub,
-                kademlia,
-                identify,
-            }
-        })
+        .with_behaviour(
+            |keypair| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
+                let local_peer_id = libp2p::PeerId::from(keypair.public());
+                let gossipsub = libp2p::gossipsub::Behaviour::<
+                    libp2p::gossipsub::IdentityTransform,
+                    libp2p::gossipsub::AllowAllSubscriptionFilter,
+                >::new(
+                    libp2p::gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+                    gossipsub_config,
+                )?;
+                let replication_factor = NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN);
+                let mut kad_config = libp2p::kad::Config::new(libp2p::kad::PROTOCOL_NAME);
+                kad_config
+                    .set_query_timeout(Duration::from_secs(IPFS_PUBSUB_KAD_QUERY_TIMEOUT_SECS))
+                    .set_replication_factor(replication_factor);
+                let kademlia = libp2p::kad::Behaviour::with_config(
+                    local_peer_id,
+                    libp2p::kad::store::MemoryStore::new(local_peer_id),
+                    kad_config,
+                );
+                let identify = libp2p::identify::Behaviour::new(
+                    libp2p::identify::Config::new(
+                        "/discrypt/ipfs-pubsub/1.0.0".to_owned(),
+                        keypair.public(),
+                    )
+                    .with_agent_version("discrypt-ipfs-pubsub/0.1.0".to_owned())
+                    .with_push_listen_addr_updates(true),
+                );
+                Ok(IpfsPubsubBehaviour {
+                    gossipsub,
+                    kademlia,
+                    identify,
+                })
+            },
+        )
         .map_err(|error| ipfs_err("swarm behaviour", error))?
         .build();
     swarm
@@ -4954,7 +4954,7 @@ async fn spawn_ipfs_pubsub_room(
                 .kademlia
                 .add_address(&peer_id, addr.clone());
         }
-        if ipfs_should_dial(&addr) {
+        if ipfs_should_dial(addr) {
             let _ = swarm.dial(addr.clone());
         }
     }
