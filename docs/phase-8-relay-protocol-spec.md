@@ -1,9 +1,10 @@
 # Phase 8 Relay Protocol Spec
 
-PER-66 defines the protocol contract for Discrypt's future adaptive encrypted
-peer-assisted relay route. This is a specification and type skeleton only. It
-does not make overlay relay selectable, does not authorize relay candidates, and
-does not add a forwarding runtime.
+PER-66 defines the protocol contract for Discrypt's adaptive encrypted
+peer-assisted relay route. The local transport model now covers the protocol
+schema, relay authorization, candidate ranking, route selection, and opaque
+forwarding envelope construction. It still does not open network sockets, claim
+split-machine production delivery, or expose any decrypt/key path.
 
 ## Scope
 
@@ -19,7 +20,10 @@ fallback. The route remains peer-assisted and E2EE:
   application frames as a relay fallback.
 - Relay peers forward opaque ciphertext envelopes and route metadata only.
   They never receive plaintext, content keys, MLS exporter material, SFrame
-  keys, or a decrypt capability.
+  keys, or a decrypt capability. `build_peer_overlay_forwarding_plan` emits
+  per-hop forwarding envelopes from already protected text/control or media
+  frames after admission, epoch, authority, provider-boundary, TTL, and
+  relay-visible plaintext-marker checks pass.
 - Relay eligibility is bounded to peers that the backend/OpenMLS state proves
   admitted in the current group epoch. Invite parsing, pending admission, and
   stale route graph state are not relay authority.
@@ -143,13 +147,32 @@ carriers are:
 Provider signaling remains limited to rendezvous, presence, and sealed WebRTC
 negotiation/control. It is never overlay application relay evidence.
 
+## Opaque Forwarding
+
+PER-70 adds the local opaque forwarding boundary in
+`crates/transport/src/peer_overlay.rs`:
+
+- `PeerOverlayForwardingPolicy` requires `PeerAssistedOverlay` and can carry
+  test/audit-only forbidden relay-visible markers.
+- `build_peer_overlay_forwarding_plan` first validates the frame and explicit
+  current-epoch relay authority, then emits ordered `PeerOverlayForwardedHop`
+  envelopes for source-to-relay and relay-to-destination legs.
+- Each hop carries peer refs, ack id, loop id, payload kind, protected sequence,
+  remaining relay-hop count, and `PeerOverlayOpaquePayload::relay_visible_bytes`.
+- The function supports encrypted text/control and encrypted media payload
+  classes only. Store-forward queues remain out of scope for a later storage
+  task.
+- Provider application relay carriers, stale/revoked/non-authorized relay refs,
+  insufficient TTL, unsupported payload classes, and configured forbidden
+  relay-visible markers fail closed before any hop is emitted.
+- The returned evidence records `provider_application_relay_used = false` and
+  `decrypt_path_exposed = false`; this is a local model assertion, not a
+  production network proof.
+
 ## Out Of Scope
 
-This issue intentionally does not implement:
+The local Phase 8 model still does not implement:
 
-- candidate ranking,
-- route selection,
-- runtime forwarding,
 - store-forward queues,
 - voice/media expansion,
 - UI route claims,
@@ -163,7 +186,8 @@ with deterministic peer-identity ties. PER-69 adds local route-selection model
 evidence: direct WebRTC is preferred; configured TURN can be ordered before or
 after peer-assisted relay by explicit policy; and relay selection requires the
 top ranked authorized current-epoch relay plus two live non-provider route legs
-for source-to-relay and relay-to-destination. Production evidence will require
-later runtime tasks that prove explicit route evidence, ciphertext-only
-forwarding, fail-closed revocation under live group state, and no provider
-application relay.
+for source-to-relay and relay-to-destination. PER-70 adds local opaque
+forwarding envelopes for encrypted text/control and media frames. Production
+evidence will require later runtime tasks that open real peer routes, exercise
+split-machine delivery, prove fail-closed revocation under live group state,
+and preserve no-provider application relay under live adapters.

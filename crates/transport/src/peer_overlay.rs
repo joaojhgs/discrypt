@@ -1,8 +1,8 @@
 //! Peer-assisted encrypted overlay protocol contract.
 //!
 //! This module is intentionally data-only. It validates the shape of future
-//! relay frames and local route-selection evidence without forwarding bytes or
-//! exposing any decrypt/key path.
+//! relay frames and local route-selection/forwarding evidence without exposing
+//! any decrypt/key path.
 
 use crate::{SignalingPeerId, TransportError};
 use serde::{Deserialize, Serialize};
@@ -1331,6 +1331,169 @@ impl PeerOverlayFrame {
     }
 }
 
+/// Content-blind policy for forwarding one already-protected peer overlay frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayForwardingPolicy {
+    /// Carrier used by this forwarding path. Must be peer-assisted overlay.
+    pub carrier: PeerOverlayCarrier,
+    /// Optional forbidden relay-visible markers used by tests/audits to prove
+    /// caller-known plaintext or key material did not enter forwarding bytes.
+    #[serde(default)]
+    pub forbidden_relay_visible_markers: Vec<Vec<u8>>,
+}
+
+impl Default for PeerOverlayForwardingPolicy {
+    fn default() -> Self {
+        Self {
+            carrier: PeerOverlayCarrier::PeerAssistedOverlay,
+            forbidden_relay_visible_markers: Vec::new(),
+        }
+    }
+}
+
+impl PeerOverlayForwardingPolicy {
+    fn validate(&self) -> Result<(), TransportError> {
+        self.carrier.validate()?;
+        if self.carrier != PeerOverlayCarrier::PeerAssistedOverlay {
+            return Err(overlay_policy_error(
+                "peer overlay forwarding requires peer-assisted overlay carrier",
+            ));
+        }
+        for marker in &self.forbidden_relay_visible_markers {
+            if marker.is_empty() {
+                return Err(overlay_policy_error(
+                    "peer overlay forbidden plaintext marker must not be empty",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_no_forbidden_markers(&self, bytes: &[u8]) -> Result<(), TransportError> {
+        for marker in &self.forbidden_relay_visible_markers {
+            if bytes
+                .windows(marker.len())
+                .any(|window| window == marker.as_slice())
+            {
+                return Err(TransportError::PlaintextLeak);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One content-blind forwarding envelope for a direct source/relay/destination leg.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayForwardedHop {
+    /// Zero-based hop position in the forwarding path.
+    pub hop_index: u8,
+    /// Admitted current-epoch peer sending this hop.
+    pub from: PeerOverlayPeerRef,
+    /// Admitted current-epoch peer receiving this hop.
+    pub to: PeerOverlayPeerRef,
+    /// Remaining relay hops after this hop is emitted.
+    pub remaining_relay_hops_after_forward: u8,
+    /// Payload class forwarded without decryption.
+    pub payload_kind: PeerOverlayPayloadKind,
+    /// Sender monotonic protected-envelope sequence forwarded opaquely.
+    pub sequence: u64,
+    /// Ack id forwarded for destination receipt/redelivery correlation.
+    pub ack_id: PeerOverlayAckId,
+    /// Loop id forwarded for duplicate/loop suppression.
+    pub loop_id: PeerOverlayLoopId,
+    /// Relay-visible metadata commitments and ciphertext only.
+    pub relay_visible_bytes: Vec<u8>,
+}
+
+/// Forwarding plan for one already-encrypted peer-assisted overlay frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayForwardingPlan {
+    /// Frame schema version forwarded.
+    pub schema_version: u16,
+    /// Explicit current-epoch relay authorizations used for the route.
+    pub relay_authorizations: Vec<PeerOverlayRelayAuthorization>,
+    /// Ordered content-blind hop envelopes.
+    pub hops: Vec<PeerOverlayForwardedHop>,
+    /// Evidence flag: providers were not used as application relays.
+    pub provider_application_relay_used: bool,
+    /// Evidence flag: forwarding did not request or expose decrypt/key material.
+    pub decrypt_path_exposed: bool,
+}
+
+/// Build the opaque forwarding envelopes for an already protected overlay frame.
+///
+/// This function is intentionally content-blind: it validates admission,
+/// current epoch, explicit relay authority, provider boundaries, TTL, and audit
+/// markers, then copies only relay-visible ciphertext/commitment bytes into
+/// per-hop envelopes. It does not decrypt, authenticate MLS/SFrame payloads, or
+/// open network sockets.
+pub fn build_peer_overlay_forwarding_plan(
+    admitted: &PeerOverlayAdmittedSet,
+    relay_authority: &PeerOverlayRelayAuthoritySet,
+    policy: &PeerOverlayForwardingPolicy,
+    frame: &PeerOverlayFrame,
+) -> Result<PeerOverlayForwardingPlan, TransportError> {
+    policy.validate()?;
+    if frame.carrier != PeerOverlayCarrier::PeerAssistedOverlay {
+        return Err(overlay_policy_error(
+            "peer overlay forwarding only accepts peer-assisted overlay frames",
+        ));
+    }
+    if matches!(frame.payload.kind, PeerOverlayPayloadKind::StoreForward) {
+        return Err(overlay_policy_error(
+            "peer overlay forwarding supports text/control and media frames only",
+        ));
+    }
+    let relay_authorizations = frame.validate_relay_authorized(admitted, relay_authority)?;
+    let relay_hop_count = u8::try_from(frame.route.relay_path.len())
+        .map_err(|_| overlay_policy_error("peer overlay relay path exceeds supported hop count"))?;
+    if frame.route.ttl.remaining_hops < relay_hop_count {
+        return Err(overlay_policy_error(
+            "peer overlay forwarding TTL is insufficient for relay path",
+        ));
+    }
+
+    let relay_visible_bytes = frame.payload.relay_visible_bytes();
+    policy.assert_no_forbidden_markers(&relay_visible_bytes)?;
+
+    let mut peers = Vec::with_capacity(frame.route.relay_path.len() + 2);
+    peers.push(frame.route.source.clone());
+    peers.extend(frame.route.relay_path.iter().cloned());
+    peers.push(frame.route.destination.clone());
+
+    let mut hops = Vec::with_capacity(peers.len().saturating_sub(1));
+    for (index, pair) in peers.windows(2).enumerate() {
+        let hop_index = u8::try_from(index)
+            .map_err(|_| overlay_policy_error("peer overlay forwarding hop index overflow"))?;
+        let relays_already_entered = (index + 1).min(frame.route.relay_path.len());
+        let relays_already_entered = u8::try_from(relays_already_entered)
+            .map_err(|_| overlay_policy_error("peer overlay relay hop count overflow"))?;
+        hops.push(PeerOverlayForwardedHop {
+            hop_index,
+            from: pair[0].clone(),
+            to: pair[1].clone(),
+            remaining_relay_hops_after_forward: frame
+                .route
+                .ttl
+                .remaining_hops
+                .saturating_sub(relays_already_entered),
+            payload_kind: frame.payload.kind,
+            sequence: frame.payload.sequence,
+            ack_id: frame.delivery.ack_id,
+            loop_id: frame.route.loop_id,
+            relay_visible_bytes: relay_visible_bytes.clone(),
+        });
+    }
+
+    Ok(PeerOverlayForwardingPlan {
+        schema_version: frame.schema_version,
+        relay_authorizations,
+        hops,
+        provider_application_relay_used: false,
+        decrypt_path_exposed: false,
+    })
+}
+
 fn validate_label(value: &str, label: &str) -> Result<(), TransportError> {
     if value.trim().is_empty() || value.trim() != value || value.len() > 128 {
         Err(overlay_policy_error(format!(
@@ -1532,6 +1695,194 @@ mod tests {
             delivery,
             payload,
         ))
+    }
+
+    fn forwarding_policy() -> PeerOverlayForwardingPolicy {
+        PeerOverlayForwardingPolicy {
+            carrier: PeerOverlayCarrier::PeerAssistedOverlay,
+            forbidden_relay_visible_markers: vec![
+                b"plaintext message".to_vec(),
+                b"mls epoch secret".to_vec(),
+                b"sframe content key".to_vec(),
+            ],
+        }
+    }
+
+    #[test]
+    fn opaque_forwarding_emits_authorized_ciphertext_only_text_control_hops(
+    ) -> Result<(), TransportError> {
+        let admitted = admitted(9)?;
+        let authority = relay_authority(&admitted, 9)?;
+        let frame = frame(9)?;
+
+        let plan = build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &frame,
+        )?;
+
+        assert_eq!(plan.schema_version, PEER_OVERLAY_FRAME_SCHEMA_VERSION);
+        assert_eq!(plan.relay_authorizations.len(), 1);
+        assert_eq!(plan.hops.len(), 2);
+        assert_eq!(plan.hops[0].from, peer(1, 9)?);
+        assert_eq!(plan.hops[0].to, peer(2, 9)?);
+        assert_eq!(plan.hops[1].from, peer(2, 9)?);
+        assert_eq!(plan.hops[1].to, peer(3, 9)?);
+        assert_eq!(
+            plan.hops[0].payload_kind,
+            PeerOverlayPayloadKind::TextControl
+        );
+        assert_eq!(
+            plan.hops[0].relay_visible_bytes,
+            plan.hops[1].relay_visible_bytes
+        );
+        assert!(!plan.provider_application_relay_used);
+        assert!(!plan.decrypt_path_exposed);
+        for hop in &plan.hops {
+            for forbidden in &forwarding_policy().forbidden_relay_visible_markers {
+                assert!(!hop
+                    .relay_visible_bytes
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden.as_slice()));
+            }
+            assert!(hop
+                .relay_visible_bytes
+                .windows(b"DCF1:sealed-ciphertext-only".len())
+                .any(|window| window == b"DCF1:sealed-ciphertext-only"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_forwarding_accepts_media_without_decrypt_path() -> Result<(), TransportError> {
+        let admitted = admitted(9)?;
+        let authority = relay_authority(&admitted, 9)?;
+        let mut frame = frame(9)?;
+        frame.payload.kind = PeerOverlayPayloadKind::Media;
+        frame.payload.key_id = b"sframe-kid-7".to_vec();
+        frame.payload.opaque_ciphertext = b"SFRAME:opaque-media-frame".to_vec();
+
+        let plan = build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &frame,
+        )?;
+
+        assert!(plan.hops.iter().all(|hop| {
+            hop.payload_kind == PeerOverlayPayloadKind::Media && !plan.decrypt_path_exposed
+        }));
+        assert!(plan.hops.iter().all(|hop| hop
+            .relay_visible_bytes
+            .windows(b"SFRAME:opaque-media-frame".len())
+            .any(|window| window == b"SFRAME:opaque-media-frame")));
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_forwarding_rejects_forbidden_plaintext_marker() -> Result<(), TransportError> {
+        let admitted = admitted(9)?;
+        let authority = relay_authority(&admitted, 9)?;
+        let mut frame = frame(9)?;
+        frame.payload.opaque_ciphertext = b"plaintext message accidentally unsealed".to_vec();
+
+        let error = match build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &frame,
+        ) {
+            Ok(plan) => {
+                return Err(overlay_policy_error(format!(
+                    "plaintext marker unexpectedly forwarded: {plan:?}"
+                )));
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, TransportError::PlaintextLeak);
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_forwarding_fails_closed_for_provider_or_store_forward_paths(
+    ) -> Result<(), TransportError> {
+        let admitted = admitted(9)?;
+        let authority = relay_authority(&admitted, 9)?;
+
+        let mut provider_frame = frame(9)?;
+        provider_frame.carrier = PeerOverlayCarrier::ProviderApplicationRelay;
+        assert!(build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &provider_frame,
+        )
+        .is_err());
+
+        let mut provider_policy = forwarding_policy();
+        provider_policy.carrier = PeerOverlayCarrier::ProviderApplicationRelay;
+        assert!(build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &provider_policy,
+            &frame(9)?,
+        )
+        .is_err());
+
+        let mut store_forward = frame(9)?;
+        store_forward.payload.kind = PeerOverlayPayloadKind::StoreForward;
+        assert!(build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &store_forward,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_forwarding_requires_current_epoch_authorized_relay_and_sufficient_ttl(
+    ) -> Result<(), TransportError> {
+        let admitted = admitted(9)?;
+        let authority = relay_authority(&admitted, 9)?;
+
+        let stale = frame(8)?;
+        assert!(build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &stale,
+        )
+        .is_err());
+
+        let mut unauthorized = frame(9)?;
+        unauthorized.route.relay_path = vec![peer(2, 9)?, peer(4, 9)?];
+        let admitted_with_four = PeerOverlayAdmittedSet::new(
+            9,
+            [peer(1, 9)?, peer(2, 9)?, peer(3, 9)?, peer(4, 9)?],
+            [],
+        )?;
+        assert!(build_peer_overlay_forwarding_plan(
+            &admitted_with_four,
+            &authority,
+            &forwarding_policy(),
+            &unauthorized,
+        )
+        .is_err());
+
+        let mut low_ttl = frame(9)?;
+        low_ttl.route.ttl.remaining_hops = 0;
+        assert!(build_peer_overlay_forwarding_plan(
+            &admitted,
+            &authority,
+            &forwarding_policy(),
+            &low_ttl,
+        )
+        .is_err());
+        Ok(())
     }
 
     #[test]
