@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T19:57:03.644Z",
+  "updatedAt": "2026-06-25T20:24:38.260Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -380,6 +380,17 @@
       "updatedAt": "2026-06-25T19:57:03.644Z",
       "evidence": "PER-88 provider-visible privacy captures implemented and verified. Added sanitized capture artifact emission for MQTT/Nostr/IPFS/QUIC local conformance provider-visible material, npm G133 artifact/doc validation, PER-88 plan/evidence docs. Verification passed: cargo fmt --check; targeted conformance capture test; targeted plaintext rejection test; npm provider-metadata-capture-g133; cargo clippy -p discrypt-transport --lib -D warnings; git diff --check. Artifact: target/provider-visible-captures/per88-g133-provider-visible-capture.json.",
       "completedAt": "2026-06-25T19:57:03.644Z"
+    },
+    {
+      "id": "G036-per-89-p10-t08-abuse-rate-limit-back",
+      "title": "PER-89 P10-T08 abuse rate limit backoff",
+      "objective": "Implement PER-89/P10-T08 abuse, rate-limit, and backoff handling in discrypt-abuse and discrypt-transport: invite flood, reconnect storm, relay freeload, and provider rate-limit/backoff must fail closed or deprioritize safely; providers remain signaling-only; produce local deterministic soak evidence, release doc, PR, and QA handoff.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T20:14:41.734Z",
+      "updatedAt": "2026-06-25T20:24:38.260Z",
+      "evidence": "PER-89/P10-T08 local implementation complete on branch multica/P10-T08-abuse-rate-limit-backoff. Added typed abuse decisions/backoff, deterministic soak report, transport provider-boundary regression, plan/evidence docs, and local transcript target/e2e/per89-abuse-rate-limit-backoff.txt. Verification passed: cargo fmt --check; cargo test -p discrypt-abuse abuse_soak; cargo test -p discrypt-abuse; cargo test -p discrypt-transport abuse_rate_limit_backoff -- --test-threads=1; cargo test -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter abuse_rate_limit_backoff -- --test-threads=1; cargo clippy -p discrypt-abuse --lib -- -D warnings; cargo clippy -p discrypt-transport --lib -- -D warnings; git diff --check. Evidence is local deterministic Rust/harness evidence, not public-provider production soak.",
+      "completedAt": "2026-06-25T20:24:38.260Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
