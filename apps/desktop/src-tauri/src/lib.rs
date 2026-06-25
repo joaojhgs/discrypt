@@ -118,6 +118,14 @@ const DEFAULT_TEMPLATE_ID: &str = "command-center";
 const UI_THEME_IDS: &[&str] = &["midnight-steel", "graphite-calm", "ocean-contrast"];
 const UI_TEMPLATE_IDS: &[&str] = &["command-center", "compact-ops"];
 const INVITE_CREATE_LIMIT: u32 = 5;
+const APP_CONFIG_SCHEMA_VERSION: u32 = 1;
+const APP_CONFIG_MIN_SUPPORTED_VERSION: u32 = 1;
+const APP_CONFIG_SIGNED_UPDATE_ENV: &str = "DISCRYPT_SIGNED_APP_CONFIG_JSON";
+const APP_CONFIG_SIGNING_KEY_ID: &str = "discrypt-public-app-config-2026-06";
+const APP_CONFIG_SIGNING_PUBLIC_KEY_HEX: &str =
+    "7475182439334672a07f694146bb659d032f0fa3da0b09f760c869dd6f8aa1c6";
+const BUILTIN_APP_CONFIG_SIGNATURE_HEX: &str =
+    "06cf84dca8e5746067c5e88ff700357e30b19ba09a7b052e7e7f81b3fe50ecc0d6ea9ae8b433be4e0497d040654cf5e14361595cc47f68569df0050806ccea03";
 const TEXT_SEND_LIMIT: u32 = 20;
 #[allow(dead_code)]
 const TEXT_EXPORTER_LABEL: &str = "discrypt/text";
@@ -16353,6 +16361,187 @@ fn default_provider_rotation_policy() -> String {
     "rotate by issuing a fresh signed invite/connectivity policy when endpoint trust, rate limits, or availability changes".to_owned()
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SignedAppConfigEnvelope {
+    schema_version: u32,
+    config_version: u32,
+    min_supported_app_config_version: u32,
+    key_id: String,
+    issued_at: String,
+    expires_at: String,
+    provider_defaults: Vec<AppConfigProviderDefault>,
+    signature_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AppConfigProviderDefault {
+    adapter_kind: String,
+    endpoints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedAppConfigDefaults {
+    provider_defaults: Vec<AppConfigProviderDefault>,
+}
+
+impl VerifiedAppConfigDefaults {
+    fn endpoints_for(&self, adapter_kind: &str) -> Vec<String> {
+        self.provider_defaults
+            .iter()
+            .find(|profile| profile.adapter_kind == adapter_kind)
+            .map(|profile| profile.endpoints.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn builtin_signed_app_config_envelope() -> SignedAppConfigEnvelope {
+    SignedAppConfigEnvelope {
+        schema_version: APP_CONFIG_SCHEMA_VERSION,
+        config_version: 1,
+        min_supported_app_config_version: APP_CONFIG_MIN_SUPPORTED_VERSION,
+        key_id: APP_CONFIG_SIGNING_KEY_ID.to_owned(),
+        issued_at: "2026-06-25T00:00:00Z".to_owned(),
+        expires_at: "2036-06-25T00:00:00Z".to_owned(),
+        provider_defaults: vec![
+            AppConfigProviderDefault {
+                adapter_kind: "nostr".to_owned(),
+                endpoints: vec![
+                    "wss://relay.damus.io".to_owned(),
+                    "wss://nos.lol".to_owned(),
+                ],
+            },
+            AppConfigProviderDefault {
+                adapter_kind: "mqtt".to_owned(),
+                endpoints: vec!["mqtts://broker.emqx.io:8883".to_owned()],
+            },
+        ],
+        signature_hex: BUILTIN_APP_CONFIG_SIGNATURE_HEX.to_owned(),
+    }
+}
+
+fn append_app_config_signed_str(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn app_config_signing_bytes(envelope: &SignedAppConfigEnvelope) -> Vec<u8> {
+    let mut bytes = b"discrypt-app-config-defaults-v1".to_vec();
+    bytes.extend_from_slice(&envelope.schema_version.to_le_bytes());
+    bytes.extend_from_slice(&envelope.config_version.to_le_bytes());
+    bytes.extend_from_slice(&envelope.min_supported_app_config_version.to_le_bytes());
+    append_app_config_signed_str(&mut bytes, &envelope.key_id);
+    append_app_config_signed_str(&mut bytes, &envelope.issued_at);
+    append_app_config_signed_str(&mut bytes, &envelope.expires_at);
+    bytes.extend_from_slice(&(envelope.provider_defaults.len() as u64).to_le_bytes());
+    for profile in &envelope.provider_defaults {
+        append_app_config_signed_str(&mut bytes, &profile.adapter_kind);
+        bytes.extend_from_slice(&(profile.endpoints.len() as u64).to_le_bytes());
+        for endpoint in &profile.endpoints {
+            append_app_config_signed_str(&mut bytes, endpoint);
+        }
+    }
+    bytes
+}
+
+fn verify_signed_app_config_envelope_at(
+    envelope: &SignedAppConfigEnvelope,
+    now: DateTime<Utc>,
+    minimum_config_version: u32,
+) -> Result<VerifiedAppConfigDefaults, String> {
+    verify_signed_app_config_envelope_with_trust_at(
+        envelope,
+        now,
+        minimum_config_version,
+        APP_CONFIG_SIGNING_KEY_ID,
+        APP_CONFIG_SIGNING_PUBLIC_KEY_HEX,
+    )
+}
+
+fn verify_signed_app_config_envelope_with_trust_at(
+    envelope: &SignedAppConfigEnvelope,
+    now: DateTime<Utc>,
+    minimum_config_version: u32,
+    trusted_key_id: &str,
+    trusted_public_key_hex: &str,
+) -> Result<VerifiedAppConfigDefaults, String> {
+    if envelope.schema_version != APP_CONFIG_SCHEMA_VERSION {
+        return Err(format!(
+            "Unsupported app config schema version {}",
+            envelope.schema_version
+        ));
+    }
+    if envelope.config_version < APP_CONFIG_MIN_SUPPORTED_VERSION
+        || envelope.config_version < envelope.min_supported_app_config_version
+        || envelope.config_version < minimum_config_version
+    {
+        return Err("Signed app config version is below the required minimum".to_owned());
+    }
+    if envelope.key_id != trusted_key_id {
+        return Err("Signed app config key id is not trusted".to_owned());
+    }
+    let issued_at = DateTime::parse_from_rfc3339(&envelope.issued_at)
+        .map_err(|_| "Signed app config issued_at is malformed".to_owned())?
+        .with_timezone(&Utc);
+    let expires_at = DateTime::parse_from_rfc3339(&envelope.expires_at)
+        .map_err(|_| "Signed app config expires_at is malformed".to_owned())?
+        .with_timezone(&Utc);
+    if issued_at > now + Duration::minutes(5) {
+        return Err("Signed app config is not valid yet".to_owned());
+    }
+    if expires_at <= now {
+        return Err("Signed app config is stale".to_owned());
+    }
+    if envelope.provider_defaults.is_empty() {
+        return Err("Signed app config has no provider defaults".to_owned());
+    }
+    let public_key_bytes = hex::decode(trusted_public_key_hex)
+        .map_err(|_| "Built-in app config signing key is malformed".to_owned())?;
+    let public_key = VerifyingKey::from_bytes(
+        public_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Built-in app config signing key has invalid length".to_owned())?,
+    )
+    .map_err(|_| "Built-in app config signing key is invalid".to_owned())?;
+    let signature_bytes = hex::decode(&envelope.signature_hex)
+        .map_err(|_| "Signed app config signature is malformed".to_owned())?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|_| "Signed app config signature has invalid length".to_owned())?;
+    public_key
+        .verify(&app_config_signing_bytes(envelope), &signature)
+        .map_err(|_| "Signed app config signature verification failed".to_owned())?;
+
+    for profile in &envelope.provider_defaults {
+        transport_adapter_kind_from_name(&profile.adapter_kind)
+            .ok_or_else(|| format!("Unsupported app config adapter {}", profile.adapter_kind))?;
+        if profile.endpoints.is_empty() {
+            return Err(format!(
+                "Signed app config adapter {} has no endpoints",
+                profile.adapter_kind
+            ));
+        }
+        for endpoint in &profile.endpoints {
+            validate_signaling_endpoint(&profile.adapter_kind, endpoint)?;
+        }
+    }
+
+    Ok(VerifiedAppConfigDefaults {
+        provider_defaults: envelope.provider_defaults.clone(),
+    })
+}
+
+fn verified_app_config_defaults() -> Result<VerifiedAppConfigDefaults, String> {
+    if let Ok(raw_update) = std::env::var(APP_CONFIG_SIGNED_UPDATE_ENV) {
+        if raw_update.trim().is_empty() {
+            return Err("Signed app config update is empty".to_owned());
+        }
+        let envelope = serde_json::from_str::<SignedAppConfigEnvelope>(&raw_update)
+            .map_err(|error| format!("Signed app config update is malformed: {error}"))?;
+        return verify_signed_app_config_envelope_at(&envelope, Utc::now(), 1);
+    }
+    verify_signed_app_config_envelope_at(&builtin_signed_app_config_envelope(), Utc::now(), 1)
+}
+
 fn endpoint_allowlist_commitment(adapter_kind: &str, endpoint: &str) -> String {
     hash_commitment(
         "discrypt-provider-endpoint-allowlist-v1",
@@ -17062,65 +17251,13 @@ fn ice_endpoint_policy_from_connectivity(
 }
 
 fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> Option<String> {
-    match kind {
-        InviteSignalingAdapterKind::Mqtt => Some(
-            std::env::var("DISCRYPT_DEFAULT_MQTT_ENDPOINT")
-                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
-        ),
-        InviteSignalingAdapterKind::Nostr => Some(
-            std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT")
-                .unwrap_or_else(|_| "wss://relay.damus.io".to_owned()),
-        ),
-        InviteSignalingAdapterKind::IpfsPubsub => {
-            std::env::var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS")
-                .ok()
-                .and_then(|endpoints| {
-                    endpoints
-                        .split(',')
-                        .map(str::trim)
-                        .find(|endpoint| !endpoint.is_empty())
-                        .map(ToOwned::to_owned)
-                })
-        }
-        InviteSignalingAdapterKind::DiscryptQuicRendezvous => {
-            std::env::var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT")
-                .ok()
-                .filter(|endpoint| !endpoint.trim().is_empty())
-        }
-    }
-}
-
-fn split_configured_endpoints(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    default_adapter_endpoints(kind).into_iter().next()
 }
 
 fn default_adapter_endpoints(kind: &InviteSignalingAdapterKind) -> Vec<String> {
-    match kind {
-        InviteSignalingAdapterKind::Nostr => std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS")
-            .ok()
-            .map(|endpoints| split_configured_endpoints(&endpoints))
-            .filter(|endpoints| !endpoints.is_empty())
-            .or_else(|| {
-                std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT")
-                    .ok()
-                    .map(|endpoint| split_configured_endpoints(&endpoint))
-                    .filter(|endpoints| !endpoints.is_empty())
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    "wss://relay.damus.io".to_owned(),
-                    "wss://nos.lol".to_owned(),
-                ]
-            }),
-        _ => default_adapter_endpoint(kind)
-            .map(|endpoint| vec![endpoint])
-            .unwrap_or_default(),
-    }
+    verified_app_config_defaults()
+        .map(|defaults| defaults.endpoints_for(kind.canonical_name()))
+        .unwrap_or_default()
 }
 
 fn default_ice_stun_servers() -> Vec<String> {
@@ -33581,6 +33718,7 @@ mod tests {
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
         std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
         std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
+        std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
 
         let profiles = default_signaling_profiles("configured-defaults-only");
         let kinds = profiles
@@ -33608,15 +33746,149 @@ mod tests {
         }));
     }
 
+    fn sign_app_config_for_test(
+        mut envelope: SignedAppConfigEnvelope,
+        signing_key: &SigningKey,
+    ) -> SignedAppConfigEnvelope {
+        envelope.signature_hex = hex::encode(
+            signing_key
+                .sign(&app_config_signing_bytes(&envelope))
+                .to_bytes(),
+        );
+        envelope
+    }
+
+    fn app_config_test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[42_u8; 32])
+    }
+
+    fn app_config_test_envelope() -> SignedAppConfigEnvelope {
+        let signing_key = app_config_test_signing_key();
+        sign_app_config_for_test(
+            SignedAppConfigEnvelope {
+                schema_version: APP_CONFIG_SCHEMA_VERSION,
+                config_version: 3,
+                min_supported_app_config_version: APP_CONFIG_MIN_SUPPORTED_VERSION,
+                key_id: "test-app-config-key".to_owned(),
+                issued_at: "2026-06-25T00:00:00Z".to_owned(),
+                expires_at: "2036-06-25T00:00:00Z".to_owned(),
+                provider_defaults: vec![AppConfigProviderDefault {
+                    adapter_kind: "nostr".to_owned(),
+                    endpoints: vec!["wss://relay.example.test".to_owned()],
+                }],
+                signature_hex: String::new(),
+            },
+            &signing_key,
+        )
+    }
+
+    fn verify_test_app_config(
+        envelope: &SignedAppConfigEnvelope,
+        minimum_config_version: u32,
+    ) -> Result<VerifiedAppConfigDefaults, String> {
+        let signing_key = app_config_test_signing_key();
+        let public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
+        verify_signed_app_config_envelope_with_trust_at(
+            envelope,
+            DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            minimum_config_version,
+            "test-app-config-key",
+            &public_key_hex,
+        )
+    }
+
+    #[test]
+    fn app_config_builtin_public_defaults_are_signed_and_versioned() {
+        let _guard = test_lock();
+        std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
+
+        let defaults = verify_signed_app_config_envelope_at(
+            &builtin_signed_app_config_envelope(),
+            DateTime::parse_from_rfc3339("2026-06-25T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            1,
+        )
+        .expect("built-in app config verifies");
+
+        assert_eq!(
+            defaults.endpoints_for("nostr"),
+            vec![
+                "wss://relay.damus.io".to_owned(),
+                "wss://nos.lol".to_owned()
+            ]
+        );
+        assert_eq!(
+            defaults.endpoints_for("mqtt"),
+            vec!["mqtts://broker.emqx.io:8883".to_owned()]
+        );
+        assert!(defaults.endpoints_for("ipfs_pubsub").is_empty());
+    }
+
+    #[test]
+    fn app_config_signed_allowlist_update_is_accepted_with_trusted_key() {
+        let envelope = app_config_test_envelope();
+        let defaults = verify_test_app_config(&envelope, 2).expect("signed update verifies");
+
+        assert_eq!(
+            defaults.endpoints_for("nostr"),
+            vec!["wss://relay.example.test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn app_config_rejects_tampered_endpoint_after_signature() {
+        let mut envelope = app_config_test_envelope();
+        envelope.provider_defaults[0].endpoints = vec!["wss://relay.attacker.test".to_owned()];
+
+        let error = verify_test_app_config(&envelope, 1)
+            .expect_err("tampered endpoint must break signature");
+        assert!(error.contains("signature verification failed"));
+    }
+
+    #[test]
+    fn app_config_rejects_stale_downgraded_and_wrong_key_updates() {
+        let mut stale = app_config_test_envelope();
+        stale.expires_at = "2026-06-24T00:00:00Z".to_owned();
+        stale = sign_app_config_for_test(stale, &app_config_test_signing_key());
+        assert!(verify_test_app_config(&stale, 1)
+            .expect_err("stale update rejected")
+            .contains("stale"));
+
+        let mut downgraded = app_config_test_envelope();
+        downgraded.config_version = 1;
+        downgraded = sign_app_config_for_test(downgraded, &app_config_test_signing_key());
+        assert!(verify_test_app_config(&downgraded, 2)
+            .expect_err("downgraded update rejected")
+            .contains("below the required minimum"));
+
+        let mut wrong_key = app_config_test_envelope();
+        wrong_key.key_id = "attacker-key".to_owned();
+        wrong_key = sign_app_config_for_test(wrong_key, &app_config_test_signing_key());
+        assert!(verify_test_app_config(&wrong_key, 1)
+            .expect_err("wrong key rejected")
+            .contains("not trusted"));
+    }
+
+    #[test]
+    fn app_config_invalid_explicit_update_fails_closed_without_default_fallback() {
+        let _guard = test_lock();
+        std::env::set_var(APP_CONFIG_SIGNED_UPDATE_ENV, "{not-json");
+
+        let profiles = default_signaling_profiles("invalid-update-fail-closed");
+
+        assert!(profiles.is_empty());
+        std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
+    }
+
     #[test]
     fn default_profiles_carry_provider_allowlist_and_rotation_policy() {
         let _guard = test_lock();
         std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_NOSTR_ENDPOINTS",
-            " wss://relay.damus.io, wss://nos.lol ",
-        );
+        std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
 
         let profiles = default_signaling_profiles("allowlist-scope");
         assert!(!profiles.is_empty());
@@ -33647,11 +33919,10 @@ mod tests {
         let error = transport_profile_from_view(&tampered)
             .expect_err("tampered endpoint must not pass signed allowlist validation");
         assert!(error.contains("signed allowlist"));
-        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
     }
 
     #[test]
-    fn default_ipfs_profile_requires_explicit_direct_topic_peer_endpoint() {
+    fn unsigned_ipfs_default_env_cannot_enable_app_default_profile() {
         let _guard = test_lock();
         std::env::set_var(
             "DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS",
@@ -33660,19 +33931,12 @@ mod tests {
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
         std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
         std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
+        std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
 
         let profiles = default_signaling_profiles("ipfs-default-block");
-        let ipfs = profiles
+        assert!(profiles
             .iter()
-            .find(|profile| profile.adapter_kind == "ipfs_pubsub")
-            .expect("configured IPFS profile is surfaced for validation");
-        let error =
-            transport_profile_from_view(ipfs).expect_err("DNS/bootstrap IPFS defaults must fail");
-        assert!(
-            error.contains("production endpoint scheme is invalid")
-                || error.contains("Invalid connectivity policy"),
-            "expected IPFS direct topic-peer validation failure, got: {error}"
-        );
+            .all(|profile| profile.adapter_kind != "ipfs_pubsub"));
 
         std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
     }
