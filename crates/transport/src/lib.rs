@@ -11,6 +11,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod history_sync;
 pub mod ice;
 pub mod peer_overlay;
 pub mod policy;
@@ -22,6 +23,10 @@ pub mod signaling;
 pub mod webrtc_negotiation;
 
 use async_trait::async_trait;
+pub use history_sync::{
+    apply_history_sync_plan, build_history_sync_plan, HistorySyncApplyReport, HistorySyncItem,
+    HistorySyncPlan, HistorySyncPolicy, HistorySyncQueue, HistorySyncRouteKind,
+};
 pub use ice::{
     turn_stun_credential_decision, IceEndpointPolicy, IceServerConfig, TurnCredentialIssuer,
     TurnCredentialIssuerConfig, TurnCredentialMode, TurnServerConfig, TurnStunCredentialDecision,
