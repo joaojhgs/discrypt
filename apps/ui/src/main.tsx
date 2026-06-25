@@ -5259,22 +5259,142 @@ function AudioSettingsPanel({
   );
 }
 
+type SupportBundlePreview = {
+  schemaVersion: string;
+  generatedAt: string;
+  appVersion: string;
+  groupCount: string;
+  eventCount: string;
+  routeProof: string;
+  lastErrorCode: string;
+};
+
+function supportBundlePreview(bundle: string): SupportBundlePreview | null {
+  try {
+    const parsed = JSON.parse(bundle) as Record<string, unknown>;
+    const structuredLogs = parsed.structured_logs as
+      | Record<string, unknown>
+      | undefined;
+    const lastCommandError = (
+      structuredLogs?.last_command_error ??
+      parsed.last_command_error
+    ) as Record<string, unknown> | null | undefined;
+    const transportDiagnostics = parsed.transport_diagnostics as
+      | Record<string, unknown>
+      | undefined;
+    const events = Array.isArray(parsed.events) ? parsed.events : [];
+    return {
+      schemaVersion: String(parsed.schema_version ?? "unknown"),
+      generatedAt: String(parsed.generated_at ?? "not provided"),
+      appVersion: String(parsed.app_version ?? "unknown"),
+      groupCount: String(parsed.group_count ?? "unknown"),
+      eventCount: String(events.length),
+      routeProof: String(transportDiagnostics?.route_proof_status ?? "not provided"),
+      lastErrorCode: String(lastCommandError?.code ?? "none"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function downloadSupportBundle(bundle: string) {
+  if (!window.Blob || !window.URL?.createObjectURL) {
+    throw new Error("File download is unavailable in this WebView.");
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const blob = new Blob([bundle], { type: "application/json" });
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `discrypt-support-bundle-${timestamp}.json`;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.URL.revokeObjectURL(url);
+}
+
 function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
-  const [exportStatus, setExportStatus] = useState<string>("");
-  const copyDiagnostics = async () => {
+  const [consentGranted, setConsentGranted] = useState(false);
+  const [bundle, setBundle] = useState<string>("");
+  const [exportStatus, setExportStatus] = useState<string>(
+    "Consent required before loading support bundle.",
+  );
+  const [loading, setLoading] = useState(false);
+  const preview = bundle ? supportBundlePreview(bundle) : null;
+  const bundleReady = bundle.trim().length > 0;
+
+  const requireConsent = () => {
+    if (consentGranted) return true;
+    setExportStatus("Support bundle export denied until consent is enabled.");
+    return false;
+  };
+
+  const loadDiagnostics = async () => {
+    if (!requireConsent()) return;
+    setLoading(true);
+    setExportStatus("Loading support bundle from backend diagnostics.");
     try {
       const log = await exportDiagnosticsLog();
-      await navigator.clipboard?.writeText(log);
-      setExportStatus("Diagnostic log copied to clipboard.");
+      setBundle(log);
+      setExportStatus(
+        log.trim().length > 0
+          ? "Support bundle loaded from backend diagnostics."
+          : "Backend returned an empty support bundle.",
+      );
     } catch (error) {
       logSanitizedCommandError();
+      setBundle("");
       setExportStatus(
         error instanceof Error
           ? `Diagnostics export failed: ${error.message}`
           : "Diagnostics export failed.",
       );
+    } finally {
+      setLoading(false);
     }
   };
+
+  const copyDiagnostics = async () => {
+    if (!requireConsent()) return;
+    if (!bundleReady) {
+      await loadDiagnostics();
+      return;
+    }
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard is unavailable in this WebView.");
+      }
+      await navigator.clipboard.writeText(bundle);
+      setExportStatus("Support bundle copied to clipboard.");
+    } catch (error) {
+      logSanitizedCommandError();
+      setExportStatus(
+        error instanceof Error
+          ? `Diagnostics copy unavailable: ${error.message}`
+          : "Diagnostics copy unavailable.",
+      );
+    }
+  };
+
+  const exportDiagnostics = async () => {
+    if (!requireConsent()) return;
+    if (!bundleReady) {
+      await loadDiagnostics();
+      return;
+    }
+    try {
+      downloadSupportBundle(bundle);
+      setExportStatus("Support bundle export started.");
+    } catch (error) {
+      logSanitizedCommandError();
+      setExportStatus(
+        error instanceof Error
+          ? `Diagnostics file export unavailable: ${error.message}`
+          : "Diagnostics file export unavailable.",
+      );
+    }
+  };
+
   return (
     <Card>
       <CardHeader>
@@ -5282,41 +5402,116 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
           <div>
             <CardTitle>Logs and export</CardTitle>
             <CardDescription>
-              Export runtime diagnostics from the app command boundary for support and release checks.
+              Review and export the backend redacted support bundle for support and release checks.
             </CardDescription>
           </div>
-          <Button
-            type="button"
-            variant="secondary"
-            onClick={copyDiagnostics}
-            aria-label="Copy diagnostic log"
-          >
-            Copy diagnostic log
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={loadDiagnostics}
+              disabled={loading}
+              aria-label={loading ? "Loading support bundle" : "Load support bundle"}
+            >
+              {loading ? "Loading" : "Load bundle"}
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={copyDiagnostics}
+              disabled={loading}
+              aria-label="Copy support bundle"
+            >
+              Copy
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={exportDiagnostics}
+              disabled={loading}
+              aria-label="Export support bundle"
+            >
+              Export
+            </Button>
+          </div>
         </div>
         {exportStatus ? (
-          <p className="text-xs text-[hsl(var(--muted-foreground))]">
+          <p
+            className="text-xs text-[hsl(var(--muted-foreground))]"
+            role="status"
+          >
             {exportStatus}
           </p>
         ) : null}
       </CardHeader>
-      <CardContent className="grid gap-3 md:grid-cols-3">
-        <InfoRow
-          title="Runtime"
-          copy={
-            appState.runtime_mode.mode === "native"
-              ? "Native Tauri commands"
-              : "Web runtime export"
-          }
-        />
-        <InfoRow
-          title="Events"
-          copy={`${appState.events.length} event${appState.events.length === 1 ? "" : "s"} available`}
-        />
-        <InfoRow
-          title="Transport proof"
-          copy={appState.transport_diagnostics.route_proof_status}
-        />
+      <CardContent className="grid gap-4">
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted)/0.28)] px-3 py-2">
+          <Label htmlFor="support-bundle-consent" className="grid gap-1 text-sm">
+            <span>Include support bundle data</span>
+            <span className="text-xs text-[hsl(var(--muted-foreground))]">
+              Requires user consent before reading backend diagnostics into the UI.
+            </span>
+          </Label>
+          <Switch
+            id="support-bundle-consent"
+            checked={consentGranted}
+            onCheckedChange={(checked) => {
+              setConsentGranted(checked);
+              if (!checked) {
+                setBundle("");
+                setExportStatus("Consent required before loading support bundle.");
+              } else {
+                setExportStatus("Consent enabled. Load the support bundle to preview or export.");
+              }
+            }}
+            aria-label="Include support bundle data"
+          />
+        </div>
+        <div className="grid gap-3 md:grid-cols-3">
+          <InfoRow
+            title="Runtime"
+            copy={
+              appState.runtime_mode.mode === "native"
+                ? "Native Tauri commands"
+                : "Web runtime export"
+            }
+          />
+          <InfoRow
+            title="Events"
+            copy={`${appState.events.length} event${appState.events.length === 1 ? "" : "s"} available before bundle load`}
+          />
+          <InfoRow
+            title="Transport proof"
+            copy={appState.transport_diagnostics.route_proof_status}
+          />
+        </div>
+        {preview ? (
+          <div className="grid gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3 md:grid-cols-4">
+            <InfoRow title="Schema" copy={preview.schemaVersion} />
+            <InfoRow title="Generated" copy={preview.generatedAt} />
+            <InfoRow title="App version" copy={preview.appVersion} />
+            <InfoRow title="Last error" copy={preview.lastErrorCode} />
+            <InfoRow title="Groups" copy={preview.groupCount} />
+            <InfoRow title="Bundle events" copy={preview.eventCount} />
+            <InfoRow title="Route proof" copy={preview.routeProof} />
+            <InfoRow
+              title="Size"
+              copy={`${new Blob([bundle]).size.toLocaleString()} bytes`}
+            />
+          </div>
+        ) : null}
+        <ScrollArea className="max-h-56 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted)/0.2)]">
+          <pre
+            data-testid="support-bundle-preview"
+            className="whitespace-pre-wrap break-words p-3 text-xs text-[hsl(var(--muted-foreground))]"
+          >
+            {bundleReady
+              ? bundle
+              : consentGranted
+                ? "No support bundle loaded."
+                : "Enable consent to load the redacted support bundle."}
+          </pre>
+        </ScrollArea>
       </CardContent>
     </Card>
   );
@@ -7923,15 +8118,25 @@ function DiagnosticsSheet({
     (participant) => participant.speaking && !participant.muted,
   ).length;
   const [exportStatus, setExportStatus] = useState<string>("");
+  const [supportBundleConsent, setSupportBundleConsent] = useState(false);
   const copyDiagnostics = async () => {
+    if (!supportBundleConsent) {
+      setExportStatus("Support bundle copy denied until consent is enabled.");
+      return;
+    }
     try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard is unavailable in this WebView.");
+      }
       const log = await exportDiagnosticsLog();
-      await navigator.clipboard?.writeText(log);
-      setExportStatus("Diagnostics copied to clipboard.");
+      await navigator.clipboard.writeText(log);
+      setExportStatus("Support bundle copied to clipboard.");
     } catch (error) {
       setExportStatus(
         error instanceof Error
-          ? `Diagnostics export failed: ${error.message}`
+          ? error.message === "Clipboard is unavailable in this WebView."
+            ? `Diagnostics copy unavailable: ${error.message}`
+            : `Diagnostics export failed: ${error.message}`
           : "Diagnostics export failed.",
       );
     }
@@ -7949,6 +8154,30 @@ function DiagnosticsSheet({
               <Button type="button" size="sm" variant="secondary" onClick={copyDiagnostics}>
                 Copy logs
               </Button>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted)/0.28)] px-3 py-2">
+              <Label
+                htmlFor="diagnostics-support-bundle-consent"
+                className="grid gap-1 text-sm"
+              >
+                <span>Include support bundle data</span>
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Required before copying backend diagnostics from this sheet.
+                </span>
+              </Label>
+              <Switch
+                id="diagnostics-support-bundle-consent"
+                checked={supportBundleConsent}
+                onCheckedChange={(checked) => {
+                  setSupportBundleConsent(checked);
+                  setExportStatus(
+                    checked
+                      ? "Consent enabled for diagnostics sheet support bundle copy."
+                      : "Consent required before copying support bundle data.",
+                  );
+                }}
+                aria-label="Include diagnostics support bundle data"
+              />
             </div>
             {exportStatus ? (
               <p className="text-xs text-[hsl(var(--muted-foreground))]">{exportStatus}</p>
