@@ -23,7 +23,7 @@ pub use appdb::{
 };
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 pub use appdb::{PassphraseVaultKeychain, ProductionAppDbKeychain};
-pub use content_keys::KeyState;
+pub use content_keys::{KeyState, RetentionPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -589,6 +589,9 @@ pub struct AppPreferencesState {
     pub active_template: String,
     /// Default retention preset for new channels/messages.
     pub retention_preset: String,
+    /// Typed backend-owned retention policy that must survive restart.
+    #[serde(default)]
+    pub retention_policy: RetentionPolicy,
 }
 
 impl Default for AppPreferencesState {
@@ -597,6 +600,7 @@ impl Default for AppPreferencesState {
             theme: "system".to_owned(),
             active_template: "command-center".to_owned(),
             retention_preset: "7 days".to_owned(),
+            retention_policy: RetentionPolicy::default(),
         }
     }
 }
@@ -1012,6 +1016,39 @@ mod tests {
         assert_eq!(
             store.load_app_state()?,
             Some(br#"{"schema_version":2}"#.to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_state_retention_policy_survives_restart_bytes() -> Result<(), AppStoreError> {
+        let mut state = AppState::new(AppIdentityState::new(
+            "alice",
+            "Alice",
+            "friend:alice",
+            "device-a",
+            "1111",
+        ));
+        state.preferences.retention_policy = RetentionPolicy::new(
+            content_keys::RetentionWindow::CustomSeconds(43_200),
+            content_keys::RetentionPolicySource::Governance,
+        );
+        state.preferences.retention_preset = state.preferences.retention_policy.label();
+
+        let mut store = MemoryAppStore::default();
+        store.save_app_state(&serde_json::to_vec(&state)?)?;
+        let bytes = store
+            .load_app_state()?
+            .ok_or(AppStoreError::Crypto("missing app state after save"))?;
+        let reloaded: AppState = serde_json::from_slice(&bytes)?;
+
+        assert_eq!(
+            reloaded.preferences.retention_policy,
+            state.preferences.retention_policy
+        );
+        assert_eq!(
+            reloaded.preferences.retention_policy.seconds(),
+            Some(43_200)
         );
         Ok(())
     }

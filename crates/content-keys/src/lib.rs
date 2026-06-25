@@ -15,13 +15,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Retention window presets.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RetentionWindow {
     /// One hour.
     Hours1,
     /// Twenty-four hours.
     Hours24,
     /// Seven days, the default.
+    #[default]
     Days7,
     /// Thirty days.
     Days30,
@@ -34,6 +35,32 @@ pub enum RetentionWindow {
 }
 
 impl RetentionWindow {
+    /// Supported preset windows in UI/display order.
+    #[must_use]
+    pub const fn presets() -> [Self; 5] {
+        [
+            Self::Hours1,
+            Self::Hours24,
+            Self::Days7,
+            Self::Days30,
+            Self::Days90,
+        ]
+    }
+
+    /// Backend-owned display label for this retention window.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Hours1 => "1 hour".to_owned(),
+            Self::Hours24 => "24 hours".to_owned(),
+            Self::Days7 => "7 days".to_owned(),
+            Self::Days30 => "30 days".to_owned(),
+            Self::Days90 => "90 days".to_owned(),
+            Self::CustomSeconds(seconds) => format!("custom {seconds} seconds"),
+            Self::UnlimitedWarned => "warned unlimited / never-lock".to_owned(),
+        }
+    }
+
     /// Window length in seconds, or `None` for warned unlimited.
     #[must_use]
     pub fn seconds(self) -> Option<u64> {
@@ -47,6 +74,80 @@ impl RetentionWindow {
             Self::UnlimitedWarned => None,
         }
     }
+
+    /// Parse a backend/API retention label into a typed window.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        let normalized = label.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "1 hour" | "1h" | "hour" => Some(Self::Hours1),
+            "24 hours" | "24h" | "1 day" => Some(Self::Hours24),
+            "7 days" | "7d" | "7 day default" => Some(Self::Days7),
+            "30 days" | "30d" => Some(Self::Days30),
+            "90 days" | "90d" => Some(Self::Days90),
+            "unlimited" | "never-lock" | "warned unlimited / never-lock" => {
+                Some(Self::UnlimitedWarned)
+            }
+            _ => normalized
+                .strip_prefix("custom ")
+                .and_then(|rest| rest.strip_suffix(" seconds"))
+                .and_then(|seconds| seconds.parse::<u64>().ok())
+                .map(Self::CustomSeconds),
+        }
+    }
+}
+
+/// Persisted retention policy selected by backend/governance state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetentionPolicy {
+    /// Selected retention window.
+    pub window: RetentionWindow,
+    /// Backend evidence for the policy source.
+    pub source: RetentionPolicySource,
+}
+
+impl RetentionPolicy {
+    /// Create a policy from a typed window.
+    #[must_use]
+    pub const fn new(window: RetentionWindow, source: RetentionPolicySource) -> Self {
+        Self { window, source }
+    }
+
+    /// Create a user-preference policy.
+    #[must_use]
+    pub const fn user_default(window: RetentionWindow) -> Self {
+        Self::new(window, RetentionPolicySource::UserDefault)
+    }
+
+    /// Backend-owned display label.
+    #[must_use]
+    pub fn label(self) -> String {
+        self.window.label()
+    }
+
+    /// Window length in seconds, or `None` for warned unlimited.
+    #[must_use]
+    pub fn seconds(self) -> Option<u64> {
+        self.window.seconds()
+    }
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self::user_default(RetentionWindow::Days7)
+    }
+}
+
+/// Backend evidence source for a retention policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RetentionPolicySource {
+    /// Local default before any room policy override exists.
+    #[default]
+    UserDefault,
+    /// Signed/backend-governed group policy.
+    Governance,
+    /// Channel-specific backend policy.
+    Channel,
 }
 
 /// Cached, locked, decoy, rate-limited, or shredded message-key state.
@@ -141,6 +242,24 @@ fn is_shorter(new_window: RetentionWindow, old_window: RetentionWindow) -> bool 
         (Some(new), Some(old)) => new < old,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+/// Apply a policy update without resurrecting already locked or shredded keys.
+#[must_use]
+pub fn transition_key_state(
+    now: DateTime<Utc>,
+    sent_at: DateTime<Utc>,
+    current_state: KeyState,
+    transition: RetentionTransition,
+    key: [u8; 32],
+) -> KeyState {
+    match current_state {
+        KeyState::Shredded => KeyState::Shredded,
+        KeyState::Locked if !is_shorter(transition.new_window, transition.old_window) => {
+            KeyState::Locked
+        }
+        _ => transition.state_for_message(now, sent_at, key, false),
     }
 }
 
@@ -697,6 +816,110 @@ mod tests {
             transition.state_for_message(now, now + Duration::seconds(1), key, false),
             KeyState::Cached(_)
         ));
+    }
+
+    #[test]
+    fn retention_windows_cover_presets_custom_and_warned_unlimited() {
+        assert_eq!(
+            RetentionWindow::presets(),
+            [
+                RetentionWindow::Hours1,
+                RetentionWindow::Hours24,
+                RetentionWindow::Days7,
+                RetentionWindow::Days30,
+                RetentionWindow::Days90,
+            ]
+        );
+        assert_eq!(
+            RetentionWindow::from_label("custom 7200 seconds"),
+            Some(RetentionWindow::CustomSeconds(7200))
+        );
+        assert_eq!(
+            RetentionWindow::from_label("warned unlimited / never-lock"),
+            Some(RetentionWindow::UnlimitedWarned)
+        );
+        assert_eq!(RetentionWindow::CustomSeconds(7200).seconds(), Some(7200));
+        assert_eq!(RetentionWindow::UnlimitedWarned.seconds(), None);
+    }
+
+    #[test]
+    fn shorten_applies_retroactively_to_existing_cached_keys() {
+        let now = Utc::now();
+        let key = [4; 32];
+        let transition = RetentionTransition {
+            old_window: RetentionWindow::Days7,
+            new_window: RetentionWindow::Hours1,
+            changed_at: now,
+        };
+
+        assert_eq!(
+            transition_key_state(
+                now,
+                now - Duration::hours(2),
+                KeyState::Cached(key),
+                transition,
+                key,
+            ),
+            KeyState::Locked
+        );
+    }
+
+    #[test]
+    fn lengthen_is_future_only_and_never_resurrects_locked_or_shredded_keys() {
+        let now = Utc::now();
+        let key = [5; 32];
+        let transition = RetentionTransition {
+            old_window: RetentionWindow::Hours1,
+            new_window: RetentionWindow::Days7,
+            changed_at: now,
+        };
+
+        assert_eq!(
+            transition_key_state(
+                now,
+                now - Duration::hours(2),
+                KeyState::Locked,
+                transition,
+                key,
+            ),
+            KeyState::Locked
+        );
+        assert_eq!(
+            transition_key_state(
+                now,
+                now - Duration::minutes(1),
+                KeyState::Shredded,
+                transition,
+                key,
+            ),
+            KeyState::Shredded
+        );
+        assert_eq!(
+            transition_key_state(
+                now,
+                now + Duration::seconds(1),
+                KeyState::Cached(key),
+                transition,
+                key,
+            ),
+            KeyState::Cached(key)
+        );
+    }
+
+    #[test]
+    fn persisted_retention_policy_round_trips_with_backend_source() -> Result<(), serde_json::Error>
+    {
+        let policy = RetentionPolicy::new(
+            RetentionWindow::CustomSeconds(43_200),
+            RetentionPolicySource::Governance,
+        );
+        let serialized = serde_json::to_vec(&policy)?;
+        let reloaded: RetentionPolicy = serde_json::from_slice(&serialized)?;
+
+        assert_eq!(reloaded, policy);
+        assert_eq!(reloaded.seconds(), Some(43_200));
+        assert_eq!(reloaded.label(), "custom 43200 seconds");
+        Ok(())
     }
 
     #[test]

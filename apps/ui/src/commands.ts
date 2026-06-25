@@ -44,6 +44,8 @@ export type InviteFlowView = {
 export type RetentionSettingsView = {
   presets: string[];
   selected: string;
+  selected_window_seconds: number | null;
+  policy_source: string;
   unlimited_warning: string;
   transition_copy: string;
 };
@@ -1278,6 +1280,8 @@ const fallbackSnapshot: AppSnapshot = {
       "warned unlimited / never-lock",
     ],
     selected: "7 days",
+    selected_window_seconds: 604800,
+    policy_source: "UserDefault",
     unlimited_warning:
       "Unlimited keeps local keys longer and weakens lock behavior; opt in explicitly",
     transition_copy:
