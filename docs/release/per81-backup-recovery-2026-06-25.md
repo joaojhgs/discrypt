@@ -8,9 +8,10 @@ PER-81 / P9-T07 adds local backend/storage evidence for explicit account-continu
 
 - `crates/storage/src/lib.rs` now exposes versioned `AccountBackupExport` metadata for backend-created account-continuity backups.
 - Backup metadata persists across JSON serialization/restart and records version, created time, exporting own device, recovery method, and compromised-device rotation requirements.
-- Restore validates the backup envelope before returning account continuity and never restores archival content keys.
+- Generic restore validates the backup envelope before returning account continuity, rejects `RecoveryCode` exports with `RecoveryCodeRequired`, and never restores archival content keys.
+- Recovery-code-gated exports restore only through the explicit verified-code path, which checks the user-held code against the persisted `RecoveryCodeVerifier`.
 - Malformed/corrupt backup restore fails closed with typed `RecoveryError` variants and does not overwrite existing app-state bytes.
-- Lost-password recovery is explicit: without both a stored verifier and user-held recovery code it returns `NoTrustMaterial`; wrong codes return `InvalidRecoveryCode`.
+- Lost-password and code-gated backup recovery are explicit: without required trust material they fail closed; wrong codes return `InvalidRecoveryCode`.
 - Device-compromise recovery is explicit: compromised-device backups return `DeviceRotationRequired` until the caller supplies distinct replacement-device rotation evidence.
 
 ## Deletion-Control Boundary

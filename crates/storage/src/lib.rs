@@ -1097,7 +1097,7 @@ pub fn restore_account_backup_export_json(bytes: &[u8]) -> Result<AccountRecover
     restore_account_backup_export(export)
 }
 
-/// Restore a backup export that does not require compromised-device rotation.
+/// Restore a backup export that does not require compromised-device rotation or recovery code.
 pub fn restore_account_backup_export(
     export: AccountBackupExport,
 ) -> Result<AccountRecovery, RecoveryError> {
@@ -1111,7 +1111,53 @@ pub fn restore_account_backup_export(
                 .unwrap_or_else(|| "unknown".to_owned()),
         });
     }
+    if export.metadata.recovery_method == AccountBackupRecoveryMethod::RecoveryCode {
+        return Err(RecoveryError::RecoveryCodeRequired);
+    }
     recover_account(RecoveryMaterial::SealedBackup(export.backup))
+}
+
+/// Parse and restore a recovery-code-gated account-continuity backup export.
+pub fn restore_recovery_code_backup_export_json(
+    bytes: &[u8],
+    code: impl AsRef<str>,
+    verifier: &RecoveryCodeVerifier,
+) -> Result<AccountRecovery, RecoveryError> {
+    let export: AccountBackupExport =
+        serde_json::from_slice(bytes).map_err(|error| RecoveryError::MalformedBackup {
+            reason: error.to_string(),
+        })?;
+    restore_recovery_code_backup_export(export, code, verifier)
+}
+
+/// Restore a recovery-code-gated backup only after verifying the user-held code.
+pub fn restore_recovery_code_backup_export(
+    export: AccountBackupExport,
+    code: impl AsRef<str>,
+    verifier: &RecoveryCodeVerifier,
+) -> Result<AccountRecovery, RecoveryError> {
+    validate_backup_export(&export)?;
+    if export.metadata.device_rotation_required {
+        return Err(RecoveryError::DeviceRotationRequired {
+            compromised_device_id: export
+                .metadata
+                .compromised_device_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+        });
+    }
+    if export.metadata.recovery_method != AccountBackupRecoveryMethod::RecoveryCode {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "backup does not require recovery code".to_owned(),
+        ));
+    }
+    let material = recovery_code_material(
+        code,
+        verifier,
+        export.backup.room_memberships,
+        export.backup.device_count,
+    )?;
+    recover_account(material)
 }
 
 /// Restore a compromised-device backup after explicit replacement-device evidence.
@@ -1166,6 +1212,9 @@ pub enum RecoveryError {
     /// The supplied recovery code does not match the stored verifier.
     #[error("recovery code did not match account verifier")]
     InvalidRecoveryCode,
+    /// This backup requires the explicit recovery-code restore path.
+    #[error("recovery code is required before restoring this backup")]
+    RecoveryCodeRequired,
     /// Serialized backup bytes could not be parsed.
     #[error("account backup is malformed: {reason}")]
     MalformedBackup {
@@ -1501,7 +1550,19 @@ mod tests {
         );
         assert!(!reloaded.metadata.device_rotation_required);
 
-        let recovered = restore_account_backup_export_json(&bytes)?;
+        assert_eq!(
+            restore_account_backup_export_json(&bytes),
+            Err(RecoveryError::RecoveryCodeRequired)
+        );
+
+        let verifier = RecoveryCodeVerifier::from_code("paper-coral-falcon")?;
+        assert_eq!(
+            restore_recovery_code_backup_export(export.clone(), "wrong", &verifier),
+            Err(RecoveryError::InvalidRecoveryCode)
+        );
+
+        let recovered =
+            restore_recovery_code_backup_export_json(&bytes, " paper-coral-falcon ", &verifier)?;
         assert_eq!(
             recovered,
             AccountRecovery {
@@ -1511,6 +1572,16 @@ mod tests {
                 content_keys_restored: false,
             }
         );
+
+        let sealed_export = export_account_backup(
+            &[3; 32],
+            vec!["ops".into()],
+            1,
+            "alice:laptop",
+            AccountBackupRecoveryMethod::SealedBackup,
+            1_782_400_000_100,
+        )?;
+        assert!(restore_account_backup_export(sealed_export)?.account_access_restored);
         Ok(())
     }
 
