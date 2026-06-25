@@ -2489,7 +2489,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         phone_text_envelope.content_ciphertext.clone(),
     );
     let mut laptop = LocalStore::default();
-    laptop.append_sent(laptop_entry.clone());
+    laptop.append_sent(laptop_entry.clone())?;
     laptop.cache_received(RecipientCacheEntry::new(
         "alice-1",
         text_envelope.content_ciphertext.clone(),
