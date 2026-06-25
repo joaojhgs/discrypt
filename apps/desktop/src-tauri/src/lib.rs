@@ -976,10 +976,37 @@ pub struct CommandErrorView {
     pub code: String,
     /// Command that produced the error.
     pub command: String,
+    /// RFC3339 timestamp for support-bundle and structured-log correlation.
+    #[serde(default = "default_command_error_timestamp")]
+    pub timestamp: String,
     /// Human-readable error message.
     pub message: String,
     /// Actionable recovery hint for the UI.
     pub recovery_hint: String,
+    /// Redacted, low-cardinality context suitable for logs and support bundles.
+    #[serde(default)]
+    pub redacted_context: BTreeMap<String, String>,
+}
+
+/// Structured redacted command-error log entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandErrorLogEntry {
+    /// Stable log schema name.
+    pub schema: String,
+    /// Log level for downstream filtering.
+    pub level: String,
+    /// RFC3339 event timestamp.
+    pub timestamp: String,
+    /// Command that produced the error.
+    pub command: String,
+    /// Stable machine error code.
+    pub code: String,
+    /// Redacted human-readable message.
+    pub message: String,
+    /// Redacted recovery hint.
+    pub recovery_hint: String,
+    /// Redacted structured context.
+    pub redacted_context: BTreeMap<String, String>,
 }
 
 /// Honest backend-derived transport/connectivity status for UI display.
@@ -2820,7 +2847,7 @@ impl TauriAppService {
         match self.persist_candidate(&candidate) {
             Ok(()) => self.state = candidate,
             Err(error) => {
-                self.state.last_command_error = Some(error);
+                self.state.last_command_error = Some(*error);
             }
         }
         self.to_view()
@@ -3509,7 +3536,7 @@ impl TauriAppService {
         Ok(())
     }
 
-    fn persist_candidate(&self, state: &PersistedAppState) -> Result<(), CommandErrorView> {
+    fn persist_candidate(&self, state: &PersistedAppState) -> Result<(), Box<CommandErrorView>> {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
             return persist_state_to_path(path, state);
@@ -3519,7 +3546,7 @@ impl TauriAppService {
 
     fn persist(&mut self) {
         if let Err(error) = self.persist_candidate(&self.state) {
-            self.state.last_command_error = Some(error);
+            self.state.last_command_error = Some(*error);
         }
     }
 
@@ -4107,6 +4134,9 @@ pub fn export_diagnostics_log() -> String {
         "transport_diagnostics": &view.transport_diagnostics,
         "route_graph_diagnostics": route_graph_diagnostics,
         "last_command_error": &view.last_command_error,
+        "structured_logs": {
+            "last_command_error": view.last_command_error.as_ref().map(command_error_log_entry),
+        },
         "events": &view.events,
         "groups": groups,
         "dm_count": view.dms.len(),
@@ -4130,12 +4160,13 @@ fn storage_security_error_state(
     recovery_hint: impl Into<String>,
 ) -> AppStateView {
     let mut state = PersistedAppState::initial();
-    state.last_command_error = Some(CommandErrorView {
-        code: code.to_owned(),
-        command: "storage_security".to_owned(),
-        message: redact_sensitive_observable_copy(message.into()),
-        recovery_hint: recovery_hint.into(),
-    });
+    state.last_command_error = Some(command_error_view(
+        "storage_security",
+        code,
+        message,
+        recovery_hint,
+        BTreeMap::new(),
+    ));
     state.to_view()
 }
 
@@ -4149,7 +4180,7 @@ fn reload_app_service_after_storage_change() -> AppStateView {
     let candidate = guard.state.clone();
     if candidate.last_command_error.is_none() {
         if let Err(error) = guard.persist_candidate(&candidate) {
-            guard.state.last_command_error = Some(error);
+            guard.state.last_command_error = Some(*error);
         }
     }
     guard.to_view()
@@ -14097,21 +14128,6 @@ impl PersistedAppState {
         }
     }
 
-    fn set_command_error(
-        &mut self,
-        command: impl Into<String>,
-        code: impl Into<String>,
-        message: impl Into<String>,
-        recovery_hint: impl Into<String>,
-    ) {
-        self.last_command_error = Some(CommandErrorView {
-            code: code.into(),
-            command: command.into(),
-            message: redact_sensitive_observable_copy(message),
-            recovery_hint: redact_sensitive_observable_copy(recovery_hint),
-        });
-    }
-
     fn push_command_error(
         &mut self,
         event_kind: impl Into<String>,
@@ -14125,14 +14141,17 @@ impl PersistedAppState {
         let message = message.into();
         let command = command.into();
         let recovery_hint = recovery_hint.into();
-        eprintln!(
-            "discrypt-command-error command={} code={} message={} recovery_hint={}",
+        let mut context = BTreeMap::new();
+        context.insert("event_kind".to_owned(), event_kind.clone());
+        let error = command_error_view(
             command,
-            code,
-            redact_sensitive_observable_copy(&message),
-            redact_sensitive_observable_copy(&recovery_hint)
+            code.clone(),
+            message.clone(),
+            recovery_hint,
+            context,
         );
-        self.set_command_error(command, code.clone(), message.clone(), recovery_hint);
+        eprintln!("{}", structured_command_error_log_line(&error));
+        self.last_command_error = Some(error);
         self.push_event(event_kind, format!("{code}: {message}"));
     }
 
@@ -14363,6 +14382,66 @@ fn redacted_message_ref(message_id: &str) -> String {
     redacted_observable_ref("message", message_id)
 }
 
+fn default_command_error_timestamp() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn command_error_view(
+    command: impl Into<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    recovery_hint: impl Into<String>,
+    context: BTreeMap<String, String>,
+) -> CommandErrorView {
+    CommandErrorView {
+        code: code.into(),
+        command: command.into(),
+        timestamp: default_command_error_timestamp(),
+        message: redact_sensitive_observable_copy(message),
+        recovery_hint: redact_sensitive_observable_copy(recovery_hint),
+        redacted_context: redact_command_error_context(context),
+    }
+}
+
+fn redact_command_error_context(context: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    context
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                redact_sensitive_observable_copy(key),
+                redact_sensitive_observable_copy(value),
+            )
+        })
+        .collect()
+}
+
+fn command_error_log_entry(error: &CommandErrorView) -> CommandErrorLogEntry {
+    CommandErrorLogEntry {
+        schema: "discrypt.command_error.v1".to_owned(),
+        level: "error".to_owned(),
+        timestamp: error.timestamp.clone(),
+        command: error.command.clone(),
+        code: error.code.clone(),
+        message: error.message.clone(),
+        recovery_hint: error.recovery_hint.clone(),
+        redacted_context: error.redacted_context.clone(),
+    }
+}
+
+fn structured_command_error_log_line(error: &CommandErrorView) -> String {
+    serde_json::to_string(&command_error_log_entry(error)).unwrap_or_else(|json_error| {
+        format!(
+            "{{\"schema\":\"discrypt.command_error.v1\",\"level\":\"error\",\"timestamp\":\"{}\",\"command\":\"{}\",\"code\":\"{}\",\"message\":\"{}\",\"recovery_hint\":\"{}\",\"redacted_context\":{{\"serialization\":\"{}\"}}}}",
+            error.timestamp,
+            redact_sensitive_observable_copy(&error.command),
+            redact_sensitive_observable_copy(&error.code),
+            redact_sensitive_observable_copy(&error.message),
+            redact_sensitive_observable_copy(&error.recovery_hint),
+            redact_sensitive_observable_copy(json_error.to_string())
+        )
+    })
+}
+
 fn redact_sensitive_observable_copy(value: impl Into<String>) -> String {
     let value = value.into();
     let classes = sensitive_observable_classes(&value);
@@ -14387,6 +14466,15 @@ fn sensitive_observable_classes(value: &str) -> Vec<&'static str> {
         ("ice credential", "ice_credentials"),
         ("turn credential", "turn_credentials"),
         ("turn password", "turn_credentials"),
+        ("provider credential", "provider_credentials"),
+        ("bearer ", "auth_token"),
+        ("api key", "auth_token"),
+        ("access token", "auth_token"),
+        ("refresh token", "auth_token"),
+        ("vault passphrase", "vault_secret"),
+        ("vault password", "vault_secret"),
+        ("private key", "private_key"),
+        ("secret key", "private_key"),
         ("room-secret:", "room_seed"),
         ("room seed", "room_seed"),
         ("discrypt://join", "invite_link"),
@@ -14474,7 +14562,7 @@ fn mutate_app_service_with_result<T>(
     match guard.persist_candidate(&candidate) {
         Ok(()) => guard.state = candidate,
         Err(error) => {
-            guard.state.last_command_error = Some(error);
+            guard.state.last_command_error = Some(*error);
         }
     }
     let view = guard.to_view();
@@ -14715,7 +14803,7 @@ fn migrate_legacy_app_state(
         "schema_version below current"
     };
     if let Err(error) = persist_state_to_store(store, &state) {
-        state.last_command_error = Some(error);
+        state.last_command_error = Some(*error);
     } else {
         eprintln!(
             "[Discrypt persistence] migrated legacy app state ({source}, version {version}) to schema {APP_STATE_SCHEMA_VERSION}"
@@ -14724,7 +14812,7 @@ fn migrate_legacy_app_state(
     state
 }
 
-fn persist_state(state: &PersistedAppState) -> Result<(), CommandErrorView> {
+fn persist_state(state: &PersistedAppState) -> Result<(), Box<CommandErrorView>> {
     let mut store = app_store();
     persist_state_to_store(&mut store, state)
 }
@@ -14732,22 +14820,22 @@ fn persist_state(state: &PersistedAppState) -> Result<(), CommandErrorView> {
 fn persist_state_to_store(
     store: &mut impl AppStore,
     state: &PersistedAppState,
-) -> Result<(), CommandErrorView> {
+) -> Result<(), Box<CommandErrorView>> {
     let mut persisted = state.clone();
     persisted.clear_non_persistent_voice_runtime();
     let encoded = serde_json::to_vec_pretty(&persisted).map_err(|error| {
-        persistence_command_error(
+        Box::new(persistence_command_error(
             "state_encode_failed",
             format!("App state could not be encoded for persistence: {error}"),
             "Retry after preserving current logs; the app did not write partial state.",
-        )
+        ))
     })?;
     store.save_app_state(&encoded).map_err(|error| {
-        persistence_command_error(
+        Box::new(persistence_command_error(
             "state_save_failed",
             format!("App state could not be saved: {error}"),
             "Check disk/keychain availability before continuing; the app did not confirm persistence.",
-        )
+        ))
     })
 }
 
@@ -15071,13 +15159,17 @@ fn persistence_command_error(
     let code = code.into();
     let message = message.into();
     let redacted_detail = redact_sensitive_observable_copy(&message);
-    eprintln!("[Discrypt persistence] {code}: {redacted_detail}");
-    CommandErrorView {
-        code: code.clone(),
-        command: "app_persistence".to_owned(),
-        message: format!("Persistence/security error {code}: {redacted_detail}"),
-        recovery_hint: redact_sensitive_observable_copy(recovery_hint),
-    }
+    let mut context = BTreeMap::new();
+    context.insert("component".to_owned(), "app_persistence".to_owned());
+    let error = command_error_view(
+        "app_persistence",
+        code.clone(),
+        format!("Persistence/security error {code}: {redacted_detail}"),
+        recovery_hint,
+        context,
+    );
+    eprintln!("{}", structured_command_error_log_line(&error));
+    error
 }
 
 fn account_recovery_from_request(request: &RecoverUserRequest) -> AccountRecovery {
@@ -15262,7 +15354,7 @@ fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
-) -> Result<(), CommandErrorView> {
+) -> Result<(), Box<CommandErrorView>> {
     let mut store = EncryptedAppDb::new(path.to_path_buf(), TestAppDbKeychain);
     persist_state_to_store(&mut store, state)
 }
@@ -15277,7 +15369,7 @@ fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
-) -> Result<(), CommandErrorView> {
+) -> Result<(), Box<CommandErrorView>> {
     let mut store = FileAppStore::new(path);
     persist_state_to_store(&mut store, state)
 }
@@ -34336,6 +34428,103 @@ mod tests {
         assert_eq!(error.command, "set_speaker_volume");
         assert_eq!(error.code, "voice_participant_not_found");
         assert!(error.recovery_hint.contains("visible participant"));
+        Ok(())
+    }
+
+    #[test]
+    fn redacted_structured_command_logs_include_timestamp_context_and_support_bundle(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("redacted-structured-command-logs");
+
+        let forbidden = [
+            "Bearer per90-token",
+            "api key per90-secret",
+            "vault passphrase per90-vault",
+            "private key per90-private",
+            "provider credential per90-provider",
+            "v=0\r\na=ice-pwd:per90-ice",
+            "candidate:per90-candidate",
+            "turn credential per90-turn",
+            "plaintext message per90-body",
+            "sframe key per90-media",
+            "content key per90-content",
+            "mls exporter per90-mls",
+        ];
+        let mut context = BTreeMap::new();
+        context.insert(
+            "adapter".to_owned(),
+            "provider credential per90-provider".to_owned(),
+        );
+        context.insert(
+            "token".to_owned(),
+            "Bearer per90-token and api key per90-secret".to_owned(),
+        );
+        context.insert(
+            "vault".to_owned(),
+            "vault passphrase per90-vault".to_owned(),
+        );
+
+        let error = command_error_view(
+            "per90_sensitive_command",
+            "per90_sensitive_failure",
+            "v=0\r\na=ice-pwd:per90-ice plaintext message per90-body",
+            "Retry after removing provider credential per90-provider and private key per90-private",
+            context,
+        );
+
+        DateTime::parse_from_rfc3339(&error.timestamp).map_err(|err| err.to_string())?;
+        assert_eq!(error.command, "per90_sensitive_command");
+        assert_eq!(error.code, "per90_sensitive_failure");
+        assert!(error.message.contains("redacted sensitive observable copy"));
+        assert!(error
+            .recovery_hint
+            .contains("redacted sensitive observable copy"));
+        assert!(error
+            .redacted_context
+            .values()
+            .all(|value| value.contains("redacted sensitive observable copy")));
+
+        let line = structured_command_error_log_line(&error);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        assert_eq!(parsed["schema"], "discrypt.command_error.v1");
+        assert_eq!(parsed["command"], "per90_sensitive_command");
+        assert_eq!(parsed["code"], "per90_sensitive_failure");
+        assert_eq!(parsed["timestamp"], error.timestamp);
+        assert!(parsed["redacted_context"].is_object());
+
+        mutate_app_service(|state| {
+            state.last_command_error = Some(error.clone());
+        });
+        let diagnostics = export_diagnostics_log();
+        let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("target/per90-redacted-structured-logs");
+        std::fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
+        let artifact = artifact_dir.join("diagnostics-log.json");
+        std::fs::write(&artifact, &diagnostics).map_err(|err| err.to_string())?;
+        let diagnostics_json: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|err| err.to_string())?;
+        assert_eq!(
+            diagnostics_json["structured_logs"]["last_command_error"]["schema"],
+            "discrypt.command_error.v1"
+        );
+        assert_eq!(
+            diagnostics_json["last_command_error"]["code"],
+            "per90_sensitive_failure"
+        );
+
+        for forbidden_value in forbidden {
+            assert!(
+                !line.contains(forbidden_value),
+                "structured stderr log leaked {forbidden_value}: {line}"
+            );
+            assert!(
+                !diagnostics.contains(forbidden_value),
+                "diagnostics artifact leaked {forbidden_value}: {diagnostics}"
+            );
+        }
         Ok(())
     }
 

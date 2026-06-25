@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T20:24:38.260Z",
+  "updatedAt": "2026-06-25T21:11:17.088Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -391,6 +391,17 @@
       "updatedAt": "2026-06-25T20:24:38.260Z",
       "evidence": "PER-89/P10-T08 local implementation complete on branch multica/P10-T08-abuse-rate-limit-backoff. Added typed abuse decisions/backoff, deterministic soak report, transport provider-boundary regression, plan/evidence docs, and local transcript target/e2e/per89-abuse-rate-limit-backoff.txt. Verification passed: cargo fmt --check; cargo test -p discrypt-abuse abuse_soak; cargo test -p discrypt-abuse; cargo test -p discrypt-transport abuse_rate_limit_backoff -- --test-threads=1; cargo test -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter abuse_rate_limit_backoff -- --test-threads=1; cargo clippy -p discrypt-abuse --lib -- -D warnings; cargo clippy -p discrypt-transport --lib -- -D warnings; git diff --check. Evidence is local deterministic Rust/harness evidence, not public-provider production soak.",
       "completedAt": "2026-06-25T20:24:38.260Z"
+    },
+    {
+      "id": "G037-per-90-p11-t01-redacted-structured-l",
+      "title": "PER-90 P11-T01 redacted structured logs",
+      "objective": "Implement PER-90/P11-T01 redacted structured backend logs and typed command error output: command errors must include stable error code, recovery hint, redacted context, and timestamp; exported logs/support bundle must redact secrets, tokens, vault/key material, provider credentials, raw SDP/ICE/TURN details, plaintext, and media/key material. Scope is Tauri/backend diagnostics foundation only; do not implement log viewer/export UI, storage/MLS/ICE diagnostic reports, crash hygiene, packaging, release matrix, or broader Phase 11 work.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T21:01:20.400Z",
+      "updatedAt": "2026-06-25T21:11:17.088Z",
+      "evidence": "PER-90/P11-T01 local implementation complete on branch multica/P11-T01-redacted-structured-logs. Added structured command-error timestamps/redacted_context, JSON discrypt.command_error.v1 log entries, support-bundle structured_logs.last_command_error, expanded sensitive-class redaction, PER-90 plan/evidence docs, and generated artifact target/per90-redacted-structured-logs/diagnostics-log.json. Verification passed: targeted redacted_structured_command_logs test; typed_command_errors_surface_actionable_codes; cargo fmt --check; cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --lib -- -D warnings; git diff --check; PER90_SECRET_SCAN=PASSED. Evidence is local Rust/Tauri backend diagnostics evidence, not production installed-app support workflow evidence.",
+      "completedAt": "2026-06-25T21:11:17.088Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
