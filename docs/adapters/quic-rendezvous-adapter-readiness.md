@@ -9,6 +9,12 @@ The `discrypt_quic_rendezvous` adapter is registered in the transport adapter re
 
 Native `quic://` is still reserved by the sibling service ADR and is rejected with an explicit error until an audited native QUIC client exists. This adapter does not replace WebRTC media/data paths; it is only a rendezvous/signaling provider.
 
+Provider-visible service envelopes are versioned and fail closed before publish
+or after take when schema/payload versions are unsupported, service signal kind
+does not match the sealed WebRTC payload kind, plaintext markers are present, or
+an application/control relay envelope appears. `broadcast_control` and
+`take_control_payloads` remain disabled for this adapter.
+
 Verified guard:
 
 ```bash
@@ -29,6 +35,9 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
   quic_rendezvous_health_requires_production_protocol_metadata -- --nocapture
+
+cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter \
+  quic_rendezvous_wire_envelopes_are_versioned_signaling_only -- --nocapture
 ```
 
 ## Required production implementation checklist
@@ -38,7 +47,7 @@ cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter 
 - Require the signed endpoint trust fingerprint from app/DM/group/channel policy or invite bootstrap metadata before any production/self-hosted endpoint is used, and reject mismatched fingerprints before health probes.
 - Validate `/healthz` status, service label, advertised `public_base_url`, protocol/schema version, max-body bounds, and rate-limit metadata; production/self-hosted service health must advertise the same normalized endpoint being used.
 - Still add TLS certificate/public-key pin validation, ALPN, service expiry/rotation enforcement, and endpoint allowlist proof before production release.
-- Transport only sealed rendezvous, WebRTC offer/answer/candidate, and control envelopes. QUIC rendezvous does not replace WebRTC data/audio.
+- Transport only sealed rendezvous and WebRTC offer/answer/candidate envelopes. QUIC rendezvous does not replace WebRTC data/audio, and application/control relay envelopes are rejected.
 - Map trust mismatch, version mismatch, rate-limit, payload-too-large, outage, and provider-unhealthy states to typed health/readiness.
 - Extend the local sibling-service harness into staged/deployed service E2E with TLS-edge identity/fingerprint checks.
 - Add provider-visible capture scans proving no raw SDP/ICE/TURN credentials/room seeds/names/plaintext enter the rendezvous service.
