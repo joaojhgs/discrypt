@@ -10,6 +10,7 @@ PER-91 / P11-T02 adds the frontend support-bundle viewer and export surface for 
 - The UI reads diagnostics only after the user enables consent, then loads the backend redacted support bundle through `export_diagnostics_log()`.
 - The panel shows backend-derived bundle metadata, a scrollable raw redacted JSON preview, copy-to-clipboard, and JSON file export.
 - The UI reports denied, loading, empty, command failure, clipboard-unavailable, and file-export-unavailable states without claiming diagnostic success.
+- The diagnostics inspector sheet is a secondary support-bundle entry point when `VITE_DISCRYPT_SHOW_DIAGNOSTICS=1`; its `Copy logs` action now has its own explicit consent gate before invoking `export_diagnostics_log()`.
 
 ## Evidence
 
@@ -22,6 +23,7 @@ Commands run:
 - `npm --prefix apps/ui run build`
 - `VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npm --prefix apps/ui run build`
 - `PLAYWRIGHT_BROWSERS_PATH=/tmp/discrypt-playwright-browsers npx playwright test tests/e2e/config-modal.spec.ts --workers=1` from `apps/ui`
+- `VITE_DISCRYPT_SHOW_DIAGNOSTICS=1 PLAYWRIGHT_BROWSERS_PATH=/tmp/discrypt-playwright-browsers npx playwright test tests/e2e/config-modal.spec.ts --grep "diagnostics sheet support bundle copy requires explicit consent" --workers=1` from `apps/ui`
 - `PLAYWRIGHT_BROWSERS_PATH=/tmp/discrypt-playwright-browsers npx playwright test tests/e2e/production-smoke.spec.ts --workers=1` from `apps/ui`
 
 ## Evidence Boundary

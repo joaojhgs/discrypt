@@ -8118,11 +8118,16 @@ function DiagnosticsSheet({
     (participant) => participant.speaking && !participant.muted,
   ).length;
   const [exportStatus, setExportStatus] = useState<string>("");
+  const [supportBundleConsent, setSupportBundleConsent] = useState(false);
   const copyDiagnostics = async () => {
+    if (!supportBundleConsent) {
+      setExportStatus("Support bundle copy denied until consent is enabled.");
+      return;
+    }
     try {
       const log = await exportDiagnosticsLog();
       await navigator.clipboard?.writeText(log);
-      setExportStatus("Diagnostics copied to clipboard.");
+      setExportStatus("Support bundle copied to clipboard.");
     } catch (error) {
       setExportStatus(
         error instanceof Error
@@ -8144,6 +8149,30 @@ function DiagnosticsSheet({
               <Button type="button" size="sm" variant="secondary" onClick={copyDiagnostics}>
                 Copy logs
               </Button>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted)/0.28)] px-3 py-2">
+              <Label
+                htmlFor="diagnostics-support-bundle-consent"
+                className="grid gap-1 text-sm"
+              >
+                <span>Include support bundle data</span>
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Required before copying backend diagnostics from this sheet.
+                </span>
+              </Label>
+              <Switch
+                id="diagnostics-support-bundle-consent"
+                checked={supportBundleConsent}
+                onCheckedChange={(checked) => {
+                  setSupportBundleConsent(checked);
+                  setExportStatus(
+                    checked
+                      ? "Consent enabled for diagnostics sheet support bundle copy."
+                      : "Consent required before copying support bundle data.",
+                  );
+                }}
+                aria-label="Include diagnostics support bundle data"
+              />
             </div>
             {exportStatus ? (
               <p className="text-xs text-[hsl(var(--muted-foreground))]">{exportStatus}</p>

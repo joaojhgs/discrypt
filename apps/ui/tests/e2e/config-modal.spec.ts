@@ -217,3 +217,59 @@ test("support bundle export reports loading, empty, command failure, and clipboa
     ),
   ).toBeVisible();
 });
+
+test("diagnostics sheet support bundle copy requires explicit consent", async ({
+  page,
+}) => {
+  test.skip(
+    process.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS !== "1",
+    "diagnostics sheet is compiled only for diagnostics-enabled builds",
+  );
+  await page.addInitScript(() => {
+    window.localStorage.clear();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (value: string) => {
+          Object.defineProperty(window, "__discryptCopiedDiagnosticsSheetLog", {
+            configurable: true,
+            value,
+          });
+        },
+      },
+    });
+  });
+  await bootReadyShell(page);
+
+  await page.getByRole("button", { name: "Open diagnostics" }).click();
+  const diagnosticsDialog = page.getByRole("dialog", { name: "Diagnostics" });
+  await expect(
+    diagnosticsDialog.getByRole("heading", { name: "Workspace diagnostics" }),
+  ).toBeVisible();
+
+  await diagnosticsDialog.getByRole("button", { name: "Copy logs" }).click();
+  await expect(
+    diagnosticsDialog.getByText(
+      "Support bundle copy denied until consent is enabled.",
+    ),
+  ).toBeVisible();
+
+  await diagnosticsDialog
+    .getByLabel("Include diagnostics support bundle data")
+    .click();
+  await expect(
+    diagnosticsDialog.getByText(
+      "Consent enabled for diagnostics sheet support bundle copy.",
+    ),
+  ).toBeVisible();
+  await diagnosticsDialog.getByRole("button", { name: "Copy logs" }).click();
+  await expect(
+    diagnosticsDialog.getByText("Support bundle copied to clipboard."),
+  ).toBeVisible();
+  const copiedLog = await page.evaluate(
+    () => (window as Window & { __discryptCopiedDiagnosticsSheetLog?: string })
+      .__discryptCopiedDiagnosticsSheetLog,
+  );
+  expect(copiedLog).toContain('"schema_version": 1');
+  expect(copiedLog).toContain('"provider_role": "signaling only for SDP/candidates"');
+});
