@@ -574,18 +574,18 @@ impl IceDtlsProviderReport {
     /// Build a provider-missing report when no provider/probe evidence exists.
     #[must_use]
     pub fn provider_missing(detail: impl Into<String>) -> Self {
-        Self::new(
-            IceDtlsProviderFailureKind::ProviderMissing,
-            detail,
-            false,
-            false,
-            false,
-            false,
-            None,
-            None,
-            "not_observed".to_owned(),
-            false,
-        )
+        Self::new(IceDtlsProviderReportFields {
+            failure_kind: IceDtlsProviderFailureKind::ProviderMissing,
+            detail: detail.into(),
+            provider_selected: false,
+            offer_observed: false,
+            answer_observed: false,
+            candidate_observed: false,
+            ice_state: None,
+            dtls_state: None,
+            data_channel_state: "not_observed".to_owned(),
+            turn_required: false,
+        })
     }
 
     /// Build a redacted report from a provider-signaled WebRTC probe.
@@ -652,10 +652,10 @@ impl IceDtlsProviderReport {
             direct_ready,
             turn_ready,
         );
-        Self::new(
+        Self::new(IceDtlsProviderReportFields {
             failure_kind,
             detail,
-            true,
+            provider_selected: true,
             offer_observed,
             answer_observed,
             candidate_observed,
@@ -663,37 +663,39 @@ impl IceDtlsProviderReport {
             dtls_state,
             data_channel_state,
             turn_required,
-        )
+        })
     }
 
-    fn new(
-        failure_kind: IceDtlsProviderFailureKind,
-        detail: impl Into<String>,
-        provider_selected: bool,
-        offer_observed: bool,
-        answer_observed: bool,
-        candidate_observed: bool,
-        ice_state: Option<String>,
-        dtls_state: Option<String>,
-        data_channel_state: String,
-        turn_required: bool,
-    ) -> Self {
+    fn new(fields: IceDtlsProviderReportFields) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
-            failure_kind,
-            status: failure_kind.code().to_owned(),
-            detail: detail.into(),
-            provider_selected,
+            failure_kind: fields.failure_kind,
+            status: fields.failure_kind.code().to_owned(),
+            detail: fields.detail,
+            provider_selected: fields.provider_selected,
             provider_application_relay_used: false,
-            offer_observed,
-            answer_observed,
-            candidate_observed,
-            ice_state,
-            dtls_state,
-            data_channel_state,
-            turn_required,
+            offer_observed: fields.offer_observed,
+            answer_observed: fields.answer_observed,
+            candidate_observed: fields.candidate_observed,
+            ice_state: fields.ice_state,
+            dtls_state: fields.dtls_state,
+            data_channel_state: fields.data_channel_state,
+            turn_required: fields.turn_required,
         }
     }
+}
+
+struct IceDtlsProviderReportFields {
+    failure_kind: IceDtlsProviderFailureKind,
+    detail: String,
+    provider_selected: bool,
+    offer_observed: bool,
+    answer_observed: bool,
+    candidate_observed: bool,
+    ice_state: Option<String>,
+    dtls_state: Option<String>,
+    data_channel_state: String,
+    turn_required: bool,
 }
 
 impl ProviderWebRtcDataChannelProbe {
@@ -7228,7 +7230,8 @@ mod tests {
     }
 
     #[test]
-    fn ice_dtls_provider_report_redacts_raw_webrtc_and_turn_material() {
+    fn ice_dtls_provider_report_redacts_raw_webrtc_and_turn_material() -> Result<(), TransportError>
+    {
         let mut probe = report_probe(report_timeline(
             true,
             true,
@@ -7240,7 +7243,8 @@ mod tests {
         ));
         probe.endpoint_label = "endpoint-label-only".to_owned();
         let report = probe.ice_dtls_provider_report(false);
-        let json = serde_json::to_string(&report).expect("report serializes");
+        let json = serde_json::to_string(&report)
+            .map_err(|err| TransportError::Unavailable(format!("serialize report: {err}")))?;
 
         assert_eq!(report.failure_kind, IceDtlsProviderFailureKind::Connected);
         assert!(!report.provider_application_relay_used);
@@ -7259,6 +7263,7 @@ mod tests {
                 "report leaked forbidden marker {forbidden}: {json}"
             );
         }
+        Ok(())
     }
 
     fn expected_readiness(boundary: ProviderAdapterBoundary) -> ProviderAdapterReadiness {

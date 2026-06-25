@@ -10089,7 +10089,7 @@ impl PersistedAppState {
             .or_else(|| {
                 fallback_plan.selected.is_none().then(|| {
                     discrypt_transport::IceDtlsProviderReport::provider_missing(
-                        "no selectable provider boundary for sealed WebRTC negotiation",
+                        "no selectable signaling-provider boundary for diagnostic negotiation setup; no connection or delivery proof is available",
                     )
                 })
             });
