@@ -1,0 +1,13 @@
+{
+  "goal": {
+    "threadId": "019eff79-1ac8-7531-b1df-a9f27c1671d8",
+    "objective": "Complete PER-82 / P10-T01 adapter registry/factory plan in .omx/plans/P10-T01-adapter-registry-factory-2026-06-25.md: harden discrypt-transport registry/factory/profile validation, preserve provider-as-signaling-only boundaries, add targeted tests, verify locally, open/update PR, and hand off to QA via Multica.",
+    "status": "active",
+    "tokensUsed": 102058,
+    "timeUsedSeconds": 527,
+    "createdAt": 1782402728,
+    "updatedAt": 1782403256
+  },
+  "remainingTokens": null,
+  "completionBudgetReport": null
+}
