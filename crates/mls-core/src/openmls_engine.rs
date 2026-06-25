@@ -690,6 +690,22 @@ impl OpenMlsGroupEngine {
         snapshot(&tracked.group, &tracked.pending_commit)
     }
 
+    /// Return backend-observed member credential labels for a live group.
+    ///
+    /// Higher layers use these labels as evidence that device membership came
+    /// from OpenMLS group state instead of frontend-only device labels.
+    pub fn member_labels(&self, group_id: &str) -> Result<Vec<String>, OpenMlsGroupError> {
+        let tracked = self
+            .groups
+            .get(group_id)
+            .ok_or_else(|| OpenMlsGroupError::GroupNotFound(group_id.to_owned()))?;
+        Ok(tracked
+            .group
+            .members()
+            .filter_map(|member| credential_label(&member.credential))
+            .collect())
+    }
+
     /// Return the creator/signer public key for a live group so callers can persist handles.
     pub fn signer_public_key(&self, group_id: &str) -> Result<Vec<u8>, OpenMlsGroupError> {
         self.groups
@@ -776,6 +792,9 @@ fn openmls_error(error: impl std::fmt::Debug) -> OpenMlsGroupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DeviceSet, Identity};
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -853,6 +872,124 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn two_device_profile_pairing_join_reload_and_remove_rekey(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let alice_path = temp_path("per80-alice-laptop");
+        let phone_path = temp_path("per80-alice-phone");
+        let mut alice_laptop = OpenMlsGroupEngine::open(&alice_path)?;
+        let mut alice_phone = OpenMlsGroupEngine::open(&phone_path)?;
+
+        let identity = Identity::generate("alice");
+        let mut device_set = DeviceSet::new();
+        let laptop_leaf = device_set.add_authorized_device(
+            &identity,
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            "laptop",
+            0,
+        );
+        let created = alice_laptop.create_group("room-two-device", b"alice:laptop")?;
+        assert_eq!(created.epoch, 0);
+
+        let pairing_payload =
+            device_set.create_pairing_payload(&identity, laptop_leaf.device_id, "phone", 0, 3)?;
+        let phone_leaf = device_set.add_device_from_pairing_payload(
+            &identity,
+            &pairing_payload,
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            1,
+        )?;
+        assert_eq!(phone_leaf.leaf_index, 1);
+        assert_eq!(laptop_leaf.identity_key, phone_leaf.identity_key);
+        assert_ne!(laptop_leaf.device_key, phone_leaf.device_key);
+
+        let phone_package = alice_phone.generate_member_package(b"alice:phone")?;
+        let added_phone = alice_laptop.add_member_package("room-two-device", &phone_package)?;
+        let phone_welcome = added_phone.welcome.as_ref().ok_or_else(|| {
+            OpenMlsGroupError::OpenMls("OpenMLS add did not produce phone welcome".to_owned())
+        })?;
+        let joined_phone = alice_phone.join_from_welcome(
+            "room-two-device",
+            phone_package.signer_public_key(),
+            phone_welcome,
+        )?;
+        assert_eq!(joined_phone.epoch, added_phone.state.epoch);
+        assert_eq!(
+            joined_phone.confirmation_tag,
+            added_phone.state.confirmation_tag
+        );
+        assert_eq!(
+            alice_laptop.member_labels("room-two-device")?,
+            vec!["alice:laptop".to_owned(), "alice:phone".to_owned()]
+        );
+        assert_eq!(
+            alice_phone.export_secret("room-two-device", "discrypt/v1/text", b"room", 32)?,
+            alice_laptop.export_secret("room-two-device", "discrypt/v1/text", b"room", 32)?
+        );
+
+        let serialized_devices = serde_json::to_vec(&device_set)?;
+        drop(alice_phone);
+        let mut reloaded_phone = OpenMlsGroupEngine::open(&phone_path)?;
+        let reloaded_joined =
+            reloaded_phone.load_group("room-two-device", phone_package.signer_public_key())?;
+        assert_eq!(reloaded_joined.epoch, added_phone.state.epoch);
+        assert_eq!(
+            reloaded_joined.confirmation_tag,
+            added_phone.state.confirmation_tag
+        );
+        let reloaded_devices: DeviceSet = serde_json::from_slice(&serialized_devices)?;
+        assert_eq!(reloaded_devices.active_devices().len(), 2);
+        assert_eq!(
+            reloaded_devices
+                .transparency_events()
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["device-added", "device-paired"]
+        );
+
+        let before_remove =
+            alice_laptop.export_secret("room-two-device", "discrypt/v1/text", b"room", 32)?;
+        let removed_phone = alice_laptop.remove_device("room-two-device", "alice", "phone")?;
+        assert_eq!(removed_phone.state.epoch, added_phone.state.epoch + 1);
+        assert!(device_set.remove_device(phone_leaf.device_id, removed_phone.state.epoch));
+        assert_eq!(
+            device_set
+                .transparency_events()
+                .last()
+                .map(|event| event.kind.as_str()),
+            Some("device-removed")
+        );
+        let after_remove =
+            alice_laptop.export_secret("room-two-device", "discrypt/v1/text", b"room", 32)?;
+        assert_ne!(before_remove, after_remove);
+        assert_eq!(
+            alice_laptop.member_labels("room-two-device")?,
+            vec!["alice:laptop".to_owned()]
+        );
+
+        let removed_view = reloaded_phone.apply_external_remove_commit(
+            "room-two-device",
+            removed_phone.state.epoch,
+            &removed_phone.commit,
+            "alice:phone",
+        )?;
+        assert_eq!(removed_view.epoch, removed_phone.state.epoch);
+        let bob_package = alice_laptop.generate_member_package(b"bob:laptop")?;
+        let post_removal_add = alice_laptop.add_member_package("room-two-device", &bob_package)?;
+        assert!(reloaded_phone
+            .apply_external_commit(
+                "room-two-device",
+                post_removal_add.state.epoch,
+                &post_removal_add.commit,
+            )
+            .is_err());
+
+        let _ = std::fs::remove_file(alice_path);
+        let _ = std::fs::remove_file(phone_path);
         Ok(())
     }
 
