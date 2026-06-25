@@ -275,7 +275,7 @@ pub fn apply_history_sync_plan(
         policy.validate_entry(item)?;
     }
     let report = recipient_store
-        .merge_author_logs(plan.entries())
+        .merge_author_logs_atomic(plan.entries())
         .map_err(storage_error)?;
     Ok(apply_report(report))
 }
@@ -640,6 +640,30 @@ mod tests {
         let fork_plan = build_history_sync_plan(&policy, "member-3", &selection, [fork])?;
         assert!(apply_history_sync_plan(&policy, &fork_plan, &mut store).is_err());
         assert_eq!(store.author_log_snapshot().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn history_sync_failed_batch_does_not_partially_mutate_store() -> Result<(), TransportError> {
+        let policy = policy(9);
+        let selection = direct_selection(9)?;
+        let mut store = LocalStore::default();
+        let original =
+            AuthorLogEntry::new_stable(1, "device-1", 2, 9, b"original-ciphertext".to_vec());
+        store.append_sent(original.clone()).map_err(storage_error)?;
+
+        let earlier = HistorySyncItem::new(
+            AuthorLogEntry::new_stable(1, "device-1", 1, 9, b"new-ciphertext".to_vec()),
+            19_000,
+        );
+        let fork = HistorySyncItem::new(
+            AuthorLogEntry::new_stable(1, "device-1", 2, 9, b"different-ciphertext".to_vec()),
+            19_000,
+        );
+        let plan = build_history_sync_plan(&policy, "member-3", &selection, [earlier, fork])?;
+
+        assert!(apply_history_sync_plan(&policy, &plan, &mut store).is_err());
+        assert_eq!(store.author_log_snapshot(), vec![original]);
         Ok(())
     }
 }

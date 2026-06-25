@@ -429,6 +429,22 @@ impl LocalStore {
         Ok(report)
     }
 
+    /// Merge received author-log entries atomically.
+    ///
+    /// If any entry conflicts, the store is left unchanged.
+    pub fn merge_author_logs_atomic<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<AuthorLogMergeReport, AuthorLogError>
+    where
+        I: IntoIterator<Item = AuthorLogEntry>,
+    {
+        let mut candidate = self.clone();
+        let report = candidate.merge_author_logs(entries)?;
+        *self = candidate;
+        Ok(report)
+    }
+
     /// Ordered author-log snapshot.
     #[must_use]
     pub fn author_log_snapshot(&self) -> Vec<AuthorLogEntry> {
@@ -1127,6 +1143,30 @@ mod tests {
             store.merge_author_logs([reused]),
             Err(AuthorLogError::MessageIdReused {
                 message_id: "stable-id".to_owned()
+            })
+        );
+        assert_eq!(store.author_log_snapshot(), vec![original]);
+        Ok(())
+    }
+
+    #[test]
+    fn author_log_atomic_merge_rejects_late_conflict_without_partial_insert(
+    ) -> Result<(), AuthorLogError> {
+        let mut store = LocalStore::default();
+        let original =
+            AuthorLogEntry::new_stable(1, "device-1", 2, 5, b"original-ciphertext".to_vec());
+        store.append_sent(original.clone())?;
+
+        let earlier = AuthorLogEntry::new_stable(1, "device-1", 1, 5, b"new-ciphertext".to_vec());
+        let fork =
+            AuthorLogEntry::new_stable(1, "device-1", 2, 5, b"different-ciphertext".to_vec());
+
+        assert_eq!(
+            store.merge_author_logs_atomic([earlier, fork]),
+            Err(AuthorLogError::SequenceFork {
+                author_leaf: 1,
+                device_id: "device-1".to_owned(),
+                sequence: 2,
             })
         );
         assert_eq!(store.author_log_snapshot(), vec![original]);
