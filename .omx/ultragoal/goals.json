@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T19:34:36.412Z",
+  "updatedAt": "2026-06-25T19:57:03.644Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -369,6 +369,17 @@
       "updatedAt": "2026-06-25T19:34:36.412Z",
       "evidence": "PER-87 implementation committed as 9563b47 on branch multica/P10-T06-app-config-signing-versioning and opened as draft PR https://github.com/joaojhgs/discrypt/pull/87. Verification passed: cargo fmt --check; desktop app_config_ tests; desktop default_profiles_ tests; unsigned_ipfs_default_env_cannot_enable_app_default_profile; desktop clippy --lib -D warnings; git diff --check. Evidence doc: docs/release/per87-app-config-signing-versioning-2026-06-25.md.",
       "completedAt": "2026-06-25T19:34:36.412Z"
+    },
+    {
+      "id": "G035-per-88-p10-t07-provider-visible-priv",
+      "title": "PER-88 P10-T07 provider-visible privacy captures",
+      "objective": "Complete PER-88/P10-T07 provider-visible privacy captures: retain sanitized capture artifacts for MQTT, Nostr, IPFS/libp2p PubSub, and Discrypt QUIC rendezvous boundaries; scan for names, raw SDP, ICE/TURN credentials, keys, plaintext, media, and sensitive tokens; keep providers signaling-only; document evidence level and release gaps; verify with targeted Rust/npm gates.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T19:52:07.892Z",
+      "updatedAt": "2026-06-25T19:57:03.644Z",
+      "evidence": "PER-88 provider-visible privacy captures implemented and verified. Added sanitized capture artifact emission for MQTT/Nostr/IPFS/QUIC local conformance provider-visible material, npm G133 artifact/doc validation, PER-88 plan/evidence docs. Verification passed: cargo fmt --check; targeted conformance capture test; targeted plaintext rejection test; npm provider-metadata-capture-g133; cargo clippy -p discrypt-transport --lib -D warnings; git diff --check. Artifact: target/provider-visible-captures/per88-g133-provider-visible-capture.json.",
+      "completedAt": "2026-06-25T19:57:03.644Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

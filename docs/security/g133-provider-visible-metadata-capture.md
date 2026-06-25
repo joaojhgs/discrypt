@@ -28,6 +28,13 @@ inherits the no-plaintext contract.
 - `cargo test -q -p discrypt-transport local_conformance_adapter_rejects_plaintext_sdp_and_ice_markers -- --nocapture`
 - `npm --prefix apps/ui run test:provider-metadata-capture-g133`
 
+The npm gate sets `DISCRYPT_PROVIDER_METADATA_CAPTURE_OUT` for the conformance
+capture and retains the sanitized scan artifact at
+`target/provider-visible-captures/per88-g133-provider-visible-capture.json`.
+The artifact records adapter kind, provider-visible row counts, byte totals, and
+SHA-256 digests only. It intentionally does not retain raw provider-visible
+payloads.
+
 ## Pass condition
 
 The gate passes only when:
@@ -42,6 +49,8 @@ The gate passes only when:
    reach provider-visible state; and
 5. release documentation keeps external libpcap/tcpdump capture as a separate
    release-run artifact rather than claiming it has already passed.
+6. the retained PER-88 artifact exists, covers MQTT/Nostr/IPFS/QUIC, marks every
+   adapter scan as passed, and contains no forbidden-field tokens.
 
 ## Current limitation
 
