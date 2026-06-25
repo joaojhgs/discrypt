@@ -1611,6 +1611,17 @@ pub fn order_application_events(mut events: Vec<ApplicationEvent>) -> Vec<Applic
     events
 }
 
+/// Canonical key for ordered MLS commits: epoch → committer leaf index → signed content hash.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CommitOrderKey {
+    /// Commit epoch.
+    pub epoch: u64,
+    /// Committer leaf index in the last common accepted tree.
+    pub committer_leaf: u32,
+    /// Hash of the signed commit content and ordered application event references.
+    pub content_hash: [u8; 32],
+}
+
 /// Commit envelope accepted by the delivery layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommitEnvelope {
@@ -1636,6 +1647,95 @@ impl CommitEnvelope {
             application_events: order_application_events(application_events),
         }
     }
+
+    /// Content hash used by the commit comparator.
+    #[must_use]
+    pub fn content_hash(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"discrypt-mls-delivery-commit-v1");
+        h.update(self.summary.epoch.to_be_bytes());
+        h.update(self.summary.tree_hash);
+        h.update(self.summary.confirmation_tag);
+        h.update(self.committer_leaf.to_be_bytes());
+        for event in &self.application_events {
+            let key = CanonicalEventKey::from(event);
+            h.update(key.epoch.to_be_bytes());
+            h.update(key.leaf_index.to_be_bytes());
+            h.update(key.content_hash);
+            push_str_for_hash(&mut h, &event.event_id);
+        }
+        h.finalize().into()
+    }
+
+    /// Canonical comparator key for ordered delivery and fork recovery.
+    #[must_use]
+    pub fn order_key(&self) -> CommitOrderKey {
+        CommitOrderKey {
+            epoch: self.summary.epoch,
+            committer_leaf: self.committer_leaf,
+            content_hash: self.content_hash(),
+        }
+    }
+}
+
+/// Deterministically order MLS commits by the shared canonical comparator.
+#[must_use]
+pub fn order_commits(mut commits: Vec<CommitEnvelope>) -> Vec<CommitEnvelope> {
+    commits.sort_by_key(CommitEnvelope::order_key);
+    commits
+}
+
+/// Canonical key for comparing full candidate histories during fork recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct DeliveryHistoryKey {
+    /// Ordered commit keys that make up the candidate history.
+    pub commits: Vec<CommitOrderKey>,
+}
+
+impl DeliveryHistoryKey {
+    /// Build a history key from ordered commits.
+    #[must_use]
+    pub fn from_commits(commits: &[CommitEnvelope]) -> Self {
+        Self {
+            commits: commits.iter().map(CommitEnvelope::order_key).collect(),
+        }
+    }
+}
+
+/// A fork candidate used by the AC-MLS-FORK recovery harness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryHistory {
+    /// Accepted branch summary.
+    pub summary: EpochSummary,
+    /// Ordered commits that produced the branch.
+    pub commits: Vec<CommitEnvelope>,
+}
+
+impl DeliveryHistory {
+    /// Build a candidate history with commits sorted by the canonical comparator.
+    #[must_use]
+    pub fn new(summary: EpochSummary, commits: Vec<CommitEnvelope>) -> Self {
+        Self {
+            summary,
+            commits: order_commits(commits),
+        }
+    }
+
+    /// Canonical comparator key for winner selection.
+    #[must_use]
+    pub fn key(&self) -> DeliveryHistoryKey {
+        DeliveryHistoryKey::from_commits(&self.commits)
+    }
+}
+
+/// Pick the comparator-maximal candidate history for deterministic fork repair.
+#[must_use]
+pub fn comparator_maximal_history(histories: &[DeliveryHistory]) -> Option<&DeliveryHistory> {
+    histories.iter().max_by(|a, b| {
+        a.key()
+            .cmp(&b.key())
+            .then_with(|| a.summary.cmp(&b.summary))
+    })
 }
 
 /// Deterministic delivery state for tests and higher-level service boundaries.
@@ -1796,7 +1896,7 @@ impl CatchUpBundle {
     ) -> Self {
         Self {
             summary,
-            commits,
+            commits: order_commits(commits),
             application_events: order_application_events(application_events),
         }
     }
@@ -1859,6 +1959,28 @@ pub fn plan_repair(
         ),
         replays_divergent_mls_commits: false,
     }
+}
+
+/// Build an explicit repair plan using the comparator-maximal fork history.
+#[must_use]
+pub fn plan_repair_from_histories(
+    histories: &[DeliveryHistory],
+    last_common_leaves: &[u32],
+    still_valid_events: Vec<ApplicationEvent>,
+) -> Option<RepairPlan> {
+    let winner = comparator_maximal_history(histories)?;
+    let winner_epoch = winner.summary.epoch;
+    Some(RepairPlan {
+        action: select_repair_action(histories.len() > 1, last_common_leaves),
+        winner: winner.summary.clone(),
+        reproposed_events: order_application_events(
+            still_valid_events
+                .into_iter()
+                .filter(|event| event.epoch == winner_epoch)
+                .collect(),
+        ),
+        replays_divergent_mls_commits: false,
+    })
 }
 
 /// Apply a repair plan to all honest members and return their repaired summaries.
@@ -2479,6 +2601,68 @@ mod tests {
     }
 
     #[test]
+    fn ordered_mls_delivery_orders_commits_by_epoch_leaf_and_content_hash() {
+        let same_epoch_high_leaf = CommitEnvelope::new(
+            summary(2, 2, 2),
+            7,
+            vec![ApplicationEvent::new(
+                2,
+                7,
+                "leaf-7",
+                b"ciphertext".to_vec(),
+            )],
+        );
+        let later_epoch = CommitEnvelope::new(
+            summary(3, 3, 3),
+            1,
+            vec![ApplicationEvent::new(
+                3,
+                1,
+                "epoch-3",
+                b"ciphertext".to_vec(),
+            )],
+        );
+        let same_epoch_low_leaf = CommitEnvelope::new(
+            summary(2, 9, 9),
+            1,
+            vec![ApplicationEvent::new(
+                2,
+                1,
+                "leaf-1",
+                b"ciphertext".to_vec(),
+            )],
+        );
+
+        let ordered = order_commits(vec![
+            same_epoch_high_leaf.clone(),
+            later_epoch.clone(),
+            same_epoch_low_leaf.clone(),
+        ]);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(CommitEnvelope::order_key)
+                .collect::<Vec<_>>(),
+            vec![
+                same_epoch_low_leaf.order_key(),
+                same_epoch_high_leaf.order_key(),
+                later_epoch.order_key()
+            ]
+        );
+
+        let catchup = CatchUpBundle::new(
+            later_epoch.summary.clone(),
+            vec![later_epoch, same_epoch_high_leaf, same_epoch_low_leaf],
+            Vec::new(),
+        );
+        assert!(catchup
+            .commits
+            .windows(2)
+            .all(|pair| pair[0].order_key() <= pair[1].order_key()));
+    }
+
+    #[test]
     fn detects_same_epoch_divergence_and_plans_explicit_repair() {
         let a = summary(2, 1, 2);
         let b = summary(2, 9, 2);
@@ -2586,6 +2770,103 @@ mod tests {
             event_ids(&state.accepted_events()),
             BTreeSet::from(["valid".into()])
         );
+    }
+
+    #[test]
+    fn ac_mls_fork_adversarial_harness_recovers_to_comparator_maximal_history() {
+        let common = summary(1, 1, 1);
+        let low_leaf_commit = CommitEnvelope::new(
+            summary(2, 2, 2),
+            1,
+            vec![ApplicationEvent::new(
+                2,
+                1,
+                "losing-branch-message",
+                b"losing-ciphertext".to_vec(),
+            )],
+        );
+        let high_leaf_commit = CommitEnvelope::new(
+            summary(2, 9, 9),
+            7,
+            vec![ApplicationEvent::new(
+                2,
+                7,
+                "winning-branch-message",
+                b"winning-ciphertext".to_vec(),
+            )],
+        );
+        let low_leaf_history = DeliveryHistory::new(
+            low_leaf_commit.summary.clone(),
+            vec![low_leaf_commit.clone()],
+        );
+        let high_leaf_history = DeliveryHistory::new(
+            high_leaf_commit.summary.clone(),
+            vec![high_leaf_commit.clone()],
+        );
+
+        assert_eq!(
+            detect_fork_or_replay(&low_leaf_history.summary, &high_leaf_history.summary),
+            ForkStatus::Diverged(ForkEvidence {
+                local: low_leaf_history.summary.clone(),
+                remote: high_leaf_history.summary.clone(),
+            })
+        );
+
+        let histories = vec![low_leaf_history.clone(), high_leaf_history.clone()];
+        assert_eq!(
+            comparator_maximal_history(&histories).map(|history| history.summary.clone()),
+            Some(high_leaf_history.summary.clone())
+        );
+        assert!(high_leaf_history.key() > low_leaf_history.key());
+
+        let plan = plan_repair_from_histories(
+            &histories,
+            &[1, 7],
+            vec![
+                ApplicationEvent::new(1, 1, "stale-before-repair", b"stale".to_vec()),
+                ApplicationEvent::new(
+                    2,
+                    1,
+                    "losing-app-event-reproposed",
+                    b"still-valid-ciphertext".to_vec(),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            plan.as_ref().map(|plan| &plan.action),
+            Some(&RepairAction::RejoinAndReproposal {
+                coordinator_leaf: 7
+            })
+        );
+        assert_eq!(
+            plan.as_ref().map(|plan| plan.winner.clone()),
+            Some(high_leaf_history.summary.clone())
+        );
+        assert_eq!(
+            plan.as_ref().map(|plan| event_ids(&plan.reproposed_events)),
+            Some(BTreeSet::from(["losing-app-event-reproposed".into()]))
+        );
+        assert_eq!(
+            plan.as_ref().map(|plan| plan.replays_divergent_mls_commits),
+            Some(false)
+        );
+
+        assert!(plan.is_some());
+        if let Some(plan) = plan {
+            let mut partition_a = DeliveryState::new(low_leaf_history.summary);
+            let mut partition_b = DeliveryState::new(high_leaf_history.summary.clone());
+            assert_eq!(partition_a.apply_repair_plan(plan.clone()), Ok(()));
+            assert_eq!(partition_b.apply_repair_plan(plan.clone()), Ok(()));
+            let repaired = repair_to_winner(2, &plan);
+
+            assert_eq!(partition_a.summary(), &high_leaf_history.summary);
+            assert_eq!(partition_b.summary(), &high_leaf_history.summary);
+            assert_eq!(repaired, vec![high_leaf_history.summary; 2]);
+            assert!(equal_confirmation_tags(&repaired));
+            assert_eq!(partition_a.accepted_events(), partition_b.accepted_events());
+            assert_ne!(partition_a.summary(), &common);
+        }
     }
 
     #[test]
