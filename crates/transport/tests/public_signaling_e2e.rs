@@ -28,13 +28,23 @@ use discrypt_transport::{
     SealedWebRtcNegotiationPayload, SignalingAdapter, SignalingPeerId,
     WebRtcNegotiationPayloadKind,
 };
+#[cfg(feature = "nostr-adapter")]
+use futures::{SinkExt, StreamExt};
 use rand::RngCore;
+#[cfg(feature = "nostr-adapter")]
+use serde_json::Value;
+#[cfg(feature = "nostr-adapter")]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "nostr-adapter")]
+use tokio::sync::broadcast;
 #[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter"
 ))]
 use tokio::time::{sleep, Duration, Instant};
+#[cfg(feature = "nostr-adapter")]
+use tokio_tungstenite::tungstenite::Message;
 
 #[cfg(feature = "mqtt-adapter")]
 fn public_mqtt_profile(endpoint: String) -> Result<SignalingAdapterProfile, TransportError> {
@@ -92,6 +102,131 @@ fn comma_separated_endpoints(value: &str) -> Vec<String> {
         .filter(|endpoint| !endpoint.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[cfg(feature = "nostr-adapter")]
+struct LocalNostrRelay {
+    endpoint: String,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "nostr-adapter")]
+impl Drop for LocalNostrRelay {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[cfg(feature = "nostr-adapter")]
+async fn spawn_local_nostr_relay() -> Result<LocalNostrRelay, TransportError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|err| {
+        TransportError::SignalingAdapter(format!("bind local Nostr relay: {err}"))
+    })?;
+    let endpoint = format!(
+        "ws://{}",
+        listener.local_addr().map_err(|err| {
+            TransportError::SignalingAdapter(format!("read local Nostr relay address: {err}"))
+        })?
+    );
+    let (events, _) = broadcast::channel::<Value>(128);
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let events = events.clone();
+            tokio::spawn(async move {
+                if let Err(error) = handle_local_nostr_relay_connection(stream, events).await {
+                    eprintln!("local Nostr relay connection closed: {error}");
+                }
+            });
+        }
+    });
+    Ok(LocalNostrRelay { endpoint, handle })
+}
+
+#[cfg(feature = "nostr-adapter")]
+async fn handle_local_nostr_relay_connection(
+    stream: TcpStream,
+    events: broadcast::Sender<Value>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let websocket = tokio_tungstenite::accept_async(stream).await?;
+    let (mut writer, mut reader) = websocket.split();
+    let mut event_rx = events.subscribe();
+    let mut subscriptions = Vec::<String>::new();
+
+    loop {
+        tokio::select! {
+            message = reader.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let Message::Text(text) = message? else {
+                    continue;
+                };
+                let Value::Array(parts) = serde_json::from_str::<Value>(&text)? else {
+                    continue;
+                };
+                let Some(command) = parts.first().and_then(Value::as_str) else {
+                    continue;
+                };
+                match command {
+                    "REQ" => {
+                        if let Some(subscription_id) = parts.get(1).and_then(Value::as_str) {
+                            subscriptions.push(subscription_id.to_owned());
+                            let eose = serde_json::json!(["EOSE", subscription_id]);
+                            writer.send(Message::Text(eose.to_string().into())).await?;
+                        }
+                    }
+                    "EVENT" => {
+                        if let Some(event) = parts.get(1).cloned() {
+                            let event_id = event.get("id").and_then(Value::as_str).unwrap_or("");
+                            let ok = serde_json::json!(["OK", event_id, true, ""]);
+                            writer.send(Message::Text(ok.to_string().into())).await?;
+                            let _ = events.send(event);
+                        }
+                    }
+                    "CLOSE" => {
+                        if let Some(subscription_id) = parts.get(1).and_then(Value::as_str) {
+                            subscriptions.retain(|id| id != subscription_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            event = event_rx.recv(), if !subscriptions.is_empty() => {
+                match event {
+                    Ok(event) => {
+                        for subscription_id in &subscriptions {
+                            let relay_event = serde_json::json!(["EVENT", subscription_id, event]);
+                            writer.send(Message::Text(relay_event.to_string().into())).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn local_nostr_profile(endpoint: String) -> Result<SignalingAdapterProfile, TransportError> {
+    Ok(SignalingAdapterProfile {
+        profile_id: "local-nostr-relay-e2e".to_owned(),
+        kind: SignalingAdapterKind::Nostr,
+        endpoints: vec![SignalingProviderEndpoint::new(
+            Endpoint::new(endpoint),
+            SignalingEndpointSecurity::LocalDevLoopback,
+        )],
+        metadata_posture: ProviderMetadataPosture::HashedTopic,
+        capabilities: SignalingAdapterCapabilities::production_required(),
+        trust_label: AdapterTrustLabel::new(
+            "local nostr",
+            "loopback relay; opaque envelopes only",
+        )?,
+    })
 }
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
@@ -384,6 +519,19 @@ async fn run_public_nostr_two_peer_roundtrip(
     alice_session.close().await?;
     bob_session.close().await?;
     Ok(())
+}
+
+#[cfg(feature = "nostr-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_nostr_relay_presence_and_signal_roundtrip() -> Result<(), TransportError> {
+    let relay = spawn_local_nostr_relay().await?;
+    let profile = local_nostr_profile(relay.endpoint.clone())?;
+    run_public_nostr_two_peer_roundtrip(
+        profile,
+        "local-nostr-relay-e2e",
+        "loopback relay with hashed topic and opaque payloads",
+    )
+    .await
 }
 
 #[cfg(feature = "nostr-adapter")]

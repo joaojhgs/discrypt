@@ -335,9 +335,9 @@
       "status": "complete",
       "attempt": 0,
       "createdAt": "2026-06-25T17:22:27.759Z",
-      "updatedAt": "2026-06-25T17:32:08.828Z",
-      "evidence": "PER-84 Nostr production profile implemented and verified: Nostr relay list dedupe, payload cap fail-closed behavior, privacy-safe tags/envelopes, desktop multi-relay default/custom profile allowlist commitments, live public Nostr roundtrip, live multi-relay degraded fallback soak, fmt, targeted tests, and clippy passed. See docs/release/per84-nostr-production-profile-2026-06-25.md.",
-      "completedAt": "2026-06-25T17:32:08.828Z"
+      "updatedAt": "2026-06-25T17:47:18.262Z",
+      "evidence": "PER-84 QA rejection fixed and verified: default workspace clippy unused BTreeSet import is cfg-gated; public_signaling_e2e now includes a live loopback Nostr relay roundtrip through NostrProviderAdapter; local relay, public nos.lol relay, multi-relay degraded fallback, desktop default_profiles_, cargo fmt --check, cargo clippy --workspace --all-targets -- -D warnings, and git diff --check all passed. See docs/release/per84-nostr-production-profile-2026-06-25.md.",
+      "completedAt": "2026-06-25T17:47:18.262Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

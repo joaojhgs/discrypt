@@ -34,7 +34,9 @@ use crate::{WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(feature = "nostr-adapter", feature = "ipfs-pubsub-adapter"))]
+use std::collections::BTreeSet;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};

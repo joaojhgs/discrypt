@@ -12,7 +12,7 @@ Present plan anchors:
 - Public/custom Nostr relay lists must validate and work through the existing adapter profile/factory contract.
 - Nostr provider-visible data must stay limited to endpoint metadata, derived hashed topic/tag, and opaque sealed WebRTC/presence envelopes.
 - Nostr must fail closed for malformed relay profiles, oversized provider envelopes, provider errors/rate limits/auth failures, and attempted application/control relay.
-- Verification must include local harness tests and a public Nostr relay path when network access allows.
+- Verification must include a live loopback Nostr relay roundtrip and a public Nostr relay path when network access allows.
 
 ## Code Paths
 
@@ -49,5 +49,6 @@ Present plan anchors:
 
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features nostr-adapter nostr_`
+  - Includes `local_nostr_relay_presence_and_signal_roundtrip`, a test-local WebSocket Nostr relay exercising two real adapter sessions.
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features nostr-adapter default_profiles_carry_provider_allowlist_and_rotation_policy default_profiles_omit_unconfigured_ipfs_quic_placeholder_endpoints -- --test-threads=1`
 - Public relay check where network access permits: targeted `discrypt-transport` public/local Nostr test or split-machine example against `DISCRYPT_PUBLIC_NOSTR_ENDPOINT`.
