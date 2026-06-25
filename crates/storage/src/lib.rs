@@ -34,6 +34,7 @@ use zeroize::Zeroize;
 
 const SEALED_ACCOUNT_BACKUP_DOMAIN: &[u8] = b"discrypt:v1:sealed-account-backup";
 const RECOVERY_CODE_DOMAIN: &[u8] = b"discrypt:v1:account-recovery-code";
+const ACCOUNT_BACKUP_EXPORT_VERSION: u16 = 1;
 
 /// App-store persistence errors.
 #[derive(Debug, thiserror::Error)]
@@ -955,6 +956,43 @@ pub struct AccountBackup {
     pub device_count: usize,
 }
 
+/// User-visible account-continuity backup recovery method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AccountBackupRecoveryMethod {
+    /// Another already-authorized own device exported the backup.
+    ExistingDevice,
+    /// User-held recovery code is required before the backup is restored.
+    RecoveryCode,
+    /// The backup itself is the sealed account-continuity trust material.
+    SealedBackup,
+}
+
+/// Persisted backup metadata that survives export/import and restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountBackupMetadata {
+    /// Backup envelope version.
+    pub version: u16,
+    /// Creation time recorded by the backend caller.
+    pub created_at_ms: u64,
+    /// Backend-proven own device that exported the backup.
+    pub exported_by_device_id: String,
+    /// Recovery method required by this backup.
+    pub recovery_method: AccountBackupRecoveryMethod,
+    /// Compromised device that must be rotated before account continuity is restored.
+    pub compromised_device_id: Option<String>,
+    /// True when restore must fail until caller supplies device-rotation evidence.
+    pub device_rotation_required: bool,
+}
+
+/// Versioned account-continuity backup export.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountBackupExport {
+    /// Persisted recovery metadata.
+    pub metadata: AccountBackupMetadata,
+    /// Sealed account-continuity backup. This never contains archival content keys.
+    pub backup: AccountBackup,
+}
+
 /// Persistable verifier for a user-held recovery code.
 ///
 /// The raw recovery code is deliberately not stored here. Call
@@ -1001,6 +1039,147 @@ pub fn seal_account_backup(
     }
 }
 
+/// Create a versioned account-continuity backup export without content keys.
+pub fn export_account_backup(
+    key: &[u8; 32],
+    rooms: Vec<String>,
+    device_count: usize,
+    exported_by_device_id: impl Into<String>,
+    recovery_method: AccountBackupRecoveryMethod,
+    created_at_ms: u64,
+) -> Result<AccountBackupExport, RecoveryError> {
+    let exported_by_device_id = normalize_required_id(exported_by_device_id)?;
+    Ok(AccountBackupExport {
+        metadata: AccountBackupMetadata {
+            version: ACCOUNT_BACKUP_EXPORT_VERSION,
+            created_at_ms,
+            exported_by_device_id,
+            recovery_method,
+            compromised_device_id: None,
+            device_rotation_required: false,
+        },
+        backup: seal_account_backup(key, rooms, device_count),
+    })
+}
+
+/// Create a backup export for a compromised-device recovery path.
+///
+/// Restoring this envelope through [`restore_account_backup_export`] fails
+/// closed until the caller supplies replacement-device rotation evidence through
+/// [`restore_account_backup_after_device_rotation`].
+pub fn export_device_compromise_backup(
+    key: &[u8; 32],
+    rooms: Vec<String>,
+    device_count: usize,
+    exported_by_device_id: impl Into<String>,
+    compromised_device_id: impl Into<String>,
+    created_at_ms: u64,
+) -> Result<AccountBackupExport, RecoveryError> {
+    let mut export = export_account_backup(
+        key,
+        rooms,
+        device_count,
+        exported_by_device_id,
+        AccountBackupRecoveryMethod::ExistingDevice,
+        created_at_ms,
+    )?;
+    export.metadata.compromised_device_id = Some(normalize_required_id(compromised_device_id)?);
+    export.metadata.device_rotation_required = true;
+    Ok(export)
+}
+
+/// Parse and restore a serialized account-continuity backup export.
+pub fn restore_account_backup_export_json(bytes: &[u8]) -> Result<AccountRecovery, RecoveryError> {
+    let export: AccountBackupExport =
+        serde_json::from_slice(bytes).map_err(|error| RecoveryError::MalformedBackup {
+            reason: error.to_string(),
+        })?;
+    restore_account_backup_export(export)
+}
+
+/// Restore a backup export that does not require compromised-device rotation or recovery code.
+pub fn restore_account_backup_export(
+    export: AccountBackupExport,
+) -> Result<AccountRecovery, RecoveryError> {
+    validate_backup_export(&export)?;
+    if export.metadata.device_rotation_required {
+        return Err(RecoveryError::DeviceRotationRequired {
+            compromised_device_id: export
+                .metadata
+                .compromised_device_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+        });
+    }
+    if export.metadata.recovery_method == AccountBackupRecoveryMethod::RecoveryCode {
+        return Err(RecoveryError::RecoveryCodeRequired);
+    }
+    recover_account(RecoveryMaterial::SealedBackup(export.backup))
+}
+
+/// Parse and restore a recovery-code-gated account-continuity backup export.
+pub fn restore_recovery_code_backup_export_json(
+    bytes: &[u8],
+    code: impl AsRef<str>,
+    verifier: &RecoveryCodeVerifier,
+) -> Result<AccountRecovery, RecoveryError> {
+    let export: AccountBackupExport =
+        serde_json::from_slice(bytes).map_err(|error| RecoveryError::MalformedBackup {
+            reason: error.to_string(),
+        })?;
+    restore_recovery_code_backup_export(export, code, verifier)
+}
+
+/// Restore a recovery-code-gated backup only after verifying the user-held code.
+pub fn restore_recovery_code_backup_export(
+    export: AccountBackupExport,
+    code: impl AsRef<str>,
+    verifier: &RecoveryCodeVerifier,
+) -> Result<AccountRecovery, RecoveryError> {
+    validate_backup_export(&export)?;
+    if export.metadata.device_rotation_required {
+        return Err(RecoveryError::DeviceRotationRequired {
+            compromised_device_id: export
+                .metadata
+                .compromised_device_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+        });
+    }
+    if export.metadata.recovery_method != AccountBackupRecoveryMethod::RecoveryCode {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "backup does not require recovery code".to_owned(),
+        ));
+    }
+    let material = recovery_code_material(
+        code,
+        verifier,
+        export.backup.room_memberships,
+        export.backup.device_count,
+    )?;
+    recover_account(material)
+}
+
+/// Restore a compromised-device backup after explicit replacement-device evidence.
+pub fn restore_account_backup_after_device_rotation(
+    export: AccountBackupExport,
+    replacement_device_id: impl Into<String>,
+) -> Result<AccountRecovery, RecoveryError> {
+    validate_backup_export(&export)?;
+    if !export.metadata.device_rotation_required {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "backup does not require device rotation".to_owned(),
+        ));
+    }
+    let replacement_device_id = normalize_required_id(replacement_device_id)?;
+    if export.metadata.compromised_device_id.as_deref() == Some(replacement_device_id.as_str()) {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "replacement device must differ from compromised device".to_owned(),
+        ));
+    }
+    recover_account(RecoveryMaterial::SealedBackup(export.backup))
+}
+
 /// Recovery material available to a user.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RecoveryMaterial {
@@ -1033,6 +1212,30 @@ pub enum RecoveryError {
     /// The supplied recovery code does not match the stored verifier.
     #[error("recovery code did not match account verifier")]
     InvalidRecoveryCode,
+    /// This backup requires the explicit recovery-code restore path.
+    #[error("recovery code is required before restoring this backup")]
+    RecoveryCodeRequired,
+    /// Serialized backup bytes could not be parsed.
+    #[error("account backup is malformed: {reason}")]
+    MalformedBackup {
+        /// Parse or shape error.
+        reason: String,
+    },
+    /// Backup envelope version is not supported.
+    #[error("account backup version {version} is unsupported")]
+    UnsupportedBackupVersion {
+        /// Unsupported envelope version.
+        version: u16,
+    },
+    /// Backup metadata is missing required backend evidence.
+    #[error("account backup metadata is invalid: {0}")]
+    InvalidBackupMetadata(String),
+    /// The backup came from a compromised-device flow and requires rotation.
+    #[error("device rotation is required before recovery: {compromised_device_id}")]
+    DeviceRotationRequired {
+        /// Device id that must be evicted/rotated before restore.
+        compromised_device_id: String,
+    },
 }
 
 /// Account-continuity recovery result.
@@ -1070,6 +1273,22 @@ pub fn recovery_code_material(
     })
 }
 
+/// Build recovery material for an explicit lost-password flow.
+///
+/// Without a stored verifier and a user-supplied recovery code, account recovery
+/// is non-recoverable and fails closed.
+pub fn lost_password_recovery_material(
+    code: Option<&str>,
+    verifier: Option<&RecoveryCodeVerifier>,
+    rooms: Vec<String>,
+    device_count: usize,
+) -> Result<RecoveryMaterial, RecoveryError> {
+    match (code, verifier) {
+        (Some(code), Some(verifier)) => recovery_code_material(code, verifier, rooms, device_count),
+        _ => Err(RecoveryError::NoTrustMaterial),
+    }
+}
+
 /// Recover account continuity without restoring archival content keys.
 pub fn recover_account(material: RecoveryMaterial) -> Result<AccountRecovery, RecoveryError> {
     match material {
@@ -1100,6 +1319,42 @@ fn hash_recovery_code(code: &str) -> Result<[u8; 32], RecoveryError> {
     let mut hash = [0_u8; 32];
     hash.copy_from_slice(&digest);
     Ok(hash)
+}
+
+fn normalize_required_id(id: impl Into<String>) -> Result<String, RecoveryError> {
+    let id = id.into().trim().to_owned();
+    if id.is_empty() {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "device id is required".to_owned(),
+        ));
+    }
+    Ok(id)
+}
+
+fn validate_backup_export(export: &AccountBackupExport) -> Result<(), RecoveryError> {
+    if export.metadata.version != ACCOUNT_BACKUP_EXPORT_VERSION {
+        return Err(RecoveryError::UnsupportedBackupVersion {
+            version: export.metadata.version,
+        });
+    }
+    normalize_required_id(export.metadata.exported_by_device_id.clone())?;
+    if export.backup.identity_key_ciphertext.len() != 32 {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "identity backup material must be 32 bytes".to_owned(),
+        ));
+    }
+    if export.metadata.device_rotation_required
+        && export
+            .metadata
+            .compromised_device_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(RecoveryError::InvalidBackupMetadata(
+            "compromised device id is required when rotation is required".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_account_continuity(rooms: Vec<String>, device_count: usize) -> (Vec<String>, usize) {
@@ -1271,6 +1526,102 @@ mod tests {
         assert_eq!(b.device_count, 2);
         assert_eq!(b.room_memberships, vec!["room"]);
         assert_eq!(b.identity_key_ciphertext.len(), 32);
+    }
+
+    #[test]
+    fn account_backup_export_restore_persists_metadata_without_content_keys(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let export = export_account_backup(
+            &[7; 32],
+            vec![" ops ".into(), "ops".into(), "engineering".into()],
+            2,
+            "alice:laptop",
+            AccountBackupRecoveryMethod::RecoveryCode,
+            1_782_400_000_000,
+        )?;
+        let bytes = serde_json::to_vec(&export)?;
+        let reloaded: AccountBackupExport = serde_json::from_slice(&bytes)?;
+
+        assert_eq!(reloaded.metadata.version, ACCOUNT_BACKUP_EXPORT_VERSION);
+        assert_eq!(reloaded.metadata.exported_by_device_id, "alice:laptop");
+        assert_eq!(
+            reloaded.metadata.recovery_method,
+            AccountBackupRecoveryMethod::RecoveryCode
+        );
+        assert!(!reloaded.metadata.device_rotation_required);
+
+        assert_eq!(
+            restore_account_backup_export_json(&bytes),
+            Err(RecoveryError::RecoveryCodeRequired)
+        );
+
+        let verifier = RecoveryCodeVerifier::from_code("paper-coral-falcon")?;
+        assert_eq!(
+            restore_recovery_code_backup_export(export.clone(), "wrong", &verifier),
+            Err(RecoveryError::InvalidRecoveryCode)
+        );
+
+        let recovered =
+            restore_recovery_code_backup_export_json(&bytes, " paper-coral-falcon ", &verifier)?;
+        assert_eq!(
+            recovered,
+            AccountRecovery {
+                account_access_restored: true,
+                room_memberships: vec!["engineering".to_owned(), "ops".to_owned()],
+                device_count: 2,
+                content_keys_restored: false,
+            }
+        );
+
+        let sealed_export = export_account_backup(
+            &[3; 32],
+            vec!["ops".into()],
+            1,
+            "alice:laptop",
+            AccountBackupRecoveryMethod::SealedBackup,
+            1_782_400_000_100,
+        )?;
+        assert!(restore_account_backup_export(sealed_export)?.account_access_restored);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_backup_restore_fails_closed_without_overwriting_existing_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = MemoryAppStore::default();
+        store.save_app_state(br#"{"schema_version":2,"profile":"existing"}"#)?;
+
+        let restore = restore_account_backup_export_json(br#"{"metadata":{"version":1}}"#);
+        assert!(matches!(
+            restore,
+            Err(RecoveryError::MalformedBackup { .. })
+                | Err(RecoveryError::InvalidBackupMetadata(_))
+        ));
+        assert_eq!(
+            store.load_app_state()?,
+            Some(br#"{"schema_version":2,"profile":"existing"}"#.to_vec())
+        );
+
+        let mut corrupt = export_account_backup(
+            &[1; 32],
+            vec!["room".into()],
+            1,
+            "alice:laptop",
+            AccountBackupRecoveryMethod::SealedBackup,
+            1,
+        )?;
+        corrupt.backup.identity_key_ciphertext.truncate(8);
+        assert_eq!(
+            restore_account_backup_export(corrupt),
+            Err(RecoveryError::InvalidBackupMetadata(
+                "identity backup material must be 32 bytes".to_owned()
+            ))
+        );
+        assert_eq!(
+            store.load_app_state()?,
+            Some(br#"{"schema_version":2,"profile":"existing"}"#.to_vec())
+        );
+        Ok(())
     }
 
     #[test]
@@ -1566,6 +1917,68 @@ mod tests {
                 account_access_restored: true,
                 room_memberships: vec!["room".to_owned()],
                 device_count: 3,
+                content_keys_restored: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lost_password_without_trust_material_is_not_recoverable() -> Result<(), RecoveryError> {
+        assert_eq!(
+            lost_password_recovery_material(None, None, vec!["room".into()], 1),
+            Err(RecoveryError::NoTrustMaterial)
+        );
+
+        let verifier = RecoveryCodeVerifier::from_code("paper-coral-falcon")?;
+        assert_eq!(
+            lost_password_recovery_material(Some("wrong"), Some(&verifier), vec!["room".into()], 1),
+            Err(RecoveryError::InvalidRecoveryCode)
+        );
+
+        let material = lost_password_recovery_material(
+            Some(" paper-coral-falcon "),
+            Some(&verifier),
+            vec!["room".into()],
+            1,
+        )?;
+        let recovered = recover_account(material)?;
+        assert!(recovered.account_access_restored);
+        assert!(!recovered.content_keys_restored);
+        Ok(())
+    }
+
+    #[test]
+    fn compromised_device_backup_requires_rotation_before_restore() -> Result<(), RecoveryError> {
+        let export = export_device_compromise_backup(
+            &[4; 32],
+            vec!["room".into()],
+            2,
+            "alice:laptop",
+            "alice:phone",
+            1_782_400_001_000,
+        )?;
+
+        assert_eq!(
+            restore_account_backup_export(export.clone()),
+            Err(RecoveryError::DeviceRotationRequired {
+                compromised_device_id: "alice:phone".to_owned()
+            })
+        );
+        assert_eq!(
+            restore_account_backup_after_device_rotation(export.clone(), "alice:phone"),
+            Err(RecoveryError::InvalidBackupMetadata(
+                "replacement device must differ from compromised device".to_owned()
+            ))
+        );
+
+        let recovered = restore_account_backup_after_device_rotation(export, "alice:tablet")?;
+        assert_eq!(
+            recovered,
+            AccountRecovery {
+                account_access_restored: true,
+                room_memberships: vec!["room".to_owned()],
+                device_count: 2,
                 content_keys_restored: false,
             }
         );
