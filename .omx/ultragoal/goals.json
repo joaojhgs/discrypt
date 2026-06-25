@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T18:49:05.729Z",
+  "updatedAt": "2026-06-25T19:25:07.174Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -358,6 +358,16 @@
       "createdAt": "2026-06-25T18:49:05.729Z",
       "updatedAt": "2026-06-25T18:49:05.729Z",
       "evidence": "PER-86 issue metadata requires signed endpoint/fingerprint/version validation, no content relay, local sibling/staged harness evidence, and docs/release artifacts."
+    },
+    {
+      "id": "G034-per-87-p10-t06-app-config-signing-ve",
+      "title": "PER-87 P10-T06 app config signing/versioning",
+      "objective": "Implement PER-87/P10-T06 app-config signing/versioning: public app signaling defaults and endpoint allowlist updates must be signed, versioned, tamper/downgrade/stale checked, and fail closed before transport profile selection; preserve provider signaling-only boundaries and produce targeted signature/tamper verification plus docs/PR/QA handoff.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-25T19:25:07.174Z",
+      "updatedAt": "2026-06-25T19:25:07.174Z",
+      "evidence": "Multica PER-87 metadata and .omx/plans/P10-T06-app-config-signing-versioning-2026-06-25.md"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
