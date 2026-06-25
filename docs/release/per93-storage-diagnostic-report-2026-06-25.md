@@ -18,6 +18,9 @@ promotion.
 - Deterministic classification covers keyring missing/denied/unavailable/corrupt
   entry, password-vault wrong-password/corrupt-vault/decode, schema/decode, and
   preserve/quarantine failures.
+- Corrupt OS keychain wrapping-key material is classified separately from
+  provider-unavailable failures as `storage_keyring_corrupt_entry`, with a
+  fail-closed recovery hint that preserves original material for recovery.
 - Context uses redacted observable refs instead of raw keyring details or paths.
   The diagnostic path does not create replacement keyring/vault material.
 
@@ -32,6 +35,7 @@ Commands run:
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `npm --prefix apps/ui ci`
 - `npm --prefix apps/ui run typecheck`
+- `npm --prefix apps/ui run test:honesty`
 - `git diff --check`
 
 ## Evidence Boundary

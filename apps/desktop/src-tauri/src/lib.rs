@@ -14666,6 +14666,13 @@ fn classify_storage_diagnostic(
         }
     } else if combined.contains("denied") || combined.contains("permission") {
         "keyring_access_denied"
+    } else if combined.contains("invalid os keychain wrapping key")
+        || combined.contains("invalid keychain wrapping key")
+        || combined.contains("invalid keyring wrapping key")
+        || combined.contains("corrupt keychain")
+        || combined.contains("corrupt keyring")
+    {
+        "keyring_corrupt_entry"
     } else if combined.contains("keyring")
         || combined.contains("keychain")
         || combined.contains("secret service")
@@ -14696,16 +14703,20 @@ fn storage_diagnostic_code(failure_class: &str) -> String {
 }
 
 fn storage_diagnostic_recovery_hint(failure_class: &str, source_hint: &str) -> String {
-    if !source_hint.trim().is_empty() && sensitive_observable_classes(source_hint).is_empty() {
+    if !source_hint.trim().is_empty()
+        && sensitive_observable_classes(source_hint).is_empty()
+        && !source_hint.contains("redacted sensitive observable copy")
+    {
         return source_hint.to_owned();
     }
     match failure_class {
-        "keyring_missing_key" => "Use the same desktop keyring session and original Discrypt data directory; Discrypt preserved the encrypted store and will not create replacement key material over it.",
-        "keyring_access_denied" => "Unlock or allow the desktop keyring prompt, then retry. Discrypt preserved the encrypted store and did not write replacement state.",
+        "keyring_missing_key" => "Use the same desktop keyring session and original Discrypt data directory; Discrypt stopped before writing replacement key material over the existing store.",
+        "keyring_access_denied" => "Unlock or allow the desktop keyring prompt, then retry. Discrypt stopped before writing replacement state over the existing store.",
+        "keyring_corrupt_entry" => "Keep the original keyring entry and Discrypt data directory for recovery; Discrypt stopped before writing replacement key material over the existing store.",
         "keyring_unavailable" => "Start the desktop Secret Service or KWallet provider, then retry from the same profile directory.",
-        "password_vault_unlock_failed" => "Re-enter the same Discrypt storage password used for this profile. Discrypt preserved the encrypted store and did not create replacement vault material.",
+        "password_vault_unlock_failed" => "Re-enter the same Discrypt storage password used for this profile. Discrypt stopped before writing replacement vault material over the existing store.",
         "password_vault_corrupt" => "Keep the existing vault and profile files for recovery; retry only with the original files and password.",
-        "password_vault_missing_key" => "Restore the original vault file next to this profile before retrying; Discrypt will not generate replacement key material over existing encrypted state.",
+        "password_vault_missing_key" => "Restore the original vault file next to this profile before retrying; Discrypt stopped before generating replacement key material over existing state.",
         "schema_future" => "Open this profile with a newer compatible Discrypt build; this build will not downgrade or overwrite the store.",
         "schema_invalid" | "app_state_decode_failed" => "Keep the existing store for recovery or quarantine analysis; Discrypt did not treat it as a first-run profile.",
         "storage_preserve_failed" => "Fix filesystem permissions or disk availability so Discrypt can preserve the existing store before changing storage mode.",
@@ -34879,8 +34890,15 @@ mod tests {
                 "keyring",
                 "state_load_failed",
                 "invalid OS keychain wrapping key encoding",
-                "keyring_unavailable",
-                "storage_keyring_unavailable",
+                "keyring_corrupt_entry",
+                "storage_keyring_corrupt_entry",
+            ),
+            (
+                "keyring",
+                "state_load_failed",
+                "invalid OS keychain wrapping key length",
+                "keyring_corrupt_entry",
+                "storage_keyring_corrupt_entry",
             ),
             (
                 "passphrase_vault",
@@ -34932,6 +34950,13 @@ mod tests {
             assert_eq!(report.schema, "discrypt.storage_diagnostic.v1");
             assert_eq!(report.failure_class, expected_class);
             assert_eq!(report.code, expected_code);
+            if expected_class == "keyring_corrupt_entry" {
+                assert!(
+                    report.recovery_hint.contains("original keyring entry")
+                        && report.recovery_hint.contains("stopped before writing replacement"),
+                    "corrupt keyring entry needs a distinct actionable fail-closed hint: {report:?}"
+                );
+            }
             assert_eq!(report.mode, mode);
             assert!(report.fail_closed);
             assert!(
