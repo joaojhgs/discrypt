@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-#[cfg(feature = "ipfs-pubsub-adapter")]
+#[cfg(any(feature = "nostr-adapter", feature = "ipfs-pubsub-adapter"))]
 use std::collections::BTreeSet;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 use std::num::NonZeroUsize;
@@ -2774,6 +2774,7 @@ fn provider_runtime_spec_from_live_material(
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn probe_webrtc_with_adapter_and_answerer<A, F>(
     adapter: A,
     profile: SignalingAdapterProfile,
@@ -3660,6 +3661,7 @@ pub struct NostrProviderRoom {
     local_peer_id: SignalingPeerId,
     client: nostr_sdk::Client,
     relay_urls: Vec<String>,
+    max_message_bytes: u32,
     subscription_id: nostr_sdk::SubscriptionId,
     topic: String,
     notifications: AsyncMutex<tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>>,
@@ -3857,11 +3859,38 @@ fn nostr_endpoints_for_profile(
             "nostr adapter profile must contain at least one relay endpoint".to_owned(),
         ));
     }
-    Ok(profile
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for endpoint in &profile.endpoints {
+        if seen.insert(endpoint.endpoint.0.clone()) {
+            endpoints.push(endpoint.endpoint.0.clone());
+        }
+    }
+    Ok(endpoints)
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_max_message_bytes_for_profile(profile: &SignalingAdapterProfile) -> u32 {
+    profile
         .endpoints
         .iter()
-        .map(|endpoint| endpoint.endpoint.0.clone())
-        .collect())
+        .filter_map(|endpoint| endpoint.max_message_bytes)
+        .min()
+        .unwrap_or(crate::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES)
+}
+
+#[cfg(feature = "nostr-adapter")]
+fn nostr_validate_event_bytes(bytes: &[u8], max_message_bytes: u32) -> Result<(), TransportError> {
+    if bytes.len() > max_message_bytes as usize {
+        return Err(TransportError::SignalingAdapter(format!(
+            "nostr provider message too large: envelope_size={} max_message_bytes={} failure_class={} health_state={:?}",
+            bytes.len(),
+            max_message_bytes,
+            AdapterReadinessState::ProviderMessageTooLarge.failure_class(),
+            AdapterReadinessState::ProviderMessageTooLarge.to_health_state()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "nostr-adapter")]
@@ -5312,6 +5341,7 @@ impl NostrProviderRoom {
         let bytes =
             serde_json::to_vec(&envelope).map_err(|err| nostr_err("wire envelope encode", err))?;
         reject_forbidden_plaintext(&bytes)?;
+        nostr_validate_event_bytes(&bytes, self.max_message_bytes)?;
         let content =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, bytes);
         let builder = nostr_sdk::EventBuilder::new(
@@ -5495,6 +5525,7 @@ impl AdapterSession for NostrProviderSession {
             )));
         }
         let relay_urls = nostr_endpoints_for_profile(&self.profile)?;
+        let max_message_bytes = nostr_max_message_bytes_for_profile(&self.profile);
         let keys = nostr_client_secret(&rendezvous.topic, &local_peer_id)?;
         let client = nostr_sdk::Client::new(keys);
         for relay_url in &relay_urls {
@@ -5527,6 +5558,7 @@ impl AdapterSession for NostrProviderSession {
             local_peer_id,
             client: client.clone(),
             relay_urls,
+            max_message_bytes,
             subscription_id,
             topic: rendezvous.topic,
             notifications: AsyncMutex::new(client.notifications()),
@@ -7053,6 +7085,10 @@ mod tests {
             Endpoint::new("wss://nostr-backup.example.invalid"),
             SignalingEndpointSecurity::ProductionTls,
         ));
+        profile.endpoints.push(SignalingProviderEndpoint::new(
+            Endpoint::new("wss://nostr.example.invalid"),
+            SignalingEndpointSecurity::ProductionTls,
+        ));
 
         let relays = nostr_endpoints_for_profile(&profile)?;
         assert_eq!(
@@ -7062,6 +7098,72 @@ mod tests {
                 "wss://nostr-backup.example.invalid".to_owned(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn nostr_relay_profile_validation_fails_closed_for_public_cleartext(
+    ) -> Result<(), TransportError> {
+        let mut profile = valid_profile(SignalingAdapterKind::Nostr)?;
+        profile.endpoints = vec![SignalingProviderEndpoint::new(
+            Endpoint::new("ws://relay.example.com"),
+            SignalingEndpointSecurity::ProductionTls,
+        )];
+        let error = profile
+            .validate()
+            .expect_err("public Nostr relays must require wss");
+        assert!(error.to_string().contains("production endpoint scheme"));
+
+        let local = local_profile(SignalingAdapterKind::Nostr)?;
+        local
+            .validate()
+            .expect("loopback ws Nostr relay remains valid for local harnesses");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn nostr_oversized_envelope_maps_to_typed_health() -> Result<(), TransportError> {
+        let error = nostr_validate_event_bytes(&vec![7_u8; 17], 16)
+            .expect_err("oversized Nostr envelope must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("failure_class=provider_message_too_large"));
+        assert!(message.contains("health_state=ProviderMessageTooLarge"));
+        assert!(
+            !message.contains("7777"),
+            "payload-limit diagnostics must not echo provider-visible bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "nostr-adapter")]
+    fn nostr_event_content_and_tags_are_privacy_safe() -> Result<(), TransportError> {
+        let topic = "dc-topic-8f7d6c5b4a392817";
+        let envelope = NostrWireEnvelope::Signal {
+            schema: NOSTR_EVENT_SCHEMA,
+            from_peer: SignalingPeerId::new("alice-device")?,
+            to_peer: SignalingPeerId::new("bob-device")?,
+            payload: SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [9_u8; 12],
+                ciphertext: vec![0x91, 0x92, 0x93, 0x94],
+            },
+        };
+        let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
+        reject_forbidden_plaintext(&bytes)?;
+        nostr_validate_event_bytes(&bytes, crate::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES)?;
+        let content =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, bytes);
+        assert!(!content.contains("v=0"));
+        assert!(!content.to_ascii_lowercase().contains("candidate:"));
+        assert!(!content.to_ascii_lowercase().contains("alice display"));
+
+        let tag = nostr_discrypt_tag(topic)?;
+        assert_eq!(tag.kind().to_string(), "d");
+        assert_eq!(tag.content(), Some(topic));
         Ok(())
     }
 

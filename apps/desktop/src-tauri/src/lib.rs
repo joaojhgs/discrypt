@@ -17090,6 +17090,39 @@ fn default_adapter_endpoint(kind: &InviteSignalingAdapterKind) -> Option<String>
     }
 }
 
+fn split_configured_endpoints(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn default_adapter_endpoints(kind: &InviteSignalingAdapterKind) -> Vec<String> {
+    match kind {
+        InviteSignalingAdapterKind::Nostr => std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS")
+            .ok()
+            .map(|endpoints| split_configured_endpoints(&endpoints))
+            .filter(|endpoints| !endpoints.is_empty())
+            .or_else(|| {
+                std::env::var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT")
+                    .ok()
+                    .map(|endpoint| split_configured_endpoints(&endpoint))
+                    .filter(|endpoints| !endpoints.is_empty())
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "wss://relay.damus.io".to_owned(),
+                    "wss://nos.lol".to_owned(),
+                ]
+            }),
+        _ => default_adapter_endpoint(kind)
+            .map(|endpoint| vec![endpoint])
+            .unwrap_or_default(),
+    }
+}
+
 fn default_ice_stun_servers() -> Vec<String> {
     vec!["stun:stun.l.google.com:19302".to_owned()]
 }
@@ -17104,16 +17137,26 @@ fn signaling_profile_for_endpoint(
     endpoint: String,
     profile_suffix: &str,
 ) -> SignalingProfileView {
+    signaling_profile_for_endpoints(scope_commitment, kind, vec![endpoint], profile_suffix)
+}
+
+fn signaling_profile_for_endpoints(
+    scope_commitment: &str,
+    kind: InviteSignalingAdapterKind,
+    endpoints: Vec<String>,
+    profile_suffix: &str,
+) -> SignalingProfileView {
     let adapter_kind = profile_kind_name(&kind);
+    let primary_endpoint = endpoints.first().cloned().unwrap_or_default();
     SignalingProfileView {
         profile_id: format!("{adapter_kind}-{profile_suffix}"),
         adapter_kind: adapter_kind.clone(),
-        endpoints: vec![endpoint.clone()],
+        endpoints: endpoints.clone(),
         room_topic_commitment: hash_commitment(
             "discrypt-rendezvous-topic-commitment-v1",
             &[scope_commitment, &adapter_kind],
         ),
-        trust_fingerprint: signaling_fingerprint_for_endpoint(&endpoint),
+        trust_fingerprint: signaling_fingerprint_for_endpoint(&primary_endpoint),
         ttl_seconds: 300,
         metadata_posture: "hashed_topic".to_owned(),
         rate_limit_policy: "bounded publish/take with provider backoff".to_owned(),
@@ -17123,10 +17166,10 @@ fn signaling_profile_for_endpoint(
         backoff_multiplier: DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
         backoff_max_attempts: DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
         provider_policy_version: INVITE_PROVIDER_POLICY_VERSION,
-        endpoint_allowlist_commitments: vec![endpoint_allowlist_commitment(
-            &adapter_kind,
-            &endpoint,
-        )],
+        endpoint_allowlist_commitments: endpoints
+            .iter()
+            .map(|endpoint| endpoint_allowlist_commitment(&adapter_kind, endpoint))
+            .collect(),
         provider_rotation_policy: default_provider_rotation_policy(),
         capabilities: vec![
             "presence_ttl".to_owned(),
@@ -17145,11 +17188,14 @@ fn default_signaling_profiles(scope_commitment: &str) -> Vec<SignalingProfileVie
     ]
     .into_iter()
     .filter_map(|kind| {
-        let endpoint = default_adapter_endpoint(&kind)?;
-        Some(signaling_profile_for_endpoint(
+        let endpoints = default_adapter_endpoints(&kind);
+        if endpoints.is_empty() {
+            return None;
+        }
+        Some(signaling_profile_for_endpoints(
             scope_commitment,
             kind,
-            endpoint,
+            endpoints,
             "default",
         ))
     })
@@ -33533,6 +33579,8 @@ mod tests {
         let _guard = test_lock();
         std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
+        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
+        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
 
         let profiles = default_signaling_profiles("configured-defaults-only");
         let kinds = profiles
@@ -33541,6 +33589,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(kinds, vec!["nostr", "mqtt"]);
+        let nostr = profiles
+            .iter()
+            .find(|profile| profile.adapter_kind == "nostr")
+            .expect("nostr default profile");
+        assert_eq!(
+            nostr.endpoints,
+            vec![
+                "wss://relay.damus.io".to_owned(),
+                "wss://nos.lol".to_owned(),
+            ]
+        );
         assert!(profiles.iter().all(|profile| {
             profile
                 .endpoints
@@ -33554,6 +33613,10 @@ mod tests {
         let _guard = test_lock();
         std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
+        std::env::set_var(
+            "DISCRYPT_DEFAULT_NOSTR_ENDPOINTS",
+            " wss://relay.damus.io, wss://nos.lol ",
+        );
 
         let profiles = default_signaling_profiles("allowlist-scope");
         assert!(!profiles.is_empty());
@@ -33578,10 +33641,13 @@ mod tests {
             .into_iter()
             .find(|profile| profile.adapter_kind == "nostr")
             .expect("nostr default profile");
+        assert_eq!(tampered.endpoints.len(), 2);
+        assert_eq!(tampered.endpoint_allowlist_commitments.len(), 2);
         tampered.endpoints = vec!["wss://relay.example.com".to_owned()];
         let error = transport_profile_from_view(&tampered)
             .expect_err("tampered endpoint must not pass signed allowlist validation");
         assert!(error.contains("signed allowlist"));
+        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
     }
 
     #[test]
