@@ -19,6 +19,7 @@ import {
   GroupAdmissionRequestView,
   GroupGovernanceLogEntryView,
   GroupMemberView,
+  GroupRuntimePeerView,
   GroupRoleView,
   GroupView,
   InviteView,
@@ -29,6 +30,7 @@ import {
   TextStateView,
   TransportDiagnosticsView,
   TransportStatusView,
+  PeerRouteEvidenceView,
   VoiceMediaRuntimeView,
   VoiceParticipantView,
   VoiceRemoteAudioView,
@@ -955,6 +957,71 @@ function turnRequiredCopy(
     return `TURN-required state: ${turnState}; configured TURN endpoints have no declared credentials, so relay use remains blocked until backend proves credentialed relay success.`;
   }
   return `TURN-required state: ${turnState}; ${credentialed} credentialed redacted TURN endpoint${credentialed === 1 ? "" : "s"} can be tried, but success still requires backend route proof.`;
+}
+
+type PeerRouteKind = "direct" | "turn" | "relay" | "failed";
+
+const peerRouteLabels: Record<PeerRouteKind, string> = {
+  direct: "direct",
+  turn: "TURN",
+  relay: "relay",
+  failed: "failed",
+};
+
+function normalizedPeerRouteKind(
+  evidence: PeerRouteEvidenceView | null | undefined,
+): PeerRouteKind | null {
+  if (!evidence) return null;
+  const tokens = [
+    evidence.route_kind,
+    evidence.route,
+    evidence.route_label,
+    evidence.route_status,
+    evidence.status,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "_"));
+  if (tokens.some((token) => /(^|_)(failed|failure|blocked|unavailable)($|_)/.test(token))) {
+    return "failed";
+  }
+  if (tokens.some((token) => /(^|_)turn(_|$)/.test(token))) return "turn";
+  if (tokens.some((token) => /(^|_)(relay|overlay|peer_relay)($|_)/.test(token))) {
+    return "relay";
+  }
+  if (tokens.some((token) => /(^|_)(direct|stun|webrtc_direct)($|_)/.test(token))) {
+    return "direct";
+  }
+  return null;
+}
+
+function peerRouteCopy(evidence: PeerRouteEvidenceView | null | undefined): string {
+  const route = normalizedPeerRouteKind(evidence);
+  return route ? `route: ${peerRouteLabels[route]}` : "route: no route proof";
+}
+
+function routeEvidenceFromRuntimePeer(
+  member: GroupMemberView,
+  peers: GroupRuntimePeerView[],
+): PeerRouteEvidenceView | null {
+  const matchedPeer = peers.find((peer) => {
+    if (peer.member_id && peer.member_id === member.member_id) return true;
+    if (peer.device_id && member.device_id && peer.device_id === member.device_id) {
+      return true;
+    }
+    return false;
+  });
+  return matchedPeer?.route_evidence ?? null;
+}
+
+function routeEvidenceForMember(
+  member: GroupMemberView,
+  group: GroupView | null,
+): PeerRouteEvidenceView | null {
+  return (
+    member.route_evidence ??
+    routeEvidenceFromRuntimePeer(member, group?.runtime_peers ?? []) ??
+    null
+  );
 }
 
 function Icon({
@@ -5999,6 +6066,7 @@ function MemberPanel({
               title={section.title}
               emptyCopy={section.emptyCopy}
               members={section.members}
+              group={group}
               onContextMenu={setMenu}
             />
           ))}
@@ -6021,11 +6089,13 @@ function MemberSection({
   title,
   emptyCopy,
   members,
+  group,
   onContextMenu,
 }: {
   title: string;
   emptyCopy: string;
   members: GroupMemberView[];
+  group: GroupView | null;
   onContextMenu: (menu: {
     member: GroupMemberView;
     x: number;
@@ -6049,6 +6119,7 @@ function MemberSection({
           <MemberRow
             key={member.member_id}
             member={member}
+            group={group}
             onContextMenu={onContextMenu}
           />
         ))
@@ -6059,9 +6130,11 @@ function MemberSection({
 
 function MemberRow({
   member,
+  group,
   onContextMenu,
 }: {
   member: GroupMemberView;
+  group: GroupView | null;
   onContextMenu: (menu: {
     member: GroupMemberView;
     x: number;
@@ -6069,6 +6142,7 @@ function MemberRow({
   }) => void;
 }) {
   const status = memberDisplayStatus(member);
+  const routeCopy = peerRouteCopy(routeEvidenceForMember(member, group));
   return (
     <div
       className="group flex min-w-0 items-center gap-3 rounded-xl px-2 py-2 text-sm hover:bg-[hsl(var(--accent)/0.58)]"
@@ -6093,6 +6167,9 @@ function MemberRow({
         <p className="truncate font-medium">{member.display_name}</p>
         <p className="truncate text-[11px] text-[hsl(var(--muted-foreground))]">
           {member.role} · {status}
+        </p>
+        <p className="truncate text-[11px] text-[hsl(var(--muted-foreground))]">
+          {routeCopy}
         </p>
       </div>
       <span

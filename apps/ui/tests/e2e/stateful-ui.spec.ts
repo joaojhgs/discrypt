@@ -865,6 +865,103 @@ test("group invite join text channel and voice controls work without fake member
   expect(errors).toEqual([]);
 });
 
+test("member panel renders only backend-provided per-peer route evidence", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Route State Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
+
+  await page.evaluate((storageKey) => {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) throw new Error("missing fallback app state");
+    const state = JSON.parse(raw);
+    const group = state.groups.find((candidate) => candidate.name === "Route State Lab");
+    if (!group) throw new Error("missing route state group");
+    const now = new Date(Date.now() + 60_000).toISOString();
+    group.members = [
+      {
+        ...group.members[0],
+        display_name: "Dina Direct",
+        route_evidence: {
+          route_kind: "direct",
+          evidence_source: "backend_route_graph",
+        },
+      },
+      {
+        member_id: "turn-member",
+        display_name: "Tara TURN",
+        device_id: "turn-device",
+        role: "member",
+        status: "online",
+        joined_at: now,
+        presence_expires_at: now,
+        route_evidence: {
+          route_kind: "turn",
+          evidence_source: "backend_route_graph",
+        },
+      },
+      {
+        member_id: "relay-member",
+        display_name: "Rafi Relay",
+        device_id: "relay-device",
+        role: "member",
+        status: "online",
+        joined_at: now,
+        presence_expires_at: now,
+        route_evidence: {
+          route_kind: "relay",
+          evidence_source: "backend_overlay_route_selection",
+        },
+      },
+      {
+        member_id: "failed-member",
+        display_name: "Faye Failed",
+        device_id: "failed-device",
+        role: "member",
+        status: "online",
+        joined_at: now,
+        presence_expires_at: now,
+        route_evidence: {
+          route_kind: "failed",
+          evidence_source: "backend_route_graph",
+        },
+      },
+      {
+        member_id: "unknown-member",
+        display_name: "Noah Unknown",
+        device_id: "unknown-device",
+        role: "member",
+        status: "online",
+        joined_at: now,
+        presence_expires_at: now,
+        route_evidence: {
+          route_kind: "provider_signaling",
+          evidence_source: "signaling_adapter_only",
+        },
+      },
+    ];
+    window.localStorage.setItem(storageKey, JSON.stringify(state));
+  }, "discrypt.local-dev.app-state.v1");
+
+  await page.reload();
+  const memberPanel = page.getByRole("complementary", { name: "Member panel" });
+  await expect(memberPanel.getByLabel("Dina Direct member")).toContainText("route: direct");
+  await expect(memberPanel.getByLabel("Tara TURN member")).toContainText("route: TURN");
+  await expect(memberPanel.getByLabel("Rafi Relay member")).toContainText("route: relay");
+  await expect(memberPanel.getByLabel("Faye Failed member")).toContainText("route: failed");
+  await expect(memberPanel.getByLabel("Noah Unknown member")).toContainText(
+    "route: no route proof",
+  );
+  await expect(memberPanel.getByLabel("Noah Unknown member")).not.toContainText(
+    "route: relay",
+  );
+});
+
 test("channel section plus controls create inline drafts and blur persists only valid names", async ({
   page,
 }) => {

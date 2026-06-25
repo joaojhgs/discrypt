@@ -228,6 +228,20 @@ export type GroupRuntimePeerView = {
   role: string;
   is_local: boolean;
   source: string;
+  member_id?: string | null;
+  device_id?: string | null;
+  route_evidence?: PeerRouteEvidenceView | null;
+};
+
+export type PeerRouteEvidenceView = {
+  route_kind?: string | null;
+  route?: string | null;
+  route_label?: string | null;
+  route_status?: string | null;
+  status?: string | null;
+  evidence_source?: string | null;
+  detail?: string | null;
+  updated_at?: string | null;
 };
 
 export type GroupRoleView = "owner" | "staff" | "member" | string;
@@ -249,6 +263,7 @@ export type GroupMemberView = {
   presence_expires_at?: string | null;
   revoked_at?: string | null;
   revoked_by?: string | null;
+  route_evidence?: PeerRouteEvidenceView | null;
 };
 
 export type GroupRolePolicyView = {
