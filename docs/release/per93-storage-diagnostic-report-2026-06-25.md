@@ -35,6 +35,8 @@ Commands run:
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `npm --prefix apps/ui ci`
 - `npm --prefix apps/ui run typecheck`
+- `npm --prefix apps/ui run build`
+- `npm --prefix apps/ui run test:production-copy`
 - `npm --prefix apps/ui run test:honesty`
 - `git diff --check`
 

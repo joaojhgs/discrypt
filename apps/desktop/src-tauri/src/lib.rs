@@ -34855,8 +34855,8 @@ mod tests {
             StorageSecurityView {
                 status: status.to_owned(),
                 mode: mode.to_owned(),
-                title: "Storage diagnostic fixture".to_owned(),
-                detail: "Fixture detail".to_owned(),
+                title: "Storage diagnostic injected failure".to_owned(),
+                detail: "Storage diagnostic injected failure context".to_owned(),
                 recovery_hint: "Preserve existing unreadable storage and retry with the original storage material.".to_owned(),
                 password_required: mode == "passphrase_vault",
                 keyring_available: false,
