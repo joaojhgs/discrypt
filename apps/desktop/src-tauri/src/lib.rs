@@ -178,6 +178,31 @@ pub struct StorageSecurityView {
     pub keyring_detail: String,
 }
 
+/// Redacted storage diagnostic report suitable for support bundles.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageDiagnosticReportView {
+    /// Stable report schema.
+    pub schema: String,
+    /// RFC3339 timestamp for support-bundle correlation.
+    pub timestamp: String,
+    /// Current storage security status.
+    pub status: String,
+    /// Current storage mode.
+    pub mode: String,
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Stable failure/success class.
+    pub failure_class: String,
+    /// True when Discrypt refused to create replacement storage over unreadable state.
+    pub fail_closed: bool,
+    /// Whether this build is using production storage boundaries.
+    pub production_storage: bool,
+    /// User-actionable recovery hint.
+    pub recovery_hint: String,
+    /// Redacted, low-cardinality context for support triage.
+    pub redacted_context: BTreeMap<String, String>,
+}
+
 /// Storage setup/unlock mode selected before account setup.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1093,6 +1118,9 @@ pub struct AppStateView {
     pub lifecycle: AppLifecycle,
     /// Local storage security setup/unlock state.
     pub storage_security: StorageSecurityView,
+    /// Redacted keyring/vault/storage diagnostic report.
+    #[serde(default)]
+    pub storage_diagnostic_report: Option<StorageDiagnosticReportView>,
     /// Local profile, if setup/recovery has completed.
     pub profile: Option<UserProfileView>,
     /// Persisted UI preferences.
@@ -4165,6 +4193,7 @@ pub fn export_diagnostics_log() -> String {
         "app_version": env!("CARGO_PKG_VERSION"),
         "lifecycle": &view.lifecycle,
         "storage_security": &view.storage_security,
+        "storage_diagnostic_report": &view.storage_diagnostic_report,
         "runtime_mode": &view.runtime_mode,
         "webrtc_env": {
             "ice_mode": std::env::var("DISCRYPT_WEBRTC_ICE_MODE").unwrap_or_else(|_| "default".to_owned()),
@@ -9980,10 +10009,14 @@ impl PersistedAppState {
     }
 
     fn to_view(&self) -> AppStateView {
+        let storage_security = storage_security_view(self.last_command_error.as_ref());
+        let storage_diagnostic_report =
+            storage_diagnostic_report_view(&storage_security, self.last_command_error.as_ref());
         AppStateView {
             schema_version: self.schema_version,
             lifecycle: self.lifecycle.clone(),
-            storage_security: storage_security_view(self.last_command_error.as_ref()),
+            storage_security,
+            storage_diagnostic_report: Some(storage_diagnostic_report),
             profile: self.profile.clone(),
             preferences: self.preferences.clone(),
             dms: self.dms.clone(),
@@ -14496,6 +14529,192 @@ fn command_error_log_entry(error: &CommandErrorView) -> CommandErrorLogEntry {
     }
 }
 
+fn storage_diagnostic_report_view(
+    storage: &StorageSecurityView,
+    last_error: Option<&CommandErrorView>,
+) -> StorageDiagnosticReportView {
+    let classification = classify_storage_diagnostic(storage, last_error);
+    let mut context = BTreeMap::new();
+    context.insert("component".to_owned(), "storage".to_owned());
+    context.insert("storage_status".to_owned(), storage.status.clone());
+    context.insert("storage_mode".to_owned(), storage.mode.clone());
+    context.insert(
+        "production_storage".to_owned(),
+        cfg!(all(target_os = "linux", feature = "production-storage")).to_string(),
+    );
+    context.insert(
+        "keyring_preflight".to_owned(),
+        if storage.keyring_available {
+            "available"
+        } else {
+            "attention_required"
+        }
+        .to_owned(),
+    );
+    context.insert(
+        "keyring_detail_ref".to_owned(),
+        redacted_observable_ref("keyring_detail", &storage.keyring_detail),
+    );
+    if let Some(error) = last_error {
+        context.insert("source_command".to_owned(), error.command.clone());
+        context.insert("source_code".to_owned(), error.code.clone());
+        context.insert("source_timestamp".to_owned(), error.timestamp.clone());
+        context.extend(
+            error
+                .redacted_context
+                .iter()
+                .map(|(key, value)| (format!("source_{key}"), value.clone())),
+        );
+    }
+
+    StorageDiagnosticReportView {
+        schema: "discrypt.storage_diagnostic.v1".to_owned(),
+        timestamp: last_error
+            .map(|error| error.timestamp.clone())
+            .unwrap_or_else(default_command_error_timestamp),
+        status: storage.status.clone(),
+        mode: storage.mode.clone(),
+        code: classification.code,
+        failure_class: classification.failure_class,
+        fail_closed: classification.fail_closed,
+        production_storage: cfg!(all(target_os = "linux", feature = "production-storage")),
+        recovery_hint: redact_sensitive_observable_copy(classification.recovery_hint),
+        redacted_context: redact_command_error_context(context),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageDiagnosticClassification {
+    code: String,
+    failure_class: String,
+    fail_closed: bool,
+    recovery_hint: String,
+}
+
+fn classify_storage_diagnostic(
+    storage: &StorageSecurityView,
+    last_error: Option<&CommandErrorView>,
+) -> StorageDiagnosticClassification {
+    let Some(error) = last_error
+        .filter(|error| error.command == "app_persistence" || error.command == "storage_security")
+    else {
+        let class = if storage.mode == "development_store" {
+            "development_storage"
+        } else if storage.status == "ready" {
+            "storage_ready"
+        } else if storage.status == "locked" {
+            "password_vault_locked"
+        } else {
+            "storage_setup_required"
+        };
+        return StorageDiagnosticClassification {
+            code: storage_diagnostic_code(class),
+            failure_class: class.to_owned(),
+            fail_closed: storage.status != "ready",
+            recovery_hint: storage.recovery_hint.clone(),
+        };
+    };
+
+    let combined =
+        format!("{} {} {}", error.code, error.message, error.recovery_hint).to_ascii_lowercase();
+    let mode = storage.mode.as_str();
+    let failure_class = if combined.contains("schema_future") || combined.contains("newer") {
+        "schema_future"
+    } else if combined.contains("schema_invalid")
+        || combined.contains("schema_version")
+        || combined.contains("unsupported app db schema")
+    {
+        "schema_invalid"
+    } else if combined.contains("decode")
+        || combined.contains("serde")
+        || combined.contains("serialization")
+        || combined.contains("could not be decoded")
+    {
+        "app_state_decode_failed"
+    } else if combined.contains("quarantine")
+        || combined.contains("preserve")
+        || combined.contains("mode_switch_preserve")
+    {
+        "storage_preserve_failed"
+    } else if combined.contains("password_too_short") {
+        "password_policy_rejected"
+    } else if combined.contains("storage_security_unlock_failed")
+        || combined.contains("vault unlock failed")
+        || (mode == "passphrase_vault"
+            && (combined.contains("decryption failed")
+                || combined.contains("unlock_failed")
+                || combined.contains("wrong password")))
+    {
+        "password_vault_unlock_failed"
+    } else if mode == "passphrase_vault"
+        && (combined.contains("unsupported discrypt vault")
+            || combined.contains("vault format")
+            || combined.contains("vault kdf"))
+    {
+        "password_vault_corrupt"
+    } else if combined.contains("keychain key missing")
+        || combined.contains("no wrapping key")
+        || combined.contains("keychainmissing")
+        || combined.contains("noentry")
+        || combined.contains("no entry")
+        || combined.contains("missing vault")
+    {
+        if mode == "passphrase_vault" {
+            "password_vault_missing_key"
+        } else {
+            "keyring_missing_key"
+        }
+    } else if combined.contains("denied") || combined.contains("permission") {
+        "keyring_access_denied"
+    } else if combined.contains("keyring")
+        || combined.contains("keychain")
+        || combined.contains("secret service")
+        || combined.contains("kwallet")
+        || combined.contains("gnome")
+    {
+        "keyring_unavailable"
+    } else if combined.contains("config") {
+        "storage_config_failed"
+    } else {
+        "storage_error"
+    };
+
+    StorageDiagnosticClassification {
+        code: storage_diagnostic_code(failure_class),
+        failure_class: failure_class.to_owned(),
+        fail_closed: true,
+        recovery_hint: storage_diagnostic_recovery_hint(failure_class, &error.recovery_hint),
+    }
+}
+
+fn storage_diagnostic_code(failure_class: &str) -> String {
+    if failure_class.starts_with("storage_") {
+        failure_class.to_owned()
+    } else {
+        format!("storage_{failure_class}")
+    }
+}
+
+fn storage_diagnostic_recovery_hint(failure_class: &str, source_hint: &str) -> String {
+    if !source_hint.trim().is_empty() && sensitive_observable_classes(source_hint).is_empty() {
+        return source_hint.to_owned();
+    }
+    match failure_class {
+        "keyring_missing_key" => "Use the same desktop keyring session and original Discrypt data directory; Discrypt preserved the encrypted store and will not create replacement key material over it.",
+        "keyring_access_denied" => "Unlock or allow the desktop keyring prompt, then retry. Discrypt preserved the encrypted store and did not write replacement state.",
+        "keyring_unavailable" => "Start the desktop Secret Service or KWallet provider, then retry from the same profile directory.",
+        "password_vault_unlock_failed" => "Re-enter the same Discrypt storage password used for this profile. Discrypt preserved the encrypted store and did not create replacement vault material.",
+        "password_vault_corrupt" => "Keep the existing vault and profile files for recovery; retry only with the original files and password.",
+        "password_vault_missing_key" => "Restore the original vault file next to this profile before retrying; Discrypt will not generate replacement key material over existing encrypted state.",
+        "schema_future" => "Open this profile with a newer compatible Discrypt build; this build will not downgrade or overwrite the store.",
+        "schema_invalid" | "app_state_decode_failed" => "Keep the existing store for recovery or quarantine analysis; Discrypt did not treat it as a first-run profile.",
+        "storage_preserve_failed" => "Fix filesystem permissions or disk availability so Discrypt can preserve the existing store before changing storage mode.",
+        "storage_config_failed" => "Fix the storage security config file before creating or unlocking an account.",
+        _ => "Preserve the existing Discrypt data directory, retry with the original storage material, and do not create a replacement profile over unreadable storage.",
+    }
+    .to_owned()
+}
+
 fn structured_command_error_log_line(error: &CommandErrorView) -> String {
     serde_json::to_string(&command_error_log_entry(error)).unwrap_or_else(|json_error| {
         format!(
@@ -14541,6 +14760,7 @@ fn sensitive_observable_classes(value: &str) -> Vec<&'static str> {
         ("refresh token", "auth_token"),
         ("vault passphrase", "vault_secret"),
         ("vault password", "vault_secret"),
+        ("profile name", "profile_name"),
         ("private key", "private_key"),
         ("secret key", "private_key"),
         ("room-secret:", "room_seed"),
@@ -34612,6 +34832,205 @@ mod tests {
             assert!(
                 !diagnostics.contains(forbidden_value),
                 "diagnostics artifact leaked {forbidden_value}: {diagnostics}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn storage_diagnostic_report_classifies_keyring_vault_and_schema_failures() -> Result<(), String>
+    {
+        fn storage_view(mode: &str, status: &str) -> StorageSecurityView {
+            StorageSecurityView {
+                status: status.to_owned(),
+                mode: mode.to_owned(),
+                title: "Storage diagnostic fixture".to_owned(),
+                detail: "Fixture detail".to_owned(),
+                recovery_hint: "Preserve existing unreadable storage and retry with the original storage material.".to_owned(),
+                password_required: mode == "passphrase_vault",
+                keyring_available: false,
+                keyring_detail: "KWallet prompt at /home/alice/.local/share/discrypt/profile-name Alice".to_owned(),
+            }
+        }
+
+        let cases = [
+            (
+                "keyring",
+                "state_save_failed",
+                "app store keychain key missing: local-appdb-wrapping-key-v1",
+                "keyring_missing_key",
+                "storage_keyring_missing_key",
+            ),
+            (
+                "keyring",
+                "state_load_failed",
+                "KWallet keyring denied permission to read the Discrypt entry",
+                "keyring_access_denied",
+                "storage_keyring_access_denied",
+            ),
+            (
+                "keyring",
+                "state_load_failed",
+                "Secret Service keyring unavailable while reading Discrypt storage",
+                "keyring_unavailable",
+                "storage_keyring_unavailable",
+            ),
+            (
+                "keyring",
+                "state_load_failed",
+                "invalid OS keychain wrapping key encoding",
+                "keyring_unavailable",
+                "storage_keyring_unavailable",
+            ),
+            (
+                "passphrase_vault",
+                "state_load_failed",
+                "app db decryption failed",
+                "password_vault_unlock_failed",
+                "storage_password_vault_unlock_failed",
+            ),
+            (
+                "passphrase_vault",
+                "state_load_failed",
+                "unsupported Discrypt vault format",
+                "password_vault_corrupt",
+                "storage_password_vault_corrupt",
+            ),
+            (
+                "keyring",
+                "state_decode_failed",
+                "Stored app state could not be decoded: app store serialization error",
+                "app_state_decode_failed",
+                "storage_app_state_decode_failed",
+            ),
+            (
+                "keyring",
+                "state_schema_future",
+                "Stored app state schema version 99 is newer than supported version 1",
+                "schema_future",
+                "storage_schema_future",
+            ),
+            (
+                "keyring",
+                "storage_security_mode_switch_preserve_failed",
+                "could not preserve existing production store before storage-mode switch",
+                "storage_preserve_failed",
+                "storage_preserve_failed",
+            ),
+        ];
+
+        for (mode, source_code, message, expected_class, expected_code) in cases {
+            let error = command_error_view(
+                "app_persistence",
+                source_code,
+                message,
+                "Preserve existing unreadable storage; retry with original vault password and do not create a replacement profile.",
+                BTreeMap::new(),
+            );
+            let report = storage_diagnostic_report_view(&storage_view(mode, "error"), Some(&error));
+            DateTime::parse_from_rfc3339(&report.timestamp).map_err(|err| err.to_string())?;
+            assert_eq!(report.schema, "discrypt.storage_diagnostic.v1");
+            assert_eq!(report.failure_class, expected_class);
+            assert_eq!(report.code, expected_code);
+            assert_eq!(report.mode, mode);
+            assert!(report.fail_closed);
+            assert!(
+                report
+                    .redacted_context
+                    .get("keyring_detail_ref")
+                    .is_some_and(|value| value.starts_with("keyring_detail_ref=")),
+                "raw keyring detail must be converted to a ref: {report:?}"
+            );
+            let report_json = serde_json::to_string(&report).map_err(|err| err.to_string())?;
+            for forbidden in [
+                "per93-vault",
+                "profile name Alice",
+                "/home/alice",
+                "local-appdb-wrapping-key-v1",
+            ] {
+                assert!(
+                    !report_json.contains(forbidden),
+                    "storage diagnostic leaked {forbidden}: {report_json}"
+                );
+            }
+        }
+
+        let dev_report =
+            storage_diagnostic_report_view(&storage_view("development_store", "ready"), None);
+        assert_eq!(dev_report.failure_class, "development_storage");
+        assert_eq!(dev_report.code, "storage_development_storage");
+        assert!(!dev_report.fail_closed);
+        assert!(!dev_report.production_storage);
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_diagnostic_report_reaches_support_bundle_without_secrets() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("storage-diagnostic-report");
+
+        let mut context = BTreeMap::new();
+        context.insert(
+            "vault".to_owned(),
+            "vault passphrase per93-support-vault".to_owned(),
+        );
+        context.insert(
+            "provider".to_owned(),
+            "provider credential per93-provider".to_owned(),
+        );
+        let error = command_error_view(
+            "storage_security",
+            "storage_security_unlock_failed",
+            "Password vault unlock failed: app db decryption failed for profile name Alice",
+            "Retry with the original vault password; do not create replacement storage over the existing profile.",
+            context,
+        );
+        mutate_app_service(|state| {
+            state.last_command_error = Some(error);
+        });
+
+        let view = app_state();
+        let report = view
+            .storage_diagnostic_report
+            .as_ref()
+            .ok_or_else(|| "storage_diagnostic_report missing from app state".to_owned())?;
+        assert_eq!(report.schema, "discrypt.storage_diagnostic.v1");
+        assert_eq!(report.failure_class, "password_vault_unlock_failed");
+        assert_eq!(report.code, "storage_password_vault_unlock_failed");
+        assert!(report.fail_closed);
+
+        let diagnostics = export_diagnostics_log();
+        let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("target/per93-storage-diagnostic-report");
+        std::fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
+        let artifact = artifact_dir.join("diagnostics-log.json");
+        std::fs::write(&artifact, &diagnostics).map_err(|err| err.to_string())?;
+        let diagnostics_json: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|err| err.to_string())?;
+        assert_eq!(
+            diagnostics_json["storage_diagnostic_report"]["schema"],
+            "discrypt.storage_diagnostic.v1"
+        );
+        assert_eq!(
+            diagnostics_json["storage_diagnostic_report"]["failure_class"],
+            "password_vault_unlock_failed"
+        );
+        assert_eq!(
+            diagnostics_json["storage_diagnostic_report"]["fail_closed"],
+            true
+        );
+
+        for forbidden in [
+            "per93-support-vault",
+            "per93-provider",
+            "profile name Alice",
+            "original vault password",
+        ] {
+            assert!(
+                !diagnostics.contains(forbidden),
+                "storage support bundle leaked {forbidden}: {diagnostics}"
             );
         }
         Ok(())

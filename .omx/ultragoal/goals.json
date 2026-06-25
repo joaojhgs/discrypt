@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T22:31:09.025Z",
+  "updatedAt": "2026-06-25T23:13:47.325Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -413,6 +413,17 @@
       "updatedAt": "2026-06-25T22:31:09.025Z",
       "evidence": "PER-92 local implementation complete: added IceDtlsProviderReport classifier/export, Tauri diagnostics support-bundle surface, synthetic report tests, plan and release evidence docs. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport ice_dtls_provider_report; RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml turn_needed_fail_closed_probe_marks_failed_without_delivery_claim --lib -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; git diff --check. Evidence is local synthetic backend/transport diagnostics evidence, not production installed-app/split-machine proof.",
       "completedAt": "2026-06-25T22:31:09.025Z"
+    },
+    {
+      "id": "G039-per-93-p11-t04-storage-diagnostic-re",
+      "title": "PER-93 P11-T04 storage diagnostic report",
+      "objective": "Implement PER-93/P11-T04 storage diagnostic report using .omx/plans/P11-T04-storage-diagnostic-report-2026-06-25.md: add redacted stable keyring/vault/storage failure diagnostics, support-bundle evidence, deterministic failure tests, and release evidence while preserving unreadable state and production-vs-dev storage boundaries.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T23:02:05.652Z",
+      "updatedAt": "2026-06-25T23:13:47.325Z",
+      "evidence": "G039-per-93-p11-t04-storage-diagnostic-re complete using .omx/ultragoal/goals.json and .omx/ultragoal/ledger.jsonl. PER-93 local implementation complete on branch multica/P11-T04-storage-diagnostic-report, commit b16045d, draft PR https://github.com/joaojhgs/discrypt/pull/93. Added storage_diagnostic_report to app state/support bundle with stable redacted keyring/vault/schema/preserve diagnostics, deterministic tests, plan and release evidence docs, and QA handoff comment. Verification passed: desktop storage_diagnostic_report tests, discrypt-storage appdb tests, cargo fmt --check, npm UI typecheck, git diff --check. Evidence is deterministic local backend diagnostics, not live KDE/KWallet installed-app proof.",
+      "completedAt": "2026-06-25T23:13:47.325Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."

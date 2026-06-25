@@ -623,8 +623,10 @@ export type AppEventView = {
 export type CommandErrorView = {
   code: string;
   command: string;
+  timestamp?: string;
   message: string;
   recovery_hint: string;
+  redacted_context?: Record<string, string>;
 };
 
 export type PollAppEventsRequest = {
@@ -645,6 +647,7 @@ export type AppState = {
   schema_version: number;
   lifecycle: AppLifecycle;
   storage_security: StorageSecurityView;
+  storage_diagnostic_report: StorageDiagnosticReportView | null;
   profile: UserProfileView | null;
   preferences: PreferencesView;
   dms: DirectConversationView[];
@@ -690,6 +693,19 @@ export type StorageSecurityView = {
   password_required: boolean;
   keyring_available: boolean;
   keyring_detail: string;
+};
+
+export type StorageDiagnosticReportView = {
+  schema: string;
+  timestamp: string;
+  status: string;
+  mode: string;
+  code: string;
+  failure_class: string;
+  fail_closed: boolean;
+  production_storage: boolean;
+  recovery_hint: string;
+  redacted_context: Record<string, string>;
 };
 
 export type ConfigureStorageSecurityRequest = {
@@ -1358,6 +1374,23 @@ const fallbackState: AppState = {
     password_required: false,
     keyring_available: true,
     keyring_detail: "Development builds do not require OS-keyring preflight.",
+  },
+  storage_diagnostic_report: {
+    schema: "discrypt.storage_diagnostic.v1",
+    timestamp: new Date(0).toISOString(),
+    status: "ready",
+    mode: "development_store",
+    code: "storage_development_storage",
+    failure_class: "development_storage",
+    fail_closed: false,
+    production_storage: false,
+    recovery_hint:
+      "Run the packaged Tauri app to configure production keyring or password-vault storage.",
+    redacted_context: {
+      component: "storage",
+      storage_mode: "development_store",
+      production_storage: "false",
+    },
   },
   profile: null,
   preferences: fallbackSnapshot.preferences,
@@ -3466,6 +3499,7 @@ export async function exportDiagnosticsLog(): Promise<string> {
         },
         lifecycle: state.lifecycle,
         storage_security: state.storage_security,
+        storage_diagnostic_report: state.storage_diagnostic_report,
         runtime_mode: state.runtime_mode,
         active_context: state.active_context,
         transport_status: state.transport_status,
