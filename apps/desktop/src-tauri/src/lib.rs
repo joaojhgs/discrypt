@@ -33655,7 +33655,7 @@ mod tests {
         let _guard = test_lock();
         std::env::set_var(
             "DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS",
-            "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+            "/dnsaddr/bootstrap.libp2p.io",
         );
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
         std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
