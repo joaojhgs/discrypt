@@ -405,6 +405,113 @@ impl PeerOverlayRelayAuthoritySet {
     }
 }
 
+/// Post-revocation overlay state supplied by backend/OpenMLS/governance evidence.
+///
+/// The state is intentionally local-model only: it binds the current admitted
+/// set and relay authority to the post-revocation epoch so callers can validate
+/// overlay frames before route reuse or forwarding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRevocationState {
+    /// Current post-revocation admitted peer set.
+    pub admitted: PeerOverlayAdmittedSet,
+    /// Current post-revocation relay authority set.
+    pub relay_authority: PeerOverlayRelayAuthoritySet,
+    /// Revoked refs from prior epochs that must not send, receive, or relay.
+    pub revoked_peers: Vec<PeerOverlayPeerRef>,
+}
+
+impl PeerOverlayRevocationState {
+    /// Validate a frame against the post-revocation epoch and relay authority.
+    pub fn validate_frame_after_revocation(
+        &self,
+        frame: &PeerOverlayFrame,
+    ) -> Result<Vec<PeerOverlayRelayAuthorization>, TransportError> {
+        frame.validate_relay_authorized(&self.admitted, &self.relay_authority)
+    }
+}
+
+/// Inputs for constructing a post-revocation overlay validation state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRevocationInput {
+    /// Authority source that produced the post-revocation relay set.
+    pub source: PeerOverlayRelayAuthoritySource,
+    /// Current post-revocation group epoch.
+    pub current_epoch: u64,
+    /// Commitment to the current OpenMLS group id.
+    pub group_id_commitment: [u8; 32],
+    /// Commitment to the current OpenMLS confirmation tag.
+    pub confirmation_tag_commitment: [u8; 32],
+    /// Remaining admitted refs at the current post-revocation epoch.
+    pub remaining_admitted: Vec<PeerOverlayPeerRef>,
+    /// Revoked refs from prior epochs.
+    pub revoked_peers: Vec<PeerOverlayPeerRef>,
+    /// Remaining admitted refs explicitly authorized as relays.
+    pub authorized_relays: Vec<PeerOverlayPeerRef>,
+}
+
+/// Build a post-revocation overlay state from already verified backend evidence.
+pub fn build_peer_overlay_revocation_state(
+    input: PeerOverlayRevocationInput,
+) -> Result<PeerOverlayRevocationState, TransportError> {
+    input.source.validate()?;
+    validate_nonzero_32(
+        input.group_id_commitment,
+        "peer overlay revocation group id commitment",
+    )?;
+    validate_nonzero_32(
+        input.confirmation_tag_commitment,
+        "peer overlay revocation confirmation commitment",
+    )?;
+    if input.revoked_peers.is_empty() {
+        return Err(overlay_policy_error(
+            "peer overlay revocation requires at least one revoked peer",
+        ));
+    }
+
+    let mut revoked_ids = BTreeSet::new();
+    let mut revoked_bindings = BTreeSet::new();
+    for revoked in &input.revoked_peers {
+        revoked.validate_shape()?;
+        if revoked.epoch >= input.current_epoch {
+            return Err(overlay_policy_error(
+                "peer overlay revocation epoch must advance beyond revoked refs",
+            ));
+        }
+        revoked_ids.insert(revoked.peer_id.clone());
+        revoked_bindings.insert((revoked.member_id.clone(), revoked.device_id.clone()));
+    }
+
+    for admitted in &input.remaining_admitted {
+        if revoked_bindings.contains(&(admitted.member_id.clone(), admitted.device_id.clone())) {
+            return Err(overlay_policy_error(
+                "peer overlay post-revocation admitted set must not include revoked member/device bindings",
+            ));
+        }
+    }
+    for relay in &input.authorized_relays {
+        if revoked_bindings.contains(&(relay.member_id.clone(), relay.device_id.clone())) {
+            return Err(overlay_policy_error(
+                "peer overlay post-revocation relay authority must not include revoked member/device bindings",
+            ));
+        }
+    }
+
+    let admitted =
+        PeerOverlayAdmittedSet::new(input.current_epoch, input.remaining_admitted, revoked_ids)?;
+    let relay_authority = PeerOverlayRelayAuthoritySet::new(
+        input.source,
+        &admitted,
+        input.group_id_commitment,
+        input.confirmation_tag_commitment,
+        input.authorized_relays,
+    )?;
+    Ok(PeerOverlayRevocationState {
+        admitted,
+        relay_authority,
+        revoked_peers: input.revoked_peers,
+    })
+}
+
 /// Runtime/backend evidence used to rank one relay candidate.
 ///
 /// These diagnostics are intentionally content-blind. They describe transport
@@ -2001,6 +2108,63 @@ mod tests {
         ))
     }
 
+    fn frame_with_route(
+        source: PeerOverlayPeerRef,
+        relay_path: Vec<PeerOverlayPeerRef>,
+        destination: PeerOverlayPeerRef,
+        epoch: u64,
+    ) -> PeerOverlayFrame {
+        PeerOverlayFrame::new(
+            PeerOverlayCarrier::PeerAssistedOverlay,
+            PeerOverlayRoute {
+                source,
+                relay_path,
+                destination,
+                ttl: PeerOverlayTtl {
+                    remaining_hops: 2,
+                    created_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                },
+                loop_id: PeerOverlayLoopId([7; 16]),
+            },
+            auth(epoch),
+            PeerOverlayDelivery {
+                ack_id: PeerOverlayAckId([4; 16]),
+                ack_mode: PeerOverlayAckMode::AckRequired,
+                redelivery: PeerOverlayRedelivery {
+                    max_attempts: 3,
+                    max_relay_fanout: 2,
+                    deadline_ms: 1_800,
+                },
+            },
+            PeerOverlayOpaquePayload {
+                kind: PeerOverlayPayloadKind::TextControl,
+                key_id: b"kid-text".to_vec(),
+                sequence: 42,
+                aad_commitment: nonzero_32(5),
+                opaque_ciphertext: b"DCF1:sealed-ciphertext-only".to_vec(),
+            },
+        )
+    }
+
+    fn post_revocation_state(
+        current_epoch: u64,
+    ) -> Result<PeerOverlayRevocationState, TransportError> {
+        build_peer_overlay_revocation_state(PeerOverlayRevocationInput {
+            source: PeerOverlayRelayAuthoritySource::OpenMlsCurrentEpoch,
+            current_epoch,
+            group_id_commitment: nonzero_32(1),
+            confirmation_tag_commitment: nonzero_32(2),
+            remaining_admitted: vec![
+                peer(1, current_epoch)?,
+                peer(3, current_epoch)?,
+                peer(4, current_epoch)?,
+            ],
+            revoked_peers: vec![peer(2, current_epoch - 1)?],
+            authorized_relays: vec![peer(4, current_epoch)?],
+        })
+    }
+
     fn forwarding_policy() -> PeerOverlayForwardingPolicy {
         PeerOverlayForwardingPolicy {
             carrier: PeerOverlayCarrier::PeerAssistedOverlay,
@@ -2010,6 +2174,107 @@ mod tests {
                 b"sframe content key".to_vec(),
             ],
         }
+    }
+
+    #[test]
+    fn overlay_revocation_rejects_removed_source_destination_and_relay_current_epoch_frames(
+    ) -> Result<(), TransportError> {
+        let epoch = 10;
+        let revoked = peer(2, epoch)?;
+        let state = post_revocation_state(epoch)?;
+
+        let revoked_source = frame_with_route(
+            revoked.clone(),
+            vec![peer(4, epoch)?],
+            peer(3, epoch)?,
+            epoch,
+        );
+        assert!(state
+            .validate_frame_after_revocation(&revoked_source)
+            .is_err());
+
+        let revoked_destination = frame_with_route(
+            peer(1, epoch)?,
+            vec![peer(4, epoch)?],
+            revoked.clone(),
+            epoch,
+        );
+        assert!(state
+            .validate_frame_after_revocation(&revoked_destination)
+            .is_err());
+
+        let revoked_relay =
+            frame_with_route(peer(1, epoch)?, vec![revoked], peer(3, epoch)?, epoch);
+        assert!(state
+            .validate_frame_after_revocation(&revoked_relay)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_revocation_rejects_stale_pre_revocation_frame() -> Result<(), TransportError> {
+        let state = post_revocation_state(10)?;
+        let stale = frame(9)?;
+
+        assert!(state.validate_frame_after_revocation(&stale).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_revocation_preserves_remaining_member_opaque_forwarding(
+    ) -> Result<(), TransportError> {
+        let epoch = 10;
+        let state = post_revocation_state(epoch)?;
+        let frame = frame_with_route(
+            peer(1, epoch)?,
+            vec![peer(4, epoch)?],
+            peer(3, epoch)?,
+            epoch,
+        );
+
+        state.validate_frame_after_revocation(&frame)?;
+        let plan = build_peer_overlay_forwarding_plan(
+            &state.admitted,
+            &state.relay_authority,
+            &forwarding_policy(),
+            &frame,
+        )?;
+
+        assert_eq!(plan.hops.len(), 2);
+        assert_eq!(plan.hops[0].from, peer(1, epoch)?);
+        assert_eq!(plan.hops[0].to, peer(4, epoch)?);
+        assert_eq!(plan.hops[1].from, peer(4, epoch)?);
+        assert_eq!(plan.hops[1].to, peer(3, epoch)?);
+        assert!(!plan.provider_application_relay_used);
+        assert!(!plan.decrypt_path_exposed);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_revocation_state_rejects_stale_or_reintroduced_revoked_bindings(
+    ) -> Result<(), TransportError> {
+        let stale_revocation = build_peer_overlay_revocation_state(PeerOverlayRevocationInput {
+            source: PeerOverlayRelayAuthoritySource::OpenMlsCurrentEpoch,
+            current_epoch: 10,
+            group_id_commitment: nonzero_32(1),
+            confirmation_tag_commitment: nonzero_32(2),
+            remaining_admitted: vec![peer(1, 10)?, peer(3, 10)?],
+            revoked_peers: vec![peer(2, 10)?],
+            authorized_relays: vec![peer(3, 10)?],
+        });
+        assert!(stale_revocation.is_err());
+
+        let reintroduced = build_peer_overlay_revocation_state(PeerOverlayRevocationInput {
+            source: PeerOverlayRelayAuthoritySource::OpenMlsCurrentEpoch,
+            current_epoch: 10,
+            group_id_commitment: nonzero_32(1),
+            confirmation_tag_commitment: nonzero_32(2),
+            remaining_admitted: vec![peer(1, 10)?, peer(2, 10)?, peer(3, 10)?],
+            revoked_peers: vec![peer(2, 9)?],
+            authorized_relays: vec![peer(3, 10)?],
+        });
+        assert!(reintroduced.is_err());
+        Ok(())
     }
 
     #[test]
