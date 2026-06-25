@@ -15,13 +15,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Retention window presets.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RetentionWindow {
     /// One hour.
     Hours1,
     /// Twenty-four hours.
     Hours24,
     /// Seven days, the default.
+    #[default]
     Days7,
     /// Thirty days.
     Days30,
@@ -93,12 +94,6 @@ impl RetentionWindow {
                 .and_then(|seconds| seconds.parse::<u64>().ok())
                 .map(Self::CustomSeconds),
         }
-    }
-}
-
-impl Default for RetentionWindow {
-    fn default() -> Self {
-        Self::Days7
     }
 }
 
