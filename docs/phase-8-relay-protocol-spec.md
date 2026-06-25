@@ -169,6 +169,30 @@ PER-70 adds the local opaque forwarding boundary in
   `decrypt_path_exposed = false`; this is a local model assertion, not a
   production network proof.
 
+## Redelivery And Failover
+
+PER-71 adds a local redelivery/failover planner in
+`crates/transport/src/peer_overlay.rs`:
+
+- `plan_peer_overlay_redelivery_failover` validates the original protected
+  overlay frame, current admitted-peer state, explicit relay authority, ack
+  requirement, redelivery deadline, failed-relay evidence, and replay-window
+  attempt evidence before selecting a replacement route.
+- Failed relays are excluded from ranked relay candidates and relay-route
+  evidence before route selection. Replacement routes may be backend-proven
+  direct WebRTC, configured TURN-backed WebRTC, or a peer-assisted alternate
+  relay with fresh opaque forwarding hops.
+- The planner preserves the protected frame's ack id, loop id, sequence,
+  payload kind, and ciphertext/commitment bytes for redelivery evidence. It
+  does not decrypt or inspect payload contents beyond the existing
+  relay-visible audit marker checks.
+- Stale replay is rejected when the same ack/loop/sequence has already been
+  acknowledged or when the requested attempt number does not advance the replay
+  window.
+- Provider application relay remains forbidden. The returned evidence records
+  `provider_application_relay_used = false`; this is local Rust model evidence,
+  not live split-machine route proof.
+
 ## Out Of Scope
 
 The local Phase 8 model still does not implement:
@@ -188,6 +212,9 @@ after peer-assisted relay by explicit policy; and relay selection requires the
 top ranked authorized current-epoch relay plus two live non-provider route legs
 for source-to-relay and relay-to-destination. PER-70 adds local opaque
 forwarding envelopes for encrypted text/control and media frames. Production
-evidence will require later runtime tasks that open real peer routes, exercise
-split-machine delivery, prove fail-closed revocation under live group state,
-and preserve no-provider application relay under live adapters.
+PER-71 adds local redelivery/failover model evidence for killed-relay route
+replacement, protected-frame preservation, and stale replay rejection.
+Production evidence will require later runtime tasks that open real peer
+routes, exercise split-machine delivery, prove fail-closed revocation under
+live group state, and preserve no-provider application relay under live
+adapters.
