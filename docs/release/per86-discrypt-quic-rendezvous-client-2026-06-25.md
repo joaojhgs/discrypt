@@ -1,6 +1,7 @@
 # PER-86 Discrypt QUIC Rendezvous Client Evidence
 
-Issue: PER-86 / P10-T05  
+Issue: PER-86 / P10-T05
+
 Scope: `discrypt_quic_rendezvous` transport adapter behind
 `discrypt-quic-rendezvous-adapter`
 
