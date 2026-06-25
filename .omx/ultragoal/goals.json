@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T14:56:00.095Z",
+  "updatedAt": "2026-06-25T15:21:17.108Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -296,6 +296,17 @@
       "updatedAt": "2026-06-25T14:56:00.095Z",
       "evidence": "PER-80 multi-device identity implemented: OpenMLS member_labels backend evidence helper; two-device profile harness proves signed existing-device pairing, second device own OpenMLS leaf via Welcome, persisted reload, transparency events, remove/rekey exporter rotation, and removed-device post-removal commit denial. Verification passed: targeted PER-80 harness, full discrypt-mls-core tests, cargo fmt --check, clippy -p discrypt-mls-core, git diff --check.",
       "completedAt": "2026-06-25T14:56:00.095Z"
+    },
+    {
+      "id": "G028-per-81-p9-t07-backup-recovery",
+      "title": "PER-81 P9-T07 backup recovery",
+      "objective": "Implement and verify PER-81 backup/recovery: versioned account-continuity backup export/import, lost-password no-material fail-closed behavior, device-compromise rotation-required flow, persisted recovery metadata restart evidence, release docs, PR, and QA handoff without expanding into UI, transport, packaging, or release readiness.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T15:15:43.223Z",
+      "updatedAt": "2026-06-25T15:21:17.108Z",
+      "evidence": "PER-81/P9-T07 local storage implementation complete. Files: crates/storage/src/lib.rs, .omx/plans/P9-T07-backup-recovery-2026-06-25.md, docs/release/per81-backup-recovery-2026-06-25.md. Passed: targeted account_backup/lost_password/compromised_device_backup/malformed_backup storage tests; full discrypt-storage tests 43 passed plus doc tests; cargo fmt --check; cargo clippy -p discrypt-storage --lib -- -D warnings; git diff --check. Evidence is local Rust storage model evidence, not production split-machine/native UI recovery readiness.",
+      "completedAt": "2026-06-25T15:21:17.108Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
