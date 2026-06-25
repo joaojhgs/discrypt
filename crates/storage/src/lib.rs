@@ -85,6 +85,23 @@ pub enum AuthorLogError {
     },
 }
 
+/// Local decrypt failures for cached recipient ciphertext.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LocalDecryptError {
+    /// The message is not present in the local recipient cache.
+    #[error("cached message not found: {0}")]
+    Missing(String),
+    /// The message has a cooperative shred tombstone.
+    #[error("message content key has been shredded: {0}")]
+    Shredded(String),
+    /// The message key is retention-locked and requires authorized live-key flow.
+    #[error("message content key is retention locked: {0}")]
+    Locked(String),
+    /// The message has no usable local decrypt key.
+    #[error("message content key is unavailable: {0}")]
+    Unavailable(String),
+}
+
 /// Result of one author-log insert.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorLogAppendOutcome {
@@ -361,6 +378,38 @@ impl BoundedRecipientCache {
         self.entries.get(message_id)
     }
 
+    /// Mark one message as shredded and zeroize any cached content-key bytes.
+    pub fn shred(&mut self, message_id: &str) -> bool {
+        let Some(entry) = self.entries.get_mut(message_id) else {
+            return false;
+        };
+        if let KeyState::Cached(key) | KeyState::Decoy(key) = &mut entry.key_state {
+            key.zeroize();
+        }
+        entry.key_state = KeyState::Shredded;
+        true
+    }
+
+    /// Harness decrypt boundary: only cached keys may decrypt local ciphertext.
+    ///
+    /// This intentionally models the storage fail-closed contract rather than
+    /// production text crypto. Once a key is locked or shredded, callers cannot
+    /// get plaintext through this path.
+    pub fn decrypt_for_harness(&self, message_id: &str) -> Result<Vec<u8>, LocalDecryptError> {
+        let entry = self
+            .entries
+            .get(message_id)
+            .ok_or_else(|| LocalDecryptError::Missing(message_id.to_owned()))?;
+        match &entry.key_state {
+            KeyState::Cached(key) => Ok(xor_harness_ciphertext(&entry.ciphertext, key)),
+            KeyState::Shredded => Err(LocalDecryptError::Shredded(message_id.to_owned())),
+            KeyState::Locked => Err(LocalDecryptError::Locked(message_id.to_owned())),
+            KeyState::Decoy(_) | KeyState::RateLimited | KeyState::Unavailable => {
+                Err(LocalDecryptError::Unavailable(message_id.to_owned()))
+            }
+        }
+    }
+
     /// Cache size.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -380,6 +429,14 @@ impl BoundedRecipientCache {
     }
 }
 
+fn xor_harness_ciphertext(ciphertext: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    ciphertext
+        .iter()
+        .enumerate()
+        .map(|(idx, byte)| byte ^ key[idx % key.len()])
+        .collect()
+}
+
 impl Default for BoundedRecipientCache {
     fn default() -> Self {
         Self::new(256)
@@ -391,6 +448,7 @@ impl Default for BoundedRecipientCache {
 pub struct LocalStore {
     author_log: BTreeMap<AuthorLogKey, AuthorLogEntry>,
     recipient_cache: BoundedRecipientCache,
+    message_tombstones: BTreeSet<String>,
 }
 
 impl LocalStore {
@@ -400,6 +458,7 @@ impl LocalStore {
         Self {
             author_log: BTreeMap::new(),
             recipient_cache: BoundedRecipientCache::new(capacity),
+            message_tombstones: BTreeSet::new(),
         }
     }
 
@@ -493,7 +552,51 @@ impl LocalStore {
 
     /// Cache a received message under the bounded retention cache.
     pub fn cache_received(&mut self, entry: RecipientCacheEntry) {
+        if self.message_tombstones.contains(&entry.message_id) {
+            let mut entry = entry;
+            if let KeyState::Cached(key) | KeyState::Decoy(key) = &mut entry.key_state {
+                key.zeroize();
+            }
+            entry.key_state = KeyState::Shredded;
+            self.recipient_cache.insert(entry);
+            return;
+        }
         self.recipient_cache.insert(entry);
+    }
+
+    /// Cooperatively shred a message key and retain a local tombstone.
+    pub fn cooperative_shred_message(&mut self, message_id: impl Into<String>) {
+        let message_id = message_id.into();
+        self.message_tombstones.insert(message_id.clone());
+        self.recipient_cache.shred(&message_id);
+    }
+
+    /// Merge tombstones received from another own device.
+    pub fn merge_message_tombstones<I, S>(&mut self, message_ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for message_id in message_ids {
+            self.cooperative_shred_message(message_id);
+        }
+    }
+
+    /// Ordered local tombstone ids.
+    #[must_use]
+    pub fn message_tombstones(&self) -> Vec<String> {
+        self.message_tombstones.iter().cloned().collect()
+    }
+
+    /// Harness decrypt boundary for tests and storage contracts.
+    pub fn decrypt_cached_message_for_harness(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<u8>, LocalDecryptError> {
+        if self.message_tombstones.contains(message_id) {
+            return Err(LocalDecryptError::Shredded(message_id.to_owned()));
+        }
+        self.recipient_cache.decrypt_for_harness(message_id)
     }
 
     /// Recipient cache reference.
@@ -694,6 +797,33 @@ pub struct AppMessageState {
     pub sent_at_ms: u64,
 }
 
+/// Persisted cooperative shred tombstone for a message.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct AppMessageTombstoneState {
+    /// Stable message id.
+    pub message_id: String,
+    /// Backend/device timestamp when the tombstone was recorded.
+    pub shredded_at_ms: u64,
+    /// Backend-owned reason label, such as `cooperative-shred`.
+    pub reason: String,
+}
+
+impl AppMessageTombstoneState {
+    /// Construct a persisted tombstone.
+    #[must_use]
+    pub fn new(
+        message_id: impl Into<String>,
+        shredded_at_ms: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            shredded_at_ms,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Invite/admission flow state persisted for restart-safe admin UX.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppInviteState {
@@ -741,6 +871,9 @@ pub struct AppState {
     pub groups: Vec<AppGroupState>,
     /// Ciphertext-only messages.
     pub messages: Vec<AppMessageState>,
+    /// Cooperative shred tombstones. Ciphertext can remain, but content keys cannot.
+    #[serde(default)]
+    pub message_tombstones: Vec<AppMessageTombstoneState>,
     /// Invite flow state.
     pub invites: Vec<AppInviteState>,
     /// Voice session state.
@@ -757,9 +890,57 @@ impl AppState {
             preferences: AppPreferencesState::default(),
             groups: Vec::new(),
             messages: Vec::new(),
+            message_tombstones: Vec::new(),
             invites: Vec::new(),
             voice_sessions: Vec::new(),
         }
+    }
+
+    /// Record a cooperative shred tombstone without deleting ciphertext history.
+    pub fn record_message_tombstone(&mut self, tombstone: AppMessageTombstoneState) {
+        if let Some(existing) = self
+            .message_tombstones
+            .iter_mut()
+            .find(|existing| existing.message_id == tombstone.message_id)
+        {
+            if tombstone.shredded_at_ms < existing.shredded_at_ms {
+                existing.shredded_at_ms = tombstone.shredded_at_ms;
+            }
+            if existing.reason.is_empty() {
+                existing.reason = tombstone.reason;
+            }
+            return;
+        }
+        self.message_tombstones.push(tombstone);
+        self.message_tombstones
+            .sort_by(|a, b| a.message_id.cmp(&b.message_id));
+    }
+
+    /// Merge tombstones from another own device.
+    pub fn merge_message_tombstones<I>(&mut self, tombstones: I)
+    where
+        I: IntoIterator<Item = AppMessageTombstoneState>,
+    {
+        for tombstone in tombstones {
+            self.record_message_tombstone(tombstone);
+        }
+    }
+
+    /// True when persisted state has a tombstone for this message.
+    #[must_use]
+    pub fn has_message_tombstone(&self, message_id: &str) -> bool {
+        self.message_tombstones
+            .iter()
+            .any(|tombstone| tombstone.message_id == message_id)
+    }
+
+    /// Ordered tombstone ids for sync or assertions.
+    #[must_use]
+    pub fn message_tombstone_ids(&self) -> Vec<String> {
+        self.message_tombstones
+            .iter()
+            .map(|tombstone| tombstone.message_id.clone())
+            .collect()
     }
 }
 
@@ -1224,6 +1405,120 @@ mod tests {
         assert_eq!(store.recipient_cache().len(), 2);
         assert!(store.recipient_cache().get("m-0").is_none());
         assert!(store.recipient_cache().get("m-2").is_some());
+    }
+
+    #[test]
+    fn crypto_shred_tombstone_blocks_cached_decrypt_without_deleting_ciphertext() {
+        let key = [0xA5; 32];
+        let plaintext = b"message plaintext";
+        let ciphertext = xor_harness_ciphertext(plaintext, &key);
+        let mut store = LocalStore::default();
+        store.cache_received(RecipientCacheEntry::new(
+            "m-shred",
+            ciphertext.clone(),
+            KeyState::Cached(key),
+            1,
+        ));
+
+        assert_eq!(
+            store.decrypt_cached_message_for_harness("m-shred"),
+            Ok(plaintext.to_vec())
+        );
+        store.cooperative_shred_message("m-shred");
+
+        assert_eq!(
+            store.decrypt_cached_message_for_harness("m-shred"),
+            Err(LocalDecryptError::Shredded("m-shred".to_owned()))
+        );
+        assert_eq!(
+            store
+                .recipient_cache()
+                .get("m-shred")
+                .map(|entry| &entry.ciphertext),
+            Some(&ciphertext)
+        );
+        assert_eq!(store.message_tombstones(), vec!["m-shred".to_owned()]);
+    }
+
+    #[test]
+    fn crypto_shred_tombstones_merge_and_apply_to_late_cache_entries() {
+        let mut store = LocalStore::default();
+        store.merge_message_tombstones(["m1", "m2", "m1"]);
+        store.cache_received(RecipientCacheEntry::new(
+            "m1",
+            b"ciphertext".to_vec(),
+            KeyState::Cached([9; 32]),
+            1,
+        ));
+
+        assert_eq!(
+            store.message_tombstones(),
+            vec!["m1".to_owned(), "m2".to_owned()]
+        );
+        assert_eq!(
+            store.decrypt_cached_message_for_harness("m1"),
+            Err(LocalDecryptError::Shredded("m1".to_owned()))
+        );
+        assert_eq!(
+            store
+                .recipient_cache()
+                .get("m1")
+                .map(|entry| &entry.key_state),
+            Some(&KeyState::Shredded)
+        );
+    }
+
+    #[test]
+    fn crypto_shred_tombstones_survive_app_state_restart_bytes() -> Result<(), AppStoreError> {
+        let mut state = AppState::new(AppIdentityState::new(
+            "alice",
+            "Alice",
+            "friend:alice",
+            "device-a",
+            "1111",
+        ));
+        state.messages.push(AppMessageState {
+            message_id: "m1".to_owned(),
+            group_id: "g1".to_owned(),
+            channel_id: "c1".to_owned(),
+            author_id: "alice-device".to_owned(),
+            sequence: 1,
+            epoch: 7,
+            ciphertext: b"ciphertext-only".to_vec(),
+            sent_at_ms: 1000,
+        });
+        state.record_message_tombstone(AppMessageTombstoneState::new(
+            "m1",
+            2000,
+            "cooperative-shred",
+        ));
+
+        let mut store = MemoryAppStore::default();
+        store.save_app_state(&serde_json::to_vec(&state)?)?;
+        let bytes = store
+            .load_app_state()?
+            .ok_or(AppStoreError::Crypto("missing app state after save"))?;
+        let reloaded: AppState = serde_json::from_slice(&bytes)?;
+
+        assert!(reloaded.has_message_tombstone("m1"));
+        assert_eq!(reloaded.message_tombstone_ids(), vec!["m1".to_owned()]);
+        assert_eq!(reloaded.messages, state.messages);
+        Ok(())
+    }
+
+    #[test]
+    fn crypto_shred_scan_removes_key_material_from_db_wal_and_key_store() {
+        let key_material = b"content-key-material";
+        let mut sim = SecureDeleteSimulator::default();
+        sim.write("app-state.discrypt", b"ciphertext envelope only".to_vec());
+        sim.write("app-state.discrypt-wal", Vec::new());
+        sim.write("content-key.store", key_material.to_vec());
+        assert!(sim.contains_material(key_material));
+
+        sim.secure_delete(["content-key.store", "app-state.discrypt-wal"]);
+
+        assert!(!sim.contains_material(key_material));
+        assert!(sim.deleted_all(["content-key.store", "app-state.discrypt-wal"]));
     }
 
     #[test]

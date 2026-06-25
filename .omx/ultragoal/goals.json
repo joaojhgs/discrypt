@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T13:37:35.566Z",
+  "updatedAt": "2026-06-25T14:20:08.535Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -274,6 +274,17 @@
       "updatedAt": "2026-06-25T13:37:35.566Z",
       "evidence": "PER-78 retention windows implemented and verified. Files: crates/content-keys/src/lib.rs, crates/content-keys/Cargo.toml, crates/storage/src/lib.rs, crates/core/src/lib.rs, apps/ui/src/commands.ts, .omx/plans/P9-T04-retention-windows-2026-06-25.md, docs/release/per78-retention-windows-2026-06-25.md. Passed: cargo fmt --check; cargo test -p discrypt-content-keys retention; cargo test -p discrypt-content-keys; cargo test -p discrypt-storage retention_policy; cargo test -p discrypt-core retention_policy_surface; clippy for content-keys/storage/core; npm --prefix apps/ui ci; npm --prefix apps/ui run typecheck; git diff --check.",
       "completedAt": "2026-06-25T13:37:35.566Z"
+    },
+    {
+      "id": "G026-per-79-p9-t05-crypto-shred-tombstone",
+      "title": "PER-79 P9-T05 crypto-shred tombstones",
+      "objective": "Implement PER-79/P9-T05 crypto-shred tombstones: cooperative shred removes cached content-key material, persists tombstones, syncs own-device tombstones, proves negative decrypt after shred, and documents SQLite/WAL best-effort caveats. Scope is local Rust content-key/storage model evidence plus docs; do not implement multi-device identity, backup/recovery, UI, packaging, or release-gate matrix work.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T14:18:35.003Z",
+      "updatedAt": "2026-06-25T14:20:08.535Z",
+      "evidence": "PER-79/P9-T05 implemented and verified. Files: crates/content-keys/src/lib.rs, crates/storage/src/lib.rs, .omx/plans/P9-T05-crypto-shred-tombstones-2026-06-25.md, docs/release/per79-crypto-shred-tombstones-2026-06-25.md. Passed: cargo test -p discrypt-content-keys shred; cargo test -p discrypt-storage crypto_shred; cargo test -p discrypt-storage secure_delete_removes_material_and_snapshot_restores_on_failed_verify; full content-keys and storage crate tests; cargo fmt --check; clippy for content-keys/storage; git diff --check. Evidence is local Rust content-key/storage model evidence, not production split-machine multi-device/release readiness.",
+      "completedAt": "2026-06-25T14:20:08.535Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
