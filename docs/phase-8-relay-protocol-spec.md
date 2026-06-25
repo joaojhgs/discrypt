@@ -134,6 +134,23 @@ Revocation is fail-closed:
 Route cleanup from Phase 7 remains authoritative for direct/TURN runtime state.
 This spec adds no alternate delivery success state for revoked or removed peers.
 
+PER-73 adds a local post-revocation overlay validation boundary:
+
+- `build_peer_overlay_revocation_state` accepts already verified backend,
+  OpenMLS, or signed-governance revocation evidence and constructs a
+  post-revocation admitted set plus relay authority set.
+- The post-revocation epoch must advance beyond every revoked ref, and the
+  remaining admitted set and authorized relay list must exclude the revoked
+  member/device bindings.
+- `PeerOverlayRevocationState::validate_frame_after_revocation` validates a
+  frame against the post-revocation admitted set and explicit relay authority
+  before route reuse or forwarding. Current-epoch frames naming the removed
+  source, destination, or relay fail closed, and pre-revocation stale frames
+  fail closed against the new epoch.
+- This is local Rust model evidence. Live runtime work still has to feed this
+  boundary with persisted OpenMLS/governance state and route-cleanup evidence
+  before any production split-machine revocation claim.
+
 ## Provider Boundary
 
 `PeerOverlayCarrier::ProviderApplicationRelay` exists only as a forbidden enum

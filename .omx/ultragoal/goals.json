@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T01:35:40.789Z",
+  "updatedAt": "2026-06-25T02:11:38.451Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -210,6 +210,17 @@
       "updatedAt": "2026-06-25T01:35:40.789Z",
       "evidence": "PER-71/P8-T06 local implementation complete on branch multica/P8-T06-redelivery-failover. Added plan_peer_overlay_redelivery_failover with killed-relay exclusion, protected-frame preservation, stale replay rejection, and no-provider-relay evidence. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport peer_overlay -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter peer_overlay -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-transport --lib -- -D warnings; git diff --check. Evidence is local Rust transport model/unit evidence, not production split-machine overlay delivery.",
       "completedAt": "2026-06-25T01:35:40.789Z"
+    },
+    {
+      "id": "G020-per-73-p8-t08-overlay-revocation",
+      "title": "PER-73 P8-T08 overlay revocation",
+      "objective": "Implement PER-73/P8-T08 overlay revocation in discrypt-transport: revoked peers must be unable to receive, send, decrypt-target, or relay current-epoch peer-overlay frames; stale pre-revocation overlay frames must be rejected; relay authority remains epoch-bound and providers remain signaling-only. Scope is local transport overlay model/unit evidence plus docs/plan artifacts; do not implement voice fanout, Phase 9 history, store-forward queues, UI, packaging, or release gates.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T02:05:31.608Z",
+      "updatedAt": "2026-06-25T02:11:38.451Z",
+      "evidence": "PER-73/P8-T08 local implementation complete on branch multica/P8-T08-overlay-revocation. Added build_peer_overlay_revocation_state and PeerOverlayRevocationState validation so revoked peers cannot be source, destination, or relay after the post-revocation epoch, stale pre-revocation frames are rejected, remaining members can still forward opaque frames, and provider application relay remains forbidden. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport peer_overlay -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter peer_overlay -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-transport --lib -- -D warnings; git diff --check. Evidence is local Rust transport model/unit evidence, not production split-machine overlay delivery.",
+      "completedAt": "2026-06-25T02:11:38.451Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
