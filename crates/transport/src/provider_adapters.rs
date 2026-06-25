@@ -4126,6 +4126,9 @@ const DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION: u16 = 1;
 const DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION: &str = "discrypt-signaling-http-v1";
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+const DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION: u8 = 1;
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 const DISCRYPT_RENDEZVOUS_MIN_MAX_BODY_BYTES: usize = 4096;
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
@@ -4737,6 +4740,95 @@ fn discrypt_rendezvous_signal_kind(
 }
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_validate_wire_envelope(
+    expected_kind: DiscryptRendezvousSignalKind,
+    envelope: &DiscryptRendezvousWireEnvelope,
+) -> Result<(), TransportError> {
+    match envelope {
+        DiscryptRendezvousWireEnvelope::Presence {
+            schema,
+            payload,
+            ttl_seconds,
+            ..
+        } => {
+            if expected_kind != DiscryptRendezvousSignalKind::Rendezvous {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous presence envelope arrived on non-rendezvous signal kind"
+                        .to_owned(),
+                ));
+            }
+            if *schema != DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous presence envelope schema_version is unsupported"
+                        .to_owned(),
+                ));
+            }
+            if *ttl_seconds == 0 {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous presence ttl must be non-zero".to_owned(),
+                ));
+            }
+            reject_forbidden_plaintext(&payload.bytes)
+        }
+        DiscryptRendezvousWireEnvelope::Signal {
+            schema, payload, ..
+        } => {
+            if *schema != DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous signal envelope schema_version is unsupported".to_owned(),
+                ));
+            }
+            if payload.version != 1 {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous sealed signal payload version is unsupported".to_owned(),
+                ));
+            }
+            if discrypt_rendezvous_signal_kind(&payload.kind) != expected_kind {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous signal envelope kind does not match service signal kind"
+                        .to_owned(),
+                ));
+            }
+            reject_forbidden_plaintext(&payload.ciphertext)
+        }
+        DiscryptRendezvousWireEnvelope::Control { .. } => {
+            Err(provider_app_payload_relay_disabled_error())
+        }
+    }
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_encode_envelope(
+    expected_kind: DiscryptRendezvousSignalKind,
+    envelope: &DiscryptRendezvousWireEnvelope,
+) -> Result<Vec<u8>, TransportError> {
+    discrypt_rendezvous_validate_wire_envelope(expected_kind, envelope)?;
+    let bytes = serde_json::to_vec(envelope).map_err(|err| {
+        TransportError::SignalingAdapter(format!(
+            "discrypt rendezvous envelope encode failed: {err}"
+        ))
+    })?;
+    reject_forbidden_plaintext(&bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+fn discrypt_rendezvous_decode_envelope(
+    expected_kind: DiscryptRendezvousSignalKind,
+    bytes: &[u8],
+) -> Result<DiscryptRendezvousWireEnvelope, TransportError> {
+    reject_forbidden_plaintext(bytes)?;
+    let envelope =
+        serde_json::from_slice::<DiscryptRendezvousWireEnvelope>(bytes).map_err(|error| {
+            TransportError::SignalingAdapter(format!(
+                "discrypt rendezvous envelope decode failed: {error}"
+            ))
+        })?;
+    discrypt_rendezvous_validate_wire_envelope(expected_kind, &envelope)?;
+    Ok(envelope)
+}
+
+#[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 fn discrypt_rendezvous_post_json<T, R>(
     endpoint_base: String,
     path: &'static str,
@@ -4795,12 +4887,7 @@ impl DiscryptQuicRendezvousProviderRoom {
         envelope: DiscryptRendezvousWireEnvelope,
         ttl_seconds: u32,
     ) -> Result<(), TransportError> {
-        let payload = serde_json::to_vec(&envelope).map_err(|err| {
-            TransportError::SignalingAdapter(format!(
-                "discrypt rendezvous envelope encode failed: {err}"
-            ))
-        })?;
-        reject_forbidden_plaintext(&payload)?;
+        let payload = discrypt_rendezvous_encode_envelope(kind, &envelope)?;
         let request = DiscryptRendezvousPublishSignalRequest {
             client_token_hex: self.client_token_hex(),
             nonce_hex: self.next_nonce_hex(),
@@ -4864,12 +4951,7 @@ impl DiscryptQuicRendezvousProviderRoom {
                         "discrypt rendezvous payload hex decode failed: {error}"
                     ))
                 })?;
-                reject_forbidden_plaintext(&bytes)?;
-                serde_json::from_slice::<DiscryptRendezvousWireEnvelope>(&bytes).map_err(|error| {
-                    TransportError::SignalingAdapter(format!(
-                        "discrypt rendezvous envelope decode failed: {error}"
-                    ))
-                })
+                discrypt_rendezvous_decode_envelope(signal.kind, &bytes)
             })
             .collect()
     }
@@ -8108,6 +8190,68 @@ mod tests {
 
     #[test]
     #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_rejects_malformed_service_identity_fingerprint() {
+        let endpoint = "https://rendezvous.example.invalid";
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint);
+        let health = DiscryptRendezvousHealthResponse {
+            schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
+            protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: endpoint.to_owned(),
+            max_body_bytes: Some(64 * 1024),
+            rate_limit_window_seconds: Some(60),
+            rate_limit_max_requests: Some(120),
+            service_identity_fingerprint: Some("not-a-sha256-fingerprint".to_owned()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            rotation_policy: Some("rotate before service_expires_at expires".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
+            at_rest_records: 0,
+        };
+        let error = discrypt_rendezvous_validate_health(
+            endpoint,
+            SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
+            &health,
+        )
+        .expect_err("malformed service identity must fail closed");
+        assert!(error.to_string().contains("identity fingerprint"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_health_rejects_expired_identity_proof() {
+        let endpoint = "https://rendezvous.example.invalid";
+        let trust_fingerprint = discrypt_rendezvous_trust_fingerprint_for_endpoint(endpoint);
+        let health = DiscryptRendezvousHealthResponse {
+            schema_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_SCHEMA_VERSION),
+            protocol_version: Some(DISCRYPT_RENDEZVOUS_HEALTH_PROTOCOL_VERSION.to_owned()),
+            status: "ok".to_owned(),
+            service: "discrypt-rendezvous".to_owned(),
+            public_base_url: endpoint.to_owned(),
+            max_body_bytes: Some(64 * 1024),
+            rate_limit_window_seconds: Some(60),
+            rate_limit_max_requests: Some(120),
+            service_identity_fingerprint: Some(trust_fingerprint.clone()),
+            tls_alpn_protocols: vec!["h2".to_owned()],
+            service_expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+            rotation_policy: Some("rotate before service_expires_at expires".to_owned()),
+            endpoint_allowlist_commitment: Some(trust_fingerprint.clone()),
+            at_rest_records: 0,
+        };
+        let error = discrypt_rendezvous_validate_health(
+            endpoint,
+            SignalingEndpointSecurity::ProductionTls,
+            Some(&trust_fingerprint),
+            &health,
+        )
+        .expect_err("expired service identity proof must fail closed");
+        assert!(error.to_string().contains("expired"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
     fn quic_rendezvous_health_allows_local_loopback_public_base_mismatch(
     ) -> Result<(), TransportError> {
         let health = DiscryptRendezvousHealthResponse {
@@ -8228,6 +8372,106 @@ mod tests {
         )
         .expect_err("production health must keep max body bounded");
         assert!(error.to_string().contains("max_body_bytes"));
+    }
+
+    #[test]
+    #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+    fn quic_rendezvous_wire_envelopes_are_versioned_signaling_only() -> Result<(), TransportError> {
+        let alice = SignalingPeerId::new("quic-wire-alice")?;
+        let bob = SignalingPeerId::new("quic-wire-bob")?;
+        let signal = DiscryptRendezvousWireEnvelope::Signal {
+            schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION,
+            from_peer: alice.clone(),
+            to_peer: bob.clone(),
+            payload: SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [7; 12],
+                ciphertext: b"ciphertext:sealed-offer".to_vec(),
+            },
+        };
+        let encoded =
+            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Offer, &signal)?;
+        assert!(!String::from_utf8_lossy(&encoded)
+            .to_ascii_lowercase()
+            .contains("v=0"));
+        let decoded =
+            discrypt_rendezvous_decode_envelope(DiscryptRendezvousSignalKind::Offer, &encoded)?;
+        assert!(matches!(
+            decoded,
+            DiscryptRendezvousWireEnvelope::Signal { .. }
+        ));
+
+        let wrong_service_kind =
+            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Answer, &signal)
+                .expect_err("service signal kind must match sealed payload kind");
+        assert!(wrong_service_kind
+            .to_string()
+            .contains("kind does not match"));
+
+        let stale_schema = DiscryptRendezvousWireEnvelope::Signal {
+            schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION + 1,
+            from_peer: alice.clone(),
+            to_peer: bob.clone(),
+            payload: SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [8; 12],
+                ciphertext: b"ciphertext:sealed-offer".to_vec(),
+            },
+        };
+        let schema_error =
+            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Offer, &stale_schema)
+                .expect_err("unsupported envelope schema must fail closed");
+        assert!(schema_error.to_string().contains("schema_version"));
+
+        let stale_payload = DiscryptRendezvousWireEnvelope::Signal {
+            schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION,
+            from_peer: alice.clone(),
+            to_peer: bob.clone(),
+            payload: SealedWebRtcNegotiationPayload {
+                version: 2,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [9; 12],
+                ciphertext: b"ciphertext:sealed-offer".to_vec(),
+            },
+        };
+        let payload_error = discrypt_rendezvous_encode_envelope(
+            DiscryptRendezvousSignalKind::Offer,
+            &stale_payload,
+        )
+        .expect_err("unsupported sealed payload version must fail closed");
+        assert!(payload_error.to_string().contains("payload version"));
+
+        let plaintext = DiscryptRendezvousWireEnvelope::Signal {
+            schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION,
+            from_peer: alice.clone(),
+            to_peer: bob.clone(),
+            payload: SealedWebRtcNegotiationPayload {
+                version: 1,
+                kind: WebRtcNegotiationPayloadKind::Offer,
+                nonce: [10; 12],
+                ciphertext: b"v=0\r\na=ice-ufrag:secret".to_vec(),
+            },
+        };
+        assert!(matches!(
+            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Offer, &plaintext),
+            Err(TransportError::PlaintextLeak)
+        ));
+
+        let control = DiscryptRendezvousWireEnvelope::Control {
+            schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION,
+            from_peer: alice,
+            payload: OpaqueSignalingPayload::new(b"ciphertext:application-control".to_vec())?,
+        };
+        let control_error =
+            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Rendezvous, &control)
+                .expect_err("application/control relay must remain disabled");
+        assert!(control_error
+            .to_string()
+            .contains("application-payload relay is disabled"));
+
+        Ok(())
     }
 
     #[tokio::test]
