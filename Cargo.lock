@@ -1449,6 +1449,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "discrypt-mls-core",
+ "discrypt-transport",
  "hex",
  "libopus-rs",
  "serde",
