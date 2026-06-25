@@ -20,7 +20,7 @@ use crate::{
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
     SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDiagnosticTimeline,
-    WebRtcNegotiationConfig,
+    WebRtcNegotiationConfig, WebRtcSdpType,
 };
 #[cfg(any(
     test,
@@ -490,6 +490,264 @@ pub struct ProviderWebRtcDataChannelProbe {
     /// Answerer-side redacted ICE/DTLS/DataChannel diagnostic timeline.
     #[serde(default)]
     pub answerer_diagnostic_timeline: Option<WebRtcDiagnosticTimeline>,
+}
+
+/// Redacted top-level ICE/DTLS/provider diagnostic class for support reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IceDtlsProviderFailureKind {
+    /// No selectable provider was available for sealed WebRTC negotiation.
+    ProviderMissing,
+    /// The provider path did not expose a redacted SDP offer event.
+    OfferMissing,
+    /// The provider path did not expose a redacted SDP answer event.
+    AnswerMissing,
+    /// The provider path did not expose local and remote ICE candidate evidence.
+    CandidateMissing,
+    /// ICE reached a failed/disconnected state or never became direct/TURN ready.
+    IceFailed,
+    /// DTLS/peer connection reached a failed/disconnected state.
+    DtlsFailed,
+    /// DataChannel did not open on both peers or did not carry the opaque proof frame.
+    DataChannelFailed,
+    /// Direct WebRTC failed and no configured TURN route evidence is available.
+    TurnRequired,
+    /// No failure was detected in the redacted probe evidence.
+    Connected,
+}
+
+impl IceDtlsProviderFailureKind {
+    /// Stable diagnostic code used by support bundles and tests.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProviderMissing => "provider_missing",
+            Self::OfferMissing => "offer_missing",
+            Self::AnswerMissing => "answer_missing",
+            Self::CandidateMissing => "candidate_missing",
+            Self::IceFailed => "ice_failed",
+            Self::DtlsFailed => "dtls_failed",
+            Self::DataChannelFailed => "data_channel_failed",
+            Self::TurnRequired => "turn_required",
+            Self::Connected => "connected",
+        }
+    }
+}
+
+/// Redacted support-bundle report for provider-signaled WebRTC setup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IceDtlsProviderReport {
+    /// Versioned report schema.
+    pub schema_version: u16,
+    /// Classified outcome.
+    pub failure_kind: IceDtlsProviderFailureKind,
+    /// Stable diagnostic status code.
+    pub status: String,
+    /// Redacted support detail without SDP, ICE credentials, TURN URLs, or frame bytes.
+    pub detail: String,
+    /// Whether a signaling provider was selected/available.
+    pub provider_selected: bool,
+    /// Providers are never used as application relays.
+    pub provider_application_relay_used: bool,
+    /// Any redacted SDP offer evidence was observed.
+    pub offer_observed: bool,
+    /// Any redacted SDP answer evidence was observed.
+    pub answer_observed: bool,
+    /// Both local-gathered and remote-applied candidate evidence were observed.
+    pub candidate_observed: bool,
+    /// Last redacted ICE connection state, if present.
+    #[serde(default)]
+    pub ice_state: Option<String>,
+    /// Last redacted DTLS/peer-connection state, if present.
+    #[serde(default)]
+    pub dtls_state: Option<String>,
+    /// Last redacted DataChannel state.
+    pub data_channel_state: String,
+    /// Whether TURN is required because direct path evidence failed without configured TURN proof.
+    pub turn_required: bool,
+}
+
+impl IceDtlsProviderReport {
+    /// Current report schema.
+    pub const SCHEMA_VERSION: u16 = 1;
+
+    /// Build a provider-missing report when no provider/probe evidence exists.
+    #[must_use]
+    pub fn provider_missing(detail: impl Into<String>) -> Self {
+        Self::new(
+            IceDtlsProviderFailureKind::ProviderMissing,
+            detail,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            "not_observed".to_owned(),
+            false,
+        )
+    }
+
+    /// Build a redacted report from a provider-signaled WebRTC probe.
+    #[must_use]
+    pub fn from_probe(
+        probe: &ProviderWebRtcDataChannelProbe,
+        configured_turn_available: bool,
+    ) -> Self {
+        let offer_observed = probe.timeline_sdp_observed(WebRtcSdpType::Offer);
+        let answer_observed = probe.timeline_sdp_observed(WebRtcSdpType::Answer);
+        let local_candidate_observed = probe.timeline_candidate_observed("local");
+        let remote_candidate_observed = probe.timeline_candidate_observed("remote");
+        let candidate_observed = local_candidate_observed && remote_candidate_observed;
+        let ice_state = probe.last_timeline_state("ice_connection_state");
+        let dtls_state = probe.last_timeline_state("dtls_transport_state");
+        let data_channel_state = probe
+            .last_timeline_state("data_channel")
+            .unwrap_or_else(|| {
+                if probe.offerer_data_channel_open && probe.answerer_data_channel_open {
+                    "open".to_owned()
+                } else {
+                    "not_open".to_owned()
+                }
+            });
+        let direct_ready = probe.offerer_direct_path_ready && probe.answerer_direct_path_ready;
+        let turn_ready = probe.offerer_turn_fallback_ready
+            && probe.answerer_turn_fallback_ready
+            && probe.offerer_configured_turn_servers > 0
+            && probe.answerer_configured_turn_servers > 0
+            && configured_turn_available;
+        let turn_required = !direct_ready && !turn_ready;
+        let data_channel_ready = probe.offerer_data_channel_open
+            && probe.answerer_data_channel_open
+            && probe.text_control_frame_roundtrip;
+        let failure_kind = if !offer_observed {
+            IceDtlsProviderFailureKind::OfferMissing
+        } else if !answer_observed {
+            IceDtlsProviderFailureKind::AnswerMissing
+        } else if !candidate_observed {
+            IceDtlsProviderFailureKind::CandidateMissing
+        } else if state_failed(ice_state.as_deref()) {
+            IceDtlsProviderFailureKind::IceFailed
+        } else if state_failed(dtls_state.as_deref()) {
+            IceDtlsProviderFailureKind::DtlsFailed
+        } else if turn_required {
+            IceDtlsProviderFailureKind::TurnRequired
+        } else if !data_channel_ready || state_failed(Some(data_channel_state.as_str())) {
+            IceDtlsProviderFailureKind::DataChannelFailed
+        } else {
+            IceDtlsProviderFailureKind::Connected
+        };
+        let detail = format!(
+            "adapter={} profile={} endpoint={} topic_digest={} offer={} answer={} candidates={} ice_state={} dtls_state={} data_channel_state={} direct_ready={} turn_ready={} provider_application_relay_used=false",
+            probe.kind.canonical_name(),
+            probe.profile_id,
+            probe.endpoint_label,
+            redacted_observable_digest(&probe.rendezvous_topic),
+            offer_observed,
+            answer_observed,
+            candidate_observed,
+            ice_state.as_deref().unwrap_or("not_observed"),
+            dtls_state.as_deref().unwrap_or("not_observed"),
+            data_channel_state,
+            direct_ready,
+            turn_ready,
+        );
+        Self::new(
+            failure_kind,
+            detail,
+            true,
+            offer_observed,
+            answer_observed,
+            candidate_observed,
+            ice_state,
+            dtls_state,
+            data_channel_state,
+            turn_required,
+        )
+    }
+
+    fn new(
+        failure_kind: IceDtlsProviderFailureKind,
+        detail: impl Into<String>,
+        provider_selected: bool,
+        offer_observed: bool,
+        answer_observed: bool,
+        candidate_observed: bool,
+        ice_state: Option<String>,
+        dtls_state: Option<String>,
+        data_channel_state: String,
+        turn_required: bool,
+    ) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            failure_kind,
+            status: failure_kind.code().to_owned(),
+            detail: detail.into(),
+            provider_selected,
+            provider_application_relay_used: false,
+            offer_observed,
+            answer_observed,
+            candidate_observed,
+            ice_state,
+            dtls_state,
+            data_channel_state,
+            turn_required,
+        }
+    }
+}
+
+impl ProviderWebRtcDataChannelProbe {
+    /// Build the redacted ICE/DTLS/provider report for this probe.
+    #[must_use]
+    pub fn ice_dtls_provider_report(
+        &self,
+        configured_turn_available: bool,
+    ) -> IceDtlsProviderReport {
+        IceDtlsProviderReport::from_probe(self, configured_turn_available)
+    }
+
+    fn timelines(&self) -> impl Iterator<Item = &WebRtcDiagnosticTimeline> {
+        self.offerer_diagnostic_timeline
+            .iter()
+            .chain(self.answerer_diagnostic_timeline.iter())
+    }
+
+    fn timeline_sdp_observed(&self, sdp_type: WebRtcSdpType) -> bool {
+        self.timelines().any(|timeline| match sdp_type {
+            WebRtcSdpType::Offer => timeline.offer_count > 0,
+            WebRtcSdpType::Answer => timeline.answer_count > 0,
+        })
+    }
+
+    fn timeline_candidate_observed(&self, direction: &str) -> bool {
+        self.timelines().any(|timeline| {
+            timeline.events.iter().any(|event| {
+                event.kind == "ice_candidate"
+                    && event.direction.as_deref() == Some(direction)
+                    && matches!(
+                        event.state.as_deref(),
+                        None | Some("applied") | Some("queued")
+                    )
+            })
+        })
+    }
+
+    fn last_timeline_state(&self, kind: &str) -> Option<String> {
+        self.timelines()
+            .flat_map(|timeline| timeline.events.iter())
+            .filter(|event| event.kind == kind)
+            .max_by(|left, right| left.observed_at.cmp(&right.observed_at))
+            .and_then(|event| event.state.clone())
+    }
+}
+
+fn state_failed(state: Option<&str>) -> bool {
+    state.is_some_and(|state| {
+        matches!(
+            state.to_ascii_lowercase().as_str(),
+            "failed" | "disconnected" | "closed" | "error" | "not_open"
+        )
+    })
 }
 
 /// Evidence returned when a live provider-signaled text/control runtime is attached.
@@ -6660,8 +6918,8 @@ mod tests {
     use super::*;
     use crate::{
         derive_scope_commitment, ConnectivityScopeLevel, Endpoint, ProviderMetadataPosture,
-        SignalingEndpointSecurity, SignalingProviderEndpoint, WebRtcIceCandidate,
-        WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcSdpType,
+        SignalingEndpointSecurity, SignalingProviderEndpoint, WebRtcDiagnosticEvent,
+        WebRtcIceCandidate, WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer, WebRtcSdpType,
         WebRtcSessionDescription,
     };
 
@@ -6717,6 +6975,113 @@ mod tests {
         })
     }
 
+    fn report_timeline(
+        include_offer: bool,
+        include_answer: bool,
+        include_local_candidate: bool,
+        include_remote_candidate: bool,
+        ice_state: &str,
+        dtls_state: &str,
+        data_channel_state: &str,
+    ) -> WebRtcDiagnosticTimeline {
+        let mut events = Vec::new();
+        let mut sequence = 1;
+        let mut push = |mut event: WebRtcDiagnosticEvent| {
+            event.sequence = sequence;
+            sequence += 1;
+            events.push(event);
+        };
+        if include_offer {
+            let mut event = report_event("sdp");
+            event.sdp_type = Some(WebRtcSdpType::Offer);
+            push(event);
+        }
+        if include_answer {
+            let mut event = report_event("sdp");
+            event.sdp_type = Some(WebRtcSdpType::Answer);
+            push(event);
+        }
+        if include_local_candidate {
+            let mut event = report_event("ice_candidate");
+            event.direction = Some("local".to_owned());
+            event.state = Some("applied".to_owned());
+            event.candidate_type = Some("host".to_owned());
+            event.relay_candidate = Some(false);
+            push(event);
+        }
+        if include_remote_candidate {
+            let mut event = report_event("ice_candidate");
+            event.direction = Some("remote".to_owned());
+            event.state = Some("applied".to_owned());
+            event.candidate_type = Some("host".to_owned());
+            event.relay_candidate = Some(false);
+            push(event);
+        }
+        let mut ice = report_event("ice_connection_state");
+        ice.state = Some(ice_state.to_owned());
+        push(ice);
+        let mut dtls = report_event("dtls_transport_state");
+        dtls.state = Some(dtls_state.to_owned());
+        push(dtls);
+        let mut data_channel = report_event("data_channel");
+        data_channel.state = Some(data_channel_state.to_owned());
+        push(data_channel);
+        WebRtcDiagnosticTimeline {
+            schema_version: WebRtcDiagnosticTimeline::SCHEMA_VERSION,
+            events,
+            offer_count: include_offer as u64,
+            answer_count: include_answer as u64,
+            local_candidate_count: include_local_candidate as u64,
+            remote_candidate_count: include_remote_candidate as u64,
+            failure_reason: None,
+        }
+    }
+
+    fn report_event(kind: &str) -> WebRtcDiagnosticEvent {
+        WebRtcDiagnosticEvent {
+            sequence: 0,
+            observed_at: Utc::now(),
+            kind: kind.to_owned(),
+            peer_role: Some("local".to_owned()),
+            direction: None,
+            state: None,
+            sdp_type: None,
+            candidate_type: None,
+            relay_candidate: None,
+            count: None,
+            failure_reason: None,
+        }
+    }
+
+    fn report_probe(timeline: WebRtcDiagnosticTimeline) -> ProviderWebRtcDataChannelProbe {
+        ProviderWebRtcDataChannelProbe {
+            kind: SignalingAdapterKind::Mqtt,
+            profile_id: "unit-test-profile".to_owned(),
+            endpoint_label: "mqtts://broker.example".to_owned(),
+            scope_commitment: "scope".to_owned(),
+            rendezvous_topic: "topic".to_owned(),
+            offerer_direct_path_ready: true,
+            answerer_direct_path_ready: true,
+            offerer_turn_fallback_ready: false,
+            answerer_turn_fallback_ready: false,
+            offerer_configured_turn_servers: 0,
+            answerer_configured_turn_servers: 0,
+            offerer_local_relay_candidates_gathered: 0,
+            answerer_local_relay_candidates_gathered: 0,
+            offerer_remote_relay_candidates_applied: 0,
+            answerer_remote_relay_candidates_applied: 0,
+            offerer_data_channel_open: true,
+            answerer_data_channel_open: true,
+            text_control_frame_roundtrip: true,
+            text_control_frame_sha256: "a".repeat(64),
+            receipt_frame_roundtrip: true,
+            receipt_frame_sha256: "b".repeat(64),
+            runtime_spec: None,
+            offerer_diagnostic_timeline: Some(timeline),
+            answerer_diagnostic_timeline: None,
+        }
+    }
+
     fn assert_provider_app_payload_relay_disabled<T>(result: Result<T, TransportError>) {
         assert!(
             result.is_err(),
@@ -6728,6 +7093,170 @@ mod tests {
                     .to_string()
                     .contains(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE),
                 "unexpected provider relay error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ice_dtls_provider_report_distinguishes_provider_missing() {
+        let report = IceDtlsProviderReport::provider_missing("no selectable provider boundary");
+
+        assert_eq!(
+            report.failure_kind,
+            IceDtlsProviderFailureKind::ProviderMissing
+        );
+        assert_eq!(report.status, "provider_missing");
+        assert!(!report.provider_selected);
+        assert!(!report.provider_application_relay_used);
+    }
+
+    #[test]
+    fn ice_dtls_provider_report_distinguishes_offer_answer_and_candidate_missing() {
+        let missing_offer = report_probe(report_timeline(
+            false,
+            true,
+            true,
+            true,
+            "connected",
+            "connected",
+            "open",
+        ));
+        assert_eq!(
+            missing_offer.ice_dtls_provider_report(false).failure_kind,
+            IceDtlsProviderFailureKind::OfferMissing
+        );
+
+        let missing_answer = report_probe(report_timeline(
+            true,
+            false,
+            true,
+            true,
+            "connected",
+            "connected",
+            "open",
+        ));
+        assert_eq!(
+            missing_answer.ice_dtls_provider_report(false).failure_kind,
+            IceDtlsProviderFailureKind::AnswerMissing
+        );
+
+        let missing_candidate = report_probe(report_timeline(
+            true,
+            true,
+            true,
+            false,
+            "connected",
+            "connected",
+            "open",
+        ));
+        let report = missing_candidate.ice_dtls_provider_report(false);
+        assert_eq!(
+            report.failure_kind,
+            IceDtlsProviderFailureKind::CandidateMissing
+        );
+        assert!(!report.candidate_observed);
+    }
+
+    #[test]
+    fn ice_dtls_provider_report_distinguishes_ice_dtls_datachannel_and_turn_failures() {
+        let ice_failed = report_probe(report_timeline(
+            true,
+            true,
+            true,
+            true,
+            "failed",
+            "connected",
+            "open",
+        ));
+        assert_eq!(
+            ice_failed.ice_dtls_provider_report(false).failure_kind,
+            IceDtlsProviderFailureKind::IceFailed
+        );
+
+        let dtls_failed = report_probe(report_timeline(
+            true,
+            true,
+            true,
+            true,
+            "connected",
+            "failed",
+            "open",
+        ));
+        assert_eq!(
+            dtls_failed.ice_dtls_provider_report(false).failure_kind,
+            IceDtlsProviderFailureKind::DtlsFailed
+        );
+
+        let mut data_channel_failed = report_probe(report_timeline(
+            true,
+            true,
+            true,
+            true,
+            "connected",
+            "connected",
+            "error",
+        ));
+        data_channel_failed.text_control_frame_roundtrip = false;
+        assert_eq!(
+            data_channel_failed
+                .ice_dtls_provider_report(false)
+                .failure_kind,
+            IceDtlsProviderFailureKind::DataChannelFailed
+        );
+
+        let mut turn_required = report_probe(report_timeline(
+            true,
+            true,
+            true,
+            true,
+            "connected",
+            "connected",
+            "open",
+        ));
+        turn_required.offerer_direct_path_ready = false;
+        turn_required.answerer_direct_path_ready = false;
+        let report = turn_required.ice_dtls_provider_report(false);
+        assert_eq!(
+            report.failure_kind,
+            IceDtlsProviderFailureKind::TurnRequired
+        );
+        assert_eq!(report.status, "turn_required");
+        assert!(report.turn_required);
+        assert!(report
+            .detail
+            .contains("provider_application_relay_used=false"));
+    }
+
+    #[test]
+    fn ice_dtls_provider_report_redacts_raw_webrtc_and_turn_material() {
+        let mut probe = report_probe(report_timeline(
+            true,
+            true,
+            true,
+            true,
+            "connected",
+            "connected",
+            "open",
+        ));
+        probe.endpoint_label = "endpoint-label-only".to_owned();
+        let report = probe.ice_dtls_provider_report(false);
+        let json = serde_json::to_string(&report).expect("report serializes");
+
+        assert_eq!(report.failure_kind, IceDtlsProviderFailureKind::Connected);
+        assert!(!report.provider_application_relay_used);
+        for forbidden in [
+            "v=0",
+            "candidate:",
+            "ice-ufrag",
+            "ice-pwd",
+            "turn:",
+            "turns:",
+            "plaintext",
+            "content key",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "report leaked forbidden marker {forbidden}: {json}"
             );
         }
     }

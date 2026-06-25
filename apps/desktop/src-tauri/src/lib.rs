@@ -2141,6 +2141,9 @@ pub struct TransportDiagnosticsView {
     /// Structured latest provider-signaled WebRTC DataChannel proof.
     #[serde(default)]
     pub data_channel_probe: Option<ProviderWebRtcDataChannelProbeView>,
+    /// Redacted ICE/DTLS/provider failure report derived from backend transport evidence.
+    #[serde(default)]
+    pub ice_dtls_provider_report: Option<discrypt_transport::IceDtlsProviderReport>,
 }
 
 /// Support-bundle-only route graph diagnostics derived from backend route state.
@@ -2340,6 +2343,12 @@ pub struct ProviderWebRtcDataChannelProbeView {
     /// Versioned provider runtime handoff material captured by the backend probe.
     #[serde(default)]
     pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
+    /// Offerer redacted ICE/DTLS/DataChannel timeline.
+    #[serde(default)]
+    pub offerer_diagnostic_timeline: Option<discrypt_transport::WebRtcDiagnosticTimeline>,
+    /// Answerer redacted ICE/DTLS/DataChannel timeline.
+    #[serde(default)]
+    pub answerer_diagnostic_timeline: Option<discrypt_transport::WebRtcDiagnosticTimeline>,
 }
 
 impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
@@ -2371,7 +2380,46 @@ impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
             receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
             receipt_frame_sha256: probe.receipt_frame_sha256,
             runtime_spec: probe.runtime_spec,
+            offerer_diagnostic_timeline: probe.offerer_diagnostic_timeline,
+            answerer_diagnostic_timeline: probe.answerer_diagnostic_timeline,
         }
+    }
+}
+
+impl ProviderWebRtcDataChannelProbeView {
+    fn ice_dtls_provider_report(
+        &self,
+        configured_turn_available: bool,
+    ) -> discrypt_transport::IceDtlsProviderReport {
+        let kind =
+            transport_adapter_kind_from_name(&self.kind).unwrap_or(SignalingAdapterKind::Mqtt);
+        let probe = discrypt_transport::ProviderWebRtcDataChannelProbe {
+            kind,
+            profile_id: self.profile_id.clone(),
+            endpoint_label: self.endpoint_label.clone(),
+            scope_commitment: self.scope_commitment.clone(),
+            rendezvous_topic: self.rendezvous_topic.clone(),
+            offerer_direct_path_ready: self.offerer_direct_path_ready,
+            answerer_direct_path_ready: self.answerer_direct_path_ready,
+            offerer_turn_fallback_ready: self.offerer_turn_fallback_ready,
+            answerer_turn_fallback_ready: self.answerer_turn_fallback_ready,
+            offerer_configured_turn_servers: self.offerer_configured_turn_servers,
+            answerer_configured_turn_servers: self.answerer_configured_turn_servers,
+            offerer_local_relay_candidates_gathered: self.offerer_local_relay_candidates_gathered,
+            answerer_local_relay_candidates_gathered: self.answerer_local_relay_candidates_gathered,
+            offerer_remote_relay_candidates_applied: self.offerer_remote_relay_candidates_applied,
+            answerer_remote_relay_candidates_applied: self.answerer_remote_relay_candidates_applied,
+            offerer_data_channel_open: self.offerer_data_channel_open,
+            answerer_data_channel_open: self.answerer_data_channel_open,
+            text_control_frame_roundtrip: self.text_control_frame_roundtrip,
+            text_control_frame_sha256: self.text_control_frame_sha256.clone(),
+            receipt_frame_roundtrip: self.receipt_frame_roundtrip,
+            receipt_frame_sha256: self.receipt_frame_sha256.clone(),
+            runtime_spec: self.runtime_spec.clone(),
+            offerer_diagnostic_timeline: self.offerer_diagnostic_timeline.clone(),
+            answerer_diagnostic_timeline: self.answerer_diagnostic_timeline.clone(),
+        };
+        probe.ice_dtls_provider_report(configured_turn_available)
     }
 }
 
@@ -10030,6 +10078,21 @@ impl PersistedAppState {
         let (adapter_probe_status, adapter_probe_detail) = self.signaling_probe_status();
         let (data_channel_probe_status, data_channel_probe_detail) =
             self.data_channel_probe_status();
+        let configured_turn_available = self
+            .active_connectivity_policy()
+            .and_then(|(_, connectivity)| configured_turn_endpoint(&connectivity))
+            .is_some();
+        let ice_dtls_provider_report = self
+            .latest_data_channel_probe
+            .as_ref()
+            .map(|probe| probe.ice_dtls_provider_report(configured_turn_available))
+            .or_else(|| {
+                fallback_plan.selected.is_none().then(|| {
+                    discrypt_transport::IceDtlsProviderReport::provider_missing(
+                        "no selectable provider boundary for sealed WebRTC negotiation",
+                    )
+                })
+            });
         TransportDiagnosticsView {
             adapter_boundaries,
             adapter_fallback_attempts,
@@ -10043,6 +10106,7 @@ impl PersistedAppState {
             data_channel_probe_status,
             data_channel_probe_detail,
             data_channel_probe: self.latest_data_channel_probe.clone(),
+            ice_dtls_provider_report,
         }
     }
 
@@ -10427,6 +10491,8 @@ impl PersistedAppState {
             receipt_frame_roundtrip: evidence.data_channel_open,
             receipt_frame_sha256: redacted_observable_token("receipt", &evidence.rendezvous_topic),
             runtime_spec: Some(evidence.runtime_spec.clone()),
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
         self.latest_data_channel_probe_error = None;
         self.latest_data_channel_probe = Some(proof.clone());
@@ -10704,6 +10770,8 @@ impl PersistedAppState {
             receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
             receipt_frame_sha256: probe.receipt_frame_sha256,
             runtime_spec: probe.runtime_spec,
+            offerer_diagnostic_timeline: probe.offerer_diagnostic_timeline,
+            answerer_diagnostic_timeline: probe.answerer_diagnostic_timeline,
         };
         self.latest_data_channel_probe_error = None;
         self.latest_data_channel_probe = Some(view.clone());
@@ -19464,6 +19532,8 @@ mod tests {
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
         mutate_app_service(|state| {
             state.latest_data_channel_probe = Some(synthetic_probe.clone());
@@ -31338,6 +31408,8 @@ mod tests {
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
         let attached = mutate_app_service(|state| {
             state.latest_data_channel_probe = Some(synthetic_probe.clone());
@@ -31427,6 +31499,8 @@ mod tests {
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
         let session_id = load_state()
             .text_session
@@ -32714,6 +32788,8 @@ mod tests {
             receipt_frame_roundtrip: false,
             receipt_frame_sha256: String::new(),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
 
         let state = mutate_app_service(|state| {
@@ -32730,6 +32806,13 @@ mod tests {
             state.transport_diagnostics.data_channel_probe_status,
             "webrtc-datachannel-failed"
         );
+        let report = state
+            .transport_diagnostics
+            .ice_dtls_provider_report
+            .as_ref()
+            .expect("ICE/DTLS/provider report should be exported");
+        assert_eq!(report.status, "offer_missing");
+        assert!(!report.provider_application_relay_used);
         assert!(state
             .transport_diagnostics
             .data_channel_probe_detail
@@ -32757,6 +32840,8 @@ mod tests {
         assert!(diagnostics.contains("direct_failed_turn_required"));
         assert!(diagnostics.contains("turn-required"));
         assert!(diagnostics.contains("webrtc-datachannel-failed"));
+        assert!(diagnostics.contains("ice_dtls_provider_report"));
+        assert!(diagnostics.contains("provider_application_relay_used"));
     }
 
     #[test]
@@ -32801,6 +32886,8 @@ mod tests {
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
 
         let state = mutate_app_service(|state| {
@@ -32922,6 +33009,8 @@ mod tests {
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
             runtime_spec: None,
+            offerer_diagnostic_timeline: None,
+            answerer_diagnostic_timeline: None,
         };
 
         let state = mutate_app_service(|state| {

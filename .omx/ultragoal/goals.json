@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T21:11:17.088Z",
+  "updatedAt": "2026-06-25T22:31:09.025Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -402,6 +402,17 @@
       "updatedAt": "2026-06-25T21:11:17.088Z",
       "evidence": "PER-90/P11-T01 local implementation complete on branch multica/P11-T01-redacted-structured-logs. Added structured command-error timestamps/redacted_context, JSON discrypt.command_error.v1 log entries, support-bundle structured_logs.last_command_error, expanded sensitive-class redaction, PER-90 plan/evidence docs, and generated artifact target/per90-redacted-structured-logs/diagnostics-log.json. Verification passed: targeted redacted_structured_command_logs test; typed_command_errors_surface_actionable_codes; cargo fmt --check; cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --lib -- -D warnings; git diff --check; PER90_SECRET_SCAN=PASSED. Evidence is local Rust/Tauri backend diagnostics evidence, not production installed-app support workflow evidence.",
       "completedAt": "2026-06-25T21:11:17.088Z"
+    },
+    {
+      "id": "G038-per-92-p11-t03-ice-dtls-provider-rep",
+      "title": "PER-92 P11-T03 ICE/DTLS/provider report",
+      "objective": "Implement PER-92 using .omx/plans/P11-T03-ice-dtls-provider-report-2026-06-25.md: add redacted transport diagnostics that distinguish provider missing, offer missing, answer missing, candidate missing, ICE failed, DTLS failed, DataChannel failed, and TURN required; add synthetic tests and release evidence; preserve provider signaling-only policy.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T22:21:34.193Z",
+      "updatedAt": "2026-06-25T22:31:09.025Z",
+      "evidence": "PER-92 local implementation complete: added IceDtlsProviderReport classifier/export, Tauri diagnostics support-bundle surface, synthetic report tests, plan and release evidence docs. Verification passed: RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport ice_dtls_provider_report; RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml turn_needed_fail_closed_probe_marks_failed_without_delivery_claim --lib -- --test-threads=1; RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check; git diff --check. Evidence is local synthetic backend/transport diagnostics evidence, not production installed-app/split-machine proof.",
+      "completedAt": "2026-06-25T22:31:09.025Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
