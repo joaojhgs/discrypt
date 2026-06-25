@@ -8125,13 +8125,18 @@ function DiagnosticsSheet({
       return;
     }
     try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard is unavailable in this WebView.");
+      }
       const log = await exportDiagnosticsLog();
-      await navigator.clipboard?.writeText(log);
+      await navigator.clipboard.writeText(log);
       setExportStatus("Support bundle copied to clipboard.");
     } catch (error) {
       setExportStatus(
         error instanceof Error
-          ? `Diagnostics export failed: ${error.message}`
+          ? error.message === "Clipboard is unavailable in this WebView."
+            ? `Diagnostics copy unavailable: ${error.message}`
+            : `Diagnostics export failed: ${error.message}`
           : "Diagnostics export failed.",
       );
     }

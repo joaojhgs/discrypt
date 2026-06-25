@@ -262,6 +262,33 @@ test("diagnostics sheet support bundle copy requires explicit consent", async ({
       "Consent enabled for diagnostics sheet support bundle copy.",
     ),
   ).toBeVisible();
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  await diagnosticsDialog.getByRole("button", { name: "Copy logs" }).click();
+  await expect(
+    diagnosticsDialog.getByText(
+      "Diagnostics copy unavailable: Clipboard is unavailable in this WebView.",
+    ),
+  ).toBeVisible();
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (value: string) => {
+          Object.defineProperty(window, "__discryptCopiedDiagnosticsSheetLog", {
+            configurable: true,
+            value,
+          });
+        },
+      },
+    });
+  });
   await diagnosticsDialog.getByRole("button", { name: "Copy logs" }).click();
   await expect(
     diagnosticsDialog.getByText("Support bundle copied to clipboard."),
