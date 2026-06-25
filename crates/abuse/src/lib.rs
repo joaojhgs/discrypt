@@ -10,6 +10,132 @@ pub mod production_status;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use thiserror::Error;
+
+/// Structured local abuse-control error.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum AbuseError {
+    /// A backoff policy would allow unbounded, zero-delay, or otherwise unsafe retry behavior.
+    #[error("invalid abuse backoff policy")]
+    InvalidBackoffPolicy,
+    /// Static soak timestamp could not be represented.
+    #[error("invalid abuse soak clock")]
+    InvalidSoakClock,
+    /// Content-free soak report serialization failed.
+    #[error("abuse soak report serialization failed")]
+    ReportSerialization,
+}
+
+/// Structured decision returned by abuse gates and soak harnesses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum AbuseDecision {
+    /// The action may proceed.
+    Allowed,
+    /// The actor exceeded a bounded rate limit and must wait before retrying.
+    RateLimited {
+        /// Minimum deterministic retry delay before the oldest hit leaves the window.
+        retry_after_ms: u64,
+    },
+    /// The action may retry after a bounded backoff delay.
+    Backoff {
+        /// One-based retry attempt.
+        attempt: u32,
+        /// Delay before the next attempt.
+        delay_ms: u64,
+    },
+    /// The peer remains eligible for direct delivery but is deprioritized as a relay.
+    Deprioritized {
+        /// Freeloader penalty units derived from consumed-minus-contributed relay work.
+        penalty_units: u64,
+    },
+    /// The action must fail closed.
+    FailClosed {
+        /// Redacted, stable reason label.
+        reason: String,
+    },
+}
+
+impl AbuseDecision {
+    /// True when the action is allowed immediately.
+    #[must_use]
+    pub const fn allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    /// True when the action is blocked or delayed instead of succeeding optimistically.
+    #[must_use]
+    pub const fn blocks_success_claim(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Backoff { .. } | Self::FailClosed { .. }
+        )
+    }
+}
+
+/// Deterministic exponential backoff used for reconnect storms and provider retry handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AbuseBackoffPolicy {
+    /// First retry delay in milliseconds.
+    pub initial_ms: u64,
+    /// Maximum retry delay in milliseconds.
+    pub max_ms: u64,
+    /// Integer multiplier applied after each attempt.
+    pub multiplier: u64,
+    /// Maximum attempts before fail-closed exhaustion.
+    pub max_attempts: u32,
+}
+
+impl AbuseBackoffPolicy {
+    /// Create and validate a bounded backoff policy.
+    pub fn new(
+        initial_ms: u64,
+        max_ms: u64,
+        multiplier: u64,
+        max_attempts: u32,
+    ) -> Result<Self, AbuseError> {
+        let policy = Self {
+            initial_ms,
+            max_ms,
+            multiplier,
+            max_attempts,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Validate that retry behavior is finite, non-zero, and monotonic.
+    pub fn validate(self) -> Result<(), AbuseError> {
+        if self.initial_ms == 0
+            || self.max_ms < self.initial_ms
+            || self.multiplier < 1
+            || self.max_attempts == 0
+        {
+            Err(AbuseError::InvalidBackoffPolicy)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return the bounded retry decision for a one-based attempt.
+    pub fn decision_for_attempt(self, attempt: u32) -> Result<AbuseDecision, AbuseError> {
+        self.validate()?;
+        if attempt == 0 || attempt > self.max_attempts {
+            return Ok(AbuseDecision::FailClosed {
+                reason: "retry_attempts_exhausted".to_owned(),
+            });
+        }
+        let exponent = attempt.saturating_sub(1);
+        let mut delay = self.initial_ms;
+        for _ in 0..exponent {
+            delay = delay.saturating_mul(self.multiplier).min(self.max_ms);
+        }
+        Ok(AbuseDecision::Backoff {
+            attempt,
+            delay_ms: delay.min(self.max_ms),
+        })
+    }
+}
 
 /// Simple fixed-window limiter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,13 +158,22 @@ impl RateLimiter {
 
     /// Attempt one action for a key.
     pub fn allow(&mut self, key: &str, now: DateTime<Utc>) -> bool {
+        self.decision(key, now).allowed()
+    }
+
+    /// Attempt one action and return a structured rate-limit decision.
+    pub fn decision(&mut self, key: &str, now: DateTime<Utc>) -> AbuseDecision {
         let hits = self.hits.entry(key.into()).or_default();
         hits.retain(|t| *t + self.window >= now);
         if hits.len() as u32 >= self.limit {
-            return false;
+            let retry_after_ms = hits
+                .first()
+                .map(|oldest| (*oldest + self.window - now).num_milliseconds().max(1) as u64)
+                .unwrap_or(1);
+            return AbuseDecision::RateLimited { retry_after_ms };
         }
         hits.push(now);
-        true
+        AbuseDecision::Allowed
     }
 }
 
@@ -115,24 +250,34 @@ impl AbuseControls {
 
     /// Allow/deny invite creation.
     pub fn allow_invite(&mut self, actor: &str, now: DateTime<Utc>) -> bool {
-        let allowed = self.invite_limiter.allow(actor, now);
-        if allowed {
+        self.invite_decision(actor, now).allowed()
+    }
+
+    /// Return a structured invite-flood decision.
+    pub fn invite_decision(&mut self, actor: &str, now: DateTime<Utc>) -> AbuseDecision {
+        let decision = self.invite_limiter.decision(actor, now);
+        if decision.allowed() {
             self.metrics.invite_allowed_total += 1;
         } else {
             self.metrics.invite_rate_limited_total += 1;
         }
-        allowed
+        decision
     }
 
     /// Allow/deny message send.
     pub fn allow_message(&mut self, actor: &str, now: DateTime<Utc>) -> bool {
-        let allowed = self.spam_limiter.allow(actor, now);
-        if allowed {
+        self.message_decision(actor, now).allowed()
+    }
+
+    /// Return a structured message/spam decision.
+    pub fn message_decision(&mut self, actor: &str, now: DateTime<Utc>) -> AbuseDecision {
+        let decision = self.spam_limiter.decision(actor, now);
+        if decision.allowed() {
             self.metrics.message_allowed_total += 1;
         } else {
             self.metrics.message_rate_limited_total += 1;
         }
-        allowed
+        decision
     }
 
     /// Record relay contribution.
@@ -154,6 +299,19 @@ impl AbuseControls {
             .copied()
             .unwrap_or_default()
             .freeload_penalty()
+    }
+
+    /// Return the relay-freeload decision for route ranking.
+    #[must_use]
+    pub fn relay_decision(&self, peer: &str) -> AbuseDecision {
+        let penalty = self.freeload_penalty(peer).max(0.0) as u64;
+        if penalty == 0 {
+            AbuseDecision::Allowed
+        } else {
+            AbuseDecision::Deprioritized {
+                penalty_units: penalty,
+            }
+        }
     }
 
     /// Return aggregate content-free abuse metrics without actor, peer, group,
@@ -181,6 +339,149 @@ impl AbuseControls {
     }
 }
 
+/// Deterministic Phase 10 abuse soak configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AbuseSoakConfig {
+    /// Invite attempts by one actor inside one fixed window.
+    pub invite_attempts: u32,
+    /// Invite attempts allowed per actor/window.
+    pub invite_limit: u32,
+    /// Fixed-window duration in seconds.
+    pub window_seconds: i64,
+    /// Reconnect attempts to simulate.
+    pub reconnect_attempts: u32,
+    /// Provider retry attempts to simulate after a typed rate-limit failure.
+    pub provider_attempts: u32,
+}
+
+impl Default for AbuseSoakConfig {
+    fn default() -> Self {
+        Self {
+            invite_attempts: 8,
+            invite_limit: 3,
+            window_seconds: 60,
+            reconnect_attempts: 6,
+            provider_attempts: 6,
+        }
+    }
+}
+
+/// Content-free deterministic abuse soak result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AbuseSoakReport {
+    /// Invite flood decisions for one redacted actor.
+    pub invite_decisions: Vec<AbuseDecision>,
+    /// Reconnect storm decisions.
+    pub reconnect_decisions: Vec<AbuseDecision>,
+    /// Provider rate-limit/backoff decisions.
+    pub provider_decisions: Vec<AbuseDecision>,
+    /// Relay freeloader route-ranking decision.
+    pub relay_freeload_decision: AbuseDecision,
+    /// Aggregate, content-free metrics.
+    pub metrics: AbuseMetricsSnapshot,
+    /// True when no actor, peer, group, payload, or key identifiers are exported.
+    pub content_free: bool,
+}
+
+impl AbuseSoakReport {
+    /// True when all PER-89 local abuse scenarios fail closed or degrade safely.
+    #[must_use]
+    pub fn satisfies_per89(&self) -> bool {
+        self.invite_decisions
+            .iter()
+            .any(|decision| matches!(decision, AbuseDecision::RateLimited { .. }))
+            && self.reconnect_decisions.iter().any(|decision| {
+                matches!(
+                    decision,
+                    AbuseDecision::FailClosed {
+                        reason
+                    } if reason == "retry_attempts_exhausted"
+                )
+            })
+            && self.provider_decisions.iter().any(|decision| {
+                matches!(
+                    decision,
+                    AbuseDecision::FailClosed {
+                        reason
+                    } if reason == "retry_attempts_exhausted"
+                )
+            })
+            && matches!(
+                self.relay_freeload_decision,
+                AbuseDecision::Deprioritized { penalty_units } if penalty_units > 0
+            )
+            && self.content_free
+            && self.metrics.content_free_and_safe_to_export()
+    }
+}
+
+/// Run a deterministic local soak covering invite flood, reconnect storm,
+/// provider rate-limit/backoff, and relay freeload ranking behavior.
+pub fn run_abuse_soak(config: AbuseSoakConfig) -> Result<AbuseSoakReport, AbuseError> {
+    let mut controls = AbuseControls::new(
+        config.invite_limit,
+        config.invite_limit,
+        Duration::seconds(config.window_seconds.max(1)),
+    );
+    let now = DateTime::from_timestamp(1_782_345_600, 0).ok_or(AbuseError::InvalidSoakClock)?;
+
+    let invite_decisions = (0..config.invite_attempts)
+        .map(|_| controls.invite_decision("actor", now))
+        .collect::<Vec<_>>();
+
+    let reconnect_policy = AbuseBackoffPolicy::new(125, 1_000, 2, 4)?;
+    let reconnect_decisions = (1..=config.reconnect_attempts)
+        .map(|attempt| reconnect_policy.decision_for_attempt(attempt))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let provider_policy = AbuseBackoffPolicy::new(250, 5_000, 2, 5)?;
+    let mut provider_decisions = Vec::with_capacity(config.provider_attempts as usize + 1);
+    provider_decisions.push(AbuseDecision::RateLimited {
+        retry_after_ms: provider_policy.initial_ms,
+    });
+    provider_decisions.extend(
+        (1..=config.provider_attempts)
+            .map(|attempt| provider_policy.decision_for_attempt(attempt))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
+    controls.record_relay("freeloader", 0, 32);
+    controls.record_relay("helper", 64, 2);
+    let relay_freeload_decision = controls.relay_decision("freeloader");
+    let metrics = controls.metrics_snapshot();
+
+    let exported = serde_json::to_string(&AbuseSoakReport {
+        invite_decisions: invite_decisions.clone(),
+        reconnect_decisions: reconnect_decisions.clone(),
+        provider_decisions: provider_decisions.clone(),
+        relay_freeload_decision: relay_freeload_decision.clone(),
+        metrics: metrics.clone(),
+        content_free: true,
+    })
+    .map_err(|_| AbuseError::ReportSerialization)?;
+    let content_free = [
+        "actor",
+        "freeloader",
+        "helper",
+        "room",
+        "invite-secret",
+        "payload",
+        "plaintext",
+        "key_material",
+    ]
+    .iter()
+    .all(|marker| !exported.contains(marker));
+
+    Ok(AbuseSoakReport {
+        invite_decisions,
+        reconnect_decisions,
+        provider_decisions,
+        relay_freeload_decision,
+        metrics,
+        content_free,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +498,10 @@ mod tests {
         controls.record_relay("freeloader", 1, 10);
         controls.record_relay("helper", 10, 1);
         assert!(controls.freeload_penalty("freeloader") > controls.freeload_penalty("helper"));
+        assert!(matches!(
+            controls.relay_decision("freeloader"),
+            AbuseDecision::Deprioritized { penalty_units } if penalty_units > 0
+        ));
     }
 
     #[test]
@@ -234,5 +539,49 @@ mod tests {
             assert!(!exported.contains(forbidden));
         }
         Ok(())
+    }
+
+    #[test]
+    fn abuse_soak_covers_invite_reconnect_provider_and_relay_freeload() {
+        let report = run_abuse_soak(AbuseSoakConfig::default()).expect("soak report");
+        assert!(report.satisfies_per89());
+        assert_eq!(report.metrics.invite_allowed_total, 3);
+        assert_eq!(report.metrics.invite_rate_limited_total, 5);
+        assert!(report
+            .invite_decisions
+            .iter()
+            .any(|decision| matches!(decision, AbuseDecision::RateLimited { .. })));
+        assert!(report
+            .reconnect_decisions
+            .windows(2)
+            .all(|window| match window {
+                [AbuseDecision::Backoff { delay_ms: left, .. }, AbuseDecision::Backoff {
+                    delay_ms: right, ..
+                }] => left <= right,
+                [AbuseDecision::Backoff { .. }, AbuseDecision::FailClosed { .. }] => true,
+                [AbuseDecision::FailClosed { .. }, AbuseDecision::FailClosed { .. }] => true,
+                _ => false,
+            }));
+        assert!(report.provider_decisions.iter().any(|decision| {
+            matches!(
+                decision,
+                AbuseDecision::FailClosed { reason } if reason == "retry_attempts_exhausted"
+            )
+        }));
+    }
+
+    #[test]
+    fn invalid_backoff_policy_fails_closed_before_use() {
+        assert_eq!(
+            AbuseBackoffPolicy::new(0, 1_000, 2, 4),
+            Err(AbuseError::InvalidBackoffPolicy)
+        );
+        let policy = AbuseBackoffPolicy::new(250, 500, 2, 2).expect("valid policy");
+        assert_eq!(
+            policy.decision_for_attempt(3),
+            Ok(AbuseDecision::FailClosed {
+                reason: "retry_attempts_exhausted".to_owned()
+            })
+        );
     }
 }

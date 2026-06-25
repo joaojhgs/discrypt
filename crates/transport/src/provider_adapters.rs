@@ -6797,6 +6797,67 @@ mod tests {
     }
 
     #[test]
+    fn abuse_rate_limit_backoff_soak_preserves_provider_signaling_only_boundaries(
+    ) -> Result<(), TransportError> {
+        use discrypt_abuse::{run_abuse_soak, AbuseBackoffPolicy, AbuseDecision, AbuseSoakConfig};
+
+        let report = run_abuse_soak(AbuseSoakConfig::default())
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        assert!(report.satisfies_per89());
+        assert!(report
+            .invite_decisions
+            .iter()
+            .any(|decision| matches!(decision, AbuseDecision::RateLimited { .. })));
+        assert!(matches!(
+            report.relay_freeload_decision,
+            AbuseDecision::Deprioritized { penalty_units } if penalty_units > 0
+        ));
+
+        let provider_rate_limited =
+            AdapterReadinessState::classify_provider_failure("rate-limited: slow down");
+        assert_eq!(
+            provider_rate_limited,
+            AdapterReadinessState::ProviderRateLimited
+        );
+        assert_eq!(
+            provider_rate_limited.to_health_state(),
+            SignalingHealthState::ProviderRateLimited
+        );
+
+        let provider_policy = crate::ProviderRetryBackoffPolicy::default();
+        provider_policy.validate()?;
+        let provider_abuse_policy = AbuseBackoffPolicy::new(
+            u64::from(provider_policy.initial_ms),
+            u64::from(provider_policy.max_ms),
+            u64::from(provider_policy.multiplier),
+            u32::from(provider_policy.max_attempts),
+        )
+        .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        assert_eq!(
+            provider_abuse_policy.decision_for_attempt(1),
+            Ok(AbuseDecision::Backoff {
+                attempt: 1,
+                delay_ms: u64::from(provider_policy.initial_ms),
+            })
+        );
+        assert!(matches!(
+            provider_abuse_policy.decision_for_attempt(u32::from(provider_policy.max_attempts) + 1),
+            Ok(AbuseDecision::FailClosed { reason }) if reason == "retry_attempts_exhausted"
+        ));
+
+        let reconnect_policy = crate::ReconnectBackoffPolicy::new(125, 1_000, 2, 2)
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        assert_eq!(reconnect_policy.delay_for_attempt(1), 125);
+        assert_eq!(reconnect_policy.delay_for_attempt(4), 1_000);
+
+        assert_provider_app_payload_relay_disabled::<()>(Err(
+            provider_app_payload_relay_disabled_error(),
+        ));
+        assert!(report.metrics.content_free_and_safe_to_export());
+        Ok(())
+    }
+
+    #[test]
     fn required_provider_adapter_registry_is_stable_and_matches_boundaries_and_factory(
     ) -> Result<(), TransportError> {
         let registry = required_provider_adapter_registry();
