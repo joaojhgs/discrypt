@@ -6678,15 +6678,17 @@ mod tests {
     }
 
     #[test]
-    fn signaling_adapter_factory_rejects_misconfigured_profiles_before_connect() {
-        let mut profile = valid_profile(SignalingAdapterKind::Mqtt).expect("valid profile");
+    fn signaling_adapter_factory_rejects_misconfigured_profiles_before_connect(
+    ) -> Result<(), TransportError> {
+        let mut profile = valid_profile(SignalingAdapterKind::Mqtt)?;
         profile.endpoints.clear();
-        let error = SignalingAdapterFactory::for_profile(&profile)
-            .expect_err("empty profile endpoints must fail before provider connect");
-        assert!(matches!(
-            error,
-            TransportError::InvalidConnectivityPolicy(_)
-        ));
+        match SignalingAdapterFactory::for_profile(&profile) {
+            Err(TransportError::InvalidConnectivityPolicy(_)) => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(TransportError::InvalidConnectivityPolicy(
+                "empty profile endpoints must fail before provider connect".to_owned(),
+            )),
+        }
     }
 
     #[test]
