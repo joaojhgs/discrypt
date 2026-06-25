@@ -58,6 +58,51 @@ pub enum AppStoreError {
     Keychain(String),
 }
 
+/// Author-log append/merge failures.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AuthorLogError {
+    /// Device id is required to keep each own-device branch independently append-only.
+    #[error("author log device id cannot be empty")]
+    EmptyDeviceId,
+    /// Stable message ids are mandatory for merge/dedupe.
+    #[error("author log message id cannot be empty")]
+    EmptyMessageId,
+    /// The same author/device/sequence already contains different ciphertext or metadata.
+    #[error("author log fork at author {author_leaf} device {device_id} sequence {sequence}")]
+    SequenceFork {
+        /// Author MLS leaf.
+        author_leaf: u32,
+        /// Device branch.
+        device_id: String,
+        /// Device-local sequence.
+        sequence: u64,
+    },
+    /// One stable message id was reused for another log position.
+    #[error("author log message id reused at another position: {message_id}")]
+    MessageIdReused {
+        /// Reused message id.
+        message_id: String,
+    },
+}
+
+/// Result of one author-log insert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorLogAppendOutcome {
+    /// A new append-only entry was inserted.
+    Inserted,
+    /// The entry was already present byte-for-byte.
+    Duplicate,
+}
+
+/// Aggregate result of an author-log merge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuthorLogMergeReport {
+    /// Newly inserted entries.
+    pub inserted: usize,
+    /// Idempotent duplicate entries already present.
+    pub duplicates: usize,
+}
+
 /// Byte-oriented local app-state store used by the core AppService.
 ///
 /// The core crate owns the typed schema; storage owns durable byte persistence so
@@ -136,10 +181,10 @@ impl AppStore for FileAppStore {
 pub struct AuthorLogKey {
     /// Author MLS leaf.
     pub author_leaf: u32,
-    /// Per-author sequence.
+    /// Device id that authored this entry.
+    pub device_id: String,
+    /// Device-local sequence under the author.
     pub sequence: u64,
-    /// Stable message id.
-    pub message_id: String,
 }
 
 /// Authoritative sent-log entry.
@@ -180,13 +225,68 @@ impl AuthorLogEntry {
         }
     }
 
+    /// Construct a sent-log entry with a stable id derived from canonical fields.
+    #[must_use]
+    pub fn new_stable(
+        author_leaf: u32,
+        device_id: impl Into<String>,
+        sequence: u64,
+        epoch: u64,
+        ciphertext: Vec<u8>,
+    ) -> Self {
+        let device_id = device_id.into();
+        let message_id =
+            Self::stable_message_id(author_leaf, &device_id, sequence, epoch, &ciphertext);
+        Self {
+            author_leaf,
+            device_id,
+            sequence,
+            epoch,
+            message_id,
+            ciphertext,
+        }
+    }
+
+    /// Stable message-id derivation used before transport fanout or history merge.
+    #[must_use]
+    pub fn stable_message_id(
+        author_leaf: u32,
+        device_id: &str,
+        sequence: u64,
+        epoch: u64,
+        ciphertext: &[u8],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"discrypt:v1:author-log-message-id");
+        hasher.update(author_leaf.to_be_bytes());
+        hasher.update((device_id.len() as u64).to_be_bytes());
+        hasher.update(device_id.as_bytes());
+        hasher.update(sequence.to_be_bytes());
+        hasher.update(epoch.to_be_bytes());
+        hasher.update(Sha256::digest(ciphertext));
+        format!("msg_{}", hex::encode(hasher.finalize()))
+    }
+
+    /// Whether this entry's id matches the canonical stable derivation.
+    #[must_use]
+    pub fn has_stable_message_id(&self) -> bool {
+        self.message_id
+            == Self::stable_message_id(
+                self.author_leaf,
+                &self.device_id,
+                self.sequence,
+                self.epoch,
+                &self.ciphertext,
+            )
+    }
+
     /// Key used for deterministic merge/dedupe.
     #[must_use]
     pub fn key(&self) -> AuthorLogKey {
         AuthorLogKey {
             author_leaf: self.author_leaf,
+            device_id: self.device_id.clone(),
             sequence: self.sequence,
-            message_id: self.message_id.clone(),
         }
     }
 }
@@ -304,29 +404,45 @@ impl LocalStore {
     }
 
     /// Append an authoritative sent message for its author.
-    pub fn append_sent(&mut self, entry: AuthorLogEntry) {
-        self.author_log.insert(entry.key(), entry);
+    pub fn append_sent(
+        &mut self,
+        entry: AuthorLogEntry,
+    ) -> Result<AuthorLogAppendOutcome, AuthorLogError> {
+        self.insert_author_log_entry(entry)
     }
 
     /// Merge received author-log entries from another own device or gossip peer.
-    pub fn merge_author_logs<I>(&mut self, entries: I) -> usize
+    pub fn merge_author_logs<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<AuthorLogMergeReport, AuthorLogError>
     where
         I: IntoIterator<Item = AuthorLogEntry>,
     {
-        let mut inserted = 0;
+        let mut report = AuthorLogMergeReport::default();
         for entry in entries {
-            let key = entry.key();
-            if self.author_log.insert(key, entry).is_none() {
-                inserted += 1;
+            match self.insert_author_log_entry(entry)? {
+                AuthorLogAppendOutcome::Inserted => report.inserted += 1,
+                AuthorLogAppendOutcome::Duplicate => report.duplicates += 1,
             }
         }
-        inserted
+        Ok(report)
     }
 
     /// Ordered author-log snapshot.
     #[must_use]
     pub fn author_log_snapshot(&self) -> Vec<AuthorLogEntry> {
         self.author_log.values().cloned().collect()
+    }
+
+    /// Ordered author-log snapshot for one author.
+    #[must_use]
+    pub fn author_log_for(&self, author_leaf: u32) -> Vec<AuthorLogEntry> {
+        self.author_log
+            .values()
+            .filter(|entry| entry.author_leaf == author_leaf)
+            .cloned()
+            .collect()
     }
 
     /// Ordered message ids in the author log.
@@ -338,6 +454,27 @@ impl LocalStore {
             .collect()
     }
 
+    /// Deterministic ordered message ids in the author log.
+    #[must_use]
+    pub fn ordered_author_message_ids(&self) -> Vec<String> {
+        self.author_log
+            .values()
+            .map(|entry| entry.message_id.clone())
+            .collect()
+    }
+
+    /// Next append sequence for one author/device branch.
+    #[must_use]
+    pub fn next_sequence_for_device(&self, author_leaf: u32, device_id: &str) -> u64 {
+        self.author_log
+            .keys()
+            .filter(|key| key.author_leaf == author_leaf && key.device_id == device_id)
+            .map(|key| key.sequence)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
     /// Cache a received message under the bounded retention cache.
     pub fn cache_received(&mut self, entry: RecipientCacheEntry) {
         self.recipient_cache.insert(entry);
@@ -347,6 +484,42 @@ impl LocalStore {
     #[must_use]
     pub fn recipient_cache(&self) -> &BoundedRecipientCache {
         &self.recipient_cache
+    }
+
+    fn insert_author_log_entry(
+        &mut self,
+        entry: AuthorLogEntry,
+    ) -> Result<AuthorLogAppendOutcome, AuthorLogError> {
+        if entry.device_id.trim().is_empty() {
+            return Err(AuthorLogError::EmptyDeviceId);
+        }
+        if entry.message_id.trim().is_empty() {
+            return Err(AuthorLogError::EmptyMessageId);
+        }
+
+        let key = entry.key();
+        if let Some(existing) = self.author_log.get(&key) {
+            return if existing == &entry {
+                Ok(AuthorLogAppendOutcome::Duplicate)
+            } else {
+                Err(AuthorLogError::SequenceFork {
+                    author_leaf: key.author_leaf,
+                    device_id: key.device_id,
+                    sequence: key.sequence,
+                })
+            };
+        }
+
+        if self.author_log.iter().any(|(existing_key, existing)| {
+            existing.message_id == entry.message_id && existing_key != &key
+        }) {
+            return Err(AuthorLogError::MessageIdReused {
+                message_id: entry.message_id,
+            });
+        }
+
+        self.author_log.insert(key, entry);
+        Ok(AuthorLogAppendOutcome::Inserted)
     }
 }
 
@@ -867,31 +1040,97 @@ mod tests {
     }
 
     #[test]
-    fn author_logs_merge_across_devices_deterministically() {
+    fn author_log_stable_message_id_is_canonical() {
+        let entry = AuthorLogEntry::new_stable(7, "laptop", 3, 11, b"ciphertext".to_vec());
+        assert!(entry.has_stable_message_id());
+        assert_eq!(
+            entry.message_id,
+            AuthorLogEntry::stable_message_id(7, "laptop", 3, 11, b"ciphertext")
+        );
+
+        let same = AuthorLogEntry::new_stable(7, "laptop", 3, 11, b"ciphertext".to_vec());
+        let other_device = AuthorLogEntry::new_stable(7, "phone", 3, 11, b"ciphertext".to_vec());
+        assert_eq!(entry.message_id, same.message_id);
+        assert_ne!(entry.message_id, other_device.message_id);
+    }
+
+    #[test]
+    fn author_logs_merge_across_devices_deterministically() -> Result<(), AuthorLogError> {
         let mut laptop = LocalStore::default();
-        laptop.append_sent(AuthorLogEntry::new(
-            1,
-            "laptop",
-            1,
-            5,
-            "a-1",
-            b"ciphertext-a".to_vec(),
-        ));
+        let laptop_entry = AuthorLogEntry::new_stable(1, "laptop", 1, 5, b"ciphertext-a".to_vec());
+        let phone_entry = AuthorLogEntry::new_stable(1, "phone", 1, 5, b"ciphertext-b".to_vec());
+        assert_eq!(
+            laptop.append_sent(laptop_entry.clone())?,
+            AuthorLogAppendOutcome::Inserted
+        );
         let mut phone = LocalStore::default();
-        phone.append_sent(AuthorLogEntry::new(
-            1,
-            "phone",
-            2,
-            5,
-            "a-2",
-            b"ciphertext-b".to_vec(),
-        ));
-        let inserted = laptop.merge_author_logs(phone.author_log_snapshot());
-        assert_eq!(inserted, 1);
+        phone.append_sent(phone_entry.clone())?;
+        let report = laptop.merge_author_logs(phone.author_log_snapshot())?;
+        assert_eq!(
+            report,
+            AuthorLogMergeReport {
+                inserted: 1,
+                duplicates: 0
+            }
+        );
+        assert_eq!(
+            laptop.merge_author_logs([phone_entry.clone()])?,
+            AuthorLogMergeReport {
+                inserted: 0,
+                duplicates: 1
+            }
+        );
         assert_eq!(
             laptop.author_message_ids(),
-            BTreeSet::from(["a-1".to_owned(), "a-2".to_owned()])
+            BTreeSet::from([
+                laptop_entry.message_id.clone(),
+                phone_entry.message_id.clone()
+            ])
         );
+        assert_eq!(
+            laptop.ordered_author_message_ids(),
+            vec![laptop_entry.message_id, phone_entry.message_id]
+        );
+        assert_eq!(laptop.next_sequence_for_device(1, "laptop"), 2);
+        assert_eq!(laptop.next_sequence_for_device(1, "phone"), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn author_log_rejects_sequence_forks_without_overwrite() -> Result<(), AuthorLogError> {
+        let mut store = LocalStore::default();
+        let original = AuthorLogEntry::new_stable(1, "laptop", 1, 5, b"ciphertext-a".to_vec());
+        store.append_sent(original.clone())?;
+
+        let fork = AuthorLogEntry::new_stable(1, "laptop", 1, 5, b"ciphertext-b".to_vec());
+        assert_eq!(
+            store.append_sent(fork),
+            Err(AuthorLogError::SequenceFork {
+                author_leaf: 1,
+                device_id: "laptop".to_owned(),
+                sequence: 1
+            })
+        );
+        assert_eq!(store.author_log_snapshot(), vec![original]);
+        Ok(())
+    }
+
+    #[test]
+    fn author_log_rejects_message_id_reuse_at_different_position() -> Result<(), AuthorLogError> {
+        let mut store = LocalStore::default();
+        let original =
+            AuthorLogEntry::new(1, "laptop", 1, 5, "stable-id", b"ciphertext-a".to_vec());
+        let reused = AuthorLogEntry::new(1, "phone", 1, 5, "stable-id", b"ciphertext-b".to_vec());
+        store.append_sent(original.clone())?;
+
+        assert_eq!(
+            store.merge_author_logs([reused]),
+            Err(AuthorLogError::MessageIdReused {
+                message_id: "stable-id".to_owned()
+            })
+        );
+        assert_eq!(store.author_log_snapshot(), vec![original]);
+        Ok(())
     }
 
     #[test]
