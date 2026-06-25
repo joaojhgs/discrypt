@@ -32,6 +32,7 @@ Planned local commands:
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test -p discrypt-transport --features mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter abuse_rate_limit_backoff -- --test-threads=1`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-abuse --lib -- -D warnings`
+- `RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-abuse --all-targets -- -D warnings`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo clippy -p discrypt-transport --lib -- -D warnings`
 - `git diff --check`
 

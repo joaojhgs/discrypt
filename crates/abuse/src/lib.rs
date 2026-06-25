@@ -542,8 +542,8 @@ mod tests {
     }
 
     #[test]
-    fn abuse_soak_covers_invite_reconnect_provider_and_relay_freeload() {
-        let report = run_abuse_soak(AbuseSoakConfig::default()).expect("soak report");
+    fn abuse_soak_covers_invite_reconnect_provider_and_relay_freeload() -> Result<(), AbuseError> {
+        let report = run_abuse_soak(AbuseSoakConfig::default())?;
         assert!(report.satisfies_per89());
         assert_eq!(report.metrics.invite_allowed_total, 3);
         assert_eq!(report.metrics.invite_rate_limited_total, 5);
@@ -568,20 +568,22 @@ mod tests {
                 AbuseDecision::FailClosed { reason } if reason == "retry_attempts_exhausted"
             )
         }));
+        Ok(())
     }
 
     #[test]
-    fn invalid_backoff_policy_fails_closed_before_use() {
+    fn invalid_backoff_policy_fails_closed_before_use() -> Result<(), AbuseError> {
         assert_eq!(
             AbuseBackoffPolicy::new(0, 1_000, 2, 4),
             Err(AbuseError::InvalidBackoffPolicy)
         );
-        let policy = AbuseBackoffPolicy::new(250, 500, 2, 2).expect("valid policy");
+        let policy = AbuseBackoffPolicy::new(250, 500, 2, 2)?;
         assert_eq!(
             policy.decision_for_attempt(3),
             Ok(AbuseDecision::FailClosed {
                 reason: "retry_attempts_exhausted".to_owned()
             })
         );
+        Ok(())
     }
 }
