@@ -21,6 +21,7 @@ ipfs-pubsub-adapter = ["production-network", "dep:libp2p", "dep:hex"]
 discrypt-quic-rendezvous-adapter = ["production-network", "dep:ureq", "dep:hex"]
 
 [dependencies]
+discrypt-storage = { path = "../storage", version = "0.1.0" }
 rand = { workspace = true }
 aes-gcm = { workspace = true }
 chrono = { workspace = true }
