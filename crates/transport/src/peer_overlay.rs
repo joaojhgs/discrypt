@@ -1420,6 +1420,96 @@ pub struct PeerOverlayForwardingPlan {
     pub decrypt_path_exposed: bool,
 }
 
+/// Status of a prior redelivery attempt for replay-window checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerOverlayRedeliveryAttemptStatus {
+    /// Attempt was emitted and is still waiting for destination acknowledgement.
+    InFlight,
+    /// Attempt failed without a destination acknowledgement.
+    Failed,
+    /// Destination acknowledgement was authenticated for this ack/loop/sequence.
+    Acked,
+}
+
+/// Bounded replay-window evidence for one prior redelivery attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRedeliveryAttemptEvidence {
+    /// Ack id correlated with the destination acknowledgement.
+    pub ack_id: PeerOverlayAckId,
+    /// Loop id correlated with duplicate/loop suppression.
+    pub loop_id: PeerOverlayLoopId,
+    /// Protected payload sequence.
+    pub sequence: u64,
+    /// One-based attempt number emitted by the sender/runtime.
+    pub attempt_number: u8,
+    /// Current attempt outcome.
+    pub status: PeerOverlayRedeliveryAttemptStatus,
+}
+
+/// Backend/runtime evidence that a relay should be excluded from failover.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRelayFailureEvidence {
+    /// Failed relay peer.
+    pub relay: PeerOverlayPeerRef,
+    /// Runtime-observed failure timestamp in milliseconds.
+    pub observed_at_ms: u64,
+    /// Redacted route/session label from backend route evidence.
+    pub route_label: String,
+}
+
+/// Inputs to redelivery route failover for one protected overlay frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRedeliveryFailoverInput {
+    /// Already protected frame being redelivered.
+    pub frame: PeerOverlayFrame,
+    /// Runtime evidence for relays killed or otherwise unavailable.
+    pub failed_relays: Vec<PeerOverlayRelayFailureEvidence>,
+    /// Direct pair route evidence available after failure, if any.
+    pub direct_pair: Option<PeerOverlayRouteLegEvidence>,
+    /// Configured TURN pair route evidence available after failure, if any.
+    pub configured_turn_pair: Option<PeerOverlayRouteLegEvidence>,
+    /// Ranked relay candidates before failed-relay exclusion.
+    pub ranked_relays: Vec<PeerOverlayRankedRelayCandidate>,
+    /// Two-leg relay route evidence before failed-relay exclusion.
+    pub relay_routes: Vec<PeerOverlayRelayRouteEvidence>,
+    /// Prior attempts for replay-window checks.
+    pub prior_attempts: Vec<PeerOverlayRedeliveryAttemptEvidence>,
+    /// One-based attempt number for this redelivery.
+    pub next_attempt_number: u8,
+    /// Sender/runtime wall-clock timestamp in milliseconds.
+    pub now_ms: u64,
+    /// Maximum acceptable reroute age after failure observation.
+    pub target_reroute_ms: u64,
+}
+
+/// Redelivery/failover plan with route and payload preservation evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerOverlayRedeliveryFailoverPlan {
+    /// One-based attempt number for this redelivery.
+    pub attempt_number: u8,
+    /// Selected replacement route.
+    pub route_selection: PeerOverlayRouteSelection,
+    /// Opaque forwarding plan when the replacement route is peer-assisted.
+    pub forwarding_plan: Option<PeerOverlayForwardingPlan>,
+    /// Ack id preserved from the original protected frame.
+    pub preserved_ack_id: PeerOverlayAckId,
+    /// Loop id preserved from the original protected frame.
+    pub preserved_loop_id: PeerOverlayLoopId,
+    /// Protected payload sequence preserved from the original frame.
+    pub preserved_sequence: u64,
+    /// Payload kind preserved from the original frame.
+    pub preserved_payload_kind: PeerOverlayPayloadKind,
+    /// Evidence flag: the protected payload remains available for redelivery.
+    pub protected_frame_retained: bool,
+    /// Evidence flag: no provider application relay was selected.
+    pub provider_application_relay_used: bool,
+    /// Evidence flag: route selection occurred inside the caller's target.
+    pub rerouted_within_target_ms: bool,
+    /// Honest limitation for release evidence and UI consumers.
+    pub limitation: String,
+}
+
 /// Build the opaque forwarding envelopes for an already protected overlay frame.
 ///
 /// This function is intentionally content-blind: it validates admission,
@@ -1492,6 +1582,171 @@ pub fn build_peer_overlay_forwarding_plan(
         provider_application_relay_used: false,
         decrypt_path_exposed: false,
     })
+}
+
+/// Plan redelivery after one or more relay failures.
+///
+/// The planner is content-blind and local-model only. It validates the original
+/// frame and relay authority, rejects stale replay, excludes killed relays from
+/// route selection, and returns direct/TURN/peer-assisted replacement evidence
+/// without using providers as application relays.
+pub fn plan_peer_overlay_redelivery_failover(
+    admitted: &PeerOverlayAdmittedSet,
+    relay_authority: &PeerOverlayRelayAuthoritySet,
+    route_policy: &PeerOverlayRouteSelectionPolicy,
+    forwarding_policy: &PeerOverlayForwardingPolicy,
+    input: PeerOverlayRedeliveryFailoverInput,
+) -> Result<PeerOverlayRedeliveryFailoverPlan, TransportError> {
+    forwarding_policy.validate()?;
+    input
+        .frame
+        .validate_relay_authorized(admitted, relay_authority)?;
+    if input.frame.delivery.ack_mode != PeerOverlayAckMode::AckRequired {
+        return Err(overlay_policy_error(
+            "peer overlay redelivery failover requires destination ack mode",
+        ));
+    }
+    if input.next_attempt_number == 0 {
+        return Err(overlay_policy_error(
+            "peer overlay redelivery attempt number must be non-zero",
+        ));
+    }
+    if input.next_attempt_number > input.frame.delivery.redelivery.max_attempts {
+        return Err(overlay_policy_error(
+            "peer overlay redelivery attempt exceeds frame retry policy",
+        ));
+    }
+    if input.now_ms > input.frame.delivery.redelivery.deadline_ms
+        || input.now_ms > input.frame.route.ttl.expires_at_ms
+    {
+        return Err(overlay_policy_error(
+            "peer overlay redelivery deadline has expired",
+        ));
+    }
+    if input.failed_relays.is_empty() {
+        return Err(overlay_policy_error(
+            "peer overlay redelivery failover requires failed relay evidence",
+        ));
+    }
+    reject_stale_redelivery_replay(&input)?;
+
+    let mut failed_relay_ids = BTreeSet::new();
+    let mut rerouted_within_target_ms = true;
+    for failure in &input.failed_relays {
+        admitted.validate_ref(&failure.relay)?;
+        validate_label(
+            &failure.route_label,
+            "peer overlay failed relay route evidence label",
+        )?;
+        if failure.observed_at_ms < input.frame.route.ttl.created_at_ms {
+            return Err(overlay_policy_error(
+                "peer overlay failed relay evidence predates frame creation",
+            ));
+        }
+        if input.now_ms < failure.observed_at_ms {
+            return Err(overlay_policy_error(
+                "peer overlay redelivery time predates failure evidence",
+            ));
+        }
+        if input.now_ms.saturating_sub(failure.observed_at_ms) > input.target_reroute_ms {
+            rerouted_within_target_ms = false;
+        }
+        failed_relay_ids.insert(failure.relay.peer_id.clone());
+    }
+    if !rerouted_within_target_ms {
+        return Err(overlay_policy_error(
+            "peer overlay redelivery reroute exceeded target window",
+        ));
+    }
+
+    let ranked_relays = input
+        .ranked_relays
+        .into_iter()
+        .filter(|ranked| !failed_relay_ids.contains(&ranked.relay.peer_id))
+        .collect::<Vec<_>>();
+    let relay_routes = input
+        .relay_routes
+        .into_iter()
+        .filter(|route| !failed_relay_ids.contains(&route.relay.peer_id))
+        .collect::<Vec<_>>();
+
+    let route_selection = select_peer_overlay_route(
+        admitted,
+        &input.frame.auth,
+        route_policy,
+        PeerOverlayRouteSelectionInput {
+            source: input.frame.route.source.clone(),
+            destination: input.frame.route.destination.clone(),
+            direct_pair: input.direct_pair,
+            configured_turn_pair: input.configured_turn_pair,
+            ranked_relays,
+            relay_routes,
+        },
+    )?;
+
+    let forwarding_plan = match &route_selection.selected {
+        PeerOverlaySelectedRoute::PeerAssistedOverlay { relay, .. } => {
+            let mut replacement_frame = input.frame.clone();
+            replacement_frame.route.relay_path = vec![relay.clone()];
+            replacement_frame.carrier = PeerOverlayCarrier::PeerAssistedOverlay;
+            Some(build_peer_overlay_forwarding_plan(
+                admitted,
+                relay_authority,
+                forwarding_policy,
+                &replacement_frame,
+            )?)
+        }
+        PeerOverlaySelectedRoute::DirectWebRtc { evidence } => {
+            evidence.carrier.validate()?;
+            None
+        }
+        PeerOverlaySelectedRoute::ConfiguredTurnBackedWebRtc { evidence } => {
+            evidence.carrier.validate()?;
+            None
+        }
+    };
+
+    Ok(PeerOverlayRedeliveryFailoverPlan {
+        attempt_number: input.next_attempt_number,
+        route_selection,
+        forwarding_plan,
+        preserved_ack_id: input.frame.delivery.ack_id,
+        preserved_loop_id: input.frame.route.loop_id,
+        preserved_sequence: input.frame.payload.sequence,
+        preserved_payload_kind: input.frame.payload.kind,
+        protected_frame_retained: true,
+        provider_application_relay_used: false,
+        rerouted_within_target_ms,
+        limitation:
+            "local model redelivery/failover evidence only; not runtime delivery or production route proof"
+                .to_owned(),
+    })
+}
+
+fn reject_stale_redelivery_replay(
+    input: &PeerOverlayRedeliveryFailoverInput,
+) -> Result<(), TransportError> {
+    for attempt in &input.prior_attempts {
+        attempt.ack_id.validate()?;
+        attempt.loop_id.validate()?;
+        if attempt.ack_id != input.frame.delivery.ack_id
+            || attempt.loop_id != input.frame.route.loop_id
+            || attempt.sequence != input.frame.payload.sequence
+        {
+            continue;
+        }
+        if attempt.status == PeerOverlayRedeliveryAttemptStatus::Acked {
+            return Err(overlay_policy_error(
+                "peer overlay redelivery rejects replay after destination ack",
+            ));
+        }
+        if attempt.attempt_number >= input.next_attempt_number {
+            return Err(overlay_policy_error(
+                "peer overlay redelivery rejects stale non-increasing attempt replay",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_label(value: &str, label: &str) -> Result<(), TransportError> {
@@ -1639,6 +1894,17 @@ mod tests {
         })
     }
 
+    fn relay_failure(
+        relay: u8,
+        epoch: u64,
+    ) -> Result<PeerOverlayRelayFailureEvidence, TransportError> {
+        Ok(PeerOverlayRelayFailureEvidence {
+            relay: peer(relay, epoch)?,
+            observed_at_ms: 1_200,
+            route_label: format!("killed-relay-{relay}"),
+        })
+    }
+
     fn ranked_relay(
         epoch: u64,
         admitted: &PeerOverlayAdmittedSet,
@@ -1650,6 +1916,44 @@ mod tests {
             &auth(epoch),
             &PeerOverlayRelayCandidatePolicy::default(),
             [candidate(2, epoch, 12, 10, 0, 96_000, 8_000, 100, 0)?],
+        )
+    }
+
+    fn ranked_relays_for(
+        epoch: u64,
+        admitted: &PeerOverlayAdmittedSet,
+        relays: impl IntoIterator<Item = u8>,
+    ) -> Result<Vec<PeerOverlayRankedRelayCandidate>, TransportError> {
+        let relays = relays.into_iter().collect::<Vec<_>>();
+        let authority = relay_authority_for(
+            admitted,
+            relays
+                .iter()
+                .map(|relay| peer(*relay, epoch))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let candidates = relays
+            .iter()
+            .map(|relay| {
+                candidate(
+                    *relay,
+                    epoch,
+                    u32::from(*relay) * 10,
+                    10,
+                    0,
+                    192_000,
+                    8_000,
+                    100,
+                    0,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        rank_relay_candidates(
+            admitted,
+            &authority,
+            &auth(epoch),
+            &PeerOverlayRelayCandidatePolicy::default(),
+            candidates,
         )
     }
 
@@ -1880,6 +2184,232 @@ mod tests {
             &authority,
             &forwarding_policy(),
             &low_ttl,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn redelivery_failover_three_member_forced_relay_reroutes_to_direct_without_loss(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+        let authority = relay_authority(&admitted, epoch)?;
+        let frame = frame(epoch)?;
+
+        let plan = plan_peer_overlay_redelivery_failover(
+            &admitted,
+            &authority,
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            &forwarding_policy(),
+            PeerOverlayRedeliveryFailoverInput {
+                frame: frame.clone(),
+                failed_relays: vec![relay_failure(2, epoch)?],
+                direct_pair: Some(route_leg(
+                    1,
+                    3,
+                    epoch,
+                    PeerOverlayCarrier::DirectWebRtcDataChannel,
+                    true,
+                )?),
+                configured_turn_pair: None,
+                ranked_relays: ranked_relay(epoch, &admitted)?,
+                relay_routes: vec![relay_route(2, epoch)?],
+                prior_attempts: vec![PeerOverlayRedeliveryAttemptEvidence {
+                    ack_id: frame.delivery.ack_id,
+                    loop_id: frame.route.loop_id,
+                    sequence: frame.payload.sequence,
+                    attempt_number: 1,
+                    status: PeerOverlayRedeliveryAttemptStatus::Failed,
+                }],
+                next_attempt_number: 2,
+                now_ms: 1_500,
+                target_reroute_ms: 500,
+            },
+        )?;
+
+        assert!(matches!(
+            plan.route_selection.selected,
+            PeerOverlaySelectedRoute::DirectWebRtc { .. }
+        ));
+        assert!(plan.forwarding_plan.is_none());
+        assert_eq!(plan.preserved_ack_id, frame.delivery.ack_id);
+        assert_eq!(plan.preserved_loop_id, frame.route.loop_id);
+        assert_eq!(plan.preserved_sequence, frame.payload.sequence);
+        assert_eq!(plan.preserved_payload_kind, frame.payload.kind);
+        assert!(plan.protected_frame_retained);
+        assert!(!plan.provider_application_relay_used);
+        assert!(plan.rerouted_within_target_ms);
+        Ok(())
+    }
+
+    #[test]
+    fn redelivery_failover_excludes_killed_relay_and_forwards_with_alternate_relay(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = PeerOverlayAdmittedSet::new(
+            epoch,
+            [
+                peer(1, epoch)?,
+                peer(2, epoch)?,
+                peer(3, epoch)?,
+                peer(4, epoch)?,
+            ],
+            [],
+        )?;
+        let authority = relay_authority_for(&admitted, [peer(2, epoch)?, peer(4, epoch)?])?;
+        let frame = frame(epoch)?;
+
+        let plan = plan_peer_overlay_redelivery_failover(
+            &admitted,
+            &authority,
+            &PeerOverlayRouteSelectionPolicy {
+                configured_turn_order: PeerOverlayConfiguredTurnOrder::AfterPeerRelay,
+            },
+            &forwarding_policy(),
+            PeerOverlayRedeliveryFailoverInput {
+                frame: frame.clone(),
+                failed_relays: vec![relay_failure(2, epoch)?],
+                direct_pair: None,
+                configured_turn_pair: None,
+                ranked_relays: ranked_relays_for(epoch, &admitted, [2, 4])?,
+                relay_routes: vec![relay_route(2, epoch)?, relay_route(4, epoch)?],
+                prior_attempts: vec![PeerOverlayRedeliveryAttemptEvidence {
+                    ack_id: frame.delivery.ack_id,
+                    loop_id: frame.route.loop_id,
+                    sequence: frame.payload.sequence,
+                    attempt_number: 1,
+                    status: PeerOverlayRedeliveryAttemptStatus::Failed,
+                }],
+                next_attempt_number: 2,
+                now_ms: 1_400,
+                target_reroute_ms: 500,
+            },
+        )?;
+
+        match plan.route_selection.selected {
+            PeerOverlaySelectedRoute::PeerAssistedOverlay { relay, .. } => {
+                assert_eq!(relay, peer(4, epoch)?);
+            }
+            other => {
+                return Err(overlay_policy_error(format!(
+                    "unexpected failover route: {other:?}"
+                )));
+            }
+        }
+        let forwarding = plan
+            .forwarding_plan
+            .ok_or_else(|| overlay_policy_error("missing alternate relay forwarding plan"))?;
+        assert_eq!(forwarding.hops.len(), 2);
+        assert_eq!(forwarding.hops[0].to, peer(4, epoch)?);
+        assert_eq!(forwarding.hops[1].from, peer(4, epoch)?);
+        assert!(forwarding
+            .hops
+            .iter()
+            .all(|hop| hop.ack_id == frame.delivery.ack_id
+                && hop.loop_id == frame.route.loop_id
+                && hop.sequence == frame.payload.sequence));
+        assert!(!forwarding.provider_application_relay_used);
+        assert!(!forwarding.decrypt_path_exposed);
+        assert!(plan.protected_frame_retained);
+        Ok(())
+    }
+
+    #[test]
+    fn redelivery_failover_rejects_stale_replay_attempts() -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+        let authority = relay_authority(&admitted, epoch)?;
+        let frame = frame(epoch)?;
+        let base_input = PeerOverlayRedeliveryFailoverInput {
+            frame: frame.clone(),
+            failed_relays: vec![relay_failure(2, epoch)?],
+            direct_pair: Some(route_leg(
+                1,
+                3,
+                epoch,
+                PeerOverlayCarrier::DirectWebRtcDataChannel,
+                true,
+            )?),
+            configured_turn_pair: None,
+            ranked_relays: ranked_relay(epoch, &admitted)?,
+            relay_routes: vec![relay_route(2, epoch)?],
+            prior_attempts: vec![PeerOverlayRedeliveryAttemptEvidence {
+                ack_id: frame.delivery.ack_id,
+                loop_id: frame.route.loop_id,
+                sequence: frame.payload.sequence,
+                attempt_number: 2,
+                status: PeerOverlayRedeliveryAttemptStatus::Acked,
+            }],
+            next_attempt_number: 3,
+            now_ms: 1_500,
+            target_reroute_ms: 500,
+        };
+
+        assert!(plan_peer_overlay_redelivery_failover(
+            &admitted,
+            &authority,
+            &PeerOverlayRouteSelectionPolicy::default(),
+            &forwarding_policy(),
+            base_input.clone(),
+        )
+        .is_err());
+
+        let mut duplicate_attempt = base_input;
+        duplicate_attempt.prior_attempts[0].status = PeerOverlayRedeliveryAttemptStatus::Failed;
+        duplicate_attempt.next_attempt_number = 2;
+        assert!(plan_peer_overlay_redelivery_failover(
+            &admitted,
+            &authority,
+            &PeerOverlayRouteSelectionPolicy::default(),
+            &forwarding_policy(),
+            duplicate_attempt,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn redelivery_failover_preserves_no_provider_application_relay_boundary(
+    ) -> Result<(), TransportError> {
+        let epoch = 9;
+        let admitted = admitted(epoch)?;
+        let authority = relay_authority(&admitted, epoch)?;
+        let frame = frame(epoch)?;
+
+        let mut provider_leg = route_leg(
+            1,
+            3,
+            epoch,
+            PeerOverlayCarrier::DirectWebRtcDataChannel,
+            true,
+        )?;
+        provider_leg.carrier = PeerOverlayCarrier::ProviderApplicationRelay;
+        assert!(plan_peer_overlay_redelivery_failover(
+            &admitted,
+            &authority,
+            &PeerOverlayRouteSelectionPolicy::default(),
+            &forwarding_policy(),
+            PeerOverlayRedeliveryFailoverInput {
+                frame: frame.clone(),
+                failed_relays: vec![relay_failure(2, epoch)?],
+                direct_pair: Some(provider_leg),
+                configured_turn_pair: None,
+                ranked_relays: ranked_relay(epoch, &admitted)?,
+                relay_routes: vec![relay_route(2, epoch)?],
+                prior_attempts: vec![PeerOverlayRedeliveryAttemptEvidence {
+                    ack_id: frame.delivery.ack_id,
+                    loop_id: frame.route.loop_id,
+                    sequence: frame.payload.sequence,
+                    attempt_number: 1,
+                    status: PeerOverlayRedeliveryAttemptStatus::Failed,
+                }],
+                next_attempt_number: 2,
+                now_ms: 1_500,
+                target_reroute_ms: 500,
+            },
         )
         .is_err());
         Ok(())
