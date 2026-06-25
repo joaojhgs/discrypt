@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-25T14:20:08.535Z",
+  "updatedAt": "2026-06-25T14:56:00.095Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -285,6 +285,17 @@
       "updatedAt": "2026-06-25T14:20:08.535Z",
       "evidence": "PER-79/P9-T05 implemented and verified. Files: crates/content-keys/src/lib.rs, crates/storage/src/lib.rs, .omx/plans/P9-T05-crypto-shred-tombstones-2026-06-25.md, docs/release/per79-crypto-shred-tombstones-2026-06-25.md. Passed: cargo test -p discrypt-content-keys shred; cargo test -p discrypt-storage crypto_shred; cargo test -p discrypt-storage secure_delete_removes_material_and_snapshot_restores_on_failed_verify; full content-keys and storage crate tests; cargo fmt --check; clippy for content-keys/storage; git diff --check. Evidence is local Rust content-key/storage model evidence, not production split-machine multi-device/release readiness.",
       "completedAt": "2026-06-25T14:20:08.535Z"
+    },
+    {
+      "id": "G027-per-80-p9-t06-multi-device-identity",
+      "title": "PER-80 P9-T06 multi-device identity",
+      "objective": "Implement and verify PER-80 multi-device identity: existing-device-authorized second device as its own OpenMLS leaf, backend transparency notice, remove/rekey denial, persisted two-device profile harness evidence, and QA handoff without broadening into backup/recovery or release readiness.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-25T14:52:24.829Z",
+      "updatedAt": "2026-06-25T14:56:00.095Z",
+      "evidence": "PER-80 multi-device identity implemented: OpenMLS member_labels backend evidence helper; two-device profile harness proves signed existing-device pairing, second device own OpenMLS leaf via Welcome, persisted reload, transparency events, remove/rekey exporter rotation, and removed-device post-removal commit denial. Verification passed: targeted PER-80 harness, full discrypt-mls-core tests, cargo fmt --check, clippy -p discrypt-mls-core, git diff --check.",
+      "completedAt": "2026-06-25T14:56:00.095Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
