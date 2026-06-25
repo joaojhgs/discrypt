@@ -1039,7 +1039,7 @@ mod tests {
         store.save_app_state(&serde_json::to_vec(&state)?)?;
         let bytes = store
             .load_app_state()?
-            .ok_or_else(|| AppStoreError::Crypto("missing app state after save"))?;
+            .ok_or(AppStoreError::Crypto("missing app state after save"))?;
         let reloaded: AppState = serde_json::from_slice(&bytes)?;
 
         assert_eq!(
