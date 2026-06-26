@@ -1082,6 +1082,25 @@ pub struct CommandErrorLogEntry {
     pub redacted_context: BTreeMap<String, String>,
 }
 
+/// Structured redacted panic log entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PanicLogEntry {
+    /// Stable log schema name.
+    pub schema: String,
+    /// Log level for downstream filtering.
+    pub level: String,
+    /// RFC3339 event timestamp.
+    pub timestamp: String,
+    /// Stable machine error code.
+    pub code: String,
+    /// Redacted panic payload summary.
+    pub message: String,
+    /// Recovery hint that avoids raw dumps and storage replacement.
+    pub recovery_hint: String,
+    /// Redacted structured context.
+    pub redacted_context: BTreeMap<String, String>,
+}
+
 /// Honest backend-derived transport/connectivity status for UI display.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransportStatusView {
@@ -2891,6 +2910,8 @@ enum PersistedSchemaVersion {
 }
 
 static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
+static LAST_PANIC_LOG: OnceLock<Mutex<Option<PanicLogEntry>>> = OnceLock::new();
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
 static STORAGE_UNLOCK: OnceLock<Mutex<ProductionStorageUnlockState>> = OnceLock::new();
@@ -4265,6 +4286,7 @@ pub fn export_diagnostics_log() -> String {
         "last_command_error": &view.last_command_error,
         "structured_logs": {
             "last_command_error": view.last_command_error.as_ref().map(command_error_log_entry),
+            "last_panic": latest_panic_log_entry(),
         },
         "events": &view.events,
         "groups": groups,
@@ -8979,6 +9001,7 @@ mod ipc_commands {
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_discrypt_panic_hook();
     tauri::Builder::<tauri::Wry>::default()
         .setup(|app| {
             enable_platform_webview_voice_features(app)?;
@@ -14584,6 +14607,92 @@ fn command_error_log_entry(error: &CommandErrorView) -> CommandErrorLogEntry {
     }
 }
 
+fn last_panic_log() -> &'static Mutex<Option<PanicLogEntry>> {
+    LAST_PANIC_LOG.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg_attr(not(feature = "tauri-runtime"), allow(dead_code))]
+fn install_discrypt_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        std::panic::set_hook(Box::new(|info| {
+            record_panic_hook_info(info);
+        }));
+    });
+}
+
+fn record_panic_hook_info(info: &std::panic::PanicHookInfo<'_>) {
+    let entry = panic_log_entry_from_parts(
+        panic_payload_summary(info.payload()),
+        info.location()
+            .map(|location| (location.file(), location.line(), location.column())),
+    );
+    eprintln!("{}", structured_panic_log_line(&entry));
+    *last_panic_log()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
+}
+
+fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non_string_panic_payload".to_owned()
+    }
+}
+
+fn panic_log_entry_from_parts(
+    message: impl Into<String>,
+    location: Option<(&str, u32, u32)>,
+) -> PanicLogEntry {
+    let mut context = BTreeMap::new();
+    context.insert("component".to_owned(), "panic_hook".to_owned());
+    context.insert(
+        "backtrace".to_owned(),
+        "omitted_redacted_boundary".to_owned(),
+    );
+    if let Some((file, line, column)) = location {
+        context.insert(
+            "source_file_ref".to_owned(),
+            redacted_observable_ref("source_file", file),
+        );
+        context.insert("source_line".to_owned(), line.to_string());
+        context.insert("source_column".to_owned(), column.to_string());
+    } else {
+        context.insert("source_location".to_owned(), "unavailable".to_owned());
+    }
+
+    PanicLogEntry {
+        schema: "discrypt.panic.v1".to_owned(),
+        level: "fatal".to_owned(),
+        timestamp: default_command_error_timestamp(),
+        code: "panic_redacted".to_owned(),
+        message: redact_sensitive_observable_copy(message),
+        recovery_hint: "Preserve the existing Discrypt data directory and redacted diagnostics; do not paste raw store dumps, keyring/vault material, OpenMLS payloads, SDP/ICE/TURN credentials, or plaintext into support reports.".to_owned(),
+        redacted_context: redact_command_error_context(context),
+    }
+}
+
+fn structured_panic_log_line(entry: &PanicLogEntry) -> String {
+    serde_json::to_string(entry).unwrap_or_else(|json_error| {
+        format!(
+            "{{\"schema\":\"discrypt.panic.v1\",\"level\":\"fatal\",\"timestamp\":\"{}\",\"code\":\"panic_redacted\",\"message\":\"{}\",\"recovery_hint\":\"{}\",\"redacted_context\":{{\"serialization\":\"{}\"}}}}",
+            entry.timestamp,
+            redact_sensitive_observable_copy(&entry.message),
+            redact_sensitive_observable_copy(&entry.recovery_hint),
+            redact_sensitive_observable_copy(json_error.to_string())
+        )
+    })
+}
+
+fn latest_panic_log_entry() -> Option<PanicLogEntry> {
+    last_panic_log()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 fn storage_diagnostic_report_view(
     storage: &StorageSecurityView,
     last_error: Option<&CommandErrorView>,
@@ -15198,6 +15307,9 @@ fn sensitive_observable_classes(value: &str) -> Vec<&'static str> {
         ("serialized key package", "mls_key_package"),
         ("key package bytes", "mls_key_package"),
         ("epoch secret", "mls_key"),
+        ("raw store dump", "raw_store_dump"),
+        ("store dump", "raw_store_dump"),
+        ("app-state.discrypt-store", "raw_store_dump"),
         ("raw member", "member_identifier"),
         ("raw-member", "member_identifier"),
         ("production-ready", "fake_production_label"),
@@ -35262,6 +35374,114 @@ mod tests {
                 "diagnostics artifact leaked {forbidden_value}: {diagnostics}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn crash_panic_hygiene_forced_panic_is_redacted_in_logs_and_bundle() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("crash-panic-hygiene");
+
+        *last_panic_log()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        let forbidden = [
+            "provider credential per95-provider",
+            "Bearer per95-token",
+            "api key per95-api",
+            "vault passphrase per95-vault",
+            "vault password per95-password",
+            "private key per95-private",
+            "v=0\r\na=ice-ufrag:per95-ufrag\r\na=ice-pwd:per95-ice",
+            "candidate:per95-candidate",
+            "turn credential per95-turn",
+            "plaintext message per95-body",
+            "audio plaintext per95-audio",
+            "sframe key per95-media",
+            "content key per95-content",
+            "mls exporter per95-exporter",
+            "mls epoch secret per95-epoch",
+            "Welcome payload per95-welcome",
+            "OpenMLS Welcome bytes per95-openmls-welcome",
+            "serialized key package per95-key-package",
+            "raw-member-id per95-member",
+            "profile name per95-profile",
+            "raw store dump per95-store-dump",
+        ];
+        let panic_payload = forbidden.join(" | ");
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            record_panic_hook_info(info);
+        }));
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("{panic_payload}");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(panic_result.is_err());
+
+        let entry = latest_panic_log_entry().ok_or_else(|| "panic log missing".to_owned())?;
+        DateTime::parse_from_rfc3339(&entry.timestamp).map_err(|err| err.to_string())?;
+        assert_eq!(entry.schema, "discrypt.panic.v1");
+        assert_eq!(entry.level, "fatal");
+        assert_eq!(entry.code, "panic_redacted");
+        assert!(entry.message.contains("redacted sensitive observable copy"));
+        assert!(entry.redacted_context.contains_key("source_file_ref"));
+        assert!(entry.redacted_context.contains_key("source_line"));
+        assert!(entry
+            .redacted_context
+            .values()
+            .any(|value| value == "omitted_redacted_boundary"));
+
+        let line = structured_panic_log_line(&entry);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        assert_eq!(parsed["schema"], "discrypt.panic.v1");
+        assert_eq!(parsed["code"], "panic_redacted");
+        assert_eq!(
+            parsed["redacted_context"]["backtrace"],
+            "omitted_redacted_boundary"
+        );
+
+        let diagnostics = export_diagnostics_log();
+        let diagnostics_json: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|err| err.to_string())?;
+        assert_eq!(
+            diagnostics_json["structured_logs"]["last_panic"]["schema"],
+            "discrypt.panic.v1"
+        );
+        assert_eq!(
+            diagnostics_json["structured_logs"]["last_panic"]["code"],
+            "panic_redacted"
+        );
+
+        let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("target/per95-crash-panic-hygiene");
+        std::fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
+        let artifact = artifact_dir.join("panic-diagnostics-log.json");
+        std::fs::write(&artifact, &diagnostics).map_err(|err| err.to_string())?;
+
+        for forbidden_value in forbidden {
+            assert!(
+                !line.contains(forbidden_value),
+                "structured panic log leaked {forbidden_value}: {line}"
+            );
+            assert!(
+                !diagnostics.contains(forbidden_value),
+                "diagnostics artifact leaked {forbidden_value}: {diagnostics}"
+            );
+        }
+        assert!(
+            !line.contains("app-state.discrypt-store"),
+            "structured panic log must not include raw store file names: {line}"
+        );
+        assert!(
+            !diagnostics.contains("app-state.discrypt-store"),
+            "diagnostics artifact must not include raw store file names: {diagnostics}"
+        );
+
         Ok(())
     }
 
