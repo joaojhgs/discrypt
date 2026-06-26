@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-26T01:49:11.396Z",
+  "updatedAt": "2026-06-26T02:17:43.116Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -455,6 +455,16 @@
       "createdAt": "2026-06-26T01:49:11.396Z",
       "updatedAt": "2026-06-26T01:49:11.396Z",
       "evidence": "PER-97 issue metadata and local plan .omx/plans/P12-T02-tauri-webdriver-integrated-two-profile-2026-06-26.md"
+    },
+    {
+      "id": "G043-per-98-p12-t03-tauri-launcher-bounda",
+      "title": "PER-98 P12-T03 Tauri launcher boundary",
+      "objective": "Harden scripts/g012-tauri-two-profile-e2e.mjs so launch-only evidence cannot be reported as production success, delegated WebDriver evidence is explicit, deterministic manifest checks cover dry-run/preflight/launch/delegated/action-driven boundaries, and PR/QA handoff evidence is produced without broadening into split-machine or provider matrix work.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-06-26T02:17:43.116Z",
+      "updatedAt": "2026-06-26T02:17:43.116Z",
+      "evidence": "Issue PER-98 metadata and launcher inspection: scripts/g012-tauri-two-profile-e2e.mjs currently reports launch-smoke-passed with integrated_e2e_status not_proven_by_launch_smoke; PER-97 integrated harness provides separate WebDriver action proof contract."
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
