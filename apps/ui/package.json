@@ -88,6 +88,7 @@
     "test:p1-t04-dev-prod-storage": "node ../../scripts/check-dev-prod-storage-separation-p1-t04.mjs",
     "test:p1-t06-storage-recovery-roadmap": "node ../../scripts/check-storage-recovery-roadmap-p1-t06.mjs",
     "test:p12-t02-tauri-webdriver-integrated": "node ../../scripts/check-p12-t02-tauri-webdriver-integrated.mjs",
+    "test:p12-t05-public-mqtt-split-machine-matrix": "node ../../scripts/check-p12-t05-public-mqtt-split-machine-matrix.mjs",
     "g012:tauri-two-profile-e2e": "node ../../scripts/g012-tauri-two-profile-e2e.mjs",
     "test:g012-tauri-two-profile-e2e": "node ../../scripts/check-g012-tauri-two-profile-e2e.mjs"
   },
