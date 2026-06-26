@@ -1,7 +1,7 @@
 {
   "version": 1,
   "createdAt": "2026-06-20T09:05:41.772Z",
-  "updatedAt": "2026-06-26T03:59:24.181Z",
+  "updatedAt": "2026-06-26T04:45:59.005Z",
   "briefPath": ".omx/ultragoal/brief.md",
   "goalsPath": ".omx/ultragoal/goals.json",
   "ledgerPath": ".omx/ultragoal/ledger.jsonl",
@@ -487,6 +487,17 @@
       "updatedAt": "2026-06-26T03:59:24.181Z",
       "evidence": "PER-100/P12-T05 public MQTT matrix complete on branch multica/P12-T05-public-mqtt-split-machine-matrix with draft PR https://github.com/joaojhgs/discrypt/pull/100. Added plan, release report, release matrix row, npm static checker, and local MQTT app-flow substitute artifacts. Verification passed: cargo fmt --check; cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness --example g009_split_machine_app_flow; G009 local-pair run with --adapter mqtt wrote target/per100-public-mqtt-split-machine-matrix/local-pair.json plus owner/joiner artifacts; npm --prefix apps/ui run test:p12-t05-public-mqtt-split-machine-matrix; git diff --check. SSH split-machine promotion remains blocked in this runtime by no configured DISCRYPT_G009_SSH_TARGET/DISCRYPT_PER100_SSH_TARGET.",
       "completedAt": "2026-06-26T03:59:24.181Z"
+    },
+    {
+      "id": "G046-per-101-p12-t06-public-nostr-split-m",
+      "title": "PER-101 P12-T06 public Nostr split-machine matrix",
+      "objective": "Produce PER-101/P12-T06 public Nostr split-machine matrix planning, verification docs, local Nostr app-flow substitute evidence, and QA handoff. Preserve OpenMLS/admission truth, direct/TURN WebRTC route proof boundaries, route-gated presence, and Nostr signaling-only/no application relay policy; do not broaden into MQTT, overlay, packaging, or production-ready release decisions.",
+      "status": "complete",
+      "attempt": 0,
+      "createdAt": "2026-06-26T04:41:06.656Z",
+      "updatedAt": "2026-06-26T04:45:59.005Z",
+      "evidence": "PER-101/P12-T06 public Nostr matrix complete locally on branch multica/P12-T06-public-nostr-split-machine-matrix. Added plan, release report, release matrix row, npm static checker, and local Nostr app-flow substitute artifacts. Verification passed: cargo fmt --check; cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness --example g009_split_machine_app_flow; G009 local-pair run with --adapter nostr wrote target/per101-public-nostr-split-machine-matrix/local-pair.json plus owner/joiner artifacts; npm --prefix apps/ui run test:p12-t06-public-nostr-split-machine-matrix; git diff --check. SSH split-machine promotion remains blocked in this runtime by no configured DISCRYPT_G009_SSH_TARGET/DISCRYPT_PER101_SSH_TARGET.",
+      "completedAt": "2026-06-26T04:45:59.005Z"
     }
   ],
   "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail."
