@@ -15192,8 +15192,11 @@ fn sensitive_observable_classes(value: &str) -> Vec<&'static str> {
         ("mls exporter", "mls_key"),
         ("welcome payload", "mls_welcome"),
         ("welcome bytes", "mls_welcome"),
-        ("openmls welcome", "mls_welcome"),
-        ("key package", "mls_key_package"),
+        ("serialized welcome", "mls_welcome"),
+        ("serialized openmls welcome", "mls_welcome"),
+        ("openmls welcome bytes", "mls_welcome"),
+        ("serialized key package", "mls_key_package"),
+        ("key package bytes", "mls_key_package"),
         ("epoch secret", "mls_key"),
         ("raw member", "member_identifier"),
         ("raw-member", "member_identifier"),
@@ -35478,6 +35481,42 @@ mod tests {
     #[test]
     fn mls_admission_diagnostic_report_classifies_required_codes() -> Result<(), String> {
         let _guard = test_lock();
+
+        fn assert_actionable_mls_recovery_hint(
+            report: &MlsAdmissionDiagnosticReportView,
+            code: &str,
+            expected_hint_fragment: &str,
+        ) {
+            assert_eq!(report.code, code);
+            assert!(
+                !report
+                    .recovery_hint
+                    .contains("redacted sensitive observable copy"),
+                "{code} aggregate recovery hint was over-redacted: {report:?}"
+            );
+            assert!(
+                report.recovery_hint.contains(expected_hint_fragment),
+                "{code} aggregate recovery hint was not actionable: {}",
+                report.recovery_hint
+            );
+            let group = report
+                .groups
+                .iter()
+                .find(|group| group.code == code)
+                .unwrap_or_else(|| panic!("{code} per-group diagnostic missing: {report:?}"));
+            assert!(
+                !group
+                    .recovery_hint
+                    .contains("redacted sensitive observable copy"),
+                "{code} per-group recovery hint was over-redacted: {group:?}"
+            );
+            assert!(
+                group.recovery_hint.contains(expected_hint_fragment),
+                "{code} per-group recovery hint was not actionable: {}",
+                group.recovery_hint
+            );
+        }
+
         reset_with_temp_state("mls-admission-diagnostic-missing-handle");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
@@ -35504,8 +35543,12 @@ mod tests {
             .mls_admission_diagnostic_report
             .ok_or_else(|| "MLS/admission diagnostic report missing".to_owned())?;
         assert_eq!(report.schema, "discrypt.mls_admission_diagnostic.v1");
-        assert_eq!(report.code, "mls_missing_openmls_handle");
         assert!(report.fail_closed);
+        assert_actionable_mls_recovery_hint(
+            &report,
+            "mls_missing_openmls_handle",
+            "persisted OpenMLS group handle",
+        );
 
         reset_with_temp_state("mls-admission-diagnostic-pending");
         create_user(CreateUserRequest {
@@ -35534,7 +35577,7 @@ mod tests {
         let report = app_state()
             .mls_admission_diagnostic_report
             .ok_or_else(|| "pending MLS/admission diagnostic report missing".to_owned())?;
-        assert_eq!(report.code, "mls_admission_pending");
+        assert_actionable_mls_recovery_hint(&report, "mls_admission_pending", "owner/staff");
         assert!(
             report
                 .groups
@@ -35572,7 +35615,7 @@ mod tests {
         let report = app_state()
             .mls_admission_diagnostic_report
             .ok_or_else(|| "revoked MLS/admission diagnostic report missing".to_owned())?;
-        assert_eq!(report.code, "mls_member_revoked");
+        assert_actionable_mls_recovery_hint(&report, "mls_member_revoked", "revoked");
 
         reset_with_temp_state("mls-admission-diagnostic-welcome-missing");
         create_user(CreateUserRequest {
@@ -35622,7 +35665,11 @@ mod tests {
         let report = app_state()
             .mls_admission_diagnostic_report
             .ok_or_else(|| "Welcome-missing MLS/admission diagnostic report missing".to_owned())?;
-        assert_eq!(report.code, "mls_welcome_missing");
+        assert_actionable_mls_recovery_hint(
+            &report,
+            "mls_welcome_missing",
+            "authorized OpenMLS Welcome",
+        );
 
         mutate_app_service(|state| {
             state.last_command_error = Some(command_error_view(
@@ -35636,8 +35683,8 @@ mod tests {
         let report = app_state()
             .mls_admission_diagnostic_report
             .ok_or_else(|| "fork MLS/admission diagnostic report missing".to_owned())?;
-        assert_eq!(report.code, "mls_fork_mismatch");
         assert!(report.fail_closed);
+        assert_actionable_mls_recovery_hint(&report, "mls_fork_mismatch", "forked or replayed");
 
         Ok(())
     }
@@ -35700,6 +35747,30 @@ mod tests {
         assert_eq!(
             diagnostics_json["mls_admission_diagnostic_report"]["fail_closed"],
             true
+        );
+        let recovery_hint = diagnostics_json["mls_admission_diagnostic_report"]["recovery_hint"]
+            .as_str()
+            .ok_or_else(|| "MLS/admission support recovery hint missing".to_owned())?;
+        assert!(
+            recovery_hint.contains("authorized OpenMLS Welcome"),
+            "MLS/admission support recovery hint should stay actionable: {recovery_hint}"
+        );
+        assert!(
+            !recovery_hint.contains("redacted sensitive observable copy"),
+            "MLS/admission support recovery hint was over-redacted: {recovery_hint}"
+        );
+        let group_recovery_hint = diagnostics_json["mls_admission_diagnostic_report"]["groups"]
+            .as_array()
+            .and_then(|groups| groups.first())
+            .and_then(|group| group["recovery_hint"].as_str())
+            .ok_or_else(|| "MLS/admission per-group support recovery hint missing".to_owned())?;
+        assert!(
+            group_recovery_hint.contains("authorized OpenMLS Welcome"),
+            "MLS/admission per-group support recovery hint should stay actionable: {group_recovery_hint}"
+        );
+        assert!(
+            !group_recovery_hint.contains("redacted sensitive observable copy"),
+            "MLS/admission per-group support recovery hint was over-redacted: {group_recovery_hint}"
         );
 
         for forbidden in [
@@ -36359,8 +36430,8 @@ mod tests {
             "mls epoch secret g009",
             "mls exporter g009",
             "Welcome payload g009",
-            "OpenMLS Welcome g009",
-            "key package g009",
+            "OpenMLS Welcome bytes g009",
+            "serialized key package g009",
             "raw-member-id g009",
             "production-ready",
             "fake production label",

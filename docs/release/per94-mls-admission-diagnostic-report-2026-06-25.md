@@ -22,12 +22,23 @@ bundle.
 - Context uses redacted refs and low-cardinality counts rather than raw group
   ids, raw member ids, Welcome payloads, key packages, exporter/epoch secrets,
   provider credentials, or private keys.
+- Recovery hints remain actionable static guidance in app state and diagnostics
+  export; conceptual references to an OpenMLS Welcome are not treated as secret
+  payload material.
 
 ## Verification
 
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib mls_admission_diagnostic_report -- --test-threads=1 --nocapture`
+- `RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib g010_native_command_e2e_setup_group_invite_text_voice_is_honest -- --test-threads=1 --nocapture`
+- `RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib g009_observable_copy_redacts_sensitive_classes -- --test-threads=1 --nocapture`
+- `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
+- `npm --prefix apps/ui run typecheck`
+- `git diff --check`
 
-Result: passed locally, 2 tests.
+Result: passed locally. The regenerated diagnostics artifact reports
+`mls_welcome_missing`, `fail_closed=true`, and keeps the aggregate and per-group
+recovery hint as `Refresh owner/staff admission delivery and require an
+authorized OpenMLS Welcome before marking the joiner admitted.`
 
 Artifact:
 
