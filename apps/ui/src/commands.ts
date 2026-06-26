@@ -648,6 +648,7 @@ export type AppState = {
   lifecycle: AppLifecycle;
   storage_security: StorageSecurityView;
   storage_diagnostic_report: StorageDiagnosticReportView | null;
+  mls_admission_diagnostic_report: MlsAdmissionDiagnosticReportView | null;
   profile: UserProfileView | null;
   preferences: PreferencesView;
   dms: DirectConversationView[];
@@ -706,6 +707,30 @@ export type StorageDiagnosticReportView = {
   production_storage: boolean;
   recovery_hint: string;
   redacted_context: Record<string, string>;
+};
+
+export type MlsAdmissionGroupDiagnosticView = {
+  group_ref: string;
+  code: string;
+  failure_class: string;
+  fail_closed: boolean;
+  local_role: string;
+  local_member_status: string;
+  openmls_handle_present: boolean;
+  openmls_handle_ref?: string | null;
+  recovery_hint: string;
+  redacted_context: Record<string, string>;
+};
+
+export type MlsAdmissionDiagnosticReportView = {
+  schema: string;
+  timestamp: string;
+  code: string;
+  failure_class: string;
+  fail_closed: boolean;
+  recovery_hint: string;
+  redacted_context: Record<string, string>;
+  groups: MlsAdmissionGroupDiagnosticView[];
 };
 
 export type ConfigureStorageSecurityRequest = {
@@ -1392,6 +1417,21 @@ const fallbackState: AppState = {
       production_storage: "false",
     },
   },
+  mls_admission_diagnostic_report: {
+    schema: "discrypt.mls_admission_diagnostic.v1",
+    timestamp: new Date(0).toISOString(),
+    code: "mls_admission_ready",
+    failure_class: "mls_admission_ready",
+    fail_closed: false,
+    recovery_hint:
+      "Packaged Tauri diagnostics provide backend OpenMLS/admission evidence.",
+    redacted_context: {
+      component: "mls_admission",
+      group_count: "0",
+      openmls_handle_count: "0",
+    },
+    groups: [],
+  },
   profile: null,
   preferences: fallbackSnapshot.preferences,
   dms: [],
@@ -1668,6 +1708,21 @@ function persistFallbackState(): void {
 function syncSnapshot(state: AppState): AppState {
   normalizeVoiceSessionRuntime(state);
   ensureGroupGovernanceDefaults(state);
+  state.mls_admission_diagnostic_report ??= {
+    schema: "discrypt.mls_admission_diagnostic.v1",
+    timestamp: new Date(0).toISOString(),
+    code: "mls_admission_ready",
+    failure_class: "mls_admission_ready",
+    fail_closed: false,
+    recovery_hint:
+      "Packaged Tauri diagnostics provide backend OpenMLS/admission evidence.",
+    redacted_context: {
+      component: "mls_admission",
+      group_count: String(state.groups.length),
+      openmls_handle_count: "0",
+    },
+    groups: [],
+  };
   state.preferences.voice_input_device_id ||= "default";
   state.preferences.voice_output_device_id ||= "default";
   state.preferences.mic_gain_percent = clampPercent(
@@ -3500,6 +3555,7 @@ export async function exportDiagnosticsLog(): Promise<string> {
         lifecycle: state.lifecycle,
         storage_security: state.storage_security,
         storage_diagnostic_report: state.storage_diagnostic_report,
+        mls_admission_diagnostic_report: state.mls_admission_diagnostic_report,
         runtime_mode: state.runtime_mode,
         active_context: state.active_context,
         transport_status: state.transport_status,
