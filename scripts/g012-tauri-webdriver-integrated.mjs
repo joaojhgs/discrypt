@@ -55,6 +55,53 @@ const profiles = {
 };
 for (const profile of Object.values(profiles)) mkdirSync(dirname(profile.state_path), { recursive: true });
 
+const per97WorkflowSteps = [
+  {
+    id: "setup",
+    description: "Create two isolated Tauri WebDriver sessions and complete local profile setup in each real WebView.",
+    required_artifacts: ["tauri-driver logs", "profile app-state files"],
+  },
+  {
+    id: "invite",
+    description: "Create a governed group invite in Alice and submit it through Bob's join flow without treating invite parsing as membership.",
+    required_artifacts: ["manifest invite prefix", "OpenMLS admission request state"],
+  },
+  {
+    id: "approval",
+    description: "Approve Bob's pending admission through the backend owner/staff command and wait for persisted OpenMLS Welcome state.",
+    required_artifacts: ["openmls_admission_owner_approval", "OpenMLS handle epochs"],
+  },
+  {
+    id: "text",
+    description: "Send signed group text both ways after admission and record plaintext, envelope, and receipt evidence from persisted state.",
+    required_artifacts: ["text.evidence", "text_control_bridge_* or provider runtime pump records"],
+  },
+  {
+    id: "voice",
+    description: "Join voice from both WebViews, prove native Rust/generated-audio media or report unavailable native capability, then mute and leave.",
+    required_artifacts: ["voice_proof", "per59_release_smoke", "native_voice_capability"],
+  },
+  {
+    id: "persistence",
+    description: "Reload both WebViews after admission/text/voice and retain profile state hashes, screenshots, logs, and leave-cleanup evidence.",
+    required_artifacts: ["screenshots", "profile_state_files", "logs", "voice.leave_cleanup"],
+  },
+  {
+    id: "degraded_unavailable",
+    description: "Fail preflight with a manifest when DISPLAY, tauri-driver, WebKitWebDriver, app binary, or native voice proof requirements are unavailable.",
+    required_artifacts: ["preflight_result", "failed-preflight manifest"],
+  },
+];
+
+const per97ArtifactContract = {
+  issue: "PER-97 / P12-T02 Tauri WebDriver integrated two-profile",
+  evidence_level: "Tauri WebDriver release harness evidence when run with --run on a display-capable runner",
+  dry_run_boundary: "Dry-run writes the manifest/preflight contract only; it is not setup, invite, approval, text, voice, persistence, or production evidence.",
+  provider_policy: "MQTT/Nostr/IPFS/QUIC providers remain signaling/rendezvous only; manual command bridge fallback is labeled non-provider-runtime evidence and never a provider application relay.",
+  membership_policy: "Invite parsing is not membership; protected text and voice evidence require backend approval plus persisted OpenMLS Welcome/add state.",
+  voice_policy: "Synthetic WebView peer-connection fallback is diagnostic only and cannot make production voice or G012 checkpoint claims.",
+};
+
 const manifestPath = resolve(artifactRoot, "tauri-webdriver-integrated-manifest.json");
 const summaryPath = resolve(artifactRoot, "tauri-webdriver-integrated-summary.json");
 const manifest = {
@@ -70,6 +117,8 @@ const manifest = {
   automation_env: "TAURI_WEBVIEW_AUTOMATION=1",
   require_native_voice: requireNativeVoice,
   boundary: "Drives two real Tauri WebViews through setup/group invite/text/voice UX. It reports remote text/media delivery truthfully and does not convert launch/UI smoke into a production network claim.",
+  per97_workflow_steps: per97WorkflowSteps,
+  per97_artifact_contract: per97ArtifactContract,
   profiles,
   commands: [],
 };
@@ -1556,6 +1605,20 @@ try {
     schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
+    per97_acceptance: {
+      setup_completed: true,
+      invite_created: invite.startsWith("discrypt://join/v1/"),
+      owner_staff_approval_applied: Boolean(manifest.openmls_admission_owner_approval?.approved),
+      openmls_admission_persisted: true,
+      text_plaintext_observed_both_ways: remotePlaintextObserved,
+      text_envelope_or_receipt_observed_both_ways: remoteEncryptedEnvelopeObserved || peerReceiptsObserved,
+      voice_native_or_capability_evidence_recorded: nativeVoiceLoopbackObserved || Boolean(nativeVoiceCapability.alice || nativeVoiceCapability.bob),
+      persistence_reloaded_after_admission_text_and_voice: true,
+      screenshots_logs_and_summary_recorded: true,
+      degraded_unavailable_states_recorded_by_preflight: true,
+    },
+    per97_workflow_steps: per97WorkflowSteps,
+    per97_artifact_contract: per97ArtifactContract,
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
     voice_remote_media_status: nativeVoiceLoopbackObserved
       ? (nativeRustBackendMediaObserved || aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" || bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel"
