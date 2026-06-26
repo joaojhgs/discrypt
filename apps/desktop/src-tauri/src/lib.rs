@@ -1624,6 +1624,9 @@ pub enum TextControlFrameView {
         owner_member_id: Option<String>,
         /// Owner signer public key handle.
         owner_signer_public_key_hex: String,
+        /// Owner identity signer used for subsequent signed governance frames.
+        #[serde(default)]
+        owner_identity_signer_public_key_hex: Option<String>,
         /// Joiner signer public key handle expected to apply the Welcome.
         member_signer_public_key_hex: String,
         /// TLS-serialized OpenMLS Welcome bytes.
@@ -2929,16 +2932,16 @@ struct TauriAppService {
         BTreeMap<TextControlRuntimeMapKey, TextControlTransportRuntime>,
     pending_text_control_transport_runtimes:
         BTreeMap<TextControlRuntimeMapKey, PendingTextControlTransportRuntime>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "harness"))]
     state_path_override: Option<PathBuf>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "harness"))]
 struct TestAppStatePathOverrideGuard {
     previous: Option<std::ffi::OsString>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "harness"))]
 impl TestAppStatePathOverrideGuard {
     fn activate(path: &std::path::Path) -> Self {
         let previous = std::env::var_os("DISCRYPT_APP_STATE_PATH");
@@ -2947,7 +2950,7 @@ impl TestAppStatePathOverrideGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "harness"))]
 impl Drop for TestAppStatePathOverrideGuard {
     fn drop(&mut self) {
         if let Some(previous) = &self.previous {
@@ -2964,12 +2967,13 @@ impl TauriAppService {
             state: load_state(),
             text_control_transport_runtimes: BTreeMap::new(),
             pending_text_control_transport_runtimes: BTreeMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "harness"))]
             state_path_override: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "harness"))]
+    #[allow(dead_code)]
     fn load_for_test_path(path: PathBuf) -> Self {
         Self {
             state: load_state_from_path(&path),
@@ -2984,7 +2988,7 @@ impl TauriAppService {
     }
 
     fn mutate(&mut self, update: impl FnOnce(&mut PersistedAppState)) -> AppStateView {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "harness"))]
         let _state_path_override_guard = self
             .state_path_override
             .as_deref()
@@ -4190,6 +4194,115 @@ impl TauriAppService {
         self.persist();
         aggregate
     }
+}
+
+/// Harness-only state switcher used by split-profile release examples. Production builds keep the
+/// process-global app service bound to the normal app data path and cannot hot-swap vaults.
+#[cfg(feature = "harness")]
+pub fn reload_app_state_for_harness(path: impl AsRef<std::path::Path>) -> AppStateView {
+    let path = path.as_ref();
+    std::env::set_var("DISCRYPT_APP_STATE_PATH", path);
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state = load_state_from_path(path);
+    guard.text_control_transport_runtimes.clear();
+    guard.pending_text_control_transport_runtimes.clear();
+    guard.state_path_override = Some(path.to_path_buf());
+    guard.to_view()
+}
+
+#[cfg(feature = "harness")]
+#[derive(Debug)]
+struct HarnessOpenTextControlTransport;
+
+#[cfg(feature = "harness")]
+#[async_trait::async_trait]
+impl discrypt_transport::TextControlDataTransport for HarnessOpenTextControlTransport {
+    async fn send_text_control_frame(&self, _frame: Vec<u8>) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn recv_text_control_frame(&self) -> Result<Vec<u8>, TransportError> {
+        Err(TransportError::Unavailable(
+            "harness text/control route is driven by explicit state-file frame delivery".to_owned(),
+        ))
+    }
+
+    async fn text_control_transport_metrics(
+        &self,
+    ) -> discrypt_transport::WebRtcDataTransportMetrics {
+        discrypt_transport::WebRtcDataTransportMetrics {
+            schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+            label: "g009-harness-text-control".to_owned(),
+            attached_channels: 1,
+            open: true,
+            frames_sent: 0,
+            frames_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_state: "open".to_owned(),
+        }
+    }
+}
+
+/// Harness-only route evidence used by split-profile local examples. It deliberately does not send
+/// application messages over a provider; frames are applied explicitly through backend handlers.
+#[cfg(feature = "harness")]
+pub fn attach_harness_text_control_route_for_harness() -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    let Some(session) = guard.state.transport_session(BackendTransportMode::Text) else {
+        guard.state.push_command_error(
+            "transport.text_runtime_attach_rejected",
+            "attach_harness_text_control_route_for_harness",
+            "text_session_missing",
+            "No active text transport session exists for harness route evidence",
+            "Start a text session before attaching the harness text/control route",
+        );
+        guard.persist();
+        return guard.to_view();
+    };
+    let session_id = session.session_id.clone();
+    let synthetic_probe = ProviderWebRtcDataChannelProbeView {
+        kind: "harness".to_owned(),
+        profile_id: "g009-harness-local-pair".to_owned(),
+        endpoint_label: "state-file-frame-bridge".to_owned(),
+        scope_commitment: "g009-harness-local-pair".to_owned(),
+        rendezvous_topic: "g009-harness-local-pair".to_owned(),
+        offerer_direct_path_ready: true,
+        answerer_direct_path_ready: true,
+        offerer_turn_fallback_ready: false,
+        answerer_turn_fallback_ready: false,
+        offerer_configured_turn_servers: 0,
+        answerer_configured_turn_servers: 0,
+        offerer_local_relay_candidates_gathered: 0,
+        answerer_local_relay_candidates_gathered: 0,
+        offerer_remote_relay_candidates_applied: 0,
+        answerer_remote_relay_candidates_applied: 0,
+        offerer_data_channel_open: true,
+        answerer_data_channel_open: true,
+        text_control_frame_roundtrip: true,
+        text_control_frame_sha256: "c".repeat(64),
+        receipt_frame_roundtrip: true,
+        receipt_frame_sha256: "d".repeat(64),
+        runtime_spec: None,
+        offerer_diagnostic_timeline: None,
+        answerer_diagnostic_timeline: None,
+    };
+    guard
+        .state
+        .mark_text_session_data_channel_route_proof(&synthetic_probe);
+    guard.attach_text_control_transport_runtime(
+        Arc::new(HarnessOpenTextControlTransport),
+        session_id,
+    );
+    guard.persist();
+    guard.to_view()
 }
 
 /// Tauri command: return the transitional compatibility snapshot for older clients.
@@ -9905,10 +10018,16 @@ impl PersistedAppState {
                 redacted_observable_ref("group", group_id)
             ),
         );
+        let owner_identity_signer_public_key_hex = hex::encode(
+            SigningKey::from_bytes(&self.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
         Ok(TextControlFrameView::OpenMlsAdmissionWelcome {
             group_id: group_id.to_owned(),
             owner_member_id: Some(self.local_user_id()),
             owner_signer_public_key_hex: owner_record.signer_public_key_hex,
+            owner_identity_signer_public_key_hex: Some(owner_identity_signer_public_key_hex),
             member_signer_public_key_hex: signer_public_key_hex.to_owned(),
             welcome_bytes,
             epoch: result.state.epoch,
@@ -9924,6 +10043,7 @@ impl PersistedAppState {
             group_id,
             owner_member_id,
             owner_signer_public_key_hex,
+            owner_identity_signer_public_key_hex,
             member_signer_public_key_hex,
             welcome_bytes,
             epoch,
@@ -9985,8 +10105,11 @@ impl PersistedAppState {
                 {
                     owner_member.role = GroupRoleView::Owner;
                     owner_member.status = "unknown".to_owned();
-                    owner_member.signer_public_key_hex =
-                        Some(owner_signer_public_key_hex.to_owned());
+                    owner_member.signer_public_key_hex = Some(
+                        owner_identity_signer_public_key_hex
+                            .clone()
+                            .unwrap_or_else(|| owner_signer_public_key_hex.to_owned()),
+                    );
                     owner_member.revoked_at = None;
                     owner_member.revoked_by = None;
                 } else {
@@ -9996,7 +10119,11 @@ impl PersistedAppState {
                         device_id: None,
                         role: GroupRoleView::Owner,
                         status: "unknown".to_owned(),
-                        signer_public_key_hex: Some(owner_signer_public_key_hex.to_owned()),
+                        signer_public_key_hex: Some(
+                            owner_identity_signer_public_key_hex
+                                .clone()
+                                .unwrap_or_else(|| owner_signer_public_key_hex.to_owned()),
+                        ),
                         joined_at: created_at,
                         last_seen_at: None,
                         presence_expires_at: None,
@@ -16172,13 +16299,22 @@ fn app_store() -> FileAppStore {
     FileAppStore::new(app_store_path())
 }
 
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
 fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
     let mut store = EncryptedAppDb::new(path.to_path_buf(), TestAppDbKeychain);
     load_state_from_store(&mut store)
 }
 
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
+#[allow(dead_code)]
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
@@ -16187,13 +16323,20 @@ fn persist_state_to_path(
     persist_state_to_store(&mut store, state)
 }
 
-#[cfg(all(test, not(all(target_os = "linux", feature = "production-storage"))))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    not(all(target_os = "linux", feature = "production-storage"))
+))]
 fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
     let mut store = FileAppStore::new(path);
     load_state_from_store(&mut store)
 }
 
-#[cfg(all(test, not(all(target_os = "linux", feature = "production-storage"))))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    not(all(target_os = "linux", feature = "production-storage"))
+))]
+#[allow(dead_code)]
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
@@ -25054,6 +25197,22 @@ mod tests {
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| "Bob admitted group missing after Welcome".to_owned())?;
         assert_eq!(bob_admitted_group.role, "member");
+        let owner_identity_signer = group
+            .members
+            .iter()
+            .find(|member| member.role == GroupRoleView::Owner)
+            .and_then(|member| member.signer_public_key_hex.as_deref())
+            .ok_or_else(|| "Alice owner identity signer missing".to_owned())?;
+        let bob_owner_signer = bob_admitted_group
+            .members
+            .iter()
+            .find(|member| member.role == GroupRoleView::Owner)
+            .and_then(|member| member.signer_public_key_hex.as_deref())
+            .ok_or_else(|| "Bob owner roster signer missing after Welcome".to_owned())?;
+        assert_eq!(
+            bob_owner_signer, owner_identity_signer,
+            "joiner must persist owner identity signer for later signed governance frames"
+        );
         assert!(bob_admitted_group
             .members
             .iter()

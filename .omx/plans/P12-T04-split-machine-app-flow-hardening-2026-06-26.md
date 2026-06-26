@@ -6,6 +6,7 @@
 - Primary path: `apps/desktop/src-tauri/examples/g009_split_machine_app_flow.rs`.
 - Scope: harden the split-machine example artifact contract for owner, joiner, staff, revoked member, manual approval, protected text, presence, voice proof classification, and no provider application relay fallback.
 - Non-scope: public MQTT/Nostr split-machine matrix, 3-member harnesses, package install/reinstall, Phase 13 packaging, or UI redesign.
+- QA rejection follow-up: default `owner` cannot bootstrap from prepare-owner alone because backend runtime derivation correctly fails without a live provider/WebRTC peer route or admitted remote member. The remediation is a harness-only `local-pair` role for two isolated local profiles, plus explicit documentation of the live-provider precondition for default split-machine roles.
 
 ## Invariants
 - Invite parsing is not membership; protected group text and voice require an approved OpenMLS admission path and persisted group state.
@@ -20,11 +21,13 @@
 3. Add joiner-side evidence: pre-approval pending state and send denial in manual mode, post-approval OpenMLS/admitted state, protected joiner text, received owner text, staff promotion observation, revoked state observation, revoked send denial, presence publication, and voice classification.
 4. Add structured helper functions for role status, OpenMLS handle presence, voice proof, presence proof, and transport no-relay boundary evidence.
 5. Verify with formatting, targeted example build/test, and retained local artifacts. Attempt SSH/split-machine execution if an SSH target is configured; otherwise record the exact blocker and classify evidence as local/harness only.
+6. Add a harness-gated local-pair path that switches between isolated app-state files, delivers backend text/control frames explicitly, and records manual approval, OpenMLS protected text, presence TTL, staff promotion, revoke, revoked-send denial, voice classification, and no provider relay fallback.
 
 ## Acceptance Criteria
 - Artifact schema records PER-99, admission mode, evidence level, direct/TURN-only transport boundary, and provider application relay fallback as false.
 - Owner artifact includes manual approval and governance evidence for owner, staff, and revoke flows.
 - Joiner artifact includes pending-before-approval and fail-closed revoked send evidence.
+- When SSH/provider split-machine execution is unavailable, harness local-pair artifacts provide the owner/joiner proof pair without synthesizing production provider readiness.
 - Presence evidence is tied to backend TTL state after route attach, not optimistic status.
 - Voice evidence identifies whether it is local capture only or remote media proof.
 
@@ -32,6 +35,8 @@
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml g007_manual_admission_approval_persists_openmls_join_without_auto_approving_old_requests --lib -- --test-threads=1`
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --example g009_split_machine_app_flow`
+- `RUSTUP_TOOLCHAIN=1.89.0 cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness --example g009_split_machine_app_flow`
+- `XDG_DATA_HOME=/tmp/discrypt-per99-local-pair-xdg target/debug/examples/g009_split_machine_app_flow --role local-pair --artifact target/per99-g009-split-machine-app-flow/local-pair.json --adapter nostr --endpoint wss://nos.lol --admission-mode manual --timeout-secs 20`
 - Local artifact command(s) under `target/per99-g009-split-machine-app-flow/`.
 - SSH artifact command(s) when a target exists; otherwise document the missing target as a blocker and avoid production split-machine claims.
 

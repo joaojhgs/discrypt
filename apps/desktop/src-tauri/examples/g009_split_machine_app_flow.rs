@@ -11,6 +11,12 @@ use discrypt_desktop::{
     PromoteGroupMemberRequest, PublishGroupPresenceRequest, RevokeGroupMemberAccessRequest,
     SendMessageRequest, SetActiveGroupRequest, StartTextSessionRequest, VoiceSessionView,
 };
+#[cfg(feature = "harness")]
+use discrypt_desktop::{
+    attach_harness_text_control_route_for_harness, handle_text_control_frame,
+    list_pending_text_control_frames, mark_text_control_frame_sent, reload_app_state_for_harness,
+    HandleTextControlFrameRequest, MarkTextControlFrameSentRequest, TextControlFrameView,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::env;
@@ -82,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "prepare-owner" => prepare_owner(&args)?,
         "owner" => run_owner(&args)?,
         "joiner" => run_joiner(&args)?,
+        "local-pair" => run_local_pair(&args)?,
         other => return Err(format!("unsupported --role {other}").into()),
     };
     let doc = json!({
@@ -170,6 +177,509 @@ fn prepare_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::E
         "invite_contains_gid": invite.contains("gid="),
         "invite_omits_unsigned_gname": !invite.contains("gname="),
     }))
+}
+
+#[cfg(not(feature = "harness"))]
+fn run_local_pair(_args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Err("local-pair requires building the example with --features harness; default builds keep split-machine owner/joiner roles bound to live provider/WebRTC setup".into())
+}
+
+#[cfg(feature = "harness")]
+fn run_local_pair(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifact_dir = args
+        .artifact
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    fs::create_dir_all(&artifact_dir)?;
+    let run_id = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let owner_state_path = artifact_dir.join(format!("g009-local-owner-{run_id}.json"));
+    let joiner_state_path = artifact_dir.join(format!("g009-local-joiner-{run_id}.json"));
+    reset_harness_state_file(&owner_state_path)?;
+    reset_harness_state_file(&joiner_state_path)?;
+
+    reload_app_state_for_harness(&owner_state_path);
+    let owner_user = create_user(CreateUserRequest {
+        display_name: "G009 Owner".to_owned(),
+        device_name: Some("local harness owner profile".to_owned()),
+    });
+    ensure_ok(&owner_user.last_command_error, "create local owner user")?;
+    let owner_group_state = create_group(CreateGroupRequest {
+        name: args.group_name.clone(),
+        retention: "7 days".to_owned(),
+        admission_mode: Some(args.admission_mode.clone()),
+        adapter_kind: Some(args.adapter.clone()),
+        signaling_endpoint: Some(args.endpoint.clone()),
+        ice_stun_servers: Some(vec!["stun:stun.l.google.com:19302".to_owned()]),
+        ice_turn_servers: Some(vec![]),
+    });
+    ensure_ok(
+        &owner_group_state.last_command_error,
+        "create local owner group",
+    )?;
+    let owner_group = owner_group_state
+        .groups
+        .iter()
+        .find(|group| group.name == args.group_name)
+        .ok_or("local owner group missing")?
+        .clone();
+    let group_id = owner_group.group_id.clone();
+    set_active_group(SetActiveGroupRequest {
+        group_id: group_id.clone(),
+    });
+    let channel_id = owner_group
+        .channels
+        .iter()
+        .find(|channel| matches!(channel.kind, ChannelKind::Text))
+        .or_else(|| owner_group.channels.first())
+        .ok_or("local owner group has no text channel")?
+        .channel_id
+        .clone();
+    let voice_channel_id = owner_group
+        .channels
+        .iter()
+        .find(|channel| matches!(channel.kind, ChannelKind::Voice))
+        .map(|channel| channel.channel_id.clone())
+        .unwrap_or_else(|| "voice-lobby".to_owned());
+    let invite_state = create_invite(CreateInviteRequest {
+        group_id: Some(group_id.clone()),
+        expires: "1 day".to_owned(),
+        max_use: "5".to_owned(),
+        password_gate: None,
+    });
+    ensure_ok(&invite_state.last_command_error, "create local invite")?;
+    let invite = invite_state
+        .invites
+        .last()
+        .ok_or("local invite missing")?
+        .code
+        .clone();
+
+    reload_app_state_for_harness(&joiner_state_path);
+    let joiner_user = create_user(CreateUserRequest {
+        display_name: "G009 Joiner".to_owned(),
+        device_name: Some("local harness joiner profile".to_owned()),
+    });
+    ensure_ok(&joiner_user.last_command_error, "create local joiner user")?;
+    let joined = join_group(JoinGroupRequest {
+        invite_code: invite.clone(),
+        group_name: None,
+    });
+    ensure_ok(&joined.last_command_error, "local joiner consume invite")?;
+    let target = MessageTargetView {
+        kind: "channel".to_owned(),
+        dm_id: None,
+        group_id: Some(group_id.clone()),
+        channel_id: Some(channel_id.clone()),
+    };
+    let pre_approval_role_status = local_role_status(&group_id);
+    let denied = send_message(SendMessageRequest {
+        target: target.clone(),
+        body: "g009 pending local joiner must wait for manual approval".to_owned(),
+        transport_proof: false,
+        adapter_kind: None,
+    });
+    let pre_approval_send_error = denied.last_command_error.map(|error| error.code);
+    let admission_request_delivery = deliver_next_frame_between_harness_states(
+        &joiner_state_path,
+        &owner_state_path,
+        "manual-admission-key-package",
+        |frame| {
+            matches!(
+                frame,
+                TextControlFrameView::OpenMlsAdmissionKeyPackage { .. }
+            )
+        },
+    )?;
+
+    reload_app_state_for_harness(&owner_state_path);
+    let request_id = app_state()
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .and_then(|group| {
+            group
+                .admission_requests
+                .iter()
+                .find(|request| request.status == "pending")
+                .map(|request| request.request_id.clone())
+        })
+        .ok_or("local owner admission request missing after key package delivery")?;
+    let approved = approve_group_admission_request(ApproveGroupAdmissionRequest {
+        group_id: group_id.clone(),
+        request_id: request_id.clone(),
+    });
+    ensure_ok(
+        &approved.last_command_error,
+        "local approve manual admission",
+    )?;
+    let welcome_delivery = deliver_next_frame_between_harness_states(
+        &owner_state_path,
+        &joiner_state_path,
+        "manual-admission-welcome",
+        |frame| matches!(frame, TextControlFrameView::OpenMlsAdmissionWelcome { .. }),
+    )?;
+
+    reload_app_state_for_harness(&joiner_state_path);
+    wait_until(
+        args.timeout_secs,
+        "local joiner OpenMLS send readiness",
+        || {
+            let sent = send_message(SendMessageRequest {
+                target: target.clone(),
+                body: "g009 local joiner to owner protected text".to_owned(),
+                transport_proof: false,
+                adapter_kind: None,
+            });
+            sent.last_command_error.is_none()
+        },
+    )?;
+    let joiner_text_delivery = deliver_next_frame_between_harness_states(
+        &joiner_state_path,
+        &owner_state_path,
+        "joiner-to-owner-protected-text",
+        |frame| matches!(frame, TextControlFrameView::Envelope { .. }),
+    )?;
+
+    reload_app_state_for_harness(&owner_state_path);
+    wait_for_message(
+        "g009 local joiner to owner protected text",
+        args.timeout_secs,
+    )?;
+    let owner_sent = send_message(SendMessageRequest {
+        target: target.clone(),
+        body: "g009 local owner to joiner protected text".to_owned(),
+        transport_proof: false,
+        adapter_kind: None,
+    });
+    ensure_ok(
+        &owner_sent.last_command_error,
+        "local owner send protected text",
+    )?;
+    let owner_text_delivery = deliver_next_frame_between_harness_states(
+        &owner_state_path,
+        &joiner_state_path,
+        "owner-to-joiner-protected-text",
+        |frame| matches!(frame, TextControlFrameView::Envelope { .. }),
+    )?;
+
+    reload_app_state_for_harness(&joiner_state_path);
+    wait_for_message(
+        "g009 local owner to joiner protected text",
+        args.timeout_secs,
+    )?;
+    attach_local_harness_text_route("g009-local-joiner-presence")?;
+    let joiner_presence = publish_group_presence(PublishGroupPresenceRequest {
+        group_id: group_id.clone(),
+        member_id: app_state()
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone()),
+        ttl_seconds: Some(120),
+    });
+    ensure_ok(
+        &joiner_presence.last_command_error,
+        "local joiner publish presence",
+    )?;
+    let presence_delivery = deliver_next_frame_between_harness_states(
+        &joiner_state_path,
+        &owner_state_path,
+        "joiner-presence-heartbeat",
+        |frame| matches!(frame, TextControlFrameView::GroupPresenceHeartbeat { .. }),
+    )?;
+
+    reload_app_state_for_harness(&owner_state_path);
+    let joiner_member = app_state()
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .and_then(|group| {
+            group
+                .members
+                .iter()
+                .find(|member| member.role != GroupRoleView::Owner)
+                .cloned()
+        })
+        .ok_or("local owner cannot find admitted joiner member")?;
+    let owner_joined_voice = join_voice(JoinVoiceRequest {
+        group_id: group_id.clone(),
+        channel_id: voice_channel_id.clone(),
+        microphone_permission: "granted".to_owned(),
+        input_device_id: Some("g009-local-owner-mic".to_owned()),
+        input_device_label: Some("G009 local owner microphone".to_owned()),
+        output_device_id: Some("g009-local-owner-speaker".to_owned()),
+        output_device_label: Some("G009 local owner speaker".to_owned()),
+    });
+    let owner_voice = voice_evidence(owner_joined_voice.voice_session.as_ref());
+    let promoted = promote_group_member_to_staff(PromoteGroupMemberRequest {
+        group_id: group_id.clone(),
+        member_id: joiner_member.member_id.clone(),
+    });
+    ensure_ok(
+        &promoted.last_command_error,
+        "local promote joiner to staff",
+    )?;
+    let promotion_delivery = deliver_next_frame_between_harness_states(
+        &owner_state_path,
+        &joiner_state_path,
+        "staff-promotion",
+        |frame| matches!(frame, TextControlFrameView::GroupMemberRoleChanged { .. }),
+    )?;
+
+    reload_app_state_for_harness(&joiner_state_path);
+    let joiner_joined_voice = join_voice(JoinVoiceRequest {
+        group_id: group_id.clone(),
+        channel_id: voice_channel_id.clone(),
+        microphone_permission: "granted".to_owned(),
+        input_device_id: Some("g009-local-joiner-mic".to_owned()),
+        input_device_label: Some("G009 local joiner microphone".to_owned()),
+        output_device_id: Some("g009-local-joiner-speaker".to_owned()),
+        output_device_label: Some("G009 local joiner speaker".to_owned()),
+    });
+    let joiner_voice = voice_evidence(joiner_joined_voice.voice_session.as_ref());
+    let staff_role_seen = local_role_status(&group_id)
+        .map(|(role, _)| role == "staff")
+        .unwrap_or(false);
+
+    reload_app_state_for_harness(&owner_state_path);
+    let revoked = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+        group_id: group_id.clone(),
+        member_id: joiner_member.member_id.clone(),
+        reason: Some("g009 local harness revoke proof".to_owned()),
+    });
+    ensure_ok(&revoked.last_command_error, "local revoke joiner")?;
+    let revoke_delivery = deliver_next_frame_between_harness_states(
+        &owner_state_path,
+        &joiner_state_path,
+        "member-revoke",
+        |frame| matches!(frame, TextControlFrameView::GroupMemberRevoked { .. }),
+    )?;
+
+    reload_app_state_for_harness(&joiner_state_path);
+    let revoked_role_seen = local_role_status(&group_id)
+        .map(|(_, status)| status == "revoked")
+        .unwrap_or(false);
+    let revoked_send = send_message(SendMessageRequest {
+        target: target.clone(),
+        body: "g009 local revoked member should not send".to_owned(),
+        transport_proof: false,
+        adapter_kind: None,
+    });
+    let joiner_role_status = local_role_status(&group_id);
+    let joiner_artifact = args.artifact.with_file_name(format!(
+        "{}-joiner.json",
+        args.artifact
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("g009-local-pair")
+    ));
+    let joiner_doc = json!({
+        "schema_version": "discrypt.g009.split_machine_app_flow.local_pair.v1",
+        "task_id": "PER-99",
+        "phase_task_id": "P12-T04",
+        "role": "joiner",
+        "state_path": joiner_state_path,
+        "group_id": group_id,
+        "manual_admission": {
+            "required": args.admission_mode == GroupAdmissionModeView::ManualApproval,
+            "pre_approval_role_status": pre_approval_role_status,
+            "pre_approval_send_error": pre_approval_send_error,
+            "admission_request_delivery": admission_request_delivery,
+            "welcome_delivery": welcome_delivery,
+            "post_approval_role_status": joiner_role_status,
+        },
+        "protected_text": {
+            "joiner_to_owner": joiner_text_delivery,
+            "owner_to_joiner": owner_text_delivery,
+            "received_owner_text": true,
+        },
+        "presence": {
+            "backend_route_gated_ttl": presence_delivery,
+        },
+        "staff_role_seen": staff_role_seen,
+        "revoked_role_seen": revoked_role_seen,
+        "revoked_send_error": revoked_send.last_command_error.map(|error| error.code),
+        "voice": joiner_voice,
+        "provider_relay_boundary": provider_relay_boundary(None),
+    });
+    fs::write(&joiner_artifact, serde_json::to_vec_pretty(&joiner_doc)?)?;
+
+    reload_app_state_for_harness(&owner_state_path);
+    let owner_artifact = args.artifact.with_file_name(format!(
+        "{}-owner.json",
+        args.artifact
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("g009-local-pair")
+    ));
+    let owner_doc = json!({
+        "schema_version": "discrypt.g009.split_machine_app_flow.local_pair.v1",
+        "task_id": "PER-99",
+        "phase_task_id": "P12-T04",
+        "role": "owner",
+        "state_path": owner_state_path,
+        "group_id": group_id,
+        "invite_contains_gid": invite.contains("gid="),
+        "invite_omits_unsigned_gname": !invite.contains("gname="),
+        "manual_admission": {
+            "required": args.admission_mode == GroupAdmissionModeView::ManualApproval,
+            "request_id": request_id,
+            "approved": true,
+        },
+        "protected_text": {
+            "joiner_to_owner": joiner_text_delivery,
+            "owner_to_joiner": owner_text_delivery,
+            "received_joiner_text": true,
+        },
+        "presence": {
+            "backend_route_gated_ttl": presence_delivery,
+        },
+        "promotion_delivery": promotion_delivery,
+        "revoke_delivery": revoke_delivery,
+        "voice": owner_voice,
+        "provider_relay_boundary": provider_relay_boundary(None),
+        "members": app_state().groups.first().map(|group| group.members.clone()),
+    });
+    fs::write(&owner_artifact, serde_json::to_vec_pretty(&owner_doc)?)?;
+
+    Ok(json!({
+        "mode": "local_two_profile_harness",
+        "owner_artifact": owner_artifact,
+        "joiner_artifact": joiner_artifact,
+        "owner_state_path": owner_state_path,
+        "joiner_state_path": joiner_state_path,
+        "manual_approval_required": args.admission_mode == GroupAdmissionModeView::ManualApproval,
+        "provider_application_relay_used": false,
+        "production_ready_claim": false,
+        "note": "Local pair uses harness-only isolated app-state files and backend text/control frame handlers; split-machine owner/joiner roles still require live provider/WebRTC setup.",
+    }))
+}
+
+#[cfg(feature = "harness")]
+fn reset_harness_state_file(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    let openmls_path = path.with_file_name(format!(
+        "{}.openmls.sqlite",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("app-state.json")
+    ));
+    if openmls_path.exists() {
+        fs::remove_file(openmls_path)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "harness")]
+fn deliver_next_frame_between_harness_states<F>(
+    sender_path: &PathBuf,
+    receiver_path: &PathBuf,
+    label: &str,
+    predicate: F,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>>
+where
+    F: Fn(&TextControlFrameView) -> bool,
+{
+    reload_app_state_for_harness(sender_path);
+    let pending = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+        target: None,
+        limit: Some(50),
+        operation_timeout_ms: Some(5_000),
+    });
+    let frame = pending
+        .frames
+        .into_iter()
+        .find(|frame| predicate(&frame.frame))
+        .ok_or_else(|| format!("no pending text/control frame matched {label}"))?;
+    let marked = mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+        message_id: frame.message_id.clone(),
+        frame_sha256: frame.frame_sha256.clone(),
+        transport_session_id: Some(format!("g009-local-harness-{label}")),
+        route_peer_id: None,
+    });
+    ensure_ok(&marked.last_command_error, "mark local harness frame sent")?;
+
+    reload_app_state_for_harness(receiver_path);
+    let handled = handle_text_control_frame(HandleTextControlFrameRequest {
+        frame: frame.frame.clone(),
+    });
+    ensure_ok(
+        &handled.state.last_command_error,
+        "handle local harness frame",
+    )?;
+    let response_kind = handled
+        .response_frame
+        .as_ref()
+        .map(text_control_frame_kind)
+        .map(str::to_owned);
+    if let Some(response_frame) = handled.response_frame {
+        reload_app_state_for_harness(sender_path);
+        let response = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: response_frame,
+        });
+        ensure_ok(
+            &response.state.last_command_error,
+            "handle local harness response frame",
+        )?;
+    }
+
+    reload_app_state_for_harness(sender_path);
+    let sender_state = app_state();
+    reload_app_state_for_harness(receiver_path);
+    let receiver_state = app_state();
+    Ok(json!({
+        "label": label,
+        "frame_kind": text_control_frame_kind(&frame.frame),
+        "message_id": frame.message_id,
+        "frame_sha256": frame.frame_sha256,
+        "response_kind": response_kind,
+        "sender_messages_with_receipts": sender_state.messages.iter().filter(|message| message.peer_receipt.is_some()).count(),
+        "receiver_messages": receiver_state.messages.len(),
+        "provider_application_relay_used": false,
+        "transport": "harness_state_file_text_control_bridge",
+    }))
+}
+
+#[cfg(feature = "harness")]
+fn attach_local_harness_text_route(label: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let started = start_text_session(StartTextSessionRequest {
+        scope_label: Some(label.to_owned()),
+        data_channel_probe: false,
+        adapter_kind: None,
+    });
+    ensure_ok(
+        &started.last_command_error,
+        "start local harness text session",
+    )?;
+    let attached = attach_harness_text_control_route_for_harness();
+    ensure_ok(
+        &attached.last_command_error,
+        "attach local harness text/control route",
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "harness")]
+fn text_control_frame_kind(frame: &TextControlFrameView) -> &'static str {
+    match frame {
+        TextControlFrameView::OpenMlsAdmissionKeyPackage { .. } => "open_mls_admission_key_package",
+        TextControlFrameView::GroupAdmissionDecision { .. } => "group_admission_decision",
+        TextControlFrameView::OpenMlsAdmissionWelcome { .. } => "open_mls_admission_welcome",
+        TextControlFrameView::Envelope { .. } => "envelope",
+        TextControlFrameView::GroupMemberRoleChanged { .. } => "group_member_role_changed",
+        TextControlFrameView::GroupMemberRevoked { .. } => "group_member_revoked",
+        TextControlFrameView::GroupPresenceHeartbeat { .. } => "group_presence_heartbeat",
+        TextControlFrameView::GroupGovernanceAck { .. } => "group_governance_ack",
+        TextControlFrameView::VoiceSignal { .. } => "voice_signal",
+        TextControlFrameView::Receipt { .. } => "receipt",
+    }
 }
 
 fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

@@ -32,6 +32,7 @@ discrypt-storage = { path = "../../../crates/storage", version = "0.1.0" }
 discrypt-transport = { path = "../../../crates/transport", version = "0.1.0" }
 base64 = { workspace = true }
 aes-gcm = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
@@ -45,9 +46,6 @@ tauri = { version = "2.11.2", optional = true, default-features = false , featur
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", optional = true , features = [] }
-
-[dev-dependencies]
-async-trait = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 webkit2gtk = { version = "2.0.2", optional = true, features = ["v2_40"] }
