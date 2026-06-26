@@ -10,6 +10,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const argv = process.argv.slice(2);
 const run = argv.includes("--run");
 const noVite = argv.includes("--no-vite");
+const delegateWebDriver = argv.includes("--delegate-webdriver");
 const runId = valueAfter("--run-id") ?? process.env.DISCRYPT_G012_RUN_ID ?? `g012-tauri-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 const appMode = valueAfter("--app-mode") ?? valueFromPrefix("--app-mode=") ?? "dev";
 if (!["dev", "build"].includes(appMode)) failCli("Unsupported --app-mode. Use dev or build.", 2);
@@ -71,6 +72,7 @@ const manifest = {
   schema_version: "discrypt.g012.tauri_two_profile_e2e_harness.v1",
   generated_at: new Date().toISOString(),
   mode: run ? "run" : "dry-run",
+  runner_mode: delegateWebDriver ? "delegate-webdriver" : "launch-smoke",
   app_mode: appMode,
   run_id: runId,
   artifact_root: rel(artifactRoot),
@@ -80,6 +82,15 @@ const manifest = {
   tauri_features: tauriFeatures,
   profile_isolation_env: "DISCRYPT_APP_STATE_PATH",
   g012_boundary: "Launch harness only: G012 is not complete until two launched Tauri profiles complete text plus voice UX proof and artifacts cite this run.",
+  evidence_boundary: {
+    evidence_schema: "discrypt.g012.launcher_evidence_boundary.v1",
+    production_claim_allowed: false,
+    action_driven_evidence: false,
+    launch_smoke_only: !delegateWebDriver,
+    delegated_webdriver: delegateWebDriver,
+    delegated_webdriver_command: "node scripts/g012-tauri-webdriver-integrated.mjs --run --require-native-voice",
+    launch_smoke_non_claim: "Plain launch readiness proves only two isolated Tauri WebViews started; it does not prove setup, OpenMLS admission, protected text delivery, native voice, persistence, split-machine transport, or production readiness.",
+  },
   production_ux_constraint: "The harness launches real Tauri WebViews with backend IPC; local-dev/harness features are used only to permit per-profile state-path isolation.",
   profiles,
   shared_frontend: noVite
@@ -88,6 +99,14 @@ const manifest = {
   planned_commands: [],
   runtime_processes: [],
   preflight: {},
+  webdriver_delegation: delegateWebDriver
+    ? {
+        status: "planned",
+        artifact_root: rel(resolve(artifactRoot, "webdriver")),
+        manifest: rel(resolve(artifactRoot, "webdriver", "tauri-webdriver-integrated-manifest.json")),
+        summary: rel(resolve(artifactRoot, "webdriver", "tauri-webdriver-integrated-summary.json")),
+      }
+    : null,
   artifact_policy: {
     required_root: "target/g012-e2e",
     logs: true,
@@ -133,9 +152,26 @@ function writeJson(path, value) {
 
 function writeManifest(status, details = {}) {
   manifest.status = status;
+  manifest.evidence_boundary = evidenceBoundary(status, details);
   manifest.updated_at = new Date().toISOString();
   Object.assign(manifest, details);
   writeJson(manifestPath, manifest);
+}
+
+function evidenceBoundary(status, details = {}) {
+  const delegated = Boolean(details.delegated_webdriver_result || delegateWebDriver);
+  const actionDriven = Boolean(details.action_driven_evidence === true);
+  return {
+    evidence_schema: "discrypt.g012.launcher_evidence_boundary.v1",
+    status,
+    evidence_mode: actionDriven ? "action-driven-webdriver" : delegated ? "delegated-webdriver" : status === "failed-preflight" ? "failed-preflight" : status === "dry-run" ? "dry-run-contract" : "launch-smoke-only",
+    production_claim_allowed: false,
+    action_driven_evidence: actionDriven,
+    delegated_webdriver: delegated,
+    launch_smoke_only: !actionDriven && !delegated,
+    g012_checkpoint_eligible: false,
+    launcher_non_claim: "This launcher cannot prove production readiness from process launch. Production claims require a separate action-driven WebDriver/native artifact with setup, OpenMLS admission, protected text, voice, and persistence evidence.",
+  };
 }
 
 function commandExists(command) {
@@ -181,6 +217,25 @@ function tauriCommandFor(profile) {
 
 function planCommands() {
   manifest.planned_commands = [];
+  if (delegateWebDriver) {
+    const webdriverArtifactRoot = resolve(artifactRoot, "webdriver");
+    manifest.planned_commands.push({
+      label: "delegated WebDriver integrated E2E",
+      command: process.execPath,
+      args: [
+        "scripts/g012-tauri-webdriver-integrated.mjs",
+        "--run",
+        "--require-native-voice",
+        "--artifact-dir",
+        webdriverArtifactRoot,
+      ],
+      cwd: repoRoot,
+      log_path: resolve(logDir, "webdriver-integrated.log"),
+      env_keys: ["DISCRYPT_G012_WEBDRIVER_RUN_ID"],
+      rendered: `node scripts/g012-tauri-webdriver-integrated.mjs --run --require-native-voice --artifact-dir ${webdriverArtifactRoot}`,
+    });
+    return;
+  }
   if (!noVite) {
     manifest.planned_commands.push({
       label: "shared vite dev server",
@@ -354,7 +409,12 @@ function summarize(children, screenshots, launchReadiness) {
     schema_version: "discrypt.g012.tauri_two_profile_launch_summary.v1",
     generated_at: new Date().toISOString(),
     status: "launch-smoke-passed",
+    evidence_mode: "launch-smoke-only",
+    action_driven_evidence: false,
+    delegated_webdriver: false,
     integrated_e2e_status: "not_proven_by_launch_smoke",
+    production_claim_allowed: false,
+    g012_checkpoint_eligible: false,
     production_claim: "none; this live runner proves two isolated Tauri WebViews launch and leaves text/voice UX proof to separately cited artifacts",
     run_id: runId,
     artifact_root: rel(artifactRoot),
@@ -373,15 +433,102 @@ function summarize(children, screenshots, launchReadiness) {
   return summary;
 }
 
+function summarizeBoundary(status, details = {}) {
+  const boundary = evidenceBoundary(status, details);
+  const summary = {
+    schema_version: "discrypt.g012.tauri_two_profile_launch_summary.v1",
+    generated_at: new Date().toISOString(),
+    status,
+    evidence_mode: boundary.evidence_mode,
+    action_driven_evidence: boundary.action_driven_evidence,
+    delegated_webdriver: boundary.delegated_webdriver,
+    launch_smoke_only: boundary.launch_smoke_only,
+    integrated_e2e_status: boundary.action_driven_evidence ? "proven_by_delegated_webdriver_artifact" : "not_proven_by_launch_smoke",
+    production_claim_allowed: false,
+    g012_checkpoint_eligible: false,
+    production_claim: "none; launcher summaries are local harness evidence unless a separate delegated WebDriver summary is cited and independently qualifies",
+    run_id: runId,
+    artifact_root: rel(artifactRoot),
+    manifest: rel(manifestPath),
+    preflight_result: details.preflight_result ?? manifest.preflight_result ?? null,
+    webdriver_delegation: details.webdriver_delegation ?? manifest.webdriver_delegation ?? null,
+    remaining_integrated_e2e_requirements: boundary.action_driven_evidence
+      ? []
+      : [
+          "Run scripts/g012-tauri-webdriver-integrated.mjs on a display/native-WebDriver-capable runner.",
+          "Retain setup, OpenMLS admission, protected text, native voice, and persistence artifacts before making product E2E claims.",
+        ],
+  };
+  writeJson(summaryPath, summary);
+  return summary;
+}
+
+function runDelegatedWebDriver() {
+  const webdriverArtifactRoot = resolve(artifactRoot, "webdriver");
+  mkdirSync(webdriverArtifactRoot, { recursive: true });
+  const args = [
+    "scripts/g012-tauri-webdriver-integrated.mjs",
+    "--run",
+    "--require-native-voice",
+    "--artifact-dir",
+    webdriverArtifactRoot,
+  ];
+  writeManifest("delegating-webdriver", {
+    webdriver_delegation: {
+      status: "running",
+      artifact_root: rel(webdriverArtifactRoot),
+      manifest: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-manifest.json")),
+      summary: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-summary.json")),
+    },
+  });
+  const result = spawnSync(process.execPath, args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { ...process.env, DISCRYPT_G012_WEBDRIVER_RUN_ID: `${runId}-webdriver` },
+    maxBuffer: 1024 * 1024 * 64,
+  });
+  const logPath = resolve(logDir, "webdriver-integrated.log");
+  writeFileSync(logPath, `${result.stdout || ""}\n${result.stderr || ""}`);
+  const delegation = {
+    status: result.status === 0 ? "passed" : "failed",
+    exit_status: result.status,
+    log_path: rel(logPath),
+    log_sha256: sha256IfExists(logPath),
+    artifact_root: rel(webdriverArtifactRoot),
+    manifest: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-manifest.json")),
+    summary: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-summary.json")),
+  };
+  const actionDriven = result.status === 0 && existsSync(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-summary.json"));
+  const summary = summarizeBoundary(result.status === 0 ? "delegated-webdriver-passed" : "delegated-webdriver-failed", {
+    action_driven_evidence: actionDriven,
+    delegated_webdriver_result: delegation,
+    webdriver_delegation: delegation,
+  });
+  writeManifest(summary.status, {
+    action_driven_evidence: actionDriven,
+    delegated_webdriver_result: delegation,
+    webdriver_delegation: delegation,
+    summary: rel(summaryPath),
+  });
+  return result.status === 0 ? 0 : 1;
+}
+
 planCommands();
 const preflight = preflightChecks();
 writeManifest(run ? "planned" : "dry-run", { preflight_result: preflight });
 if (!run) {
+  summarizeBoundary("dry-run", { preflight_result: preflight });
   console.log(`G012 Tauri two-profile E2E dry-run manifest: ${manifestPath}`);
   process.exit(0);
 }
+if (delegateWebDriver) {
+  const status = runDelegatedWebDriver();
+  if (status === 0) console.log(`G012 Tauri two-profile delegated WebDriver artifact: ${rel(artifactRoot)}`);
+  process.exit(status);
+}
 if (!preflight.ok) {
   writeManifest("failed-preflight", { preflight_result: preflight });
+  summarizeBoundary("failed-preflight", { preflight_result: preflight });
   console.error(preflight.reason);
   process.exit(3);
 }
