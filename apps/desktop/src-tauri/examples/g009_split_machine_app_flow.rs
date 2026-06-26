@@ -35,6 +35,8 @@ struct Args {
     group_name: String,
     timeout_secs: u64,
     admission_mode: GroupAdmissionModeView,
+    task_id: String,
+    phase_task_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -93,8 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let doc = json!({
         "schema_version": "discrypt.g009.split_machine_app_flow.v2",
-        "task_id": "PER-99",
-        "phase_task_id": "P12-T04",
+        "task_id": args.task_id.clone(),
+        "phase_task_id": args.phase_task_id.clone(),
         "status": "passed",
         "role": args.role,
         "adapter": args.adapter,
@@ -477,8 +479,8 @@ fn run_local_pair(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::
     ));
     let joiner_doc = json!({
         "schema_version": "discrypt.g009.split_machine_app_flow.local_pair.v1",
-        "task_id": "PER-99",
-        "phase_task_id": "P12-T04",
+        "task_id": args.task_id.clone(),
+        "phase_task_id": args.phase_task_id.clone(),
         "role": "joiner",
         "state_path": joiner_state_path,
         "group_id": group_id,
@@ -516,8 +518,8 @@ fn run_local_pair(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::
     ));
     let owner_doc = json!({
         "schema_version": "discrypt.g009.split_machine_app_flow.local_pair.v1",
-        "task_id": "PER-99",
-        "phase_task_id": "P12-T04",
+        "task_id": args.task_id.clone(),
+        "phase_task_id": args.phase_task_id.clone(),
         "role": "owner",
         "state_path": owner_state_path,
         "group_id": group_id,
@@ -1258,6 +1260,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut group_name = "G009 Split Machine Lab".to_owned();
     let mut timeout_secs = 120_u64;
     let mut admission_mode = GroupAdmissionModeView::ManualApproval;
+    let mut task_id = "PER-99".to_owned();
+    let mut phase_task_id = "P12-T04".to_owned();
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1267,6 +1271,10 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--adapter" => adapter = iter.next().ok_or("--adapter requires value")?,
             "--endpoint" => endpoint = iter.next().ok_or("--endpoint requires value")?,
             "--group-name" => group_name = iter.next().ok_or("--group-name requires value")?,
+            "--task-id" => task_id = iter.next().ok_or("--task-id requires value")?,
+            "--phase-task-id" => {
+                phase_task_id = iter.next().ok_or("--phase-task-id requires value")?
+            }
             "--admission-mode" => {
                 admission_mode = match iter
                     .next()
@@ -1292,7 +1300,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     .parse()?
             }
             "--help" | "-h" => {
-                println!("usage: g009_split_machine_app_flow --role prepare-owner|owner|joiner --artifact <path> [--invite <invite>] [--adapter nostr|mqtt] [--endpoint <uri>] [--admission-mode manual|automatic]");
+                println!("usage: g009_split_machine_app_flow --role prepare-owner|owner|joiner|local-pair --artifact <path> [--invite <invite>] [--adapter nostr|mqtt] [--endpoint <uri>] [--admission-mode manual|automatic] [--task-id PER-99] [--phase-task-id P12-T04]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -1308,5 +1316,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         group_name,
         timeout_secs,
         admission_mode,
+        task_id,
+        phase_task_id,
     })
 }

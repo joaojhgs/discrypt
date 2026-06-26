@@ -20,13 +20,17 @@ Command result: passed.
 
 Artifacts:
 - `target/per100-public-mqtt-split-machine-matrix/local-pair.json`
-  - SHA-256: `baf4c4b0a461fef3fb8b8b816e2df9499e7c0a9d917ac2e635b839e238d8b6a2`
+  - SHA-256: `4024d6569259cbecff52011d0f21d191e5a4e2707a4b2bbd4e895a3071648d53`
   - `status`: `passed`
+  - `task_id`: `PER-100`
+  - `phase_task_id`: `P12-T05`
   - `adapter`: `mqtt`
   - `endpoint`: `mqtts://broker.emqx.io:8883`
   - `provider_application_relay_used`: `false`
 - `target/per100-public-mqtt-split-machine-matrix/local-pair-owner.json`
-  - SHA-256: `a5d71f5b81fb9714d525a540a623017871798cc50f6404d237fe2101163c87ad`
+  - SHA-256: `fcbc5c04f3f84322823a5e25077b070c86f4a75e051abca3840a5169ca01386e`
+  - `task_id`: `PER-100`
+  - `phase_task_id`: `P12-T05`
   - `manual_admission.approved`: `true`
   - `protected_text.owner_to_joiner.response_kind`: `receipt`
   - `protected_text.joiner_to_owner.response_kind`: `receipt`
@@ -34,7 +38,9 @@ Artifacts:
   - `provider_relay_boundary.provider_application_relay_used`: `false`
   - `voice.proof_level`: `local_native_capture_boundary`
 - `target/per100-public-mqtt-split-machine-matrix/local-pair-joiner.json`
-  - SHA-256: `3bb46d9927100b675d7bd9c53598bfd25aa36d4e95986259f2e7be6e8fb09ca7`
+  - SHA-256: `f948d9e0fa742faf782a071ed892a438eacf81ed025ea56e726333d4adecf7a2`
+  - `task_id`: `PER-100`
+  - `phase_task_id`: `P12-T05`
   - `manual_admission.pre_approval_send_error`: `admission_pending`
   - `manual_admission.welcome_delivery.frame_kind`: `open_mls_admission_welcome`
   - `protected_text.received_owner_text`: `true`
@@ -63,7 +69,9 @@ XDG_DATA_HOME=/tmp/discrypt-per100-local-pair-xdg \
   --adapter mqtt \
   --endpoint mqtts://broker.emqx.io:8883 \
   --admission-mode manual \
-  --timeout-secs 20
+  --timeout-secs 20 \
+  --task-id PER-100 \
+  --phase-task-id P12-T05
 ```
 
 Expected artifacts:
@@ -72,6 +80,8 @@ Expected artifacts:
 - `target/per100-public-mqtt-split-machine-matrix/local-pair-joiner.json`
 
 Expected fields:
+- `task_id: PER-100`
+- `phase_task_id: P12-T05`
 - `provider_application_relay_used: false`
 - `provider_relay_boundary.provider_application_relay_used: false`
 - manual approval before admitted protected text
@@ -112,14 +122,16 @@ XDG_DATA_HOME=/tmp/discrypt-per100-owner-xdg \
   --artifact "${DISCRYPT_PER100_ARTIFACT_DIR}/prepare-owner.json" \
   --adapter mqtt \
   --endpoint "$DISCRYPT_PUBLIC_MQTT_ENDPOINT" \
-  --admission-mode manual
+  --admission-mode manual \
+  --task-id PER-100 \
+  --phase-task-id P12-T05
 ```
 
 Run joiner remotely and owner locally with isolated state paths, then copy the remote artifact back:
 
 ```bash
 ssh "$DISCRYPT_G009_SSH_TARGET" \
-  "cd /path/to/discrypt && XDG_DATA_HOME=/tmp/discrypt-per100-joiner-xdg target/debug/examples/g009_split_machine_app_flow --role joiner --artifact ${DISCRYPT_PER100_ARTIFACT_DIR}/joiner.json --adapter mqtt --endpoint ${DISCRYPT_PUBLIC_MQTT_ENDPOINT} --admission-mode manual --timeout-secs 120"
+  "cd /path/to/discrypt && XDG_DATA_HOME=/tmp/discrypt-per100-joiner-xdg target/debug/examples/g009_split_machine_app_flow --role joiner --artifact ${DISCRYPT_PER100_ARTIFACT_DIR}/joiner.json --adapter mqtt --endpoint ${DISCRYPT_PUBLIC_MQTT_ENDPOINT} --admission-mode manual --timeout-secs 120 --task-id PER-100 --phase-task-id P12-T05"
 
 XDG_DATA_HOME=/tmp/discrypt-per100-owner-xdg \
   target/debug/examples/g009_split_machine_app_flow \
@@ -128,13 +140,16 @@ XDG_DATA_HOME=/tmp/discrypt-per100-owner-xdg \
   --adapter mqtt \
   --endpoint "$DISCRYPT_PUBLIC_MQTT_ENDPOINT" \
   --admission-mode manual \
-  --timeout-secs 120
+  --timeout-secs 120 \
+  --task-id PER-100 \
+  --phase-task-id P12-T05
 
 scp "$DISCRYPT_G009_SSH_TARGET:/path/to/discrypt/${DISCRYPT_PER100_ARTIFACT_DIR}/joiner.json" \
   "${DISCRYPT_PER100_ARTIFACT_DIR}/remote-joiner.json"
 ```
 
 Promotion requires both artifacts to show:
+- `task_id=PER-100` and `phase_task_id=P12-T05`
 - matching branch/commit and MQTT endpoint label
 - authorized OpenMLS admission before protected text
 - direct or configured TURN-backed WebRTC route evidence for text/control
@@ -144,7 +159,7 @@ Promotion requires both artifacts to show:
 
 ## Current SSH Status
 
-This runtime has no `DISCRYPT_G009_SSH_TARGET`, `DISCRYPT_PER100_SSH_TARGET`, or equivalent remote host variable configured. The local substitute row can be generated here, but the local+SSH row remains blocked until QA or a configured runner supplies a reachable remote checkout at the same commit.
+This runtime has no `DISCRYPT_G009_SSH_TARGET`, `DISCRYPT_PER100_SSH_TARGET`, or equivalent remote host variable configured. The local substitute row can be generated here, but the local+SSH row remains blocked until QA or a configured runner supplies a reachable remote checkout at the same commit. PER-100 is therefore asking the architect to accept local substitute evidence only unless a configured split-machine runner is supplied.
 
 ## Non-Claims
 - This report does not claim production readiness for Discrypt.

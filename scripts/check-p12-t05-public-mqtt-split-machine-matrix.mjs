@@ -33,6 +33,8 @@ for (const token of [
   "Presence claims require backend route-gated TTL evidence",
   "RUSTUP_TOOLCHAIN=1.89.0 cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --features harness --example g009_split_machine_app_flow",
   "--adapter mqtt",
+  "--task-id PER-100",
+  "--phase-task-id P12-T05",
   "SSH",
 ]) {
   requireText("PER-100 plan", plan, token);
@@ -47,6 +49,10 @@ for (const token of [
   "DISCRYPT_G009_SSH_TARGET",
   "mqtts://broker.emqx.io:8883",
   "target/per100-public-mqtt-split-machine-matrix/local-pair.json",
+  "task_id: PER-100",
+  "phase_task_id: P12-T05",
+  "--task-id PER-100",
+  "--phase-task-id P12-T05",
   "provider_application_relay_used: false",
   "authorized OpenMLS admission before protected text",
   "direct or configured TURN-backed WebRTC route evidence",
@@ -60,6 +66,10 @@ for (const token of [
   "P12-T05 public MQTT split-machine matrix",
   "npm --prefix apps/ui run test:p12-t05-public-mqtt-split-machine-matrix",
   "target/per100-public-mqtt-split-machine-matrix/local-pair.json",
+  "--task-id PER-100",
+  "--phase-task-id P12-T05",
+  "task_id=PER-100",
+  "phase_task_id=P12-T05",
   "local+SSH public MQTT promotion",
   "Local substitute artifacts are not split-machine proof",
 ]) {
@@ -71,12 +81,29 @@ for (const token of [
   "message_relay_fallback",
   "\"disabled\".to_owned()",
   "\"backend_route_gated_ttl\"",
+  "task_id: String",
+  "phase_task_id: String",
+  "--task-id",
+  "--phase-task-id",
   "Local pair uses harness-only isolated app-state files",
   "provider_relay_boundary",
   "voice_evidence",
 ]) {
   requireText("G009 app-flow example", g009, token);
 }
+
+rejectPattern(
+  "G009 app-flow example",
+  g009,
+  /"task_id":\s*"PER-99"/,
+  "hard-coded PER-99 task identifier in generated artifacts",
+);
+rejectPattern(
+  "G009 app-flow example",
+  g009,
+  /"phase_task_id":\s*"P12-T04"/,
+  "hard-coded P12-T04 phase identifier in generated artifacts",
+);
 
 for (const [name, text] of [
   ["PER-100 report", report],
