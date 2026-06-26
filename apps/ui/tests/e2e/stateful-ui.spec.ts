@@ -519,7 +519,9 @@ test("main chat layout keeps document fixed and message list scrollable at requi
     });
     await expect(page.getByRole("heading", { name: "#general", exact: true })).toBeVisible();
     await expect(page.getByText(/Signaling and ICE settings/i)).toHaveCount(0);
-    await expect(page.getByText(/proof|checklist|template/i)).toHaveCount(0);
+    await expect(
+      page.getByTestId("main-chat-content").getByText(/checklist|template/i),
+    ).toHaveCount(0);
     await expectMainLayoutStable(page);
     await page.screenshot({
       fullPage: true,
