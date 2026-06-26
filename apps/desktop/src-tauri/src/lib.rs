@@ -203,6 +203,54 @@ pub struct StorageDiagnosticReportView {
     pub redacted_context: BTreeMap<String, String>,
 }
 
+/// Redacted MLS/admission diagnostic report suitable for support bundles.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MlsAdmissionDiagnosticReportView {
+    /// Stable report schema.
+    pub schema: String,
+    /// RFC3339 timestamp for support-bundle correlation.
+    pub timestamp: String,
+    /// Stable aggregate diagnostic code for the active/actionable group.
+    pub code: String,
+    /// Stable aggregate diagnostic class.
+    pub failure_class: String,
+    /// True when protected group behavior must stay blocked.
+    pub fail_closed: bool,
+    /// User-actionable recovery hint.
+    pub recovery_hint: String,
+    /// Redacted, low-cardinality context for support triage.
+    pub redacted_context: BTreeMap<String, String>,
+    /// Per-group redacted MLS/admission state.
+    #[serde(default)]
+    pub groups: Vec<MlsAdmissionGroupDiagnosticView>,
+}
+
+/// Per-group redacted MLS/admission diagnostic entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MlsAdmissionGroupDiagnosticView {
+    /// Redacted group reference.
+    pub group_ref: String,
+    /// Stable diagnostic code.
+    pub code: String,
+    /// Stable diagnostic class.
+    pub failure_class: String,
+    /// True when protected group behavior must stay blocked for this group.
+    pub fail_closed: bool,
+    /// Local backend role label.
+    pub local_role: String,
+    /// Backend-derived local member status.
+    pub local_member_status: String,
+    /// Whether a persisted OpenMLS handle exists for this group.
+    pub openmls_handle_present: bool,
+    /// Redacted OpenMLS handle reference when present.
+    #[serde(default)]
+    pub openmls_handle_ref: Option<String>,
+    /// User-actionable recovery hint.
+    pub recovery_hint: String,
+    /// Redacted, low-cardinality context for support triage.
+    pub redacted_context: BTreeMap<String, String>,
+}
+
 /// Storage setup/unlock mode selected before account setup.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1121,6 +1169,9 @@ pub struct AppStateView {
     /// Redacted keyring/vault/storage diagnostic report.
     #[serde(default)]
     pub storage_diagnostic_report: Option<StorageDiagnosticReportView>,
+    /// Redacted OpenMLS/admission diagnostic report.
+    #[serde(default)]
+    pub mls_admission_diagnostic_report: Option<MlsAdmissionDiagnosticReportView>,
     /// Local profile, if setup/recovery has completed.
     pub profile: Option<UserProfileView>,
     /// Persisted UI preferences.
@@ -4194,6 +4245,7 @@ pub fn export_diagnostics_log() -> String {
         "lifecycle": &view.lifecycle,
         "storage_security": &view.storage_security,
         "storage_diagnostic_report": &view.storage_diagnostic_report,
+        "mls_admission_diagnostic_report": &view.mls_admission_diagnostic_report,
         "runtime_mode": &view.runtime_mode,
         "webrtc_env": {
             "ice_mode": std::env::var("DISCRYPT_WEBRTC_ICE_MODE").unwrap_or_else(|_| "default".to_owned()),
@@ -10012,11 +10064,14 @@ impl PersistedAppState {
         let storage_security = storage_security_view(self.last_command_error.as_ref());
         let storage_diagnostic_report =
             storage_diagnostic_report_view(&storage_security, self.last_command_error.as_ref());
+        let mls_admission_diagnostic_report =
+            mls_admission_diagnostic_report_view(self, self.last_command_error.as_ref());
         AppStateView {
             schema_version: self.schema_version,
             lifecycle: self.lifecycle.clone(),
             storage_security,
             storage_diagnostic_report: Some(storage_diagnostic_report),
+            mls_admission_diagnostic_report: Some(mls_admission_diagnostic_report),
             profile: self.profile.clone(),
             preferences: self.preferences.clone(),
             dms: self.dms.clone(),
@@ -14583,6 +14638,358 @@ fn storage_diagnostic_report_view(
     }
 }
 
+fn mls_admission_diagnostic_report_view(
+    state: &PersistedAppState,
+    last_error: Option<&CommandErrorView>,
+) -> MlsAdmissionDiagnosticReportView {
+    let group_entries = state
+        .groups
+        .iter()
+        .map(|group| mls_admission_group_diagnostic_view(state, group, last_error))
+        .collect::<Vec<_>>();
+    let active_group_id = state
+        .active_context
+        .as_ref()
+        .and_then(|context| context.group_id.as_deref());
+    let aggregate = active_group_id
+        .and_then(|group_id| {
+            group_entries
+                .iter()
+                .find(|entry| entry.group_ref == redacted_observable_ref("group", group_id))
+        })
+        .filter(|entry| entry.failure_class != "mls_admission_ready")
+        .or_else(|| {
+            group_entries
+                .iter()
+                .find(|entry| entry.failure_class != "mls_admission_ready")
+        });
+    let (code, failure_class, fail_closed, recovery_hint) = if let Some(aggregate) = aggregate {
+        (
+            aggregate.code.clone(),
+            aggregate.failure_class.clone(),
+            aggregate.fail_closed,
+            aggregate.recovery_hint.clone(),
+        )
+    } else {
+        (
+            mls_admission_diagnostic_code("mls_admission_ready"),
+            "mls_admission_ready".to_owned(),
+            false,
+            "OpenMLS/admission diagnostics found no blocked local group membership.".to_owned(),
+        )
+    };
+    let mut context = BTreeMap::new();
+    context.insert("component".to_owned(), "mls_admission".to_owned());
+    context.insert("group_count".to_owned(), state.groups.len().to_string());
+    context.insert(
+        "openmls_handle_count".to_owned(),
+        state.openmls_groups.len().to_string(),
+    );
+    context.insert(
+        "pending_admission_count".to_owned(),
+        state
+            .groups
+            .iter()
+            .map(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .filter(|request| request.status == "pending")
+                    .count()
+            })
+            .sum::<usize>()
+            .to_string(),
+    );
+    if let Some(group_id) = active_group_id {
+        context.insert(
+            "active_group_ref".to_owned(),
+            redacted_observable_ref("group", group_id),
+        );
+    }
+    if let Some(error) = last_error.filter(|error| mls_admission_error_class(error).is_some()) {
+        context.insert("source_command".to_owned(), error.command.clone());
+        context.insert("source_code".to_owned(), error.code.clone());
+        context.insert("source_timestamp".to_owned(), error.timestamp.clone());
+        context.extend(
+            error
+                .redacted_context
+                .iter()
+                .map(|(key, value)| (format!("source_{key}"), value.clone())),
+        );
+    }
+
+    MlsAdmissionDiagnosticReportView {
+        schema: "discrypt.mls_admission_diagnostic.v1".to_owned(),
+        timestamp: last_error
+            .filter(|error| mls_admission_error_class(error).is_some())
+            .map(|error| error.timestamp.clone())
+            .unwrap_or_else(default_command_error_timestamp),
+        code,
+        failure_class,
+        fail_closed,
+        recovery_hint: redact_sensitive_observable_copy(recovery_hint),
+        redacted_context: redact_command_error_context(context),
+        groups: group_entries,
+    }
+}
+
+fn mls_admission_group_diagnostic_view(
+    state: &PersistedAppState,
+    group: &GroupView,
+    last_error: Option<&CommandErrorView>,
+) -> MlsAdmissionGroupDiagnosticView {
+    let local_member_id = state.local_user_id();
+    let local_member = group
+        .members
+        .iter()
+        .find(|member| member.member_id == local_member_id);
+    let handle = state
+        .openmls_groups
+        .iter()
+        .find(|record| record.group_id == group.group_id);
+    let classification =
+        classify_mls_admission_group(state, group, local_member, handle, last_error);
+    let pending_count = group
+        .admission_requests
+        .iter()
+        .filter(|request| request.status == "pending")
+        .count();
+    let approved_without_welcome_count = group
+        .admission_requests
+        .iter()
+        .filter(|request| {
+            request.status == "approved"
+                && !state
+                    .has_openmls_welcome_outbox_for(&group.group_id, &request.signer_public_key_hex)
+        })
+        .count();
+    let mut context = BTreeMap::new();
+    context.insert("component".to_owned(), "mls_admission".to_owned());
+    context.insert(
+        "group_ref".to_owned(),
+        redacted_observable_ref("group", &group.group_id),
+    );
+    context.insert(
+        "local_member_ref".to_owned(),
+        redacted_observable_ref("member", &local_member_id),
+    );
+    context.insert("group_role".to_owned(), group.role.clone());
+    context.insert(
+        "local_member_status".to_owned(),
+        local_member
+            .map(|member| member.status.clone())
+            .unwrap_or_else(|| "missing".to_owned()),
+    );
+    context.insert(
+        "admission_mode".to_owned(),
+        group.role_policy.admission_mode.canonical_name().to_owned(),
+    );
+    context.insert(
+        "pending_request_count".to_owned(),
+        pending_count.to_string(),
+    );
+    context.insert(
+        "approved_without_welcome_count".to_owned(),
+        approved_without_welcome_count.to_string(),
+    );
+    if let Some(handle) = handle {
+        context.insert("openmls_epoch".to_owned(), handle.epoch.to_string());
+        context.insert(
+            "openmls_handle_ref".to_owned(),
+            redacted_observable_ref(
+                "openmls_handle",
+                &format!(
+                    "{}:{}:{}",
+                    handle.group_id, handle.signer_public_key_hex, handle.confirmation_tag_sha256
+                ),
+            ),
+        );
+    }
+    if let Some(error) = last_error.filter(|error| mls_admission_error_class(error).is_some()) {
+        context.insert("source_command".to_owned(), error.command.clone());
+        context.insert("source_code".to_owned(), error.code.clone());
+        context.insert("source_timestamp".to_owned(), error.timestamp.clone());
+    }
+
+    MlsAdmissionGroupDiagnosticView {
+        group_ref: redacted_observable_ref("group", &group.group_id),
+        code: mls_admission_diagnostic_code(&classification.failure_class),
+        failure_class: classification.failure_class,
+        fail_closed: classification.fail_closed,
+        local_role: group.role.clone(),
+        local_member_status: local_member
+            .map(|member| member.status.clone())
+            .unwrap_or_else(|| "missing".to_owned()),
+        openmls_handle_present: handle.is_some(),
+        openmls_handle_ref: handle.map(|handle| {
+            redacted_observable_ref(
+                "openmls_handle",
+                &format!(
+                    "{}:{}:{}",
+                    handle.group_id, handle.signer_public_key_hex, handle.confirmation_tag_sha256
+                ),
+            )
+        }),
+        recovery_hint: redact_sensitive_observable_copy(classification.recovery_hint),
+        redacted_context: redact_command_error_context(context),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MlsAdmissionDiagnosticClassification {
+    failure_class: String,
+    fail_closed: bool,
+    recovery_hint: String,
+}
+
+fn classify_mls_admission_group(
+    state: &PersistedAppState,
+    group: &GroupView,
+    local_member: Option<&GroupMemberView>,
+    handle: Option<&OpenMlsGroupHandleRecord>,
+    last_error: Option<&CommandErrorView>,
+) -> MlsAdmissionDiagnosticClassification {
+    if let Some(error_class) = last_error
+        .filter(|error| mls_admission_error_mentions_group(error, &group.group_id))
+        .and_then(mls_admission_error_class)
+    {
+        return MlsAdmissionDiagnosticClassification {
+            recovery_hint: mls_admission_diagnostic_recovery_hint(error_class),
+            failure_class: error_class.to_owned(),
+            fail_closed: error_class != "mls_admission_ready",
+        };
+    }
+    if local_member.is_some_and(|member| member.status == "revoked") {
+        return MlsAdmissionDiagnosticClassification {
+            failure_class: "mls_member_revoked".to_owned(),
+            fail_closed: true,
+            recovery_hint: mls_admission_diagnostic_recovery_hint("mls_member_revoked"),
+        };
+    }
+    if group.admission_requests.iter().any(|request| {
+        request.status == "approved"
+            && !state
+                .has_openmls_welcome_outbox_for(&group.group_id, &request.signer_public_key_hex)
+    }) {
+        return MlsAdmissionDiagnosticClassification {
+            failure_class: "mls_welcome_missing".to_owned(),
+            fail_closed: true,
+            recovery_hint: mls_admission_diagnostic_recovery_hint("mls_welcome_missing"),
+        };
+    }
+    if group.role == "pending" || local_member.is_some_and(|member| member.status == "pending") {
+        return MlsAdmissionDiagnosticClassification {
+            failure_class: "mls_admission_pending".to_owned(),
+            fail_closed: true,
+            recovery_hint: mls_admission_diagnostic_recovery_hint("mls_admission_pending"),
+        };
+    }
+    if handle.is_none() && (group.role == "member" || local_member.is_some()) {
+        return MlsAdmissionDiagnosticClassification {
+            failure_class: "mls_missing_openmls_handle".to_owned(),
+            fail_closed: true,
+            recovery_hint: mls_admission_diagnostic_recovery_hint("mls_missing_openmls_handle"),
+        };
+    }
+    MlsAdmissionDiagnosticClassification {
+        failure_class: "mls_admission_ready".to_owned(),
+        fail_closed: false,
+        recovery_hint: mls_admission_diagnostic_recovery_hint("mls_admission_ready"),
+    }
+}
+
+fn mls_admission_error_mentions_group(error: &CommandErrorView, group_id: &str) -> bool {
+    let group_ref = redacted_observable_ref("group", group_id);
+    error.message.contains(&group_ref)
+        || error.recovery_hint.contains(&group_ref)
+        || error
+            .redacted_context
+            .values()
+            .any(|value| value.contains(&group_ref))
+        || error.command.starts_with("handle_text_control_frame")
+        || error.command == "send_message"
+        || error.command == "join_group"
+}
+
+fn mls_admission_error_class(error: &CommandErrorView) -> Option<&'static str> {
+    let combined =
+        format!("{} {} {}", error.code, error.message, error.recovery_hint).to_ascii_lowercase();
+    if combined.contains("confirmation tag")
+        || combined.contains("fork")
+        || combined.contains("tree hash")
+        || combined.contains("epoch mismatch")
+        || combined.contains("downgrade")
+        || combined.contains("replay")
+    {
+        Some("mls_fork_mismatch")
+    } else if combined.contains("revoked") || error.code == "member_revoked" {
+        Some("mls_member_revoked")
+    } else if combined.contains("welcome")
+        && (combined.contains("missing")
+            || combined.contains("did not produce")
+            || combined.contains("could not be joined")
+            || combined.contains("requires a welcome")
+            || error.code == "openmls_admission_welcome_failed"
+            || error.code == "openmls_admission_welcome_join_failed")
+    {
+        Some("mls_welcome_missing")
+    } else if combined.contains("admission_pending")
+        || combined.contains("waiting for owner/staff admission")
+    {
+        Some("mls_admission_pending")
+    } else if combined.contains("openmls group state is missing")
+        || combined.contains("openmls membership/exporter state is unavailable")
+        || combined.contains("openmls group could not be loaded")
+        || combined.contains("without persisted openmls")
+        || error.code == "text_delivery_envelope_failed"
+    {
+        Some("mls_missing_openmls_handle")
+    } else {
+        None
+    }
+}
+
+fn mls_admission_diagnostic_code(failure_class: &str) -> String {
+    match failure_class {
+        "mls_missing_openmls_handle" => "mls_missing_openmls_handle",
+        "mls_admission_pending" => "mls_admission_pending",
+        "mls_member_revoked" => "mls_member_revoked",
+        "mls_welcome_missing" => "mls_welcome_missing",
+        "mls_fork_mismatch" => "mls_fork_mismatch",
+        "mls_admission_ready" => "mls_admission_ready",
+        _ => "mls_admission_unknown",
+    }
+    .to_owned()
+}
+
+fn mls_admission_diagnostic_recovery_hint(failure_class: &str) -> String {
+    match failure_class {
+        "mls_missing_openmls_handle" => "Do not treat invite parsing as membership; wait for or restore the persisted OpenMLS group handle before sending protected group text or voice.",
+        "mls_admission_pending" => "Wait for an authorized owner/staff MLS add or Welcome; protected group text and voice remain blocked while admission is pending.",
+        "mls_member_revoked" => "This member is revoked; future protected sends, receives, and relay authority remain blocked until a future authorized MLS re-add flow restores access.",
+        "mls_welcome_missing" => "Refresh owner/staff admission delivery and require an authorized OpenMLS Welcome before marking the joiner admitted.",
+        "mls_fork_mismatch" => "Treat the group state as forked or replayed; do not accept the Welcome/commit silently, and rejoin through deterministic fork-recovery or a fresh authorized Welcome.",
+        "mls_admission_ready" => "Persisted OpenMLS/admission evidence is present for local protected group behavior.",
+        _ => "Inspect redacted MLS/admission context and avoid claiming group membership without persisted OpenMLS evidence.",
+    }
+    .to_owned()
+}
+
+impl PersistedAppState {
+    fn has_openmls_welcome_outbox_for(&self, group_id: &str, signer_public_key_hex: &str) -> bool {
+        self.text_control_outbox.iter().any(|record| {
+            matches!(
+                &record.frame,
+                TextControlFrameView::OpenMlsAdmissionWelcome {
+                    group_id: frame_group_id,
+                    member_signer_public_key_hex,
+                    ..
+                } if frame_group_id == group_id && member_signer_public_key_hex == signer_public_key_hex
+            )
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StorageDiagnosticClassification {
     code: String,
@@ -14783,6 +15190,16 @@ fn sensitive_observable_classes(value: &str) -> Vec<&'static str> {
         ("content key", "content_key"),
         ("mls epoch secret", "mls_key"),
         ("mls exporter", "mls_key"),
+        ("welcome payload", "mls_welcome"),
+        ("welcome bytes", "mls_welcome"),
+        ("serialized welcome", "mls_welcome"),
+        ("serialized openmls welcome", "mls_welcome"),
+        ("openmls welcome bytes", "mls_welcome"),
+        ("serialized key package", "mls_key_package"),
+        ("key package bytes", "mls_key_package"),
+        ("epoch secret", "mls_key"),
+        ("raw member", "member_identifier"),
+        ("raw-member", "member_identifier"),
         ("production-ready", "fake_production_label"),
         ("fake production", "fake_production_label"),
     ] {
@@ -35062,6 +35479,317 @@ mod tests {
     }
 
     #[test]
+    fn mls_admission_diagnostic_report_classifies_required_codes() -> Result<(), String> {
+        let _guard = test_lock();
+
+        fn assert_actionable_mls_recovery_hint(
+            report: &MlsAdmissionDiagnosticReportView,
+            code: &str,
+            expected_hint_fragment: &str,
+        ) {
+            assert_eq!(report.code, code);
+            assert!(
+                !report
+                    .recovery_hint
+                    .contains("redacted sensitive observable copy"),
+                "{code} aggregate recovery hint was over-redacted: {report:?}"
+            );
+            assert!(
+                report.recovery_hint.contains(expected_hint_fragment),
+                "{code} aggregate recovery hint was not actionable: {}",
+                report.recovery_hint
+            );
+            let group = report
+                .groups
+                .iter()
+                .find(|group| group.code == code)
+                .unwrap_or_else(|| panic!("{code} per-group diagnostic missing: {report:?}"));
+            assert!(
+                !group
+                    .recovery_hint
+                    .contains("redacted sensitive observable copy"),
+                "{code} per-group recovery hint was over-redacted: {group:?}"
+            );
+            assert!(
+                group.recovery_hint.contains(expected_hint_fragment),
+                "{code} per-group recovery hint was not actionable: {}",
+                group.recovery_hint
+            );
+        }
+
+        reset_with_temp_state("mls-admission-diagnostic-missing-handle");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "MLS Missing Handle Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.openmls_groups.clear();
+        }
+        let report = app_state()
+            .mls_admission_diagnostic_report
+            .ok_or_else(|| "MLS/admission diagnostic report missing".to_owned())?;
+        assert_eq!(report.schema, "discrypt.mls_admission_diagnostic.v1");
+        assert!(report.fail_closed);
+        assert_actionable_mls_recovery_hint(
+            &report,
+            "mls_missing_openmls_handle",
+            "persisted OpenMLS group handle",
+        );
+
+        reset_with_temp_state("mls-admission-diagnostic-pending");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Pending Diagnostic Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        mutate_app_service(|state| {
+            state.openmls_groups.clear();
+            if let Some(group) = state.groups.first_mut() {
+                group.role = "pending".to_owned();
+                if let Some(member) = group.members.first_mut() {
+                    member.status = "pending".to_owned();
+                }
+            }
+        });
+        let report = app_state()
+            .mls_admission_diagnostic_report
+            .ok_or_else(|| "pending MLS/admission diagnostic report missing".to_owned())?;
+        assert_actionable_mls_recovery_hint(&report, "mls_admission_pending", "owner/staff");
+        assert!(
+            report
+                .groups
+                .iter()
+                .any(|group| group.failure_class == "mls_admission_pending"
+                    && !group.openmls_handle_present),
+            "invite parsing alone must stay pending without an OpenMLS handle: {report:?}"
+        );
+
+        reset_with_temp_state("mls-admission-diagnostic-revoked");
+        create_user(CreateUserRequest {
+            display_name: "Carol".to_owned(),
+            device_name: Some("Carol laptop".to_owned()),
+        });
+        create_group(CreateGroupRequest {
+            name: "MLS Revoked Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        mutate_app_service(|state| {
+            let local_member_id = state.local_user_id();
+            if let Some(member) = state.groups.first_mut().and_then(|group| {
+                group
+                    .members
+                    .iter_mut()
+                    .find(|member| member.member_id == local_member_id)
+            }) {
+                member.status = "revoked".to_owned();
+            }
+        });
+        let report = app_state()
+            .mls_admission_diagnostic_report
+            .ok_or_else(|| "revoked MLS/admission diagnostic report missing".to_owned())?;
+        assert_actionable_mls_recovery_hint(&report, "mls_member_revoked", "revoked");
+
+        reset_with_temp_state("mls-admission-diagnostic-welcome-missing");
+        create_user(CreateUserRequest {
+            display_name: "Dana".to_owned(),
+            device_name: Some("Dana laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "MLS Welcome Missing Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "welcome missing group not created".to_owned())?;
+        mutate_app_service(|state| {
+            let local_user_id = state.local_user_id();
+            if let Some(group) = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+            {
+                group.admission_requests.push(GroupAdmissionRequestView {
+                    request_id: "req-mls-welcome-missing".to_owned(),
+                    group_id: group_id.clone(),
+                    invite_id: None,
+                    display_name: "Redacted Joiner".to_owned(),
+                    device_name: Some("Joiner laptop".to_owned()),
+                    member_identity: "member-secret-should-not-leak".to_owned(),
+                    signer_public_key_hex: "feedfacecafebeef".to_owned(),
+                    key_package: b"welcome-payload-should-not-leak".to_vec(),
+                    status: "approved".to_owned(),
+                    requested_at: Utc::now().to_rfc3339(),
+                    decided_by: Some(local_user_id),
+                    decided_at: Some(Utc::now().to_rfc3339()),
+                    decision_reason: Some("approved without queued Welcome".to_owned()),
+                    policy_epoch_at_request: group.role_policy.policy_epoch,
+                    admission_mode_at_request: Some(GroupAdmissionModeView::ManualApproval),
+                });
+            }
+        });
+        let report = app_state()
+            .mls_admission_diagnostic_report
+            .ok_or_else(|| "Welcome-missing MLS/admission diagnostic report missing".to_owned())?;
+        assert_actionable_mls_recovery_hint(
+            &report,
+            "mls_welcome_missing",
+            "authorized OpenMLS Welcome",
+        );
+
+        mutate_app_service(|state| {
+            state.last_command_error = Some(command_error_view(
+                "handle_text_control_frame",
+                "openmls_admission_welcome_join_failed",
+                "OpenMLS joined confirmation tag did not match owner Welcome state",
+                "Do not accept forked or replayed group state silently; request fresh recovery",
+                BTreeMap::new(),
+            ));
+        });
+        let report = app_state()
+            .mls_admission_diagnostic_report
+            .ok_or_else(|| "fork MLS/admission diagnostic report missing".to_owned())?;
+        assert!(report.fail_closed);
+        assert_actionable_mls_recovery_hint(&report, "mls_fork_mismatch", "forked or replayed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn mls_admission_diagnostic_report_reaches_support_bundle_without_secrets() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        reset_with_temp_state("mls-admission-diagnostic-support-bundle");
+        create_user(CreateUserRequest {
+            display_name: "Eve".to_owned(),
+            device_name: Some("Eve laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "MLS Diagnostic Support Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let mut context = BTreeMap::new();
+        context.insert(
+            "welcome".to_owned(),
+            "Welcome payload per94-welcome-secret and epoch secret per94-epoch-secret".to_owned(),
+        );
+        context.insert(
+            "provider".to_owned(),
+            "provider credential per94-provider-secret".to_owned(),
+        );
+        mutate_app_service(|state| {
+            state.last_command_error = Some(command_error_view(
+                "handle_text_control_frame",
+                "openmls_admission_welcome_failed",
+                "OpenMLS add_member_package did not produce a Welcome for per94-raw-member-id",
+                "Retry admission without exposing Welcome payload or private key per94-private-key",
+                context,
+            ));
+        });
+
+        let diagnostics = export_diagnostics_log();
+        let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("target/per94-mls-admission-diagnostic-report");
+        std::fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
+        let artifact = artifact_dir.join("diagnostics-log.json");
+        std::fs::write(&artifact, &diagnostics).map_err(|err| err.to_string())?;
+        let diagnostics_json: serde_json::Value =
+            serde_json::from_str(&diagnostics).map_err(|err| err.to_string())?;
+        assert_eq!(
+            diagnostics_json["mls_admission_diagnostic_report"]["schema"],
+            "discrypt.mls_admission_diagnostic.v1"
+        );
+        assert_eq!(
+            diagnostics_json["mls_admission_diagnostic_report"]["code"],
+            "mls_welcome_missing"
+        );
+        assert_eq!(
+            diagnostics_json["mls_admission_diagnostic_report"]["fail_closed"],
+            true
+        );
+        let recovery_hint = diagnostics_json["mls_admission_diagnostic_report"]["recovery_hint"]
+            .as_str()
+            .ok_or_else(|| "MLS/admission support recovery hint missing".to_owned())?;
+        assert!(
+            recovery_hint.contains("authorized OpenMLS Welcome"),
+            "MLS/admission support recovery hint should stay actionable: {recovery_hint}"
+        );
+        assert!(
+            !recovery_hint.contains("redacted sensitive observable copy"),
+            "MLS/admission support recovery hint was over-redacted: {recovery_hint}"
+        );
+        let group_recovery_hint = diagnostics_json["mls_admission_diagnostic_report"]["groups"]
+            .as_array()
+            .and_then(|groups| groups.first())
+            .and_then(|group| group["recovery_hint"].as_str())
+            .ok_or_else(|| "MLS/admission per-group support recovery hint missing".to_owned())?;
+        assert!(
+            group_recovery_hint.contains("authorized OpenMLS Welcome"),
+            "MLS/admission per-group support recovery hint should stay actionable: {group_recovery_hint}"
+        );
+        assert!(
+            !group_recovery_hint.contains("redacted sensitive observable copy"),
+            "MLS/admission per-group support recovery hint was over-redacted: {group_recovery_hint}"
+        );
+
+        for forbidden in [
+            "per94-welcome-secret",
+            "per94-epoch-secret",
+            "per94-provider-secret",
+            "per94-raw-member-id",
+            "per94-private-key",
+            "feedfacecafebeef",
+        ] {
+            assert!(
+                !diagnostics.contains(forbidden),
+                "MLS/admission support bundle leaked {forbidden}: {diagnostics}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mutation_commands_return_current_state_with_event_cursor() -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("mutation-cursor");
@@ -35701,6 +36429,10 @@ mod tests {
             "content key g009",
             "mls epoch secret g009",
             "mls exporter g009",
+            "Welcome payload g009",
+            "OpenMLS Welcome bytes g009",
+            "serialized key package g009",
+            "raw-member-id g009",
             "production-ready",
             "fake production label",
         ] {
