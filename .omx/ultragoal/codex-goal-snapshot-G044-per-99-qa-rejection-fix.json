@@ -1,0 +1,20 @@
+{
+  "goal_id": "G044-per-99-p12-t04-split-machine-app-flo",
+  "issue": "PER-99",
+  "phase_task": "P12-T04",
+  "checkpoint": "qa_rejection_fix",
+  "summary": "Added harness-only local-pair two-profile G009 evidence path after QA found default owner cannot attach runtime from prepare-owner alone without a live provider/WebRTC peer route or admitted remote member.",
+  "changed_paths": [
+    "apps/desktop/src-tauri/Cargo.toml",
+    "apps/desktop/src-tauri/src/lib.rs",
+    "apps/desktop/src-tauri/examples/g009_split_machine_app_flow.rs",
+    "docs/release/per99-g009-split-machine-app-flow-2026-06-26.md",
+    ".omx/plans/P12-T04-split-machine-app-flow-hardening-2026-06-26.md"
+  ],
+  "artifact_paths": [
+    "target/per99-g009-split-machine-app-flow/local-pair.json",
+    "target/per99-g009-split-machine-app-flow/local-pair-owner.json",
+    "target/per99-g009-split-machine-app-flow/local-pair-joiner.json"
+  ],
+  "status": "verification_in_progress"
+}
