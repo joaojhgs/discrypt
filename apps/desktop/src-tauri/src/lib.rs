@@ -5810,33 +5810,37 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             );
             return;
         }
-        let parsed_invite = parse_invite_metadata(&invite_code);
-        if let Some(parsed) = parsed_invite.as_ref() {
-            if let Err(failure) = validate_parsed_invite_usable(parsed, Utc::now()) {
-                state.push_command_error(
-                    "invite.rejected",
-                    "join_group",
-                    failure.code,
-                    failure.message,
-                    failure.recovery_hint,
-                );
-                return;
-            }
+        let Some(parsed_invite) = parse_invite_metadata(&invite_code) else {
+            state.push_command_error(
+                "invite.rejected",
+                "join_group",
+                "invite_unparsable",
+                "Invite code is not a valid signed Discrypt invite descriptor",
+                "Request a fresh invite link from the group owner or staff",
+            );
+            return;
+        };
+        if let Err(failure) = validate_parsed_invite_usable(&parsed_invite, Utc::now()) {
+            state.push_command_error(
+                "invite.rejected",
+                "join_group",
+                failure.code,
+                failure.message,
+                failure.recovery_hint,
+            );
+            return;
         }
         let name = invite_group_name_from_metadata(
             &invite_code,
             request.group_name.clone(),
-            parsed_invite.as_ref(),
+            Some(&parsed_invite),
         );
         let group_id = parsed_invite
-            .as_ref()
-            .and_then(|parsed| parsed.group_id.clone())
+            .group_id
+            .clone()
             .unwrap_or_else(|| stable_id("group", &name, state.next_sequence));
         if !state.groups.iter().any(|group| group.group_id == group_id) {
-            let connectivity = parsed_invite
-                .as_ref()
-                .map(|parsed| parsed.connectivity.clone())
-                .unwrap_or_else(|| group_connectivity_policy(&group_id));
+            let connectivity = parsed_invite.connectivity.clone();
             let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
             let created_at = Utc::now().to_rfc3339();
             let local_member_id = state.local_user_id();
@@ -5881,7 +5885,7 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 runtime_peers,
                 connectivity: Some(connectivity),
             });
-        } else if let Some(parsed) = parsed_invite.as_ref() {
+        } else {
             let has_openmls_handle = state
                 .openmls_groups
                 .iter()
@@ -5897,8 +5901,8 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                     "pending".to_owned()
                 };
                 existing_group.runtime_peers =
-                    group_runtime_peers(Some(&parsed.connectivity), "member");
-                existing_group.connectivity = Some(parsed.connectivity.clone());
+                    group_runtime_peers(Some(&parsed_invite.connectivity), "member");
+                existing_group.connectivity = Some(parsed_invite.connectivity.clone());
             }
         }
         state.ensure_group_governance_defaults();
@@ -5925,7 +5929,8 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 return;
             }
         }
-        if let Some(parsed) = parsed_invite {
+        {
+            let parsed = parsed_invite;
             state.invites.push(InviteView {
                 invite_id: format!("invite-{}", parsed.invite_key),
                 invite_key: parsed.invite_key,
@@ -17220,10 +17225,14 @@ fn validate_parsed_invite_usable(
             recovery_hint: "Request a fresh invite from an owner or staff member",
         });
     }
-    if DateTime::parse_from_rfc3339(&invite.expires_at)
-        .map(|expires_at| now > expires_at.with_timezone(&Utc))
-        .unwrap_or(false)
-    {
+    let Ok(expires_at) = DateTime::parse_from_rfc3339(&invite.expires_at) else {
+        return Err(InviteUseFailure {
+            code: "invite_expiry_invalid",
+            message: "Invite expiry metadata is missing or invalid",
+            recovery_hint: "Request a fresh invite with a valid signed expiry",
+        });
+    };
+    if now > expires_at.with_timezone(&Utc) {
         return Err(InviteUseFailure {
             code: "invite_expired",
             message: "Invite expired before admission could proceed",
@@ -19771,8 +19780,7 @@ struct ParsedInviteMetadata {
 
 fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
     let trimmed = invite_code.trim();
-    let (prefix, query) = trimmed.split_once('?')?;
-    let invite_key = prefix.rsplit('/').next()?.to_owned();
+    let (_prefix, query) = trimmed.split_once('?')?;
     if let Some(descriptor_payload) = query_value(query, "d") {
         let descriptor_bytes = URL_SAFE_NO_PAD.decode(descriptor_payload.as_bytes()).ok()?;
         let descriptor: discrypt_admission::StoredInvite =
@@ -19825,6 +19833,18 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             revoked,
         });
     }
+    #[cfg(feature = "local-dev")]
+    if let Some(parsed) = parse_legacy_invite_metadata(_prefix, query) {
+        return Some(parsed);
+    }
+    None
+}
+
+/// Security boundary: unsigned legacy invites are accepted only under `local-dev`;
+/// production membership flows require signed `d=` descriptors.
+#[cfg(feature = "local-dev")]
+fn parse_legacy_invite_metadata(prefix: &str, query: &str) -> Option<ParsedInviteMetadata> {
+    let invite_key = prefix.rsplit('/').next()?.to_owned();
     let endpoint = query_value(query, "endpoint")
         .and_then(percent_decode)
         .filter(|value| !value.is_empty())?;
@@ -24044,6 +24064,7 @@ mod tests {
             .any(|message| message.body == "hello encrypted local shell"));
     }
 
+    #[cfg(feature = "local-dev")]
     #[test]
     fn production_invite_parser_surfaces_endpoint_and_trust_without_room_secret() {
         let code = "discrypt://join/v1/invite-a?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2026-05-29T00%3A00%3A00Z&max=3";
@@ -24173,6 +24194,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local-dev")]
     #[test]
     fn expired_parsed_invite_fails_before_pending_group_state() {
         let _guard = test_lock();
@@ -24204,6 +24226,125 @@ mod tests {
             "expired parsed invite must not leave a pending compatibility group"
         );
         assert!(rejected.invites.is_empty());
+    }
+
+    #[test]
+    fn garbage_invite_code_is_rejected_with_typed_error_without_group_creation() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("join-garbage-invite");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let before = load_state().to_view();
+
+        let rejected = join_group(JoinGroupRequest {
+            invite_code: "totally-garbage-invite".to_owned(),
+            group_name: Some("Should Not Exist".to_owned()),
+        });
+
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invite_unparsable"),
+            "unparsable invite must fail with a typed command error"
+        );
+        assert_eq!(
+            rejected.groups.len(),
+            before.groups.len(),
+            "unparsable invite must not create a placeholder group"
+        );
+        assert!(
+            rejected
+                .groups
+                .iter()
+                .all(|group| group.name != "Should Not Exist" && group.role != "pending"),
+            "unparsable invite must not leave a pending group"
+        );
+        assert!(rejected.invites.is_empty());
+    }
+
+    fn corrupt_invite_descriptor_signature(invite_code: &str) -> String {
+        let marker = "?d=";
+        let payload_start = invite_code
+            .find(marker)
+            .expect("production invite link must carry a signed descriptor parameter")
+            + marker.len();
+        let payload_end = invite_code[payload_start..]
+            .find('&')
+            .map_or(invite_code.len(), |offset| payload_start + offset);
+        let payload = &invite_code[payload_start..payload_end];
+        let descriptor_bytes = URL_SAFE_NO_PAD
+            .decode(payload.as_bytes())
+            .expect("fixture descriptor payload must decode");
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&descriptor_bytes).expect("fixture descriptor must be JSON");
+        let signature = descriptor["issuer_signature"]
+            .as_array_mut()
+            .expect("issuer signature array");
+        let first = signature[0].as_u64().expect("signature byte");
+        signature[0] = serde_json::json!(first ^ 1);
+        let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&descriptor).expect("reserialize"));
+        format!(
+            "{}{}{}",
+            &invite_code[..payload_start],
+            tampered,
+            &invite_code[payload_end..]
+        )
+    }
+
+    #[test]
+    fn tampered_invite_descriptor_signature_is_rejected_without_group_creation() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("join-tampered-invite");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Descriptor Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_state.groups[0].group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        let tampered_code = corrupt_invite_descriptor_signature(&invite_state.invites[0].code);
+
+        let rejected = join_group(JoinGroupRequest {
+            invite_code: tampered_code,
+            group_name: Some("Should Not Exist".to_owned()),
+        });
+
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invite_unparsable"),
+            "tampered descriptor signature must fail closed with a typed error"
+        );
+        assert_eq!(
+            rejected.groups.len(),
+            group_state.groups.len(),
+            "tampered invite must not create a group"
+        );
+        assert!(
+            rejected
+                .groups
+                .iter()
+                .all(|group| group.name != "Should Not Exist" && group.role != "pending"),
+            "tampered invite must not leave a pending group"
+        );
     }
 
     #[test]
