@@ -81,6 +81,9 @@ use discrypt_transport::{
     DEFAULT_PROVIDER_BACKOFF_MAX_MS, DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
     DEFAULT_PROVIDER_MAX_MESSAGE_BYTES,
 };
+use discrypt_transport::{
+    broker_control_lane_key, join_provider_control_lane_room, BrokerControlLaneTransport,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -1746,8 +1749,27 @@ pub struct TextControlOutboxFrameView {
     pub receipted_route_peer_ids: Vec<String>,
 }
 
+/// Request to attach the sealed broker control lane for the active DM/group context.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachBrokerControlLaneRuntimeRequest {
+    /// Optional signaling adapter kind override (`mqtt`, `nostr`, ...).
+    #[serde(default)]
+    pub adapter_kind: Option<String>,
+}
+
+/// Request to drain sealed inbound broker control frames for one pump window.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DrainTextControlInboundFramesRequest {
+    /// Drain window length in milliseconds. Clamped to 100..=30000.
+    #[serde(default)]
+    pub drain_ms: Option<u64>,
+    /// Optional per-receive transport operation timeout in milliseconds.
+    #[serde(default)]
+    pub operation_timeout_ms: Option<u64>,
+}
+
 /// Request to list pending text/control frames for a session loop.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ListPendingTextControlFramesRequest {
     /// Optional target filter for the active DM/channel session.
     #[serde(default)]
@@ -3756,6 +3778,355 @@ impl TauriAppService {
         let key = TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id);
         self.pending_text_control_transport_runtimes.remove(&key);
         self.text_control_transport_runtimes.insert(key, runtime);
+    }
+
+    fn local_signaling_peer_id_for_active_context(&self) -> Result<SignalingPeerId, String> {
+        let state = &self.state;
+        let context = state.active_context.as_ref().ok_or_else(|| {
+            "No active DM/group context is available for the broker control lane".to_owned()
+        })?;
+        if let Some(dm_id) = &context.dm_id {
+            let dm = state
+                .dms
+                .iter()
+                .find(|dm| &dm.dm_id == dm_id)
+                .ok_or_else(|| format!("Active DM {dm_id} is missing for the broker control lane"))?;
+            let local = dm
+                .runtime_peers
+                .iter()
+                .find(|peer| peer.is_local)
+                .ok_or_else(|| {
+                    "Active DM has no local runtime peer for the broker control lane".to_owned()
+                })?;
+            return SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string());
+        }
+        if let Some(group_id) = &context.group_id {
+            let group = state
+                .groups
+                .iter()
+                .find(|group| &group.group_id == group_id)
+                .ok_or_else(|| format!("Active group {group_id} is missing for the broker control lane"))?;
+            let local_role = runtime_role_for_group(group, &state.local_user_id())
+                .cloned()
+                .ok_or_else(|| {
+                    format!("Active group {group_id} has no local member role for the broker control lane")
+                })?;
+            let runtime_peers = group_runtime_peers(group.connectivity.as_ref(), group_role_label(&local_role));
+            let local = runtime_peers
+                .iter()
+                .find(|peer| peer.is_local)
+                .ok_or_else(|| {
+                    format!("Active group {group_id} has no local runtime peer for the broker control lane")
+                })?;
+            return SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string());
+        }
+        Err("Active context is not a DM or group for the broker control lane".to_owned())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn broker_control_lane_attach_inputs(
+        &self,
+        requested_kind: Option<&str>,
+    ) -> Result<
+        (
+            SignalingAdapterProfile,
+            ConversationScope,
+            Vec<u8>,
+            Vec<u8>,
+            [u8; 32],
+            SignalingPeerId,
+        ),
+        String,
+    > {
+        let (scope_level, connectivity) = self.state.active_connectivity_policy().ok_or_else(|| {
+            "No active DM/group connectivity policy is available for the broker control lane"
+                .to_owned()
+        })?;
+        let requested = requested_kind.and_then(transport_adapter_kind_from_name);
+        let profile_view = self
+            .state
+            .select_signaling_profile(&connectivity, requested)
+            .ok_or_else(|| {
+                "No signaling profile matches the requested adapter kind and build readiness"
+                    .to_owned()
+            })?;
+        let profile = transport_profile_from_view(&profile_view)?;
+        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
+            .map_err(|error| error.to_string())?;
+        let bootstrap_secret = shared_runtime_material(
+            "discrypt-broker-control-lane-bootstrap-v1",
+            &connectivity,
+            &profile.profile_id,
+            32,
+        );
+        let random_entropy = shared_runtime_material(
+            "discrypt-broker-control-lane-entropy-v1",
+            &connectivity,
+            &profile.profile_id,
+            16,
+        );
+        let key = broker_control_lane_key(&shared_runtime_material(
+            "discrypt-broker-control-lane-key-v1",
+            &connectivity,
+            &profile.profile_id,
+            32,
+        ))
+        .map_err(|error| error.to_string())?;
+        let local_peer_id = self.local_signaling_peer_id_for_active_context()?;
+        Ok((
+            profile,
+            scope,
+            bootstrap_secret,
+            random_entropy,
+            key,
+            local_peer_id,
+        ))
+    }
+
+    fn register_broker_control_lane_transport(
+        &mut self,
+        room: Box<dyn discrypt_transport::RendezvousRoom>,
+        key: [u8; 32],
+        local_peer_id: SignalingPeerId,
+        transport_session_id: String,
+        executor: Arc<tokio::runtime::Runtime>,
+    ) {
+        let transport: Arc<dyn discrypt_transport::TextControlDataTransport> = Arc::new(
+            BrokerControlLaneTransport::new(room, key, local_peer_id.clone()),
+        );
+        self.pending_text_control_transport_runtimes
+            .retain(|key, _| key.session_id != transport_session_id);
+        self.text_control_transport_runtimes.insert(
+            TextControlRuntimeMapKey::legacy(transport_session_id.clone()),
+            TextControlTransportRuntime {
+                transport,
+                owned_runtime: None,
+                executor: Some(executor),
+                session_id: transport_session_id,
+                role: None,
+                local_peer_id: Some(local_peer_id.0),
+                remote_peer_id: None,
+            },
+        );
+    }
+
+    fn attach_broker_control_lane_runtime(
+        &mut self,
+        requested_kind: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            return Err(
+                "text transport session is not active; call start_text_session before attaching the broker control lane"
+                    .to_owned(),
+            );
+        };
+        let transport_session_id = session.session_id.clone();
+        let (profile, scope, bootstrap_secret, random_entropy, key, local_peer_id) =
+            self.broker_control_lane_attach_inputs(requested_kind)?;
+        let executor = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|error| format!("could not start broker control lane runtime: {error}"))?,
+        );
+        let room = executor
+            .block_on(join_provider_control_lane_room(
+                profile,
+                scope,
+                &bootstrap_secret,
+                &random_entropy,
+                local_peer_id.clone(),
+            ))
+            .map_err(|error| error.to_string())?;
+        self.register_broker_control_lane_transport(
+            room,
+            key,
+            local_peer_id.clone(),
+            transport_session_id,
+            executor,
+        );
+        self.state.push_event(
+            "transport.broker_control_lane_attached",
+            format!(
+                "Sealed broker control lane attached for local peer {}",
+                redacted_observable_ref("peer", &local_peer_id.0)
+            ),
+        );
+        Ok(())
+    }
+
+    fn drain_text_control_inbound_frames(
+        &mut self,
+        drain_ms: Option<u64>,
+        operation_timeout_ms: Option<u64>,
+    ) -> TextControlTransportPumpReportView {
+        let drain_ms = drain_ms.unwrap_or(2_000);
+        fn failure_report(label: &str, message: String) -> TextControlTransportPumpReportView {
+            TextControlTransportPumpReportView {
+                pending_before: 0,
+                frames_sent: 0,
+                response_frames_received: 0,
+                receipts_applied: 0,
+                failures: vec![message],
+                metrics: discrypt_transport::WebRtcDataTransportMetrics {
+                    schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+                    label: label.to_owned(),
+                    attached_channels: 0,
+                    open: false,
+                    frames_sent: 0,
+                    frames_received: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    last_state: "unavailable".to_owned(),
+                },
+            }
+        }
+
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            let message = "text transport session is not active".to_owned();
+            self.state.push_command_error(
+                "message.transport_drain_unavailable",
+                "drain_text_control_inbound_frames",
+                "text_session_missing",
+                message.clone(),
+                "Call start_text_session before draining inbound control frames",
+            );
+            let report = failure_report("inactive-text-session", message);
+            self.persist();
+            return report;
+        };
+        if matches!(
+            session.state(),
+            TransportSessionState::Idle
+                | TransportSessionState::Disconnected
+                | TransportSessionState::Failed
+                | TransportSessionState::Cancelled
+        ) {
+            let message = format!("text transport session {} is not active", session.session_id);
+            self.state.push_command_error(
+                "message.transport_drain_unavailable",
+                "drain_text_control_inbound_frames",
+                "text_session_inactive",
+                message.clone(),
+                "Start the text session and attach a live transport runtime before draining inbound frames",
+            );
+            let report = failure_report("inactive-text-session", message);
+            self.persist();
+            return report;
+        }
+        let transport_session_id = session.session_id.clone();
+        let Some(runtime) = self.text_control_runtime_for_pump().cloned() else {
+            let message = "text/control runtime is not attached".to_owned();
+            self.state.push_command_error(
+                "message.transport_drain_unavailable",
+                "drain_text_control_inbound_frames",
+                "transport_runtime_missing",
+                message.clone(),
+                "Attach a direct or broker control lane runtime before draining inbound frames",
+            );
+            let report = failure_report("unattached-text-control-runtime", message);
+            self.persist();
+            return report;
+        };
+        if runtime.session_id != transport_session_id {
+            let message = format!(
+                "text transport runtime session id {} does not match active text session {}",
+                runtime.session_id, transport_session_id
+            );
+            self.state.push_command_error(
+                "message.transport_drain_unavailable",
+                "drain_text_control_inbound_frames",
+                "text_session_id_mismatch",
+                message.clone(),
+                "Restart the text session before draining inbound frames",
+            );
+            let report = failure_report("text-control-runtime-session-mismatch", message);
+            self.persist();
+            return report;
+        }
+        let drain_duration =
+            std::time::Duration::from_millis(drain_ms.clamp(100, 30_000));
+        let operation_timeout =
+            std::time::Duration::from_millis(operation_timeout_ms.unwrap_or(5_000).clamp(100, 60_000));
+        let executor = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let message = format!("could not start control lane drain runtime: {error}");
+                self.state.push_command_error(
+                    "message.transport_drain_unavailable",
+                    "drain_text_control_inbound_frames",
+                    "transport_runtime_unavailable",
+                    message.clone(),
+                    "Retry after the backend runtime can construct a drain executor",
+                );
+                let report = failure_report("control-lane-drain-runtime-error", message);
+                self.persist();
+                return report;
+            }
+        };
+        let transport = runtime.transport.clone();
+        let deadline = std::time::Instant::now() + drain_duration;
+        let mut inbound_frames = 0_usize;
+        let mut failures = Vec::new();
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let received = executor.block_on(async {
+                tokio::time::timeout(
+                    remaining.min(operation_timeout),
+                    transport.recv_text_control_frame(),
+                )
+                .await
+            });
+            let inbound = match received {
+                Ok(Ok(inbound)) => inbound,
+                Ok(Err(error)) => {
+                    failures.push(format!("receive control frame failed: {error}"));
+                    break;
+                }
+                Err(_) => break,
+            };
+            let Ok(inbound_frame) = serde_json::from_slice::<TextControlFrameView>(&inbound) else {
+                failures.push("decode inbound text/control frame failed".to_owned());
+                continue;
+            };
+            inbound_frames += 1;
+            self.state.last_command_error = None;
+            if let Some(response_frame) = self.state.handle_text_control_frame(inbound_frame) {
+                match serde_json::to_vec(&response_frame) {
+                    Ok(response) => {
+                        if let Err(error) =
+                            executor.block_on(transport.send_text_control_frame(response))
+                        {
+                            failures.push(format!("send control response failed: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        failures.push(format!("encode control response failed: {error}"));
+                    }
+                }
+            }
+        }
+        let metrics = executor.block_on(transport.text_control_transport_metrics());
+        self.state.push_event(
+            "message.transport_drain",
+            format!(
+                "Broker control lane drain applied {} inbound frame(s), failures={}",
+                inbound_frames,
+                failures.len()
+            ),
+        );
+        self.persist();
+        TextControlTransportPumpReportView {
+            pending_before: 0,
+            frames_sent: 0,
+            response_frames_received: inbound_frames,
+            receipts_applied: 0,
+            failures,
+            metrics,
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -6044,129 +6415,7 @@ pub fn set_group_admission_mode(request: SetGroupAdmissionModeRequest) -> AppSta
 
 /// Tauri command: approve a pending invite admission request and generate an OpenMLS Welcome.
 pub fn approve_group_admission_request(request: ApproveGroupAdmissionRequest) -> AppStateView {
-    mutate_app_service(|state| {
-        state.ensure_ready_profile();
-        if let Err(error) = state.local_actor_can_decide_group_admission(&request.group_id) {
-            state.push_command_error(
-                "group.admission_decision_rejected",
-                "approve_group_admission_request",
-                "admission_decision_unauthorized",
-                error,
-                "Only owner or staff can approve pending admission requests",
-            );
-            return;
-        }
-        let pending = state
-            .groups
-            .iter()
-            .find(|group| group.group_id == request.group_id)
-            .and_then(|group| {
-                group
-                    .admission_requests
-                    .iter()
-                    .find(|item| item.request_id == request.request_id && item.status == "pending")
-                    .cloned()
-            });
-        let Some(pending) = pending else {
-            state.push_command_error(
-                "group.admission_decision_rejected",
-                "approve_group_admission_request",
-                "admission_request_not_pending",
-                "Admission request is missing or already decided",
-                "Refresh pending requests before approving",
-            );
-            return;
-        };
-        let welcome = match state.openmls_admission_welcome_from_frame(
-            &pending.group_id,
-            &pending.member_identity,
-            &pending.signer_public_key_hex,
-            &pending.key_package,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                state.push_command_error(
-                    "group.admission_decision_rejected",
-                    "approve_group_admission_request",
-                    "openmls_admission_welcome_failed",
-                    error,
-                    "Only mark admission approved after OpenMLS Welcome generation succeeds",
-                );
-                return;
-            }
-        };
-        let decided_by = state.local_user_id();
-        let decided_at = Utc::now().to_rfc3339();
-        if let Err(error) = state.mark_group_admission_decision(
-            &request.group_id,
-            &request.request_id,
-            true,
-            &decided_by,
-            &decided_at,
-            None,
-        ) {
-            state.push_command_error(
-                "group.admission_decision_rejected",
-                "approve_group_admission_request",
-                "admission_request_update_failed",
-                error,
-                "Retry approval after refreshing pending requests",
-            );
-            return;
-        }
-        for (suffix, frame) in [
-            (
-                "decision",
-                TextControlFrameView::GroupAdmissionDecision {
-                    group_id: request.group_id.clone(),
-                    request_id: request.request_id.clone(),
-                    approved: true,
-                    reason: None,
-                    decided_by,
-                    decided_at,
-                },
-            ),
-            ("welcome", welcome),
-        ] {
-            match text_control_frame_sha256(&frame) {
-                Ok(frame_sha256) => state.text_control_outbox.push(TextControlOutboxRecord {
-                    message_id: stable_id(
-                        &format!("group-admission-approval-{suffix}"),
-                        &format!("{}:{}", request.group_id, request.request_id),
-                        state.next_sequence,
-                    ),
-                    target: MessageTargetView {
-                        kind: "channel".to_owned(),
-                        dm_id: None,
-                        group_id: Some(request.group_id.clone()),
-                        channel_id: None,
-                    },
-                    frame,
-                    frame_sha256,
-                    attempts: 0,
-                    state_key: "pending".to_owned(),
-                    last_transport_session_id: None,
-                    route_peer_ids: Vec::new(),
-                    sent_route_peer_ids: Vec::new(),
-                    receipted_route_peer_ids: Vec::new(),
-                }),
-                Err(error) => state.push_command_error(
-                    "group.admission_decision_rejected",
-                    "approve_group_admission_request",
-                    "admission_frame_hash_failed",
-                    error,
-                    "Retry approval after the decision frame can be serialized",
-                ),
-            }
-        }
-        state.push_event(
-            "group.admission_request_approved",
-            format!(
-                "Approved admission request {}",
-                redacted_observable_ref("request", &request.request_id)
-            ),
-        );
-    })
+    mutate_app_service(|state| state.approve_group_admission_request(request))
 }
 
 /// Tauri command: refuse a pending invite admission request without deleting it.
@@ -7819,6 +8068,39 @@ pub fn pump_text_control_transport_once(
     guard.pump_text_control_transport_once(request)
 }
 
+/// Tauri command: attach the sealed broker control lane as the active text/control transport.
+pub fn attach_broker_control_lane_runtime(
+    request: AttachBrokerControlLaneRuntimeRequest,
+) -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    if let Err(error) = guard.attach_broker_control_lane_runtime(request.adapter_kind.as_deref()) {
+        guard.state.push_command_error(
+            "transport.broker_control_lane_attach_failed",
+            "attach_broker_control_lane_runtime",
+            "broker_control_lane_attach_failed",
+            error,
+            "Start a text session and select a ready signaling profile before attaching the broker control lane",
+        );
+    }
+    guard.persist();
+    guard.to_view()
+}
+
+/// Tauri command: drain sealed inbound control frames and apply them to app state.
+pub fn drain_text_control_inbound_frames(
+    request: DrainTextControlInboundFramesRequest,
+) -> TextControlTransportPumpReportView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.drain_text_control_inbound_frames(request.drain_ms, request.operation_timeout_ms)
+}
+
 /// Tauri command: mark an outbound text/control frame as handed to transport.
 pub fn mark_text_control_frame_sent(request: MarkTextControlFrameSentRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -8961,6 +9243,26 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn attach_broker_control_lane_runtime(
+        app_handle: tauri::AppHandle,
+        request: AttachBrokerControlLaneRuntimeRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::attach_broker_control_lane_runtime(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn drain_text_control_inbound_frames(
+        app_handle: tauri::AppHandle,
+        request: DrainTextControlInboundFramesRequest,
+    ) -> TextControlTransportPumpReportView {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::drain_text_control_inbound_frames(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn mark_text_control_frame_sent(
         app_handle: tauri::AppHandle,
         request: MarkTextControlFrameSentRequest,
@@ -9168,6 +9470,8 @@ pub fn run() {
             ipc_commands::receive_text_delivery_envelope,
             ipc_commands::list_pending_text_control_frames,
             ipc_commands::pump_text_control_transport_once,
+            ipc_commands::attach_broker_control_lane_runtime,
+            ipc_commands::drain_text_control_inbound_frames,
             ipc_commands::mark_text_control_frame_sent,
             ipc_commands::handle_text_control_frame,
             ipc_commands::publish_voice_signaling_message,
@@ -12834,6 +13138,130 @@ impl PersistedAppState {
             let _ = state.accept(&record.envelope);
         }
         state
+    }
+
+    fn approve_group_admission_request(&mut self, request: ApproveGroupAdmissionRequest) {
+        self.ensure_ready_profile();
+        if let Err(error) = self.local_actor_can_decide_group_admission(&request.group_id) {
+            self.push_command_error(
+                "group.admission_decision_rejected",
+                "approve_group_admission_request",
+                "admission_decision_unauthorized",
+                error,
+                "Only owner or staff can approve pending admission requests",
+            );
+            return;
+        }
+        let pending = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == request.group_id)
+            .and_then(|group| {
+                group
+                    .admission_requests
+                    .iter()
+                    .find(|item| item.request_id == request.request_id && item.status == "pending")
+                    .cloned()
+            });
+        let Some(pending) = pending else {
+            self.push_command_error(
+                "group.admission_decision_rejected",
+                "approve_group_admission_request",
+                "admission_request_not_pending",
+                "Admission request is missing or already decided",
+                "Refresh pending requests before approving",
+            );
+            return;
+        };
+        let welcome = match self.openmls_admission_welcome_from_frame(
+            &pending.group_id,
+            &pending.member_identity,
+            &pending.signer_public_key_hex,
+            &pending.key_package,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.push_command_error(
+                    "group.admission_decision_rejected",
+                    "approve_group_admission_request",
+                    "openmls_admission_welcome_failed",
+                    error,
+                    "Only mark admission approved after OpenMLS Welcome generation succeeds",
+                );
+                return;
+            }
+        };
+        let decided_by = self.local_user_id();
+        let decided_at = Utc::now().to_rfc3339();
+        if let Err(error) = self.mark_group_admission_decision(
+            &request.group_id,
+            &request.request_id,
+            true,
+            &decided_by,
+            &decided_at,
+            None,
+        ) {
+            self.push_command_error(
+                "group.admission_decision_rejected",
+                "approve_group_admission_request",
+                "admission_request_update_failed",
+                error,
+                "Retry approval after refreshing pending requests",
+            );
+            return;
+        }
+        for (suffix, frame) in [
+            (
+                "decision",
+                TextControlFrameView::GroupAdmissionDecision {
+                    group_id: request.group_id.clone(),
+                    request_id: request.request_id.clone(),
+                    approved: true,
+                    reason: None,
+                    decided_by,
+                    decided_at,
+                },
+            ),
+            ("welcome", welcome),
+        ] {
+            match text_control_frame_sha256(&frame) {
+                Ok(frame_sha256) => self.text_control_outbox.push(TextControlOutboxRecord {
+                    message_id: stable_id(
+                        &format!("group-admission-approval-{suffix}"),
+                        &format!("{}:{}", request.group_id, request.request_id),
+                        self.next_sequence,
+                    ),
+                    target: MessageTargetView {
+                        kind: "channel".to_owned(),
+                        dm_id: None,
+                        group_id: Some(request.group_id.clone()),
+                        channel_id: None,
+                    },
+                    frame,
+                    frame_sha256,
+                    attempts: 0,
+                    state_key: "pending".to_owned(),
+                    last_transport_session_id: None,
+                    route_peer_ids: Vec::new(),
+                    sent_route_peer_ids: Vec::new(),
+                    receipted_route_peer_ids: Vec::new(),
+                }),
+                Err(error) => self.push_command_error(
+                    "group.admission_decision_rejected",
+                    "approve_group_admission_request",
+                    "admission_frame_hash_failed",
+                    error,
+                    "Retry approval after the decision frame can be serialized",
+                ),
+            }
+        }
+        self.push_event(
+            "group.admission_request_approved",
+            format!(
+                "Approved admission request {}",
+                redacted_observable_ref("request", &request.request_id)
+            ),
+        );
     }
 
     fn handle_text_control_frame(
@@ -24296,6 +24724,58 @@ mod tests {
     }
 
     #[test]
+    fn production_invite_descriptor_parser_surfaces_redacted_ice_metadata() {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("invite-ice-parse");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "ICE Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_state.groups[0].group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        let tampered_code = corrupt_invite_descriptor_signature(&invite_state.invites[0].code);
+
+        let rejected = join_group(JoinGroupRequest {
+            invite_code: tampered_code,
+            group_name: Some("Should Not Exist".to_owned()),
+        });
+
+        assert_eq!(
+            rejected
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invite_unparsable"),
+            "tampered descriptor signature must fail closed with a typed error"
+        );
+        assert_eq!(
+            rejected.groups.len(),
+            group_state.groups.len(),
+            "tampered invite must not create a group"
+        );
+        assert!(
+            rejected
+                .groups
+                .iter()
+                .all(|group| group.name != "Should Not Exist" && group.role != "pending"),
+            "tampered invite must not leave a pending group"
+        );
+    }
+
+    #[test]
     fn tampered_invite_descriptor_signature_is_rejected_without_group_creation() {
         let _guard = test_lock();
         let _path = reset_with_temp_state("join-tampered-invite");
@@ -24347,16 +24827,57 @@ mod tests {
         );
     }
 
+    fn control_lane_material_for_test(
+        connectivity: &ConnectivityPolicyView,
+    ) -> (String, [u8; 32], String) {
+        let profile_view = connectivity
+            .signaling_profiles
+            .first()
+            .expect("connectivity carries a signaling profile");
+        let key = broker_control_lane_key(&shared_runtime_material(
+            "discrypt-broker-control-lane-key-v1",
+            connectivity,
+            &profile_view.profile_id,
+            32,
+        ))
+        .expect("control lane key derives");
+        let rendezvous = discrypt_transport::RendezvousCapability::derive(
+            ConversationScope::new(
+                ConnectivityScopeLevel::Group,
+                connectivity.scope_id_commitment.clone(),
+            )
+            .expect("scope constructs"),
+            SignalingAdapterKind::Mqtt,
+            &shared_runtime_material(
+                "discrypt-broker-control-lane-bootstrap-v1",
+                connectivity,
+                &profile_view.profile_id,
+                32,
+            ),
+            &shared_runtime_material(
+                "discrypt-broker-control-lane-entropy-v1",
+                connectivity,
+                &profile_view.profile_id,
+                16,
+            ),
+            3600,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "control lane test").expect("trust label"),
+        )
+        .expect("rendezvous derives");
+        (rendezvous.topic, key, profile_view.profile_id.clone())
+    }
+
     #[test]
-    fn production_invite_descriptor_parser_surfaces_redacted_ice_metadata() {
+    fn broker_control_lane_material_matches_between_owner_and_joiner() {
         let _guard = test_lock();
-        let _path = reset_with_temp_state("invite-ice-parse");
+        let owner_path = reset_with_temp_state("control-lane-owner-material");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: None,
         });
         let group_state = create_group(CreateGroupRequest {
-            name: "ICE Lab".to_owned(),
+            name: "Lane Lab".to_owned(),
             retention: "24 hours".to_owned(),
             admission_mode: None,
             adapter_kind: None,
@@ -24364,24 +24885,330 @@ mod tests {
             ice_stun_servers: None,
             ice_turn_servers: None,
         });
+        let group_id = group_state.groups[0].group_id.clone();
+        set_active_group(SetActiveGroupRequest {
+            group_id: group_id.clone(),
+        });
         let invite_state = create_invite(CreateInviteRequest {
-            group_id: Some(group_state.groups[0].group_id.clone()),
+            group_id: Some(group_id.clone()),
             expires: "1 day".to_owned(),
-            max_use: "2".to_owned(),
+            max_use: "5".to_owned(),
             password_gate: None,
         });
-        let parsed = parse_invite_metadata(&invite_state.invites[0].code);
-        assert!(parsed.is_some());
-        let Some(parsed) = parsed else {
-            return;
+        let invite_code = invite_state.invites[0].code.clone();
+        let owner_connectivity = load_state().groups[0]
+            .connectivity
+            .clone()
+            .expect("owner connectivity");
+
+        let joiner_path = reset_with_temp_state("control-lane-joiner-material");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: None,
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let joiner_connectivity = load_state().groups[0]
+            .connectivity
+            .clone()
+            .expect("joiner connectivity");
+
+        let (owner_topic, owner_key, owner_profile_id) =
+            control_lane_material_for_test(&owner_connectivity);
+        let (joiner_topic, joiner_key, joiner_profile_id) =
+            control_lane_material_for_test(&joiner_connectivity);
+        assert_eq!(
+            owner_profile_id, joiner_profile_id,
+            "invite must carry the owner signaling profile id"
+        );
+        assert_eq!(
+            owner_topic, joiner_topic,
+            "owner and joiner must derive the same control lane topic"
+        );
+        assert_eq!(
+            owner_key, joiner_key,
+            "owner and joiner must derive the same control lane AEAD key"
+        );
+        std::fs::remove_file(owner_path).ok();
+        std::fs::remove_file(joiner_path).ok();
+    }
+
+    #[test]
+    fn broker_control_lane_completes_manual_admission_without_data_channel() {
+        use discrypt_transport::{
+            AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
+            SignalingAdapter,
         };
 
-        assert_eq!(
-            parsed.ice_stun_servers,
-            vec!["stun:stun.l.google.com:19302".to_owned()]
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("control-lane-owner-flow");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "Lane Flow".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        set_active_group(SetActiveGroupRequest {
+            group_id: group_id.clone(),
+        });
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        let invite_code = invite_state.invites[0].code.clone();
+        let owner_connectivity = load_state().groups[0]
+            .connectivity
+            .clone()
+            .expect("owner connectivity");
+
+        let joiner_path = reset_with_temp_state("control-lane-joiner-flow");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: None,
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        assert_eq!(joined.groups[0].role, "pending");
+        let joiner_connectivity = joined.groups[0]
+            .connectivity
+            .clone()
+            .expect("joiner connectivity");
+        let joiner_service = TauriAppService::load_for_test_path(joiner_path.clone());
+        let mut owner_service = TauriAppService::load_for_test_path(owner_path.clone());
+
+        let (topic, key, _) = control_lane_material_for_test(&owner_connectivity);
+        let (joiner_topic, joiner_key, _) = control_lane_material_for_test(&joiner_connectivity);
+        assert_eq!(topic, joiner_topic);
+        assert_eq!(key, joiner_key);
+
+        let profile_kind = transport_adapter_kind_from_name(
+            owner_connectivity
+                .signaling_profiles
+                .first()
+                .expect("profile")
+                .adapter_kind
+                .as_str(),
+        )
+        .expect("profile adapter kind");
+        let join_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test join runtime");
+        let scope = ConversationScope::new(
+            ConnectivityScopeLevel::Group,
+            owner_connectivity.scope_id_commitment.clone(),
+        )
+        .expect("scope constructs");
+        let rendezvous = discrypt_transport::RendezvousCapability::derive(
+            scope.clone(),
+            profile_kind,
+            &shared_runtime_material(
+                "discrypt-broker-control-lane-bootstrap-v1",
+                &owner_connectivity,
+                "control-lane-test-profile",
+                32,
+            ),
+            &shared_runtime_material(
+                "discrypt-broker-control-lane-entropy-v1",
+                &owner_connectivity,
+                "control-lane-test-profile",
+                16,
+            ),
+            3600,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "control lane test").expect("trust label"),
+        )
+        .expect("rendezvous derives");
+        let profile = transport_profile_from_view(
+            owner_connectivity
+                .signaling_profiles
+                .first()
+                .expect("profile"),
+        )
+        .expect("profile converts");
+        let mut room_profile = profile.clone();
+        room_profile.endpoints = vec![discrypt_transport::SignalingProviderEndpoint::new(
+            discrypt_transport::Endpoint::new("http://127.0.0.1:1"),
+            discrypt_transport::SignalingEndpointSecurity::LocalDevLoopback,
+        )];
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(profile_kind, bus);
+        let (owner_room, joiner_room) = join_runtime.block_on(async {
+            let session = adapter
+                .connect(room_profile)
+                .await
+                .expect("adapter connects");
+            let owner_room = session
+                .join(
+                    scope.clone(),
+                    rendezvous.clone(),
+                    SignalingPeerId::new("owner-peer").expect("peer id"),
+                )
+                .await
+                .expect("owner joins control lane room");
+            let joiner_room = session
+                .join(
+                    scope,
+                    rendezvous,
+                    SignalingPeerId::new("joiner-peer").expect("peer id"),
+                )
+                .await
+                .expect("joiner joins control lane room");
+            (owner_room, joiner_room)
+        });
+
+        let executor = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("executor builds"),
         );
-        assert!(parsed.ice_turn_servers.is_empty());
-        assert!(!format!("{parsed:?}").contains("raw-turn-secret"));
+        owner_service
+            .state
+            .start_transport_session(
+                BackendTransportMode::Text,
+                Some("control-lane-owner".to_owned()),
+            )
+            .expect("owner session starts");
+        let owner_session_id = owner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("owner session")
+            .session_id
+            .clone();
+        owner_service.register_broker_control_lane_transport(
+            Box::new(owner_room),
+            key,
+            SignalingPeerId::new("owner-peer").expect("peer id"),
+            owner_session_id,
+            executor.clone(),
+        );
+
+        let mut joiner_service = joiner_service;
+        joiner_service
+            .state
+            .start_transport_session(
+                BackendTransportMode::Text,
+                Some("control-lane-joiner".to_owned()),
+            )
+            .expect("joiner session starts");
+        let joiner_session_id = joiner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("joiner session")
+            .session_id
+            .clone();
+        joiner_service.register_broker_control_lane_transport(
+            Box::new(joiner_room),
+            key,
+            SignalingPeerId::new("joiner-peer").expect("peer id"),
+            joiner_session_id,
+            executor,
+        );
+
+        // Joiner: pump the queued OpenMLS admission key package over the broker lane.
+        let joiner_pump = joiner_service.pump_text_control_transport_once(
+            ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(5_000),
+            },
+        );
+        assert_eq!(joiner_pump.frames_sent, 1, "{joiner_pump:?}");
+        assert!(joiner_pump.failures.is_empty(), "{joiner_pump:?}");
+
+        // Owner: drain inbound sealed control frames; the key package becomes a
+        // pending manual admission request. No WebRTC runtime exists anywhere.
+        let owner_drain =
+            owner_service.drain_text_control_inbound_frames(Some(3_000), Some(1_000));
+        assert_eq!(owner_drain.response_frames_received, 1, "{owner_drain:?}");
+        assert!(owner_drain.failures.is_empty(), "{owner_drain:?}");
+
+        let request_id = owner_service
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("owner group")
+            .admission_requests
+            .first()
+            .map(|request| request.request_id.clone())
+            .expect("manual admission request persisted");
+
+        // Owner: approve via the public command path; the global singleton state is
+        // swapped so the command mutates this detached owner profile.
+        {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = std::mem::replace(&mut guard.state, owner_service.state.clone());
+            guard
+                .state
+                .approve_group_admission_request(ApproveGroupAdmissionRequest {
+                    group_id: group_id.clone(),
+                    request_id,
+                });
+            owner_service.state = std::mem::replace(&mut guard.state, saved);
+        }
+        assert_eq!(
+            owner_service.state.groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .expect("owner group")
+                .admission_requests
+                .first()
+                .expect("approved request")
+                .status,
+            "approved"
+        );
+
+        // Owner: pump the admission decision + OpenMLS Welcome over the lane.
+        let owner_pump =
+            owner_service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(5_000),
+            });
+        assert_eq!(owner_pump.frames_sent, 2, "{owner_pump:?}");
+        assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
+
+        // Joiner: drain the decision + Welcome; MLS admission completes member-side.
+        let joiner_drain = joiner_service.drain_text_control_inbound_frames(Some(5_000), Some(2_000));
+        assert_eq!(joiner_drain.response_frames_received, 2, "{joiner_drain:?}");
+        assert!(joiner_drain.failures.is_empty(), "{joiner_drain:?}");
+
+        assert_eq!(
+            joiner_service.state.groups[0].role, "member",
+            "joiner must become a member via the broker control lane alone"
+        );
+        assert!(
+            joiner_service
+                .state
+                .openmls_groups
+                .iter()
+                .any(|handle| handle.group_id == group_id),
+            "joiner must hold a persisted OpenMLS group handle after the Welcome"
+        );
+        std::fs::remove_file(owner_path).ok();
+        std::fs::remove_file(joiner_path).ok();
     }
 
     #[test]

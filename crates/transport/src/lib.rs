@@ -11,6 +11,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod control_lane;
 pub mod history_sync;
 pub mod ice;
 pub mod peer_overlay;
@@ -111,6 +112,12 @@ pub use signaling::{
 };
 #[cfg(any(test, feature = "harness", feature = "local-dev"))]
 pub use signaling::{LocalConformanceSignalingAdapter, LocalConformanceSignalingBus};
+pub use provider_adapters::join_provider_control_lane_room;
+pub use control_lane::{
+    broker_control_lane_key, decode_broker_control_envelope, open_broker_control_frame,
+    seal_broker_control_frame, BrokerControlEnvelope, BrokerControlLaneTransport,
+    BROKER_CONTROL_LANE_KEY_DOMAIN, BROKER_CONTROL_LANE_SCHEMA_VERSION,
+};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;

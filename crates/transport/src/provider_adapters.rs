@@ -951,9 +951,11 @@ pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
 pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
     "Persisted provider offer/answer/ICE handoff and a long-lived receiver loop are still required before runtime attachment can be established";
 
+#[allow(dead_code)]
 const PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE: &str =
     "provider application-payload relay is disabled; providers carry presence and sealed WebRTC negotiation only";
 
+#[allow(dead_code)]
 fn provider_app_payload_relay_disabled_error() -> TransportError {
     TransportError::SignalingAdapter(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE.to_owned())
 }
@@ -1256,6 +1258,99 @@ pub async fn probe_provider_adapter_roundtrip(
         random_entropy,
     )
     .await
+}
+
+/// Join one provider room for the sealed broker control lane.
+///
+/// Returns a boxed room for [`crate::BrokerControlLaneTransport`]. The room's
+/// control topic carries only AEAD-sealed, versioned control envelopes; the
+/// provider observes ciphertext and envelope metadata. Feature-disabled
+/// adapters fail closed.
+pub async fn join_provider_control_lane_room(
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    local_peer_id: SignalingPeerId,
+) -> Result<Box<dyn RendezvousRoom>, TransportError> {
+    scope.validate()?;
+    let factory = SignalingAdapterFactory::for_profile(&profile)?;
+    match factory {
+        SignalingAdapterFactory::Mqtt(adapter) => {
+            #[cfg(feature = "mqtt-adapter")]
+            {
+                join_control_lane_room_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    local_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "mqtt-adapter"))]
+            {
+                let _ = (bootstrap_secret, random_entropy, local_peer_id);
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::Nostr(adapter) => {
+            #[cfg(feature = "nostr-adapter")]
+            {
+                join_control_lane_room_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    local_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "nostr-adapter"))]
+            {
+                let _ = (bootstrap_secret, random_entropy, local_peer_id);
+                Err(adapter.boundary().unavailable_error())
+            }
+        }
+        SignalingAdapterFactory::IpfsPubsub(adapter) => {
+            let _ = (bootstrap_secret, random_entropy, local_peer_id);
+            Err(adapter.boundary().unavailable_error())
+        }
+        SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
+            let _ = (bootstrap_secret, random_entropy, local_peer_id);
+            Err(adapter.boundary().unavailable_error())
+        }
+    }
+}
+
+#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+async fn join_control_lane_room_with_adapter<A>(
+    adapter: A,
+    profile: SignalingAdapterProfile,
+    scope: ConversationScope,
+    bootstrap_secret: &[u8],
+    random_entropy: &[u8],
+    local_peer_id: SignalingPeerId,
+) -> Result<Box<dyn RendezvousRoom>, TransportError>
+where
+    A: SignalingAdapter,
+    A::Session: AdapterSession,
+    <A::Session as AdapterSession>::Room: 'static,
+{
+    let session = adapter.connect(profile.clone()).await?;
+    let rendezvous = RendezvousCapability::derive(
+        scope.clone(),
+        profile.kind,
+        bootstrap_secret,
+        random_entropy,
+        3600,
+        profile.metadata_posture,
+        profile.trust_label,
+    )?;
+    let room = session.join(scope, rendezvous, local_peer_id).await?;
+    Ok(Box::new(room))
 }
 
 async fn probe_provider_adapter_roundtrip_with_factory(
@@ -5978,12 +6073,19 @@ impl RendezvousRoom for NostrProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        let _ = sealed_payload;
-        Err(provider_app_payload_relay_disabled_error())
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.publish_envelope(NostrWireEnvelope::Control {
+            schema: NOSTR_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            payload: sealed_payload,
+        })
+        .await
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        Err(provider_app_payload_relay_disabled_error())
+        self.drain_network_for(Duration::from_millis(300)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.controls))
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6591,12 +6693,22 @@ impl RendezvousRoom for MqttProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        let _ = sealed_payload;
-        Err(provider_app_payload_relay_disabled_error())
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.publish_envelope(
+            self.topics.control.clone(),
+            MqttWireEnvelope::Control {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                payload: sealed_payload,
+            },
+        )
+        .await
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        Err(provider_app_payload_relay_disabled_error())
+        self.drain_network_for(Duration::from_millis(300)).await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.controls))
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6783,12 +6895,36 @@ impl RendezvousRoom for LocalConformanceProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        let _ = sealed_payload;
-        Err(provider_app_payload_relay_disabled_error())
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.bus.with_state(|state| {
+            state
+                .rooms
+                .entry(self.key.clone())
+                .or_default()
+                .controls
+                .push(ControlBroadcast {
+                    from_peer: self.local_peer_id.clone(),
+                    payload: sealed_payload,
+                });
+        })
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        Err(provider_app_payload_relay_disabled_error())
+        self.bus.with_state(|state| {
+            let Some(room) = state.rooms.get_mut(&self.key) else {
+                return Vec::new();
+            };
+            let mut delivered = Vec::new();
+            room.controls.retain(|control| {
+                if control.from_peer != self.local_peer_id {
+                    delivered.push(control.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            delivered
+        })
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6796,9 +6932,11 @@ impl RendezvousRoom for LocalConformanceProviderRoom {
             if let Some(room) = state.rooms.get_mut(&self.key) {
                 room.presence
                     .retain(|event| event.peer_id != self.local_peer_id);
-                room.signals.retain(|signal| {
-                    signal.from_peer != self.local_peer_id && signal.to_peer != self.local_peer_id
-                });
+                room.signals
+                    .retain(|signal| {
+                        signal.from_peer != self.local_peer_id
+                            && signal.to_peer != self.local_peer_id
+                    });
                 room.controls
                     .retain(|control| control.from_peer != self.local_peer_id);
             }
@@ -9710,14 +9848,20 @@ mod tests {
             assert_eq!(alice_signals[0].payload, answer);
             assert_eq!(alice_signals[1].payload, bob_candidate);
 
-            assert_provider_app_payload_relay_disabled(
-                alice_room
-                    .broadcast_control(OpaqueSignalingPayload::new(
-                        b"sealed-provider-relay-attempt-alice".to_vec(),
-                    )?)
-                    .await,
+            let control_payload_bytes = b"sealed-provider-control-envelope-alice".to_vec();
+            alice_room
+                .broadcast_control(OpaqueSignalingPayload::new(
+                    control_payload_bytes.clone(),
+                )?)
+                .await?;
+            let bob_controls = bob_room.take_control_payloads().await?;
+            assert_eq!(bob_controls.len(), 1, "peer control envelope must be delivered");
+            assert_eq!(bob_controls[0].from_peer, alice);
+            assert_eq!(bob_controls[0].payload.bytes, control_payload_bytes);
+            assert!(
+                alice_room.take_control_payloads().await?.is_empty(),
+                "sender must not receive its own control broadcast"
             );
-            assert_provider_app_payload_relay_disabled(bob_room.take_control_payloads().await);
 
             assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
             let material = bus.relay_visible_material_for_tests();
@@ -9834,7 +9978,7 @@ mod tests {
         assert!(matches!(
             room.broadcast_control(OpaqueSignalingPayload::new(b"raw sdp control".to_vec())?)
                 .await,
-            Err(TransportError::SignalingAdapter(_))
+            Err(TransportError::PlaintextLeak)
         ));
         Ok(())
     }
@@ -9883,7 +10027,7 @@ mod tests {
                         marker.as_bytes().to_vec()
                     )?)
                     .await,
-                    Err(TransportError::SignalingAdapter(_))
+                    Err(TransportError::PlaintextLeak)
                 ),
                 "provider-visible control payload must fail closed before relaying {marker}"
             );
