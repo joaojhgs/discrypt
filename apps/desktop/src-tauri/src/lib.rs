@@ -6,6 +6,7 @@
 //! explicit `production-network`, `production-media`, or `production-storage`
 //! feature matching the claimed runtime capability.
 
+pub mod connection;
 pub mod production_status;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -9263,6 +9264,36 @@ mod ipc_commands {
     }
 
     #[tauri::command]
+    pub(super) fn start_control_lane_session_manager(
+        app_handle: tauri::AppHandle,
+        request: connection::StartControlLaneSessionManagerRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::connection::start_control_lane_session_manager(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn stop_control_lane_session_manager(
+        app_handle: tauri::AppHandle,
+        request: connection::StopControlLaneSessionManagerRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::connection::stop_control_lane_session_manager(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn control_lane_session_manager_status(
+        app_handle: tauri::AppHandle,
+        request: connection::ControlLaneSessionManagerStatusRequest,
+    ) -> Option<connection::ControlLaneSessionManagerStatusView> {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::connection::control_lane_session_manager_status(request)
+        })
+    }
+
+    #[tauri::command]
     pub(super) fn mark_text_control_frame_sent(
         app_handle: tauri::AppHandle,
         request: MarkTextControlFrameSentRequest,
@@ -9472,6 +9503,9 @@ pub fn run() {
             ipc_commands::pump_text_control_transport_once,
             ipc_commands::attach_broker_control_lane_runtime,
             ipc_commands::drain_text_control_inbound_frames,
+            ipc_commands::start_control_lane_session_manager,
+            ipc_commands::stop_control_lane_session_manager,
+            ipc_commands::control_lane_session_manager_status,
             ipc_commands::mark_text_control_frame_sent,
             ipc_commands::handle_text_control_frame,
             ipc_commands::publish_voice_signaling_message,
@@ -37878,5 +37912,256 @@ mod tests {
         assert!(!source.contains(&["static", "APP_STATE"].join(" ")));
         assert!(!source.contains(&["get_or_init(||", "Mutex::new(load_state()))"].join(" ")));
         assert!(source.matches("mutate_app_service(").count() >= 16);
+    }
+
+    #[test]
+    fn control_lane_session_manager_pumps_outbox_without_ui_calls() {
+        use discrypt_transport::{
+            AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
+            SignalingAdapter,
+        };
+
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("control-lane-manager-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let mut owner_service = TauriAppService::load_for_test_path(owner_path.clone());
+        let owner_defaults = owner_service.state.connectivity_defaults.clone();
+
+        let joiner_path = reset_with_temp_state("control-lane-manager-joiner");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let mut joiner_service = TauriAppService::load_for_test_path(joiner_path.clone());
+        let frame = TextControlFrameView::OpenMlsAdmissionKeyPackage {
+            group_id: "group-lane-pump".to_owned(),
+            member_identity: "member-1".to_owned(),
+            signer_public_key_hex: "aa".repeat(32),
+            key_package: b"key-package-bytes".to_vec(),
+        };
+        let frame_sha256 = text_control_frame_sha256(&frame).expect("frame hash");
+        joiner_service
+            .state
+            .text_control_outbox
+            .push(TextControlOutboxRecord {
+                message_id: "manager-pump-frame-1".to_owned(),
+                target: MessageTargetView {
+                    kind: "channel".to_owned(),
+                    dm_id: None,
+                    group_id: Some("group-lane-pump".to_owned()),
+                    channel_id: None,
+                },
+                frame,
+                frame_sha256,
+                attempts: 0,
+                state_key: "pending".to_owned(),
+                last_transport_session_id: None,
+                route_peer_ids: Vec::new(),
+                sent_route_peer_ids: Vec::new(),
+                receipted_route_peer_ids: Vec::new(),
+            });
+
+        let join_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test join runtime");
+        let scope = ConversationScope::new(
+            ConnectivityScopeLevel::Group,
+            "d".repeat(64),
+        )
+        .expect("scope constructs");
+        let rendezvous = discrypt_transport::RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Mqtt,
+            &[7_u8; 32],
+            &[9_u8; 16],
+            3600,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "control lane manager test").expect("trust label"),
+        )
+        .expect("rendezvous derives");
+        let profile_view = owner_defaults
+            .signaling_profiles
+            .iter()
+            .find(|profile| profile.adapter_kind == "mqtt")
+            .expect("mqtt default profile");
+        let profile = transport_profile_from_view(profile_view).expect("profile converts");
+        let mut room_profile = profile.clone();
+        room_profile.endpoints = vec![discrypt_transport::SignalingProviderEndpoint::new(
+            discrypt_transport::Endpoint::new("http://127.0.0.1:1"),
+            discrypt_transport::SignalingEndpointSecurity::LocalDevLoopback,
+        )];
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus);
+        let (owner_room, joiner_room) = join_runtime.block_on(async {
+            let session = adapter
+                .connect(room_profile)
+                .await
+                .expect("adapter connects");
+            let owner_room = session
+                .join(
+                    scope.clone(),
+                    rendezvous.clone(),
+                    SignalingPeerId::new("owner-peer").expect("peer id"),
+                )
+                .await
+                .expect("owner joins control lane room");
+            let joiner_room = session
+                .join(
+                    scope,
+                    rendezvous,
+                    SignalingPeerId::new("joiner-peer").expect("peer id"),
+                )
+                .await
+                .expect("joiner joins control lane room");
+            (owner_room, joiner_room)
+        });
+
+        let executor = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("executor builds"),
+        );
+        owner_service
+            .state
+            .start_transport_session(
+                BackendTransportMode::Text,
+                Some("control-lane-manager-owner".to_owned()),
+            )
+            .expect("owner session starts");
+        let owner_session_id = owner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("owner session")
+            .session_id
+            .clone();
+        owner_service.register_broker_control_lane_transport(
+            Box::new(owner_room),
+            broker_control_lane_key(&[42_u8; 32]).expect("key derives"),
+            SignalingPeerId::new("owner-peer").expect("peer id"),
+            owner_session_id,
+            executor.clone(),
+        );
+
+        joiner_service
+            .state
+            .start_transport_session(
+                BackendTransportMode::Text,
+                Some("control-lane-manager-joiner".to_owned()),
+            )
+            .expect("joiner session starts");
+        let joiner_session_id = joiner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("joiner session")
+            .session_id
+            .clone();
+        joiner_service.register_broker_control_lane_transport(
+            Box::new(joiner_room),
+            broker_control_lane_key(&[42_u8; 32]).expect("key derives"),
+            SignalingPeerId::new("joiner-peer").expect("peer id"),
+            joiner_session_id.clone(),
+            executor,
+        );
+
+        // The backend manager must pump the queued frame autonomously: the owner
+        // drains until the frame arrives with NO explicit pump call anywhere.
+        connection::spawn_control_lane_session_manager(
+            joiner_session_id.clone(),
+            Box::new(connection::SharedControlLaneSessionDriver {
+                service: Arc::new(Mutex::new(joiner_service)),
+            }),
+            connection::ControlLaneManagerConfig {
+                pump_interval_ms: Some(50),
+                drain_ms: Some(100),
+                backoff_initial_ms: Some(10),
+                backoff_max_ms: Some(20),
+                backoff_max_attempts: Some(10),
+            },
+        )
+        .expect("manager starts");
+
+        let mut inbound = 0_usize;
+        for _ in 0..60 {
+            let report = owner_service
+                .drain_text_control_inbound_frames(Some(200), Some(200));
+            inbound += report.response_frames_received;
+            if inbound >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            inbound >= 1,
+            "backend manager must pump the outbox without UI-driven pump calls"
+        );
+
+        assert!(connection::halt_control_lane_session_manager(&joiner_session_id));
+        assert!(
+            connection::control_lane_session_manager_snapshot(&joiner_session_id).is_none(),
+            "halted manager must leave the registry"
+        );
+        std::fs::remove_file(owner_path).ok();
+        std::fs::remove_file(joiner_path).ok();
+    }
+
+    #[test]
+    fn control_lane_session_manager_fails_closed_after_exhausted_backoff() {
+        let _guard = test_lock();
+        let empty_path = reset_with_temp_state("control-lane-manager-empty");
+        let service = TauriAppService::load_for_test_path(empty_path.clone());
+        let service_handle = Arc::new(Mutex::new(service));
+        let session_id = "control-lane-manager-empty-session".to_owned();
+
+        connection::spawn_control_lane_session_manager(
+            session_id.clone(),
+            Box::new(connection::SharedControlLaneSessionDriver {
+                service: service_handle.clone(),
+            }),
+            connection::ControlLaneManagerConfig {
+                pump_interval_ms: Some(20),
+                drain_ms: Some(100),
+                backoff_initial_ms: Some(10),
+                backoff_max_ms: Some(20),
+                backoff_max_attempts: Some(3),
+            },
+        )
+        .expect("manager starts");
+
+        let mut stopped = false;
+        for _ in 0..100 {
+            if let Some(status) = connection::control_lane_session_manager_snapshot(&session_id) {
+                if status.stopped {
+                    stopped = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            stopped,
+            "manager must fail closed after exhausted backoff attempts"
+        );
+        let events = service_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .state
+            .events
+            .iter()
+            .map(|event| event.kind.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|kind| kind == "transport.control_session_fail_closed"),
+            "fail-closed stop must be observable in backend events: {events:?}"
+        );
+        connection::halt_control_lane_session_manager(&session_id);
+        std::fs::remove_file(empty_path).ok();
     }
 }
