@@ -6200,18 +6200,49 @@ impl MqttProviderRoom {
         }
     }
 
-    async fn record_publish(&self, _topic: String, bytes: Vec<u8>) -> Result<(), TransportError> {
+    async fn record_publish(&self, topic: String, bytes: Vec<u8>) -> Result<(), TransportError> {
+        let mut inbox = self.inbox.lock().await;
+        Self::record_mqtt_envelope(&mut inbox, &self.local_peer_id, topic, bytes)
+    }
+
+    /// Consume already-received network events into the inbox synchronously.
+    ///
+    /// Uses `try_recv` (no awaits in the loop) so a take completes within any
+    /// caller window; a cancellation can never drop recorded envelopes.
+    async fn consume_network_events(&self) -> Result<(), TransportError> {
+        let mut inbox = self.inbox.lock().await;
+        let mut events = self.events.lock().await;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                MqttProviderEvent::Publish { topic, payload } => {
+                    Self::record_mqtt_envelope(&mut inbox, &self.local_peer_id, topic, payload)?;
+                }
+                MqttProviderEvent::SubAck => {}
+                MqttProviderEvent::Error(err) => return Err(mqtt_err("event loop", err)),
+            }
+        }
+        Ok(())
+    }
+
+    fn record_mqtt_envelope(
+        inbox: &mut MqttInbox,
+        local_peer_id: &SignalingPeerId,
+        topic: String,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        if provider_runtime_debug_enabled() {
+            eprintln!("mqtt record_publish topic={topic} bytes={}", bytes.len());
+        }
         reject_forbidden_plaintext(&bytes)?;
         let envelope: MqttWireEnvelope =
             serde_json::from_slice(&bytes).map_err(|err| mqtt_err("wire envelope decode", err))?;
-        let mut inbox = self.inbox.lock().await;
         match envelope {
             MqttWireEnvelope::Presence {
                 schema,
                 from_peer,
                 payload,
                 ttl_seconds,
-            } if schema == 1 && from_peer != self.local_peer_id => {
+            } if schema == 1 && from_peer != *local_peer_id => {
                 inbox.presence.push(PresenceEvent {
                     peer_id: from_peer,
                     encrypted_presence: payload,
@@ -6223,7 +6254,7 @@ impl MqttProviderRoom {
                 from_peer,
                 to_peer,
                 payload,
-            } if schema == 1 && to_peer == self.local_peer_id => {
+            } if schema == 1 && to_peer == *local_peer_id => {
                 inbox.signals.push(PeerSignal {
                     from_peer,
                     to_peer,
@@ -6234,7 +6265,7 @@ impl MqttProviderRoom {
                 schema,
                 from_peer,
                 payload,
-            } if schema == 1 && from_peer != self.local_peer_id => {
+            } if schema == 1 && from_peer != *local_peer_id => {
                 inbox.controls.push(ControlBroadcast { from_peer, payload });
             }
             _ => {}
@@ -6659,7 +6690,7 @@ impl RendezvousRoom for MqttProviderRoom {
     }
 
     async fn subscribe_presence(&self) -> Result<Vec<PresenceEvent>, TransportError> {
-        self.drain_network_for(Duration::from_millis(300)).await?;
+        self.consume_network_events().await?;
         let mut inbox = self.inbox.lock().await;
         Ok(std::mem::take(&mut inbox.presence))
     }
@@ -6684,7 +6715,7 @@ impl RendezvousRoom for MqttProviderRoom {
     }
 
     async fn take_signals(&self) -> Result<Vec<PeerSignal>, TransportError> {
-        self.drain_network_for(Duration::from_millis(300)).await?;
+        self.consume_network_events().await?;
         let mut inbox = self.inbox.lock().await;
         Ok(std::mem::take(&mut inbox.signals))
     }
@@ -6694,6 +6725,13 @@ impl RendezvousRoom for MqttProviderRoom {
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
         reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        if provider_runtime_debug_enabled() {
+            eprintln!(
+                "mqtt control broadcast topic={} bytes={}",
+                self.topics.control,
+                sealed_payload.bytes.len()
+            );
+        }
         self.publish_envelope(
             self.topics.control.clone(),
             MqttWireEnvelope::Control {
@@ -6706,7 +6744,7 @@ impl RendezvousRoom for MqttProviderRoom {
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        self.drain_network_for(Duration::from_millis(300)).await?;
+        self.consume_network_events().await?;
         let mut inbox = self.inbox.lock().await;
         Ok(std::mem::take(&mut inbox.controls))
     }

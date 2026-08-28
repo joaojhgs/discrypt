@@ -3824,6 +3824,31 @@ impl TauriAppService {
         Err("Active context is not a DM or group for the broker control lane".to_owned())
     }
 
+    fn broker_lane_remote_peer_ids(&self) -> Vec<SignalingPeerId> {
+        let state = &self.state;
+        let Some(context) = state.active_context.as_ref() else {
+            return Vec::new();
+        };
+        let Some(group_id) = &context.group_id else {
+            return Vec::new();
+        };
+        let Some(group) = state
+            .groups
+            .iter()
+            .find(|group| &group.group_id == group_id)
+        else {
+            return Vec::new();
+        };
+        let Some(local_role) = runtime_role_for_group(group, &state.local_user_id()) else {
+            return Vec::new();
+        };
+        group_runtime_peers(group.connectivity.as_ref(), group_role_label(local_role))
+            .iter()
+            .filter(|peer| !peer.is_local)
+            .filter_map(|peer| SignalingPeerId::new(peer.peer_id.clone()).ok())
+            .collect()
+    }
+
     #[allow(clippy::type_complexity)]
     fn broker_control_lane_attach_inputs(
         &self,
@@ -3900,15 +3925,32 @@ impl TauriAppService {
         self.text_control_transport_runtimes.insert(
             TextControlRuntimeMapKey::legacy(transport_session_id.clone()),
             TextControlTransportRuntime {
-                transport,
+                transport: transport.clone(),
                 owned_runtime: None,
-                executor: Some(executor),
-                session_id: transport_session_id,
+                executor: Some(executor.clone()),
+                session_id: transport_session_id.clone(),
                 role: None,
-                local_peer_id: Some(local_peer_id.0),
+                local_peer_id: Some(local_peer_id.0.clone()),
                 remote_peer_id: None,
             },
         );
+        for remote in self.broker_lane_remote_peer_ids() {
+            self.text_control_transport_runtimes.insert(
+                TextControlRuntimeMapKey::for_remote(
+                    transport_session_id.clone(),
+                    remote.0.clone(),
+                ),
+                TextControlTransportRuntime {
+                    transport: transport.clone(),
+                    owned_runtime: None,
+                    executor: Some(executor.clone()),
+                    session_id: transport_session_id.clone(),
+                    role: None,
+                    local_peer_id: Some(local_peer_id.0.clone()),
+                    remote_peer_id: Some(remote.0),
+                },
+            );
+        }
     }
 
     fn attach_broker_control_lane_runtime(
@@ -4480,9 +4522,23 @@ impl TauriAppService {
                         "route peer {route_peer_id}: runtime session {} does not match active text session {}",
                         runtime.session_id, transport_session_id
                     )),
-                    None => route_failures.push(format!(
-                        "route peer {route_peer_id}: missing direct/TURN text/control runtime; provider signaling is not a message relay"
-                    )),
+                    None => {
+                        // The attached broker control lane broadcasts topic-wide;
+                        // fall back to it for route-targeted frames when no
+                        // per-peer direct/TURN runtime exists for this peer.
+                        let lane_fallback = self
+                            .text_control_runtime_for_pump()
+                            .filter(|runtime| runtime.session_id == transport_session_id)
+                            .cloned();
+                        match lane_fallback {
+                            Some(runtime) => {
+                                route_runtimes.push((Some(route_peer_id), runtime));
+                            }
+                            None => route_failures.push(format!(
+                                "route peer {route_peer_id}: missing direct/TURN text/control runtime; provider signaling is not a message relay"
+                            )),
+                        }
+                    }
                 }
             }
             if route_runtimes.is_empty() {

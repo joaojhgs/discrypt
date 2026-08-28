@@ -1,12 +1,14 @@
 use chrono::Utc;
 use discrypt_core::ChannelKind;
 use discrypt_desktop::{
-    app_state, approve_group_admission_request, attach_text_control_transport_runtime,
-    create_group, create_invite, create_user, join_group, join_voice,
-    promote_group_member_to_staff, publish_group_presence, pump_text_control_transport_once,
-    revoke_group_member_access, send_message, set_active_group, start_text_session,
-    ApproveGroupAdmissionRequest, AttachTextControlTransportRuntimeRequest, CreateGroupRequest,
-    CreateInviteRequest, CreateUserRequest, GroupAdmissionModeView, GroupRoleView,
+    app_state, approve_group_admission_request, attach_broker_control_lane_runtime,
+    attach_text_control_transport_runtime, create_group, create_invite, create_user,
+    drain_text_control_inbound_frames, join_group, join_voice, promote_group_member_to_staff,
+    publish_group_presence, pump_text_control_transport_once, revoke_group_member_access,
+    send_message, set_active_group, start_text_session, ApproveGroupAdmissionRequest,
+    AttachBrokerControlLaneRuntimeRequest, AttachTextControlTransportRuntimeRequest,
+    CreateGroupRequest, CreateInviteRequest, CreateUserRequest,
+    DrainTextControlInboundFramesRequest, GroupAdmissionModeView, GroupRoleView,
     JoinGroupRequest, JoinVoiceRequest, ListPendingTextControlFramesRequest, MessageTargetView,
     PromoteGroupMemberRequest, PublishGroupPresenceRequest, RevokeGroupMemberAccessRequest,
     SendMessageRequest, SetActiveGroupRequest, StartTextSessionRequest, VoiceSessionView,
@@ -35,6 +37,7 @@ struct Args {
     group_name: String,
     timeout_secs: u64,
     admission_mode: GroupAdmissionModeView,
+    control_lane: bool,
     task_id: String,
     phase_task_id: String,
 }
@@ -347,6 +350,7 @@ fn run_local_pair(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::
 
     reload_app_state_for_harness(&owner_state_path);
     wait_for_message(
+        false,
         "g009 local joiner to owner protected text",
         args.timeout_secs,
     )?;
@@ -369,6 +373,7 @@ fn run_local_pair(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::
 
     reload_app_state_for_harness(&joiner_state_path);
     wait_for_message(
+        false,
         "g009 local owner to joiner protected text",
         args.timeout_secs,
     )?;
@@ -731,9 +736,13 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
             adapter_kind: None,
         });
         pre_approval_send_error = denied.last_command_error.map(|error| error.code);
-        let attached = start_and_attach_runtime_derived_or_relay()?;
-        if !attached {
-            return Err("manual admission key-package route did not attach".into());
+        if args.control_lane {
+            start_and_attach_control_lane(args)?;
+        } else {
+            let attached = start_and_attach_runtime_derived_or_relay()?;
+            if !attached {
+                return Err("manual admission key-package route did not attach".into());
+            }
         }
         manual_admission_request_pump = Some(pump_until(
             "joiner-manual-admission-request",
@@ -741,6 +750,7 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
             |report| report.frames_sent > 0 && report.failures.is_empty(),
         )?);
         wait_for_state_with_pump(
+            args.control_lane,
             args.timeout_secs,
             "joiner approved OpenMLS admission",
             || {
@@ -759,7 +769,13 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
         output_device_id: Some("g009-virtual-speaker".to_owned()),
         output_device_label: Some("G009 virtual speaker".to_owned()),
     });
-    let runtime_attached_direct_path = start_and_attach_runtime_derived_or_relay()?;
+    let (runtime_attached_direct_path, control_lane_attached) = if args.control_lane {
+        start_and_attach_control_lane(args)?;
+        (false, true)
+    } else {
+        start_and_attach_runtime_derived_or_relay()?;
+        (true, false)
+    };
     let admission = if args.admission_mode == GroupAdmissionModeView::ManualApproval {
         PumpEvidence {
             label: "manual-admission-applied-from-welcome".to_owned(),
@@ -784,20 +800,43 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
             transport_proof: false,
             adapter_kind: None,
         });
-        sent.last_command_error.is_none()
-    })?;
-    let presence = publish_presence_and_pump(&group_id, args.timeout_secs)?;
+          sent.last_command_error.is_none()
+      })?;
+      let presence = if args.control_lane {
+          // Route-gated presence requires a connected direct/TURN route; the
+          // broker control lane is coordination-only in this phase.
+          PresenceEvidence {
+              published: false,
+              local_member_id: app_state()
+                  .profile
+                  .as_ref()
+                  .map(|profile| profile.user_id.clone())
+                  .unwrap_or_default(),
+              local_status: None,
+              presence_expires_at: None,
+              pump: PumpEvidence {
+                  label: "lane-mode-presence-skipped".to_owned(),
+                  frames_sent: 0,
+                  response_frames_received: 0,
+                  receipts_applied: 0,
+                  failures: Vec::new(),
+                  runtime_open: true,
+              },
+          }
+      } else {
+          publish_presence_and_pump(&group_id, args.timeout_secs)?
+      };
     let joiner_text = pump_until("joiner-to-owner-text", args.timeout_secs, |report| {
         report.receipts_applied > 0 && report.failures.is_empty()
     })?;
-    wait_for_message("g009 owner to joiner protected text", args.timeout_secs)?;
+    wait_for_message(args.control_lane, "g009 owner to joiner protected text", args.timeout_secs)?;
     let local_member_id = app_state()
         .profile
         .as_ref()
         .map(|profile| profile.user_id.clone())
         .ok_or("joiner profile missing before governance wait")?;
     let promotion_seen =
-        wait_for_state_with_pump(args.timeout_secs, "joiner promoted to staff", || {
+        wait_for_state_with_pump(args.control_lane, args.timeout_secs, "joiner promoted to staff", || {
             app_state().groups.iter().any(|group| {
                 group.group_id == group_id
                     && group.members.iter().any(|member| {
@@ -808,7 +847,7 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
                     })
             })
         })?;
-    let revoke_seen = wait_for_state_with_pump(args.timeout_secs, "joiner revoked", || {
+    let revoke_seen = wait_for_state_with_pump(args.control_lane, args.timeout_secs, "joiner revoked", || {
         app_state().groups.iter().any(|group| {
             group.group_id == group_id
                 && group
@@ -835,6 +874,7 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
             "post_approval_role_status": local_role_status(&group_id),
         },
         "runtime_attached_direct_path": runtime_attached_direct_path,
+        "control_lane_attached": control_lane_attached,
         "admission": admission,
         "presence": presence,
         "joiner_text": joiner_text,
@@ -848,7 +888,13 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
 }
 
 fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let runtime_attached_direct_path = start_and_attach_runtime_derived_or_relay()?;
+    let (runtime_attached_direct_path, control_lane_attached) = if args.control_lane {
+        start_and_attach_control_lane(args)?;
+        (false, true)
+    } else {
+        start_and_attach_runtime_derived_or_relay()?;
+        (true, false)
+    };
     let group = app_state()
         .groups
         .first()
@@ -876,14 +922,38 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
         output_device_id: Some("g009-local-virtual-speaker".to_owned()),
         output_device_label: Some("G009 local virtual speaker".to_owned()),
     });
-    wait_for_state_with_pump(args.timeout_secs, "owner admitted remote member", || {
-        app_state()
-            .groups
-            .first()
-            .map(|g| g.members.len())
-            .unwrap_or(0)
-            > 1
-    })?;
+    let manual_lane =
+        args.control_lane && args.admission_mode == GroupAdmissionModeView::ManualApproval;
+    if !manual_lane {
+        wait_for_state_with_pump(
+            args.control_lane,
+            args.timeout_secs,
+            "owner admitted remote member",
+            || {
+                app_state()
+                    .groups
+                    .first()
+                    .map(|g| g.members.len())
+                    .unwrap_or(0)
+                    > 1
+            },
+        )?;
+    }
+    if manual_lane {
+        wait_for_state_with_pump(
+            true,
+            args.timeout_secs,
+            "owner received manual admission request",
+            || {
+                app_state().groups.iter().any(|group| {
+                    group
+                        .admission_requests
+                        .iter()
+                        .any(|request| request.status == "pending")
+                })
+            },
+        )?;
+    }
     let pending_admission_request_id =
         if args.admission_mode == GroupAdmissionModeView::ManualApproval {
             let request_id = app_state()
@@ -919,7 +989,7 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
         } else {
             None
         };
-    wait_for_message("g009 joiner to owner protected text", args.timeout_secs)?;
+    wait_for_message(args.control_lane, "g009 joiner to owner protected text", args.timeout_secs)?;
     let target = MessageTargetView {
         kind: "channel".to_owned(),
         dm_id: None,
@@ -933,7 +1003,28 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
         adapter_kind: None,
     });
     ensure_ok(&sent.last_command_error, "owner send protected text")?;
-    let presence = publish_presence_and_pump(&group_id, args.timeout_secs)?;
+    let presence = if args.control_lane {
+        PresenceEvidence {
+            published: false,
+            local_member_id: app_state()
+                .profile
+                .as_ref()
+                .map(|profile| profile.user_id.clone())
+                .unwrap_or_default(),
+            local_status: None,
+            presence_expires_at: None,
+            pump: PumpEvidence {
+                label: "lane-mode-presence-skipped".to_owned(),
+                frames_sent: 0,
+                response_frames_received: 0,
+                receipts_applied: 0,
+                failures: Vec::new(),
+                runtime_open: true,
+            },
+        }
+    } else {
+        publish_presence_and_pump(&group_id, args.timeout_secs)?
+    };
     let owner_text = pump_until("owner-to-joiner-text", args.timeout_secs, |report| {
         report.receipts_applied > 0 && report.failures.is_empty()
     })?;
@@ -975,6 +1066,7 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
             "approval": pending_admission_request_id,
         },
         "owner_runtime_attached_direct_path": runtime_attached_direct_path,
+        "control_lane_attached": control_lane_attached,
         "owner_text": owner_text,
         "received_joiner_text": true,
         "presence": presence,
@@ -1019,6 +1111,20 @@ fn start_and_attach_runtime_derived_or_relay() -> Result<bool, Box<dyn std::erro
     }
 }
 
+fn start_and_attach_control_lane(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let started = start_text_session(StartTextSessionRequest {
+        scope_label: Some("g009-control-lane".to_owned()),
+        data_channel_probe: false,
+        adapter_kind: None,
+    });
+    ensure_ok(&started.last_command_error, "start text session")?;
+    let attached = attach_broker_control_lane_runtime(AttachBrokerControlLaneRuntimeRequest {
+        adapter_kind: Some(args.adapter.clone()),
+    });
+    ensure_ok(&attached.last_command_error, "attach broker control lane")?;
+    Ok(())
+}
+
 fn pump_until<F>(
     label: &str,
     timeout_secs: u64,
@@ -1059,6 +1165,7 @@ where
 }
 
 fn wait_for_state_with_pump<F>(
+    lane_drain: bool,
     timeout_secs: u64,
     label: &str,
     mut condition: F,
@@ -1076,18 +1183,33 @@ where
             limit: Some(16),
             operation_timeout_ms: Some(5_000),
         });
+        if lane_drain {
+            let _ = drain_text_control_inbound_frames(DrainTextControlInboundFramesRequest {
+                drain_ms: Some(150),
+                operation_timeout_ms: Some(1_000),
+            });
+        }
         thread::sleep(Duration::from_millis(500));
     }
     Err(format!("timed out waiting for {label}").into())
 }
 
-fn wait_for_message(body: &str, timeout_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_state_with_pump(timeout_secs, &format!("message {body}"), || {
-        app_state()
-            .messages
-            .iter()
-            .any(|message| message.body == body)
-    })?;
+fn wait_for_message(
+    lane_drain: bool,
+    body: &str,
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_state_with_pump(
+        lane_drain,
+        timeout_secs,
+        &format!("message {body}"),
+        || {
+            app_state()
+                .messages
+                .iter()
+                .any(|message| message.body == body)
+        },
+    )?;
     Ok(())
 }
 
@@ -1260,6 +1382,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut group_name = "G009 Split Machine Lab".to_owned();
     let mut timeout_secs = 120_u64;
     let mut admission_mode = GroupAdmissionModeView::ManualApproval;
+    let mut control_lane = false;
     let mut task_id = "PER-99".to_owned();
     let mut phase_task_id = "P12-T04".to_owned();
     let mut iter = env::args().skip(1);
@@ -1293,6 +1416,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     }
                 }
             }
+            "--control-lane" => control_lane = true,
             "--timeout-secs" => {
                 timeout_secs = iter
                     .next()
@@ -1300,7 +1424,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     .parse()?
             }
             "--help" | "-h" => {
-                println!("usage: g009_split_machine_app_flow --role prepare-owner|owner|joiner|local-pair --artifact <path> [--invite <invite>] [--adapter nostr|mqtt] [--endpoint <uri>] [--admission-mode manual|automatic] [--task-id PER-99] [--phase-task-id P12-T04]");
+                println!("usage: g009_split_machine_app_flow --role prepare-owner|owner|joiner|local-pair --artifact <path> [--invite <invite>] [--adapter nostr|mqtt] [--endpoint <uri>] [--admission-mode manual|automatic] [--control-lane] [--task-id PER-99] [--phase-task-id P12-T04]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -1316,6 +1440,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         group_name,
         timeout_secs,
         admission_mode,
+        control_lane,
         task_id,
         phase_task_id,
     })
