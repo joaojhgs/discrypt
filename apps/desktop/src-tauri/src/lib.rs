@@ -2659,6 +2659,7 @@ struct TextControlTransportRuntime {
     role: Option<ProviderTextControlRuntimePeerRole>,
     local_peer_id: Option<String>,
     remote_peer_id: Option<String>,
+    lane: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -3080,6 +3081,12 @@ impl TauriAppService {
             }
         }
         self.text_control_transport_runtimes.values().next()
+    }
+
+    fn broker_control_lane_attached_for_session(&self, session_id: &str) -> bool {
+        self.text_control_transport_runtimes
+            .values()
+            .any(|runtime| runtime.session_id == session_id && runtime.lane)
     }
 
     fn text_control_runtime_status_row(&self) -> TransportStatusView {
@@ -3512,7 +3519,9 @@ impl TauriAppService {
                 "Start and attach the backend text/control runtime before publishing online presence".to_owned(),
             ));
         };
-        if !session.state().is_connected() {
+        if !session.state().is_connected()
+            && !self.broker_control_lane_attached_for_session(&session.session_id)
+        {
             return Err((
                 "text_session_not_connected",
                 format!(
@@ -3733,6 +3742,7 @@ impl TauriAppService {
     ) {
         let session_id = session_id.into();
         let runtime = TextControlTransportRuntime {
+        lane: false,
             transport,
             owned_runtime: None,
             executor: None,
@@ -3768,6 +3778,7 @@ impl TauriAppService {
             );
         }
         let runtime = TextControlTransportRuntime {
+        lane: false,
             transport,
             owned_runtime: Some(owned_runtime),
             executor: Some(executor),
@@ -3925,6 +3936,7 @@ impl TauriAppService {
         self.text_control_transport_runtimes.insert(
             TextControlRuntimeMapKey::legacy(transport_session_id.clone()),
             TextControlTransportRuntime {
+            lane: true,
                 transport: transport.clone(),
                 owned_runtime: None,
                 executor: Some(executor.clone()),
@@ -3941,6 +3953,7 @@ impl TauriAppService {
                     remote.0.clone(),
                 ),
                 TextControlTransportRuntime {
+                lane: true,
                     transport: transport.clone(),
                     owned_runtime: None,
                     executor: Some(executor.clone()),
@@ -20910,6 +20923,7 @@ mod tests {
         let local_peer_id = local_peer_id.into();
         let remote_peer_id = remote_peer_id.into();
         let runtime = TextControlTransportRuntime {
+            lane: false,
             transport,
             owned_runtime: None,
             executor: None,
@@ -38219,5 +38233,390 @@ mod tests {
         );
         connection::halt_control_lane_session_manager(&session_id);
         std::fs::remove_file(empty_path).ok();
+    }
+
+    // BLOCKED (G6): the three-member lane flow exposed a state-accumulation
+    // defect — `create_user` on an existing state file creates a new profile
+    // identity without resetting groups/members, so the profile drifts from
+    // the group roster across prepare-owner invocations and the lane attach
+    // fails the role lookup. Requires an identity-reset design decision.
+    #[test]
+    #[ignore = "G6 blocked: profile/roster identity drift across prepare-owner runs"]
+    fn broker_control_lane_three_member_automatic_admission_text_and_revoke() {
+        use discrypt_transport::{
+            AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
+            SignalingAdapter,
+        };
+
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("g6-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let group_state = create_group(CreateGroupRequest {
+            name: "G6 Trio".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::AutomaticWhenAuthorizedOnline),
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = group_state.groups[0].group_id.clone();
+        set_active_group(SetActiveGroupRequest {
+            group_id: group_id.clone(),
+        });
+        let invite_state = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        });
+        let invite_code = invite_state.invites[0].code.clone();
+        let mut owner_service = TauriAppService::load_for_test_path(owner_path.clone());
+
+        let j1_path = reset_with_temp_state("g6-joiner1");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let j1 = join_group(JoinGroupRequest {
+            invite_code: invite_code.clone(),
+            group_name: None,
+        });
+        assert!(j1.last_command_error.is_none(), "{j1:?}");
+        let mut joiner1_service = TauriAppService::load_for_test_path(j1_path.clone());
+
+        let j2_path = reset_with_temp_state("g6-joiner2");
+        create_user(CreateUserRequest {
+            display_name: "Carol".to_owned(),
+            device_name: None,
+        });
+        let j2 = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: None,
+        });
+        assert!(j2.last_command_error.is_none(), "{j2:?}");
+        let mut joiner2_service = TauriAppService::load_for_test_path(j2_path.clone());
+
+        // The owner grants itself the online heartbeat (the automatic authority gate).
+        {
+            let group = owner_service
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .expect("owner group");
+            group.members[0].status = "online".to_owned();
+        }
+
+        let owner_connectivity = owner_service
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .and_then(|group| group.connectivity.clone())
+            .expect("owner connectivity");
+        let join_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("join runtime");
+        let scope = ConversationScope::new(
+            ConnectivityScopeLevel::Group,
+            owner_connectivity.scope_id_commitment.clone(),
+        )
+        .expect("scope constructs");
+        let rendezvous = discrypt_transport::RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Mqtt,
+            &[7_u8; 32],
+            &[9_u8; 16],
+            3600,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "g6 trio test").expect("trust label"),
+        )
+        .expect("rendezvous derives");
+        let profile_view = owner_connectivity
+            .signaling_profiles
+            .iter()
+            .find(|profile| profile.adapter_kind == "mqtt")
+            .expect("mqtt profile");
+        let profile = transport_profile_from_view(profile_view).expect("profile converts");
+        let mut room_profile = profile.clone();
+        room_profile.endpoints = vec![discrypt_transport::SignalingProviderEndpoint::new(
+            discrypt_transport::Endpoint::new("http://127.0.0.1:1"),
+            discrypt_transport::SignalingEndpointSecurity::LocalDevLoopback,
+        )];
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus);
+        let (owner_room, j1_room, j2_room) = join_runtime.block_on(async {
+            let session = adapter
+                .connect(room_profile)
+                .await
+                .expect("adapter connects");
+            let owner_room = session
+                .join(
+                    scope.clone(),
+                    rendezvous.clone(),
+                    SignalingPeerId::new("owner-peer").expect("pid"),
+                )
+                .await
+                .expect("owner joins");
+            let j1_room = session
+                .join(
+                    scope.clone(),
+                    rendezvous.clone(),
+                    SignalingPeerId::new("j1-peer").expect("pid"),
+                )
+                .await
+                .expect("j1 joins");
+            let j2_room = session
+                .join(
+                    scope,
+                    rendezvous,
+                    SignalingPeerId::new("j2-peer").expect("pid"),
+                )
+                .await
+                .expect("j2 joins");
+            (owner_room, j1_room, j2_room)
+        });
+
+        let key = broker_control_lane_key(&[42_u8; 32]).expect("key derives");
+        let executor = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("executor builds"),
+        );
+        owner_service
+            .state
+            .start_transport_session(BackendTransportMode::Text, Some("g6-owner".to_owned()))
+            .expect("owner session starts");
+        let owner_session_id = owner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("owner session")
+            .session_id
+            .clone();
+        owner_service.register_broker_control_lane_transport(
+            Box::new(owner_room),
+            key,
+            SignalingPeerId::new("owner-peer").expect("pid"),
+            owner_session_id,
+            executor.clone(),
+        );
+        for (service, room, peer) in [
+            (&mut joiner1_service, j1_room, "j1-peer"),
+            (&mut joiner2_service, j2_room, "j2-peer"),
+        ] {
+            service
+                .state
+                .start_transport_session(BackendTransportMode::Text, Some("g6-joiner".to_owned()))
+                .expect("joiner session starts");
+            let session_id = service
+                .state
+                .transport_session(BackendTransportMode::Text)
+                .expect("joiner session")
+                .session_id
+                .clone();
+            service.register_broker_control_lane_transport(
+                Box::new(room),
+                key,
+                SignalingPeerId::new(peer).expect("pid"),
+                session_id,
+                executor.clone(),
+            );
+        }
+
+        // Both joiners pump their admission key packages over the lane.
+        for service in [&mut joiner1_service, &mut joiner2_service] {
+            let report = service.pump_text_control_transport_once(
+                ListPendingTextControlFramesRequest {
+                    target: None,
+                    limit: Some(8),
+                    operation_timeout_ms: Some(1_000),
+                },
+            );
+            assert_eq!(report.frames_sent, 1, "{report:?}");
+        }
+
+        // The owner's drain applies both key packages; the automatic authority
+        // (online heartbeat) approves both and the Welcomes cross the lane.
+        let owner_drain =
+            owner_service.drain_text_control_inbound_frames(Some(3_000), Some(1_000));
+        assert!(
+            owner_drain.response_frames_received >= 2,
+            "owner must receive both joiner key packages: {owner_drain:?}"
+        );
+        assert!(owner_drain.failures.is_empty(), "{owner_drain:?}");
+        let owner_handle_error = owner_service
+            .state
+            .last_command_error
+            .as_ref()
+            .map(|error| format!("{}: {}", error.code, error.message));
+        assert!(
+            owner_handle_error.is_none(),
+            "owner key-package handling failed: {owner_handle_error:?}"
+        );
+        let owner_group = owner_service
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("owner group");
+        let admitted = owner_group
+            .members
+            .iter()
+            .filter(|member| member.member_id != owner_service.state.local_user_id())
+            .count();
+        assert_eq!(admitted, 2, "both joiners must be admitted members");
+
+        // The owner's text fans out to both admitted route peers through the
+        // pump's lane fallback (no per-peer direct/TURN runtimes exist).
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "g009 owner to trio protected text".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(sent.last_command_error.is_none(), "{sent:?}");
+        let owner_pump = owner_service.pump_text_control_transport_once(
+            ListPendingTextControlFramesRequest {
+                target: Some(target),
+                limit: Some(8),
+                operation_timeout_ms: Some(1_000),
+            },
+        );
+        assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
+
+        // The owner's protected text: the public command path with the global
+        // state swapped to this detached profile (the send mutates the swapped-in
+        // state and the MLS-encrypted envelope lands in its outbox).
+        let sent_view = {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = std::mem::replace(&mut guard.state, owner_service.state.clone());
+            let view = send_message(SendMessageRequest {
+                target: target.clone(),
+                body: "g009 owner to trio protected text".to_owned(),
+                transport_proof: false,
+                adapter_kind: None,
+            });
+            owner_service.state = std::mem::replace(&mut guard.state, saved);
+            view
+        };
+        assert!(sent_view.last_command_error.is_none(), "{sent_view:?}");
+        let owner_pump = owner_service.pump_text_control_transport_once(
+            ListPendingTextControlFramesRequest {
+                target: Some(target),
+                limit: Some(8),
+                operation_timeout_ms: Some(1_000),
+            },
+        );
+        assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
+
+        // Both joiners drain the owner's text; each returns a signed receipt.
+        for service in [&mut joiner1_service, &mut joiner2_service] {
+            let drain = service.drain_text_control_inbound_frames(Some(2_000), Some(1_000));
+            assert!(drain.failures.is_empty(), "{drain:?}");
+            assert!(
+                drain.response_frames_received >= 1,
+                "joiner must receive the owner text: {drain:?}"
+            );
+        }
+
+        // The owner revokes one member mid-session; the governance frame
+        // crosses the lane and the revoked member's state flips.
+        let joiner2_member_id = joiner2_service.state.local_user_id();
+        {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = std::mem::replace(&mut guard.state, owner_service.state.clone());
+            guard.state.revoke_group_member_access_state(
+                RevokeGroupMemberAccessRequest {
+                    group_id: group_id.clone(),
+                    member_id: joiner2_member_id.clone(),
+                    reason: Some("g6 trio revoke proof".to_owned()),
+                },
+            );
+            owner_service.state = std::mem::replace(&mut guard.state, saved);
+        }
+        let owner_revoke_pump = owner_service.pump_text_control_transport_once(
+            ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(1_000),
+            },
+        );
+        assert!(owner_revoke_pump.failures.is_empty(), "{owner_revoke_pump:?}");
+        let joiner_revoke_drain =
+            joiner2_service.drain_text_control_inbound_frames(Some(2_000), Some(1_000));
+        assert!(
+            joiner_revoke_drain.failures.is_empty(),
+            "{joiner_revoke_drain:?}"
+        );
+        let j2_member_status = joiner2_service
+            .state
+            .groups
+            .first()
+            .and_then(|group| {
+                group
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == joiner2_member_id)
+            })
+            .map(|member| member.status.clone())
+            .expect("joiner2 member row");
+        assert_eq!(j2_member_status, "revoked", "revoke must cross the lane");
+
+        // The revoked member's own send is denied on its side.
+        let denied_view = {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = std::mem::replace(&mut guard.state, joiner2_service.state.clone());
+            let view = send_message(SendMessageRequest {
+                target: target.clone(),
+                body: "g009 revoked member should not send".to_owned(),
+                transport_proof: false,
+                adapter_kind: None,
+            });
+            joiner2_service.state = std::mem::replace(&mut guard.state, saved);
+            view
+        };
+        assert!(
+            denied_view.last_command_error.is_some(),
+            "the revoked member's send must be denied"
+        );
+
+        // The owner's roster reflects the three-member lifecycle.
+        let roster: Vec<(String, String)> = owner_service
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("owner group")
+            .members
+            .iter()
+            .map(|member| (member.member_id.clone(), member.status.clone()))
+            .collect();
+        assert_eq!(roster.len(), 3, "owner roster must hold three members");
+
+        std::fs::remove_file(owner_path).ok();
+        std::fs::remove_file(j1_path).ok();
+        std::fs::remove_file(j2_path).ok();
     }
 }
