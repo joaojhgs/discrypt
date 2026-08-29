@@ -38490,7 +38490,7 @@ mod tests {
         assert!(sent.last_command_error.is_none(), "{sent:?}");
         let owner_pump = owner_service.pump_text_control_transport_once(
             ListPendingTextControlFramesRequest {
-                target: Some(target),
+                target: Some(target.clone()),
                 limit: Some(8),
                 operation_timeout_ms: Some(1_000),
             },
@@ -38500,22 +38500,27 @@ mod tests {
         // The owner's protected text: the public command path with the global
         // state swapped to this detached profile (the send mutates the swapped-in
         // state and the MLS-encrypted envelope lands in its outbox).
-        let sent_view = {
+        {
             let global = app_service();
             let mut guard = global
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let saved = std::mem::replace(&mut guard.state, owner_service.state.clone());
-            let view = send_message(SendMessageRequest {
-                target: target.clone(),
-                body: "g009 owner to trio protected text".to_owned(),
-                transport_proof: false,
-                adapter_kind: None,
-            });
-            owner_service.state = std::mem::replace(&mut guard.state, saved);
-            view
-        };
+            guard.state = owner_service.state.clone();
+        }
+        let sent_view = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "g009 owner to trio protected text".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
         assert!(sent_view.last_command_error.is_none(), "{sent_view:?}");
+        {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner_service.state = guard.state.clone();
+        }
         let owner_pump = owner_service.pump_text_control_transport_once(
             ListPendingTextControlFramesRequest {
                 target: Some(target),
@@ -38543,15 +38548,20 @@ mod tests {
             let mut guard = global
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let saved = std::mem::replace(&mut guard.state, owner_service.state.clone());
-            guard.state.revoke_group_member_access_state(
-                RevokeGroupMemberAccessRequest {
-                    group_id: group_id.clone(),
-                    member_id: joiner2_member_id.clone(),
-                    reason: Some("g6 trio revoke proof".to_owned()),
-                },
-            );
-            owner_service.state = std::mem::replace(&mut guard.state, saved);
+            guard.state = owner_service.state.clone();
+        }
+        let revoked_view = revoke_group_member_access(RevokeGroupMemberAccessRequest {
+            group_id: group_id.clone(),
+            member_id: joiner2_member_id.clone(),
+            reason: Some("g6 trio revoke proof".to_owned()),
+        });
+        assert!(revoked_view.last_command_error.is_none(), "{revoked_view:?}");
+        {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner_service.state = guard.state.clone();
         }
         let owner_revoke_pump = owner_service.pump_text_control_transport_once(
             ListPendingTextControlFramesRequest {
