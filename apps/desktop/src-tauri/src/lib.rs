@@ -38523,7 +38523,7 @@ mod tests {
         }
         let owner_pump = owner_service.pump_text_control_transport_once(
             ListPendingTextControlFramesRequest {
-                target: Some(target),
+                target: Some(target.clone()),
                 limit: Some(8),
                 operation_timeout_ms: Some(1_000),
             },
