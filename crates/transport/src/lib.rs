@@ -24,6 +24,11 @@ pub mod signaling;
 pub mod webrtc_negotiation;
 
 use async_trait::async_trait;
+pub use control_lane::{
+    broker_control_lane_key, decode_broker_control_envelope, open_broker_control_frame,
+    seal_broker_control_frame, BrokerControlEnvelope, BrokerControlLaneTransport,
+    BROKER_CONTROL_LANE_KEY_DOMAIN, BROKER_CONTROL_LANE_SCHEMA_VERSION,
+};
 pub use history_sync::{
     apply_history_sync_plan, build_history_sync_plan, HistorySyncApplyReport, HistorySyncItem,
     HistorySyncPlan, HistorySyncPolicy, HistorySyncQueue, HistorySyncRouteKind,
@@ -61,6 +66,7 @@ pub use policy::{
     DEFAULT_PROVIDER_BACKOFF_MAX_MS, DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
     DEFAULT_PROVIDER_MAX_MESSAGE_BYTES,
 };
+pub use provider_adapters::join_provider_control_lane_room;
 #[cfg(any(test, feature = "harness"))]
 pub use provider_adapters::start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer;
 #[cfg(feature = "ipfs-pubsub-adapter")]
@@ -112,12 +118,6 @@ pub use signaling::{
 };
 #[cfg(any(test, feature = "harness", feature = "local-dev"))]
 pub use signaling::{LocalConformanceSignalingAdapter, LocalConformanceSignalingBus};
-pub use provider_adapters::join_provider_control_lane_room;
-pub use control_lane::{
-    broker_control_lane_key, decode_broker_control_envelope, open_broker_control_frame,
-    seal_broker_control_frame, BrokerControlEnvelope, BrokerControlLaneTransport,
-    BROKER_CONTROL_LANE_KEY_DOMAIN, BROKER_CONTROL_LANE_SCHEMA_VERSION,
-};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;

@@ -224,7 +224,10 @@ pub fn spawn_control_lane_session_manager(
             .unwrap_or(DEFAULT_PUMP_INTERVAL_MS)
             .clamp(50, 60_000),
     );
-    let drain_window = config.drain_ms.unwrap_or(DEFAULT_MANAGER_DRAIN_MS).clamp(100, 5_000);
+    let drain_window = config
+        .drain_ms
+        .unwrap_or(DEFAULT_MANAGER_DRAIN_MS)
+        .clamp(100, 5_000);
     let backoff = AbuseBackoffPolicy::new(
         config
             .backoff_initial_ms
@@ -235,7 +238,10 @@ pub fn spawn_control_lane_session_manager(
             .unwrap_or(DEFAULT_BACKOFF_MAX_MS)
             .clamp(10, 60_000),
         DEFAULT_BACKOFF_MULTIPLIER,
-        config.backoff_max_attempts.unwrap_or(DEFAULT_BACKOFF_MAX_ATTEMPTS).max(1),
+        config
+            .backoff_max_attempts
+            .unwrap_or(DEFAULT_BACKOFF_MAX_ATTEMPTS)
+            .max(1),
     )
     .map_err(|error| error.to_string())?;
     let entry = ControlLaneManagerEntry {
@@ -427,8 +433,6 @@ pub fn stop_control_lane_session_manager(
 pub fn control_lane_session_manager_status(
     request: ControlLaneSessionManagerStatusRequest,
 ) -> Option<ControlLaneSessionManagerStatusView> {
-    let session_id = request
-        .session_id
-        .or_else(active_text_session_id)?;
+    let session_id = request.session_id.or_else(active_text_session_id)?;
     control_lane_session_manager_snapshot(&session_id)
 }

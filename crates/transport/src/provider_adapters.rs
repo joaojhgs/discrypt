@@ -37,6 +37,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(any(feature = "nostr-adapter", feature = "ipfs-pubsub-adapter"))]
 use std::collections::BTreeSet;
+use std::collections::HashSet;
+
+type DeliveredControls = HashSet<(String, Vec<u8>)>;
 #[cfg(feature = "ipfs-pubsub-adapter")]
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -3789,6 +3792,7 @@ pub struct LocalConformanceProviderRoom {
     bus: LocalConformanceProviderBus,
     key: LocalRoomKey,
     local_peer_id: SignalingPeerId,
+    delivered_controls: Arc<Mutex<DeliveredControls>>,
 }
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
@@ -3940,6 +3944,7 @@ pub struct MqttProviderRoom {
     rendezvous_topic: String,
     topics: MqttTopics,
     inbox: AsyncMutex<MqttInbox>,
+    delivered_controls: AsyncMutex<DeliveredControls>,
     max_message_bytes: u32,
 }
 
@@ -4021,6 +4026,7 @@ pub struct NostrProviderRoom {
     topic: String,
     notifications: AsyncMutex<tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>>,
     inbox: AsyncMutex<NostrInbox>,
+    delivered_controls: AsyncMutex<DeliveredControls>,
 }
 
 #[cfg(feature = "nostr-adapter")]
@@ -6000,6 +6006,7 @@ impl AdapterSession for NostrProviderSession {
             topic: rendezvous.topic,
             notifications: AsyncMutex::new(client.notifications()),
             inbox: AsyncMutex::new(NostrInbox::default()),
+            delivered_controls: AsyncMutex::new(HashSet::new()),
         };
         room.drain_network_for(Duration::from_millis(700)).await?;
         Ok(room)
@@ -6084,8 +6091,22 @@ impl RendezvousRoom for NostrProviderRoom {
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
         self.drain_network_for(Duration::from_millis(300)).await?;
-        let mut inbox = self.inbox.lock().await;
-        Ok(std::mem::take(&mut inbox.controls))
+        let candidates: Vec<ControlBroadcast> = {
+            let inbox = self.inbox.lock().await;
+            inbox
+                .controls
+                .iter()
+                .filter(|control| control.from_peer != self.local_peer_id)
+                .cloned()
+                .collect()
+        };
+        let mut delivered = self.delivered_controls.lock().await;
+        Ok(candidates
+            .into_iter()
+            .filter(|control| {
+                delivered.insert((control.from_peer.0.clone(), control.payload.bytes.clone()))
+            })
+            .collect())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6639,6 +6660,7 @@ impl AdapterSession for MqttProviderSession {
             rendezvous_topic: rendezvous.topic,
             topics,
             inbox: AsyncMutex::new(MqttInbox::default()),
+            delivered_controls: AsyncMutex::new(HashSet::new()),
             max_message_bytes: endpoint
                 .max_message_bytes
                 .unwrap_or(crate::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES),
@@ -6745,8 +6767,22 @@ impl RendezvousRoom for MqttProviderRoom {
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
         self.consume_network_events().await?;
-        let mut inbox = self.inbox.lock().await;
-        Ok(std::mem::take(&mut inbox.controls))
+        let candidates: Vec<ControlBroadcast> = {
+            let inbox = self.inbox.lock().await;
+            inbox
+                .controls
+                .iter()
+                .filter(|control| control.from_peer != self.local_peer_id)
+                .cloned()
+                .collect()
+        };
+        let mut delivered = self.delivered_controls.lock().await;
+        Ok(candidates
+            .into_iter()
+            .filter(|control| {
+                delivered.insert((control.from_peer.0.clone(), control.payload.bytes.clone()))
+            })
+            .collect())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6837,6 +6873,7 @@ impl AdapterSession for LocalConformanceProviderSession {
             bus: self.bus.clone(),
             key,
             local_peer_id,
+            delivered_controls: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -6948,21 +6985,32 @@ impl RendezvousRoom for LocalConformanceProviderRoom {
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        self.bus.with_state(|state| {
-            let Some(room) = state.rooms.get_mut(&self.key) else {
-                return Vec::new();
-            };
-            let mut delivered = Vec::new();
-            room.controls.retain(|control| {
-                if control.from_peer != self.local_peer_id {
-                    delivered.push(control.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            delivered
-        })
+        let candidates: Vec<ControlBroadcast> = self
+            .bus
+            .with_state(|state| {
+                state
+                    .rooms
+                    .get(&self.key)
+                    .map(|room| {
+                        room.controls
+                            .iter()
+                            .filter(|control| control.from_peer != self.local_peer_id)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let mut delivered = self
+            .delivered_controls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(candidates
+            .into_iter()
+            .filter(|control| {
+                delivered.insert((control.from_peer.0.clone(), control.payload.bytes.clone()))
+            })
+            .collect())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -6970,11 +7018,9 @@ impl RendezvousRoom for LocalConformanceProviderRoom {
             if let Some(room) = state.rooms.get_mut(&self.key) {
                 room.presence
                     .retain(|event| event.peer_id != self.local_peer_id);
-                room.signals
-                    .retain(|signal| {
-                        signal.from_peer != self.local_peer_id
-                            && signal.to_peer != self.local_peer_id
-                    });
+                room.signals.retain(|signal| {
+                    signal.from_peer != self.local_peer_id && signal.to_peer != self.local_peer_id
+                });
                 room.controls
                     .retain(|control| control.from_peer != self.local_peer_id);
             }
@@ -9888,12 +9934,14 @@ mod tests {
 
             let control_payload_bytes = b"sealed-provider-control-envelope-alice".to_vec();
             alice_room
-                .broadcast_control(OpaqueSignalingPayload::new(
-                    control_payload_bytes.clone(),
-                )?)
+                .broadcast_control(OpaqueSignalingPayload::new(control_payload_bytes.clone())?)
                 .await?;
             let bob_controls = bob_room.take_control_payloads().await?;
-            assert_eq!(bob_controls.len(), 1, "peer control envelope must be delivered");
+            assert_eq!(
+                bob_controls.len(),
+                1,
+                "peer control envelope must be delivered"
+            );
             assert_eq!(bob_controls[0].from_peer, alice);
             assert_eq!(bob_controls[0].payload.bytes, control_payload_bytes);
             assert!(

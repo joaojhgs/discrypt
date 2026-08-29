@@ -123,9 +123,7 @@ pub fn seal_broker_control_frame(
             },
         )
         .map_err(|_| {
-            TransportError::SignalingAdapter(
-                "broker control lane seal failed".to_owned(),
-            )
+            TransportError::SignalingAdapter("broker control lane seal failed".to_owned())
         })?;
     let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let envelope = BrokerControlEnvelope {
@@ -135,12 +133,15 @@ pub fn seal_broker_control_frame(
         nonce_b64: encoder.encode(nonce_bytes),
         ciphertext_b64: encoder.encode(ciphertext),
     };
-    serde_json::to_vec(&envelope)
-        .map_err(|error| TransportError::SignalingAdapter(format!("control envelope encode: {error}")))
+    serde_json::to_vec(&envelope).map_err(|error| {
+        TransportError::SignalingAdapter(format!("control envelope encode: {error}"))
+    })
 }
 
 /// Decode an envelope from wire bytes without opening the ciphertext.
-pub fn decode_broker_control_envelope(payload: &[u8]) -> Result<BrokerControlEnvelope, TransportError> {
+pub fn decode_broker_control_envelope(
+    payload: &[u8],
+) -> Result<BrokerControlEnvelope, TransportError> {
     let envelope: BrokerControlEnvelope = serde_json::from_slice(payload).map_err(|_| {
         TransportError::SignalingAdapter(
             "broker control lane payload is not a versioned control envelope".to_owned(),
@@ -323,10 +324,7 @@ mod tests {
         let wire = seal_broker_control_frame(&key, &peer, &frame).expect("seal");
         let envelope = decode_broker_control_envelope(&wire).expect("decode");
         assert_eq!(envelope.from_peer, "peer-alice");
-        assert_eq!(
-            envelope.schema_version,
-            BROKER_CONTROL_LANE_SCHEMA_VERSION
-        );
+        assert_eq!(envelope.schema_version, BROKER_CONTROL_LANE_SCHEMA_VERSION);
         let opened = open_broker_control_frame(&key, &envelope).expect("open");
         assert_eq!(opened, frame);
     }
@@ -337,10 +335,9 @@ mod tests {
         let peer = SignalingPeerId::new("peer-alice".to_owned()).expect("peer id");
         let wire = seal_broker_control_frame(&key, &peer, b"frame-bytes").expect("seal");
         let mut envelope = decode_broker_control_envelope(&wire).expect("decode");
-        let mut ciphertext =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(envelope.ciphertext_b64.as_bytes())
-                .expect("ciphertext decode");
+        let mut ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(envelope.ciphertext_b64.as_bytes())
+            .expect("ciphertext decode");
         ciphertext[0] ^= 1;
         envelope.ciphertext_b64 =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&ciphertext);

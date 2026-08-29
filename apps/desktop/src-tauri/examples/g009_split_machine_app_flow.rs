@@ -8,8 +8,8 @@ use discrypt_desktop::{
     send_message, set_active_group, start_text_session, ApproveGroupAdmissionRequest,
     AttachBrokerControlLaneRuntimeRequest, AttachTextControlTransportRuntimeRequest,
     CreateGroupRequest, CreateInviteRequest, CreateUserRequest,
-    DrainTextControlInboundFramesRequest, GroupAdmissionModeView, GroupRoleView,
-    JoinGroupRequest, JoinVoiceRequest, ListPendingTextControlFramesRequest, MessageTargetView,
+    DrainTextControlInboundFramesRequest, GroupAdmissionModeView, GroupRoleView, JoinGroupRequest,
+    JoinVoiceRequest, ListPendingTextControlFramesRequest, MessageTargetView,
     PromoteGroupMemberRequest, PublishGroupPresenceRequest, RevokeGroupMemberAccessRequest,
     SendMessageRequest, SetActiveGroupRequest, StartTextSessionRequest, VoiceSessionView,
 };
@@ -800,43 +800,50 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
             transport_proof: false,
             adapter_kind: None,
         });
-          sent.last_command_error.is_none()
-      })?;
-      let presence = if args.control_lane {
-          // Route-gated presence requires a connected direct/TURN route; the
-          // broker control lane is coordination-only in this phase.
-          PresenceEvidence {
-              published: false,
-              local_member_id: app_state()
-                  .profile
-                  .as_ref()
-                  .map(|profile| profile.user_id.clone())
-                  .unwrap_or_default(),
-              local_status: None,
-              presence_expires_at: None,
-              pump: PumpEvidence {
-                  label: "lane-mode-presence-skipped".to_owned(),
-                  frames_sent: 0,
-                  response_frames_received: 0,
-                  receipts_applied: 0,
-                  failures: Vec::new(),
-                  runtime_open: true,
-              },
-          }
-      } else {
-          publish_presence_and_pump(&group_id, args.timeout_secs)?
-      };
+        sent.last_command_error.is_none()
+    })?;
+    let presence = if args.control_lane {
+        // Route-gated presence requires a connected direct/TURN route; the
+        // broker control lane is coordination-only in this phase.
+        PresenceEvidence {
+            published: false,
+            local_member_id: app_state()
+                .profile
+                .as_ref()
+                .map(|profile| profile.user_id.clone())
+                .unwrap_or_default(),
+            local_status: None,
+            presence_expires_at: None,
+            pump: PumpEvidence {
+                label: "lane-mode-presence-skipped".to_owned(),
+                frames_sent: 0,
+                response_frames_received: 0,
+                receipts_applied: 0,
+                failures: Vec::new(),
+                runtime_open: true,
+            },
+        }
+    } else {
+        publish_presence_and_pump(&group_id, args.timeout_secs)?
+    };
     let joiner_text = pump_until("joiner-to-owner-text", args.timeout_secs, |report| {
         report.receipts_applied > 0 && report.failures.is_empty()
     })?;
-    wait_for_message(args.control_lane, "g009 owner to joiner protected text", args.timeout_secs)?;
+    wait_for_message(
+        args.control_lane,
+        "g009 owner to joiner protected text",
+        args.timeout_secs,
+    )?;
     let local_member_id = app_state()
         .profile
         .as_ref()
         .map(|profile| profile.user_id.clone())
         .ok_or("joiner profile missing before governance wait")?;
-    let promotion_seen =
-        wait_for_state_with_pump(args.control_lane, args.timeout_secs, "joiner promoted to staff", || {
+    let promotion_seen = wait_for_state_with_pump(
+        args.control_lane,
+        args.timeout_secs,
+        "joiner promoted to staff",
+        || {
             app_state().groups.iter().any(|group| {
                 group.group_id == group_id
                     && group.members.iter().any(|member| {
@@ -846,16 +853,21 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
                                 .contains("staff")
                     })
             })
-        })?;
-    let revoke_seen = wait_for_state_with_pump(args.control_lane, args.timeout_secs, "joiner revoked", || {
-        app_state().groups.iter().any(|group| {
-            group.group_id == group_id
-                && group
-                    .members
-                    .iter()
-                    .any(|member| member.member_id == local_member_id && member.status == "revoked")
-        })
-    })?;
+        },
+    )?;
+    let revoke_seen = wait_for_state_with_pump(
+        args.control_lane,
+        args.timeout_secs,
+        "joiner revoked",
+        || {
+            app_state().groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.members.iter().any(|member| {
+                        member.member_id == local_member_id && member.status == "revoked"
+                    })
+            })
+        },
+    )?;
     let revoked_send = send_message(SendMessageRequest {
         target,
         body: "g009 revoked member should not send".to_owned(),
@@ -989,7 +1001,11 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
         } else {
             None
         };
-    wait_for_message(args.control_lane, "g009 joiner to owner protected text", args.timeout_secs)?;
+    wait_for_message(
+        args.control_lane,
+        "g009 joiner to owner protected text",
+        args.timeout_secs,
+    )?;
     let target = MessageTargetView {
         kind: "channel".to_owned(),
         dm_id: None,
@@ -1199,17 +1215,12 @@ fn wait_for_message(
     body: &str,
     timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_state_with_pump(
-        lane_drain,
-        timeout_secs,
-        &format!("message {body}"),
-        || {
-            app_state()
-                .messages
-                .iter()
-                .any(|message| message.body == body)
-        },
-    )?;
+    wait_for_state_with_pump(lane_drain, timeout_secs, &format!("message {body}"), || {
+        app_state()
+            .messages
+            .iter()
+            .any(|message| message.body == body)
+    })?;
     Ok(())
 }
 

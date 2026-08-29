@@ -19,16 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let _ = rumqttc::tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
-            .install_default();
+        let _ =
+            rumqttc::tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut options = rumqttc::MqttOptions::parse_url(&endpoint)?;
         options.set_client_id(format!("g004-probe-{}", std::process::id()));
         options.set_keep_alive(30);
         if endpoint.starts_with("mqtts://") || endpoint.starts_with("tls://") {
             options.set_transport(rumqttc::Transport::tls_with_default_config());
         }
-        let (client, mut eventloop) =
-            rumqttc::AsyncClient::builder(options).capacity(64).build();
+        let (client, mut eventloop) = rumqttc::AsyncClient::builder(options).capacity(64).build();
         client
             .subscribe(filter, rumqttc::QoS::AtLeastOnce)
             .await

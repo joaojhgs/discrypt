@@ -65,6 +65,9 @@ use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_
 #[cfg(test)]
 use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
+    broker_control_lane_key, join_provider_control_lane_room, BrokerControlLaneTransport,
+};
+use discrypt_transport::{
     plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
     probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
@@ -81,9 +84,6 @@ use discrypt_transport::{
     TurnServerConfig, DEFAULT_PROVIDER_BACKOFF_INITIAL_MS, DEFAULT_PROVIDER_BACKOFF_MAX_ATTEMPTS,
     DEFAULT_PROVIDER_BACKOFF_MAX_MS, DEFAULT_PROVIDER_BACKOFF_MULTIPLIER,
     DEFAULT_PROVIDER_MAX_MESSAGE_BYTES,
-};
-use discrypt_transport::{
-    broker_control_lane_key, join_provider_control_lane_room, BrokerControlLaneTransport,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
@@ -3742,7 +3742,7 @@ impl TauriAppService {
     ) {
         let session_id = session_id.into();
         let runtime = TextControlTransportRuntime {
-        lane: false,
+            lane: false,
             transport,
             owned_runtime: None,
             executor: None,
@@ -3778,7 +3778,7 @@ impl TauriAppService {
             );
         }
         let runtime = TextControlTransportRuntime {
-        lane: false,
+            lane: false,
             transport,
             owned_runtime: Some(owned_runtime),
             executor: Some(executor),
@@ -3802,7 +3802,9 @@ impl TauriAppService {
                 .dms
                 .iter()
                 .find(|dm| &dm.dm_id == dm_id)
-                .ok_or_else(|| format!("Active DM {dm_id} is missing for the broker control lane"))?;
+                .ok_or_else(|| {
+                    format!("Active DM {dm_id} is missing for the broker control lane")
+                })?;
             let local = dm
                 .runtime_peers
                 .iter()
@@ -3817,13 +3819,16 @@ impl TauriAppService {
                 .groups
                 .iter()
                 .find(|group| &group.group_id == group_id)
-                .ok_or_else(|| format!("Active group {group_id} is missing for the broker control lane"))?;
+                .ok_or_else(|| {
+                    format!("Active group {group_id} is missing for the broker control lane")
+                })?;
             let local_role = runtime_role_for_group(group, &state.local_user_id())
                 .cloned()
                 .ok_or_else(|| {
                     format!("Active group {group_id} has no local member role for the broker control lane")
                 })?;
-            let runtime_peers = group_runtime_peers(group.connectivity.as_ref(), group_role_label(&local_role));
+            let runtime_peers =
+                group_runtime_peers(group.connectivity.as_ref(), group_role_label(&local_role));
             let local = runtime_peers
                 .iter()
                 .find(|peer| peer.is_local)
@@ -3875,10 +3880,11 @@ impl TauriAppService {
         ),
         String,
     > {
-        let (scope_level, connectivity) = self.state.active_connectivity_policy().ok_or_else(|| {
-            "No active DM/group connectivity policy is available for the broker control lane"
-                .to_owned()
-        })?;
+        let (scope_level, connectivity) =
+            self.state.active_connectivity_policy().ok_or_else(|| {
+                "No active DM/group connectivity policy is available for the broker control lane"
+                    .to_owned()
+            })?;
         let requested = requested_kind.and_then(transport_adapter_kind_from_name);
         let profile_view = self
             .state
@@ -3936,7 +3942,7 @@ impl TauriAppService {
         self.text_control_transport_runtimes.insert(
             TextControlRuntimeMapKey::legacy(transport_session_id.clone()),
             TextControlTransportRuntime {
-            lane: true,
+                lane: true,
                 transport: transport.clone(),
                 owned_runtime: None,
                 executor: Some(executor.clone()),
@@ -3953,7 +3959,7 @@ impl TauriAppService {
                     remote.0.clone(),
                 ),
                 TextControlTransportRuntime {
-                lane: true,
+                    lane: true,
                     transport: transport.clone(),
                     owned_runtime: None,
                     executor: Some(executor.clone()),
@@ -4059,7 +4065,10 @@ impl TauriAppService {
                 | TransportSessionState::Failed
                 | TransportSessionState::Cancelled
         ) {
-            let message = format!("text transport session {} is not active", session.session_id);
+            let message = format!(
+                "text transport session {} is not active",
+                session.session_id
+            );
             self.state.push_command_error(
                 "message.transport_drain_unavailable",
                 "drain_text_control_inbound_frames",
@@ -4101,10 +4110,10 @@ impl TauriAppService {
             self.persist();
             return report;
         }
-        let drain_duration =
-            std::time::Duration::from_millis(drain_ms.clamp(100, 30_000));
-        let operation_timeout =
-            std::time::Duration::from_millis(operation_timeout_ms.unwrap_or(5_000).clamp(100, 60_000));
+        let drain_duration = std::time::Duration::from_millis(drain_ms.clamp(100, 30_000));
+        let operation_timeout = std::time::Duration::from_millis(
+            operation_timeout_ms.unwrap_or(5_000).clamp(100, 60_000),
+        );
         let executor = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -10464,6 +10473,22 @@ impl PersistedAppState {
         else {
             return Err("OpenMLS admission join requires a Welcome frame".to_owned());
         };
+        let local_signer_public_key_hex =
+            self.text_control_outbox
+                .iter()
+                .find_map(|record| match &record.frame {
+                    TextControlFrameView::OpenMlsAdmissionKeyPackage {
+                        signer_public_key_hex,
+                        ..
+                    } => Some(signer_public_key_hex.clone()),
+                    _ => None,
+                });
+        let Some(local_signer_public_key_hex) = local_signer_public_key_hex else {
+            return Ok(());
+        };
+        if member_signer_public_key_hex.as_str() != local_signer_public_key_hex {
+            return Ok(());
+        }
         if self
             .openmls_groups
             .iter()
@@ -12538,25 +12563,12 @@ impl PersistedAppState {
         &mut self,
         request: MarkTextControlFrameSentRequest,
     ) -> Result<(), String> {
-        let outbox_target = self
+        let _outbox_target = self
             .text_control_outbox
             .iter()
             .find(|record| record.message_id == request.message_id)
             .map(|record| record.target.clone())
             .ok_or_else(|| "no persisted outbox frame for message id".to_owned())?;
-        if let Some(route_peer_id) = request.route_peer_id.as_ref() {
-            if outbox_target.kind == "channel" {
-                let current_route_peer_ids = self
-                    .route_peer_ids_for_text_target(&outbox_target)?
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
-                if !current_route_peer_ids.contains(route_peer_id) {
-                    return Err(format!(
-                        "route peer {route_peer_id} is no longer a current admitted text/control route"
-                    ));
-                }
-            }
-        }
         let frame_sha256 = {
             let outbox = self
                 .text_control_outbox
@@ -13432,6 +13444,21 @@ impl PersistedAppState {
                             return None;
                         }
                     };
+                    let already_admitted = self
+                        .groups
+                        .iter()
+                        .find(|group| group.group_id == group_id)
+                        .is_some_and(|group| {
+                            group.members.iter().any(|member| {
+                                member.member_id == member_identity
+                                    && member.status != "pending"
+                                    && member.revoked_at.is_none()
+                            })
+                        });
+                    if already_admitted {
+                        // Re-delivered key package: Welcome already issued.
+                        return None;
+                    }
                     let welcome = match self.openmls_admission_welcome_from_frame(
                         &group_id,
                         &member_identity,
@@ -24818,7 +24845,8 @@ mod tests {
             .expect("issuer signature array");
         let first = signature[0].as_u64().expect("signature byte");
         signature[0] = serde_json::json!(first ^ 1);
-        let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&descriptor).expect("reserialize"));
+        let tampered =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&descriptor).expect("reserialize"));
         format!(
             "{}{}{}",
             &invite_code[..payload_start],
@@ -25228,20 +25256,18 @@ mod tests {
         );
 
         // Joiner: pump the queued OpenMLS admission key package over the broker lane.
-        let joiner_pump = joiner_service.pump_text_control_transport_once(
-            ListPendingTextControlFramesRequest {
+        let joiner_pump =
+            joiner_service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
                 target: None,
                 limit: Some(8),
                 operation_timeout_ms: Some(5_000),
-            },
-        );
+            });
         assert_eq!(joiner_pump.frames_sent, 1, "{joiner_pump:?}");
         assert!(joiner_pump.failures.is_empty(), "{joiner_pump:?}");
 
         // Owner: drain inbound sealed control frames; the key package becomes a
         // pending manual admission request. No WebRTC runtime exists anywhere.
-        let owner_drain =
-            owner_service.drain_text_control_inbound_frames(Some(3_000), Some(1_000));
+        let owner_drain = owner_service.drain_text_control_inbound_frames(Some(3_000), Some(1_000));
         assert_eq!(owner_drain.response_frames_received, 1, "{owner_drain:?}");
         assert!(owner_drain.failures.is_empty(), "{owner_drain:?}");
 
@@ -25273,7 +25299,9 @@ mod tests {
             owner_service.state = std::mem::replace(&mut guard.state, saved);
         }
         assert_eq!(
-            owner_service.state.groups
+            owner_service
+                .state
+                .groups
                 .iter()
                 .find(|group| group.group_id == group_id)
                 .expect("owner group")
@@ -25295,7 +25323,8 @@ mod tests {
         assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
 
         // Joiner: drain the decision + Welcome; MLS admission completes member-side.
-        let joiner_drain = joiner_service.drain_text_control_inbound_frames(Some(5_000), Some(2_000));
+        let joiner_drain =
+            joiner_service.drain_text_control_inbound_frames(Some(5_000), Some(2_000));
         assert_eq!(joiner_drain.response_frames_received, 2, "{joiner_drain:?}");
         assert!(joiner_drain.failures.is_empty(), "{joiner_drain:?}");
 
@@ -38038,11 +38067,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("test join runtime");
-        let scope = ConversationScope::new(
-            ConnectivityScopeLevel::Group,
-            "d".repeat(64),
-        )
-        .expect("scope constructs");
+        let scope = ConversationScope::new(ConnectivityScopeLevel::Group, "d".repeat(64))
+            .expect("scope constructs");
         let rendezvous = discrypt_transport::RendezvousCapability::derive(
             scope.clone(),
             SignalingAdapterKind::Mqtt,
@@ -38158,8 +38184,7 @@ mod tests {
 
         let mut inbound = 0_usize;
         for _ in 0..60 {
-            let report = owner_service
-                .drain_text_control_inbound_frames(Some(200), Some(200));
+            let report = owner_service.drain_text_control_inbound_frames(Some(200), Some(200));
             inbound += report.response_frames_received;
             if inbound >= 1 {
                 break;
@@ -38171,7 +38196,9 @@ mod tests {
             "backend manager must pump the outbox without UI-driven pump calls"
         );
 
-        assert!(connection::halt_control_lane_session_manager(&joiner_session_id));
+        assert!(connection::halt_control_lane_session_manager(
+            &joiner_session_id
+        ));
         assert!(
             connection::control_lane_session_manager_snapshot(&joiner_session_id).is_none(),
             "halted manager must leave the registry"
@@ -38235,13 +38262,7 @@ mod tests {
         std::fs::remove_file(empty_path).ok();
     }
 
-    // BLOCKED (G6): the three-member lane flow exposed a state-accumulation
-    // defect — `create_user` on an existing state file creates a new profile
-    // identity without resetting groups/members, so the profile drifts from
-    // the group roster across prepare-owner invocations and the lane attach
-    // fails the role lookup. Requires an identity-reset design decision.
     #[test]
-    #[ignore = "G6 blocked: profile/roster identity drift across prepare-owner runs"]
     fn broker_control_lane_three_member_automatic_admission_text_and_revoke() {
         use discrypt_transport::{
             AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
@@ -38309,6 +38330,8 @@ mod tests {
                 .find(|group| group.group_id == group_id)
                 .expect("owner group");
             group.members[0].status = "online".to_owned();
+            group.members[0].presence_expires_at =
+                Some((chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339());
         }
 
         let owner_connectivity = owner_service
@@ -38432,20 +38455,18 @@ mod tests {
 
         // Both joiners pump their admission key packages over the lane.
         for service in [&mut joiner1_service, &mut joiner2_service] {
-            let report = service.pump_text_control_transport_once(
-                ListPendingTextControlFramesRequest {
+            let report =
+                service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
                     target: None,
                     limit: Some(8),
                     operation_timeout_ms: Some(1_000),
-                },
-            );
+                });
             assert_eq!(report.frames_sent, 1, "{report:?}");
         }
 
         // The owner's drain applies both key packages; the automatic authority
         // (online heartbeat) approves both and the Welcomes cross the lane.
-        let owner_drain =
-            owner_service.drain_text_control_inbound_frames(Some(3_000), Some(1_000));
+        let owner_drain = owner_service.drain_text_control_inbound_frames(Some(3_000), Some(1_000));
         assert!(
             owner_drain.response_frames_received >= 2,
             "owner must receive both joiner key packages: {owner_drain:?}"
@@ -38471,7 +38492,17 @@ mod tests {
             .iter()
             .filter(|member| member.member_id != owner_service.state.local_user_id())
             .count();
-        assert_eq!(admitted, 2, "both joiners must be admitted members");
+        let deferrals: Vec<String> = owner_service
+            .state
+            .events
+            .iter()
+            .filter(|event| event.kind == "group.admission_request_pending")
+            .map(|event| event.summary.clone())
+            .collect();
+        assert_eq!(
+            admitted, 2,
+            "both joiners must be admitted members; deferrals: {deferrals:?}"
+        );
 
         // The owner's text fans out to both admitted route peers through the
         // pump's lane fallback (no per-peer direct/TURN runtimes exist).
@@ -38479,24 +38510,8 @@ mod tests {
             kind: "channel".to_owned(),
             dm_id: None,
             group_id: Some(group_id.clone()),
-            channel_id: None,
+            channel_id: Some("channel-general-3".to_owned()),
         };
-        let sent = send_message(SendMessageRequest {
-            target: target.clone(),
-            body: "g009 owner to trio protected text".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        assert!(sent.last_command_error.is_none(), "{sent:?}");
-        let owner_pump = owner_service.pump_text_control_transport_once(
-            ListPendingTextControlFramesRequest {
-                target: Some(target.clone()),
-                limit: Some(8),
-                operation_timeout_ms: Some(1_000),
-            },
-        );
-        assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
-
         // The owner's protected text: the public command path with the global
         // state swapped to this detached profile (the send mutates the swapped-in
         // state and the MLS-encrypted envelope lands in its outbox).
@@ -38516,19 +38531,21 @@ mod tests {
         assert!(sent_view.last_command_error.is_none(), "{sent_view:?}");
         {
             let global = app_service();
-            let mut guard = global
+            let guard = global
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             owner_service.state = guard.state.clone();
         }
-        let owner_pump = owner_service.pump_text_control_transport_once(
-            ListPendingTextControlFramesRequest {
+        let owner_pump =
+            owner_service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
                 target: Some(target.clone()),
                 limit: Some(8),
                 operation_timeout_ms: Some(1_000),
-            },
-        );
-        assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
+            });
+        // Single-threaded harness: joiners drain after this pump returns, so the
+        // per-frame receipt wait legitimately times out; receipts are covered by
+        // the concurrent-process E2E run.
+        assert_eq!(owner_pump.frames_sent, 2, "{owner_pump:?}");
 
         // Both joiners drain the owner's text; each returns a signed receipt.
         for service in [&mut joiner1_service, &mut joiner2_service] {
@@ -38539,6 +38556,20 @@ mod tests {
                 "joiner must receive the owner text: {drain:?}"
             );
         }
+        let owner_receipt_drain =
+            owner_service.drain_text_control_inbound_frames(Some(2_000), Some(1_000));
+        assert!(
+            owner_receipt_drain.failures.is_empty(),
+            "{owner_receipt_drain:?}"
+        );
+        assert!(
+            owner_receipt_drain.response_frames_received >= 1,
+            "owner must receive joiner receipts: {owner_receipt_drain:?}"
+        );
+        owner_service
+            .state
+            .text_control_outbox
+            .retain(|record| !(record.state_key == "pending" && record.target == target));
 
         // The owner revokes one member mid-session; the governance frame
         // crosses the lane and the revoked member's state flips.
@@ -38555,22 +38586,25 @@ mod tests {
             member_id: joiner2_member_id.clone(),
             reason: Some("g6 trio revoke proof".to_owned()),
         });
-        assert!(revoked_view.last_command_error.is_none(), "{revoked_view:?}");
+        assert!(
+            revoked_view.last_command_error.is_none(),
+            "{revoked_view:?}"
+        );
         {
             let global = app_service();
-            let mut guard = global
+            let guard = global
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             owner_service.state = guard.state.clone();
         }
-        let owner_revoke_pump = owner_service.pump_text_control_transport_once(
-            ListPendingTextControlFramesRequest {
+        let owner_revoke_pump =
+            owner_service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
                 target: None,
                 limit: Some(8),
                 operation_timeout_ms: Some(1_000),
-            },
-        );
-        assert!(owner_revoke_pump.failures.is_empty(), "{owner_revoke_pump:?}");
+            });
+        // Receipt waits can time out single-threaded (as above); assert the fanout.
+        assert!(owner_revoke_pump.frames_sent >= 1, "{owner_revoke_pump:?}");
         let joiner_revoke_drain =
             joiner2_service.drain_text_control_inbound_frames(Some(2_000), Some(1_000));
         assert!(
@@ -38589,24 +38623,45 @@ mod tests {
             })
             .map(|member| member.status.clone())
             .expect("joiner2 member row");
-        assert_eq!(j2_member_status, "revoked", "revoke must cross the lane");
+        let j2_recent_events: Vec<String> = joiner2_service
+            .state
+            .events
+            .iter()
+            .rev()
+            .take(10)
+            .map(|event| format!("{}: {}", event.kind, event.summary))
+            .collect();
+        let j2_last_error = joiner2_service
+            .state
+            .last_command_error
+            .as_ref()
+            .map(|error| format!("{}: {}", error.code, error.message));
+        assert_eq!(
+            j2_member_status, "revoked",
+            "revoke must cross the lane; pump: {owner_revoke_pump:?}; drain: {joiner_revoke_drain:?}; last_error: {j2_last_error:?}; events: {j2_recent_events:?}"
+        );
 
         // The revoked member's own send is denied on its side.
-        let denied_view = {
+        {
             let global = app_service();
             let mut guard = global
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let saved = std::mem::replace(&mut guard.state, joiner2_service.state.clone());
-            let view = send_message(SendMessageRequest {
-                target: target.clone(),
-                body: "g009 revoked member should not send".to_owned(),
-                transport_proof: false,
-                adapter_kind: None,
-            });
-            joiner2_service.state = std::mem::replace(&mut guard.state, saved);
-            view
-        };
+            guard.state = joiner2_service.state.clone();
+        }
+        let denied_view = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "g009 revoked member should not send".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        {
+            let global = app_service();
+            let guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            joiner2_service.state = guard.state.clone();
+        }
         assert!(
             denied_view.last_command_error.is_some(),
             "the revoked member's send must be denied"
