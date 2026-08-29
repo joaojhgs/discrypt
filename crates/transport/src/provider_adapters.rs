@@ -5792,21 +5792,34 @@ impl NostrProviderRoom {
             content,
         )
         .tag(nostr_discrypt_tag(&self.topic)?);
-        let output = self
-            .client
-            .send_event_builder_to(self.relay_urls.iter().map(String::as_str), builder)
-            .await
-            .map_err(|err| nostr_err("publish", err))?;
-        if output.success.is_empty() {
-            let failed = format!("{:?}", output.failed);
-            let readiness = AdapterReadinessState::classify_provider_failure(&failed);
-            return Err(TransportError::SignalingAdapter(format!(
-                "nostr publish failed on all relays: failure_class={} health_state={:?} details={failed}",
-                readiness.failure_class(),
-                readiness.to_health_state()
-            )));
+        // Relay handshakes can be slow from cold starts; the SDK reports
+        // "relay not connected"/timeout until the WebSocket is up even though
+        // the event is queued. Retry until a relay accepts the event.
+        let mut last_failure = String::new();
+        for _ in 0..10 {
+            let output = self
+                .client
+                .send_event_builder_to(self.relay_urls.iter().map(String::as_str), builder.clone())
+                .await;
+            match output {
+                Ok(output) => {
+                    if !output.success.is_empty() {
+                        return self.drain_network_for(Duration::from_secs(2)).await;
+                    }
+                    last_failure = format!("{:?}", output.failed);
+                }
+                Err(err) => {
+                    last_failure = format!("{err:?}");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        self.drain_network_for(Duration::from_secs(2)).await
+        let readiness = AdapterReadinessState::classify_provider_failure(&last_failure);
+        Err(TransportError::SignalingAdapter(format!(
+            "nostr publish failed on all relays: failure_class={} health_state={:?} details={last_failure}",
+            readiness.failure_class(),
+            readiness.to_health_state()
+        )))
     }
 
     async fn drain_network_for(&self, duration: Duration) -> Result<(), TransportError> {
@@ -5820,6 +5833,9 @@ impl NostrProviderRoom {
                 let mut notifications = self.notifications.lock().await;
                 timeout(remaining, notifications.recv()).await
             };
+            if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+                eprintln!("nostr drain: notification received");
+            }
             match notification {
                 Ok(Ok(nostr_sdk::RelayPoolNotification::Event { event, .. })) => {
                     self.record_event(&event).await?;
@@ -5849,6 +5865,13 @@ impl NostrProviderRoom {
     }
 
     async fn record_event(&self, event: &nostr_sdk::Event) -> Result<(), TransportError> {
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!(
+                "nostr record_event: kind={:?} topic_match={}",
+                event.kind,
+                event.tags.iter().any(|tag| tag.kind().to_string() == "d")
+            );
+        }
         if event.kind != nostr_sdk::Kind::Custom(NOSTR_DISCRYPT_EVENT_KIND) {
             return Ok(());
         }
@@ -5979,7 +6002,9 @@ impl AdapterSession for NostrProviderSession {
         }
         client.connect().await;
         let subscription_id = nostr_subscription_id(&rendezvous.topic, &local_peer_id);
-        let output = client
+        // nostr-sdk reports empty success/failed while the relay WebSocket is
+        // still handshaking; retry the subscribe until a relay acknowledges it.
+        let mut output = client
             .subscribe_with_id_to(
                 relay_urls.iter().map(String::as_str),
                 subscription_id.clone(),
@@ -5988,6 +6013,27 @@ impl AdapterSession for NostrProviderSession {
             )
             .await
             .map_err(|err| nostr_err("subscribe", err))?;
+        for _ in 0..25 {
+            if !output.success.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            output = client
+                .subscribe_with_id_to(
+                    relay_urls.iter().map(String::as_str),
+                    subscription_id.clone(),
+                    nostr_filter(&rendezvous.topic),
+                    None,
+                )
+                .await
+                .map_err(|err| nostr_err("subscribe", err))?;
+        }
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!(
+                "nostr join: relays={relay_urls:?} topic={:?} subscribe_success={:?} subscribe_failed={:?}",
+                rendezvous.topic, output.success, output.failed
+            );
+        }
         if output.success.is_empty() && !output.failed.is_empty() {
             let failed = format!("{:?}", output.failed);
             let readiness = AdapterReadinessState::classify_provider_failure(&failed);
@@ -8064,6 +8110,68 @@ mod tests {
         assert_eq!(tag.kind().to_string(), "d");
         assert_eq!(tag.content(), Some(topic));
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "nostr-adapter")]
+    #[ignore = "real-relay E2E; run explicitly with --ignored"]
+    async fn nostr_two_room_control_roundtrip_against_real_relay() -> Result<(), TransportError> {
+        let adapter = NostrProviderAdapter;
+        let alice = SignalingPeerId::new("g7-real-relay-alice")?;
+        let bob = SignalingPeerId::new("g7-real-relay-bob")?;
+        let scope = crate::ConversationScope::new(
+            ConnectivityScopeLevel::Group,
+            derive_scope_commitment(ConnectivityScopeLevel::Group, b"g7 real relay lab", "test"),
+        )?;
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Nostr,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("nostr", "real relay probe")?,
+        )?;
+        let profile = SignalingAdapterProfile {
+            profile_id: "nostr-real-relay-g7".to_owned(),
+            kind: SignalingAdapterKind::Nostr,
+            endpoints: vec![SignalingProviderEndpoint::new(
+                Endpoint::new("wss://relay.damus.io"),
+                SignalingEndpointSecurity::ProductionTls,
+            )],
+            metadata_posture: ProviderMetadataPosture::HashedTopic,
+            capabilities: SignalingAdapterCapabilities::production_required(),
+            trust_label: AdapterTrustLabel::new("nostr", "real relay probe")?,
+        };
+        let room_a = adapter
+            .connect(profile.clone())
+            .await?
+            .join(scope.clone(), capability.clone(), alice)
+            .await?;
+        let room_b = adapter
+            .connect(profile)
+            .await?
+            .join(scope, capability, bob)
+            .await?;
+        let sealed_payload = OpaqueSignalingPayload::new(vec![9_u8; 48])?;
+        room_a.broadcast_control(sealed_payload).await?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        loop {
+            let taken = room_b.take_control_payloads().await?;
+            if !taken.is_empty() {
+                println!(
+                    "real-relay two-room round-trip: B took {} payload(s)",
+                    taken.len()
+                );
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(TransportError::SignalingAdapter(
+                    "real-relay two-room control round-trip failed".to_owned(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
