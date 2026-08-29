@@ -234,7 +234,13 @@ impl BrokerControlLaneTransport {
     }
 
     async fn take_remote_frames(&self) -> Result<Vec<Vec<u8>>, TransportError> {
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!("lane transport: take_remote_frames polling room");
+        }
         let broadcasts: Vec<ControlBroadcast> = self.room.take_control_payloads().await?;
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!("lane transport: room returned {} broadcast(s)", broadcasts.len());
+        }
         let mut opened = Vec::with_capacity(broadcasts.len());
         for broadcast in broadcasts {
             if broadcast.from_peer == self.local_peer_id {

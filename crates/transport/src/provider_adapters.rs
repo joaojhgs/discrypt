@@ -5891,6 +5891,27 @@ impl NostrProviderRoom {
         reject_forbidden_plaintext(&bytes)?;
         let envelope: NostrWireEnvelope =
             serde_json::from_slice(&bytes).map_err(|err| nostr_err("wire envelope decode", err))?;
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            let variant = match &envelope {
+                NostrWireEnvelope::Presence { .. } => "presence",
+                NostrWireEnvelope::Signal { to_peer, .. } => "signal",
+                NostrWireEnvelope::Control { from_peer, .. } => "control",
+            };
+            let sender = match &envelope {
+                NostrWireEnvelope::Presence { from_peer, .. }
+                | NostrWireEnvelope::Signal { from_peer, .. }
+                | NostrWireEnvelope::Control { from_peer, .. } => from_peer.0.as_str(),
+            };
+            let schema_ok = match &envelope {
+                NostrWireEnvelope::Presence { schema, .. }
+                | NostrWireEnvelope::Signal { schema, .. }
+                | NostrWireEnvelope::Control { schema, .. } => *schema == NOSTR_EVENT_SCHEMA,
+            };
+            eprintln!(
+                "nostr record_event: decoded variant={variant} schema_ok={schema_ok} from_peer={sender} local={}",
+                self.local_peer_id.0
+            );
+        }
         let mut inbox = self.inbox.lock().await;
         match envelope {
             NostrWireEnvelope::Presence {
@@ -6136,7 +6157,13 @@ impl RendezvousRoom for NostrProviderRoom {
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!("nostr take: step1 before drain_network_for");
+        }
         self.drain_network_for(Duration::from_millis(300)).await?;
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!("nostr take: step2 drain done, locking inbox");
+        }
         let candidates: Vec<ControlBroadcast> = {
             let inbox = self.inbox.lock().await;
             inbox
@@ -6146,13 +6173,20 @@ impl RendezvousRoom for NostrProviderRoom {
                 .cloned()
                 .collect()
         };
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!("nostr take: step3 inbox read, candidates={}", candidates.len());
+        }
         let mut delivered = self.delivered_controls.lock().await;
-        Ok(candidates
+        let fresh: Vec<ControlBroadcast> = candidates
             .into_iter()
             .filter(|control| {
                 delivered.insert((control.from_peer.0.clone(), control.payload.bytes.clone()))
             })
-            .collect())
+            .collect();
+        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
+            eprintln!("nostr take: fresh={} total_delivered={}", fresh.len(), delivered.len());
+        }
+        Ok(fresh)
     }
 
     async fn leave(&self) -> Result<(), TransportError> {

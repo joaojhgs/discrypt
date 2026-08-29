@@ -3075,10 +3075,37 @@ impl TauriAppService {
     }
 
     fn text_control_runtime_for_pump(&self) -> Option<&TextControlTransportRuntime> {
+        let debug = std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some();
         if let Some(session) = self.state.transport_session(BackendTransportMode::Text) {
-            if let Some(runtime) = self.text_control_runtime_for_session(&session.session_id) {
+            let session_id = &session.session_id;
+            // The control-lane runtime is the coordination path that actually
+            // connects without WebRTC; prefer it over an unconnected direct
+            // runtime registered for the same session.
+            if let Some(runtime) = self
+                .text_control_transport_runtimes
+                .values()
+                .find(|runtime| runtime.session_id == *session_id && runtime.lane)
+            {
+                if debug {
+                    eprintln!(
+                        "runtime_for_pump: lane runtime session={} lane={}",
+                        runtime.session_id, runtime.lane
+                    );
+                }
                 return Some(runtime);
             }
+            if let Some(runtime) = self.text_control_runtime_for_session(session_id) {
+                if debug {
+                    eprintln!(
+                        "runtime_for_pump: fallback session={} lane={}",
+                        runtime.session_id, runtime.lane
+                    );
+                }
+                return Some(runtime);
+            }
+        }
+        if debug {
+            eprintln!("runtime_for_pump: no runtime found");
         }
         self.text_control_transport_runtimes.values().next()
     }
@@ -19226,11 +19253,35 @@ fn runtime_role_for_group<'a>(
     group: &'a GroupView,
     local_member_id: &str,
 ) -> Option<&'a GroupRoleView> {
+    let debug = std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some();
     let member = group.members.iter().find(|member| {
         member.member_id == local_member_id
             && member.status != "revoked"
             && member.status != "migration_default"
-    })?;
+    });
+    if debug {
+        eprintln!(
+            "runtime_role: group={} local_id={local_member_id} members={:?} gov={:?}",
+            group.group_id,
+            group
+                .members
+                .iter()
+                .map(|m| (m.member_id.as_str(), m.status.as_str(), m.role.clone()))
+                .collect::<Vec<_>>(),
+            group
+                .governance_log
+                .iter()
+                .map(|e| {
+                    (
+                        e.event_kind.as_str(),
+                        e.target_member_id.as_deref().unwrap_or(""),
+                        e.role_after.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    let member = member?;
     let has_role_evidence = group.governance_log.iter().any(|entry| {
         entry.target_member_id.as_deref() == Some(local_member_id)
             && entry.role_after.as_ref() == Some(&member.role)
@@ -19239,6 +19290,9 @@ fn runtime_role_for_group<'a>(
                 "group_governance_initialized" | "governance.defaults_restored"
             )
     });
+    if debug {
+        eprintln!("runtime_role: has_role_evidence={has_role_evidence}");
+    }
     if has_role_evidence {
         Some(&member.role)
     } else {
