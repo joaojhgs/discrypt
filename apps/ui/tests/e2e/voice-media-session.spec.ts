@@ -2,6 +2,7 @@ import { Browser, expect, Page, test } from "playwright/test";
 
 type VoiceMediaEvidence = {
   getUserMediaCalls: number;
+  getUserMediaConstraints: MediaStreamConstraints[];
   localAudioTracksSent: number;
   remoteTrackEvents: number;
   playbackAttachments: number;
@@ -11,10 +12,15 @@ type VoiceMediaEvidence = {
   sinkIds: string[];
 };
 
-async function installVoiceMediaHarness(page: Page, profile: string) {
-  await page.addInitScript((profileName) => {
+async function installVoiceMediaHarness(
+  page: Page,
+  profile: string,
+  anonymousUntilPermission = false,
+) {
+  await page.addInitScript(({ profileName, anonymousBeforePermission }) => {
     const evidence: VoiceMediaEvidence = {
       getUserMediaCalls: 0,
+      getUserMediaConstraints: [],
       localAudioTracksSent: 0,
       remoteTrackEvents: 0,
       playbackAttachments: 0,
@@ -49,30 +55,46 @@ async function installVoiceMediaHarness(page: Page, profile: string) {
       getTracks: () => [localAudioTrack],
       getAudioTracks: () => [localAudioTrack],
     };
+    let permissionGranted = false;
 
     Object.defineProperty(navigator, "mediaDevices", {
       configurable: true,
       value: {
-        getUserMedia: async () => {
+        getUserMedia: async (constraints: MediaStreamConstraints) => {
           evidence.getUserMediaCalls += 1;
+          evidence.getUserMediaConstraints.push(constraints);
+          permissionGranted = true;
           return localStream;
         },
-        enumerateDevices: async () => [
-          {
-            kind: "audioinput",
-            deviceId: `${profileName.toLowerCase()}-mic`,
-            label: `${profileName} E2E microphone`,
-            groupId: `${profileName.toLowerCase()}-audio`,
-            toJSON: () => ({}),
-          },
-          {
-            kind: "audiooutput",
-            deviceId: `${profileName.toLowerCase()}-speaker`,
-            label: `${profileName} E2E speaker`,
-            groupId: `${profileName.toLowerCase()}-audio`,
-            toJSON: () => ({}),
-          },
-        ],
+        enumerateDevices: async () => {
+          if (anonymousBeforePermission && !permissionGranted) {
+            return [
+              {
+                kind: "audioinput",
+                deviceId: "",
+                label: "",
+                groupId: "",
+                toJSON: () => ({}),
+              },
+            ];
+          }
+          return [
+            {
+              kind: "audioinput",
+              deviceId: `${profileName.toLowerCase()}-mic`,
+              label: `${profileName} E2E microphone`,
+              groupId: `${profileName.toLowerCase()}-audio`,
+              toJSON: () => ({}),
+            },
+            {
+              kind: "audiooutput",
+              deviceId: `${profileName.toLowerCase()}-speaker`,
+              label: `${profileName} E2E speaker`,
+              groupId: `${profileName.toLowerCase()}-audio`,
+              toJSON: () => ({}),
+            },
+          ];
+        },
       },
     });
 
@@ -216,7 +238,10 @@ async function installVoiceMediaHarness(page: Page, profile: string) {
       configurable: true,
       value: E2ERtcPeerConnection,
     });
-  }, profile);
+  }, {
+    profileName: profile,
+    anonymousBeforePermission: anonymousUntilPermission,
+  });
 }
 
 async function readEvidence(page: Page): Promise<VoiceMediaEvidence> {
@@ -234,6 +259,7 @@ async function openProfile(
   browser: Browser,
   displayName: string,
   deviceName: string,
+  anonymousUntilPermission = false,
 ) {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
@@ -245,7 +271,7 @@ async function openProfile(
     if (message.type() === "error") errors.push(message.text());
   });
 
-  await installVoiceMediaHarness(page, displayName);
+  await installVoiceMediaHarness(page, displayName, anonymousUntilPermission);
   await page.goto("/");
   await expect(
     page.getByRole("heading", { name: /set up your local discrypt profile/i }),
@@ -402,5 +428,39 @@ test("two profiles attach local microphone tracks and surface remote audio playb
   } finally {
     await alice.context.close();
     await bob.context.close();
+  }
+});
+
+test("anonymous WebKit devices keep the default microphone instead of persisting a fabricated exact constraint", async ({
+  browser,
+}) => {
+  const profile = await openProfile(
+    browser,
+    "WebKit User",
+    "Linux Desktop",
+    true,
+  );
+  try {
+    await profile.page
+      .getByRole("button", { name: "Open app configuration" })
+      .click();
+    const inputSelector = profile.page.getByTestId("voice-mic-selector");
+    await expect(inputSelector).toHaveValue("default");
+    await expect(
+      inputSelector.locator('option[value="audioinput-1"]'),
+    ).toHaveCount(0);
+    await profile.page.getByRole("button", { name: /Close Config/i }).click();
+
+    await createInvite(profile.page);
+    await joinVoice(profile.page);
+
+    const evidence = await readEvidence(profile.page);
+    expect(evidence.getUserMediaConstraints.at(-1)).toEqual({
+      audio: true,
+      video: false,
+    });
+    expect(profile.errors).toEqual([]);
+  } finally {
+    await profile.context.close();
   }
 });

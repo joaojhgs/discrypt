@@ -648,8 +648,9 @@ function voiceDeviceOptions(
   const inputs = devices.filter((device) => device.kind === kind);
   const seen = new Set<string>();
   return inputs
+    .filter((device) => Boolean(device.deviceId))
     .map((device, index) => ({
-      device_id: device.deviceId || `${kind}-${index + 1}`,
+      device_id: device.deviceId,
       label: device.label || `${fallbackLabel} ${index + 1}`,
     }))
     .filter((device) => {
