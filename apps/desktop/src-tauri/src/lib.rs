@@ -5461,35 +5461,27 @@ pub fn start_text_session(request: StartTextSessionRequest) -> AppStateView {
         && guard.text_control_transport_runtimes.is_empty()
         && guard.pending_text_control_transport_runtimes.is_empty()
     {
-        if let Ok(attachment) = guard
-            .state
-            .active_runtime_peer_attachment_for_text_control()
-        {
-            match guard
-                .state
-                .text_control_runtime_inputs_for_active_scope(request.adapter_kind.as_deref())
-            {
-                Ok(runtime_inputs) => {
-                    let job = prepare_text_control_runtime_attach_job(
-                        &mut guard,
-                        "start_text_session",
-                        started_session_id.clone(),
-                        runtime_inputs,
-                        attachment,
-                    );
-                    let view = guard.to_view();
-                    drop(guard);
+        match prepare_active_text_control_runtime_attach_jobs(
+            &mut guard,
+            "start_text_session",
+            started_session_id.clone(),
+            request.adapter_kind.as_deref(),
+        ) {
+            Ok(jobs) => {
+                let view = guard.to_view();
+                drop(guard);
+                for job in jobs {
                     spawn_text_control_runtime_attach(job);
-                    return view;
                 }
-                Err(error) => guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "start_text_session",
-                    "text_runtime_scope_unavailable",
-                    error,
-                    "Open a DM/group/invite context with a configured signaling profile before starting automatic text/control runtime attach",
-                ),
+                return view;
             }
+            Err(error) => guard.state.push_command_error(
+                "transport.text_runtime_attach_rejected",
+                "start_text_session",
+                "text_runtime_scope_unavailable",
+                error,
+                "Open a DM/group/invite context with admitted peers and a configured signaling profile before starting automatic text/control runtime attach",
+            ),
         }
     }
     guard.persist();
@@ -8747,7 +8739,9 @@ pub fn send_native_voice_audio_frame(
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.native_voice_transport_error = send_result.as_ref().err().cloned();
+    if let Err(error) = &send_result {
+        guard.native_voice_transport_error = Some(error.clone());
+    }
     SendNativeVoiceAudioFrameResponse {
         accepted: send_result.is_ok(),
         status: guard.native_voice_stream_status(&request.session_id),
@@ -17936,6 +17930,17 @@ impl NativeVoiceCodecState {
         {
             return Err("Native voice codec requires distinct provider peer ids".to_owned());
         }
+        if discrypt_webrtc_debug_enabled() {
+            let media_key_digest = Sha256::digest(epoch_secret);
+            eprintln!(
+                "discrypt-native-voice-codec session={} local_peer={} remote_peer={} epoch={} media_key#{}",
+                redacted_observable_ref("voice_session", session_id),
+                redacted_observable_ref("peer", local_peer_id),
+                redacted_observable_ref("peer", remote_peer_id),
+                current_epoch,
+                hex::encode(&media_key_digest[..6])
+            );
+        }
         let local_binding = SenderBinding::derive_for_epoch(
             epoch_secret,
             group_id,
@@ -19456,6 +19461,39 @@ fn prepare_text_control_runtime_attach_job(
     }
 }
 
+fn prepare_active_text_control_runtime_attach_jobs(
+    guard: &mut TauriAppService,
+    command_name: &'static str,
+    active_session_id: String,
+    requested_adapter_kind: Option<&str>,
+) -> Result<Vec<TextControlRuntimeAttachJob>, String> {
+    let attachments = guard
+        .state
+        .active_runtime_peer_attachments_for_text_control()?;
+    let runtime_inputs = guard
+        .state
+        .text_control_runtime_inputs_for_active_scope(requested_adapter_kind)?;
+    let mut jobs = Vec::new();
+    for attachment in attachments {
+        let key = TextControlRuntimeMapKey::for_attachment(
+            active_session_id.clone(),
+            &attachment.remote_peer_id,
+        );
+        if guard.text_control_runtime_attach_already_active(command_name, &active_session_id, &key)
+        {
+            continue;
+        }
+        jobs.push(prepare_text_control_runtime_attach_job(
+            guard,
+            command_name,
+            active_session_id.clone(),
+            runtime_inputs.clone(),
+            attachment,
+        ));
+    }
+    Ok(jobs)
+}
+
 fn process_live_native_voice_frame(
     codec: &Arc<Mutex<NativeVoiceCodecState>>,
     received: Vec<u8>,
@@ -19583,6 +19621,7 @@ fn start_role_split_native_voice_runtime(
                     .await
                 }
                 ProviderTextControlRuntimePeerRole::Answerer => {
+                    let answerer_codec = codec.clone();
                     start_provider_webrtc_text_control_answer_runtime_with_answerer(
                         inputs.profile,
                         inputs.scope,
@@ -19591,9 +19630,23 @@ fn start_role_split_native_voice_runtime(
                         discrypt_transport::WebRtcNegotiationConfig::new(inputs.ice_config),
                         local_peer_id,
                         remote_peer_id,
-                        move |received| {
-                            process_live_native_voice_frame(&codec, received)?;
-                            Ok(Vec::new())
+                        move |received| match process_live_native_voice_frame(
+                            &answerer_codec,
+                            received,
+                        ) {
+                            Ok(()) => Ok(Vec::new()),
+                            Err(error) => {
+                                if discrypt_webrtc_debug_enabled() {
+                                    eprintln!(
+                                        "discrypt-native-voice-receive role=answerer event=frame_rejected error={error}"
+                                    );
+                                }
+                                let service = app_service();
+                                if let Ok(mut guard) = service.lock() {
+                                    guard.native_voice_transport_error = Some(error.to_string());
+                                }
+                                Err(error)
+                            }
                         },
                     )
                     .await
@@ -28961,7 +29014,8 @@ mod tests {
     }
 
     #[test]
-    fn per_peer_group_runtime_attach_prepares_independent_pending_entries() -> Result<(), String> {
+    fn automatic_group_text_runtime_attach_prepares_independent_member_routes() -> Result<(), String>
+    {
         let _guard = test_lock();
         reset_with_temp_state("group-runtime-peer-contract-independent-pending");
         create_user(CreateUserRequest {
@@ -29012,35 +29066,25 @@ mod tests {
         let attachments = guard
             .state
             .active_runtime_peer_attachments_for_text_control()?;
-        let (scope_level, connectivity) = guard
-            .state
-            .active_connectivity_policy()
-            .ok_or_else(|| "active connectivity policy missing".to_owned())?;
-        let profile_view = connectivity
-            .signaling_profiles
-            .first()
-            .cloned()
-            .ok_or_else(|| "active signaling profile missing".to_owned())?;
-        let runtime_inputs = TextControlRuntimeAttachInputs {
-            profile: transport_profile_from_view(&profile_view)?,
-            scope: ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
-                .map_err(|error| error.to_string())?,
-            bootstrap_secret: vec![7; 32],
-            random_entropy: vec![9; 16],
-            ice_config: ice_config_from_connectivity(&connectivity)
-                .map_err(|error| error.to_string())?,
-        };
-        for attachment in attachments.clone() {
-            prepare_text_control_runtime_attach_job(
-                &mut guard,
-                "attach_text_control_transport_runtime",
-                active_session_id.clone(),
-                runtime_inputs.clone(),
-                attachment,
-            );
-        }
+        let jobs = prepare_active_text_control_runtime_attach_jobs(
+            &mut guard,
+            "start_text_session",
+            active_session_id.clone(),
+            None,
+        )?;
 
+        assert_eq!(jobs.len(), 2);
         assert_eq!(guard.pending_text_control_transport_runtimes.len(), 2);
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.remote_peer_id.0.clone())
+                .collect::<BTreeSet<_>>(),
+            attachments
+                .iter()
+                .map(|attachment| attachment.remote_peer_id.0.clone())
+                .collect::<BTreeSet<_>>(),
+            "automatic start must use admitted member-derived runtime peers"
+        );
         for attachment in attachments {
             let key = TextControlRuntimeMapKey::for_attachment(
                 &active_session_id,

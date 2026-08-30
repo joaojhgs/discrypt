@@ -652,12 +652,22 @@ impl DataChannelHub {
                     }
                     DataChannelEvent::OnMessage(message) => {
                         let bytes = message.data.to_vec();
-                        {
+                        let frames_received = {
                             let mut metrics = metrics.lock().await;
                             metrics.frames_received = metrics.frames_received.saturating_add(1);
                             metrics.bytes_received =
                                 metrics.bytes_received.saturating_add(bytes.len() as u64);
                             metrics.last_state = "message".to_owned();
+                            metrics.frames_received
+                        };
+                        if webrtc_debug_enabled()
+                            && (frames_received <= 3 || frames_received.is_multiple_of(250))
+                        {
+                            eprintln!(
+                                "discrypt-webrtc-data-channel event=receive frame={} bytes={}",
+                                frames_received,
+                                bytes.len()
+                            );
                         }
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
