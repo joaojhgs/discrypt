@@ -5830,8 +5830,33 @@ impl NostrProviderRoom {
                 return Ok(());
             }
             let notification = {
-                let mut notifications = self.notifications.lock().await;
-                timeout(remaining, notifications.recv()).await
+                let debug = std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some();
+                let mut waited_ms = 0_u64;
+                let lock_result = loop {
+                    match self.notifications.try_lock() {
+                        Ok(guard) => break Ok(guard),
+                        Err(_) => {
+                            waited_ms += 100;
+                            if waited_ms >= 3000 {
+                                break Err("notifications mutex contended >3s".to_owned());
+                            }
+                            if debug && waited_ms % 500 == 0 {
+                                eprintln!(
+                                    "nostr drain: notifications lock contended {waited_ms}ms"
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                };
+                match lock_result {
+                    Err(message) => {
+                        return Err(TransportError::SignalingAdapter(format!(
+                            "nostr drain: {message}"
+                        )));
+                    }
+                    Ok(mut notifications) => timeout(remaining, notifications.recv()).await,
+                }
             };
             if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
                 eprintln!("nostr drain: notification received");
@@ -6157,12 +6182,32 @@ impl RendezvousRoom for NostrProviderRoom {
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
-            eprintln!("nostr take: step1 before drain_network_for");
-        }
-        self.drain_network_for(Duration::from_millis(300)).await?;
-        if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
-            eprintln!("nostr take: step2 drain done, locking inbox");
+        // Non-blocking notification drain: the broadcast channel buffers relay
+        // events between polls, so try_recv pulls whatever arrived without
+        // depending on a timer inside the caller's poll context.
+        {
+            let mut notifications = self.notifications.lock().await;
+            loop {
+                match notifications.try_recv() {
+                    Ok(nostr_sdk::RelayPoolNotification::Event { event, .. }) => {
+                        self.record_event(&event).await?;
+                    }
+                    Ok(nostr_sdk::RelayPoolNotification::Message { relay_url, message }) => {
+                        if let Some(error) = nostr_relay_message_error(&relay_url, &message) {
+                            return Err(error);
+                        }
+                        if let nostr_sdk::RelayMessage::Event { event, .. } = message {
+                            self.record_event(&event).await?;
+                        }
+                    }
+                    Ok(nostr_sdk::RelayPoolNotification::Shutdown) => {
+                        return Err(TransportError::SignalingAdapter(
+                            "nostr relay pool shut down".to_owned(),
+                        ));
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         let candidates: Vec<ControlBroadcast> = {
             let inbox = self.inbox.lock().await;
@@ -6174,7 +6219,10 @@ impl RendezvousRoom for NostrProviderRoom {
                 .collect()
         };
         if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
-            eprintln!("nostr take: step3 inbox read, candidates={}", candidates.len());
+            eprintln!(
+                "nostr take: step3 inbox read, candidates={}",
+                candidates.len()
+            );
         }
         let mut delivered = self.delivered_controls.lock().await;
         let fresh: Vec<ControlBroadcast> = candidates
@@ -6184,7 +6232,11 @@ impl RendezvousRoom for NostrProviderRoom {
             })
             .collect();
         if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
-            eprintln!("nostr take: fresh={} total_delivered={}", fresh.len(), delivered.len());
+            eprintln!(
+                "nostr take: fresh={} total_delivered={}",
+                fresh.len(),
+                delivered.len()
+            );
         }
         Ok(fresh)
     }
