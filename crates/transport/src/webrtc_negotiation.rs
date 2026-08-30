@@ -13,7 +13,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
+use std::io::{self, IoSliceMut};
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
@@ -23,6 +28,124 @@ use webrtc::peer_connection::{
     RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
     RTCPeerConnectionState, RTCSdpType, RTCSessionDescription, Registry,
 };
+use webrtc::runtime::{
+    default_runtime, AsyncInterval, AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, JoinHandle,
+    RecvMeta, Runtime, Transmit,
+};
+
+/// Runtime adapter that keeps WebRTC UDP writes as individual datagrams.
+///
+/// UDP GSO is an optional throughput optimization. Some virtualized Linux networking paths
+/// accept a segmented send but fail to forward its resulting DTLS/SCTP datagrams reliably,
+/// which leaves ICE connected while application DataChannel traffic silently stalls. Direct
+/// Discrypt sessions prioritize interoperable NAT traversal over bulk-transfer throughput, so
+/// advertise no GSO support while retaining the runtime's receive batching and all other I/O.
+#[derive(Debug)]
+struct DirectWebRtcRuntime {
+    inner: Arc<dyn Runtime>,
+}
+
+impl DirectWebRtcRuntime {
+    fn new() -> Result<Self, TransportError> {
+        let inner = default_runtime().ok_or_else(|| {
+            TransportError::Unavailable("no WebRTC async runtime is available".to_owned())
+        })?;
+        Ok(Self { inner })
+    }
+}
+
+#[derive(Debug)]
+struct SingleDatagramUdpSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+}
+
+impl AsyncUdpSocket for SingleDatagramUdpSocket {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn poll_send(&self, cx: &mut Context<'_>, transmit: &Transmit<'_>) -> Poll<io::Result<usize>> {
+        self.inner.poll_send(cx, transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn max_gso_segments(&self) -> usize {
+        1
+    }
+
+    fn max_gro_segments(&self) -> usize {
+        self.inner.max_gro_segments()
+    }
+}
+
+impl Runtime for DirectWebRtcRuntime {
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> Box<dyn JoinHandle> {
+        self.inner.spawn(future)
+    }
+
+    fn spawn_reactor(
+        &self,
+        reactor_pool_size: usize,
+        future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Box<dyn JoinHandle> {
+        self.inner.spawn_reactor(reactor_pool_size, future)
+    }
+
+    fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        Ok(Arc::new(SingleDatagramUdpSocket {
+            inner: self.inner.wrap_udp_socket(socket)?,
+        }))
+    }
+
+    fn wrap_tcp_listener(
+        &self,
+        listener: std::net::TcpListener,
+    ) -> io::Result<Arc<dyn AsyncTcpListener>> {
+        self.inner.wrap_tcp_listener(listener)
+    }
+
+    fn connect_tcp<'a>(
+        &'a self,
+        remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>> {
+        self.inner.connect_tcp(remote_addr)
+    }
+
+    fn resolve_host<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + 'a>> {
+        self.inner.resolve_host(host)
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.inner.sleep(duration)
+    }
+
+    fn interval(&self, period: Duration) -> Box<dyn AsyncInterval> {
+        self.inner.interval(period)
+    }
+
+    fn block_on(&self, future: Pin<Box<dyn Future<Output = ()> + '_>>) {
+        self.inner.block_on(future);
+    }
+
+    fn yield_now(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.inner.yield_now()
+    }
+
+    fn name(&self) -> &'static str {
+        "discrypt-direct"
+    }
+}
 
 /// Redacted WebRTC diagnostic timeline safe for logs, Tauri diagnostics, and issue evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1106,6 +1229,7 @@ impl WebRtcNegotiator {
             )
             .with_media_engine(media)
             .with_interceptor_registry(registry)
+            .with_runtime(Arc::new(DirectWebRtcRuntime::new()?))
             .with_handler(handler)
             .with_udp_addrs(config.udp_addrs.clone())
             .build()
@@ -1679,6 +1803,16 @@ mod tests {
     use std::collections::VecDeque;
     use tokio::time::{sleep, Duration, Instant};
     use webrtc::data_channel::RTCDataChannelId;
+
+    #[tokio::test]
+    async fn direct_webrtc_runtime_disables_udp_gso() -> Result<(), Box<dyn std::error::Error>> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let runtime = DirectWebRtcRuntime::new()?;
+        let socket = runtime.wrap_udp_socket(socket)?;
+
+        assert_eq!(socket.max_gso_segments(), 1);
+        Ok(())
+    }
 
     struct MockDataChannel {
         id: RTCDataChannelId,
