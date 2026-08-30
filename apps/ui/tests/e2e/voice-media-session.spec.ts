@@ -441,6 +441,14 @@ test("anonymous WebKit devices keep the default microphone instead of persisting
     true,
   );
   try {
+    await profile.page.evaluate(() => {
+      const key = "discrypt.local-dev.app-state.v1";
+      const state = JSON.parse(window.localStorage.getItem(key) ?? "null");
+      state.preferences.voice_input_device_id = "audioinput-1";
+      state.snapshot.preferences.voice_input_device_id = "audioinput-1";
+      window.localStorage.setItem(key, JSON.stringify(state));
+    });
+    await profile.page.reload();
     await profile.page
       .getByRole("button", { name: "Open app configuration" })
       .click();

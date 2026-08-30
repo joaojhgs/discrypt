@@ -660,6 +660,13 @@ function voiceDeviceOptions(
     });
 }
 
+function normalizeVoiceDevicePreference(deviceId: string | null | undefined) {
+  const normalized = deviceId?.trim() || "default";
+  return /^audio(?:input|output)-\d+$/.test(normalized)
+    ? "default"
+    : normalized;
+}
+
 function voiceInputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
   return voiceDeviceOptions(devices, "audioinput", "Microphone");
 }
@@ -821,9 +828,10 @@ async function requestVoiceDeviceAccess(
 
   let stream: MediaStream | null = null;
   try {
+    const selectedInput = normalizeVoiceDevicePreference(selectedInputDeviceId);
     const requestedDevice =
-      selectedInputDeviceId && selectedInputDeviceId !== "default"
-        ? selectedInputDeviceId
+      selectedInput !== "default"
+        ? selectedInput
         : null;
     stream = await navigator.mediaDevices.getUserMedia({
       audio: requestedDevice ? { deviceId: { exact: requestedDevice } } : true,
@@ -844,9 +852,10 @@ async function requestVoiceDeviceAccess(
         (device) => device.kind === "audioinput" && device.deviceId,
       ) ??
       devices.find((device) => device.kind === "audioinput");
+    const selectedOutput = normalizeVoiceDevicePreference(selectedOutputDeviceId);
     const requestedOutput =
-      selectedOutputDeviceId && selectedOutputDeviceId !== "default"
-        ? selectedOutputDeviceId
+      selectedOutput !== "default"
+        ? selectedOutput
         : null;
     const output =
       (requestedOutput
@@ -1409,8 +1418,12 @@ function App() {
   useEffect(() => {
     const preferences = commandState?.preferences;
     if (!preferences) return;
-    setSelectedVoiceInputId(preferences.voice_input_device_id || "default");
-    setSelectedVoiceOutputId(preferences.voice_output_device_id || "default");
+    setSelectedVoiceInputId(
+      normalizeVoiceDevicePreference(preferences.voice_input_device_id),
+    );
+    setSelectedVoiceOutputId(
+      normalizeVoiceDevicePreference(preferences.voice_output_device_id),
+    );
     setLocalMicGain(clampPercent(preferences.mic_gain_percent, 0, 200, 100));
     setAppOutputVolume(
       clampPercent(preferences.app_output_volume_percent, 0, 100, 100),
