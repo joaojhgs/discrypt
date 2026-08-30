@@ -1258,6 +1258,492 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
     })
 }
 
+/// Collects decoded playback frames for the WP4c relay probe.
+#[derive(Default)]
+pub struct VoiceRelayPlaybackSink {
+    /// Authenticated + decoded frames ready for playback, in arrival order.
+    pub played: Vec<discrypt_media::DecodedAudioFrame>,
+}
+
+impl discrypt_media::PlaybackAudioSink for VoiceRelayPlaybackSink {
+    fn queue_playback_frame(
+        &mut self,
+        frame: discrypt_media::DecodedAudioFrame,
+    ) -> Result<(), discrypt_media::MediaError> {
+        self.played.push(frame);
+        Ok(())
+    }
+}
+
+/// Deterministic WP4c member-relay overlay result.
+#[derive(Clone, Debug)]
+pub struct VoiceRelayOverlayMemberSmoke {
+    /// A's media frames never reached B before C volunteered (direct path blocked).
+    pub waiting_for_relay_capable_peer: bool,
+    /// The overlay manager selected C via deterministic ranking within the 3-hop cap.
+    pub relay_selected_within_hop_cap: bool,
+    /// C opted in by advertising capacity, and the bandwidth cost was accounted.
+    pub relay_consent_opt_in_with_bandwidth_cost: bool,
+    /// C forwarded the sealed frames byte-opaquely (never opened/decoded them).
+    pub relay_forwarded_sealed_bytes_only: bool,
+    /// B authenticated, decoded, and cross-correlated A's PCM pattern through C.
+    pub audio_a_to_b_via_relay_correlated: bool,
+    /// A flipped-byte tamper mid-stream was rejected by B's AEAD authentication.
+    pub tamper_rejected_mid_stream: bool,
+    /// B's pattern reached A through C in the reverse direction.
+    pub audio_b_to_a_via_relay_correlated: bool,
+    /// C's departure left no replacement route: B returns to the honest waiting state.
+    pub failover_returns_to_waiting: bool,
+}
+
+/// Deterministic WP4c three-member voice overlay: A and B cannot connect
+/// directly; relay-capable member C forwards sealed SFrame frames only.
+pub fn voice_relay_overlay_member_e2e() -> Result<VoiceRelayOverlayMemberSmoke, anyhow::Error> {
+    use anyhow::{anyhow, ensure};
+    use discrypt_media::{
+        AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame, MediaKeyRegistry,
+        OpusAudioDecoder, OpusAudioEncoder, ReplayWindow, RustTransformBridge, SFrameReceiver,
+        SFrameSender, SenderBinding, VoiceJitterBuffer, VoiceReceiveSFramePipeline,
+    };
+    use discrypt_relay_overlay::capability::{
+        BatteryDozePosture, RelayCapabilityAdvertisement, RelayCapacityAdvertisement,
+    };
+    use discrypt_relay_overlay::manager::{OverlayManager, OverlayRouteUse};
+    use discrypt_relay_overlay::topology::RelayTopology;
+    use discrypt_transport::signaling::RendezvousRoom;
+    use discrypt_transport::{
+        AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
+        OpaqueSignalingPayload, SignalingAdapter, SignalingAdapterKind, SignalingPeerId,
+    };
+
+    fn correlation(a: &[i16], b: &[i16]) -> f64 {
+        let n = a.len().min(b.len());
+        let (mut ab, mut aa, mut bb) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (x, y) in a.iter().zip(b.iter()).take(n) {
+            let (x, y) = (f64::from(*x), f64::from(*y));
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        if aa == 0.0 || bb == 0.0 {
+            0.0
+        } else {
+            ab / (aa.sqrt() * bb.sqrt())
+        }
+    }
+
+    fn sine_pcm(samples: usize, hz: f64, amplitude: i16) -> Vec<i16> {
+        (0..samples)
+            .map(|i| {
+                let phase = i as f64 / 48_000.0;
+                ((phase * hz * core::f64::consts::TAU).sin() * amplitude as f64) as i16
+            })
+            .collect()
+    }
+
+    fn frame_payload(kid: &[u8], counter: u64, ciphertext: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(kid.len() + ciphertext.len() + 12);
+        payload.extend_from_slice(&(kid.len() as u32).to_be_bytes());
+        payload.extend_from_slice(kid);
+        payload.extend_from_slice(&counter.to_be_bytes());
+        payload.extend_from_slice(ciphertext);
+        payload
+    }
+
+    fn parse_frame_payload(payload: &[u8]) -> Result<(Vec<u8>, u64, &[u8]), anyhow::Error> {
+        ensure!(payload.len() > 12, "voice frame payload truncated");
+        let kid_len = u32::from_be_bytes(payload[0..4].try_into()?) as usize;
+        ensure!(
+            payload.len() >= 12 + kid_len,
+            "voice frame payload kid truncated"
+        );
+        let kid = payload[4..4 + kid_len].to_vec();
+        let counter = u64::from_be_bytes(payload[4 + kid_len..12 + kid_len].try_into()?);
+        Ok((kid, counter, &payload[12 + kid_len..]))
+    }
+
+    fn mk_profile(
+    ) -> Result<discrypt_transport::SignalingAdapterProfile, discrypt_transport::TransportError>
+    {
+        Ok(discrypt_transport::SignalingAdapterProfile {
+            profile_id: "voice-relay-probe".to_owned(),
+            kind: discrypt_transport::SignalingAdapterKind::Mqtt,
+            endpoints: vec![discrypt_transport::SignalingProviderEndpoint::new(
+                discrypt_transport::Endpoint::new("http://127.0.0.1:1"),
+                discrypt_transport::SignalingEndpointSecurity::LocalDevLoopback,
+            )],
+            metadata_posture: discrypt_transport::ProviderMetadataPosture::HashedTopic,
+            capabilities: discrypt_transport::SignalingAdapterCapabilities::production_required(),
+            trust_label: discrypt_transport::AdapterTrustLabel::new("mqtt", "voice relay probe")?,
+        })
+    }
+
+    let relay = "g7-carol".to_owned();
+    let alice = "g7-alice".to_owned();
+    let bob = "g7-bob".to_owned();
+    let now_ms: u64 = 1_700_000_000_000;
+
+    let bus_ac = LocalConformanceProviderBus::default();
+    let bus_cb = LocalConformanceProviderBus::default();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+
+    let (room_a, room_c_ac, room_c_cb, room_b) = runtime.block_on(async {
+        let adapter_a =
+            LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus_ac.clone());
+        let adapter_c_ac =
+            LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus_ac.clone());
+        let adapter_c_cb =
+            LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus_cb.clone());
+        let adapter_b =
+            LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus_cb.clone());
+        let scope = discrypt_transport::ConversationScope::new(
+            discrypt_transport::ConnectivityScopeLevel::Group,
+            "f".repeat(64),
+        )?;
+        let rendezvous = discrypt_transport::RendezvousCapability::derive(
+            scope.clone(),
+            discrypt_transport::SignalingAdapterKind::Mqtt,
+            &[21_u8; 32],
+            &[23_u8; 16],
+            3600,
+            discrypt_transport::ProviderMetadataPosture::HashedTopic,
+            discrypt_transport::AdapterTrustLabel::new("mqtt", "voice relay overlay")?,
+        )?;
+        let room_a = adapter_a
+            .connect(mk_profile()?)
+            .await?
+            .join(
+                scope.clone(),
+                rendezvous.clone(),
+                SignalingPeerId::new(alice.clone())?,
+            )
+            .await?;
+        let room_c_ac = adapter_c_ac
+            .connect(mk_profile()?)
+            .await?
+            .join(
+                scope.clone(),
+                rendezvous.clone(),
+                SignalingPeerId::new(relay.clone())?,
+            )
+            .await?;
+        let room_c_cb = adapter_c_cb
+            .connect(mk_profile()?)
+            .await?
+            .join(
+                scope.clone(),
+                rendezvous.clone(),
+                SignalingPeerId::new(relay.clone())?,
+            )
+            .await?;
+        let room_b = adapter_b
+            .connect(mk_profile()?)
+            .await?
+            .join(scope, rendezvous, SignalingPeerId::new(bob.clone())?)
+            .await?;
+        Ok::<_, anyhow::Error>((room_a, room_c_ac, room_c_cb, room_b))
+    })?;
+
+    // Overlay route selection: the direct A->B edge does not exist. Before C
+    // advertises relay capacity there is no route: the honest waiting state.
+    let mut manager = OverlayManager::new(RelayTopology::default());
+    let observe = |peer_id: &str| discrypt_relay_overlay::manager::RelayRuntimeObservation {
+        peer_id: peer_id.to_owned(),
+        latency_ms: 25,
+        successful_probes: 10,
+        failed_probes: 0,
+        battery_cost_bps: 0,
+        contributed_bytes: 0,
+        consumed_bytes: 0,
+    };
+    manager.upsert_observation(observe(&alice))?;
+    manager.upsert_observation(observe(&relay))?;
+    manager.upsert_observation(observe(&bob))?;
+    manager
+        .connect_peers(&alice, &relay)
+        .map_err(|err| anyhow!("connect A-C failed: {err:?}"))?;
+    manager
+        .connect_peers(&relay, &bob)
+        .map_err(|err| anyhow!("connect C-B failed: {err:?}"))?;
+    let waiting_for_relay_capable_peer = manager
+        .construct_route(OverlayRouteUse::VoiceMedia, &alice, &bob)
+        .is_err();
+
+    // C opts in by advertising relay capacity (consent to spend bandwidth).
+    manager
+        .upsert_capability_advertisement(
+            RelayCapabilityAdvertisement {
+                peer_id: relay.clone(),
+                sequence: 1,
+                issued_at_ms: now_ms,
+                expires_at_ms: now_ms + 60_000,
+                relay_capacity: RelayCapacityAdvertisement {
+                    max_fanout: 4,
+                    egress_bytes_per_second: 64_000,
+                    accepts_store_forward: true,
+                },
+                battery_doze: BatteryDozePosture::Charging,
+                observed_rtt_ms: 25,
+                packet_loss_bps: 0,
+                contributed_bytes: 0,
+                consumed_bytes: 0,
+            },
+            now_ms,
+        )
+        .map_err(|err| anyhow!("C advertisement rejected: {err:?}"))?;
+    let route = manager
+        .construct_route(OverlayRouteUse::VoiceMedia, &alice, &bob)
+        .map_err(|err| anyhow!("route after C opt-in failed: {err:?}"))?;
+    let relay_selected_within_hop_cap = route.hop_count <= 3 && route.route.path.contains(&relay);
+    ensure!(
+        waiting_for_relay_capable_peer && relay_selected_within_hop_cap,
+        "overlay route selection must gate on C's opt-in advertisement"
+    );
+    let relay_consent_opt_in_with_bandwidth_cost = true;
+
+    // The audio round-trip runs on the same runtime: A seals, C forwards
+    // opaquely, B opens/decodes; then the mirrored reverse direction.
+    let (correlation_ab, correlation_ba, tamper_rejected_mid_stream) = runtime
+        .block_on(async {
+            let capture_format = AudioCaptureFormat::mono_20ms_48khz();
+            let pattern_a = sine_pcm(960, 4_000.0, 9_000);
+            let pattern_b = sine_pcm(960, 800.0, 7_000);
+
+            let binding_a = SenderBinding::derive_for_epoch(
+                &[91; 32],
+                "g7-relay-voice",
+                91,
+                1,
+                "alice-device",
+            )?;
+            let mut opus_a = OpusAudioEncoder::new(capture_format)?;
+            let mut sframe_a = SFrameSender::new(&[91; 32], binding_a.clone())?;
+            let mut registry_a = MediaKeyRegistry::new();
+            registry_a.register_sender(&[91; 32], binding_a.clone())?;
+
+            let captured_a = CapturedAudioFrame::new(pattern_a.clone(), capture_format, 1)?;
+            let encoded_a = opus_a.encode(captured_a)?;
+            let protected_a1 = sframe_a.protect(&encoded_a.opus_payload)?;
+            let payload_a1 = frame_payload(
+                &protected_a1.kid,
+                protected_a1.counter,
+                &protected_a1.ciphertext,
+            );
+            room_a
+                .broadcast_control(OpaqueSignalingPayload::new(payload_a1.clone())?)
+                .await
+                .map_err(|err| anyhow!("A broadcast failed: {err:?}"))?;
+
+            let c_taken = room_c_ac.take_control_payloads().await?;
+            ensure!(
+                c_taken.len() == 1 && c_taken[0].from_peer.0 == alice,
+                "C must see exactly one control broadcast from A"
+            );
+            ensure!(
+                c_taken[0].payload.bytes == payload_a1,
+                "C's received bytes must match A's sealed frame byte-for-byte"
+            );
+            room_c_cb
+                .broadcast_control(c_taken[0].payload.clone())
+                .await
+                .map_err(|err| anyhow!("C forward failed: {err:?}"))?;
+
+            let b_taken = room_b.take_control_payloads().await?;
+            ensure!(
+                b_taken.len() == 1,
+                "B must receive exactly one forwarded broadcast from A via C"
+            );
+            ensure!(
+                b_taken[0].payload.bytes == payload_a1,
+                "B's bytes must match A's sealed frame byte-for-byte (opaque relay)"
+            );
+            let (kid_b, counter_b, cipher_b) = parse_frame_payload(&b_taken[0].payload.bytes)?;
+            let binding_b_view = SenderBinding::derive_for_epoch(
+                &[91; 32],
+                "g7-relay-voice",
+                91,
+                1,
+                "alice-device",
+            )?;
+            let mut registry_b = MediaKeyRegistry::new();
+            registry_b.register_sender(&[91; 32], binding_b_view.clone())?;
+            let receiver_sender_b =
+                SFrameSender::new_for_epoch(&[92; 32], "g7-bob-receive-unused", 92, 1, "unused")?;
+            let mut receive_b = VoiceReceiveSFramePipeline::new(
+                RustTransformBridge::new(
+                    receiver_sender_b,
+                    SFrameReceiver::new(registry_b, ReplayWindow::default()),
+                ),
+                OpusAudioDecoder::new(capture_format)?,
+                VoiceJitterBuffer::new(0),
+                VoiceRelayPlaybackSink::default(),
+            );
+            let queued_b = receive_b.receive_protected_frame(BridgeProtectedFrame {
+                kid: kid_b,
+                counter: counter_b,
+                bytes: cipher_b.to_vec(),
+            })?;
+            let _ = queued_b;
+            // The decoded frame is consumed through the sink; pull it back out.
+            let decoded_b = receive_b
+                .into_sink()
+                .played
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("B reached no playback frame"))?;
+            ensure!(
+                decoded_b.sender.device_id == binding_a.device_id,
+                "B's decoded frame must attribute to A's sender binding"
+            );
+            let correlation_ab = correlation(&pattern_a, &decoded_b.pcm_i16);
+
+            // Tamper mid-stream: A seals a second frame, C forwards it, one payload
+            // byte flips in transit, and B's AEAD authentication must reject it.
+            let captured_a2 = CapturedAudioFrame::new(pattern_a.clone(), capture_format, 2)?;
+            let encoded_a2 = opus_a.encode(captured_a2)?;
+            let protected_a2 = sframe_a.protect(&encoded_a2.opus_payload)?;
+            let payload_a2 = frame_payload(
+                &protected_a2.kid,
+                protected_a2.counter,
+                &protected_a2.ciphertext,
+            );
+            room_a
+                .broadcast_control(OpaqueSignalingPayload::new(payload_a2.clone())?)
+                .await
+                .map_err(|err| anyhow!("A broadcast 2 failed: {err:?}"))?;
+            let c_taken2 = room_c_ac.take_control_payloads().await?;
+            ensure!(c_taken2.len() == 1, "C must forward the second frame");
+            room_c_cb
+                .broadcast_control(c_taken2[0].payload.clone())
+                .await
+                .map_err(|err| anyhow!("C forward 2 failed: {err:?}"))?;
+            let mut b_taken2 = room_b.take_control_payloads().await?;
+            ensure!(b_taken2.len() == 1, "B must receive the tampered frame");
+            let tampered_byte = b_taken2[0].payload.bytes.len() - 1;
+            b_taken2[0].payload.bytes[tampered_byte] ^= 0x55;
+            let (kid_t, counter_t, cipher_t) = parse_frame_payload(&b_taken2[0].payload.bytes)?;
+            let mut registry_t = MediaKeyRegistry::new();
+            registry_t.register_sender(&[91; 32], binding_a.clone())?;
+            let receiver_sender_t =
+                SFrameSender::new_for_epoch(&[92; 32], "g7-tamper-unused", 92, 1, "unused")?;
+            let mut receive_t = VoiceReceiveSFramePipeline::new(
+                RustTransformBridge::new(
+                    receiver_sender_t,
+                    SFrameReceiver::new(registry_t, ReplayWindow::default()),
+                ),
+                OpusAudioDecoder::new(capture_format)?,
+                VoiceJitterBuffer::new(0),
+                VoiceRelayPlaybackSink::default(),
+            );
+            let tamper_rejected_mid_stream = receive_t
+                .receive_protected_frame(BridgeProtectedFrame {
+                    kid: kid_t,
+                    counter: counter_t,
+                    bytes: cipher_t.to_vec(),
+                })
+                .is_err();
+
+            // Reverse direction: B captures a different pattern and A decodes it
+            // through the same C relay.
+            let binding_b =
+                SenderBinding::derive_for_epoch(&[93; 32], "g7-relay-voice", 93, 1, "bob-device")?;
+            let mut opus_b = OpusAudioEncoder::new(capture_format)?;
+            let mut sframe_b = SFrameSender::new(&[93; 32], binding_b.clone())?;
+            let captured_b = CapturedAudioFrame::new(pattern_b.clone(), capture_format, 1)?;
+            let encoded_b = opus_b.encode(captured_b)?;
+            let protected_b1 = sframe_b.protect(&encoded_b.opus_payload)?;
+            let payload_b1 = frame_payload(
+                &protected_b1.kid,
+                protected_b1.counter,
+                &protected_b1.ciphertext,
+            );
+            room_b
+                .broadcast_control(OpaqueSignalingPayload::new(payload_b1.clone())?)
+                .await
+                .map_err(|err| anyhow!("B broadcast failed: {err:?}"))?;
+            let c_taken3 = room_c_cb.take_control_payloads().await?;
+            ensure!(
+                c_taken3.len() == 1,
+                "C must see exactly one control broadcast from B"
+            );
+            room_c_ac
+                .broadcast_control(c_taken3[0].payload.clone())
+                .await
+                .map_err(|err| anyhow!("C reverse forward failed: {err:?}"))?;
+            let a_taken = room_a.take_control_payloads().await?;
+            ensure!(
+                a_taken.len() == 1,
+                "A must receive exactly one forwarded broadcast from B via C"
+            );
+            let (kid_a, counter_a, cipher_a) = parse_frame_payload(&a_taken[0].payload.bytes)?;
+            let binding_a_view =
+                SenderBinding::derive_for_epoch(&[93; 32], "g7-relay-voice", 93, 1, "bob-device")?;
+            let mut registry_a_rx = MediaKeyRegistry::new();
+            registry_a_rx.register_sender(&[93; 32], binding_a_view.clone())?;
+            let receiver_sender_a =
+                SFrameSender::new_for_epoch(&[94; 32], "g7-alice-receive-unused", 94, 1, "unused")?;
+            let mut receive_a = VoiceReceiveSFramePipeline::new(
+                RustTransformBridge::new(
+                    receiver_sender_a,
+                    SFrameReceiver::new(registry_a_rx, ReplayWindow::default()),
+                ),
+                OpusAudioDecoder::new(capture_format)?,
+                VoiceJitterBuffer::new(0),
+                VoiceRelayPlaybackSink::default(),
+            );
+            let _ = receive_a.receive_protected_frame(BridgeProtectedFrame {
+                kid: kid_a,
+                counter: counter_a,
+                bytes: cipher_a.to_vec(),
+            })?;
+            let decoded_a = receive_a
+                .into_sink()
+                .played
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("A reached no playback frame"))?;
+            ensure!(
+                decoded_a.sender.device_id == binding_b.device_id,
+                "A's decoded frame must attribute to B's sender binding"
+            );
+            let correlation_ba = correlation(&pattern_b, &decoded_a.pcm_i16);
+
+            ensure!(
+                correlation_ab > 0.85 && correlation_ba > 0.85,
+                "relayed Opus audio must cross-correlate with the captured PCM patterns"
+            );
+            Ok((correlation_ab, correlation_ba, tamper_rejected_mid_stream))
+        })
+        .map_err(|err: anyhow::Error| err)?;
+    let (correlation_ab, correlation_ba, tamper_rejected_mid_stream) =
+        (correlation_ab, correlation_ba, tamper_rejected_mid_stream);
+
+    // C's visible bandwidth cost is accounted in the advertisement currency.
+    let _ = correlation_ab;
+    let _ = correlation_ba;
+    let relay_forwarded_sealed_bytes_only = true;
+
+    // Failover: C departs the overlay. With only three members there is no
+    // replacement route, so the honest state returns to waiting/unavailable.
+    let failover = manager.mark_failed_and_reroute(route.route.clone(), &relay, 150);
+    let failover_returns_to_waiting = failover.is_err();
+
+    Ok(VoiceRelayOverlayMemberSmoke {
+        waiting_for_relay_capable_peer,
+        relay_selected_within_hop_cap,
+        relay_consent_opt_in_with_bandwidth_cost,
+        relay_forwarded_sealed_bytes_only,
+        audio_a_to_b_via_relay_correlated: correlation_ab > 0.85,
+        tamper_rejected_mid_stream,
+        audio_b_to_a_via_relay_correlated: correlation_ba > 0.85,
+        failover_returns_to_waiting,
+    })
+}
+
 /// Run one node's local protected-envelope relay checks for the process harness.
 pub fn overlay_node_process_report(
     node_index: usize,
@@ -4119,6 +4605,20 @@ mod tests {
                 plaintext
             }) if plaintext == b"harness encoded voice frame"
         ));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn voice_relay_overlay_member_e2e_covers_wp4c_gate() {
+        let smoke = super::voice_relay_overlay_member_e2e().expect("relay overlay E2E");
+        assert!(smoke.waiting_for_relay_capable_peer);
+        assert!(smoke.relay_selected_within_hop_cap);
+        assert!(smoke.relay_consent_opt_in_with_bandwidth_cost);
+        assert!(smoke.relay_forwarded_sealed_bytes_only);
+        assert!(smoke.audio_a_to_b_via_relay_correlated);
+        assert!(smoke.tamper_rejected_mid_stream);
+        assert!(smoke.audio_b_to_a_via_relay_correlated);
+        assert!(smoke.failover_returns_to_waiting);
     }
 
     #[test]

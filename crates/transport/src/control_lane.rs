@@ -239,7 +239,10 @@ impl BrokerControlLaneTransport {
         }
         let broadcasts: Vec<ControlBroadcast> = self.room.take_control_payloads().await?;
         if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
-            eprintln!("lane transport: room returned {} broadcast(s)", broadcasts.len());
+            eprintln!(
+                "lane transport: room returned {} broadcast(s)",
+                broadcasts.len()
+            );
         }
         let mut opened = Vec::with_capacity(broadcasts.len());
         for broadcast in broadcasts {

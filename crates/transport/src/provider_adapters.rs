@@ -5919,8 +5919,8 @@ impl NostrProviderRoom {
         if std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some() {
             let variant = match &envelope {
                 NostrWireEnvelope::Presence { .. } => "presence",
-                NostrWireEnvelope::Signal { to_peer, .. } => "signal",
-                NostrWireEnvelope::Control { from_peer, .. } => "control",
+                NostrWireEnvelope::Signal { .. } => "signal",
+                NostrWireEnvelope::Control { .. } => "control",
             };
             let sender = match &envelope {
                 NostrWireEnvelope::Presence { from_peer, .. }

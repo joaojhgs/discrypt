@@ -1519,6 +1519,7 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
