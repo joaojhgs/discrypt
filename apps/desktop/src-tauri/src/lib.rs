@@ -8734,7 +8734,12 @@ pub fn send_native_voice_audio_frame(
                 .map_err(|error| error.to_string())
         });
     if send_result.is_ok() {
-        frames_sent.fetch_add(1, Ordering::Relaxed);
+        let sent = frames_sent
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if sent % 250 == 0 && std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some() {
+            let _ = executor.block_on(transport.text_control_transport_metrics());
+        }
     }
     let mut guard = service
         .lock()
