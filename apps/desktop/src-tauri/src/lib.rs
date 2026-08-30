@@ -38262,6 +38262,438 @@ mod tests {
     }
 
     #[test]
+    fn voice_signaling_rides_control_lane_with_honest_no_turn_ice() {
+        // G5: voice SDP/ICE ferries over the broker control lane with
+        // STUN-only ICE and no TURN anywhere.
+        use discrypt_transport::{
+            AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
+            SignalingAdapter,
+        };
+
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("voice-lane-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let mut owner_service = TauriAppService::load_for_test_path(owner_path.clone());
+        let owner_id = owner_service.state.local_user_id();
+        let joiner_path = reset_with_temp_state("voice-lane-joiner");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let mut joiner_service = TauriAppService::load_for_test_path(joiner_path.clone());
+        let joiner_id = joiner_service.state.local_user_id();
+
+        let group_id = "group-voice-lane".to_owned();
+        let text_channel = "channel-voice-lane-text".to_owned();
+        let voice_channel = "channel-voice-lane-voice".to_owned();
+        let now = Utc::now().to_rfc3339();
+        for (service, local_peer, remote_peer, local_role, remote_role) in [
+            (
+                &mut owner_service,
+                "voice-owner-peer",
+                "voice-joiner-peer",
+                GroupRoleView::Owner,
+                GroupRoleView::Member,
+            ),
+            (
+                &mut joiner_service,
+                "voice-joiner-peer",
+                "voice-owner-peer",
+                GroupRoleView::Member,
+                GroupRoleView::Owner,
+            ),
+        ] {
+            let local_user = service.state.local_user_id();
+            let remote_user = if local_role == GroupRoleView::Owner {
+                joiner_id.clone()
+            } else {
+                owner_id.clone()
+            };
+            service.state.openmls_groups.push(OpenMlsGroupHandleRecord {
+                group_id: group_id.clone(),
+                signer_public_key_hex: "aa".repeat(32),
+                epoch: 1,
+                local_leaf: 1,
+                confirmation_tag_sha256: "bb".repeat(32),
+                openmls_store_path: None,
+                status_copy: "voice lane test handle".to_owned(),
+            });
+            let mut connectivity = service.state.connectivity_defaults.clone();
+            connectivity.invite_kind = "group_join".to_owned();
+            connectivity.group_bootstrap = Some(GroupInviteBootstrapView {
+                group_identity_commitment: "aa".repeat(32),
+                role_admission_policy_commitment: "bb".repeat(32),
+                channel_policy_commitment: "cc".repeat(32),
+            });
+            service.state.active_context = Some(ActiveContextView {
+                kind: "group".to_owned(),
+                group_id: Some(group_id.clone()),
+                channel_id: Some(voice_channel.clone()),
+                dm_id: None,
+            });
+            service.state.groups.push(GroupView {
+                group_id: group_id.clone(),
+                name: "voice lane lab".to_owned(),
+                role: if local_role == GroupRoleView::Owner {
+                    "owner".to_owned()
+                } else {
+                    "member".to_owned()
+                },
+                channels: vec![
+                    ChannelStateView {
+                        channel_id: text_channel.clone(),
+                        name: "#general".to_owned(),
+                        kind: ChannelKind::Text,
+                        retention_status: "7 days".to_owned(),
+                        connectivity: None,
+                    },
+                    ChannelStateView {
+                        channel_id: voice_channel.clone(),
+                        name: "Voice Lobby".to_owned(),
+                        kind: ChannelKind::Voice,
+                        retention_status: "session".to_owned(),
+                        connectivity: None,
+                    },
+                ],
+                members: vec![
+                    GroupMemberView {
+                        member_id: local_user.clone(),
+                        display_name: "local".to_owned(),
+                        device_id: None,
+                        role: local_role.clone(),
+                        status: "online".to_owned(),
+                        signer_public_key_hex: None,
+                        joined_at: now.clone(),
+                        last_seen_at: None,
+                        presence_expires_at: None,
+                        revoked_at: None,
+                        revoked_by: None,
+                    },
+                    GroupMemberView {
+                        member_id: remote_user.clone(),
+                        display_name: "remote".to_owned(),
+                        device_id: None,
+                        role: remote_role,
+                        status: "online".to_owned(),
+                        signer_public_key_hex: None,
+                        joined_at: now.clone(),
+                        last_seen_at: None,
+                        presence_expires_at: None,
+                        revoked_at: None,
+                        revoked_by: None,
+                    },
+                ],
+                role_policy: GroupRolePolicyView::default(),
+                admission_requests: Vec::new(),
+                governance_log: vec![GroupGovernanceLogEntryView {
+                    event_id: format!("{group_id}-created"),
+                    group_id: group_id.clone(),
+                    event_kind: "group_created".to_owned(),
+                    actor_member_id: local_user.clone(),
+                    target_member_id: Some(local_user.clone()),
+                    request_id: None,
+                    role_before: None,
+                    role_after: Some(local_role.clone()),
+                    created_at: now.clone(),
+                    summary: "voice lane lab roster".to_owned(),
+                }],
+                runtime_peers: vec![
+                    GroupRuntimePeerView {
+                        peer_id: local_peer.to_owned(),
+                        role: "local".to_owned(),
+                        is_local: true,
+                        source: "voice lane test".to_owned(),
+                    },
+                    GroupRuntimePeerView {
+                        peer_id: remote_peer.to_owned(),
+                        role: "remote".to_owned(),
+                        is_local: false,
+                        source: "voice lane test".to_owned(),
+                    },
+                ],
+                connectivity: Some(connectivity),
+            });
+        }
+
+        for (label, service) in [("owner", &owner_service), ("joiner", &joiner_service)] {
+            let defaults = &service.state.connectivity_defaults;
+            assert!(
+                !defaults.ice_stun_servers.is_empty(),
+                "{label} must retain STUN servers"
+            );
+            assert!(
+                defaults.ice_turn_servers.is_empty(),
+                "{label} must carry no TURN endpoints (no TURN anywhere)"
+            );
+        }
+
+        owner_service
+            .state
+            .start_transport_session(
+                BackendTransportMode::Text,
+                Some("voice-lane-owner".to_owned()),
+            )
+            .expect("owner session starts");
+        joiner_service
+            .state
+            .start_transport_session(
+                BackendTransportMode::Text,
+                Some("voice-lane-joiner".to_owned()),
+            )
+            .expect("joiner session starts");
+
+        let join_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test join runtime");
+        let scope = ConversationScope::new(ConnectivityScopeLevel::Group, "e".repeat(64))
+            .expect("scope constructs");
+        let rendezvous = discrypt_transport::RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::Mqtt,
+            &[11_u8; 32],
+            &[13_u8; 16],
+            3600,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("mqtt", "voice lane test").expect("trust label"),
+        )
+        .expect("rendezvous derives");
+        let profile_view = owner_service
+            .state
+            .connectivity_defaults
+            .signaling_profiles
+            .iter()
+            .find(|profile| profile.adapter_kind == "mqtt")
+            .expect("mqtt default profile");
+        let profile = transport_profile_from_view(profile_view).expect("profile converts");
+        let mut room_profile = profile.clone();
+        room_profile.endpoints = vec![discrypt_transport::SignalingProviderEndpoint::new(
+            discrypt_transport::Endpoint::new("http://127.0.0.1:1"),
+            discrypt_transport::SignalingEndpointSecurity::LocalDevLoopback,
+        )];
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus);
+        let (owner_room, joiner_room) = join_runtime.block_on(async {
+            let session = adapter
+                .connect(room_profile)
+                .await
+                .expect("adapter connects");
+            let owner_room = session
+                .join(
+                    scope.clone(),
+                    rendezvous.clone(),
+                    SignalingPeerId::new("voice-owner-peer").expect("peer id"),
+                )
+                .await
+                .expect("owner joins voice lane room");
+            let joiner_room = session
+                .join(
+                    scope,
+                    rendezvous,
+                    SignalingPeerId::new("voice-joiner-peer").expect("peer id"),
+                )
+                .await
+                .expect("joiner joins voice lane room");
+            (owner_room, joiner_room)
+        });
+
+        let executor = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("executor builds"),
+        );
+        let owner_session_id = owner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("owner session")
+            .session_id
+            .clone();
+        owner_service.register_broker_control_lane_transport(
+            Box::new(owner_room),
+            broker_control_lane_key(&[11_u8; 32]).expect("key derives"),
+            SignalingPeerId::new("voice-owner-peer").expect("peer id"),
+            owner_session_id,
+            executor.clone(),
+        );
+        let joiner_session_id = joiner_service
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .expect("joiner session")
+            .session_id
+            .clone();
+        joiner_service.register_broker_control_lane_transport(
+            Box::new(joiner_room),
+            broker_control_lane_key(&[11_u8; 32]).expect("key derives"),
+            SignalingPeerId::new("voice-joiner-peer").expect("peer id"),
+            joiner_session_id.clone(),
+            executor,
+        );
+
+        {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state = owner_service.state.clone();
+        }
+        let owner_voice = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: voice_channel.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-probe".to_owned()),
+            input_device_label: Some("probe microphone".to_owned()),
+            output_device_id: None,
+            output_device_label: None,
+        });
+        assert!(
+            owner_voice.last_command_error.is_none(),
+            "owner voice join failed: {owner_voice:?}"
+        );
+        {
+            let global = app_service();
+            let guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner_service.state = guard.state.clone();
+        }
+        {
+            let global = app_service();
+            let mut guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state = joiner_service.state.clone();
+        }
+        let joiner_voice = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: voice_channel.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic-probe".to_owned()),
+            input_device_label: Some("probe microphone".to_owned()),
+            output_device_id: None,
+            output_device_label: None,
+        });
+        assert!(
+            joiner_voice.last_command_error.is_none(),
+            "joiner voice join failed: {joiner_voice:?}"
+        );
+        {
+            let global = app_service();
+            let guard = global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            joiner_service.state = guard.state.clone();
+        }
+        let voice_session_id = joiner_service
+            .state
+            .voice_session
+            .as_ref()
+            .expect("joiner voice session")
+            .session_id
+            .clone();
+
+        joiner_service
+            .state
+            .enqueue_voice_signaling_outbox(PublishVoiceSignalingMessageRequest {
+                session_id: voice_session_id.clone(),
+                signal_kind: "offer".to_owned(),
+                sealed_payload: format!(
+                    "voice-signal-sealed:v1:{}",
+                    "c2RwLW9mZmVyLXByb29iZQ".repeat(6)
+                ),
+                signal_id: None,
+                created_at_ms: 1_700_000_000_000,
+            })
+            .expect("joiner enqueues offer");
+
+        let mut owner_offer = None;
+        for _ in 0..60 {
+            joiner_service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(200),
+            });
+            owner_service.drain_text_control_inbound_frames(Some(200), Some(200));
+            let taken = owner_service.state.take_pending_voice_signaling_messages(
+                TakePendingVoiceSignalingMessagesRequest {
+                    session_id: Some(voice_session_id.clone()),
+                    limit: None,
+                },
+            );
+            if !taken.is_empty() {
+                owner_offer = Some(taken);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let owner_offer = owner_offer.expect("owner must receive the joiner's voice offer");
+        assert_eq!(owner_offer.len(), 1, "exactly one offer crosses the lane");
+        assert_eq!(owner_offer[0].signal_kind, "offer");
+        assert!(owner_offer[0]
+            .sealed_payload
+            .starts_with("voice-signal-sealed:v1:"));
+
+        owner_service
+            .state
+            .enqueue_voice_signaling_outbox(PublishVoiceSignalingMessageRequest {
+                session_id: voice_session_id.clone(),
+                signal_kind: "candidate".to_owned(),
+                sealed_payload: format!(
+                    "voice-signal-sealed:v1:{}",
+                    "aWNlLWNhbmRpZGF0ZS1wcm9vYg".repeat(6)
+                ),
+                signal_id: None,
+                created_at_ms: 1_700_000_000_001,
+            })
+            .expect("owner enqueues candidate");
+        let owner_report =
+            owner_service.pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: None,
+                limit: Some(8),
+                operation_timeout_ms: Some(1_000),
+            });
+        assert!(
+            owner_report.frames_sent >= 1,
+            "owner must ferry the candidate: {owner_report:?}"
+        );
+
+        let mut joiner_candidate = None;
+        for _ in 0..60 {
+            let drained = joiner_service.drain_text_control_inbound_frames(Some(200), Some(200));
+            assert!(
+                drained.failures.is_empty(),
+                "joiner drain failures: {:?}",
+                drained.failures
+            );
+            let taken = joiner_service.state.take_pending_voice_signaling_messages(
+                TakePendingVoiceSignalingMessagesRequest {
+                    session_id: Some(voice_session_id.clone()),
+                    limit: None,
+                },
+            );
+            if !taken.is_empty() {
+                joiner_candidate = Some(taken);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let joiner_candidate =
+            joiner_candidate.expect("joiner must receive the owner's ICE candidate");
+        assert_eq!(joiner_candidate.len(), 1, "exactly one candidate crosses");
+        assert_eq!(joiner_candidate[0].signal_kind, "candidate");
+        assert!(joiner_candidate[0]
+            .sealed_payload
+            .starts_with("voice-signal-sealed:v1:"));
+
+        std::fs::remove_file(owner_path).ok();
+        std::fs::remove_file(joiner_path).ok();
+    }
+
+    #[test]
     fn control_lane_session_manager_fails_closed_after_exhausted_backoff() {
         let _guard = test_lock();
         let empty_path = reset_with_temp_state("control-lane-manager-empty");
