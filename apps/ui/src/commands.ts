@@ -1196,6 +1196,23 @@ export type TextControlTransportPumpReportView = {
   metrics: WebRtcDataTransportMetrics;
 };
 
+export type AttachBrokerControlLaneRuntimeRequest = {
+  adapter_kind?: string | null;
+};
+
+export type DrainTextControlInboundFramesRequest = {
+  drain_ms?: number | null;
+  operation_timeout_ms?: number | null;
+};
+
+export type StartControlLaneSessionManagerRequest = {
+  pump_interval_ms?: number | null;
+  drain_ms?: number | null;
+  backoff_initial_ms?: number | null;
+  backoff_max_ms?: number | null;
+  backoff_max_attempts?: number | null;
+};
+
 export type MarkTextControlFrameSentRequest = {
   message_id: string;
   frame_sha256: string;
@@ -3710,6 +3727,75 @@ export async function attachTextControlTransportRuntime(
           "transport_runtime_unavailable",
           "Local fallback web runtime cannot attach a long-lived text/control transport runtime; native Rust/Tauri command path is required",
           "Run the native app and attach the backend runtime before claiming delivery",
+        );
+      }),
+  );
+}
+
+export async function attachBrokerControlLaneRuntime(
+  request: AttachBrokerControlLaneRuntimeRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "attach_broker_control_lane_runtime",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "transport.broker_control_lane_attach_failed",
+          "attach_broker_control_lane_runtime",
+          "broker_control_lane_unavailable",
+          "Local fallback web runtime cannot attach the sealed broker control lane; native Rust/Tauri command path is required",
+          "Run the native app before attempting provider-backed admission bootstrap",
+        );
+      }),
+  );
+}
+
+export async function drainTextControlInboundFrames(
+  request: DrainTextControlInboundFramesRequest = {},
+): Promise<TextControlTransportPumpReportView> {
+  return invokeOrFallback<TextControlTransportPumpReportView>(
+    "drain_text_control_inbound_frames",
+    { request },
+    () => ({
+      pending_before: 0,
+      frames_sent: 0,
+      response_frames_received: 0,
+      receipts_applied: 0,
+      failures: [
+        "Local fallback web runtime cannot drain sealed broker control frames",
+      ],
+      metrics: {
+        schema_version: 1,
+        label: "fallback-broker-control-lane",
+        attached_channels: 0,
+        open: false,
+        frames_sent: 0,
+        frames_received: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        last_state: "unavailable",
+      },
+    }),
+  );
+}
+
+export async function startControlLaneSessionManager(
+  request: StartControlLaneSessionManagerRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "start_control_lane_session_manager",
+    { request },
+    () =>
+      mutateFallback((state) => {
+        pushCommandError(
+          state,
+          "transport.control_session_start_rejected",
+          "start_control_lane_session_manager",
+          "control_session_unavailable",
+          "Local fallback web runtime cannot supervise the sealed broker control lane",
+          "Run the native app before attempting provider-backed admission bootstrap",
         );
       }),
   );

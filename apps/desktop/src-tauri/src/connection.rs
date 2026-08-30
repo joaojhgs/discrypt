@@ -327,17 +327,6 @@ pub fn control_lane_session_manager_snapshot(
     })
 }
 
-fn active_text_session_id() -> Option<String> {
-    let service = app_service();
-    let guard = service
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
-        .state
-        .transport_session(BackendTransportMode::Text)
-        .map(|session| session.session_id.clone())
-}
-
 /// Tauri command: start the backend-owned broker control lane session manager.
 pub fn start_control_lane_session_manager(
     request: StartControlLaneSessionManagerRequest,
@@ -346,7 +335,11 @@ pub fn start_control_lane_session_manager(
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(session_id) = active_text_session_id() else {
+    let Some(session_id) = guard
+        .state
+        .transport_session(BackendTransportMode::Text)
+        .map(|session| session.session_id.clone())
+    else {
         guard.state.push_command_error(
             "transport.control_session_start_rejected",
             "start_control_lane_session_manager",
@@ -399,7 +392,12 @@ pub fn stop_control_lane_session_manager(
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let session_id = request.session_id.or_else(active_text_session_id);
+    let session_id = request.session_id.or_else(|| {
+        guard
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .map(|session| session.session_id.clone())
+    });
     let Some(session_id) = session_id else {
         guard.state.push_event(
             "transport.control_session_stop_noop",
@@ -433,6 +431,17 @@ pub fn stop_control_lane_session_manager(
 pub fn control_lane_session_manager_status(
     request: ControlLaneSessionManagerStatusRequest,
 ) -> Option<ControlLaneSessionManagerStatusView> {
-    let session_id = request.session_id.or_else(active_text_session_id)?;
+    let session_id = if let Some(session_id) = request.session_id {
+        session_id
+    } else {
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .map(|session| session.session_id.clone())?
+    };
     control_lane_session_manager_snapshot(&session_id)
 }

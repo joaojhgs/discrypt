@@ -9558,7 +9558,7 @@ mod ipc_commands {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_discrypt_panic_hook();
-    tauri::Builder::<tauri::Wry>::default()
+    let result = tauri::Builder::<tauri::Wry>::default()
         .setup(|app| {
             enable_platform_webview_voice_features(app)?;
             let app_handle = app.handle().clone();
@@ -9630,8 +9630,11 @@ pub fn run() {
             ipc_commands::command_health,
             ipc_commands::reset_app_state
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running discrypt Tauri application");
+        .run(tauri::generate_context!());
+    if let Err(error) = result {
+        eprintln!("error while running discrypt Tauri application: {error}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(all(

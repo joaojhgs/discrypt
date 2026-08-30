@@ -1318,17 +1318,52 @@ pub async fn join_provider_control_lane_room(
             }
         }
         SignalingAdapterFactory::IpfsPubsub(adapter) => {
-            let _ = (bootstrap_secret, random_entropy, local_peer_id);
-            Err(adapter.boundary().unavailable_error())
+            #[cfg(feature = "ipfs-pubsub-adapter")]
+            {
+                join_control_lane_room_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    local_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "ipfs-pubsub-adapter"))]
+            {
+                let _ = (bootstrap_secret, random_entropy, local_peer_id);
+                Err(adapter.boundary().unavailable_error())
+            }
         }
         SignalingAdapterFactory::DiscryptQuicRendezvous(adapter) => {
-            let _ = (bootstrap_secret, random_entropy, local_peer_id);
-            Err(adapter.boundary().unavailable_error())
+            #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
+            {
+                join_control_lane_room_with_adapter(
+                    adapter,
+                    profile,
+                    scope,
+                    bootstrap_secret,
+                    random_entropy,
+                    local_peer_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "discrypt-quic-rendezvous-adapter"))]
+            {
+                let _ = (bootstrap_secret, random_entropy, local_peer_id);
+                Err(adapter.boundary().unavailable_error())
+            }
         }
     }
 }
 
-#[cfg(any(feature = "mqtt-adapter", feature = "nostr-adapter"))]
+#[cfg(any(
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 async fn join_control_lane_room_with_adapter<A>(
     adapter: A,
     profile: SignalingAdapterProfile,
@@ -5840,7 +5875,7 @@ impl NostrProviderRoom {
                             if waited_ms >= 3000 {
                                 break Err("notifications mutex contended >3s".to_owned());
                             }
-                            if debug && waited_ms % 500 == 0 {
+                            if debug && waited_ms.is_multiple_of(500) {
                                 eprintln!(
                                     "nostr drain: notifications lock contended {waited_ms}ms"
                                 );
@@ -7270,6 +7305,12 @@ impl RendezvousRoom for FeatureGatedProviderRoom {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::assertions_on_constants,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::useless_vec
+)]
 mod tests {
     use super::*;
     use crate::{
@@ -7629,16 +7670,8 @@ mod tests {
                 cfg!(feature = "discrypt-quic-rendezvous-adapter")
             }
         };
-        if matches!(
-            boundary.kind,
-            SignalingAdapterKind::Mqtt
-                | SignalingAdapterKind::Nostr
-                | SignalingAdapterKind::IpfsPubsub
-        ) && feature_enabled
-        {
+        if feature_enabled {
             ProviderAdapterReadiness::ImplementationAvailable
-        } else if feature_enabled {
-            ProviderAdapterReadiness::ImplementationUnavailable
         } else {
             ProviderAdapterReadiness::FeatureDisabled
         }

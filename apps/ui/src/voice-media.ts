@@ -112,7 +112,7 @@ export function startNativeRustVoiceMediaSession(
       })
         .then((state) => {
           options.onState?.(state);
-          recordG012NativeVoiceEvidence({
+          recordTauriTwoProfileE2ENativeVoiceEvidence({
             mode: "native_rust_webrtc_datachannel",
             remoteTrackEventsDelta: nativeMedia.protected_frames_count || 1,
             iceConnected: true,
@@ -141,7 +141,7 @@ export function startNativeRustVoiceMediaSession(
     .then((response) => {
       options.onState?.(response.state);
       if (closed || !response.native_media) return;
-      recordG012NativeVoiceEvidence({
+      recordTauriTwoProfileE2ENativeVoiceEvidence({
         mode: "native_rust_webrtc_datachannel",
         localAudioTracksSentDelta: response.native_media.opus_frames || 1,
         getUserMediaCallsDelta: 1,
@@ -181,10 +181,10 @@ export function startNativeRustVoiceMediaSession(
     },
     setMuted: (muted) => {
       const evidenceTarget = window as typeof window & {
-        __discryptG012WebDriverVoiceEvidence?: { trackEnabled?: boolean };
+        __discryptTauriTwoProfileE2EVoiceEvidence?: { trackEnabled?: boolean };
       };
-      if (evidenceTarget.__discryptG012WebDriverVoiceEvidence) {
-        evidenceTarget.__discryptG012WebDriverVoiceEvidence.trackEnabled = !muted;
+      if (evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence) {
+        evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence.trackEnabled = !muted;
       }
       // Native Rust media proof sessions are backend-owned. The actual mute state
       // is applied by the `set_self_mute` command and reflected in backend
@@ -437,7 +437,7 @@ function createGainControlledStream(
   }
 }
 
-function recordG012NativeVoiceEvidence(update: {
+function recordTauriTwoProfileE2ENativeVoiceEvidence(update: {
   mode: string;
   localAudioTracksSentDelta?: number;
   remoteTrackEventsDelta?: number;
@@ -445,7 +445,7 @@ function recordG012NativeVoiceEvidence(update: {
   iceConnected?: boolean;
 }) {
   const target = window as typeof window & {
-    __discryptG012WebDriverVoiceEvidence?: {
+    __discryptTauriTwoProfileE2EVoiceEvidence?: {
       mode?: string;
       localAudioTracksSent?: number;
       remoteTrackEvents?: number;
@@ -454,7 +454,7 @@ function recordG012NativeVoiceEvidence(update: {
       nativeRustVoiceRuntimeAvailable?: boolean;
     };
   };
-  const evidence = target.__discryptG012WebDriverVoiceEvidence;
+  const evidence = target.__discryptTauriTwoProfileE2EVoiceEvidence;
   if (!evidence) return;
   evidence.mode = update.mode;
   evidence.nativeRustVoiceRuntimeAvailable = true;

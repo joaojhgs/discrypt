@@ -88,7 +88,7 @@ const manifest = {
     action_driven_evidence: false,
     launch_smoke_only: !delegateWebDriver,
     delegated_webdriver: delegateWebDriver,
-    delegated_webdriver_command: "node scripts/g012-tauri-webdriver-integrated.mjs --run --require-native-voice",
+    delegated_webdriver_command: "node scripts/tauri-two-profile-group-text-voice-e2e.mjs --run --require-native-voice",
     launch_smoke_non_claim: "Plain launch readiness proves only two isolated Tauri WebViews started; it does not prove setup, OpenMLS admission, protected text delivery, native voice, persistence, split-machine transport, or production readiness.",
   },
   production_ux_constraint: "The harness launches real Tauri WebViews with backend IPC; local-dev/harness features are used only to permit per-profile state-path isolation.",
@@ -103,8 +103,8 @@ const manifest = {
     ? {
         status: "planned",
         artifact_root: rel(resolve(artifactRoot, "webdriver")),
-        manifest: rel(resolve(artifactRoot, "webdriver", "tauri-webdriver-integrated-manifest.json")),
-        summary: rel(resolve(artifactRoot, "webdriver", "tauri-webdriver-integrated-summary.json")),
+        manifest: rel(resolve(artifactRoot, "webdriver", "tauri-two-profile-group-text-voice-e2e-manifest.json")),
+        summary: rel(resolve(artifactRoot, "webdriver", "tauri-two-profile-group-text-voice-e2e-summary.json")),
       }
     : null,
   artifact_policy: {
@@ -223,7 +223,7 @@ function planCommands() {
       label: "delegated WebDriver integrated E2E",
       command: process.execPath,
       args: [
-        "scripts/g012-tauri-webdriver-integrated.mjs",
+        "scripts/tauri-two-profile-group-text-voice-e2e.mjs",
         "--run",
         "--require-native-voice",
         "--artifact-dir",
@@ -231,8 +231,8 @@ function planCommands() {
       ],
       cwd: repoRoot,
       log_path: resolve(logDir, "webdriver-integrated.log"),
-      env_keys: ["DISCRYPT_G012_WEBDRIVER_RUN_ID"],
-      rendered: `node scripts/g012-tauri-webdriver-integrated.mjs --run --require-native-voice --artifact-dir ${webdriverArtifactRoot}`,
+      env_keys: ["DISCRYPT_TAURI_TWO_PROFILE_E2E_RUN_ID"],
+      rendered: `node scripts/tauri-two-profile-group-text-voice-e2e.mjs --run --require-native-voice --artifact-dir ${webdriverArtifactRoot}`,
     });
     return;
   }
@@ -455,7 +455,7 @@ function summarizeBoundary(status, details = {}) {
     remaining_integrated_e2e_requirements: boundary.action_driven_evidence
       ? []
       : [
-          "Run scripts/g012-tauri-webdriver-integrated.mjs on a display/native-WebDriver-capable runner.",
+          "Run scripts/tauri-two-profile-group-text-voice-e2e.mjs on a display/native-WebDriver-capable runner.",
           "Retain setup, OpenMLS admission, protected text, native voice, and persistence artifacts before making product E2E claims.",
         ],
   };
@@ -467,7 +467,7 @@ function runDelegatedWebDriver() {
   const webdriverArtifactRoot = resolve(artifactRoot, "webdriver");
   mkdirSync(webdriverArtifactRoot, { recursive: true });
   const args = [
-    "scripts/g012-tauri-webdriver-integrated.mjs",
+    "scripts/tauri-two-profile-group-text-voice-e2e.mjs",
     "--run",
     "--require-native-voice",
     "--artifact-dir",
@@ -477,14 +477,14 @@ function runDelegatedWebDriver() {
     webdriver_delegation: {
       status: "running",
       artifact_root: rel(webdriverArtifactRoot),
-      manifest: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-manifest.json")),
-      summary: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-summary.json")),
+      manifest: rel(resolve(webdriverArtifactRoot, "tauri-two-profile-group-text-voice-e2e-manifest.json")),
+      summary: rel(resolve(webdriverArtifactRoot, "tauri-two-profile-group-text-voice-e2e-summary.json")),
     },
   });
   const result = spawnSync(process.execPath, args, {
     cwd: repoRoot,
     encoding: "utf8",
-    env: { ...process.env, DISCRYPT_G012_WEBDRIVER_RUN_ID: `${runId}-webdriver` },
+    env: { ...process.env, DISCRYPT_TAURI_TWO_PROFILE_E2E_RUN_ID: `${runId}-webdriver` },
     maxBuffer: 1024 * 1024 * 64,
   });
   const logPath = resolve(logDir, "webdriver-integrated.log");
@@ -495,10 +495,10 @@ function runDelegatedWebDriver() {
     log_path: rel(logPath),
     log_sha256: sha256IfExists(logPath),
     artifact_root: rel(webdriverArtifactRoot),
-    manifest: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-manifest.json")),
-    summary: rel(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-summary.json")),
+    manifest: rel(resolve(webdriverArtifactRoot, "tauri-two-profile-group-text-voice-e2e-manifest.json")),
+    summary: rel(resolve(webdriverArtifactRoot, "tauri-two-profile-group-text-voice-e2e-summary.json")),
   };
-  const actionDriven = result.status === 0 && existsSync(resolve(webdriverArtifactRoot, "tauri-webdriver-integrated-summary.json"));
+  const actionDriven = result.status === 0 && existsSync(resolve(webdriverArtifactRoot, "tauri-two-profile-group-text-voice-e2e-summary.json"));
   const summary = summarizeBoundary(result.status === 0 ? "delegated-webdriver-passed" : "delegated-webdriver-failed", {
     action_driven_evidence: actionDriven,
     delegated_webdriver_result: delegation,

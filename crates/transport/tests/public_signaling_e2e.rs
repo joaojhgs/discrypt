@@ -4,6 +4,7 @@
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
+#![allow(clippy::expect_used)]
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 use discrypt_transport::probe_provider_adapter_roundtrip;

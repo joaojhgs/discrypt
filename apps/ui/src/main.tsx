@@ -72,6 +72,9 @@ import {
   startSignalingSession,
   startTextSession,
   attachTextControlTransportRuntime,
+  attachBrokerControlLaneRuntime,
+  drainTextControlInboundFrames,
+  startControlLaneSessionManager,
   pumpTextControlTransportOnce,
   publishGroupPresence,
   startDm,
@@ -188,23 +191,23 @@ type VoiceActivityReading = {
 
 type StopVoiceActivityCapture = () => void;
 
-const G012_WEBDRIVER_VOICE_HARNESS_KEY =
-  "discrypt:g012:webdriver-voice-harness";
+const TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY =
+  "discrypt:tauri-two-profile-e2e:voice-harness";
 
-function g012WebDriverVoiceHarnessEnabled(): boolean {
+function tauriTwoProfileE2EVoiceHarnessEnabled(): boolean {
   const automationWindow = window as typeof window & {
-    __discryptG012ForceNativeRustVoice?: unknown;
-    __discryptG012WebDriverVoiceEvidence?: unknown;
+    __discryptTauriTwoProfileE2EForceNativeRustVoice?: unknown;
+    __discryptTauriTwoProfileE2EVoiceEvidence?: unknown;
   };
   if (
-    automationWindow.__discryptG012ForceNativeRustVoice !== undefined ||
-    automationWindow.__discryptG012WebDriverVoiceEvidence !== undefined
+    automationWindow.__discryptTauriTwoProfileE2EForceNativeRustVoice !== undefined ||
+    automationWindow.__discryptTauriTwoProfileE2EVoiceEvidence !== undefined
   ) {
     return true;
   }
   try {
     return (
-      window.localStorage?.getItem(G012_WEBDRIVER_VOICE_HARNESS_KEY) === "1"
+      window.localStorage?.getItem(TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY) === "1"
     );
   } catch {
     return false;
@@ -222,17 +225,17 @@ function generatedAutomationVoiceDeviceAccess(
 ): VoiceDeviceAccess {
   const selectedGeneratedDeviceId = selectedInputDeviceId?.trim()
     ? selectedInputDeviceId
-    : "g012-generated-audio-input";
+    : "tauri-two-profile-e2e-generated-audio-input";
   const availableInputDevices = [
     {
       device_id: selectedGeneratedDeviceId,
       label: "Generated audio input",
     },
-    ...(selectedGeneratedDeviceId === "g012-generated-audio-input"
+    ...(selectedGeneratedDeviceId === "tauri-two-profile-e2e-generated-audio-input"
       ? []
       : [
           {
-            device_id: "g012-generated-audio-input",
+            device_id: "tauri-two-profile-e2e-generated-audio-input",
             label: "Generated audio input",
           },
         ]),
@@ -259,7 +262,7 @@ function generatedAutomationVoiceDeviceAccess(
 async function requestGeneratedAutomationVoiceAccess(
   selectedInputDeviceId?: string,
 ): Promise<VoiceDeviceAccess | null> {
-  if (!g012WebDriverVoiceHarnessEnabled()) return null;
+  if (!tauriTwoProfileE2EVoiceHarnessEnabled()) return null;
   const audioWindow = window as Window &
     typeof globalThis & { webkitAudioContext?: typeof AudioContext };
   const AudioContextCtor =
@@ -625,10 +628,10 @@ function voiceOutputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption
 async function enumerateVoiceInputDevices(
   requestPermission = false,
 ): Promise<VoiceDeviceOption[]> {
-  if (g012WebDriverVoiceHarnessEnabled()) {
+  if (tauriTwoProfileE2EVoiceHarnessEnabled()) {
     return [
       {
-        device_id: "g012-generated-audio-input",
+        device_id: "tauri-two-profile-e2e-generated-audio-input",
         label: "Generated audio input",
       },
     ];
@@ -1653,6 +1656,86 @@ function App() {
       }
       return started;
     }
+    const activeGroupId = started.active_context?.group_id ?? null;
+    const activeGroup = activeGroupId
+      ? started.groups.find((group) => group.group_id === activeGroupId) ?? null
+      : null;
+    const localMember = activeGroup?.members?.find(
+      (member) => member.member_id === started.profile?.user_id,
+    );
+    const hasAdmittedRemoteMember = activeGroup?.members?.some(
+      (member) =>
+        member.member_id !== started.profile?.user_id &&
+        member.status !== "pending" &&
+        member.status !== "revoked",
+    ) ?? false;
+    const requiresAdmissionControlLane = Boolean(
+      activeGroup &&
+        (activeGroup.role === "pending" ||
+          localMember?.status === "pending" ||
+          !hasAdmittedRemoteMember),
+    );
+    if (requiresAdmissionControlLane) {
+      const attached = await attachBrokerControlLaneRuntime({
+        adapter_kind: null,
+      });
+      setCommandState(attached);
+      if (attached.last_command_error) {
+        if (reportFailures) {
+          const action = commandErrorToAction(attached.last_command_error);
+          reportCommandError(
+            action
+              ? `${attached.last_command_error.message} — ${action}`
+              : attached.last_command_error.message,
+            attached.last_command_error.command,
+          );
+        }
+        return attached;
+      }
+      const sent = await pumpTextControlTransportOnce({
+        target: null,
+        limit: 8,
+        operation_timeout_ms: 5_000,
+      });
+      const drained = await drainTextControlInboundFrames({
+        drain_ms: 1_500,
+        operation_timeout_ms: 1_000,
+      });
+      if (reportFailures && (sent.failures.length > 0 || drained.failures.length > 0)) {
+        reportCommandError(
+          sent.failures[0] ?? drained.failures[0],
+          sent.failures.length > 0
+            ? "pump_text_control_transport_once"
+            : "drain_text_control_inbound_frames",
+        );
+      }
+      const managed = await startControlLaneSessionManager({
+        pump_interval_ms: 250,
+        drain_ms: 300,
+        backoff_initial_ms: 100,
+        backoff_max_ms: 2_000,
+        backoff_max_attempts: 5,
+      });
+      setCommandState(managed);
+      if (managed.last_command_error) {
+        if (reportFailures) {
+          const action = commandErrorToAction(managed.last_command_error);
+          reportCommandError(
+            action
+              ? `${managed.last_command_error.message} — ${action}`
+              : managed.last_command_error.message,
+            managed.last_command_error.command,
+          );
+        }
+        return managed;
+      }
+      const refreshed = await loadAppState().catch(() => null);
+      if (refreshed) {
+        setCommandState(refreshed);
+        return refreshed;
+      }
+      return managed;
+    }
     const attached = await attachTextRuntime(started).catch((error: unknown) => {
       const message =
         error instanceof Error ? error.message : String(error ?? "");
@@ -2001,6 +2084,7 @@ function App() {
         setDraftConfigAdmissionMode(group?.role_policy?.admission_mode ?? draftAdmissionMode);
         setWorkflow("channel");
         setActiveOverlay(null);
+        void syncTextRuntimeForState(state, true);
       },
     );
   }
@@ -2049,6 +2133,12 @@ function App() {
 
   function reviewPendingAdmissions() {
     setWorkflow("admission_requests");
+    void loadAppState()
+      .then((refreshed) => {
+        setCommandState(refreshed);
+        updateEventCursor(refreshed.event_cursor);
+      })
+      .catch(() => undefined);
   }
 
   function openAuditLog() {
@@ -2541,11 +2631,11 @@ function App() {
           const forceNativeRustVoice = Boolean(
             (
               window as typeof window & {
-                __discryptG012ForceNativeRustVoice?: boolean;
+                __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
               }
-            ).__discryptG012ForceNativeRustVoice ||
+            ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
             window.localStorage?.getItem(
-              "discrypt:g012:force-native-rust-voice",
+              "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
             ) === "1",
           );
           const canUseWebViewRtc = Boolean(
@@ -6821,7 +6911,10 @@ function AdmissionRequestCard({
   actionInFlight: string | null;
 }) {
   return (
-    <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4">
+    <div
+      className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4"
+      data-testid={`admission-request-${request.request_id}`}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-base font-semibold">{request.display_name}</p>
@@ -6840,6 +6933,8 @@ function AdmissionRequestCard({
       <div className="mt-4 flex flex-wrap gap-2">
         <Button
           type="button"
+          aria-label={`Approve ${request.display_name} admission`}
+          data-testid={`admission-approve-${request.request_id}`}
           onClick={() => onApprove(request)}
           disabled={actionInFlight === `approve:${request.request_id}`}
         >
