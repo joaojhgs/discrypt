@@ -1,8 +1,10 @@
 import {
-  acceptNativeVoiceMediaFrame,
   publishVoiceSignalingMessage,
-  startNativeVoiceMediaSession,
+  sendNativeVoiceAudioFrame,
+  startNativeVoiceStream,
+  stopNativeVoiceStream,
   takePendingVoiceSignalingMessages,
+  takeNativeVoicePlaybackFrames,
   type ConnectivityPolicyView,
   type NativeVoiceMediaSignalPayload,
   type VoiceSessionView,
@@ -81,57 +83,38 @@ const REMOTE_EVIDENCE_POLL_MS = 500;
 const REMOTE_EVIDENCE_TIMEOUT_MS = 15_000;
 
 export function startNativeRustVoiceMediaSession(
-  options: Omit<StartVoiceMediaSessionOptions, "localStream" | "onRemoteMedia"> & {
+  options: Omit<StartVoiceMediaSessionOptions, "onRemoteMedia"> & {
     onState?: (state: unknown) => void;
   },
 ): VoiceMediaSessionHandle | null {
-  if (!options.session.joined || !tauriVoiceSignalingAvailable()) {
+  const AudioContextCtor = window.AudioContext;
+  if (
+    !options.session.joined ||
+    !tauriVoiceSignalingAvailable() ||
+    !AudioContextCtor ||
+    localAudioTracks(options.localStream).length === 0
+  ) {
     options.onStatus?.(
-      "Native Rust voice media did not start: joined Tauri backend session is required",
+      "Native Rust voice media did not start: joined Tauri backend, WebAudio, and a live microphone track are required",
     );
     return null;
   }
-  const senderInstanceId =
-    globalThis.crypto?.randomUUID?.() ??
-    `voice-native-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   let closed = false;
-  const transport = createVoiceSignalTransport({
-    channelId: options.session.channel_id,
-    groupId: options.session.group_id,
-    localPeerId: options.localPeerId,
-    onStatus: options.onStatus,
-    sessionId: options.session.session_id,
-    senderInstanceId,
-    onSignal: (signal) => {
-      if (closed || signal.from_peer_id !== options.remotePeerId || !signal.native_media) return;
-      const nativeMedia = signal.native_media;
-      void acceptNativeVoiceMediaFrame({
-        session_id: options.session.session_id,
-        native_media: nativeMedia,
-        attached_at_ms: Date.now(),
-      })
-        .then((state) => {
-          options.onState?.(state);
-          recordTauriTwoProfileE2ENativeVoiceEvidence({
-            mode: "native_rust_webrtc_datachannel",
-            remoteTrackEventsDelta: nativeMedia.protected_frames_count || 1,
-            iceConnected: true,
-          });
-          options.onStatus?.(
-            "Native Rust voice media proof received over backend signaling; remote playback evidence attached without WebView RTCPeerConnection",
-          );
-        })
-        .catch((error) => {
-          options.onStatus?.(
-            `Native Rust voice media proof failed closed: ${
-              error instanceof Error ? error.message : "unknown error"
-            }`,
-          );
-        });
-    },
-  });
+  let muted = false;
+  let playbackTimer: number | null = null;
+  let nextPlaybackTime = 0;
+  let queuedSends = 0;
+  let pendingCaptureSamples: number[] = [];
+  const audioContext = new AudioContextCtor({ sampleRate: 48_000 });
+  const source = audioContext.createMediaStreamSource(options.localStream);
+  const captureProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+  const silentOutput = audioContext.createGain();
+  silentOutput.gain.value = 0;
+  source.connect(captureProcessor);
+  captureProcessor.connect(silentOutput);
+  silentOutput.connect(audioContext.destination);
 
-  void startNativeVoiceMediaSession({
+  void startNativeVoiceStream({
     session_id: options.session.session_id,
     local_peer_id: options.localPeerId,
     remote_peer_id: options.remotePeerId,
@@ -140,31 +123,15 @@ export function startNativeRustVoiceMediaSession(
   })
     .then((response) => {
       options.onState?.(response.state);
-      if (closed || !response.native_media) return;
+      options.onStatus?.(
+        response.status.data_channel_open
+          ? "Backend-verified native Rust WebRTC voice Local DataChannel connected with STUN and zero TURN servers"
+          : "Backend-verified native Rust WebRTC voice Local DataChannel is attaching",
+      );
       recordTauriTwoProfileE2ENativeVoiceEvidence({
         mode: "native_rust_webrtc_datachannel",
-        localAudioTracksSentDelta: response.native_media.opus_frames || 1,
         getUserMediaCallsDelta: 1,
       });
-      transport.send({
-        schema_version: 1,
-        session_id: options.session.session_id,
-        group_id: options.session.group_id,
-        channel_id: options.session.channel_id,
-        from_peer_id: options.localPeerId,
-        to_peer_id: options.remotePeerId,
-        sender_instance_id: senderInstanceId,
-        kind: "candidate",
-        candidate: {
-          candidate: `candidate:provider-signaled-native-rust-webrtc-datachannel:${response.native_media.protected_frames_count}`,
-          sdpMid: "native-rust",
-          sdpMLineIndex: 0,
-        },
-        native_media: response.native_media,
-      });
-      options.onStatus?.(
-        "Native Rust voice media proof generated and sent through backend signaling",
-      );
     })
     .catch((error) => {
       options.onStatus?.(
@@ -174,24 +141,175 @@ export function startNativeRustVoiceMediaSession(
       );
     });
 
+  captureProcessor.onaudioprocess = (event) => {
+    if (closed) return;
+    const inputBuffer = event.inputBuffer;
+    const mono = downmixAudioBuffer(inputBuffer);
+    const normalized = resampleMonoPcm(mono, inputBuffer.sampleRate, 48_000);
+    pendingCaptureSamples.push(...normalized);
+    while (pendingCaptureSamples.length >= 960) {
+      const frame = pendingCaptureSamples.splice(0, 960);
+      if (queuedSends >= 8) continue;
+      const pcm_i16 = frame.map((sample) =>
+        Math.max(-32768, Math.min(32767, Math.round(sample * 32767))),
+      );
+      queuedSends += 1;
+      void sendNativeVoiceAudioFrame({
+        session_id: options.session.session_id,
+        pcm_i16,
+        muted,
+        captured_at_ms: Date.now(),
+      })
+        .then((response) => {
+          if (response.accepted) {
+            recordTauriTwoProfileE2ENativeVoiceEvidence({
+              mode: "native_rust_webrtc_datachannel",
+              localAudioTracksSentDelta: 1,
+              iceConnected:
+                response.status.direct_path_ready && response.status.data_channel_open,
+            });
+          } else if (response.status.state === "failed" && response.status.last_error) {
+            options.onStatus?.(`Native Rust voice send failed: ${response.status.last_error}`);
+          }
+        })
+        .catch((error) => {
+          options.onStatus?.(
+            `Native Rust voice send failed: ${
+              error instanceof Error ? error.message : "unknown error"
+            }`,
+          );
+        })
+        .finally(() => {
+          queuedSends = Math.max(0, queuedSends - 1);
+        });
+    }
+  };
+
+  const pollPlayback = () => {
+    if (closed) return;
+    void takeNativeVoicePlaybackFrames({
+      session_id: options.session.session_id,
+      limit: 50,
+    })
+      .then((response) => {
+        if (closed) return;
+        for (const frame of response.frames) {
+          scheduleNativeVoicePlaybackFrame(audioContext, frame, () => nextPlaybackTime, (time) => {
+            nextPlaybackTime = time;
+          });
+        }
+        if (response.frames.length > 0) {
+          recordTauriTwoProfileE2ENativeVoiceEvidence({
+            mode: "native_rust_webrtc_datachannel",
+            remoteTrackEventsDelta: response.frames.length,
+            iceConnected:
+              response.status.direct_path_ready && response.status.data_channel_open,
+          });
+        }
+        if (response.status.state === "failed" && response.status.last_error) {
+          options.onStatus?.(`Native Rust voice receive failed: ${response.status.last_error}`);
+        }
+      })
+      .catch((error) => {
+        if (!closed) {
+          options.onStatus?.(
+            `Native Rust voice receive failed: ${
+              error instanceof Error ? error.message : "unknown error"
+            }`,
+          );
+        }
+      })
+      .finally(() => {
+        if (!closed) playbackTimer = window.setTimeout(pollPlayback, 20);
+      });
+  };
+  void audioContext.resume();
+  pollPlayback();
+
   return {
     close: () => {
       closed = true;
-      transport.close();
+      if (playbackTimer !== null) window.clearTimeout(playbackTimer);
+      captureProcessor.onaudioprocess = null;
+      source.disconnect();
+      captureProcessor.disconnect();
+      silentOutput.disconnect();
+      void audioContext.close();
+      void stopNativeVoiceStream({ session_id: options.session.session_id });
     },
-    setMuted: (muted) => {
+    setMuted: (nextMuted) => {
+      muted = Boolean(nextMuted);
+      localAudioTracks(options.localStream).forEach((track) => {
+        track.enabled = !muted;
+      });
       const evidenceTarget = window as typeof window & {
         __discryptTauriTwoProfileE2EVoiceEvidence?: { trackEnabled?: boolean };
       };
       if (evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence) {
         evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence.trackEnabled = !muted;
       }
-      // Native Rust media proof sessions are backend-owned. The actual mute state
-      // is applied by the `set_self_mute` command and reflected in backend
-      // participant/session state; this handle only mirrors WebDriver evidence.
     },
     setInputGain: () => undefined,
   };
+}
+
+function downmixAudioBuffer(buffer: AudioBuffer): Float32Array {
+  const mono = new Float32Array(buffer.length);
+  const channels = Math.max(1, buffer.numberOfChannels);
+  for (let channel = 0; channel < channels; channel += 1) {
+    const samples = buffer.getChannelData(Math.min(channel, buffer.numberOfChannels - 1));
+    for (let index = 0; index < mono.length; index += 1) {
+      mono[index] += samples[index] / channels;
+    }
+  }
+  return mono;
+}
+
+function resampleMonoPcm(
+  input: Float32Array,
+  sourceRate: number,
+  targetRate: number,
+): Float32Array {
+  if (sourceRate === targetRate) return input;
+  const outputLength = Math.max(1, Math.round((input.length * targetRate) / sourceRate));
+  const output = new Float32Array(outputLength);
+  const ratio = sourceRate / targetRate;
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * ratio;
+    const lower = Math.min(input.length - 1, Math.floor(position));
+    const upper = Math.min(input.length - 1, lower + 1);
+    const fraction = position - lower;
+    output[index] = input[lower] * (1 - fraction) + input[upper] * fraction;
+  }
+  return output;
+}
+
+function scheduleNativeVoicePlaybackFrame(
+  context: AudioContext,
+  frame: {
+    pcm_i16: number[];
+    sample_rate_hz: number;
+    channels: number;
+  },
+  getNextTime: () => number,
+  setNextTime: (time: number) => void,
+): void {
+  const channels = Math.max(1, frame.channels);
+  const samplesPerChannel = Math.floor(frame.pcm_i16.length / channels);
+  if (samplesPerChannel === 0) return;
+  const buffer = context.createBuffer(channels, samplesPerChannel, frame.sample_rate_hz);
+  for (let channel = 0; channel < channels; channel += 1) {
+    const output = buffer.getChannelData(channel);
+    for (let index = 0; index < samplesPerChannel; index += 1) {
+      output[index] = frame.pcm_i16[index * channels + channel] / 32768;
+    }
+  }
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.connect(context.destination);
+  const startAt = Math.max(context.currentTime + 0.02, getNextTime());
+  source.start(startAt);
+  setNextTime(startAt + buffer.duration);
 }
 
 export function startWebViewVoiceMediaSession(

@@ -1047,6 +1047,61 @@ export type StartNativeVoiceMediaSessionResponse = {
   native_media?: NativeVoiceMediaSignalPayload | null;
 };
 
+export type NativeVoiceStreamStatusView = {
+  schema_version: number;
+  session_id: string;
+  state: string;
+  role: string;
+  direct_path_ready: boolean;
+  data_channel_open: boolean;
+  configured_stun_servers: number;
+  configured_turn_servers: number;
+  frames_sent: number;
+  frames_received: number;
+  playback_queue_depth: number;
+  last_error?: string | null;
+};
+
+export type StartNativeVoiceStreamResponse = {
+  state: AppState;
+  status: NativeVoiceStreamStatusView;
+};
+
+export type SendNativeVoiceAudioFrameRequest = {
+  session_id: string;
+  pcm_i16: number[];
+  muted?: boolean;
+  captured_at_ms: number;
+};
+
+export type SendNativeVoiceAudioFrameResponse = {
+  accepted: boolean;
+  status: NativeVoiceStreamStatusView;
+};
+
+export type TakeNativeVoicePlaybackFramesRequest = {
+  session_id: string;
+  limit?: number | null;
+};
+
+export type NativeVoicePlaybackFrameView = {
+  from_peer_id: string;
+  counter: number;
+  sample_rate_hz: number;
+  channels: number;
+  frame_duration_ms: number;
+  pcm_i16: number[];
+};
+
+export type TakeNativeVoicePlaybackFramesResponse = {
+  frames: NativeVoicePlaybackFrameView[];
+  status: NativeVoiceStreamStatusView;
+};
+
+export type StopNativeVoiceStreamRequest = {
+  session_id: string;
+};
+
 export type AcceptNativeVoiceMediaFrameRequest = {
   session_id: string;
   native_media: NativeVoiceMediaSignalPayload;
@@ -1212,6 +1267,26 @@ export type StartControlLaneSessionManagerRequest = {
   backoff_max_ms?: number | null;
   backoff_max_attempts?: number | null;
 };
+
+export type StopControlLaneSessionManagerRequest = {
+  session_id?: string | null;
+};
+
+export type ControlLaneSessionManagerStatusRequest = {
+  session_id?: string | null;
+};
+
+export type ControlLaneSessionManagerStatusView = {
+  session_id: string;
+  running: boolean;
+  iterations: number;
+  consecutive_failures: number;
+  stopped: boolean;
+};
+
+export type OptionalControlLaneSessionManagerStatusView =
+  | ControlLaneSessionManagerStatusView
+  | null;
 
 export type MarkTextControlFrameSentRequest = {
   message_id: string;
@@ -3801,6 +3876,26 @@ export async function startControlLaneSessionManager(
   );
 }
 
+export async function stopControlLaneSessionManager(
+  request: StopControlLaneSessionManagerRequest = {},
+): Promise<AppState> {
+  return invokeOrFallback<AppState>(
+    "stop_control_lane_session_manager",
+    { request },
+    () => mutateFallback(() => undefined),
+  );
+}
+
+export async function controlLaneSessionManagerStatus(
+  request: ControlLaneSessionManagerStatusRequest = {},
+): Promise<OptionalControlLaneSessionManagerStatusView> {
+  return invokeOrFallback<OptionalControlLaneSessionManagerStatusView>(
+    "control_lane_session_manager_status",
+    { request },
+    () => null,
+  );
+}
+
 export async function createUser(
   request: CreateUserRequest,
 ): Promise<AppState> {
@@ -5066,6 +5161,81 @@ export async function startNativeVoiceMediaSession(
       });
       return { state, native_media: null };
     },
+  );
+}
+
+function unavailableNativeVoiceStreamStatus(
+  sessionId: string,
+): NativeVoiceStreamStatusView {
+  return {
+    schema_version: 1,
+    session_id: sessionId,
+    state: "failed",
+    role: "none",
+    direct_path_ready: false,
+    data_channel_open: false,
+    configured_stun_servers: 0,
+    configured_turn_servers: 0,
+    frames_sent: 0,
+    frames_received: 0,
+    playback_queue_depth: 0,
+    last_error: "Native Rust/Tauri voice runtime is unavailable",
+  };
+}
+
+export async function startNativeVoiceStream(
+  request: StartNativeVoiceMediaSessionRequest,
+): Promise<StartNativeVoiceStreamResponse> {
+  return invokeOrFallback<StartNativeVoiceStreamResponse>(
+    "start_native_voice_stream",
+    { request },
+    () => ({
+      state: mutateFallback((draft) => {
+        pushCommandError(
+          draft,
+          "voice.native_stream_rejected",
+          "start_native_voice_stream",
+          "native_voice_stream_unavailable",
+          "Local native Rust WebRTC voice streaming requires the Tauri backend",
+          "Run the installed desktop app before joining native voice",
+        );
+      }),
+      status: unavailableNativeVoiceStreamStatus(request.session_id),
+    }),
+  );
+}
+
+export async function sendNativeVoiceAudioFrame(
+  request: SendNativeVoiceAudioFrameRequest,
+): Promise<SendNativeVoiceAudioFrameResponse> {
+  return invokeOrFallback<SendNativeVoiceAudioFrameResponse>(
+    "send_native_voice_audio_frame",
+    { request },
+    () => ({
+      accepted: false,
+      status: unavailableNativeVoiceStreamStatus(request.session_id),
+    }),
+  );
+}
+
+export async function takeNativeVoicePlaybackFrames(
+  request: TakeNativeVoicePlaybackFramesRequest,
+): Promise<TakeNativeVoicePlaybackFramesResponse> {
+  return invokeOrFallback<TakeNativeVoicePlaybackFramesResponse>(
+    "take_native_voice_playback_frames",
+    { request },
+    () => ({
+      frames: [],
+      status: unavailableNativeVoiceStreamStatus(request.session_id),
+    }),
+  );
+}
+
+export async function stopNativeVoiceStream(
+  request: StopNativeVoiceStreamRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("stop_native_voice_stream", { request }, () =>
+    mutateFallback(() => undefined),
   );
 }
 

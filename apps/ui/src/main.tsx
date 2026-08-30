@@ -814,7 +814,7 @@ async function requestVoiceDeviceAccess(
   if (!navigator.mediaDevices?.getUserMedia) {
     return emptyVoiceDeviceAccess("unknown", {
       message:
-        "WebRTC audio capture is unavailable — Install the required desktop media runtime and restart discrypt",
+        "Local WebRTC audio capture is unavailable — Install the required desktop media runtime and restart discrypt",
     });
   }
 
@@ -2597,16 +2597,20 @@ function App() {
           "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
         ) === "1",
       );
-      if (!forceNativeRustVoice && typeof RTCPeerConnection === "undefined") {
+      const nativeRustVoiceAvailable = Boolean(window.__TAURI__?.core?.invoke);
+      if (
+        !forceNativeRustVoice &&
+        typeof RTCPeerConnection === "undefined" &&
+        !nativeRustVoiceAvailable
+      ) {
         reportCommandError(
-          "WebRTC audio runtime is unavailable — Install the required desktop media runtime and restart discrypt",
+          "Local WebRTC audio runtime is unavailable — Install the required desktop media runtime and restart discrypt",
           "join_voice",
         );
         stopLocalVoiceCapture();
         return;
       }
       if (
-        !forceNativeRustVoice &&
         (!voiceAccess.stream || localAudioTracks(voiceAccess.stream).length === 0)
       ) {
         reportCommandError(
@@ -2744,23 +2748,30 @@ function App() {
               stopLocalVoiceCapture();
               return;
             }
-          } else if (forceNativeRustVoice) {
+          } else if ((forceNativeRustVoice || nativeRustVoiceAvailable) && voiceAccess.stream) {
             voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
               session: voiceSession,
+              localStream: voiceAccess.stream,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
               onState: (state) => setCommandState(state as AppState),
               onStatus: (status) => {
-                if (!/proof generated|proof received/i.test(status)) {
+                if (!/Local DataChannel (is attaching|connected)/i.test(status)) {
                   reportCommandError(status, "Voice media");
                 }
               },
             });
+            if (!voiceMediaSessionRef.current) {
+              const leftState = await leaveVoice({ session_id: sessionId });
+              setCommandState(leftState);
+              stopLocalVoiceCapture();
+              return;
+            }
           } else {
             reportCommandError(
-              "WebRTC audio session could not start with the selected microphone",
+              "Local WebRTC audio session could not start with the selected microphone",
               "join_voice",
             );
             const leftState = await leaveVoice({ session_id: sessionId });

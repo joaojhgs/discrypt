@@ -244,6 +244,42 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "attach_broker_control_lane_runtime",
+    exportName: "attachBrokerControlLaneRuntime",
+    args: ["adapter_kind"],
+    returns: "AppState",
+  },
+  {
+    command: "drain_text_control_inbound_frames",
+    exportName: "drainTextControlInboundFrames",
+    args: ["drain_ms", "operation_timeout_ms"],
+    returns: "TextControlTransportPumpReportView",
+  },
+  {
+    command: "start_control_lane_session_manager",
+    exportName: "startControlLaneSessionManager",
+    args: [
+      "pump_interval_ms",
+      "drain_ms",
+      "backoff_initial_ms",
+      "backoff_max_ms",
+      "backoff_max_attempts",
+    ],
+    returns: "AppState",
+  },
+  {
+    command: "stop_control_lane_session_manager",
+    exportName: "stopControlLaneSessionManager",
+    args: ["session_id"],
+    returns: "AppState",
+  },
+  {
+    command: "control_lane_session_manager_status",
+    exportName: "controlLaneSessionManagerStatus",
+    args: ["session_id"],
+    returns: "OptionalControlLaneSessionManagerStatusView",
+  },
+  {
     command: "send_message",
     exportName: "sendMessage",
     args: ["target", "kind", "dm_id", "group_id", "channel_id", "body"],
@@ -359,6 +395,30 @@ const expectedCommands = [
     exportName: "startNativeVoiceMediaSession",
     args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
     returns: "StartNativeVoiceMediaSessionResponse",
+  },
+  {
+    command: "start_native_voice_stream",
+    exportName: "startNativeVoiceStream",
+    args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
+    returns: "StartNativeVoiceStreamResponse",
+  },
+  {
+    command: "send_native_voice_audio_frame",
+    exportName: "sendNativeVoiceAudioFrame",
+    args: ["session_id", "pcm_i16", "muted", "captured_at_ms"],
+    returns: "SendNativeVoiceAudioFrameResponse",
+  },
+  {
+    command: "take_native_voice_playback_frames",
+    exportName: "takeNativeVoicePlaybackFrames",
+    args: ["session_id", "limit"],
+    returns: "TakeNativeVoicePlaybackFramesResponse",
+  },
+  {
+    command: "stop_native_voice_stream",
+    exportName: "stopNativeVoiceStream",
+    args: ["session_id"],
+    returns: "AppState",
   },
   {
     command: "accept_native_voice_media_frame",

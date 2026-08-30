@@ -13,8 +13,8 @@ for (const configPath of [
 ]) {
   const config = JSON.parse(read(configPath));
   const mainWindow = config.app?.windows?.find((window) => window.label === "main");
-  if (mainWindow?.url !== "about:blank") {
-    failures.push(`${configPath} must defer main-window navigation with url=about:blank`);
+  if (!mainWindow || mainWindow.url === "about:blank") {
+    failures.push(`${configPath} must load the configured frontend directly`);
   }
   const debDepends = config.bundle?.linux?.deb?.depends ?? [];
   for (const dependency of [
@@ -45,16 +45,30 @@ for (const token of [
   "settings.set_enable_webrtc(true)",
   "settings.set_enable_media_stream(true)",
   "webview.connect_permission_request",
-  "webview.load_uri(frontend_url.as_str())",
+  "start_native_voice_stream",
+  "send_native_voice_audio_frame",
+  "take_native_voice_playback_frames",
+  "derive_native_voice_runtime_inputs",
+  "IceServerConfig::new(base.ice_config.stun_servers, Vec::new())",
+  "start_provider_webrtc_text_control_offer_runtime",
+  "start_provider_webrtc_text_control_answer_runtime_with_answerer",
 ]) {
   if (!desktopSource.includes(token)) {
-    failures.push(`desktop WebKit voice initialization missing token: ${token}`);
+    failures.push(`desktop native voice runtime missing token: ${token}`);
   }
 }
-const settingsOffset = desktopSource.indexOf("settings.set_enable_webrtc(true)");
-const navigationOffset = desktopSource.indexOf("webview.load_uri(frontend_url.as_str())");
-if (settingsOffset < 0 || navigationOffset < 0 || settingsOffset >= navigationOffset) {
-  failures.push("desktop WebKit voice settings must be applied before frontend navigation");
+
+const voiceMediaSource = read("apps/ui/src/voice-media.ts");
+for (const token of [
+  "createMediaStreamSource(options.localStream)",
+  "createScriptProcessor",
+  "sendNativeVoiceAudioFrame",
+  "takeNativeVoicePlaybackFrames",
+  "context.createBuffer",
+]) {
+  if (!voiceMediaSource.includes(token)) {
+    failures.push(`WebAudio native voice bridge missing token: ${token}`);
+  }
 }
 
 const preflight = read("scripts/g012-docker-tauri-preflight.sh");

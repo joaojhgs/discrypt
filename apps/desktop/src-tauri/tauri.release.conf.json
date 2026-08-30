@@ -29,8 +29,7 @@
         "minWidth": 360,
         "minHeight": 640,
         "resizable": true,
-        "label": "main",
-        "url": "about:blank"
+        "label": "main"
       }
     ],
     "security": {

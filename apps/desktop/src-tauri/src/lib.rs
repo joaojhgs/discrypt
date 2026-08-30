@@ -30,10 +30,12 @@ use discrypt_core::{
 };
 use discrypt_media::{
     apply_microphone_gain_percent, AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame,
-    MediaKeyRegistry, MicrophonePermissionState, OpusAudioEncoder, ProtectedFrame,
-    ProtectedMediaFrameSink, ReplayWindow, RustTransformBridge, SFrameReceiver, SFrameSender,
-    SenderBinding, VoiceCaptureSFramePipeline, VoiceCaptureSendOutcome, VoiceDeviceDescriptor,
-    VoiceDeviceKind, VoiceDeviceSelection, APP_OUTPUT_VOLUME_MAX_PERCENT, MIC_GAIN_MAX_PERCENT,
+    DecodedAudioFrame, MediaKeyRegistry, MicrophonePermissionState, OpusAudioDecoder,
+    OpusAudioEncoder, PlaybackAudioSink, ProtectedFrame, ProtectedMediaFrameSink, ReplayWindow,
+    RustTransformBridge, SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
+    VoiceCaptureSendOutcome, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
+    VoiceJitterBuffer, VoiceReceiveSFramePipeline, APP_OUTPUT_VOLUME_MAX_PERCENT,
+    MIC_GAIN_MAX_PERCENT,
 };
 use discrypt_mls_core::{
     verifying_key_from_hex, DeviceLeaf, DevicePairingPayload, DeviceSet, DeviceStatus, FriendCode,
@@ -89,8 +91,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::{
     path::PathBuf,
@@ -1971,6 +1974,111 @@ pub struct StartNativeVoiceMediaSessionResponse {
     pub native_media: Option<NativeVoiceMediaSignalPayload>,
 }
 
+/// Live native Rust voice-stream lifecycle and transport evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeVoiceStreamStatusView {
+    /// Stable status schema for UI/runtime consumers.
+    pub schema_version: u16,
+    /// Active voice session id.
+    pub session_id: String,
+    /// `idle`, `attaching`, `connected`, or `failed`.
+    pub state: String,
+    /// Provider runtime role for this installed peer.
+    pub role: String,
+    /// Whether backend-verified Rust WebRTC completed its direct ICE path.
+    pub direct_path_ready: bool,
+    /// Whether the backend-verified Rust WebRTC DataChannel is open.
+    pub data_channel_open: bool,
+    /// STUN servers configured for the native voice runtime.
+    pub configured_stun_servers: usize,
+    /// TURN servers configured for the native voice runtime. This is always zero.
+    pub configured_turn_servers: usize,
+    /// Protected audio frames accepted by the DataChannel sender.
+    pub frames_sent: u64,
+    /// Protected audio frames authenticated and decoded from the remote peer.
+    pub frames_received: u64,
+    /// Decoded PCM frames waiting for WebAudio playback.
+    pub playback_queue_depth: usize,
+    /// Latest attach/send/receive failure, if any.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// Response returned when the dedicated backend-verified Rust WebRTC voice stream is started.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartNativeVoiceStreamResponse {
+    /// Updated application state after validating and starting attach.
+    pub state: AppStateView,
+    /// Current native voice runtime status.
+    pub status: NativeVoiceStreamStatusView,
+}
+
+/// One canonical 20 ms mono 48 kHz PCM frame captured by real getUserMedia/WebAudio.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SendNativeVoiceAudioFrameRequest {
+    /// Active voice session id.
+    pub session_id: String,
+    /// Exactly 960 signed PCM samples.
+    pub pcm_i16: Vec<i16>,
+    /// Whether the local media path should suppress this frame before Opus/SFrame.
+    #[serde(default)]
+    pub muted: bool,
+    /// Monotonic capture timestamp in milliseconds.
+    pub captured_at_ms: u64,
+}
+
+/// Result of handing one real captured frame to the backend-verified WebRTC sender.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SendNativeVoiceAudioFrameResponse {
+    /// Whether this frame reached the backend-verified open WebRTC DataChannel.
+    pub accepted: bool,
+    /// Current native voice runtime status.
+    pub status: NativeVoiceStreamStatusView,
+}
+
+/// Request to drain decoded native voice PCM for WebAudio playback.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TakeNativeVoicePlaybackFramesRequest {
+    /// Active voice session id.
+    pub session_id: String,
+    /// Optional result cap, clamped to 1..=100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One authenticated, decoded PCM frame ready for physical speaker playback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeVoicePlaybackFrameView {
+    /// Authenticated remote provider peer id.
+    pub from_peer_id: String,
+    /// Accepted SFrame counter.
+    pub counter: u64,
+    /// PCM sample rate.
+    pub sample_rate_hz: u32,
+    /// Interleaved PCM channel count.
+    pub channels: u8,
+    /// PCM frame duration.
+    pub frame_duration_ms: u16,
+    /// Authenticated, Opus-decoded signed PCM samples.
+    pub pcm_i16: Vec<i16>,
+}
+
+/// Decoded native voice PCM plus current runtime status.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TakeNativeVoicePlaybackFramesResponse {
+    /// Frames ready for WebAudio playback.
+    pub frames: Vec<NativeVoicePlaybackFrameView>,
+    /// Current native voice runtime status.
+    pub status: NativeVoiceStreamStatusView,
+}
+
+/// Request to stop a dedicated native voice runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StopNativeVoiceStreamRequest {
+    /// Voice session id being stopped.
+    pub session_id: String,
+}
+
 /// Request to accept one remote native Rust media proof delivered through backend voice signaling.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AcceptNativeVoiceMediaFrameRequest {
@@ -2705,6 +2813,56 @@ struct TextControlRuntimeAttachInputs {
     ice_config: IceServerConfig,
 }
 
+fn derive_native_voice_runtime_material(
+    domain: &[u8],
+    source: &[u8],
+    session_id: &str,
+    output_len: usize,
+) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update((source.len() as u64).to_be_bytes());
+    digest.update(source);
+    digest.update((session_id.len() as u64).to_be_bytes());
+    digest.update(session_id.as_bytes());
+    digest.finalize()[..output_len].to_vec()
+}
+
+fn derive_native_voice_runtime_inputs(
+    base: TextControlRuntimeAttachInputs,
+    session_id: &str,
+) -> Result<TextControlRuntimeAttachInputs, String> {
+    let scope_commitment = hex::encode(derive_native_voice_runtime_material(
+        b"discrypt-native-voice-runtime-scope-v1",
+        base.scope.scope_id_commitment.as_bytes(),
+        session_id,
+        32,
+    ));
+    let scope = ConversationScope::new(base.scope.level, scope_commitment)
+        .map_err(|error| error.to_string())?;
+    let bootstrap_secret = derive_native_voice_runtime_material(
+        b"discrypt-native-voice-runtime-bootstrap-v1",
+        &base.bootstrap_secret,
+        session_id,
+        32,
+    );
+    let random_entropy = derive_native_voice_runtime_material(
+        b"discrypt-native-voice-runtime-entropy-v1",
+        &base.random_entropy,
+        session_id,
+        16,
+    );
+    let ice_config = IceServerConfig::new(base.ice_config.stun_servers, Vec::new())
+        .map_err(|error| error.to_string())?;
+    Ok(TextControlRuntimeAttachInputs {
+        profile: base.profile,
+        scope,
+        bootstrap_secret,
+        random_entropy,
+        ice_config,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct TextControlRuntimePeerAttachment {
     role: ProviderTextControlRuntimePeerRole,
@@ -2719,6 +2877,62 @@ struct TextControlRuntimeAttachJob {
     role: ProviderTextControlRuntimePeerRole,
     local_peer_id: SignalingPeerId,
     remote_peer_id: SignalingPeerId,
+}
+
+#[derive(Clone, Debug)]
+struct PendingNativeVoiceTransportRuntime {
+    session_id: String,
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: String,
+    remote_peer_id: String,
+    configured_stun_servers: usize,
+}
+
+struct NativeVoiceTransportRuntime {
+    transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+    _owned_runtime: Arc<discrypt_transport::ProviderTextControlRuntime>,
+    executor: Arc<tokio::runtime::Runtime>,
+    codec: Arc<Mutex<NativeVoiceCodecState>>,
+    session_id: String,
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: String,
+    remote_peer_id: String,
+    configured_stun_servers: usize,
+    direct_path_ready: bool,
+    data_channel_open: bool,
+    frames_sent: Arc<AtomicU64>,
+    receiver_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl fmt::Debug for NativeVoiceTransportRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeVoiceTransportRuntime")
+            .field("session_id", &self.session_id)
+            .field("role", &self.role)
+            .field("local_peer_id", &self.local_peer_id)
+            .field("remote_peer_id", &self.remote_peer_id)
+            .field("configured_stun_servers", &self.configured_stun_servers)
+            .field("direct_path_ready", &self.direct_path_ready)
+            .field("data_channel_open", &self.data_channel_open)
+            .field("frames_sent", &self.frames_sent.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for NativeVoiceTransportRuntime {
+    fn drop(&mut self) {
+        if let Some(abort) = self.receiver_abort.take() {
+            abort.abort();
+        }
+    }
+}
+
+struct NativeVoiceRuntimeAttachJob {
+    request: StartNativeVoiceMediaSessionRequest,
+    inputs: TextControlRuntimeAttachInputs,
+    role: ProviderTextControlRuntimePeerRole,
+    codec: Arc<Mutex<NativeVoiceCodecState>>,
 }
 
 impl fmt::Debug for TextControlTransportRuntime {
@@ -2956,6 +3170,9 @@ struct TauriAppService {
         BTreeMap<TextControlRuntimeMapKey, TextControlTransportRuntime>,
     pending_text_control_transport_runtimes:
         BTreeMap<TextControlRuntimeMapKey, PendingTextControlTransportRuntime>,
+    native_voice_transport_runtime: Option<NativeVoiceTransportRuntime>,
+    pending_native_voice_transport_runtime: Option<PendingNativeVoiceTransportRuntime>,
+    native_voice_transport_error: Option<String>,
     #[cfg(any(test, feature = "harness"))]
     state_path_override: Option<PathBuf>,
 }
@@ -2991,6 +3208,9 @@ impl TauriAppService {
             state: load_state(),
             text_control_transport_runtimes: BTreeMap::new(),
             pending_text_control_transport_runtimes: BTreeMap::new(),
+            native_voice_transport_runtime: None,
+            pending_native_voice_transport_runtime: None,
+            native_voice_transport_error: None,
             #[cfg(any(test, feature = "harness"))]
             state_path_override: None,
         }
@@ -3003,6 +3223,9 @@ impl TauriAppService {
             state: load_state_from_path(&path),
             text_control_transport_runtimes: BTreeMap::new(),
             pending_text_control_transport_runtimes: BTreeMap::new(),
+            native_voice_transport_runtime: None,
+            pending_native_voice_transport_runtime: None,
+            native_voice_transport_error: None,
             state_path_override: Some(path),
         }
     }
@@ -3079,7 +3302,7 @@ impl TauriAppService {
         if let Some(session) = self.state.transport_session(BackendTransportMode::Text) {
             let session_id = &session.session_id;
             // The control-lane runtime is the coordination path that actually
-            // connects without WebRTC; prefer it over an unconnected direct
+            // connects without local WebRTC; prefer it over an unconnected direct
             // runtime registered for the same session.
             if let Some(runtime) = self
                 .text_control_transport_runtimes
@@ -3205,6 +3428,72 @@ impl TauriAppService {
                     PersistedAppState::transport_state_label(session_state)
                 ),
             },
+        }
+    }
+
+    fn native_voice_stream_status(&self, session_id: &str) -> NativeVoiceStreamStatusView {
+        if let Some(runtime) = self
+            .native_voice_transport_runtime
+            .as_ref()
+            .filter(|runtime| runtime.session_id == session_id)
+        {
+            let (frames_received, playback_queue_depth) = runtime
+                .codec
+                .lock()
+                .map(|codec| (codec.frames_received, codec.playback_queue_depth()))
+                .unwrap_or_default();
+            return NativeVoiceStreamStatusView {
+                schema_version: 1,
+                session_id: session_id.to_owned(),
+                state: "backend-verified-connected".to_owned(),
+                role: runtime_role_label(Some(runtime.role)).to_owned(),
+                direct_path_ready: runtime.direct_path_ready,
+                data_channel_open: runtime.data_channel_open,
+                configured_stun_servers: runtime.configured_stun_servers,
+                configured_turn_servers: 0,
+                frames_sent: runtime.frames_sent.load(Ordering::Relaxed),
+                frames_received,
+                playback_queue_depth,
+                last_error: self.native_voice_transport_error.clone(),
+            };
+        }
+        if let Some(pending) = self
+            .pending_native_voice_transport_runtime
+            .as_ref()
+            .filter(|pending| pending.session_id == session_id)
+        {
+            return NativeVoiceStreamStatusView {
+                schema_version: 1,
+                session_id: session_id.to_owned(),
+                state: "attaching".to_owned(),
+                role: runtime_role_label(Some(pending.role)).to_owned(),
+                direct_path_ready: false,
+                data_channel_open: false,
+                configured_stun_servers: pending.configured_stun_servers,
+                configured_turn_servers: 0,
+                frames_sent: 0,
+                frames_received: 0,
+                playback_queue_depth: 0,
+                last_error: self.native_voice_transport_error.clone(),
+            };
+        }
+        NativeVoiceStreamStatusView {
+            schema_version: 1,
+            session_id: session_id.to_owned(),
+            state: if self.native_voice_transport_error.is_some() {
+                "failed".to_owned()
+            } else {
+                "idle".to_owned()
+            },
+            role: "none".to_owned(),
+            direct_path_ready: false,
+            data_channel_open: false,
+            configured_stun_servers: 0,
+            configured_turn_servers: 0,
+            frames_sent: 0,
+            frames_received: 0,
+            playback_queue_depth: 0,
+            last_error: self.native_voice_transport_error.clone(),
         }
     }
 
@@ -4686,6 +4975,9 @@ pub fn reload_app_state_for_harness(path: impl AsRef<std::path::Path>) -> AppSta
     guard.state = load_state_from_path(path);
     guard.text_control_transport_runtimes.clear();
     guard.pending_text_control_transport_runtimes.clear();
+    guard.native_voice_transport_runtime = None;
+    guard.pending_native_voice_transport_runtime = None;
+    guard.native_voice_transport_error = None;
     guard.state_path_override = Some(path.to_path_buf());
     guard.to_view()
 }
@@ -8196,6 +8488,27 @@ pub fn attach_broker_control_lane_runtime(
     guard.to_view()
 }
 
+/// Tauri command boundary: start the backend-owned broker control lane manager.
+pub fn start_control_lane_session_manager(
+    request: connection::StartControlLaneSessionManagerRequest,
+) -> AppStateView {
+    connection::start_control_lane_session_manager(request)
+}
+
+/// Tauri command boundary: stop the backend-owned broker control lane manager.
+pub fn stop_control_lane_session_manager(
+    request: connection::StopControlLaneSessionManagerRequest,
+) -> AppStateView {
+    connection::stop_control_lane_session_manager(request)
+}
+
+/// Tauri command boundary: inspect the broker control lane manager.
+pub fn control_lane_session_manager_status(
+    request: connection::ControlLaneSessionManagerStatusRequest,
+) -> Option<connection::ControlLaneSessionManagerStatusView> {
+    connection::control_lane_session_manager_status(request)
+}
+
 /// Tauri command: drain sealed inbound control frames and apply them to app state.
 pub fn drain_text_control_inbound_frames(
     request: DrainTextControlInboundFramesRequest,
@@ -8259,6 +8572,246 @@ pub fn take_pending_voice_signaling_messages(
         state.take_pending_voice_signaling_messages(request)
     });
     TakePendingVoiceSignalingMessagesResponse { state, messages }
+}
+
+/// Tauri command: attach a dedicated backend-verified Rust WebRTC DataChannel for real audio.
+pub fn start_native_voice_stream(
+    request: StartNativeVoiceMediaSessionRequest,
+) -> StartNativeVoiceStreamResponse {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard
+        .native_voice_transport_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.session_id == request.session_id)
+        || guard
+            .pending_native_voice_transport_runtime
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == request.session_id)
+    {
+        return StartNativeVoiceStreamResponse {
+            state: guard.to_view(),
+            status: guard.native_voice_stream_status(&request.session_id),
+        };
+    }
+
+    let prepared = (|| {
+        let session = guard
+            .state
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "No active voice session for native Rust voice stream".to_owned())?;
+        let attachment = guard.state.native_voice_runtime_peer_attachment(session)?;
+        if attachment.local_peer_id.0 != request.local_peer_id
+            || attachment.remote_peer_id.0 != request.remote_peer_id
+        {
+            return Err(
+                "Native Rust voice stream peer ids must match backend-derived runtime peers"
+                    .to_owned(),
+            );
+        }
+        let base_inputs = guard
+            .state
+            .text_control_runtime_inputs_for_active_scope(None)?;
+        let inputs = derive_native_voice_runtime_inputs(base_inputs, &request.session_id)?;
+        let codec = Arc::new(Mutex::new(NativeVoiceCodecState::from_state(
+            &guard.state,
+            &request,
+        )?));
+        Ok::<_, String>((attachment, inputs, codec))
+    })();
+
+    let (attachment, inputs, codec) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            guard.native_voice_transport_error = Some(error.clone());
+            guard.state.push_command_error(
+                "voice.native_stream_rejected",
+                "start_native_voice_stream",
+                "native_voice_stream_start_failed",
+                error,
+                "Join voice after OpenMLS admission and keep both provider peers online for direct STUN ICE",
+            );
+            guard.persist();
+            return StartNativeVoiceStreamResponse {
+                state: guard.to_view(),
+                status: guard.native_voice_stream_status(&request.session_id),
+            };
+        }
+    };
+    guard.native_voice_transport_runtime = None;
+    guard.native_voice_transport_error = None;
+    guard.pending_native_voice_transport_runtime = Some(PendingNativeVoiceTransportRuntime {
+        session_id: request.session_id.clone(),
+        role: attachment.role,
+        local_peer_id: request.local_peer_id.clone(),
+        remote_peer_id: request.remote_peer_id.clone(),
+        configured_stun_servers: inputs.ice_config.stun_servers.len(),
+    });
+    if let Some(session) = &mut guard.state.voice_session {
+        session.media_runtime.boundary = "native-rust-webrtc-datachannel-attaching".to_owned();
+        session.media_runtime.local_capture_active = true;
+        session.media_runtime.remote_transport_active = false;
+        session.media_runtime.status_copy =
+            "Attaching dedicated backend-verified Rust WebRTC DataChannel for real Opus/SFrame audio"
+                .to_owned();
+        session.media_runtime.fail_closed_reason =
+            "Native voice playback remains gated until direct ICE and the backend-verified WebRTC DataChannel opens"
+                .to_owned();
+    }
+    guard.state.push_event(
+        "voice.native_stream_attach_started",
+        format!(
+            "Starting STUN-only native Rust WebRTC voice runtime as {}",
+            runtime_role_label(Some(attachment.role))
+        ),
+    );
+    guard.persist();
+    let response = StartNativeVoiceStreamResponse {
+        state: guard.to_view(),
+        status: guard.native_voice_stream_status(&request.session_id),
+    };
+    drop(guard);
+    spawn_native_voice_runtime_attach(NativeVoiceRuntimeAttachJob {
+        request,
+        inputs,
+        role: attachment.role,
+        codec,
+    });
+    response
+}
+
+/// Tauri command: encode/protect and send real PCM over backend-verified WebRTC.
+pub fn send_native_voice_audio_frame(
+    request: SendNativeVoiceAudioFrameRequest,
+) -> SendNativeVoiceAudioFrameResponse {
+    let service = app_service();
+    let (transport, executor, codec, frames_sent) = {
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = guard
+            .native_voice_transport_runtime
+            .as_ref()
+            .filter(|runtime| runtime.session_id == request.session_id)
+        else {
+            return SendNativeVoiceAudioFrameResponse {
+                accepted: false,
+                status: guard.native_voice_stream_status(&request.session_id),
+            };
+        };
+        (
+            runtime.transport.clone(),
+            runtime.executor.clone(),
+            runtime.codec.clone(),
+            runtime.frames_sent.clone(),
+        )
+    };
+
+    if request.muted {
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        return SendNativeVoiceAudioFrameResponse {
+            accepted: false,
+            status: guard.native_voice_stream_status(&request.session_id),
+        };
+    }
+    let payload = codec
+        .lock()
+        .map_err(|_| "Native voice codec lock poisoned".to_owned())
+        .and_then(|mut codec| {
+            codec.encode_pcm_frame(request.pcm_i16, false, request.captured_at_ms)
+        });
+    let send_result = payload
+        .and_then(|payload| serde_json::to_vec(&payload).map_err(|error| error.to_string()))
+        .and_then(|bytes| {
+            executor
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        transport.send_text_control_frame(bytes),
+                    )
+                    .await
+                })
+                .map_err(|_| {
+                    "Backend-verified native voice WebRTC DataChannel send timed out".to_owned()
+                })?
+                .map_err(|error| error.to_string())
+        });
+    if send_result.is_ok() {
+        frames_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.native_voice_transport_error = send_result.as_ref().err().cloned();
+    SendNativeVoiceAudioFrameResponse {
+        accepted: send_result.is_ok(),
+        status: guard.native_voice_stream_status(&request.session_id),
+    }
+}
+
+/// Tauri command: drain authenticated Opus-decoded PCM for WebAudio speaker playback.
+pub fn take_native_voice_playback_frames(
+    request: TakeNativeVoicePlaybackFramesRequest,
+) -> TakeNativeVoicePlaybackFramesResponse {
+    let service = app_service();
+    let guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let codec = guard
+        .native_voice_transport_runtime
+        .as_ref()
+        .filter(|runtime| runtime.session_id == request.session_id)
+        .map(|runtime| runtime.codec.clone());
+    let frames = codec
+        .and_then(|codec| {
+            codec.lock().ok().map(|mut codec| {
+                codec.take_playback_frames(request.limit.unwrap_or(25).clamp(1, 100))
+            })
+        })
+        .unwrap_or_default();
+    TakeNativeVoicePlaybackFramesResponse {
+        frames,
+        status: guard.native_voice_stream_status(&request.session_id),
+    }
+}
+
+/// Tauri command: stop and forget one dedicated native Rust voice runtime.
+pub fn stop_native_voice_stream(request: StopNativeVoiceStreamRequest) -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard
+        .native_voice_transport_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.session_id == request.session_id)
+    {
+        guard.native_voice_transport_runtime = None;
+    }
+    if guard
+        .pending_native_voice_transport_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.session_id == request.session_id)
+    {
+        guard.pending_native_voice_transport_runtime = None;
+    }
+    guard.native_voice_transport_error = None;
+    if let Some(session) = &mut guard.state.voice_session {
+        if session.session_id == request.session_id {
+            session.media_runtime = voice_media_runtime_for_leave(&request.session_id);
+        }
+    }
+    guard.state.push_event(
+        "voice.native_stream_stopped",
+        "Stopped backend-verified native Rust WebRTC voice runtime",
+    );
+    guard.persist();
+    guard.to_view()
 }
 
 /// Tauri command: produce a Rust-owned native voice media proof frame for signaling.
@@ -8974,6 +9527,9 @@ pub fn reset_app_state_confirmed(request: ResetAppStateRequest) -> AppStateView 
         return guard.state.to_view();
     }
     guard.state = PersistedAppState::initial();
+    guard.native_voice_transport_runtime = None;
+    guard.pending_native_voice_transport_runtime = None;
+    guard.native_voice_transport_error = None;
     guard.state.push_event(
         "state.reset",
         "Local app state reset after explicit typed confirmation",
@@ -8989,6 +9545,9 @@ pub fn reset_app_state() -> AppStateView {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.state = PersistedAppState::initial();
+    guard.native_voice_transport_runtime = None;
+    guard.pending_native_voice_transport_runtime = None;
+    guard.native_voice_transport_error = None;
     guard.persist();
     guard.state.to_view()
 }
@@ -9374,7 +9933,7 @@ mod ipc_commands {
         request: connection::StartControlLaneSessionManagerRequest,
     ) -> AppStateView {
         super::run_app_state_command_with_event_emit(&app_handle, || {
-            super::connection::start_control_lane_session_manager(request)
+            super::start_control_lane_session_manager(request)
         })
     }
 
@@ -9384,7 +9943,7 @@ mod ipc_commands {
         request: connection::StopControlLaneSessionManagerRequest,
     ) -> AppStateView {
         super::run_app_state_command_with_event_emit(&app_handle, || {
-            super::connection::stop_control_lane_session_manager(request)
+            super::stop_control_lane_session_manager(request)
         })
     }
 
@@ -9394,7 +9953,7 @@ mod ipc_commands {
         request: connection::ControlLaneSessionManagerStatusRequest,
     ) -> Option<connection::ControlLaneSessionManagerStatusView> {
         super::run_command_with_event_emit(&app_handle, || {
-            super::connection::control_lane_session_manager_status(request)
+            super::control_lane_session_manager_status(request)
         })
     }
 
@@ -9445,6 +10004,46 @@ mod ipc_commands {
     ) -> StartNativeVoiceMediaSessionResponse {
         super::run_command_with_event_emit(&app_handle, || {
             super::start_native_voice_media_session(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn start_native_voice_stream(
+        app_handle: tauri::AppHandle,
+        request: StartNativeVoiceMediaSessionRequest,
+    ) -> StartNativeVoiceStreamResponse {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::start_native_voice_stream(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn send_native_voice_audio_frame(
+        app_handle: tauri::AppHandle,
+        request: SendNativeVoiceAudioFrameRequest,
+    ) -> SendNativeVoiceAudioFrameResponse {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::send_native_voice_audio_frame(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn take_native_voice_playback_frames(
+        app_handle: tauri::AppHandle,
+        request: TakeNativeVoicePlaybackFramesRequest,
+    ) -> TakeNativeVoicePlaybackFramesResponse {
+        super::run_command_with_event_emit(&app_handle, || {
+            super::take_native_voice_playback_frames(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn stop_native_voice_stream(
+        app_handle: tauri::AppHandle,
+        request: StopNativeVoiceStreamRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::stop_native_voice_stream(request)
         })
     }
 
@@ -9616,6 +10215,10 @@ pub fn run() {
             ipc_commands::publish_voice_signaling_message,
             ipc_commands::take_pending_voice_signaling_messages,
             ipc_commands::start_native_voice_media_session,
+            ipc_commands::start_native_voice_stream,
+            ipc_commands::send_native_voice_audio_frame,
+            ipc_commands::take_native_voice_playback_frames,
+            ipc_commands::stop_native_voice_stream,
             ipc_commands::accept_native_voice_media_frame,
             ipc_commands::accept_native_voice_media_signal,
             ipc_commands::join_voice,
@@ -9653,8 +10256,7 @@ fn enable_platform_webview_voice_features(
     let Some(main_webview) = app.get_webview_window("main") else {
         return Ok(());
     };
-    let frontend_url = platform_webview_frontend_url(app.config(), tauri::is_dev())?;
-    main_webview.with_webview(move |platform_webview| {
+    main_webview.with_webview(|platform_webview| {
         let webview = platform_webview.inner();
         if let Some(settings) = webview.settings() {
             // Wry enables WebAudio by default, but WebKitGTK keeps backend-verified WebRTC
@@ -9674,38 +10276,8 @@ fn enable_platform_webview_voice_features(
             }
             false
         });
-        // The configured main window starts at about:blank so WebKit receives
-        // the media settings and permission handler before its first real page
-        // navigation. Enabling WebRTC after Wry has loaded the frontend leaves
-        // RTCPeerConnection absent for the lifetime of that WebView.
-        webview.load_uri(frontend_url.as_str());
     })?;
     Ok(())
-}
-
-#[cfg(all(
-    feature = "tauri-runtime",
-    any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )
-))]
-fn platform_webview_frontend_url(
-    config: &tauri::utils::config::Config,
-    development: bool,
-) -> Result<tauri::Url, Box<dyn std::error::Error>> {
-    if development {
-        if let Some(dev_url) = &config.build.dev_url {
-            return Ok(dev_url.clone());
-        }
-    }
-    if let Some(tauri::utils::config::FrontendDist::Url(url)) = &config.build.frontend_dist {
-        return Ok(url.clone());
-    }
-    Ok(tauri::Url::parse("tauri://localhost")?)
 }
 
 #[cfg(all(
@@ -13517,7 +14089,7 @@ impl PersistedAppState {
                             })
                         });
                     if already_admitted {
-                        // Re-delivered key package: Welcome already issued.
+                        // Verified re-delivered key package: Welcome already issued.
                         return None;
                     }
                     let welcome = match self.openmls_admission_welcome_from_frame(
@@ -17284,6 +17856,313 @@ impl ProtectedMediaFrameSink for NativeVoiceProofSink {
     }
 }
 
+#[derive(Clone, Default)]
+struct NativeVoiceProtectedQueueSink {
+    frames: Arc<Mutex<VecDeque<BridgeProtectedFrame>>>,
+}
+
+impl ProtectedMediaFrameSink for NativeVoiceProtectedQueueSink {
+    fn send_protected_media_frame(
+        &mut self,
+        frame: BridgeProtectedFrame,
+    ) -> Result<(), discrypt_media::MediaError> {
+        self.frames
+            .lock()
+            .map_err(|_| {
+                discrypt_media::MediaError::MediaTransportFailed(
+                    "native voice protected-frame queue lock poisoned".to_owned(),
+                )
+            })?
+            .push_back(frame);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct NativeVoicePlaybackQueueSink {
+    frames: Arc<Mutex<VecDeque<DecodedAudioFrame>>>,
+}
+
+impl PlaybackAudioSink for NativeVoicePlaybackQueueSink {
+    fn queue_playback_frame(
+        &mut self,
+        frame: DecodedAudioFrame,
+    ) -> Result<(), discrypt_media::MediaError> {
+        let mut frames = self.frames.lock().map_err(|_| {
+            discrypt_media::MediaError::PlaybackFailed(
+                "native voice playback queue lock poisoned".to_owned(),
+            )
+        })?;
+        frames.push_back(frame);
+        while frames.len() > 250 {
+            frames.pop_front();
+        }
+        Ok(())
+    }
+}
+
+struct NativeVoiceCodecState {
+    session_id: String,
+    group_id: String,
+    channel_id: String,
+    local_peer_id: String,
+    remote_peer_id: String,
+    mic_gain_percent: u16,
+    app_output_volume_percent: u16,
+    capture_pipeline: VoiceCaptureSFramePipeline<NativeVoiceProtectedQueueSink>,
+    protected_frames: Arc<Mutex<VecDeque<BridgeProtectedFrame>>>,
+    receive_pipeline: VoiceReceiveSFramePipeline<NativeVoicePlaybackQueueSink>,
+    playback_frames: Arc<Mutex<VecDeque<DecodedAudioFrame>>>,
+    frames_encoded: u64,
+    frames_received: u64,
+}
+
+impl NativeVoiceCodecState {
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_material(
+        epoch_secret: &[u8],
+        current_epoch: u64,
+        group_id: &str,
+        channel_id: &str,
+        session_id: &str,
+        local_peer_id: &str,
+        remote_peer_id: &str,
+        mic_gain_percent: u16,
+        app_output_volume_percent: u16,
+    ) -> Result<Self, String> {
+        if local_peer_id.trim().is_empty()
+            || remote_peer_id.trim().is_empty()
+            || local_peer_id == remote_peer_id
+        {
+            return Err("Native voice codec requires distinct provider peer ids".to_owned());
+        }
+        let local_binding = SenderBinding::derive_for_epoch(
+            epoch_secret,
+            group_id,
+            current_epoch,
+            native_voice_peer_leaf_index(local_peer_id),
+            local_peer_id,
+        )
+        .map_err(|error| error.to_string())?;
+        let remote_binding = SenderBinding::derive_for_epoch(
+            epoch_secret,
+            group_id,
+            current_epoch,
+            native_voice_peer_leaf_index(remote_peer_id),
+            remote_peer_id,
+        )
+        .map_err(|error| error.to_string())?;
+        let local_sender = SFrameSender::new(epoch_secret, local_binding.clone())
+            .map_err(|error| error.to_string())?;
+        let receive_side_unused_sender =
+            SFrameSender::new(epoch_secret, local_binding).map_err(|error| error.to_string())?;
+        let mut capture_registry = MediaKeyRegistry::new();
+        capture_registry
+            .register_sender(epoch_secret, remote_binding.clone())
+            .map_err(|error| error.to_string())?;
+        let mut receive_registry = MediaKeyRegistry::new();
+        receive_registry
+            .register_sender(epoch_secret, remote_binding.clone())
+            .map_err(|error| error.to_string())?;
+
+        let protected_sink = NativeVoiceProtectedQueueSink::default();
+        let protected_frames = protected_sink.frames.clone();
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let capture_pipeline = VoiceCaptureSFramePipeline::new(
+            OpusAudioEncoder::new(format).map_err(|error| error.to_string())?,
+            RustTransformBridge::new(
+                local_sender,
+                SFrameReceiver::new(capture_registry, ReplayWindow::default()),
+            ),
+            protected_sink,
+        );
+        let playback_sink = NativeVoicePlaybackQueueSink::default();
+        let playback_frames = playback_sink.frames.clone();
+        let mut receive_pipeline = VoiceReceiveSFramePipeline::new(
+            RustTransformBridge::new(
+                receive_side_unused_sender,
+                SFrameReceiver::new(receive_registry, ReplayWindow::default()),
+            ),
+            OpusAudioDecoder::new(format).map_err(|error| error.to_string())?,
+            VoiceJitterBuffer::new(0),
+            playback_sink,
+        );
+        receive_pipeline
+            .set_speaker_volume(
+                &remote_binding,
+                app_output_volume_percent.saturating_mul(10),
+            )
+            .map_err(|error| error.to_string())?;
+
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            group_id: group_id.to_owned(),
+            channel_id: channel_id.to_owned(),
+            local_peer_id: local_peer_id.to_owned(),
+            remote_peer_id: remote_peer_id.to_owned(),
+            mic_gain_percent,
+            app_output_volume_percent,
+            capture_pipeline,
+            protected_frames,
+            receive_pipeline,
+            playback_frames,
+            frames_encoded: 0,
+            frames_received: 0,
+        })
+    }
+
+    fn from_state(
+        state: &PersistedAppState,
+        request: &StartNativeVoiceMediaSessionRequest,
+    ) -> Result<Self, String> {
+        let session = state
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "No active voice session for native Rust voice stream".to_owned())?;
+        if session.session_id != request.session_id || !session.joined {
+            return Err("Native Rust voice stream requires the active joined session".to_owned());
+        }
+        let attachment = state.native_voice_runtime_peer_attachment(session)?;
+        if attachment.local_peer_id.0 != request.local_peer_id
+            || attachment.remote_peer_id.0 != request.remote_peer_id
+        {
+            return Err(
+                "Native Rust voice stream peer ids must match backend-derived runtime peers"
+                    .to_owned(),
+            );
+        }
+        let (epoch_secret, current_epoch) = state.openmls_media_exporter_secret(
+            &session.group_id,
+            &session.channel_id,
+            &session.session_id,
+        )?;
+        Self::new_with_material(
+            &epoch_secret,
+            current_epoch,
+            &session.group_id,
+            &session.channel_id,
+            &session.session_id,
+            &request.local_peer_id,
+            &request.remote_peer_id,
+            state.preferences.mic_gain_percent,
+            state.preferences.app_output_volume_percent,
+        )
+    }
+
+    fn encode_pcm_frame(
+        &mut self,
+        mut pcm_i16: Vec<i16>,
+        muted: bool,
+        captured_at_ms: u64,
+    ) -> Result<NativeVoiceMediaSignalPayload, String> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        apply_microphone_gain_percent(&mut pcm_i16, self.mic_gain_percent)
+            .map_err(|error| error.to_string())?;
+        self.capture_pipeline.set_muted(muted);
+        let frame = CapturedAudioFrame::new(pcm_i16, format, captured_at_ms)
+            .map_err(|error| error.to_string())?;
+        let report = match self
+            .capture_pipeline
+            .capture_encode_protect_or_mute(frame)
+            .map_err(|error| error.to_string())?
+        {
+            VoiceCaptureSendOutcome::Sent(report) => report,
+            VoiceCaptureSendOutcome::Muted { .. } => {
+                return Err("Native voice capture frame was muted".to_owned());
+            }
+        };
+        let protected = self
+            .protected_frames
+            .lock()
+            .map_err(|_| "Native voice protected-frame queue lock poisoned".to_owned())?
+            .pop_front()
+            .ok_or_else(|| "Native voice Opus/SFrame pipeline produced no frame".to_owned())?;
+        self.frames_encoded = self.frames_encoded.saturating_add(1);
+        Ok(NativeVoiceMediaSignalPayload {
+            schema_version: "discrypt.native_voice_media.v1".to_owned(),
+            session_id: self.session_id.clone(),
+            group_id: self.group_id.clone(),
+            channel_id: self.channel_id.clone(),
+            from_peer_id: self.local_peer_id.clone(),
+            to_peer_id: self.remote_peer_id.clone(),
+            media_path: "native_rust_webrtc_datachannel".to_owned(),
+            boundary: "rust-opus-sframe-over-provider-webrtc-datachannel".to_owned(),
+            capture_source: "webview-getusermedia-pcm".to_owned(),
+            rms_i16: report.audio_level.rms_i16,
+            peak_i16: report.audio_level.peak_i16,
+            speaking: report.audio_level.speaking,
+            opus_frames: 1,
+            protected_frames_count: 1,
+            opus_payload_bytes: report.opus_payload_len,
+            protected_payload_bytes: protected.bytes.len(),
+            mic_gain_percent: self.mic_gain_percent,
+            app_output_volume_percent: self.app_output_volume_percent,
+            protected_frames: vec![NativeVoiceProtectedFrameView {
+                kid: protected.kid,
+                counter: protected.counter,
+                bytes: protected.bytes,
+            }],
+            created_at_ms: captured_at_ms,
+        })
+    }
+
+    fn receive_wire_frame(
+        &mut self,
+        media: NativeVoiceMediaSignalPayload,
+    ) -> Result<usize, String> {
+        if media.schema_version != "discrypt.native_voice_media.v1"
+            || media.media_path != "native_rust_webrtc_datachannel"
+            || media.session_id != self.session_id
+            || media.group_id != self.group_id
+            || media.channel_id != self.channel_id
+            || media.from_peer_id != self.remote_peer_id
+            || media.to_peer_id != self.local_peer_id
+            || media.protected_frames.is_empty()
+            || usize::from(media.protected_frames_count) != media.protected_frames.len()
+        {
+            return Err("Native voice DataChannel frame failed session/peer validation".to_owned());
+        }
+        let mut queued = 0_usize;
+        for frame in media.protected_frames {
+            queued = queued.saturating_add(
+                self.receive_pipeline
+                    .receive_protected_frame(BridgeProtectedFrame {
+                        kid: frame.kid,
+                        counter: frame.counter,
+                        bytes: frame.bytes,
+                    })
+                    .map_err(|error| error.to_string())?,
+            );
+            self.frames_received = self.frames_received.saturating_add(1);
+        }
+        Ok(queued)
+    }
+
+    fn take_playback_frames(&mut self, limit: usize) -> Vec<NativeVoicePlaybackFrameView> {
+        let Ok(mut frames) = self.playback_frames.lock() else {
+            return Vec::new();
+        };
+        (0..limit)
+            .filter_map(|_| frames.pop_front())
+            .map(|frame| NativeVoicePlaybackFrameView {
+                from_peer_id: frame.sender.device_id,
+                counter: frame.counter,
+                sample_rate_hz: frame.format.sample_rate_hz,
+                channels: frame.format.channels,
+                frame_duration_ms: frame.format.frame_duration_ms,
+                pcm_i16: frame.pcm_i16,
+            })
+            .collect()
+    }
+
+    fn playback_queue_depth(&self) -> usize {
+        self.playback_frames
+            .lock()
+            .map(|frames| frames.len())
+            .unwrap_or_default()
+    }
+}
+
 fn build_native_voice_media_signal(
     state: &PersistedAppState,
     request: &StartNativeVoiceMediaSessionRequest,
@@ -18575,6 +19454,327 @@ fn prepare_text_control_runtime_attach_job(
         local_peer_id: attachment.local_peer_id,
         remote_peer_id: attachment.remote_peer_id,
     }
+}
+
+fn process_live_native_voice_frame(
+    codec: &Arc<Mutex<NativeVoiceCodecState>>,
+    received: Vec<u8>,
+) -> Result<(), TransportError> {
+    let media: NativeVoiceMediaSignalPayload =
+        serde_json::from_slice(&received).map_err(|error| {
+            TransportError::Unavailable(format!(
+                "native voice DataChannel frame could not be decoded: {error}"
+            ))
+        })?;
+    let remote_peer_id = media.from_peer_id.clone();
+    let speaking = media.speaking;
+    let received_frames = media.protected_frames_count;
+    let attached_at_ms = media.created_at_ms;
+    codec
+        .lock()
+        .map_err(|_| TransportError::Unavailable("native voice codec lock poisoned".to_owned()))?
+        .receive_wire_frame(media)
+        .map_err(TransportError::Unavailable)?;
+
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .map_err(|_| TransportError::Unavailable("app service lock poisoned".to_owned()))?;
+    #[cfg(feature = "tauri-runtime")]
+    let previous_cursor = guard.state.latest_event_cursor();
+    let Some(session) = &mut guard.state.voice_session else {
+        return Err(TransportError::Unavailable(
+            "native voice frame arrived without an active voice session".to_owned(),
+        ));
+    };
+    let first_remote_frame = !session.media_runtime.remote_transport_active;
+    if let Some(participant) = session
+        .participants
+        .iter_mut()
+        .find(|participant| participant.id == remote_peer_id)
+    {
+        participant.speaking = speaking;
+        participant.muted = false;
+    } else {
+        session.participants.push(VoiceParticipantView {
+            id: remote_peer_id.clone(),
+            name: "Remote peer".to_owned(),
+            role: "remote".to_owned(),
+            speaking,
+            muted: false,
+            volume: 100,
+        });
+    }
+    if let Some(remote_audio) = session
+        .media_runtime
+        .remote_audio
+        .iter_mut()
+        .find(|audio| audio.remote_peer_id == remote_peer_id)
+    {
+        remote_audio.received_audio_frames = remote_audio
+            .received_audio_frames
+            .saturating_add(u64::from(received_frames));
+        remote_audio.attached_at_ms = attached_at_ms;
+    } else {
+        session
+            .media_runtime
+            .remote_audio
+            .push(VoiceRemoteAudioView {
+                participant_id: remote_peer_id.clone(),
+                remote_peer_id: remote_peer_id.clone(),
+                stream_id: format!("native-rust-stream-{remote_peer_id}"),
+                audio_track_id: format!("native-rust-opus-sframe-{remote_peer_id}"),
+                playback_element_id: format!("voice-native-rust-audio-{remote_peer_id}"),
+                local_audio_tracks_sent: 1,
+                received_audio_frames: u64::from(received_frames),
+                attached_at_ms,
+            });
+    }
+    session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
+    session.media_runtime.local_capture_active = true;
+    session.media_runtime.remote_transport_active = true;
+    session.media_runtime.fail_closed_reason.clear();
+    session.media_runtime.status_copy =
+        "Backend-verified real microphone PCM is crossing the native Rust Opus/SFrame WebRTC DataChannel and decoded PCM is queued for WebAudio playback"
+            .to_owned();
+    session.route_copy =
+        "Direct STUN ICE established a native Rust WebRTC DataChannel; no TURN relay is configured"
+            .to_owned();
+    if first_remote_frame {
+        guard.state.push_event(
+            "voice.native_stream_remote_audio",
+            format!(
+                "Backend-verified and decoded first native WebRTC voice frame from {}",
+                redacted_observable_ref("peer", &remote_peer_id)
+            ),
+        );
+        guard.persist();
+        #[cfg(feature = "tauri-runtime")]
+        {
+            let state = guard.to_view();
+            drop(guard);
+            emit_background_app_events(&state, previous_cursor);
+        }
+    }
+    Ok(())
+}
+
+fn start_role_split_native_voice_runtime(
+    executor: Arc<tokio::runtime::Runtime>,
+    inputs: TextControlRuntimeAttachInputs,
+    role: ProviderTextControlRuntimePeerRole,
+    local_peer_id: SignalingPeerId,
+    remote_peer_id: SignalingPeerId,
+    codec: Arc<Mutex<NativeVoiceCodecState>>,
+) -> Result<discrypt_transport::ProviderTextControlRuntime, String> {
+    executor
+        .block_on(async move {
+            match role {
+                ProviderTextControlRuntimePeerRole::Offerer => {
+                    start_provider_webrtc_text_control_offer_runtime(
+                        inputs.profile,
+                        inputs.scope,
+                        &inputs.bootstrap_secret,
+                        &inputs.random_entropy,
+                        discrypt_transport::WebRtcNegotiationConfig::new(inputs.ice_config),
+                        local_peer_id,
+                        remote_peer_id,
+                    )
+                    .await
+                }
+                ProviderTextControlRuntimePeerRole::Answerer => {
+                    start_provider_webrtc_text_control_answer_runtime_with_answerer(
+                        inputs.profile,
+                        inputs.scope,
+                        &inputs.bootstrap_secret,
+                        &inputs.random_entropy,
+                        discrypt_transport::WebRtcNegotiationConfig::new(inputs.ice_config),
+                        local_peer_id,
+                        remote_peer_id,
+                        move |received| {
+                            process_live_native_voice_frame(&codec, received)?;
+                            Ok(Vec::new())
+                        },
+                    )
+                    .await
+                }
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
+    std::thread::spawn(move || {
+        let executor = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(executor) => Arc::new(executor),
+            Err(error) => {
+                let service = app_service();
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.pending_native_voice_transport_runtime = None;
+                guard.native_voice_transport_error = Some(error.to_string());
+                guard.state.push_command_error(
+                    "voice.native_stream_attach_failed",
+                    "start_native_voice_stream",
+                    "native_voice_executor_unavailable",
+                    format!("Could not start native voice executor: {error}"),
+                    "Retry after the verified backend can construct its Tokio WebRTC runtime",
+                );
+                guard.persist();
+                return;
+            }
+        };
+        let local_peer_id = match SignalingPeerId::new(job.request.local_peer_id.clone()) {
+            Ok(peer_id) => peer_id,
+            Err(error) => {
+                let service = app_service();
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.pending_native_voice_transport_runtime = None;
+                guard.native_voice_transport_error = Some(error.to_string());
+                guard.persist();
+                return;
+            }
+        };
+        let remote_peer_id = match SignalingPeerId::new(job.request.remote_peer_id.clone()) {
+            Ok(peer_id) => peer_id,
+            Err(error) => {
+                let service = app_service();
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.pending_native_voice_transport_runtime = None;
+                guard.native_voice_transport_error = Some(error.to_string());
+                guard.persist();
+                return;
+            }
+        };
+        let configured_stun_servers = job.inputs.ice_config.stun_servers.len();
+        let runtime_result = start_role_split_native_voice_runtime(
+            executor.clone(),
+            job.inputs,
+            job.role,
+            local_peer_id,
+            remote_peer_id,
+            job.codec.clone(),
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(feature = "tauri-runtime")]
+        let previous_cursor = guard.state.latest_event_cursor();
+        match runtime_result {
+            Ok(runtime) => {
+                let pending_matches = guard
+                    .pending_native_voice_transport_runtime
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.session_id == job.request.session_id
+                            && pending.role == job.role
+                            && pending.local_peer_id == job.request.local_peer_id
+                            && pending.remote_peer_id == job.request.remote_peer_id
+                    });
+                let session_matches = guard.state.voice_session.as_ref().is_some_and(|session| {
+                    session.joined && session.session_id == job.request.session_id
+                });
+                if !pending_matches || !session_matches {
+                    guard.pending_native_voice_transport_runtime = None;
+                    guard.native_voice_transport_error = Some(
+                        "Native voice runtime attach completed after the session changed"
+                            .to_owned(),
+                    );
+                    guard.persist();
+                    return;
+                }
+                let evidence = runtime.evidence().clone();
+                let owned_runtime = Arc::new(runtime);
+                let transport = owned_runtime.transport();
+                let receiver_abort = if job.role == ProviderTextControlRuntimePeerRole::Offerer {
+                    let receiver_transport = transport.clone();
+                    let receiver_codec = job.codec.clone();
+                    let receiver = executor.spawn(async move {
+                        while let Ok(received) = receiver_transport.recv_text_control_frame().await
+                        {
+                            if let Err(error) =
+                                process_live_native_voice_frame(&receiver_codec, received)
+                            {
+                                let service = app_service();
+                                if let Ok(mut guard) = service.lock() {
+                                    guard.native_voice_transport_error = Some(error.to_string());
+                                }
+                                break;
+                            }
+                        }
+                    });
+                    Some(receiver.abort_handle())
+                } else {
+                    None
+                };
+                guard.pending_native_voice_transport_runtime = None;
+                guard.native_voice_transport_error = None;
+                guard.native_voice_transport_runtime = Some(NativeVoiceTransportRuntime {
+                    transport,
+                    _owned_runtime: owned_runtime,
+                    executor,
+                    codec: job.codec,
+                    session_id: job.request.session_id.clone(),
+                    role: job.role,
+                    local_peer_id: job.request.local_peer_id,
+                    remote_peer_id: job.request.remote_peer_id,
+                    configured_stun_servers,
+                    direct_path_ready: evidence.direct_path_ready,
+                    data_channel_open: evidence.data_channel_open,
+                    frames_sent: Arc::new(AtomicU64::new(0)),
+                    receiver_abort,
+                });
+                if let Some(session) = &mut guard.state.voice_session {
+                    session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
+                    session.media_runtime.status_copy =
+                        "Backend-verified native Rust WebRTC DataChannel is open over direct STUN ICE; real microphone PCM is ready for Opus/SFrame transport"
+                            .to_owned();
+                    session.media_runtime.fail_closed_reason =
+                        "Waiting for the first authenticated remote Opus/SFrame packet before enabling playback evidence"
+                            .to_owned();
+                    session.route_copy =
+                        "Direct native Rust WebRTC DataChannel connected with STUN and zero configured TURN servers"
+                            .to_owned();
+                }
+                guard.state.push_event(
+                    "voice.native_stream_attached",
+                    format!(
+                        "Backend-verified native Rust WebRTC voice DataChannel opened as {} with STUN={} TURN=0",
+                        runtime_role_label(Some(job.role)),
+                        configured_stun_servers
+                    ),
+                );
+            }
+            Err(error) => {
+                guard.pending_native_voice_transport_runtime = None;
+                guard.native_voice_transport_error = Some(error.clone());
+                guard.state.push_command_error(
+                    "voice.native_stream_attach_failed",
+                    "start_native_voice_stream",
+                    "native_voice_webrtc_attach_failed",
+                    error,
+                    "Keep both peers online and verify direct UDP/STUN reachability; this voice path intentionally does not configure TURN",
+                );
+            }
+        }
+        guard.persist();
+        #[cfg(feature = "tauri-runtime")]
+        {
+            let state = guard.to_view();
+            drop(guard);
+            emit_background_app_events(&state, previous_cursor);
+        }
+    });
 }
 
 fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
@@ -20947,6 +22147,9 @@ mod tests {
         guard.state = load_state_from_path(path);
         guard.text_control_transport_runtimes.clear();
         guard.pending_text_control_transport_runtimes.clear();
+        guard.native_voice_transport_runtime = None;
+        guard.pending_native_voice_transport_runtime = None;
+        guard.native_voice_transport_error = None;
     }
 
     fn accept_dm_invite_as_test_profile(
@@ -29166,6 +30369,9 @@ mod tests {
                 state: guard.state.clone(),
                 text_control_transport_runtimes: BTreeMap::new(),
                 pending_text_control_transport_runtimes: BTreeMap::new(),
+                native_voice_transport_runtime: None,
+                pending_native_voice_transport_runtime: None,
+                native_voice_transport_error: None,
                 state_path_override: Some(bob_path.clone()),
             }
         };
@@ -39034,7 +40240,7 @@ mod tests {
         };
         // The owner's protected text: the public command path with the global
         // state swapped to this detached profile (the send mutates the swapped-in
-        // state and the MLS-encrypted envelope lands in its outbox).
+        // state and the signed MLS-encrypted envelope lands in its outbox).
         {
             let global = app_service();
             let mut guard = global
@@ -39203,5 +40409,96 @@ mod tests {
         std::fs::remove_file(owner_path).ok();
         std::fs::remove_file(j1_path).ok();
         std::fs::remove_file(j2_path).ok();
+    }
+
+    #[test]
+    fn native_voice_stream_codec_preserves_continuous_real_pcm_across_opus_sframe(
+    ) -> Result<(), String> {
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let mut alice = NativeVoiceCodecState::new_with_material(
+            &[23; 32],
+            7,
+            "group-native-voice",
+            "channel-native-voice",
+            "voice-session-native-voice",
+            "peer-alice",
+            "peer-bob",
+            100,
+            100,
+        )?;
+        let mut bob = NativeVoiceCodecState::new_with_material(
+            &[23; 32],
+            7,
+            "group-native-voice",
+            "channel-native-voice",
+            "voice-session-native-voice",
+            "peer-bob",
+            "peer-alice",
+            100,
+            100,
+        )?;
+        let pcm = (0..format.interleaved_samples_per_frame())
+            .map(|index| (((index % 48) as i16) - 24) * 400)
+            .collect::<Vec<_>>();
+
+        let first = alice.encode_pcm_frame(pcm.clone(), false, 1_000)?;
+        let second = alice.encode_pcm_frame(pcm, false, 1_020)?;
+        assert_eq!(first.capture_source, "webview-getusermedia-pcm");
+        assert_eq!(first.protected_frames[0].counter, 0);
+        assert_eq!(second.protected_frames[0].counter, 1);
+
+        bob.receive_wire_frame(first.clone())?;
+        bob.receive_wire_frame(second)?;
+        let playback = bob.take_playback_frames(8);
+        assert_eq!(playback.len(), 2);
+        assert!(playback.iter().all(|frame| frame.sample_rate_hz == 48_000));
+        assert!(playback.iter().all(|frame| frame.channels == 1));
+        assert!(playback
+            .iter()
+            .flat_map(|frame| frame.pcm_i16.iter())
+            .any(|sample| *sample != 0));
+        assert!(
+            bob.receive_wire_frame(first).is_err(),
+            "SFrame replay must fail closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_voice_runtime_derivation_is_session_scoped_and_stun_only() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("native-voice-runtime-stun-only");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Native voice policy".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.example.invalid:8883".to_owned()),
+            ice_stun_servers: Some(vec!["stun:stun.example.invalid:3478".to_owned()]),
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let state = load_state();
+        let base = state.text_control_runtime_inputs_for_active_scope(Some("mqtt"))?;
+        let voice = derive_native_voice_runtime_inputs(base.clone(), "voice-session-a")?;
+        let other_voice = derive_native_voice_runtime_inputs(base.clone(), "voice-session-b")?;
+
+        assert_eq!(voice.ice_config.stun_servers, base.ice_config.stun_servers);
+        assert!(voice.ice_config.turn_servers.is_empty());
+        assert_ne!(
+            voice.scope.scope_id_commitment,
+            base.scope.scope_id_commitment
+        );
+        assert_ne!(
+            voice.scope.scope_id_commitment,
+            other_voice.scope.scope_id_commitment
+        );
+        assert_ne!(voice.bootstrap_secret, base.bootstrap_secret);
+        assert_ne!(voice.random_entropy, base.random_entropy);
+        Ok(())
     }
 }
