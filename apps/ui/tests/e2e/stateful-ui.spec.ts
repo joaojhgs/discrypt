@@ -1263,6 +1263,56 @@ test("voice channel click fails closed when microphone permission is denied", as
   ).toBeVisible();
 });
 
+test("voice channel reports a busy microphone separately from denied permission", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Voice Device Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        ...navigator.mediaDevices,
+        getUserMedia: async () => {
+          throw new DOMException("Device or resource busy", "NotReadableError");
+        },
+      },
+    });
+  });
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(page.getByText(/microphone could not be opened/i)).toBeVisible();
+  await expect(page.getByText(/permission\/input device required/i)).toHaveCount(0);
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
+});
+
+test("voice channel fails closed when the real WebRTC runtime is unavailable", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Voice WebRTC Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+
+  await page.evaluate(() => {
+    Object.defineProperty(window, "RTCPeerConnection", {
+      configurable: true,
+      value: undefined,
+    });
+  });
+
+  await page.getByRole("button", { name: /Voice Lobby/ }).click();
+  await expect(page.getByText(/WebRTC audio runtime is unavailable/i)).toBeVisible();
+  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
+});
+
 // Coverage note: transport status surfaces signaling not-ready state before invite metadata when the diagnostics inspector is explicitly enabled; production default keeps it hidden.
 test("production UX hides diagnostics and manual transport controls by default", async ({
   page,

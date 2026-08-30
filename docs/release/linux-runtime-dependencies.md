@@ -14,14 +14,16 @@ The Linux release script produces the package formats enabled by `apps/desktop/s
 
 ## Runtime libraries users may need
 
-Discrypt is a Tauri v2 desktop app. The UI is rendered by the platform WebView stack, so native `.deb`/`.rpm` packages must resolve runtime WebKitGTK/GTK libraries. The production Linux storage path can use the OS keychain through the Freedesktop Secret Service API (`org.freedesktop.secrets`) on the desktop default collection, so users who choose OS-keyring storage require a Secret Service provider, user D-Bus session, and login-session keyring unlock integration. KDE/KWallet Secret Service and GNOME Keyring are both acceptable providers; the app must not force a GNOME-only collection when another desktop provider owns `org.freedesktop.secrets`. Development headers are only needed on build machines.
+Discrypt is a Tauri v2 desktop app. The UI is rendered by the platform WebView stack, so native `.deb`/`.rpm` packages must resolve runtime WebKitGTK/GTK libraries. Real voice capture, playback, and `RTCPeerConnection` also require the GStreamer ALSA/PulseAudio, WebRTC/SRTP, and libnice ICE plugins used by WebKitGTK. The production Linux storage path can use the OS keychain through the Freedesktop Secret Service API (`org.freedesktop.secrets`) on the desktop default collection, so users who choose OS-keyring storage require a Secret Service provider, user D-Bus session, and login-session keyring unlock integration. KDE/KWallet Secret Service and GNOME Keyring are both acceptable providers; the app must not force a GNOME-only collection when another desktop provider owns `org.freedesktop.secrets`. Development headers are only needed on build machines.
+
+The packaged desktop voice path is direct WebRTC with the configured STUN servers. Discrypt does not require or inject a TURN server for this path; this STUN-only policy means direct connectivity still depends on the peers' network topology.
 
 Common runtime dependency names by package family:
 
 | Package family | Runtime packages | Build-only packages that should **not** be required on user machines |
 | --- | --- | --- |
-| Debian/Ubuntu | `libwebkit2gtk-4.1-0`, `libgtk-3-0`, `gnome-keyring`, `dbus-user-session`, `libpam-gnome-keyring`, plus `libappindicator3-1` only if tray integration is enabled in the future | `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `build-essential`, `pkg-config` |
-| Fedora/RHEL/openSUSE | WebKitGTK 4.1 runtime package, GTK 3 runtime package, `gnome-keyring`, and appindicator/Ayatana runtime only if tray integration is enabled in the future | `webkit2gtk4.1-devel`, GTK development headers, compiler toolchains, `pkg-config` |
+| Debian/Ubuntu | `libwebkit2gtk-4.1-0`, `libgtk-3-0`, `gstreamer1.0-alsa`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-nice`, `gstreamer1.0-pulseaudio`, `gnome-keyring`, `dbus-user-session`, `libpam-gnome-keyring`, plus `libappindicator3-1` only if tray integration is enabled in the future | `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `build-essential`, `pkg-config` |
+| Fedora/RHEL/openSUSE | WebKitGTK 4.1 runtime package, GTK 3 runtime package, `gstreamer1-plugins-base`, `gstreamer1-plugins-good`, `gstreamer1-plugins-bad-free`, `libnice-gstreamer1`, `gnome-keyring`, and appindicator/Ayatana runtime only if tray integration is enabled in the future | `webkit2gtk4.1-devel`, GTK development headers, compiler toolchains, `pkg-config` |
 | AppImage | Bundled by the AppImage where practical; host still supplies kernel/glibc compatibility and desktop integration behavior. A D-Bus user session plus Secret Service provider such as `gnome-keyring` or compatible KWallet Secret Service is needed only for OS-keyring storage; password-vault storage does not require Secret Service. | WebKitGTK/GTK development headers should not be installed by end users to run the AppImage |
 
 ## Production storage setup
@@ -50,8 +52,8 @@ Use an older supported Linux baseline for release builds. Building on a newer di
 Recommended release validation order:
 
 1. Build with `npm --prefix apps/ui run release:linux` on the chosen Linux baseline.
-2. Inspect `.deb` metadata with `dpkg-deb -I target/release/bundle/deb/*.deb` and verify runtime dependencies only, including `gnome-keyring`, `dbus-user-session`, and `libpam-gnome-keyring` for OS-keyring storage support.
-3. Inspect `.rpm` metadata with `rpm -qpR target/release/bundle/rpm/*.rpm` and verify runtime dependencies only, including `gnome-keyring` for OS-keyring storage support.
+2. Inspect `.deb` metadata with `dpkg-deb -I target/release/bundle/deb/*.deb` and verify the GStreamer/libnice voice packages plus `gnome-keyring`, `dbus-user-session`, and `libpam-gnome-keyring` for OS-keyring storage support.
+3. Inspect `.rpm` metadata with `rpm -qpR target/release/bundle/rpm/*.rpm` and verify the GStreamer/libnice voice packages plus `gnome-keyring` for OS-keyring storage support.
 4. Run `npm --prefix apps/ui run smoke:linux-packages` to install and smoke-launch `.deb` and `.rpm` artifacts in clean Linux containers and smoke-launch the AppImage under Xvfb, plus separate OS-keyring smoke under `dbus-run-session` and an active `org.freedesktop.secrets` Secret Service provider.
 5. Smoke-run the AppImage on the oldest supported baseline and one current distro before publishing a public release.
 6. Confirm no end-user instructions mention development headers or compilers.

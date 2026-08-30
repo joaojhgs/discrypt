@@ -162,6 +162,7 @@ const diagnosticsUiEnabled =
 type VoiceDeviceAccess = {
   stream: MediaStream | null;
   microphone_permission: "granted" | "denied" | "prompt" | "unknown";
+  failure: VoiceDeviceFailure | null;
   input_device_id: string | null;
   input_device_label: string | null;
   output_device_id: string | null;
@@ -171,6 +172,10 @@ type VoiceDeviceAccess = {
   activity_rms_i16: number | null;
   activity_peak_i16: number | null;
   activity_captured_at_ms: number | null;
+};
+
+type VoiceDeviceFailure = {
+  message: string;
 };
 
 type VoiceDeviceOption = {
@@ -244,6 +249,7 @@ function generatedAutomationVoiceDeviceAccess(
   return {
     stream,
     microphone_permission: "granted",
+    failure: null,
     input_device_id: selectedGeneratedDeviceId,
     input_device_label: "Generated audio input",
     output_device_id: "default",
@@ -582,10 +588,12 @@ function textRuntimeRole(state: AppState): "offerer" | "answerer" {
 
 function emptyVoiceDeviceAccess(
   microphonePermission: VoiceDeviceAccess["microphone_permission"],
+  failure: VoiceDeviceFailure | null = null,
 ): VoiceDeviceAccess {
   return {
     stream: null,
     microphone_permission: microphonePermission,
+    failure,
     input_device_id: null,
     input_device_label: null,
     output_device_id: null,
@@ -595,6 +603,40 @@ function emptyVoiceDeviceAccess(
     activity_rms_i16: null,
     activity_peak_i16: null,
     activity_captured_at_ms: null,
+  };
+}
+
+function voiceDeviceFailure(error: unknown): VoiceDeviceFailure {
+  const name = error instanceof DOMException ? error.name : "";
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return {
+      message:
+        "Microphone permission/input device required before joining voice — Grant microphone permission and select an input device before joining voice",
+    };
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return {
+      message:
+        "No microphone was found — Connect or enable an input device before joining voice",
+    };
+  }
+  if (name === "NotReadableError" || name === "AbortError") {
+    return {
+      message:
+        "Microphone could not be opened — Close other audio apps and verify the device is available, then try again",
+    };
+  }
+  if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+    return {
+      message:
+        "The selected microphone is unavailable — Choose the system default or another input device",
+    };
+  }
+  const detail = error instanceof Error && error.message.trim()
+    ? `: ${error.message.trim()}`
+    : "";
+  return {
+    message: `Microphone capture failed${detail}`,
   };
 }
 
@@ -770,32 +812,10 @@ async function requestVoiceDeviceAccess(
   if (generatedAutomationAccess) return generatedAutomationAccess;
 
   if (!navigator.mediaDevices?.getUserMedia) {
-    if (window.__TAURI__?.core?.invoke) {
-      return {
-        stream: null,
-        microphone_permission: "granted",
-        input_device_id: "native-rust-default-capture",
-        input_device_label: "Native Rust capture source",
-        output_device_id: "native-rust-default-playback",
-        output_device_label: "Native Rust playback sink",
-        available_input_devices: [
-          {
-            device_id: "native-rust-default-capture",
-            label: "Native Rust capture source",
-          },
-        ],
-        available_output_devices: [
-          {
-            device_id: "native-rust-default-playback",
-            label: "Native Rust playback sink",
-          },
-        ],
-        activity_rms_i16: null,
-        activity_peak_i16: null,
-        activity_captured_at_ms: null,
-      };
-    }
-    return emptyVoiceDeviceAccess("denied");
+    return emptyVoiceDeviceAccess("unknown", {
+      message:
+        "WebRTC audio capture is unavailable — Install the required desktop media runtime and restart discrypt",
+    });
   }
 
   let stream: MediaStream | null = null;
@@ -847,6 +867,7 @@ async function requestVoiceDeviceAccess(
     return {
       stream,
       microphone_permission: "granted",
+      failure: null,
       input_device_id: input?.deviceId || "default",
       input_device_label: input?.label || "Default microphone",
       output_device_id: output?.deviceId || "default",
@@ -855,9 +876,15 @@ async function requestVoiceDeviceAccess(
       available_output_devices: availableOutputs,
       ...activity,
     };
-  } catch {
+  } catch (error) {
     stopMediaStream(stream);
-    return emptyVoiceDeviceAccess("denied");
+    const failure = voiceDeviceFailure(error);
+    const permission =
+      error instanceof DOMException &&
+      (error.name === "NotAllowedError" || error.name === "SecurityError")
+        ? "denied"
+        : "unknown";
+    return emptyVoiceDeviceAccess(permission, failure);
   }
 }
 
@@ -2555,6 +2582,40 @@ function App() {
           setSelectedVoiceOutputId("default");
         }
       }
+      if (voiceAccess.failure) {
+        reportCommandError(voiceAccess.failure.message, "join_voice");
+        stopLocalVoiceCapture();
+        return;
+      }
+      const forceNativeRustVoice = Boolean(
+        (
+          window as typeof window & {
+            __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
+          }
+        ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
+        window.localStorage?.getItem(
+          "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+        ) === "1",
+      );
+      if (!forceNativeRustVoice && typeof RTCPeerConnection === "undefined") {
+        reportCommandError(
+          "WebRTC audio runtime is unavailable — Install the required desktop media runtime and restart discrypt",
+          "join_voice",
+        );
+        stopLocalVoiceCapture();
+        return;
+      }
+      if (
+        !forceNativeRustVoice &&
+        (!voiceAccess.stream || localAudioTracks(voiceAccess.stream).length === 0)
+      ) {
+        reportCommandError(
+          "Microphone capture did not provide a live audio track — Select another input device and try again",
+          "join_voice",
+        );
+        stopLocalVoiceCapture();
+        return;
+      }
       const joinedState = await joinVoice({
         group_id: runtimeGroup.group_id,
         channel_id: voiceChannel.channel_id,
@@ -2628,16 +2689,6 @@ function App() {
           : joinedState.voice_session;
         const voicePeers = textRuntimePeerDefaults(mediaState);
         if (voiceSession) {
-          const forceNativeRustVoice = Boolean(
-            (
-              window as typeof window & {
-                __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
-              }
-            ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
-            window.localStorage?.getItem(
-              "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
-            ) === "1",
-          );
           const canUseWebViewRtc = Boolean(
             !forceNativeRustVoice &&
             voiceAccess.stream &&
@@ -2645,7 +2696,7 @@ function App() {
             localAudioTracks(voiceAccess.stream).length > 0,
           );
           if (canUseWebViewRtc && voiceAccess.stream) {
-            voiceMediaSessionRef.current = startWebViewVoiceMediaSession({
+            const mediaHandle = startWebViewVoiceMediaSession({
               session: voiceSession,
               localStream: voiceAccess.stream,
               inputGain: localMicGain,
@@ -2686,7 +2737,14 @@ function App() {
               },
               onStatus: (status) => reportCommandError(status, "Voice media"),
             });
-          } else {
+            voiceMediaSessionRef.current = mediaHandle;
+            if (!mediaHandle) {
+              const leftState = await leaveVoice({ session_id: sessionId });
+              setCommandState(leftState);
+              stopLocalVoiceCapture();
+              return;
+            }
+          } else if (forceNativeRustVoice) {
             voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
               session: voiceSession,
               localPeerId: voicePeers.local,
@@ -2700,6 +2758,15 @@ function App() {
                 }
               },
             });
+          } else {
+            reportCommandError(
+              "WebRTC audio session could not start with the selected microphone",
+              "join_voice",
+            );
+            const leftState = await leaveVoice({ session_id: sessionId });
+            setCommandState(leftState);
+            stopLocalVoiceCapture();
+            return;
           }
         }
       }

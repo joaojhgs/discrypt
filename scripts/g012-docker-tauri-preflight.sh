@@ -24,7 +24,8 @@ chmod 700 "$XDG_RUNTIME_DIR"
 apt-get update
 apt-get install -y --no-install-recommends \
   nodejs npm xvfb xauth dbus-x11 \
-  pulseaudio pulseaudio-utils alsa-utils gstreamer1.0-pulseaudio \
+  pulseaudio pulseaudio-utils alsa-utils \
+  gstreamer1.0-alsa gstreamer1.0-plugins-bad gstreamer1.0-nice gstreamer1.0-pulseaudio \
   webkit2gtk-driver libwebkit2gtk-4.1-dev libgtk-3-dev \
   libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config \
   ca-certificates curl

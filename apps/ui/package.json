@@ -22,6 +22,7 @@
     "release:linux:dry-run": "node ../../scripts/release-linux.mjs --dry-run",
     "test:release-linux": "node ../../scripts/check-release-linux.mjs",
     "test:linux-runtime-docs": "node ../../scripts/check-linux-runtime-docs.mjs",
+    "test:linux-voice-runtime": "node ../../scripts/check-linux-voice-runtime.mjs",
     "smoke:linux-packages": "node ../../scripts/smoke-linux-packages.mjs",
     "smoke:linux-packages:dry-run": "node ../../scripts/smoke-linux-packages.mjs --dry-run",
     "release:two-profile-harness-g010": "node ../../scripts/release-two-profile-harness-g010.mjs",

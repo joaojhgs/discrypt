@@ -9653,7 +9653,8 @@ fn enable_platform_webview_voice_features(
     let Some(main_webview) = app.get_webview_window("main") else {
         return Ok(());
     };
-    main_webview.with_webview(|platform_webview| {
+    let frontend_url = platform_webview_frontend_url(app.config(), tauri::is_dev())?;
+    main_webview.with_webview(move |platform_webview| {
         let webview = platform_webview.inner();
         if let Some(settings) = webview.settings() {
             // Wry enables WebAudio by default, but WebKitGTK keeps backend-verified WebRTC
@@ -9673,8 +9674,38 @@ fn enable_platform_webview_voice_features(
             }
             false
         });
+        // The configured main window starts at about:blank so WebKit receives
+        // the media settings and permission handler before its first real page
+        // navigation. Enabling WebRTC after Wry has loaded the frontend leaves
+        // RTCPeerConnection absent for the lifetime of that WebView.
+        webview.load_uri(frontend_url.as_str());
     })?;
     Ok(())
+}
+
+#[cfg(all(
+    feature = "tauri-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )
+))]
+fn platform_webview_frontend_url(
+    config: &tauri::utils::config::Config,
+    development: bool,
+) -> Result<tauri::Url, Box<dyn std::error::Error>> {
+    if development {
+        if let Some(dev_url) = &config.build.dev_url {
+            return Ok(dev_url.clone());
+        }
+    }
+    if let Some(tauri::utils::config::FrontendDist::Url(url)) = &config.build.frontend_dist {
+        return Ok(url.clone());
+    }
+    Ok(tauri::Url::parse("tauri://localhost")?)
 }
 
 #[cfg(all(
