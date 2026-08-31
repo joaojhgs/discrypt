@@ -1016,6 +1016,28 @@ if (!main.includes("window.__TAURI__?.event?.listen")) {
   failures.push("native UI must install a Tauri app_event listener");
 }
 if (
+  !main.includes(
+    "function tauriCommandRuntimeAvailable(): boolean",
+  ) ||
+  !main.includes("return Boolean(window.__TAURI__?.core?.invoke)") ||
+  !main.includes(
+    "const hasTauriCommandRuntime = tauriCommandRuntimeAvailable()",
+  ) ||
+  !main.includes("if (!commandState || !hasTauriCommandRuntime)")
+) {
+  failures.push(
+    "Tauri event synchronization must use IPC capability instead of a runtime copy label",
+  );
+}
+if (
+  main.includes('runtime_mode.mode !== "native"') ||
+  main.includes('runtime_mode.mode === "native"')
+) {
+  failures.push(
+    "runtime_mode labels must not be treated as the Tauri IPC capability boundary",
+  );
+}
+if (
   !main.includes("APP_EVENT_FALLBACK_POLL_MS") ||
   !main.includes("startFallbackPolling")
 ) {

@@ -2720,7 +2720,11 @@ where
 
     let webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
-    let sealed_offer = sealer.seal_description(&webrtc.create_offer().await?)?;
+    let sealed_offer = sealer.seal_description(
+        &webrtc
+            .create_complete_offer(Duration::from_secs(45))
+            .await?,
+    )?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
@@ -2994,7 +2998,9 @@ where
                 WebRtcNegotiationPayloadKind::Offer if !answer_sent => {
                     captured_sealed_offer = Some(signal.payload.clone());
                     let offer = sealer.open_description(&signal.payload)?;
-                    let answer = webrtc.create_answer(offer).await?;
+                    let answer = webrtc
+                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .await?;
                     let sealed_answer = sealer.seal_description(&answer)?;
                     captured_sealed_answer = Some(sealed_answer.clone());
                     if provider_runtime_debug_enabled() {
@@ -3726,6 +3732,10 @@ pub struct LocalConformanceProviderBus {
 #[derive(Debug, Default)]
 struct LocalConformanceState {
     rooms: BTreeMap<LocalRoomKey, LocalRoomState>,
+    #[cfg(test)]
+    drop_candidate_signals: bool,
+    #[cfg(test)]
+    dropped_candidate_signals: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -3756,6 +3766,18 @@ impl LocalConformanceProviderBus {
             TransportError::SignalingAdapter("local conformance bus lock poisoned".to_owned())
         })?;
         Ok(update(&mut state))
+    }
+
+    #[cfg(test)]
+    fn drop_candidate_signals_for_tests(&self) -> Result<(), TransportError> {
+        self.with_state(|state| {
+            state.drop_candidate_signals = true;
+        })
+    }
+
+    #[cfg(test)]
+    fn dropped_candidate_signal_count_for_tests(&self) -> Result<usize, TransportError> {
+        self.with_state(|state| state.dropped_candidate_signals)
     }
 
     /// Return relay-visible test material currently held by the local bus.
@@ -7101,6 +7123,17 @@ impl RendezvousRoom for LocalConformanceProviderRoom {
         payload: SealedWebRtcNegotiationPayload,
     ) -> Result<(), TransportError> {
         reject_forbidden_plaintext(&payload.ciphertext)?;
+        #[cfg(test)]
+        if self.bus.with_state(|state| {
+            let should_drop = state.drop_candidate_signals
+                && payload.kind == WebRtcNegotiationPayloadKind::Candidate;
+            if should_drop {
+                state.dropped_candidate_signals = state.dropped_candidate_signals.saturating_add(1);
+            }
+            should_drop
+        })? {
+            return Ok(());
+        }
         self.bus.with_state(|state| {
             state
                 .rooms
@@ -10449,9 +10482,10 @@ mod tests {
         ignore = "live provider-signaled WebRTC loopback readiness is runner-dependent outside Linux CI"
     )]
     #[tokio::test]
-    async fn live_provider_text_control_role_split_runtimes_connect_two_peers(
+    async fn live_provider_text_control_role_split_runtimes_connect_without_trickled_candidates(
     ) -> Result<(), TransportError> {
         let bus = LocalConformanceProviderBus::default();
+        bus.drop_candidate_signals_for_tests()?;
         let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus.clone());
         let profile = local_profile(SignalingAdapterKind::Mqtt)?;
         let scope = ConversationScope::new(
@@ -10464,10 +10498,12 @@ mod tests {
         )?;
         let bootstrap_secret = b"runtime split bootstrap secret with thirty two bytes";
         let random_entropy = b"runtime split entropy";
-        let ice_config = WebRtcNegotiationConfig::new(IceServerConfig::new(
-            vec![Endpoint::new("stun:127.0.0.1:3478")],
-            vec![],
-        )?);
+        let ice_config = WebRtcNegotiationConfig {
+            ice_servers: IceServerConfig::host_only(),
+            udp_addrs: vec!["127.0.0.1:0".to_owned()],
+            data_channel_label: "discrypt-control".to_owned(),
+            ice_transport_policy: crate::WebRtcIceTransportPolicy::All,
+        };
         let alice = SignalingPeerId::new("alice-installed-device")?;
         let bob = SignalingPeerId::new("bob-installed-device")?;
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
@@ -10586,6 +10622,7 @@ mod tests {
                 .as_slice(),
             &[notice, frame]
         );
+        assert!(bus.dropped_candidate_signal_count_for_tests()? > 0);
         assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
 
         offerer.close().await?;

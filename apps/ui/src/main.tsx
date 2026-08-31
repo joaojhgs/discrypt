@@ -1079,7 +1079,12 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
+function tauriCommandRuntimeAvailable(): boolean {
+  return Boolean(window.__TAURI__?.core?.invoke);
+}
+
 function App() {
+  const hasTauriCommandRuntime = tauriCommandRuntimeAvailable();
   const [commandState, setCommandState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -1416,7 +1421,7 @@ function App() {
   }, [commandState?.voice_session?.self_muted]);
 
   useEffect(() => {
-    if (!commandState || commandState.runtime_mode.mode !== "native") {
+    if (!commandState || !hasTauriCommandRuntime) {
       return;
     }
 
@@ -1518,7 +1523,7 @@ function App() {
         window.clearInterval(eventHealthResync);
       }
     };
-  }, [commandState?.runtime_mode.mode]);
+  }, [commandState?.runtime_mode.mode, hasTauriCommandRuntime]);
 
   async function applyCommand(
     command: Promise<AppState>,
@@ -1843,8 +1848,7 @@ function App() {
       !activeGroupId ||
       commandState.lifecycle === "first_run" ||
       commandState.storage_security.status !== "ready" ||
-      commandState.runtime_mode.mode !== "native" ||
-      !window.__TAURI__?.core?.invoke
+      !hasTauriCommandRuntime
     ) {
       return;
     }
@@ -1892,6 +1896,7 @@ function App() {
     commandState?.runtime_mode.mode,
     commandState?.storage_security.status,
     commandState?.profile?.user_id,
+    hasTauriCommandRuntime,
   ]);
 
   if (loadError) {
@@ -2970,7 +2975,7 @@ function App() {
         commandError={storageCommandError}
         onCreate={createCommandUser}
         onRecover={recoverCommandUser}
-        allowEmptyRecovery={appState.runtime_mode.mode !== "native"}
+        allowEmptyRecovery={!hasTauriCommandRuntime}
       />
     );
   }
@@ -5654,7 +5659,7 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
           <InfoRow
             title="Runtime"
             copy={
-              appState.runtime_mode.mode === "native"
+              tauriCommandRuntimeAvailable()
                 ? "Native Tauri commands"
                 : "Web runtime export"
             }
