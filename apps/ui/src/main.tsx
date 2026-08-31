@@ -158,6 +158,8 @@ type CommandNotification = {
 };
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 10_000;
+const APP_EVENT_POLL_LIMIT = 256;
+const APP_EVENT_FALLBACK_MAX_PAGES = 8;
 const diagnosticsUiEnabled =
   import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
 type VoiceDeviceAccess = {
@@ -1396,33 +1398,55 @@ function App() {
     let eventFallbackPoll: number | null = null;
     let eventHealthResync: number | null = null;
     let unlistenAppEvent: (() => void) | null = null;
+    let fallbackPollInFlight = false;
     const fallbackPollMs = tauriListen ? 30000 : 5000;
+
+    const loadCommandStateAfterEvents = (nextCursor: number) => {
+      void loadAppState()
+        .then((refreshed) => {
+          if (!cancelled) {
+            setCommandState(refreshed);
+            updateEventCursor(Math.max(nextCursor, refreshed.event_cursor));
+          }
+        })
+        .catch(() => undefined);
+    };
 
     const refreshCommandState = (stream: AppEventStreamView) => {
       if (stream.events.length === 0) {
         updateEventCursor(stream.next_cursor);
         return;
       }
-      void loadAppState()
-        .then((refreshed) => {
-          if (!cancelled) {
-            setCommandState(refreshed);
-            updateEventCursor(
-              Math.max(stream.next_cursor, refreshed.event_cursor),
-            );
-          }
-        })
-        .catch(() => undefined);
+      loadCommandStateAfterEvents(stream.next_cursor);
     };
 
     const pollAppEventFallback = () => {
-      void pollAppEvents({ after: eventCursorRef.current, limit: 32 })
-        .then((stream) => {
-          if (!cancelled) {
-            refreshCommandState(stream);
+      if (fallbackPollInFlight) return;
+      fallbackPollInFlight = true;
+      void (async () => {
+        let nextCursor = eventCursorRef.current;
+        let sawEvents = false;
+        for (let page = 0; page < APP_EVENT_FALLBACK_MAX_PAGES; page += 1) {
+          const stream = await pollAppEvents({
+            after: nextCursor,
+            limit: APP_EVENT_POLL_LIMIT,
+          });
+          if (cancelled) return;
+          sawEvents = sawEvents || stream.events.length > 0;
+          nextCursor = stream.next_cursor;
+          updateEventCursor(nextCursor);
+          if (!stream.has_more) {
+            break;
           }
-        })
-        .catch(() => undefined);
+        }
+        if (sawEvents) {
+          loadCommandStateAfterEvents(nextCursor);
+        }
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          fallbackPollInFlight = false;
+        });
     };
 
     const startFallbackPolling = () => {
@@ -1444,7 +1468,10 @@ function App() {
           }
           unlistenAppEvent = unlisten;
         })
-        .catch(startFallbackPolling);
+        .catch(() => {
+          pollAppEventFallback();
+          startFallbackPolling();
+        });
       startFallbackPolling();
       eventHealthResync = window.setInterval(
         pollAppEventFallback,

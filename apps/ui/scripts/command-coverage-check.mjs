@@ -1021,8 +1021,37 @@ if (
 ) {
   failures.push("poll_app_events must remain a named fallback path, not the primary native update path");
 }
+if (
+  !main.includes("const APP_EVENT_POLL_LIMIT = 256") ||
+  !main.includes("limit: APP_EVENT_POLL_LIMIT") ||
+  !main.includes("APP_EVENT_FALLBACK_MAX_PAGES") ||
+  !main.includes("stream.has_more") ||
+  !main.includes("updateEventCursor(nextCursor)")
+) {
+  failures.push(
+    "native app-event fallback must drain bounded retained backend event pages",
+  );
+}
+if (
+  !main.includes(".catch(() => {") ||
+  !main.includes("pollAppEventFallback();\n          startFallbackPolling();")
+) {
+  failures.push(
+    "native app-event listener rejection must trigger an immediate polling resync",
+  );
+}
 if (!main.includes("APP_EVENT_HEALTH_RESYNC_MS")) {
   failures.push("native app_event listener must retain a slow health-resync poll");
+}
+const tauriEventCapability = readFileSync(
+  new URL("../../desktop/src-tauri/capabilities/default.json", import.meta.url),
+  "utf8",
+);
+if (!tauriEventCapability.includes('"core:event:allow-listen"')) {
+  failures.push("main Tauri window capability must allow app_event listener registration");
+}
+if (!tauriEventCapability.includes('"core:event:allow-unlisten"')) {
+  failures.push("main Tauri window capability must allow app_event listener cleanup");
 }
 const voiceCleanupEffects =
   (

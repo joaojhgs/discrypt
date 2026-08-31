@@ -39845,6 +39845,30 @@ mod tests {
     }
 
     #[test]
+    fn tauri_main_window_can_subscribe_to_app_events() -> Result<(), String> {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .map_err(|error| format!("parse main Tauri capability: {error}"))?;
+        let windows = capability
+            .get("windows")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "main Tauri capability windows must be an array".to_owned())?;
+        assert!(windows.iter().any(|window| window == "main"));
+
+        let permissions = capability
+            .get("permissions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "main Tauri capability permissions must be an array".to_owned())?;
+        for required in ["core:event:allow-listen", "core:event:allow-unlisten"] {
+            assert!(
+                permissions.iter().any(|permission| permission == required),
+                "missing Tauri event permission {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn tauri_runtime_mutating_commands_are_wired_to_push_app_event_streams() {
         let source = include_str!("lib.rs");
         assert!(source.contains("const APP_EVENT_TAURI_TOPIC: &str = \"app_event\""));
