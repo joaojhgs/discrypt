@@ -4821,6 +4821,7 @@ impl TauriAppService {
                 self.persist();
                 return true;
             }
+            self.remove_terminal_text_control_runtimes_for_attach(active_session_id, key);
             if self
                 .text_control_transport_runtimes
                 .values()
@@ -4851,6 +4852,7 @@ impl TauriAppService {
             self.persist();
             return true;
         }
+        self.remove_terminal_text_control_runtimes_for_attach(active_session_id, key);
         if self.text_control_transport_runtimes.contains_key(key) {
             self.state.push_event(
                 "transport.text_runtime_attach_deduped",
@@ -4863,6 +4865,46 @@ impl TauriAppService {
             return true;
         }
         false
+    }
+
+    fn remove_terminal_text_control_runtimes_for_attach(
+        &mut self,
+        active_session_id: &str,
+        key: &TextControlRuntimeMapKey,
+    ) {
+        let stale_keys = self
+            .text_control_transport_runtimes
+            .iter()
+            .filter_map(|(runtime_key, runtime)| {
+                if runtime_key.session_id != active_session_id {
+                    return None;
+                }
+                if key.remote_peer_id.is_some() && runtime_key != key {
+                    return None;
+                }
+                text_control_runtime_metrics_snapshot(runtime)
+                    .filter(text_control_runtime_metrics_are_terminal)
+                    .map(|_| runtime_key.clone())
+            })
+            .collect::<Vec<_>>();
+        for stale_key in &stale_keys {
+            if self
+                .text_control_transport_runtimes
+                .remove(stale_key)
+                .is_some()
+            {
+                self.state.push_event(
+                    "transport.text_runtime_stale_removed",
+                    format!(
+                        "Removed stale text/control runtime session {} peer {:?} before duplicate attach detection because transport metrics were terminal",
+                        stale_key.session_id, stale_key.remote_peer_id
+                    ),
+                );
+            }
+        }
+        if !stale_keys.is_empty() {
+            self.persist();
+        }
     }
 
     fn text_control_runtime_attach_still_current(
@@ -20046,6 +20088,16 @@ fn text_control_runtime_metrics_snapshot(
     runtime: &TextControlTransportRuntime,
 ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
     runtime.transport.text_control_transport_metrics_snapshot()
+}
+
+fn text_control_runtime_metrics_are_terminal(
+    metrics: &discrypt_transport::WebRtcDataTransportMetrics,
+) -> bool {
+    !metrics.open
+        || matches!(
+            metrics.last_state.as_str(),
+            "closed" | "disconnected" | "error" | "failed" | "not_open"
+        )
 }
 
 fn unavailable_route_graph_edge(
@@ -36574,6 +36626,86 @@ mod tests {
             ),
             "different admitted remote peers need independent runtime map entries"
         );
+    }
+
+    #[test]
+    fn text_control_runtime_attach_dedupe_removes_terminal_runtime_before_reattach() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-terminal-dedupe");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("terminal-runtime-dedupe".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        let exact_key =
+            TextControlRuntimeMapKey::for_remote(active_session_id.clone(), "bob-runtime-peer");
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(FailingSendTextControlTransport::new()),
+            active_session_id.clone(),
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+        );
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &exact_key,
+            ),
+            "terminal exact-key runtime must be removed instead of deduping reattach"
+        );
+        assert!(
+            !guard
+                .text_control_transport_runtimes
+                .contains_key(&exact_key),
+            "terminal exact-key runtime must be removed from the runtime map"
+        );
+        drop(guard);
+
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(FailingSendTextControlTransport::new()),
+            active_session_id.clone(),
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let legacy_key = TextControlRuntimeMapKey::legacy(active_session_id.clone());
+        assert!(
+            !guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &legacy_key,
+            ),
+            "terminal session runtime must not dedupe legacy reattach"
+        );
+        assert!(
+            guard.text_control_transport_runtimes.is_empty(),
+            "terminal legacy-scoped cleanup must remove stale session runtimes"
+        );
+        assert!(guard.state.events.iter().any(|event| {
+            event.kind == "transport.text_runtime_stale_removed"
+                && event.summary.contains(&active_session_id)
+        }));
     }
 
     #[test]

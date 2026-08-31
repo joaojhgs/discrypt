@@ -19,8 +19,8 @@ use crate::{
     RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
-    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDiagnosticTimeline,
-    WebRtcNegotiationConfig, WebRtcSdpType,
+    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDataTransportMetrics,
+    WebRtcDiagnosticTimeline, WebRtcNegotiationConfig, WebRtcSdpType,
 };
 #[cfg(any(
     test,
@@ -915,9 +915,17 @@ pub struct ProviderTextControlRuntimePeerEvidence {
 /// the selected adapter.
 pub struct ProviderTextControlRuntime {
     evidence: ProviderTextControlRuntimePeerEvidence,
-    peer: Arc<WebRtcNegotiator>,
+    transport: Arc<dyn TextControlDataTransport>,
+    peer: Option<Arc<WebRtcNegotiator>>,
+    recovering_peer: Option<Arc<RecoveringProviderTextControlPeer>>,
     receiver_task: Option<tokio::task::JoinHandle<()>>,
+    supervisor_task: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
+
+#[allow(dead_code)]
+type ProviderTextControlAnswerer =
+    Arc<dyn Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static>;
 
 impl ProviderTextControlRuntime {
     /// Runtime attach evidence safe to surface to the app/UI.
@@ -929,26 +937,162 @@ impl ProviderTextControlRuntime {
     /// App-facing text/control DataChannel transport for this installed peer.
     #[must_use]
     pub fn transport(&self) -> Arc<dyn TextControlDataTransport> {
-        self.peer.clone()
+        self.transport.clone()
     }
 
     /// Abort any receive/respond loop and close this peer connection.
     pub async fn close(mut self) -> Result<(), TransportError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(task) = self.receiver_task.take() {
             task.abort();
             let _ = task.await;
         }
-        self.peer.tear_down().await?;
+        let supervisor_closed_peer = self.supervisor_task.is_some();
+        if let Some(task) = self.supervisor_task.take() {
+            let _ = task.await;
+        }
+        if let Some(peer) = self.peer.take() {
+            peer.tear_down().await?;
+        }
+        if !supervisor_closed_peer {
+            if let Some(peer) = self.recovering_peer.take() {
+                peer.tear_down_current().await?;
+            }
+        }
         Ok(())
     }
 }
 
 impl Drop for ProviderTextControlRuntime {
     fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(task) = self.receiver_task.take() {
             task.abort();
         }
+        let _ = self.supervisor_task.take();
     }
+}
+
+#[allow(dead_code)]
+struct RecoveringProviderTextControlPeer {
+    current: Mutex<Arc<WebRtcNegotiator>>,
+    inbound_tx: tokio::sync::mpsc::Sender<ProviderTextControlInboundFrame>,
+    inbound_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ProviderTextControlInboundFrame>>,
+}
+
+struct ProviderTextControlInboundFrame {
+    peer: Arc<WebRtcNegotiator>,
+    frame: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl RecoveringProviderTextControlPeer {
+    fn new(peer: Arc<WebRtcNegotiator>) -> Self {
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(128);
+        Self {
+            current: Mutex::new(peer),
+            inbound_tx,
+            inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+        }
+    }
+
+    fn inbound_sender(&self) -> tokio::sync::mpsc::Sender<ProviderTextControlInboundFrame> {
+        self.inbound_tx.clone()
+    }
+
+    fn current(&self) -> Arc<WebRtcNegotiator> {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace_current(&self, peer: Arc<WebRtcNegotiator>) -> Arc<WebRtcNegotiator> {
+        std::mem::replace(
+            &mut *self
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            peer,
+        )
+    }
+
+    async fn tear_down_current(&self) -> Result<(), TransportError> {
+        self.current().tear_down().await
+    }
+
+    async fn recv_inbound_frame(&self) -> Result<ProviderTextControlInboundFrame, TransportError> {
+        self.inbound_rx.lock().await.recv().await.ok_or_else(|| {
+            TransportError::Unavailable("provider text/control receiver closed".to_owned())
+        })
+    }
+}
+
+#[async_trait]
+impl TextControlDataTransport for RecoveringProviderTextControlPeer {
+    async fn send_text_control_frame(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        self.current().send_text_control_frame(frame).await
+    }
+
+    async fn recv_text_control_frame(&self) -> Result<Vec<u8>, TransportError> {
+        Ok(self.recv_inbound_frame().await?.frame)
+    }
+
+    async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics {
+        self.current().text_control_transport_metrics().await
+    }
+
+    fn text_control_transport_metrics_snapshot(&self) -> Option<WebRtcDataTransportMetrics> {
+        self.current().text_control_transport_metrics_snapshot()
+    }
+}
+
+#[allow(dead_code)]
+fn spawn_provider_text_control_answer_receiver(
+    recovering_peer: Arc<RecoveringProviderTextControlPeer>,
+    answerer: ProviderTextControlAnswerer,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let received = match recovering_peer.recv_inbound_frame().await {
+                Ok(received) => received,
+                Err(_) => break,
+            };
+            let response = match answerer(received.frame) {
+                Ok(response) => response,
+                Err(_) => break,
+            };
+            if response.is_empty() {
+                continue;
+            }
+            let _ = received.peer.send_text_control_frame(response).await;
+        }
+    })
+}
+
+#[allow(dead_code)]
+fn spawn_provider_text_control_inbound_forwarder(
+    peer: Arc<WebRtcNegotiator>,
+    inbound_tx: tokio::sync::mpsc::Sender<ProviderTextControlInboundFrame>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok(received) = peer.recv_text_control_frame().await {
+            if inbound_tx
+                .send(ProviderTextControlInboundFrame {
+                    peer: peer.clone(),
+                    frame: received,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 /// Inputs required to resume a provider-backed WebRTC text/control runtime from a
@@ -2964,8 +3108,12 @@ where
     session.close().await?;
     Ok(ProviderTextControlRuntime {
         evidence,
-        peer: webrtc,
+        transport: webrtc.clone(),
+        peer: Some(webrtc),
+        recovering_peer: None,
         receiver_task: None,
+        supervisor_task: None,
+        shutdown: None,
     })
 }
 
@@ -2989,7 +3137,9 @@ async fn start_provider_webrtc_text_control_answer_runtime_with_adapter<A, F>(
     answerer: F,
 ) -> Result<ProviderTextControlRuntime, TransportError>
 where
-    A: SignalingAdapter,
+    A: SignalingAdapter + 'static,
+    A::Session: 'static,
+    <A::Session as AdapterSession>::Room: 'static,
     F: Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static,
 {
     let endpoint_label = profile
@@ -3021,6 +3171,7 @@ where
     let mut answer_sent = false;
     let mut active_negotiation_id = None;
     let mut active_negotiation_expires_at = None;
+    let mut seen_negotiation_ids = HashSet::new();
     let mut pending_remote_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut last_answer_resend = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -3123,16 +3274,23 @@ where
                         if !provider_answerer_allows_offer_replacement(
                             active_negotiation_id,
                             signal_negotiation_id,
-                            webrtc.direct_path_metrics().await.direct_path_ready,
+                            &seen_negotiation_ids,
                         ) {
                             continue;
                         }
-                        webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?);
+                        let old_webrtc = std::mem::replace(
+                            &mut webrtc,
+                            Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?),
+                        );
+                        old_webrtc.tear_down().await?;
                         sealed_ice_candidates.clear();
                         sealed_local_ice_candidates.clear();
                         pending_remote_candidates.clear();
                     }
                     active_negotiation_id = signal_negotiation_id;
+                    if let Some(negotiation_id) = signal_negotiation_id {
+                        seen_negotiation_ids.insert(negotiation_id);
+                    }
                     active_negotiation_expires_at = signal.payload.expires_at_unix_seconds;
                     captured_sealed_offer = Some(signal.payload.clone());
                     let offer = sealer.open_description(&signal.payload)?;
@@ -3234,7 +3392,7 @@ where
         endpoint_label.clone(),
         rendezvous_topic.clone(),
         captured_sealed_offer,
-        captured_sealed_answer,
+        captured_sealed_answer.clone(),
         sealed_ice_candidates,
     );
     let evidence = ProviderTextControlRuntimePeerEvidence {
@@ -3243,47 +3401,265 @@ where
         endpoint_label,
         scope_commitment: scope.scope_id_commitment,
         rendezvous_topic,
-        local_peer_id,
-        remote_peer_id,
+        local_peer_id: local_peer_id.clone(),
+        remote_peer_id: remote_peer_id.clone(),
         role: ProviderTextControlRuntimePeerRole::Answerer,
         direct_path_ready: direct_metrics.direct_path_ready,
         data_channel_open: data_metrics.open,
         runtime_spec,
     };
 
-    room.leave().await?;
-    session.close().await?;
-
-    let answerer_webrtc = webrtc.clone();
-    let answerer = Arc::new(answerer);
-    let receiver_task = tokio::spawn(async move {
+    let recovering_peer = Arc::new(RecoveringProviderTextControlPeer::new(webrtc.clone()));
+    let transport: Arc<dyn TextControlDataTransport> = recovering_peer.clone();
+    let answerer: ProviderTextControlAnswerer = Arc::new(answerer);
+    let receiver_task =
+        spawn_provider_text_control_answer_receiver(recovering_peer.clone(), answerer.clone());
+    let initial_forwarder = spawn_provider_text_control_inbound_forwarder(
+        webrtc.clone(),
+        recovering_peer.inbound_sender(),
+    );
+    let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let supervisor_recovering_peer = recovering_peer.clone();
+    let supervisor_local_peer_id = local_peer_id.clone();
+    let supervisor_remote_peer_id = remote_peer_id.clone();
+    let supervisor_negotiation_config = negotiation_config.clone();
+    let supervisor_task = tokio::spawn(async move {
+        let mut current_webrtc = webrtc;
+        let mut forwarder_task = initial_forwarder;
+        let mut active_negotiation_id = active_negotiation_id;
+        let mut active_negotiation_expires_at = active_negotiation_expires_at;
+        let mut seen_negotiation_ids = seen_negotiation_ids;
+        let mut captured_sealed_answer = captured_sealed_answer;
+        let mut sealed_local_ice_candidates = sealed_local_ice_candidates;
+        let mut last_answer_resend = Instant::now();
         loop {
-            let received = match answerer_webrtc.recv_text_control_frame().await {
-                Ok(received) => received,
-                Err(_) => break,
-            };
-            let response = match answerer(received) {
-                Ok(response) => response,
-                Err(_) => break,
-            };
-            if response.is_empty() {
-                continue;
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
-            if answerer_webrtc
-                .send_text_control_frame(response)
-                .await
-                .is_err()
-            {
-                break;
+
+            if last_answer_resend.elapsed() >= Duration::from_secs(2) {
+                if let Some(answer) = &captured_sealed_answer {
+                    let _ = room
+                        .send_signal(supervisor_remote_peer_id.clone(), answer.clone())
+                        .await;
+                }
+                for candidate in &sealed_local_ice_candidates {
+                    let _ = room
+                        .send_signal(supervisor_remote_peer_id.clone(), candidate.clone())
+                        .await;
+                }
+                last_answer_resend = Instant::now();
+            }
+
+            for candidate in current_webrtc.drain_local_candidates().await {
+                let Ok(sealed_candidate) = sealer.seal_candidate_for_negotiation_until(
+                    &candidate,
+                    active_negotiation_id,
+                    active_negotiation_expires_at,
+                ) else {
+                    continue;
+                };
+                sealed_local_ice_candidates.push(sealed_candidate.clone());
+                let _ = room
+                    .send_signal(supervisor_remote_peer_id.clone(), sealed_candidate)
+                    .await;
+            }
+
+            let signals = match room.take_signals().await {
+                Ok(signals) => signals,
+                Err(_) => break,
+            };
+            for signal in signals {
+                if signal.from_peer != supervisor_remote_peer_id
+                    || signal.to_peer != supervisor_local_peer_id
+                {
+                    continue;
+                }
+                let signal_negotiation_id = signal.payload.negotiation_id;
+                if signal_negotiation_id.is_none()
+                    || !provider_signal_is_current(&signal.payload, Utc::now().timestamp())
+                {
+                    continue;
+                }
+                match signal.payload.kind {
+                    WebRtcNegotiationPayloadKind::Offer
+                        if signal_negotiation_id != active_negotiation_id =>
+                    {
+                        if !provider_answerer_allows_offer_replacement(
+                            active_negotiation_id,
+                            signal_negotiation_id,
+                            &seen_negotiation_ids,
+                        ) {
+                            continue;
+                        }
+                        let replacement = match provider_answerer_build_ready_peer_for_offer(
+                            &room,
+                            &sealer,
+                            supervisor_negotiation_config.clone(),
+                            supervisor_remote_peer_id.clone(),
+                            signal.payload,
+                        )
+                        .await
+                        {
+                            Ok(replacement) => replacement,
+                            Err(_) => continue,
+                        };
+                        active_negotiation_id = replacement.negotiation_id;
+                        if let Some(negotiation_id) = replacement.negotiation_id {
+                            seen_negotiation_ids.insert(negotiation_id);
+                        }
+                        active_negotiation_expires_at = replacement.expires_at;
+                        captured_sealed_answer = Some(replacement.sealed_answer);
+                        sealed_local_ice_candidates = replacement.sealed_local_ice_candidates;
+                        forwarder_task.abort();
+                        let old_webrtc =
+                            supervisor_recovering_peer.replace_current(replacement.peer.clone());
+                        let _ = old_webrtc.tear_down().await;
+                        current_webrtc = replacement.peer.clone();
+                        forwarder_task = spawn_provider_text_control_inbound_forwarder(
+                            replacement.peer,
+                            supervisor_recovering_peer.inbound_sender(),
+                        );
+                        last_answer_resend = Instant::now();
+                    }
+                    WebRtcNegotiationPayloadKind::Candidate
+                        if provider_signal_matches_negotiation(
+                            &signal.payload,
+                            active_negotiation_id,
+                        ) =>
+                    {
+                        if let Ok(candidate) = sealer.open_candidate(&signal.payload) {
+                            let _ = current_webrtc.add_remote_candidate(candidate).await;
+                        }
+                    }
+                    WebRtcNegotiationPayloadKind::Offer
+                    | WebRtcNegotiationPayloadKind::Answer
+                    | WebRtcNegotiationPayloadKind::Candidate => {}
+                }
             }
         }
+        forwarder_task.abort();
+        let _ = current_webrtc.tear_down().await;
+        let _ = room.leave().await;
+        let _ = session.close().await;
     });
 
     Ok(ProviderTextControlRuntime {
         evidence,
-        peer: webrtc,
+        transport,
+        peer: None,
+        recovering_peer: Some(recovering_peer),
         receiver_task: Some(receiver_task),
+        supervisor_task: Some(supervisor_task),
+        shutdown: Some(shutdown),
     })
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+struct ProviderAnswererReplacementPeer {
+    peer: Arc<WebRtcNegotiator>,
+    negotiation_id: Option<WebRtcNegotiationId>,
+    expires_at: Option<i64>,
+    sealed_answer: SealedWebRtcNegotiationPayload,
+    sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+async fn provider_answerer_build_ready_peer_for_offer<R>(
+    room: &R,
+    sealer: &WebRtcNegotiationSealer,
+    negotiation_config: WebRtcNegotiationConfig,
+    remote_peer_id: SignalingPeerId,
+    offer_payload: SealedWebRtcNegotiationPayload,
+) -> Result<ProviderAnswererReplacementPeer, TransportError>
+where
+    R: RendezvousRoom,
+{
+    let negotiation_id = offer_payload.negotiation_id;
+    let expires_at = offer_payload.expires_at_unix_seconds;
+    let peer = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
+    let offer = sealer.open_description(&offer_payload)?;
+    let answer = peer
+        .create_candidate_bundled_answer(offer, PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
+        .await?;
+    let sealed_answer =
+        sealer.seal_description_for_negotiation_until(&answer, negotiation_id, expires_at)?;
+    room.send_signal(remote_peer_id.clone(), sealed_answer.clone())
+        .await?;
+
+    let mut sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
+    let mut last_answer_resend = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        if last_answer_resend.elapsed() >= Duration::from_secs(2) {
+            room.send_signal(remote_peer_id.clone(), sealed_answer.clone())
+                .await?;
+            for candidate in &sealed_local_ice_candidates {
+                room.send_signal(remote_peer_id.clone(), candidate.clone())
+                    .await?;
+            }
+            last_answer_resend = Instant::now();
+        }
+
+        for candidate in peer.drain_local_candidates().await {
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                negotiation_id,
+                expires_at,
+            )?;
+            sealed_local_ice_candidates.push(sealed_candidate.clone());
+            room.send_signal(remote_peer_id.clone(), sealed_candidate)
+                .await?;
+        }
+
+        for signal in room.take_signals().await? {
+            if signal.from_peer != remote_peer_id {
+                continue;
+            }
+            if !provider_signal_matches_negotiation(&signal.payload, negotiation_id)
+                || !provider_signal_is_current(&signal.payload, Utc::now().timestamp())
+            {
+                continue;
+            }
+            if signal.payload.kind == WebRtcNegotiationPayloadKind::Candidate {
+                peer.add_remote_candidate(sealer.open_candidate(&signal.payload)?)
+                    .await?;
+            }
+        }
+
+        if peer.direct_path_metrics().await.direct_path_ready {
+            peer.wait_text_control_transport_ready(Duration::from_secs(5))
+                .await?;
+            return Ok(ProviderAnswererReplacementPeer {
+                peer,
+                negotiation_id,
+                expires_at,
+                sealed_answer,
+                sealed_local_ice_candidates,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(TransportError::Unavailable(
+        "provider-signaled answerer replacement WebRTC runtime data channel did not open"
+            .to_owned(),
+    ))
 }
 
 #[cfg(any(
@@ -3756,11 +4132,13 @@ fn provider_signal_is_current(
 fn provider_answerer_allows_offer_replacement(
     active_negotiation_id: Option<WebRtcNegotiationId>,
     incoming_negotiation_id: Option<WebRtcNegotiationId>,
-    direct_path_ready: bool,
+    seen_negotiation_ids: &HashSet<WebRtcNegotiationId>,
 ) -> bool {
-    incoming_negotiation_id.is_some()
-        && incoming_negotiation_id != active_negotiation_id
-        && !direct_path_ready
+    let Some(incoming_negotiation_id) = incoming_negotiation_id else {
+        return false;
+    };
+    Some(incoming_negotiation_id) != active_negotiation_id
+        && !seen_negotiation_ids.contains(&incoming_negotiation_id)
 }
 
 /// Production readiness for a provider adapter boundary.
@@ -7710,24 +8088,27 @@ mod tests {
     }
 
     #[test]
-    fn provider_answerer_replaces_unready_replayed_offer_with_fresh_generation() {
-        let replayed_id = WebRtcNegotiationId::generate();
+    fn provider_answerer_replaces_with_unseen_fresh_generation() {
+        let active_id = WebRtcNegotiationId::generate();
         let fresh_id = WebRtcNegotiationId::generate();
+        let mut seen_negotiation_ids = HashSet::new();
+        seen_negotiation_ids.insert(active_id);
 
         assert!(provider_answerer_allows_offer_replacement(
-            Some(replayed_id),
+            Some(active_id),
             Some(fresh_id),
-            false
+            &seen_negotiation_ids
+        ));
+        seen_negotiation_ids.insert(fresh_id);
+        assert!(!provider_answerer_allows_offer_replacement(
+            Some(active_id),
+            Some(fresh_id),
+            &seen_negotiation_ids
         ));
         assert!(!provider_answerer_allows_offer_replacement(
-            Some(replayed_id),
-            Some(fresh_id),
-            true
-        ));
-        assert!(!provider_answerer_allows_offer_replacement(
-            Some(replayed_id),
-            Some(replayed_id),
-            false
+            Some(active_id),
+            Some(active_id),
+            &seen_negotiation_ids
         ));
     }
 
@@ -10989,6 +11370,185 @@ mod tests {
         assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
 
         offerer.close().await?;
+        answerer.close().await?;
+        Ok(())
+    }
+
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "live provider-signaled WebRTC loopback readiness is runner-dependent outside Linux CI"
+    )]
+    #[tokio::test]
+    async fn provider_text_control_answerer_runtime_survives_offerer_reconnect(
+    ) -> Result<(), TransportError> {
+        let bus = LocalConformanceProviderBus::default();
+        let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus.clone());
+        let profile = local_profile(SignalingAdapterKind::Mqtt)?;
+        let scope = ConversationScope::new(
+            ConnectivityScopeLevel::Dm,
+            derive_scope_commitment(
+                ConnectivityScopeLevel::Dm,
+                b"alice bob reconnect live runtime",
+                "runtime reconnect",
+            ),
+        )?;
+        let bootstrap_secret = b"runtime reconnect bootstrap secret with thirty two bytes";
+        let random_entropy = b"runtime reconnect entropy";
+        let ice_config = WebRtcNegotiationConfig {
+            ice_servers: IceServerConfig::host_only(),
+            udp_addrs: vec!["127.0.0.1:0".to_owned()],
+            data_channel_label: "discrypt-control".to_owned(),
+            ice_transport_policy: crate::WebRtcIceTransportPolicy::All,
+        };
+        let alice = SignalingPeerId::new("alice-reconnect-installed-device")?;
+        let bob = SignalingPeerId::new("bob-reconnect-installed-device")?;
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let answerer_received = received.clone();
+
+        let answerer_task = tokio::spawn(
+            start_provider_webrtc_text_control_answer_runtime_with_adapter(
+                adapter.clone(),
+                profile.clone(),
+                scope.clone(),
+                bootstrap_secret,
+                random_entropy,
+                ice_config.clone(),
+                bob.clone(),
+                alice.clone(),
+                move |frame| {
+                    answerer_received
+                        .lock()
+                        .map_err(|_| {
+                            TransportError::Unavailable(
+                                "reconnect answerer receipt lock poisoned".to_owned(),
+                            )
+                        })?
+                        .push(frame.clone());
+                    Ok(format!("ciphertext:reconnect-receipt:{}", sha256_hex(&frame)).into_bytes())
+                },
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let first_offerer = start_provider_webrtc_text_control_offer_runtime_with_adapter(
+            adapter.clone(),
+            profile.clone(),
+            scope.clone(),
+            bootstrap_secret,
+            random_entropy,
+            ice_config.clone(),
+            alice.clone(),
+            bob.clone(),
+        )
+        .await?;
+        let answerer = timeout(Duration::from_secs(10), answerer_task)
+            .await
+            .map_err(|_| {
+                TransportError::Unavailable(
+                    "timed out waiting for reconnect answerer runtime".to_owned(),
+                )
+            })?
+            .map_err(|error| {
+                TransportError::Unavailable(format!(
+                    "reconnect answerer runtime task join failed: {error}"
+                ))
+            })??;
+        let answerer_transport = answerer.transport();
+
+        let first_frame = b"ciphertext:reconnect-frame:first".to_vec();
+        let first_expected_receipt =
+            format!("ciphertext:reconnect-receipt:{}", sha256_hex(&first_frame)).into_bytes();
+        first_offerer
+            .transport()
+            .send_text_control_frame(first_frame.clone())
+            .await?;
+        let first_receipt = timeout(
+            Duration::from_secs(5),
+            first_offerer.transport().recv_text_control_frame(),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable("timed out receiving first reconnect receipt".to_owned())
+        })??;
+        assert_eq!(first_receipt, first_expected_receipt);
+
+        let first_answerer_push = b"ciphertext:reconnect-answerer-push:first".to_vec();
+        answerer_transport
+            .send_text_control_frame(first_answerer_push.clone())
+            .await?;
+        let first_pushed = timeout(
+            Duration::from_secs(5),
+            first_offerer.transport().recv_text_control_frame(),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable("timed out receiving first answerer push".to_owned())
+        })??;
+        assert_eq!(first_pushed, first_answerer_push);
+
+        first_offerer.close().await?;
+
+        let second_offerer = timeout(
+            Duration::from_secs(60),
+            start_provider_webrtc_text_control_offer_runtime_with_adapter(
+                adapter,
+                profile,
+                scope,
+                bootstrap_secret,
+                random_entropy,
+                ice_config,
+                alice.clone(),
+                bob,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable(
+                "timed out waiting for second reconnect offerer runtime".to_owned(),
+            )
+        })??;
+
+        let second_frame = b"ciphertext:reconnect-frame:second".to_vec();
+        let second_expected_receipt =
+            format!("ciphertext:reconnect-receipt:{}", sha256_hex(&second_frame)).into_bytes();
+        second_offerer
+            .transport()
+            .send_text_control_frame(second_frame.clone())
+            .await?;
+        let second_receipt = timeout(
+            Duration::from_secs(5),
+            second_offerer.transport().recv_text_control_frame(),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable("timed out receiving second reconnect receipt".to_owned())
+        })??;
+        assert_eq!(second_receipt, second_expected_receipt);
+
+        let second_answerer_push = b"ciphertext:reconnect-answerer-push:second".to_vec();
+        answerer_transport
+            .send_text_control_frame(second_answerer_push.clone())
+            .await?;
+        let second_pushed = timeout(
+            Duration::from_secs(5),
+            second_offerer.transport().recv_text_control_frame(),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Unavailable("timed out receiving second answerer push".to_owned())
+        })??;
+        assert_eq!(second_pushed, second_answerer_push);
+
+        assert_eq!(
+            received
+                .lock()
+                .map_err(|_| TransportError::Unavailable("receipt lock poisoned".to_owned()))?
+                .as_slice(),
+            &[first_frame, second_frame]
+        );
+        assert_no_forbidden_plaintext(&bus.relay_visible_material_for_tests());
+
+        second_offerer.close().await?;
         answerer.close().await?;
         Ok(())
     }

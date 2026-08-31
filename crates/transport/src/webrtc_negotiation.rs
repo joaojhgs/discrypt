@@ -882,6 +882,7 @@ struct DataChannelHub {
     label: String,
     channels: Arc<Mutex<Vec<Arc<dyn DataChannel>>>>,
     channel_keys: Arc<Mutex<HashSet<(String, u16)>>>,
+    open_channel_keys: Arc<Mutex<HashSet<(String, u16)>>>,
     send_lock: Arc<Mutex<()>>,
     next_frame_id: Arc<AtomicU64>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
@@ -907,6 +908,7 @@ impl DataChannelHub {
             label,
             channels: Arc::new(Mutex::new(Vec::new())),
             channel_keys: Arc::new(Mutex::new(HashSet::new())),
+            open_channel_keys: Arc::new(Mutex::new(HashSet::new())),
             send_lock: Arc::new(Mutex::new(())),
             next_frame_id: Arc::new(AtomicU64::new(1)),
             inbound_tx,
@@ -950,21 +952,22 @@ impl DataChannelHub {
         record_timeline_event(&self.timeline, event).await;
         let inbound_tx = self.inbound_tx.clone();
         let metrics = Arc::clone(&self.metrics);
-        let open = Arc::clone(&self.open);
         let connection_ready = Arc::clone(&self.connection_ready);
         let unavailable = Arc::clone(&self.unavailable);
         let terminal = Arc::clone(&self.terminal);
         let state_notify = Arc::clone(&self.state_notify);
         let timeline = Arc::clone(&self.timeline);
-        let channels = Arc::clone(&self.channels);
-        let channel_keys = Arc::clone(&self.channel_keys);
+        let hub = self.clone();
         let channel_key = (label, channel.id());
         tokio::spawn(async move {
             let mut reassembler = DataChannelFrameReassembler::default();
             while let Some(event) = channel.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
-                        open.store(true, Ordering::Release);
+                        let still_attached = hub.mark_data_channel_open(&channel_key).await;
+                        if !still_attached {
+                            break;
+                        }
                         let terminal = terminal.load(Ordering::Acquire);
                         let usable = connection_ready.load(Ordering::Acquire) && !terminal;
                         if usable {
@@ -1038,17 +1041,7 @@ impl DataChannelHub {
                         }
                     }
                     DataChannelEvent::OnClose => {
-                        open.store(false, Ordering::Release);
-                        unavailable.store(true, Ordering::Release);
-                        {
-                            channel_keys.lock().await.remove(&channel_key);
-                            let mut channels = channels.lock().await;
-                            channels.retain(|attached| attached.id() != channel_key.1);
-                            let mut metrics = metrics.lock().await;
-                            metrics.attached_channels = channels.len() as u64;
-                            metrics.open = false;
-                            metrics.last_state = "closed".to_owned();
-                        }
+                        hub.detach_data_channel(&channel_key, "closed").await;
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closed".to_owned());
@@ -1057,31 +1050,23 @@ impl DataChannelHub {
                         break;
                     }
                     DataChannelEvent::OnClosing => {
-                        open.store(false, Ordering::Release);
-                        unavailable.store(true, Ordering::Release);
-                        let mut metrics = metrics.lock().await;
-                        metrics.open = false;
-                        metrics.last_state = "closing".to_owned();
-                        drop(metrics);
+                        hub.detach_data_channel(&channel_key, "closing").await;
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closing".to_owned());
                         record_timeline_event(&timeline, event).await;
                         state_notify.notify_waiters();
+                        break;
                     }
                     DataChannelEvent::OnError => {
-                        open.store(false, Ordering::Release);
-                        unavailable.store(true, Ordering::Release);
-                        let mut metrics = metrics.lock().await;
-                        metrics.open = false;
-                        metrics.last_state = "error".to_owned();
-                        drop(metrics);
+                        hub.detach_data_channel(&channel_key, "error").await;
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("error".to_owned());
                         event.failure_reason = Some("DataChannel event error".to_owned());
                         record_timeline_event(&timeline, event).await;
                         state_notify.notify_waiters();
+                        break;
                     }
                     DataChannelEvent::OnBufferedAmountLow => {
                         metrics.lock().await.last_state = "buffered_amount_low".to_owned();
@@ -1128,17 +1113,23 @@ impl DataChannelHub {
             return Err(self.unavailable_error());
         }
         let _send_guard = self.send_lock.lock().await;
-        let channels = self.channels.lock().await;
-        let channel = channels
-            .first()
-            .cloned()
-            .ok_or_else(|| TransportError::Unavailable("no DataChannel attached".to_owned()))?;
-        drop(channels);
-        if channel.ready_state().await.map_err(data_channel_error)? != RTCDataChannelState::Open {
-            return Err(TransportError::Unavailable(
-                "DataChannel is not open".to_owned(),
-            ));
+        let open_channel_keys = self.open_channel_keys.lock().await.clone();
+        let channels = self.channels.lock().await.clone();
+        let mut selected = None;
+        for channel in channels {
+            let channel_key = (self.label.clone(), channel.id());
+            if !open_channel_keys.contains(&channel_key) {
+                continue;
+            }
+            if channel.ready_state().await.map_err(data_channel_error)? == RTCDataChannelState::Open
+            {
+                selected = Some(channel);
+                break;
+            }
         }
+        let channel = selected.ok_or_else(|| {
+            TransportError::Unavailable("no open DataChannel attached".to_owned())
+        })?;
         let sent_len = frame.len();
         for message in wire_messages {
             channel
@@ -1158,6 +1149,39 @@ impl DataChannelHub {
         event.count = Some(sent_len as u64);
         record_timeline_event(&self.timeline, event).await;
         Ok(())
+    }
+
+    async fn detach_data_channel(&self, channel_key: &(String, u16), last_state: &str) {
+        self.channel_keys.lock().await.remove(channel_key);
+        self.open_channel_keys.lock().await.remove(channel_key);
+        let mut channels = self.channels.lock().await;
+        channels.retain(|attached| attached.id() != channel_key.1);
+        let attached_channels = channels.len() as u64;
+        drop(channels);
+
+        let has_open_channel = !self.open_channel_keys.lock().await.is_empty();
+        let terminal = self.terminal.load(Ordering::Acquire);
+        let usable = has_open_channel && self.connection_ready.load(Ordering::Acquire) && !terminal;
+        self.open.store(has_open_channel, Ordering::Release);
+        self.unavailable
+            .store(!has_open_channel || terminal, Ordering::Release);
+
+        let mut metrics = self.metrics.lock().await;
+        metrics.attached_channels = attached_channels;
+        metrics.open = usable;
+        metrics.last_state = last_state.to_owned();
+    }
+
+    async fn mark_data_channel_open(&self, channel_key: &(String, u16)) -> bool {
+        if !self.channel_keys.lock().await.contains(channel_key) {
+            return false;
+        }
+        self.open_channel_keys
+            .lock()
+            .await
+            .insert(channel_key.clone());
+        self.open.store(true, Ordering::Release);
+        true
     }
 
     async fn recv(&self) -> Result<Vec<u8>, TransportError> {
@@ -1263,6 +1287,7 @@ impl DataChannelHub {
         self.connection_ready.store(false, Ordering::Release);
         self.unavailable.store(true, Ordering::Release);
         self.terminal.store(true, Ordering::Release);
+        self.open_channel_keys.lock().await.clear();
         let mut metrics = self.metrics.lock().await;
         metrics.open = false;
         metrics.last_state = "closed".to_owned();
@@ -2315,6 +2340,7 @@ mod tests {
     use crate::{Endpoint, TurnServerConfig};
     use chrono::Duration as ChronoDuration;
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
     use tokio::time::{sleep, Duration, Instant};
     use webrtc::data_channel::RTCDataChannelId;
 
@@ -2322,14 +2348,26 @@ mod tests {
         id: RTCDataChannelId,
         label: String,
         events: Mutex<VecDeque<DataChannelEvent>>,
+        ready_state: Mutex<RTCDataChannelState>,
+        sends: AtomicUsize,
     }
 
     impl MockDataChannel {
         fn new(id: RTCDataChannelId, label: &str) -> Self {
+            Self::with_ready_state(id, label, RTCDataChannelState::Open)
+        }
+
+        fn with_ready_state(
+            id: RTCDataChannelId,
+            label: &str,
+            ready_state: RTCDataChannelState,
+        ) -> Self {
             Self {
                 id,
                 label: label.to_owned(),
                 events: Mutex::new(VecDeque::new()),
+                ready_state: Mutex::new(ready_state),
+                sends: AtomicUsize::new(0),
             }
         }
 
@@ -2338,7 +2376,13 @@ mod tests {
                 id,
                 label: label.to_owned(),
                 events: Mutex::new(VecDeque::from(events)),
+                ready_state: Mutex::new(RTCDataChannelState::Open),
+                sends: AtomicUsize::new(0),
             }
+        }
+
+        fn sent_count(&self) -> usize {
+            self.sends.load(Ordering::Acquire)
         }
     }
 
@@ -2373,7 +2417,7 @@ mod tests {
         }
 
         async fn ready_state(&self) -> webrtc::error::Result<RTCDataChannelState> {
-            Ok(RTCDataChannelState::Open)
+            Ok(*self.ready_state.lock().await)
         }
 
         async fn buffered_amount_high_threshold(&self) -> webrtc::error::Result<u32> {
@@ -2399,6 +2443,7 @@ mod tests {
         }
 
         async fn send(&self, _data: BytesMut) -> webrtc::error::Result<()> {
+            self.sends.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -2474,6 +2519,113 @@ mod tests {
             event.kind == "data_channel"
                 && event.state.as_deref() == Some("duplicate_attach_ignored")
         }));
+    }
+
+    #[tokio::test]
+    async fn data_channel_send_skips_stale_first_channel() -> Result<(), TransportError> {
+        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
+        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
+        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
+            .await;
+
+        let stale = Arc::new(MockDataChannel::with_ready_state(
+            7,
+            "discrypt-text-control",
+            RTCDataChannelState::Closing,
+        ));
+        let healthy = Arc::new(MockDataChannel::with_events(
+            8,
+            "discrypt-text-control",
+            vec![DataChannelEvent::OnOpen],
+        ));
+        let stale_channel: Arc<dyn DataChannel> = stale.clone();
+        let healthy_channel: Arc<dyn DataChannel> = healthy.clone();
+        hub.attach(stale_channel).await;
+        hub.attach(healthy_channel).await;
+        sleep(Duration::from_millis(25)).await;
+
+        hub.send(b"receipt over healthy channel".to_vec()).await?;
+
+        assert_eq!(
+            stale.sent_count(),
+            0,
+            "a stale first DataChannel must not receive outgoing frames"
+        );
+        assert_eq!(
+            healthy.sent_count(),
+            1,
+            "outgoing frames must use the open replacement DataChannel"
+        );
+        let metrics = hub.snapshot().await;
+        assert!(
+            metrics.open,
+            "a stale attached channel must not hide a healthy open DataChannel"
+        );
+        assert_eq!(metrics.attached_channels, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_channel_closing_detaches_only_that_channel() -> Result<(), TransportError> {
+        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
+        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
+        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
+            .await;
+
+        let healthy = Arc::new(MockDataChannel::with_events(
+            8,
+            "discrypt-text-control",
+            vec![DataChannelEvent::OnOpen],
+        ));
+        let healthy_channel: Arc<dyn DataChannel> = healthy.clone();
+        hub.attach(healthy_channel).await;
+        sleep(Duration::from_millis(25)).await;
+
+        let closing_channel: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
+            9,
+            "discrypt-text-control",
+            vec![DataChannelEvent::OnClosing],
+        ));
+        hub.attach(closing_channel).await;
+        sleep(Duration::from_millis(25)).await;
+
+        let metrics = hub.snapshot().await;
+        assert!(
+            metrics.open,
+            "detaching one closing channel must preserve another open channel"
+        );
+        assert_eq!(metrics.attached_channels, 1);
+        hub.send(b"still usable after stale closing channel".to_vec())
+            .await?;
+        assert_eq!(healthy.sent_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_channel_closing_event_loop_cannot_reopen_detached_channel(
+    ) -> Result<(), TransportError> {
+        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
+        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
+        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
+            .await;
+
+        let closing_then_open: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
+            10,
+            "discrypt-text-control",
+            vec![DataChannelEvent::OnClosing, DataChannelEvent::OnOpen],
+        ));
+        hub.attach(closing_then_open).await;
+        sleep(Duration::from_millis(25)).await;
+
+        let metrics = hub.snapshot().await;
+        assert!(
+            !metrics.open,
+            "a detached DataChannel must not re-open the hub from later events"
+        );
+        assert_eq!(metrics.attached_channels, 0);
+        assert_eq!(metrics.last_state, "closing");
+        assert!(!hub.open.load(Ordering::Acquire));
+        Ok(())
     }
 
     #[tokio::test]
