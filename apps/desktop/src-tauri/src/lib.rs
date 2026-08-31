@@ -10398,8 +10398,11 @@ struct LinuxAlsaPlaybackDevice {
 #[cfg(target_os = "linux")]
 impl LinuxAlsaPlaybackDevice {
     #[cfg(any(test, feature = "tauri-runtime"))]
-    fn alsa_name(&self) -> String {
-        format!("plughw:{},{}", self.card, self.device)
+    fn openal_config(&self, card_reference: &str) -> String {
+        format!(
+            "[alsa]\ndevice = dmix:CARD={card_reference},DEV={}\ncapture = dsnoop:CARD={card_reference},DEV={}\n",
+            self.device, self.device
+        )
     }
 
     fn display_label(&self) -> String {
@@ -10478,8 +10481,12 @@ fn configure_linux_openal_fallback() {
             return;
         }
     }
-    let alsa_name = device.alsa_name();
-    if std::fs::write(&config_path, format!("[alsa]\ndevice = {alsa_name}\n")).is_err() {
+    let card_reference = std::fs::read_to_string(format!("/proc/asound/card{}/id", device.card))
+        .ok()
+        .map(|card_id| card_id.trim().to_owned())
+        .filter(|card_id| !card_id.is_empty())
+        .unwrap_or_else(|| device.card.to_string());
+    if std::fs::write(&config_path, device.openal_config(&card_reference)).is_err() {
         return;
     }
     std::env::set_var("ALSOFT_CONF", &config_path);
@@ -30179,7 +30186,10 @@ mod tests {
             .expect("a playback-capable ALSA device should be selected");
         assert_eq!(selected.card, 2);
         assert_eq!(selected.device, 0);
-        assert_eq!(selected.alsa_name(), "plughw:2,0");
+        assert_eq!(
+            selected.openal_config("Generic_1"),
+            "[alsa]\ndevice = dmix:CARD=Generic_1,DEV=0\ncapture = dsnoop:CARD=Generic_1,DEV=0\n"
+        );
         assert_eq!(
             selected.display_label(),
             "ALC287 Analog (ALSA card 2, device 0)"
