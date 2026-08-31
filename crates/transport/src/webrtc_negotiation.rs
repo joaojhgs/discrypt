@@ -32,6 +32,8 @@ const DATA_CHANNEL_CHUNK_MAGIC: &[u8; 4] = b"DCR1";
 const DATA_CHANNEL_CHUNK_HEADER_BYTES: usize = 20;
 const DATA_CHANNEL_CHUNK_PAYLOAD_BYTES: usize = 900;
 const DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES: usize = 1024 * 1024;
+const ICE_CANDIDATE_SETTLE_DURATION: Duration = Duration::from_millis(500);
+const ICE_CANDIDATE_POLL_DURATION: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct PendingDataChannelFrame {
@@ -1268,6 +1270,7 @@ pub struct WebRtcNegotiator {
     ice_gathering_complete: Arc<Notify>,
     data_channels: DataChannelHub,
     data_channel_label: String,
+    external_candidates_configured: bool,
     turn_endpoints: Vec<Endpoint>,
 }
 
@@ -1328,6 +1331,8 @@ impl WebRtcNegotiator {
             .map_err(|err| {
                 TransportError::Unavailable(format!("build WebRTC peer failed: {err}"))
             })?;
+        let external_candidates_configured = !config.ice_servers.stun_servers.is_empty()
+            || !config.ice_servers.turn_servers.is_empty();
         Ok(Self {
             peer_connection: Box::new(peer_connection),
             candidates,
@@ -1337,6 +1342,7 @@ impl WebRtcNegotiator {
             ice_gathering_complete,
             data_channels,
             data_channel_label: config.data_channel_label,
+            external_candidates_configured,
             turn_endpoints: config
                 .ice_servers
                 .turn_servers
@@ -1396,6 +1402,22 @@ impl WebRtcNegotiator {
         self.local_description().await
     }
 
+    /// Create a local offer whose SDP snapshots a stable gathered candidate set.
+    ///
+    /// Some native WebRTC implementations gather usable host and server-reflexive
+    /// candidates without ever reporting the terminal `Complete` state. Provider
+    /// signaling therefore waits for a quiet candidate interval, preferring an
+    /// external candidate when STUN or TURN is configured, and then keeps trickle
+    /// ICE active for candidates that arrive after the bundled SDP is sent.
+    pub async fn create_candidate_bundled_offer(
+        &self,
+        duration: Duration,
+    ) -> Result<WebRtcSessionDescription, TransportError> {
+        let _initial_offer = self.create_offer().await?;
+        self.wait_ice_candidate_snapshot(duration).await?;
+        self.local_description().await
+    }
+
     /// Apply a remote offer, then create and set a local SDP answer.
     pub async fn create_answer(
         &self,
@@ -1449,6 +1471,19 @@ impl WebRtcNegotiator {
     ) -> Result<WebRtcSessionDescription, TransportError> {
         let _initial_answer = self.create_answer(remote_offer).await?;
         self.wait_ice_gathering_complete(duration).await?;
+        self.local_description().await
+    }
+
+    /// Create a local answer whose SDP snapshots a stable gathered candidate set.
+    ///
+    /// This is the answer-side counterpart to [`Self::create_candidate_bundled_offer`].
+    pub async fn create_candidate_bundled_answer(
+        &self,
+        remote_offer: WebRtcSessionDescription,
+        duration: Duration,
+    ) -> Result<WebRtcSessionDescription, TransportError> {
+        let _initial_answer = self.create_answer(remote_offer).await?;
+        self.wait_ice_candidate_snapshot(duration).await?;
         self.local_description().await
     }
 
@@ -1582,6 +1617,51 @@ impl WebRtcNegotiator {
             Err(TransportError::Unavailable(
                 "ICE gathering completion notification arrived before metrics updated".to_owned(),
             ))
+        }
+    }
+
+    async fn wait_ice_candidate_snapshot(&self, duration: Duration) -> Result<(), TransportError> {
+        let deadline = Instant::now() + duration;
+        let mut last_candidate_count = 0;
+        let mut last_candidate_change = Instant::now();
+        loop {
+            let (candidate_count, has_external_candidate) = {
+                let candidates = self.candidates.lock().await;
+                (
+                    candidates.len(),
+                    candidates.iter().any(|candidate| {
+                        ice_candidate_type(candidate).is_some_and(|kind| kind != "host")
+                    }),
+                )
+            };
+            if candidate_count != last_candidate_count {
+                last_candidate_count = candidate_count;
+                last_candidate_change = Instant::now();
+            }
+
+            let gathering_complete =
+                self.metrics.lock().await.ice_gathering_state == RTCIceGatheringState::Complete;
+            let preferred_candidate_available = candidate_count > 0
+                && (!self.external_candidates_configured || has_external_candidate);
+            if candidate_count > 0
+                && (gathering_complete
+                    || (preferred_candidate_available
+                        && last_candidate_change.elapsed() >= ICE_CANDIDATE_SETTLE_DURATION))
+            {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return if candidate_count > 0 {
+                    Ok(())
+                } else {
+                    Err(TransportError::Unavailable(format!(
+                        "ICE produced no local candidates within {} ms",
+                        duration.as_millis()
+                    )))
+                };
+            }
+            tokio::time::sleep(ICE_CANDIDATE_POLL_DURATION).await;
         }
     }
 

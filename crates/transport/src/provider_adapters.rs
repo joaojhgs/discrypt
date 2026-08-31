@@ -76,6 +76,16 @@ use tokio::time::Duration;
 ))]
 use tokio::time::Instant;
 
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+const PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// End-to-end readiness state used by registry and fallback planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2500,7 +2510,7 @@ where
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
 
     let offer = alice_webrtc
-        .create_complete_offer(Duration::from_secs(45))
+        .create_candidate_bundled_offer(PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
         .await?;
     let sealed_offer = sealer.seal_description(&offer)?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
@@ -2524,7 +2534,10 @@ where
                 WebRtcNegotiationPayloadKind::Offer => {
                     let offer = sealer.open_description(&signal.payload)?;
                     let answer = bob_webrtc
-                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .create_candidate_bundled_answer(
+                            offer,
+                            PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT,
+                        )
                         .await?;
                     let sealed_answer = sealer.seal_description(&answer)?;
                     captured_sealed_answer = Some(sealed_answer.clone());
@@ -2722,7 +2735,7 @@ where
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
     let sealed_offer = sealer.seal_description(
         &webrtc
-            .create_complete_offer(Duration::from_secs(45))
+            .create_candidate_bundled_offer(PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
             .await?,
     )?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
@@ -2999,7 +3012,10 @@ where
                     captured_sealed_offer = Some(signal.payload.clone());
                     let offer = sealer.open_description(&signal.payload)?;
                     let answer = webrtc
-                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .create_candidate_bundled_answer(
+                            offer,
+                            PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT,
+                        )
                         .await?;
                     let sealed_answer = sealer.seal_description(&answer)?;
                     captured_sealed_answer = Some(sealed_answer.clone());
@@ -3227,7 +3243,7 @@ where
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
 
     let offer = alice_webrtc
-        .create_complete_offer(Duration::from_secs(45))
+        .create_candidate_bundled_offer(PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
         .await?;
     let sealed_offer = sealer.seal_description(&offer)?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
@@ -3251,7 +3267,10 @@ where
                 WebRtcNegotiationPayloadKind::Offer => {
                     let offer = sealer.open_description(&signal.payload)?;
                     let answer = bob_webrtc
-                        .create_complete_answer(offer, Duration::from_secs(45))
+                        .create_candidate_bundled_answer(
+                            offer,
+                            PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT,
+                        )
                         .await?;
                     let sealed_answer = sealer.seal_description(&answer)?;
                     captured_sealed_answer = Some(sealed_answer.clone());
