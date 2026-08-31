@@ -353,6 +353,7 @@ export function startWebViewVoiceMediaSession(
   const processedCapture = createGainControlledStream(
     options.localStream,
     options.inputGain ?? 100,
+    options.onLocalActivity,
   );
   const outboundStream = processedCapture.stream;
   const audioTracks = localAudioTracks(outboundStream);
@@ -361,6 +362,7 @@ export function startWebViewVoiceMediaSession(
     audioTracks.length === 0 ||
     !options.session.joined
   ) {
+    processedCapture.close();
     options.onStatus?.(
       "WebView RTCPeerConnection voice media did not start: browser RTCPeerConnection or local audio tracks are unavailable",
     );
@@ -381,6 +383,7 @@ export function startWebViewVoiceMediaSession(
       pc.addTrack(track, outboundStream);
     }
   } catch (error) {
+    processedCapture.close();
     pc.close();
     options.onStatus?.(
       `WebView RTCPeerConnection voice media did not start: ${
@@ -543,6 +546,11 @@ export function startWebViewVoiceMediaSession(
 function createGainControlledStream(
   stream: MediaStream,
   gainPercent: number,
+  onLocalActivity?: (reading: {
+    activity_rms_i16: number;
+    activity_peak_i16: number;
+    activity_captured_at_ms: number;
+  }) => void,
 ): {
   stream: MediaStream;
   setGain: (gainPercent: number) => void;
@@ -561,19 +569,54 @@ function createGainControlledStream(
     const source = context.createMediaStreamSource(stream);
     const gain = context.createGain();
     const destination = context.createMediaStreamDestination();
+    const analyser = onLocalActivity ? context.createAnalyser() : null;
+    let activityTimer: number | null = null;
+    let closed = false;
     const setGain = (nextPercent: number) => {
       gain.gain.value = Math.max(0, Math.min(2, nextPercent / 100));
     };
     setGain(gainPercent);
     source.connect(gain);
     gain.connect(destination);
+    if (analyser && onLocalActivity) {
+      analyser.fftSize = 1024;
+      gain.connect(analyser);
+      const activitySamples = new Uint8Array(analyser.fftSize);
+      const sampleActivity = () => {
+        if (closed) return;
+        analyser.getByteTimeDomainData(activitySamples);
+        let squareSum = 0;
+        let peak = 0;
+        for (const sample of activitySamples) {
+          const centered = Math.abs(sample - 128) / 128;
+          squareSum += centered * centered;
+          peak = Math.max(peak, centered);
+        }
+        const rms = Math.sqrt(squareSum / activitySamples.length);
+        onLocalActivity({
+          activity_rms_i16: Math.round(Math.min(1, rms) * 32767),
+          activity_peak_i16: Math.round(Math.min(1, peak) * 32767),
+          activity_captured_at_ms: Date.now(),
+        });
+        activityTimer = window.setTimeout(sampleActivity, 750);
+      };
+      void context
+        .resume()
+        .catch(() => undefined)
+        .finally(() => {
+          activityTimer = window.setTimeout(sampleActivity, 750);
+        });
+    }
     return {
       stream: destination.stream,
       setGain,
       close: () => {
+        closed = true;
+        if (activityTimer !== null) window.clearTimeout(activityTimer);
         try {
           source.disconnect();
           gain.disconnect();
+          analyser?.disconnect();
           void context.close();
         } catch {
           // Closing media graph nodes is best effort; track cleanup is owned by

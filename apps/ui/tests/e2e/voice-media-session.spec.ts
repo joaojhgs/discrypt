@@ -3,6 +3,7 @@ import { Browser, expect, Page, test } from "playwright/test";
 type VoiceMediaEvidence = {
   getUserMediaCalls: number;
   getUserMediaConstraints: MediaStreamConstraints[];
+  audioContextsCreated: number;
   localAudioTracksSent: number;
   remoteTrackEvents: number;
   playbackAttachments: number;
@@ -21,6 +22,7 @@ async function installVoiceMediaHarness(
     const evidence: VoiceMediaEvidence = {
       getUserMediaCalls: 0,
       getUserMediaConstraints: [],
+      audioContextsCreated: 0,
       localAudioTracksSent: 0,
       remoteTrackEvents: 0,
       playbackAttachments: 0,
@@ -100,6 +102,9 @@ async function installVoiceMediaHarness(
 
     class E2EAudioContext {
       state = "running";
+      constructor() {
+        evidence.audioContextsCreated += 1;
+      }
       createMediaStreamSource() {
         return { connect: () => undefined, disconnect: () => undefined };
       }
@@ -369,6 +374,11 @@ test("two profiles attach local microphone tracks and surface remote audio playb
       await expect
         .poll(async () => (await readEvidence(page)).getUserMediaCalls)
         .toBeGreaterThan(0);
+      // Gain and activity share one long-lived graph; a preflight or separate
+      // analyser graph would compete for a direct ALSA output device.
+      await expect
+        .poll(async () => (await readEvidence(page)).audioContextsCreated)
+        .toBe(1);
       await expect
         .poll(async () => (await readEvidence(page)).localAudioTracksSent)
         .toBeGreaterThan(0);

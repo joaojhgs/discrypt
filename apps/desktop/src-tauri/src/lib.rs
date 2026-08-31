@@ -10398,11 +10398,18 @@ struct LinuxAlsaPlaybackDevice {
 #[cfg(target_os = "linux")]
 impl LinuxAlsaPlaybackDevice {
     #[cfg(any(test, feature = "tauri-runtime"))]
-    fn openal_config(&self, card_reference: &str) -> String {
-        format!(
-            "[alsa]\ndevice = dmix:CARD={card_reference},DEV={}\ncapture = dsnoop:CARD={card_reference},DEV={}\n",
-            self.device, self.device
-        )
+    fn openal_config(&self, card_reference: &str, shared_pcm: bool) -> String {
+        if shared_pcm {
+            format!(
+                "[alsa]\ndevice = dmix:CARD={card_reference},DEV={}\ncapture = dsnoop:CARD={card_reference},DEV={}\n",
+                self.device, self.device
+            )
+        } else {
+            format!(
+                "[alsa]\ndevice = plughw:CARD={card_reference},DEV={}\ncapture = plughw:CARD={card_reference},DEV={}\n",
+                self.device, self.device
+            )
+        }
     }
 
     fn display_label(&self) -> String {
@@ -10486,7 +10493,17 @@ fn configure_linux_openal_fallback() {
         .map(|card_id| card_id.trim().to_owned())
         .filter(|card_id| !card_id.is_empty())
         .unwrap_or_else(|| device.card.to_string());
-    if std::fs::write(&config_path, device.openal_config(&card_reference)).is_err() {
+    let shared_pcm = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/snd/timer")
+        .is_ok();
+    if std::fs::write(
+        &config_path,
+        device.openal_config(&card_reference, shared_pcm),
+    )
+    .is_err()
+    {
         return;
     }
     std::env::set_var("ALSOFT_CONF", &config_path);
@@ -10494,8 +10511,9 @@ fn configure_linux_openal_fallback() {
         std::env::set_var("ALSOFT_DRIVERS", "alsa");
     }
     eprintln!(
-        "discrypt-linux-audio-fallback output={} config={}",
+        "discrypt-linux-audio-fallback output={} mode={} config={}",
         device.display_label(),
+        if shared_pcm { "shared" } else { "direct" },
         config_path.display()
     );
     let _ = LINUX_ALSA_PLAYBACK_FALLBACK.set(device);
@@ -30187,8 +30205,12 @@ mod tests {
         assert_eq!(selected.card, 2);
         assert_eq!(selected.device, 0);
         assert_eq!(
-            selected.openal_config("Generic_1"),
+            selected.openal_config("Generic_1", true),
             "[alsa]\ndevice = dmix:CARD=Generic_1,DEV=0\ncapture = dsnoop:CARD=Generic_1,DEV=0\n"
+        );
+        assert_eq!(
+            selected.openal_config("Generic_1", false),
+            "[alsa]\ndevice = plughw:CARD=Generic_1,DEV=0\ncapture = plughw:CARD=Generic_1,DEV=0\n"
         );
         assert_eq!(
             selected.display_label(),

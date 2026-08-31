@@ -194,8 +194,6 @@ type VoiceActivityReading = {
   activity_captured_at_ms: number;
 };
 
-type StopVoiceActivityCapture = () => void;
-
 const TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY =
   "discrypt:tauri-two-profile-e2e:voice-harness";
 
@@ -751,66 +749,6 @@ async function measureLocalVoiceActivity(
   }
 }
 
-function startLocalVoiceActivityCapture(
-  stream: MediaStream,
-  onSample: (sample: VoiceActivityReading) => void,
-): StopVoiceActivityCapture | null {
-  const audioWindow = window as Window &
-    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
-  const AudioContextCtor =
-    window.AudioContext ?? audioWindow.webkitAudioContext;
-  if (!AudioContextCtor) return null;
-
-  const context = new AudioContextCtor();
-  const source = context.createMediaStreamSource(stream);
-  const analyser = context.createAnalyser();
-  analyser.fftSize = 1024;
-  source.connect(analyser);
-
-  const buffer = new Uint8Array(analyser.fftSize);
-  let stopped = false;
-  let timer: number | null = null;
-
-  const sample = () => {
-    analyser.getByteTimeDomainData(buffer);
-    let squareSum = 0;
-    let peak = 0;
-    for (const frame of buffer) {
-      const centered = Math.abs(frame - 128) / 128;
-      squareSum += centered * centered;
-      peak = Math.max(peak, centered);
-    }
-    const rms = Math.sqrt(squareSum / buffer.length);
-    onSample({
-      activity_rms_i16: Math.round(Math.min(1, rms) * 32767),
-      activity_peak_i16: Math.round(Math.min(1, peak) * 32767),
-      activity_captured_at_ms: Date.now(),
-    });
-  };
-
-  const schedule = () => {
-    if (stopped) return;
-    timer = window.setTimeout(() => {
-      if (stopped) return;
-      sample();
-      schedule();
-    }, 750);
-  };
-
-  void context
-    .resume()
-    .catch(() => undefined)
-    .finally(schedule);
-
-  return () => {
-    stopped = true;
-    if (timer !== null) window.clearTimeout(timer);
-    source.disconnect?.();
-    analyser.disconnect?.();
-    void context.close().catch(() => undefined);
-  };
-}
-
 async function requestVoiceDeviceAccess(
   selectedInputDeviceId?: string,
   selectedOutputDeviceId?: string,
@@ -869,11 +807,13 @@ async function requestVoiceDeviceAccess(
         (device) => device.kind === "audiooutput" && device.deviceId,
       ) ??
       devices.find((device) => device.kind === "audiooutput");
-    const activity = await measureLocalVoiceActivity(stream).catch(() => ({
+    // The long-lived media session reports activity. Avoid opening a short-lived
+    // AudioContext here because direct ALSA devices allow only one output client.
+    const activity = {
       activity_rms_i16: null,
       activity_peak_i16: null,
       activity_captured_at_ms: null,
-    }));
+    };
     return {
       stream,
       microphone_permission: "granted",
@@ -1219,9 +1159,6 @@ function App() {
   const groupPresenceInFlightRef = useRef(false);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
   const voiceMediaSessionRef = useRef<VoiceMediaSessionHandle | null>(null);
-  const stopVoiceActivityCaptureRef = useRef<StopVoiceActivityCapture | null>(
-    null,
-  );
 
   function cleanupVoiceMediaSession() {
     voiceMediaSessionRef.current?.close();
@@ -1233,8 +1170,6 @@ function App() {
     voiceMediaSessionRef.current?.close();
     voiceMediaSessionRef.current = null;
     setVoiceRemoteStreams({});
-    stopVoiceActivityCaptureRef.current?.();
-    stopVoiceActivityCaptureRef.current = null;
     stopMediaStream(voiceCaptureRef.current);
     voiceCaptureRef.current = null;
     setLocalVoiceSpeaking(false);
@@ -2711,10 +2646,6 @@ function App() {
             localAudioTracks(voiceAccess.stream).length > 0,
           );
           if (canUseWebViewRtc && voiceAccess.stream) {
-            stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
-              voiceAccess.stream,
-              handleVoiceActivitySample,
-            );
             const mediaHandle = startWebViewVoiceMediaSession({
               session: voiceSession,
               localStream: voiceAccess.stream,
@@ -2723,6 +2654,7 @@ function App() {
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
+              onLocalActivity: handleVoiceActivitySample,
               onRemoteTrack: (track) => {
                 if (isUsableMediaStream(track.stream)) {
                   setVoiceRemoteStreams((current) => ({
