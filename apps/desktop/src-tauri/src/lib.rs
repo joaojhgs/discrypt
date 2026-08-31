@@ -21473,6 +21473,13 @@ fn queue_group_governance_frame(
     frame: TextControlFrameView,
 ) -> Result<(), String> {
     let frame_sha256 = text_control_frame_sha256(&frame)?;
+    let target = MessageTargetView {
+        kind: "channel".to_owned(),
+        dm_id: None,
+        group_id: Some(group_id.to_owned()),
+        channel_id: None,
+    };
+    let route_peer_ids = state.route_peer_ids_for_text_target(&target)?;
     if state
         .text_control_outbox
         .iter()
@@ -21500,19 +21507,14 @@ fn queue_group_governance_frame(
     }
     state.text_control_outbox.push(TextControlOutboxRecord {
         message_id: event_id.to_owned(),
-        target: MessageTargetView {
-            kind: "channel".to_owned(),
-            dm_id: None,
-            group_id: Some(group_id.to_owned()),
-            channel_id: None,
-        },
+        target,
         frame,
         frame_sha256,
         attempts: 0,
         last_attempted_at_ms: None,
         state_key: "pending".to_owned(),
         last_transport_session_id: None,
-        route_peer_ids: Vec::new(),
+        route_peer_ids,
         sent_route_peer_ids: Vec::new(),
         receipted_route_peer_ids: Vec::new(),
     });
@@ -34403,6 +34405,126 @@ mod tests {
             pending.frames[0].frame,
             TextControlFrameView::Envelope { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn group_governance_frame_queues_for_scoped_admitted_route() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("group-governance-scoped-route-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Governance Route".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Governance Route Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let (_bob_path, bob_service, bob_id) =
+            create_text_receiver_profile("group-governance-scoped-route-bob", "Bob Route")?;
+        reload_global_app_service_from_path(&alice_path);
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            let local_user_id = state.local_user_id();
+            let group = state
+                .groups
+                .iter_mut()
+                .find(|candidate| candidate.group_id == group.group_id)
+                .ok_or_else(|| "sender group missing".to_owned())?;
+            assert_ne!(bob_id, local_user_id);
+            group.members.push(GroupMemberView {
+                member_id: bob_id.clone(),
+                display_name: "Bob Route".to_owned(),
+                device_id: Some("Bob laptop".to_owned()),
+                role: GroupRoleView::Member,
+                status: "online".to_owned(),
+                signer_public_key_hex: None,
+                joined_at: Utc::now().to_rfc3339(),
+                last_seen_at: None,
+                presence_expires_at: None,
+                revoked_at: None,
+                revoked_by: None,
+                route_evidence: None,
+            });
+            let group_id = group.group_id.clone();
+            let event_id = "presence-scoped-route";
+            let expires = (Utc::now() + Duration::seconds(120)).to_rfc3339();
+            queue_group_governance_frame(
+                state,
+                &group_id,
+                event_id,
+                presence_heartbeat_frame(&group_id, event_id, &local_user_id, &expires),
+            )
+        })
+        .1?;
+
+        let loaded = load_state();
+        let bob_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, &bob_id)?;
+        let outbox = loaded
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == "presence-scoped-route")
+            .ok_or_else(|| "queued governance frame missing".to_owned())?;
+        assert_eq!(outbox.route_peer_ids, vec![bob_route.clone()]);
+        assert!(outbox.sent_route_peer_ids.is_empty());
+        assert_eq!(outbox.attempts, 0);
+
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("group-governance-scoped-route".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        let local_peer_id = loaded
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group.group_id)
+            .and_then(|candidate| {
+                candidate
+                    .members
+                    .iter()
+                    .find(|member| member.role == GroupRoleView::Owner)
+                    .and_then(|member| group_member_runtime_peer_id(&group.group_id, member).ok())
+            })
+            .ok_or_else(|| "local runtime peer id missing".to_owned())?;
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(ReceiverBackedTextControlTransport::new(bob_service)),
+            active_session_id,
+            local_peer_id,
+            bob_route.clone(),
+        );
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(4),
+            operation_timeout_ms: Some(250),
+        });
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.frames_sent, 1);
+
+        let after = load_state_from_path(&alice_path);
+        let outbox = after
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == "presence-scoped-route")
+            .ok_or_else(|| "sent governance frame missing".to_owned())?;
+        assert_eq!(outbox.sent_route_peer_ids, vec![bob_route]);
+        assert_eq!(outbox.attempts, 1);
+        clear_text_control_transport_runtime_for_test();
         Ok(())
     }
 

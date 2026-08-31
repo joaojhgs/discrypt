@@ -7,6 +7,40 @@ export type NativePlaybackOutput = {
   close: () => void;
 };
 
+type AudioContextWithSinkId = AudioContext & {
+  setSinkId?: (sinkId: string) => Promise<void>;
+};
+
+type PlaybackFallback = {
+  audio: HTMLAudioElement;
+  mediaDestination: MediaStreamAudioDestinationNode;
+};
+
+function sinkIdForDevice(deviceId: string | null | undefined): string {
+  return !deviceId || deviceId === "default" ? "" : deviceId;
+}
+
+function disconnectIfConnected(source: AudioNode, destination: AudioNode) {
+  try {
+    source.disconnect(destination);
+  } catch {
+    // AudioNode.disconnect(destination) throws when that exact edge is absent.
+  }
+}
+
+function closeFallback(
+  gain: GainNode,
+  fallback: PlaybackFallback | null,
+): null {
+  if (!fallback) return null;
+  fallback.audio.pause();
+  fallback.audio.srcObject = null;
+  fallback.mediaDestination.stream.getTracks().forEach((track) => track.stop());
+  disconnectIfConnected(gain, fallback.mediaDestination);
+  fallback.mediaDestination.disconnect();
+  return null;
+}
+
 export function createNativePlaybackOutput(
   context: AudioContext,
   outputDeviceId: string | null | undefined,
@@ -18,7 +52,17 @@ export function createNativePlaybackOutput(
   };
   setOutputVolume(outputVolumePercent);
 
-  try {
+  const contextWithSinkId = context as AudioContextWithSinkId;
+  let fallback: PlaybackFallback | null = null;
+
+  const connectDirectOutput = () => {
+    fallback = closeFallback(gain, fallback);
+    gain.connect(context.destination);
+  };
+
+  const connectFallbackOutput = (deviceId: string | null | undefined) => {
+    fallback = closeFallback(gain, fallback);
+    disconnectIfConnected(gain, context.destination);
     const mediaDestination = context.createMediaStreamDestination();
     const audio = document.createElement("audio") as HTMLAudioElement & {
       setSinkId?: (sinkId: string) => Promise<void>;
@@ -27,36 +71,45 @@ export function createNativePlaybackOutput(
     audio.setAttribute("playsinline", "true");
     audio.srcObject = mediaDestination.stream;
     gain.connect(mediaDestination);
-
-    const setOutputDevice = (deviceId: string | null | undefined) => {
-      if (!audio.setSinkId) return;
-      const sinkId = !deviceId || deviceId === "default" ? "" : deviceId;
-      void audio.setSinkId(sinkId).catch(() => undefined);
-    };
-    setOutputDevice(outputDeviceId);
+    if (audio.setSinkId) {
+      void audio.setSinkId(sinkIdForDevice(deviceId)).catch(() => undefined);
+    }
     void audio.play().catch(() => undefined);
+    fallback = { audio, mediaDestination };
+  };
 
-    return {
-      destination: gain,
-      setOutputDevice,
-      setOutputVolume,
-      close: () => {
-        audio.pause();
-        audio.srcObject = null;
-        mediaDestination.stream.getTracks().forEach((track) => track.stop());
-        gain.disconnect();
-        mediaDestination.disconnect();
-      },
-    };
-  } catch {
-    gain.connect(context.destination);
-    return {
-      destination: gain,
-      setOutputDevice: () => undefined,
-      setOutputVolume,
-      close: () => gain.disconnect(),
-    };
-  }
+  const setOutputDevice = (deviceId: string | null | undefined) => {
+    const sinkId = sinkIdForDevice(deviceId);
+    if (!sinkId) {
+      connectDirectOutput();
+      if (contextWithSinkId.setSinkId) {
+        void contextWithSinkId.setSinkId("").catch(() => undefined);
+      }
+      return;
+    }
+    if (contextWithSinkId.setSinkId) {
+      connectDirectOutput();
+      void contextWithSinkId.setSinkId(sinkId).catch(() => undefined);
+      return;
+    }
+    try {
+      connectFallbackOutput(deviceId);
+    } catch {
+      connectDirectOutput();
+    }
+  };
+
+  setOutputDevice(outputDeviceId);
+
+  return {
+    destination: gain,
+    setOutputDevice,
+    setOutputVolume,
+    close: () => {
+      fallback = closeFallback(gain, fallback);
+      gain.disconnect();
+    },
+  };
 }
 
 export function shouldMountRemoteAudioElement(

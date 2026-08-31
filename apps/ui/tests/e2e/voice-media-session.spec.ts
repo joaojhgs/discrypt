@@ -1,5 +1,8 @@
 import { Browser, expect, Page, test } from "playwright/test";
-import { shouldMountRemoteAudioElement } from "../../src/voice-playback";
+import {
+  createNativePlaybackOutput,
+  shouldMountRemoteAudioElement,
+} from "../../src/voice-playback";
 
 const ANSWERER_STALE_OFFER_SELECTION_WAIT_MS = 650;
 
@@ -689,6 +692,71 @@ test("native Rust WebAudio playback does not mount a duplicate HTML audio output
     ),
   ).toBe(true);
   expect(shouldMountRemoteAudioElement(null, false, true)).toBe(true);
+});
+
+test("native Rust WebAudio default playback connects directly to the AudioContext output", () => {
+  const connectedNodes: unknown[] = [];
+  const createdMediaDestinations: unknown[] = [];
+  const destination = { node: "default-output" };
+  const gain = {
+    gain: { value: 1 },
+    connect: (node: unknown) => {
+      connectedNodes.push(node);
+    },
+    disconnect: () => undefined,
+  };
+  const context = {
+    destination,
+    createGain: () => gain,
+    createMediaStreamDestination: () => {
+      const mediaDestination = {
+        disconnect: () => undefined,
+        stream: { getTracks: () => [] },
+      };
+      createdMediaDestinations.push(mediaDestination);
+      return mediaDestination;
+    },
+  } as unknown as AudioContext;
+
+  const output = createNativePlaybackOutput(context, "default", 75);
+
+  expect(output.destination).toBe(gain);
+  expect(gain.gain.value).toBe(0.75);
+  expect(connectedNodes).toEqual([destination]);
+  expect(createdMediaDestinations).toEqual([]);
+  output.close();
+});
+
+test("native Rust WebAudio explicit playback sink uses AudioContext setSinkId when available", () => {
+  const connectedNodes: unknown[] = [];
+  const sinkIds: string[] = [];
+  const destination = { node: "context-output" };
+  const gain = {
+    gain: { value: 1 },
+    connect: (node: unknown) => {
+      connectedNodes.push(node);
+    },
+    disconnect: () => undefined,
+  };
+  const context = {
+    destination,
+    createGain: () => gain,
+    createMediaStreamDestination: () => {
+      throw new Error("media-element fallback should not be used");
+    },
+    setSinkId: (sinkId: string) => {
+      sinkIds.push(sinkId);
+      return Promise.resolve();
+    },
+  } as unknown as AudioContext;
+
+  const output = createNativePlaybackOutput(context, "usb-headset", 100);
+  output.setOutputDevice(null);
+
+  expect(output.destination).toBe(gain);
+  expect(connectedNodes).toEqual([destination, destination]);
+  expect(sinkIds).toEqual(["usb-headset", ""]);
+  output.close();
 });
 
 test("sealed WebView voice signaling binds backend envelope metadata", async ({
