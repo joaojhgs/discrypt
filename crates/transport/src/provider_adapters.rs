@@ -1064,7 +1064,14 @@ fn spawn_provider_text_control_answer_receiver(
             };
             let response = match answerer(received.frame) {
                 Ok(response) => response,
-                Err(_) => break,
+                Err(_) => {
+                    if provider_runtime_debug_enabled() {
+                        eprintln!(
+                            "discrypt-provider-runtime role=answerer event=drop_invalid_app_frame"
+                        );
+                    }
+                    continue;
+                }
             };
             if response.is_empty() {
                 continue;
@@ -3432,7 +3439,7 @@ where
         let mut captured_sealed_answer = captured_sealed_answer;
         let mut sealed_local_ice_candidates = sealed_local_ice_candidates;
         let mut last_answer_resend = Instant::now();
-        loop {
+        'supervisor: loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
                     break;
@@ -3495,17 +3502,33 @@ where
                         ) {
                             continue;
                         }
-                        let replacement = match provider_answerer_build_ready_peer_for_offer(
-                            &room,
-                            &sealer,
+                        let replacement_peer = match WebRtcNegotiator::new(
                             supervisor_negotiation_config.clone(),
-                            supervisor_remote_peer_id.clone(),
-                            signal.payload,
                         )
                         .await
                         {
-                            Ok(replacement) => replacement,
+                            Ok(peer) => Arc::new(peer),
                             Err(_) => continue,
+                        };
+                        let replacement = tokio::select! {
+                            _ = &mut shutdown_rx => {
+                                let _ = replacement_peer.tear_down().await;
+                                break 'supervisor;
+                            }
+                            replacement = provider_answerer_build_ready_peer_for_offer(
+                                &room,
+                                &sealer,
+                                replacement_peer.clone(),
+                                supervisor_remote_peer_id.clone(),
+                                signal.payload,
+                            ) => replacement,
+                        };
+                        let replacement = match replacement {
+                            Ok(replacement) => replacement,
+                            Err(_) => {
+                                let _ = replacement_peer.tear_down().await;
+                                continue;
+                            }
                         };
                         active_negotiation_id = replacement.negotiation_id;
                         if let Some(negotiation_id) = replacement.negotiation_id {
@@ -3583,7 +3606,7 @@ struct ProviderAnswererReplacementPeer {
 async fn provider_answerer_build_ready_peer_for_offer<R>(
     room: &R,
     sealer: &WebRtcNegotiationSealer,
-    negotiation_config: WebRtcNegotiationConfig,
+    peer: Arc<WebRtcNegotiator>,
     remote_peer_id: SignalingPeerId,
     offer_payload: SealedWebRtcNegotiationPayload,
 ) -> Result<ProviderAnswererReplacementPeer, TransportError>
@@ -3592,7 +3615,6 @@ where
 {
     let negotiation_id = offer_payload.negotiation_id;
     let expires_at = offer_payload.expires_at_unix_seconds;
-    let peer = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
     let offer = sealer.open_description(&offer_payload)?;
     let answer = peer
         .create_candidate_bundled_answer(offer, PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
@@ -11416,6 +11438,11 @@ mod tests {
                 bob.clone(),
                 alice.clone(),
                 move |frame| {
+                    if frame == b"ciphertext:reconnect-invalid-frame" {
+                        return Err(TransportError::Unavailable(
+                            "reconnect test rejected invalid frame".to_owned(),
+                        ));
+                    }
                     answerer_received
                         .lock()
                         .map_err(|_| {
@@ -11455,6 +11482,10 @@ mod tests {
             })??;
         let answerer_transport = answerer.transport();
 
+        first_offerer
+            .transport()
+            .send_text_control_frame(b"ciphertext:reconnect-invalid-frame".to_vec())
+            .await?;
         let first_frame = b"ciphertext:reconnect-frame:first".to_vec();
         let first_expected_receipt =
             format!("ciphertext:reconnect-receipt:{}", sha256_hex(&first_frame)).into_bytes();
@@ -11486,7 +11517,13 @@ mod tests {
         })??;
         assert_eq!(first_pushed, first_answerer_push);
 
-        first_offerer.close().await?;
+        assert!(
+            answerer_transport
+                .text_control_transport_metrics()
+                .await
+                .open,
+            "the replacement offer must be accepted while the first path still looks healthy"
+        );
 
         let second_offerer = timeout(
             Duration::from_secs(60),
@@ -11507,6 +11544,7 @@ mod tests {
                 "timed out waiting for second reconnect offerer runtime".to_owned(),
             )
         })??;
+        first_offerer.close().await?;
 
         let second_frame = b"ciphertext:reconnect-frame:second".to_vec();
         let second_expected_receipt =
