@@ -32230,6 +32230,26 @@ mod tests {
         text_exporter_secret: &[u8],
         sender: &SigningKey,
     ) -> Result<TextMessageEnvelope, String> {
+        openmls_text_envelope_for_test_at_sequence(
+            group_id,
+            channel_id,
+            message_id,
+            plaintext,
+            1,
+            text_exporter_secret,
+            sender,
+        )
+    }
+
+    fn openmls_text_envelope_for_test_at_sequence(
+        group_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        plaintext: &str,
+        sequence: u64,
+        text_exporter_secret: &[u8],
+        sender: &SigningKey,
+    ) -> Result<TextMessageEnvelope, String> {
         let mut log = InMemoryTextAuthorLog::default();
         let mut transport = InMemoryTextTransport::default();
         let mut events = InMemoryTextSendEvents::default();
@@ -32247,16 +32267,16 @@ mod tests {
                     epoch: 0,
                     sender_leaf: 1,
                     sender_device_id: "remote-device".to_owned(),
-                    sequence: 1,
+                    sequence,
                     message_id: message_id.to_owned(),
                     retention: TextRetentionMetadata {
                         policy: "app-default".to_owned(),
-                        created_at_ms: 1,
+                        created_at_ms: sequence,
                         expires_at_ms: None,
                         delete_after_read: false,
                     },
                     plaintext: plaintext.as_bytes().to_vec(),
-                    sent_at_ms: 1,
+                    sent_at_ms: sequence,
                     now: Utc::now(),
                 },
                 TextSelectedRoute {
@@ -32330,11 +32350,21 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let sender = SigningKey::generate(&mut OsRng);
-        let envelope = openmls_text_envelope_for_test(
+        let envelope = openmls_text_envelope_for_test_at_sequence(
             &group_id,
             &channel_id,
             "msg-openmls-plaintext",
             "hello from remote openmls",
+            19_468,
+            &text_exporter_secret,
+            &sender,
+        )?;
+        let earlier_envelope = openmls_text_envelope_for_test_at_sequence(
+            &group_id,
+            &channel_id,
+            "msg-openmls-out-of-order",
+            "earlier remote openmls message",
+            19_460,
             &text_exporter_secret,
             &sender,
         )?;
@@ -32351,10 +32381,26 @@ mod tests {
             recipient_leaf: Some(2),
         };
         let response = receive_text_delivery_envelope(request.clone());
+        let earlier = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+            target: request.target.clone(),
+            envelope: earlier_envelope,
+            sender_verifying_key_hex: request.sender_verifying_key_hex.clone(),
+            recipient_leaf: Some(2),
+        });
         let duplicate = receive_text_delivery_envelope(request);
 
         assert!(response.receipt.is_some(), "{response:?}");
         assert!(response.state.last_command_error.is_none(), "{response:?}");
+        assert!(earlier.receipt.is_some(), "{earlier:?}");
+        assert!(earlier.state.last_command_error.is_none(), "{earlier:?}");
+        let earlier_message = earlier
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message_id == "msg-openmls-out-of-order")
+            .ok_or_else(|| "out-of-order received message row missing".to_owned())?;
+        assert_eq!(earlier_message.state_key, "received_plaintext");
+        assert_eq!(earlier_message.body, "earlier remote openmls message");
         assert_eq!(duplicate.receipt, response.receipt, "{duplicate:?}");
         assert_eq!(
             duplicate.recipient_verifying_key_hex, response.recipient_verifying_key_hex,
