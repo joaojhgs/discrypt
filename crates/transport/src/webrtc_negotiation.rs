@@ -27,7 +27,10 @@ use webrtc::peer_connection::{
     StatsSelector,
 };
 
-const DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES: usize = 64 * 1024;
+// Keep the SCTP window large enough for several 20 ms voice frames across a WAN RTT,
+// but small enough that a burst of retried control frames cannot monopolize the
+// bidirectional DataChannel before peer acknowledgements release queued bytes.
+const DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES: usize = 8 * 1024;
 const DATA_CHANNEL_CHUNK_MAGIC: &[u8; 4] = b"DCR1";
 const DATA_CHANNEL_CHUNK_HEADER_BYTES: usize = 20;
 const DATA_CHANNEL_CHUNK_PAYLOAD_BYTES: usize = 900;

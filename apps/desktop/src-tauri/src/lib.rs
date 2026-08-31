@@ -4228,26 +4228,8 @@ impl TauriAppService {
             remote_peer_id: Some(remote_peer_id.clone()),
         };
         let key = TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id.clone());
-        self.prepare_text_control_outbox_for_runtime_attachment(&remote_peer_id);
         self.pending_text_control_transport_runtimes.remove(&key);
         self.text_control_transport_runtimes.insert(key, runtime);
-    }
-
-    fn prepare_text_control_outbox_for_runtime_attachment(&mut self, remote_peer_id: &str) {
-        for outbox in &mut self.state.text_control_outbox {
-            if outbox.state_key != "receipted"
-                && (outbox.route_peer_ids.is_empty()
-                    || outbox
-                        .route_peer_ids
-                        .iter()
-                        .any(|peer_id| peer_id == remote_peer_id))
-            {
-                outbox.last_attempted_at_ms = None;
-                outbox
-                    .sent_route_peer_ids
-                    .retain(|peer_id| peer_id != remote_peer_id);
-            }
-        }
     }
 
     fn local_signaling_peer_id_for_active_context(&self) -> Result<SignalingPeerId, String> {
@@ -13594,22 +13576,6 @@ impl PersistedAppState {
             .min(MAX_DELAY_MS)
     }
 
-    fn text_control_outbox_retry_due(&self, message_id: &str, now_ms: u64) -> bool {
-        let Some(record) = self
-            .text_control_outbox
-            .iter()
-            .find(|record| record.message_id == message_id)
-        else {
-            return false;
-        };
-        record
-            .last_attempted_at_ms
-            .is_none_or(|last_attempted_at_ms| {
-                now_ms.saturating_sub(last_attempted_at_ms)
-                    >= Self::text_control_outbox_retry_delay_ms(record.attempts)
-            })
-    }
-
     fn mark_text_control_frame_sent(
         &mut self,
         request: MarkTextControlFrameSentRequest,
@@ -13793,20 +13759,50 @@ impl PersistedAppState {
         T: discrypt_transport::TextControlDataTransport + ?Sized,
     {
         let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
-        let pending = self
-            .list_pending_text_control_frames(&request)
-            .into_iter()
-            .filter(|frame| match route_peer_id.as_ref() {
-                Some(route_peer_id) => {
-                    frame.route_peer_ids.contains(route_peer_id)
-                        && !frame.receipted_route_peer_ids.contains(route_peer_id)
-                }
-                None => frame.route_peer_ids.is_empty(),
-            })
-            .filter(|frame| {
-                wait_for_response || self.text_control_outbox_retry_due(&frame.message_id, now_ms)
-            })
-            .collect::<Vec<_>>();
+        let limit = request.limit.unwrap_or(50).clamp(1, 200);
+        let mut unsent = Vec::new();
+        let mut retries = Vec::new();
+        for record in &self.text_control_outbox {
+            let target_matches = request
+                .target
+                .as_ref()
+                .is_none_or(|target| &record.target == target);
+            if !target_matches {
+                continue;
+            }
+            let (route_matches, route_was_sent) = match route_peer_id.as_ref() {
+                Some(route_peer_id) => (
+                    record.state_key != "receipted"
+                        && record.route_peer_ids.contains(route_peer_id)
+                        && !record.receipted_route_peer_ids.contains(route_peer_id),
+                    record.sent_route_peer_ids.contains(route_peer_id),
+                ),
+                None => (
+                    record.route_peer_ids.is_empty() && record.state_key == "pending",
+                    record.attempts > 0,
+                ),
+            };
+            if !route_matches {
+                continue;
+            }
+            let frame = TextControlOutboxFrameView::from(record);
+            if !route_was_sent {
+                unsent.push(frame);
+            } else if wait_for_response
+                || record
+                    .last_attempted_at_ms
+                    .is_none_or(|last_attempted_at_ms| {
+                        now_ms.saturating_sub(last_attempted_at_ms)
+                            >= Self::text_control_outbox_retry_delay_ms(record.attempts)
+                    })
+            {
+                retries.push(frame);
+            }
+        }
+        let retry_limit = if wait_for_response { limit } else { 2 };
+        let mut pending = unsent.into_iter().take(limit).collect::<Vec<_>>();
+        let remaining = limit.saturating_sub(pending.len()).min(retry_limit);
+        pending.extend(retries.into_iter().take(remaining));
         let mut frames_sent = 0_usize;
         let mut response_frames_received = 0_usize;
         let mut receipts_applied = 0_usize;
@@ -22861,7 +22857,6 @@ mod tests {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.prepare_text_control_outbox_for_runtime_attachment(&remote_peer_id);
         guard.text_control_transport_runtimes.insert(
             TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id),
             runtime,
@@ -33241,7 +33236,8 @@ mod tests {
     }
 
     #[test]
-    fn background_receiver_route_retries_unreceipted_frame_after_backoff() -> Result<(), String> {
+    fn background_receiver_prioritizes_unsent_frames_and_reattach_preserves_retry_schedule(
+    ) -> Result<(), String> {
         let _guard = test_lock();
         let alice_path = reset_with_temp_state("text-control-background-route-retry");
         create_user(CreateUserRequest {
@@ -33333,6 +33329,39 @@ mod tests {
         assert_eq!(transport.sent_frames(), 1);
         assert_eq!(transport.recv_calls(), 0);
 
+        let (_, new_message_id, new_route_peer_ids, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(remote_member_id, "Bob")],
+            "new unsent frame must not be starved by an older retry",
+        )?;
+        assert_eq!(new_route_peer_ids, route_peer_ids);
+        let new_frame = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target.clone()),
+            limit: Some(1),
+            operation_timeout_ms: Some(100),
+        });
+        assert!(new_frame.failures.is_empty(), "{new_frame:?}");
+        assert_eq!(new_frame.frames_sent, 1);
+        assert_eq!(transport.sent_frames(), 2);
+        let state_after_new_frame = load_state();
+        assert_eq!(
+            state_after_new_frame
+                .text_control_outbox
+                .iter()
+                .find(|record| record.message_id == message_id)
+                .map(|record| record.attempts),
+            Some(1)
+        );
+        assert_eq!(
+            state_after_new_frame
+                .text_control_outbox
+                .iter()
+                .find(|record| record.message_id == new_message_id)
+                .map(|record| record.attempts),
+            Some(1)
+        );
+
         {
             let service = app_service();
             let mut guard = service
@@ -33354,7 +33383,7 @@ mod tests {
         });
         assert!(retry.failures.is_empty(), "{retry:?}");
         assert_eq!(retry.frames_sent, 1);
-        assert_eq!(transport.sent_frames(), 2);
+        assert_eq!(transport.sent_frames(), 3);
         assert_eq!(transport.recv_calls(), 0);
         let outbox = load_state()
             .text_control_outbox
@@ -33374,12 +33403,42 @@ mod tests {
         );
         let after_reattach =
             pump_text_control_transport_once(ListPendingTextControlFramesRequest {
-                target: Some(target),
+                target: Some(target.clone()),
                 limit: Some(1),
                 operation_timeout_ms: Some(100),
             });
         assert!(after_reattach.failures.is_empty(), "{after_reattach:?}");
-        assert_eq!(after_reattach.frames_sent, 1);
+        assert_eq!(after_reattach.frames_sent, 0);
+        assert_eq!(replacement_transport.sent_frames(), 0);
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let outbox = guard
+                .state
+                .text_control_outbox
+                .iter_mut()
+                .find(|record| record.message_id == message_id)
+                .ok_or_else(|| "outbox missing after runtime reattach".to_owned())?;
+            assert_eq!(outbox.attempts, 2);
+            assert_eq!(
+                outbox.sent_route_peer_ids,
+                vec![outbox.route_peer_ids[0].clone()]
+            );
+            outbox.last_attempted_at_ms = Some(0);
+        }
+        let due_after_reattach =
+            pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: Some(target),
+                limit: Some(1),
+                operation_timeout_ms: Some(100),
+            });
+        assert!(
+            due_after_reattach.failures.is_empty(),
+            "{due_after_reattach:?}"
+        );
+        assert_eq!(due_after_reattach.frames_sent, 1);
         assert_eq!(replacement_transport.sent_frames(), 1);
         clear_text_control_transport_runtime_for_test();
         Ok(())

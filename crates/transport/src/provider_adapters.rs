@@ -10401,7 +10401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_provider_text_control_runtime_pair_carries_multiple_opaque_frames(
+    async fn live_provider_text_control_runtime_pair_drains_chunked_burst_receipts(
     ) -> Result<(), TransportError> {
         let bus = LocalConformanceProviderBus::default();
         let adapter = LocalConformanceProviderAdapter::new(SignalingAdapterKind::Mqtt, bus.clone());
@@ -10441,7 +10441,10 @@ mod tests {
                         )
                     })?
                     .push(frame.clone());
-                Ok(format!("ciphertext:runtime-pair-receipt:{}", sha256_hex(&frame)).into_bytes())
+                let mut receipt =
+                    format!("ciphertext:runtime-pair-receipt:{}", sha256_hex(&frame)).into_bytes();
+                receipt.resize(4_096, b'r');
+                Ok(receipt)
             },
         )
         .await?;
@@ -10459,31 +10462,37 @@ mod tests {
             )?;
 
         let transport = runtime.transport();
-        for index in 0..2 {
-            let frame = format!("ciphertext:runtime-pair-frame:{index}").into_bytes();
-            let expected_receipt =
+        let mut expected_receipts = Vec::new();
+        for index in 0..32 {
+            let mut frame = format!("ciphertext:runtime-pair-frame:{index}:").into_bytes();
+            frame.resize(4_096, u8::try_from(index).unwrap_or_default());
+            let mut expected_receipt =
                 format!("ciphertext:runtime-pair-receipt:{}", sha256_hex(&frame)).into_bytes();
+            expected_receipt.resize(4_096, b'r');
             transport.send_text_control_frame(frame).await?;
-            let receipt = timeout(Duration::from_secs(5), transport.recv_text_control_frame())
+            expected_receipts.push(expected_receipt);
+        }
+        for expected_receipt in &expected_receipts {
+            let receipt = timeout(Duration::from_secs(10), transport.recv_text_control_frame())
                 .await
                 .map_err(|_| {
                     TransportError::Unavailable(
                         "timed out receiving runtime pair receipt".to_owned(),
                     )
                 })??;
-            assert_eq!(receipt, expected_receipt);
+            assert_eq!(&receipt, expected_receipt);
         }
 
         let metrics = transport.text_control_transport_metrics().await;
         assert!(metrics.open);
-        assert_eq!(metrics.frames_sent, 2);
-        assert_eq!(metrics.frames_received, 2);
+        assert_eq!(metrics.frames_sent, expected_receipts.len() as u64);
+        assert_eq!(metrics.frames_received, expected_receipts.len() as u64);
         assert_eq!(
             received
                 .lock()
                 .map_err(|_| TransportError::Unavailable("receipt lock poisoned".to_owned()))?
                 .len(),
-            2
+            expected_receipts.len()
         );
         for material in bus.relay_visible_material_for_tests() {
             assert!(!material.windows(3).any(|window| window == b"v=0"));
