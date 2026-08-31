@@ -1043,6 +1043,29 @@ if (
 if (!main.includes("APP_EVENT_HEALTH_RESYNC_MS")) {
   failures.push("native app_event listener must retain a slow health-resync poll");
 }
+if (
+  !main.includes("function commitCommandState(nextState: AppState, force = false)") ||
+  !main.includes("currentState.event_cursor > nextState.event_cursor") ||
+  !main.includes("renderedState.event_cursor > nextState.event_cursor")
+) {
+  failures.push(
+    "native state reconciliation must reject snapshots older than the latest backend event cursor",
+  );
+}
+if (!main.includes("() => pollAppEventFallback(true)")) {
+  failures.push(
+    "native app_event health resync must reload state even when a push advanced the local cursor",
+  );
+}
+if (
+  !main.includes("if (messageSendInFlightRef.current) return") ||
+  !main.includes("messageSendInFlightRef.current = true") ||
+  !main.includes("messageSendInFlightRef.current = false")
+) {
+  failures.push(
+    "message composer must guard channel and DM sends against duplicate in-flight activation",
+  );
+}
 const tauriEventCapability = readFileSync(
   new URL("../../desktop/src-tauri/capabilities/default.json", import.meta.url),
   "utf8",

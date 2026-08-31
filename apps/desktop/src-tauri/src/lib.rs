@@ -4228,16 +4228,26 @@ impl TauriAppService {
             remote_peer_id: Some(remote_peer_id.clone()),
         };
         let key = TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id.clone());
+        self.prepare_text_control_outbox_for_runtime_attachment(&remote_peer_id);
+        self.pending_text_control_transport_runtimes.remove(&key);
+        self.text_control_transport_runtimes.insert(key, runtime);
+    }
+
+    fn prepare_text_control_outbox_for_runtime_attachment(&mut self, remote_peer_id: &str) {
         for outbox in &mut self.state.text_control_outbox {
             if outbox.state_key != "receipted"
                 && (outbox.route_peer_ids.is_empty()
-                    || outbox.route_peer_ids.contains(&remote_peer_id))
+                    || outbox
+                        .route_peer_ids
+                        .iter()
+                        .any(|peer_id| peer_id == remote_peer_id))
             {
                 outbox.last_attempted_at_ms = None;
+                outbox
+                    .sent_route_peer_ids
+                    .retain(|peer_id| peer_id != remote_peer_id);
             }
         }
-        self.pending_text_control_transport_runtimes.remove(&key);
-        self.text_control_transport_runtimes.insert(key, runtime);
     }
 
     fn local_signaling_peer_id_for_active_context(&self) -> Result<SignalingPeerId, String> {
@@ -6016,14 +6026,30 @@ fn start_text_control_offer_receiver_loop(
         loop {
             let received = match transport.recv_text_control_frame().await {
                 Ok(received) => received,
-                Err(_) => break,
+                Err(error) => {
+                    if discrypt_webrtc_debug_enabled() {
+                        eprintln!(
+                            "text_control_offer_receiver: session_id={} receive_failed={error}",
+                            redacted_message_ref(&session_id)
+                        );
+                    }
+                    break;
+                }
             };
             let inbound_frame = match serde_json::from_slice::<TextControlFrameView>(&received) {
                 Ok(frame) => frame,
-                Err(_) => break,
+                Err(error) => {
+                    if discrypt_webrtc_debug_enabled() {
+                        eprintln!(
+                            "text_control_offer_receiver: session_id={} invalid_frame={error}",
+                            redacted_message_ref(&session_id)
+                        );
+                    }
+                    continue;
+                }
             };
             let service = app_service();
-            let (response_frame, state) = {
+            let (response_frame, state, previous_cursor) = {
                 let mut guard = service
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6031,21 +6057,33 @@ fn start_text_control_offer_receiver_loop(
                 let response_frame = guard.state.handle_text_control_frame(inbound_frame);
                 guard.persist();
                 let state = guard.to_view();
-                emit_background_app_events(&state, previous_cursor);
-                (response_frame, state)
+                (response_frame, state, previous_cursor)
             };
+            emit_background_app_events(&state, previous_cursor);
             let Some(response_frame) = response_frame else {
-                let _ = state;
                 continue;
             };
             let response = match serde_json::to_vec(&response_frame) {
                 Ok(response) => response,
-                Err(_) => break,
+                Err(error) => {
+                    if discrypt_webrtc_debug_enabled() {
+                        eprintln!(
+                            "text_control_offer_receiver: session_id={} response_encode_failed={error}",
+                            redacted_message_ref(&session_id)
+                        );
+                    }
+                    continue;
+                }
             };
-            if transport.send_text_control_frame(response).await.is_err() {
+            if let Err(error) = transport.send_text_control_frame(response).await {
+                if discrypt_webrtc_debug_enabled() {
+                    eprintln!(
+                        "text_control_offer_receiver: session_id={} response_send_failed={error}",
+                        redacted_message_ref(&session_id)
+                    );
+                }
                 break;
             }
-            let _ = &session_id;
         }
     });
 }
@@ -13762,6 +13800,7 @@ impl PersistedAppState {
                 Some(route_peer_id) => {
                     frame.route_peer_ids.contains(route_peer_id)
                         && !frame.receipted_route_peer_ids.contains(route_peer_id)
+                        && (wait_for_response || !frame.sent_route_peer_ids.contains(route_peer_id))
                 }
                 None => frame.route_peer_ids.is_empty(),
             })
@@ -22823,10 +22862,39 @@ mod tests {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.prepare_text_control_outbox_for_runtime_attachment(&remote_peer_id);
         guard.text_control_transport_runtimes.insert(
             TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id),
             runtime,
         );
+    }
+
+    fn attach_background_receiver_peer_text_control_transport_runtime_for_test(
+        transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+        session_id: impl Into<String>,
+        local_peer_id: impl Into<String>,
+        remote_peer_id: impl Into<String>,
+    ) {
+        let session_id = session_id.into();
+        let remote_peer_id = remote_peer_id.into();
+        attach_peer_text_control_transport_runtime_for_test(
+            transport,
+            session_id.clone(),
+            local_peer_id,
+            remote_peer_id.clone(),
+        );
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .text_control_transport_runtimes
+            .get_mut(&TextControlRuntimeMapKey::for_remote(
+                session_id,
+                remote_peer_id,
+            ))
+            .expect("test peer runtime should be attached")
+            .inbound_receiver_owned = true;
     }
 
     fn insert_pending_text_control_transport_runtime_for_test(
@@ -24859,6 +24927,13 @@ mod tests {
 
         fn recv_calls(&self) -> u64 {
             self.recv_calls.load(Ordering::Relaxed)
+        }
+
+        fn sent_frames(&self) -> u64 {
+            self.metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .frames_sent
         }
     }
 
@@ -33162,6 +33237,138 @@ mod tests {
             .find(|message| message.message_id == message_id)
             .ok_or_else(|| "sent message row missing".to_owned())?;
         assert_eq!(message.state_key, "transport_frame_sent");
+        clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn background_receiver_route_sends_once_per_attached_data_channel() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("text-control-background-route-single-send");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Async Receipt Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        reload_global_app_service_from_path(&alice_path);
+        let remote_member_id = "member-background-receipt";
+        let (target, message_id, route_peer_ids, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(remote_member_id, "Bob")],
+            "send once while background receiver waits for receipt",
+        )?;
+        let remote_peer_id = route_peer_ids
+            .first()
+            .cloned()
+            .ok_or_else(|| "remote route missing".to_owned())?;
+        let loaded = load_state();
+        let local_peer_id = loaded
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group.group_id)
+            .and_then(|candidate| {
+                candidate
+                    .members
+                    .iter()
+                    .find(|member| member.role == GroupRoleView::Owner)
+                    .and_then(|member| group_member_runtime_peer_id(&group.group_id, member).ok())
+            })
+            .ok_or_else(|| "local runtime peer id missing".to_owned())?;
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("text-control-background-route-single-send".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        let transport = Arc::new(HangingResponseTextControlTransport::new());
+        attach_background_receiver_peer_text_control_transport_runtime_for_test(
+            transport.clone(),
+            active_session_id.clone(),
+            local_peer_id.clone(),
+            remote_peer_id.clone(),
+        );
+
+        let first = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target.clone()),
+            limit: Some(1),
+            operation_timeout_ms: Some(100),
+        });
+        assert!(first.failures.is_empty(), "{first:?}");
+        assert_eq!(first.frames_sent, 1);
+        assert_eq!(transport.sent_frames(), 1);
+
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let outbox = guard
+                .state
+                .text_control_outbox
+                .iter_mut()
+                .find(|record| record.message_id == message_id)
+                .ok_or_else(|| "outbox missing after first send".to_owned())?;
+            outbox.last_attempted_at_ms = Some(0);
+        }
+
+        let retry = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target.clone()),
+            limit: Some(1),
+            operation_timeout_ms: Some(100),
+        });
+        assert!(retry.failures.is_empty(), "{retry:?}");
+        assert_eq!(retry.frames_sent, 0);
+        assert_eq!(transport.sent_frames(), 1);
+        let outbox = load_state()
+            .text_control_outbox
+            .into_iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing after retry pump".to_owned())?;
+        assert_eq!(outbox.attempts, 1);
+        assert_eq!(outbox.sent_route_peer_ids, vec![remote_peer_id]);
+        assert!(outbox.receipted_route_peer_ids.is_empty());
+
+        let replacement_transport = Arc::new(HangingResponseTextControlTransport::new());
+        attach_background_receiver_peer_text_control_transport_runtime_for_test(
+            replacement_transport.clone(),
+            active_session_id,
+            local_peer_id,
+            outbox.sent_route_peer_ids[0].clone(),
+        );
+        let after_reattach =
+            pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: Some(target),
+                limit: Some(1),
+                operation_timeout_ms: Some(100),
+            });
+        assert!(after_reattach.failures.is_empty(), "{after_reattach:?}");
+        assert_eq!(after_reattach.frames_sent, 1);
+        assert_eq!(replacement_transport.sent_frames(), 1);
         clear_text_control_transport_runtime_for_test();
         Ok(())
     }

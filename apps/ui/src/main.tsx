@@ -24,6 +24,7 @@ import {
   GroupView,
   InviteView,
   JoinProgressStepView,
+  MessageTargetView,
   RuntimeModeView,
   SignalingAdapterKind,
   SetConnectivityPolicyRequest,
@@ -1139,6 +1140,7 @@ function App() {
     null,
   );
   const [messageTransportProof, setMessageTransportProof] = useState(false);
+  const [messageSendInFlight, setMessageSendInFlight] = useState(false);
   const [localVoiceSpeaking, setLocalVoiceSpeaking] = useState(false);
   const [voiceInputDevices, setVoiceInputDevices] = useState<
     VoiceDeviceOption[]
@@ -1158,6 +1160,7 @@ function App() {
   >({});
   const eventCursorRef = useRef(0);
   const commandStateRef = useRef<AppState | null>(null);
+  const messageSendInFlightRef = useRef(false);
   const textRuntimeSyncInFlightRef = useRef(false);
   const groupPresenceInFlightRef = useRef(false);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
@@ -1179,16 +1182,41 @@ function App() {
   }
 
   useEffect(() => {
-    commandStateRef.current = commandState;
-  }, [commandState]);
-
-  useEffect(() => {
     voiceMediaSessionRef.current?.setInputGain?.(localMicGain);
   }, [localMicGain]);
 
   function updateEventCursor(nextCursor: number) {
     const cursor = Math.max(eventCursorRef.current, nextCursor);
     eventCursorRef.current = cursor;
+  }
+
+  function commitCommandState(nextState: AppState, force = false): AppState {
+    const currentState = commandStateRef.current;
+    if (
+      !force &&
+      currentState &&
+      currentState.event_cursor > nextState.event_cursor
+    ) {
+      return currentState;
+    }
+    commandStateRef.current = nextState;
+    if (force) {
+      eventCursorRef.current = nextState.event_cursor;
+    } else {
+      updateEventCursor(nextState.event_cursor);
+    }
+    setCommandState((renderedState) => {
+      if (
+        !force &&
+        renderedState &&
+        renderedState.event_cursor > nextState.event_cursor
+      ) {
+        commandStateRef.current = renderedState;
+        return renderedState;
+      }
+      return nextState;
+    });
+    return nextState;
   }
 
   function reportCommandError(
@@ -1310,8 +1338,7 @@ function App() {
           }
           if (!mounted) return;
         }
-        setCommandState(initialState);
-        updateEventCursor(initialState.event_cursor);
+        commitCommandState(initialState);
         if (
           initialState.groups.length > 0 &&
           initialState.lifecycle !== "first_run"
@@ -1405,8 +1432,8 @@ function App() {
       void loadAppState()
         .then((refreshed) => {
           if (!cancelled) {
-            setCommandState(refreshed);
-            updateEventCursor(Math.max(nextCursor, refreshed.event_cursor));
+            commitCommandState(refreshed);
+            updateEventCursor(nextCursor);
           }
         })
         .catch(() => undefined);
@@ -1420,7 +1447,7 @@ function App() {
       loadCommandStateAfterEvents(stream.next_cursor);
     };
 
-    const pollAppEventFallback = () => {
+    const pollAppEventFallback = (forceStateResync = false) => {
       if (fallbackPollInFlight) return;
       fallbackPollInFlight = true;
       void (async () => {
@@ -1439,7 +1466,7 @@ function App() {
             break;
           }
         }
-        if (sawEvents) {
+        if (sawEvents || forceStateResync) {
           loadCommandStateAfterEvents(nextCursor);
         }
       })()
@@ -1474,7 +1501,7 @@ function App() {
         });
       startFallbackPolling();
       eventHealthResync = window.setInterval(
-        pollAppEventFallback,
+        () => pollAppEventFallback(true),
         APP_EVENT_HEALTH_RESYNC_MS,
       );
     } else {
@@ -1495,12 +1522,13 @@ function App() {
 
   async function applyCommand(
     command: Promise<AppState>,
-    success?: (state: AppState) => void,
+    success?: (state: AppState) => void | Promise<void>,
+    forceState = false,
   ): Promise<AppState | null> {
     try {
       setCommandError(null);
       const nextState = await command;
-      setCommandState(nextState);
+      commitCommandState(nextState, forceState);
       if (nextState.last_command_error) {
         const action = commandErrorToAction(nextState.last_command_error);
         const expectedInviteDenial =
@@ -1514,7 +1542,7 @@ function App() {
           !expectedInviteDenial,
         );
       }
-      success?.(nextState);
+      await success?.(nextState);
       return nextState;
     } catch (error: unknown) {
       reportCommandError(
@@ -1647,7 +1675,7 @@ function App() {
       }
       return stateForScope;
     }
-    setCommandState(started);
+    commitCommandState(started);
     if (started.last_command_error) {
       const action = commandErrorToAction(started.last_command_error);
       if (reportFailures) {
@@ -1683,7 +1711,7 @@ function App() {
       const attached = await attachBrokerControlLaneRuntime({
         adapter_kind: null,
       });
-      setCommandState(attached);
+      commitCommandState(attached);
       if (attached.last_command_error) {
         if (reportFailures) {
           const action = commandErrorToAction(attached.last_command_error);
@@ -1720,7 +1748,7 @@ function App() {
         backoff_max_ms: 2_000,
         backoff_max_attempts: 5,
       });
-      setCommandState(managed);
+      commitCommandState(managed);
       if (managed.last_command_error) {
         if (reportFailures) {
           const action = commandErrorToAction(managed.last_command_error);
@@ -1735,7 +1763,7 @@ function App() {
       }
       const refreshed = await loadAppState().catch(() => null);
       if (refreshed) {
-        setCommandState(refreshed);
+        commitCommandState(refreshed);
         return refreshed;
       }
       return managed;
@@ -1778,7 +1806,7 @@ function App() {
     }
     const refreshed = await loadAppState().catch(() => null);
     if (refreshed) {
-      setCommandState(refreshed);
+      commitCommandState(refreshed);
       return refreshed;
     }
     return attached ?? started;
@@ -1845,8 +1873,7 @@ function App() {
           ttl_seconds: 120,
         });
         if (cancelled) return;
-        setCommandState(presenceState);
-        commandStateRef.current = presenceState;
+        commitCommandState(presenceState);
       } catch (_error) {
       } finally {
         groupPresenceInFlightRef.current = false;
@@ -2139,8 +2166,7 @@ function App() {
     setWorkflow("admission_requests");
     void loadAppState()
       .then((refreshed) => {
-        setCommandState(refreshed);
-        updateEventCursor(refreshed.event_cursor);
+        commitCommandState(refreshed);
       })
       .catch(() => undefined);
   }
@@ -2341,6 +2367,46 @@ function App() {
     );
   }
 
+  function sendCommandText(target: MessageTargetView, body: string) {
+    if (messageSendInFlightRef.current) return;
+    messageSendInFlightRef.current = true;
+    setMessageSendInFlight(true);
+    setDraftMessage("");
+
+    const runtimeState = commandStateRef.current;
+    const requestTransportProof = messageTransportProof;
+    void (async () => {
+      let sent = false;
+      try {
+        let latestState = runtimeState;
+        if (runtimeState && window.__TAURI__?.core?.invoke) {
+          latestState =
+            (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
+        }
+        const result = await applyCommand(
+          sendMessage({
+            target,
+            body,
+            transport_proof: requestTransportProof,
+            adapter_kind: null,
+          }),
+          async (state) => {
+            if (latestState && window.__TAURI__?.core?.invoke) {
+              await syncTextRuntimeForState(state, false);
+            }
+          },
+        );
+        sent = Boolean(result && !result.last_command_error);
+      } finally {
+        if (!sent) {
+          setDraftMessage((currentDraft) => currentDraft || body);
+        }
+        messageSendInFlightRef.current = false;
+        setMessageSendInFlight(false);
+      }
+    })();
+  }
+
   function sendCommandMessage() {
     const body = draftMessage.trim();
     if (!body) return;
@@ -2348,67 +2414,29 @@ function App() {
       reportCommandError("Create a group text channel before sending a message.");
       return;
     }
-    const runtimeState = commandState;
-    const target = {
-      kind: "channel" as const,
-      dm_id: null,
-      group_id: activeGroup.group_id,
-      channel_id: activeTextChannel.channel_id,
-    };
-    const requestTransportProof = messageTransportProof;
-    void (async () => {
-      let latestState = runtimeState;
-      if (runtimeState && window.__TAURI__?.core?.invoke) {
-        latestState = (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
-      }
-      await applyCommand(
-        sendMessage({
-          target,
-          body,
-          transport_proof: requestTransportProof,
-          adapter_kind: null,
-        }),
-        async (state) => {
-          setDraftMessage("");
-          if (latestState && window.__TAURI__?.core?.invoke) {
-            await syncTextRuntimeForState(state, false);
-          }
-        },
-      );
-    })();
+    sendCommandText(
+      {
+        kind: "channel",
+        dm_id: null,
+        group_id: activeGroup.group_id,
+        channel_id: activeTextChannel.channel_id,
+      },
+      body,
+    );
   }
 
   function sendCommandDm() {
     const body = draftMessage.trim();
     if (!body || !activeDm) return;
-    const runtimeState = commandState;
-    const target = {
-      kind: "dm" as const,
-      dm_id: activeDm.dm_id,
-      group_id: null,
-      channel_id: null,
-    };
-    const requestTransportProof = messageTransportProof;
-    void (async () => {
-      let latestState = runtimeState;
-      if (runtimeState && window.__TAURI__?.core?.invoke) {
-        latestState = (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
-      }
-      await applyCommand(
-        sendMessage({
-          target,
-          body,
-          transport_proof: requestTransportProof,
-          adapter_kind: null,
-        }),
-        async (state) => {
-          setDraftMessage("");
-          if (latestState && window.__TAURI__?.core?.invoke) {
-            await syncTextRuntimeForState(state, false);
-          }
-        },
-      );
-    })();
+    sendCommandText(
+      {
+        kind: "dm",
+        dm_id: activeDm.dm_id,
+        group_id: null,
+        channel_id: null,
+      },
+      body,
+    );
   }
 
   function createCommandInvite() {
@@ -2520,7 +2548,7 @@ function App() {
           kind: "Voice",
           retention_status: "session",
         });
-        setCommandState(withVoice);
+        commitCommandState(withVoice);
         voiceChannel = getActiveVoiceChannel(
           withVoice,
           withVoice.groups.find(
@@ -2606,7 +2634,7 @@ function App() {
         output_device_id: voiceAccess.output_device_id,
         output_device_label: voiceAccess.output_device_label,
       });
-      setCommandState(joinedState);
+      commitCommandState(joinedState);
       setWorkflow(workflowAfterUpdate);
       voiceCaptureRef.current = voiceAccess.stream;
       if (joinedState.voice_session?.self_muted) {
@@ -2719,7 +2747,7 @@ function App() {
             voiceMediaSessionRef.current = mediaHandle;
             if (!mediaHandle) {
               const leftState = await leaveVoice({ session_id: sessionId });
-              setCommandState(leftState);
+              commitCommandState(leftState);
               stopLocalVoiceCapture();
               return;
             }
@@ -2732,7 +2760,7 @@ function App() {
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
               onLocalActivity: handleVoiceActivitySample,
-              onState: (state) => setCommandState(state as AppState),
+              onState: (state) => commitCommandState(state as AppState),
               onStatus: (status) => {
                 if (!/Local DataChannel (is attaching|connected)/i.test(status)) {
                   reportCommandError(status, "Voice media");
@@ -2741,7 +2769,7 @@ function App() {
             });
             if (!voiceMediaSessionRef.current) {
               const leftState = await leaveVoice({ session_id: sessionId });
-              setCommandState(leftState);
+              commitCommandState(leftState);
               stopLocalVoiceCapture();
               return;
             }
@@ -2751,7 +2779,7 @@ function App() {
               "join_voice",
             );
             const leftState = await leaveVoice({ session_id: sessionId });
-            setCommandState(leftState);
+            commitCommandState(leftState);
             stopLocalVoiceCapture();
             return;
           }
@@ -2825,12 +2853,16 @@ function App() {
   }
 
   function resetCommandState() {
-    void applyCommand(resetAppState({ confirmation: resetPhrase }), (state) => {
-      if (!state.last_command_error) {
-        setResetPhrase("");
-        setWorkflow("setup");
-      }
-    });
+    void applyCommand(
+      resetAppState({ confirmation: resetPhrase }),
+      (state) => {
+        if (!state.last_command_error) {
+          setResetPhrase("");
+          setWorkflow("setup");
+        }
+      },
+      true,
+    );
   }
 
   function chooseKeyringStorage() {
@@ -3062,6 +3094,7 @@ function App() {
                 setDraftMessage={setDraftMessage}
                 onStartDm={startCommandDm}
                 onSendDm={sendCommandDm}
+                messageSendInFlight={messageSendInFlight}
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
@@ -3119,6 +3152,7 @@ function App() {
                 setDraftMessage={setDraftMessage}
                 onOpenCreateChannel={() => setInlineTextDraft("")}
                 onSendMessage={sendCommandMessage}
+                messageSendInFlight={messageSendInFlight}
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
@@ -6100,6 +6134,7 @@ function DmPanel({
   setDraftMessage,
   onStartDm,
   onSendDm,
+  messageSendInFlight,
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
@@ -6113,6 +6148,7 @@ function DmPanel({
   setDraftMessage: (value: string) => void;
   onStartDm: () => void;
   onSendDm: () => void;
+  messageSendInFlight: boolean;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
@@ -6164,7 +6200,7 @@ function DmPanel({
         setDraftMessage={setDraftMessage}
         sendLabel="Send DM message"
         onSend={onSendDm}
-        disabled={!activeDm}
+        disabled={!activeDm || messageSendInFlight}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
         diagnosticsEnabled={diagnosticsEnabled}
@@ -7926,6 +7962,7 @@ function ChannelPanel({
   setDraftMessage,
   onOpenCreateChannel,
   onSendMessage,
+  messageSendInFlight,
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
@@ -7939,6 +7976,7 @@ function ChannelPanel({
   setDraftMessage: (value: string) => void;
   onOpenCreateChannel: () => void;
   onSendMessage: () => void;
+  messageSendInFlight: boolean;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
@@ -7988,7 +8026,7 @@ function ChannelPanel({
         setDraftMessage={setDraftMessage}
         sendLabel="Send message"
         onSend={onSendMessage}
-        disabled={admissionPending}
+        disabled={admissionPending || messageSendInFlight}
         composerNotice={admissionPending ? "Waiting for owner/staff approval before protected messages can be sent." : null}
         transportProof={transportProof}
         setTransportProof={setTransportProof}

@@ -530,6 +530,30 @@ test("main chat layout keeps document fixed and message list scrollable at requi
   }
 });
 
+test("message composer suppresses duplicate activation while send is in flight", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Single Send Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "#general", exact: true }),
+  ).toBeVisible();
+
+  const body = "one activation creates one message";
+  await page.getByRole("textbox", { name: "Message" }).fill(body);
+  await page.getByRole("button", { name: /^Send message$/ }).evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+
+  await expect(page.getByTestId("message-row").filter({ hasText: body })).toHaveCount(1);
+  await expect(page.getByRole("textbox", { name: "Message" })).toHaveValue("");
+});
+
 test("theme tokens default dark and drive shadcn shell surfaces", async ({
   page,
 }, testInfo) => {
