@@ -11602,13 +11602,33 @@ impl PersistedAppState {
 
     fn clear_non_persistent_voice_runtime(&mut self) {
         self.voice_session = None;
-        if self
+        let voice_group_id = self
             .active_context
             .as_ref()
-            .map(|context| context.kind == "voice_channel")
-            .unwrap_or(false)
-        {
-            self.active_context = None;
+            .filter(|context| context.kind == "voice_channel")
+            .and_then(|context| context.group_id.clone());
+        if let Some(group_id) = voice_group_id {
+            let text_channel_id = self
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .and_then(|group| {
+                    group
+                        .channels
+                        .iter()
+                        .find(|channel| channel.kind == ChannelKind::Text)
+                })
+                .map(|channel| channel.channel_id.clone());
+            self.active_context = Some(ActiveContextView {
+                kind: if text_channel_id.is_some() {
+                    "text_channel".to_owned()
+                } else {
+                    "group".to_owned()
+                },
+                group_id: Some(group_id),
+                channel_id: text_channel_id,
+                dm_id: None,
+            });
         }
     }
 
@@ -31420,11 +31440,16 @@ mod tests {
         let channel_id = channel
             .groups
             .first()
-            .and_then(|group| group.channels.first())
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Voice)
+            })
             .map(|channel| channel.channel_id.clone())
             .ok_or_else(|| "voice channel created".to_owned())?;
         let joined = join_voice(JoinVoiceRequest {
-            group_id,
+            group_id: group_id.clone(),
             channel_id,
             microphone_permission: "granted".to_owned(),
             input_device_id: Some("mic-restart".to_owned()),
@@ -31465,9 +31490,24 @@ mod tests {
             reloaded.voice_session.is_none(),
             "restart must not restore stale persisted voice_session as joined"
         );
+        let active_context = reloaded
+            .active_context
+            .as_ref()
+            .ok_or_else(|| "restart should preserve the active group route".to_owned())?;
+        assert_eq!(active_context.kind, "text_channel");
+        assert_eq!(active_context.group_id.as_deref(), Some(group_id.as_str()));
+        let active_channel_id = active_context
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| "restart should select the group's text channel".to_owned())?;
         assert!(
-            reloaded.active_context.is_none(),
-            "restart must not reopen stale voice_channel active context"
+            reloaded.groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.channels.iter().any(|channel| {
+                        channel.channel_id == active_channel_id && channel.kind == ChannelKind::Text
+                    })
+            }),
+            "restart must route to a real text channel instead of reopening stale voice"
         );
         assert!(
             reloaded
