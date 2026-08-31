@@ -3420,16 +3420,23 @@ impl TauriAppService {
     }
 
     fn text_control_runtime_for_pump(&self) -> Option<&TextControlTransportRuntime> {
+        self.text_control_runtime_entry_for_pump()
+            .map(|(_, runtime)| runtime)
+    }
+
+    fn text_control_runtime_entry_for_pump(
+        &self,
+    ) -> Option<(&TextControlRuntimeMapKey, &TextControlTransportRuntime)> {
         let debug = std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some();
         if let Some(session) = self.state.transport_session(BackendTransportMode::Text) {
             let session_id = &session.session_id;
             // The control-lane runtime is the coordination path that actually
             // connects without local WebRTC; prefer it over an unconnected direct
             // runtime registered for the same session.
-            if let Some(runtime) = self
+            if let Some((key, runtime)) = self
                 .text_control_transport_runtimes
-                .values()
-                .find(|runtime| runtime.session_id == *session_id && runtime.lane)
+                .iter()
+                .find(|(_, runtime)| runtime.session_id == *session_id && runtime.lane)
             {
                 if debug {
                     eprintln!(
@@ -3437,22 +3444,26 @@ impl TauriAppService {
                         runtime.session_id, runtime.lane
                     );
                 }
-                return Some(runtime);
+                return Some((key, runtime));
             }
-            if let Some(runtime) = self.text_control_runtime_for_session(session_id) {
+            if let Some((key, runtime)) = self
+                .text_control_transport_runtimes
+                .iter()
+                .find(|(_, runtime)| runtime.session_id == *session_id)
+            {
                 if debug {
                     eprintln!(
                         "runtime_for_pump: fallback session={} lane={}",
                         runtime.session_id, runtime.lane
                     );
                 }
-                return Some(runtime);
+                return Some((key, runtime));
             }
         }
         if debug {
             eprintln!("runtime_for_pump: no runtime found");
         }
-        self.text_control_transport_runtimes.values().next()
+        self.text_control_transport_runtimes.iter().next()
     }
 
     fn broker_control_lane_attached_for_session(&self, session_id: &str) -> bool {
@@ -4933,7 +4944,10 @@ impl TauriAppService {
                 return report;
             }
 
-            let Some(runtime) = self.text_control_runtime_for_pump().cloned() else {
+            let Some((runtime_key, runtime)) = self
+                .text_control_runtime_entry_for_pump()
+                .map(|(key, runtime)| (key.clone(), runtime.clone()))
+            else {
                 let message = "text/control direct data-channel runtime is not attached; provider signaling is not a message relay".to_owned();
                 self.state.push_command_error(
                     "message.transport_pump_unavailable",
@@ -4962,7 +4976,7 @@ impl TauriAppService {
                 self.persist();
                 return report;
             }
-            route_runtimes.push((None, runtime));
+            route_runtimes.push((None, runtime_key, runtime));
         } else {
             for route_peer_id in route_peer_ids {
                 let key = TextControlRuntimeMapKey::for_remote(
@@ -4980,7 +4994,7 @@ impl TauriAppService {
                 }
                 match self.text_control_transport_runtimes.get(&key).cloned() {
                     Some(runtime) if runtime.session_id == transport_session_id => {
-                        route_runtimes.push((Some(route_peer_id), runtime));
+                        route_runtimes.push((Some(route_peer_id), key, runtime));
                     }
                     Some(runtime) => route_failures.push(format!(
                         "route peer {route_peer_id}: runtime session {} does not match active text session {}",
@@ -4991,12 +5005,12 @@ impl TauriAppService {
                         // fall back to it for route-targeted frames when no
                         // per-peer direct/TURN runtime exists for this peer.
                         let lane_fallback = self
-                            .text_control_runtime_for_pump()
-                            .filter(|runtime| runtime.session_id == transport_session_id)
-                            .cloned();
+                            .text_control_runtime_entry_for_pump()
+                            .filter(|(_, runtime)| runtime.session_id == transport_session_id)
+                            .map(|(key, runtime)| (key.clone(), runtime.clone()));
                         match lane_fallback {
-                            Some(runtime) => {
-                                route_runtimes.push((Some(route_peer_id), runtime));
+                            Some((runtime_key, runtime)) => {
+                                route_runtimes.push((Some(route_peer_id), runtime_key, runtime));
                             }
                             None => route_failures.push(format!(
                                 "route peer {route_peer_id}: missing direct/TURN text/control runtime; provider signaling is not a message relay"
@@ -5060,7 +5074,8 @@ impl TauriAppService {
                 last_state: "fanout".to_owned(),
             },
         };
-        for (route_peer_id, runtime) in route_runtimes {
+        let mut stale_runtime_keys = BTreeSet::new();
+        for (route_peer_id, runtime_key, runtime) in route_runtimes {
             let transport = runtime.transport.clone();
             let report = executor.block_on(async {
                 if runtime.inbound_receiver_owned {
@@ -5083,6 +5098,14 @@ impl TauriAppService {
                         .await
                 }
             });
+            let send_failed = report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("send text/control frame failed"));
+            let runtime_closed = !report.metrics.open;
+            if send_failed || runtime_closed {
+                stale_runtime_keys.insert(runtime_key);
+            }
             aggregate.frames_sent += report.frames_sent;
             aggregate.response_frames_received += report.response_frames_received;
             aggregate.receipts_applied += report.receipts_applied;
@@ -5093,6 +5116,17 @@ impl TauriAppService {
             aggregate.metrics.bytes_received += report.metrics.bytes_received;
             aggregate.metrics.open &= report.metrics.open;
             aggregate.metrics.last_state = report.metrics.last_state;
+        }
+        for key in stale_runtime_keys {
+            if self.text_control_transport_runtimes.remove(&key).is_some() {
+                self.state.push_event(
+                    "transport.text_runtime_stale_removed",
+                    format!(
+                        "Removed stale text/control runtime session {} peer {:?} after pump send failure or closed transport metrics",
+                        key.session_id, key.remote_peer_id
+                    ),
+                );
+            }
         }
         self.persist();
         aggregate
@@ -25043,6 +25077,58 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingSendTextControlTransport {
+        metrics: Mutex<discrypt_transport::WebRtcDataTransportMetrics>,
+    }
+
+    impl FailingSendTextControlTransport {
+        fn new() -> Self {
+            Self {
+                metrics: Mutex::new(discrypt_transport::WebRtcDataTransportMetrics {
+                    schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+                    label: "failing-send-text-control-datachannel".to_owned(),
+                    attached_channels: 1,
+                    open: false,
+                    frames_sent: 0,
+                    frames_received: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    last_state: "failed".to_owned(),
+                }),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl discrypt_transport::TextControlDataTransport for FailingSendTextControlTransport {
+        async fn send_text_control_frame(
+            &self,
+            _frame: Vec<u8>,
+        ) -> Result<(), discrypt_transport::TransportError> {
+            Err(discrypt_transport::TransportError::Unavailable(
+                "test datachannel is closed".to_owned(),
+            ))
+        }
+
+        async fn recv_text_control_frame(
+            &self,
+        ) -> Result<Vec<u8>, discrypt_transport::TransportError> {
+            Err(discrypt_transport::TransportError::Unavailable(
+                "test datachannel is closed".to_owned(),
+            ))
+        }
+
+        async fn text_control_transport_metrics(
+            &self,
+        ) -> discrypt_transport::WebRtcDataTransportMetrics {
+            self.metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
     #[test]
     fn test_harness_can_run_two_isolated_app_profiles() {
         let _guard = test_lock();
@@ -33517,6 +33603,112 @@ mod tests {
         assert_eq!(due_after_reattach.frames_sent, 1);
         assert_eq!(replacement_transport.sent_frames(), 1);
         clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_pump_removes_stale_route_runtime_after_send_failure() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("text-control-stale-route-runtime-send-failure");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Route Reattach Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        reload_global_app_service_from_path(&alice_path);
+        let (target, _, route_peer_ids, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[("member-stale-runtime", "Bob")],
+            "failed runtime should not block reattach",
+        )?;
+        let remote_peer_id = route_peer_ids
+            .first()
+            .cloned()
+            .ok_or_else(|| "remote route missing".to_owned())?;
+        let loaded = load_state();
+        let local_peer_id = loaded
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group.group_id)
+            .and_then(|candidate| {
+                candidate
+                    .members
+                    .iter()
+                    .find(|member| member.role == GroupRoleView::Owner)
+                    .and_then(|member| group_member_runtime_peer_id(&group.group_id, member).ok())
+            })
+            .ok_or_else(|| "local runtime peer id missing".to_owned())?;
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("text-control-stale-route-runtime".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        let transport = Arc::new(FailingSendTextControlTransport::new());
+        attach_background_receiver_peer_text_control_transport_runtime_for_test(
+            transport,
+            active_session_id.clone(),
+            local_peer_id,
+            remote_peer_id.clone(),
+        );
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(1),
+            operation_timeout_ms: Some(100),
+        });
+
+        assert_eq!(report.frames_sent, 0);
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("send text/control frame failed")));
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = TextControlRuntimeMapKey::for_remote(active_session_id.clone(), remote_peer_id);
+        assert!(
+            !guard.text_control_transport_runtimes.contains_key(&key),
+            "failed route runtime must be removed so recovery attach can replace it"
+        );
+        assert!(
+            !guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &key,
+            ),
+            "removed failed route runtime must not dedupe the next attach request"
+        );
+        assert!(guard.state.events.iter().any(|event| {
+            event.kind == "transport.text_runtime_stale_removed"
+                && event.summary.contains(&active_session_id)
+        }));
         Ok(())
     }
 
