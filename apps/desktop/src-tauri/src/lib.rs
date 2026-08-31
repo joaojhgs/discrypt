@@ -13529,9 +13529,14 @@ impl PersistedAppState {
         request: &ListPendingTextControlFramesRequest,
     ) -> Vec<TextControlOutboxFrameView> {
         let limit = request.limit.unwrap_or(50).clamp(1, 200);
-        self.text_control_outbox
+        let now = Utc::now();
+        let mut records = self
+            .text_control_outbox
             .iter()
             .filter(|record| {
+                if text_control_frame_is_expired_presence(&record.frame, now) {
+                    return false;
+                }
                 if record.route_peer_ids.is_empty() {
                     record.state_key == "pending"
                 } else {
@@ -13548,8 +13553,20 @@ impl PersistedAppState {
                     .as_ref()
                     .is_none_or(|target| &record.target == target)
             })
+            .enumerate()
+            .map(|(index, record)| {
+                (
+                    text_control_frame_delivery_priority(&record.frame),
+                    index,
+                    record,
+                )
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|(priority, index, _)| (*priority, *index));
+        records
+            .into_iter()
             .take(limit)
-            .map(TextControlOutboxFrameView::from)
+            .map(|(_, _, record)| TextControlOutboxFrameView::from(record))
             .collect()
     }
 
@@ -13759,10 +13776,14 @@ impl PersistedAppState {
         T: discrypt_transport::TextControlDataTransport + ?Sized,
     {
         let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let now = Utc::now();
         let limit = request.limit.unwrap_or(50).clamp(1, 200);
         let mut unsent = Vec::new();
         let mut retries = Vec::new();
         for record in &self.text_control_outbox {
+            if text_control_frame_is_expired_presence(&record.frame, now) {
+                continue;
+            }
             let target_matches = request
                 .target
                 .as_ref()
@@ -13786,8 +13807,9 @@ impl PersistedAppState {
                 continue;
             }
             let frame = TextControlOutboxFrameView::from(record);
+            let priority = text_control_frame_delivery_priority(&record.frame);
             if !route_was_sent {
-                unsent.push(frame);
+                unsent.push((priority, unsent.len(), frame));
             } else if wait_for_response
                 || record
                     .last_attempted_at_ms
@@ -13796,13 +13818,24 @@ impl PersistedAppState {
                             >= Self::text_control_outbox_retry_delay_ms(record.attempts)
                     })
             {
-                retries.push(frame);
+                retries.push((priority, retries.len(), frame));
             }
         }
+        unsent.sort_by_key(|(priority, index, _)| (*priority, *index));
+        retries.sort_by_key(|(priority, index, _)| (*priority, *index));
         let retry_limit = if wait_for_response { limit } else { 2 };
-        let mut pending = unsent.into_iter().take(limit).collect::<Vec<_>>();
+        let mut pending = unsent
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, frame)| frame)
+            .collect::<Vec<_>>();
         let remaining = limit.saturating_sub(pending.len()).min(retry_limit);
-        pending.extend(retries.into_iter().take(remaining));
+        pending.extend(
+            retries
+                .into_iter()
+                .take(remaining)
+                .map(|(_, _, frame)| frame),
+        );
         let mut frames_sent = 0_usize;
         let mut response_frames_received = 0_usize;
         let mut receipts_applied = 0_usize;
@@ -21125,6 +21158,31 @@ fn local_member_is_revoked(group: &GroupView, local_member_id: &str) -> bool {
         .any(|member| member.member_id == local_member_id && member.status == "revoked")
 }
 
+fn text_control_frame_delivery_priority(frame: &TextControlFrameView) -> u8 {
+    match frame {
+        TextControlFrameView::Envelope { .. } => 0,
+        TextControlFrameView::VoiceSignal { .. } => 1,
+        TextControlFrameView::GroupPresenceHeartbeat { .. } => 3,
+        _ => 2,
+    }
+}
+
+fn text_control_frame_is_expired_presence(
+    frame: &TextControlFrameView,
+    now: DateTime<Utc>,
+) -> bool {
+    let TextControlFrameView::GroupPresenceHeartbeat {
+        presence_expires_at,
+        ..
+    } = frame
+    else {
+        return false;
+    };
+    DateTime::parse_from_rfc3339(presence_expires_at)
+        .map(|expires_at| expires_at.with_timezone(&Utc) <= now)
+        .unwrap_or(true)
+}
+
 fn queue_group_governance_frame(
     state: &mut PersistedAppState,
     group_id: &str,
@@ -21138,6 +21196,24 @@ fn queue_group_governance_frame(
         .any(|record| record.message_id == event_id || record.frame_sha256 == frame_sha256)
     {
         return Ok(());
+    }
+    if let TextControlFrameView::GroupPresenceHeartbeat {
+        group_id: presence_group_id,
+        member_id: presence_member_id,
+        ..
+    } = &frame
+    {
+        state.text_control_outbox.retain(|record| {
+            !matches!(
+                &record.frame,
+                TextControlFrameView::GroupPresenceHeartbeat {
+                    group_id: existing_group_id,
+                    member_id: existing_member_id,
+                    ..
+                } if existing_group_id == presence_group_id
+                    && existing_member_id == presence_member_id
+            )
+        });
     }
     state.text_control_outbox.push(TextControlOutboxRecord {
         message_id: event_id.to_owned(),
@@ -29683,7 +29759,7 @@ mod tests {
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("per-peer-full-mesh-pending".to_owned()),
             data_channel_probe: false,
-            adapter_kind: None,
+            adapter_kind: Some("mqtt".to_owned()),
         });
         assert!(started.last_command_error.is_none(), "{started:?}");
         let active_session_id = load_state()
@@ -29713,7 +29789,7 @@ mod tests {
             &mut guard,
             "start_text_session",
             active_session_id.clone(),
-            None,
+            Some("mqtt"),
         )?;
 
         assert_eq!(jobs.len(), 2);
@@ -33445,6 +33521,201 @@ mod tests {
     }
 
     #[test]
+    fn group_presence_heartbeat_outbox_keeps_latest_per_member() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("presence-heartbeat-outbox-coalesce");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Presence Coalesce".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let member_id = load_state().local_user_id();
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.clone()),
+            channel_id: None,
+        };
+        let expires = (Utc::now() + Duration::seconds(120)).to_rfc3339();
+        let old_sent =
+            presence_heartbeat_frame(&group_id, "presence-old-sent", &member_id, &expires);
+        let old_pending =
+            presence_heartbeat_frame(&group_id, "presence-old-pending", &member_id, &expires);
+
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            for (message_id, frame, state_key) in [
+                ("presence-old-sent", old_sent, "sent"),
+                ("presence-old-pending", old_pending, "pending"),
+            ] {
+                state.text_control_outbox.push(TextControlOutboxRecord {
+                    message_id: message_id.to_owned(),
+                    target: target.clone(),
+                    frame_sha256: text_control_frame_sha256(&frame)?,
+                    frame,
+                    attempts: 7,
+                    last_attempted_at_ms: Some(1),
+                    state_key: state_key.to_owned(),
+                    last_transport_session_id: Some("stale-session".to_owned()),
+                    route_peer_ids: Vec::new(),
+                    sent_route_peer_ids: Vec::new(),
+                    receipted_route_peer_ids: Vec::new(),
+                });
+            }
+            queue_group_governance_frame(
+                state,
+                &group_id,
+                "presence-new",
+                presence_heartbeat_frame(&group_id, "presence-new", &member_id, &expires),
+            )
+        })
+        .1?;
+
+        let presence_records = load_state()
+            .text_control_outbox
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    &record.frame,
+                    TextControlFrameView::GroupPresenceHeartbeat {
+                        group_id: record_group_id,
+                        member_id: record_member_id,
+                        ..
+                    } if record_group_id == &group_id && record_member_id == &member_id
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(presence_records.len(), 1);
+        assert_eq!(presence_records[0].message_id, "presence-new");
+        assert_eq!(presence_records[0].state_key, "pending");
+        assert_eq!(presence_records[0].attempts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_pending_list_skips_expired_presence_heartbeats() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("presence-heartbeat-expired-skip");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Presence Expiry".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let member_id = load_state().local_user_id();
+        let expired = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        mutate_app_service_with_result(|state| {
+            queue_group_governance_frame(
+                state,
+                &group_id,
+                "presence-expired",
+                presence_heartbeat_frame(&group_id, "presence-expired", &member_id, &expired),
+            )
+        })
+        .1?;
+
+        let pending = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(10),
+            operation_timeout_ms: None,
+        });
+        assert!(pending.state.last_command_error.is_none());
+        assert!(pending.frames.is_empty(), "{:?}", pending.frames);
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_pending_list_prioritizes_envelopes_over_presence_backlog() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-envelope-priority-over-presence");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Text Priority".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let expires = (Utc::now() + Duration::seconds(120)).to_rfc3339();
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            for index in 0..16 {
+                let member_id = format!("presence-member-{index}");
+                let event_id = format!("presence-backlog-{index}");
+                queue_group_governance_frame(
+                    state,
+                    &group.group_id,
+                    &event_id,
+                    presence_heartbeat_frame(&group.group_id, &event_id, &member_id, &expires),
+                )?;
+            }
+            Ok(())
+        })
+        .1?;
+        let (target, message_id, _, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[("member-text-priority-bob", "Bob")],
+            "text envelope must not sit behind presence backlog",
+        )?;
+
+        let pending = list_pending_text_control_frames(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(1),
+            operation_timeout_ms: None,
+        });
+        assert!(pending.state.last_command_error.is_none());
+        assert_eq!(pending.frames.len(), 1);
+        assert_eq!(pending.frames[0].message_id, message_id);
+        assert_eq!(pending.frames[0].target, target);
+        assert!(matches!(
+            pending.frames[0].frame,
+            TextControlFrameView::Envelope { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn text_control_retry_backoff_is_bounded_for_unreceipted_frames() {
         assert_eq!(PersistedAppState::text_control_outbox_retry_delay_ms(0), 0);
         assert_eq!(
@@ -33467,6 +33738,25 @@ mod tests {
             PersistedAppState::text_control_outbox_retry_delay_ms(u32::MAX),
             30_000
         );
+    }
+
+    fn presence_heartbeat_frame(
+        group_id: &str,
+        event_id: &str,
+        member_id: &str,
+        presence_expires_at: &str,
+    ) -> TextControlFrameView {
+        TextControlFrameView::GroupPresenceHeartbeat {
+            group_id: group_id.to_owned(),
+            event_id: event_id.to_owned(),
+            member_id: member_id.to_owned(),
+            display_name: Some(member_id.to_owned()),
+            device_id: Some(format!("{member_id}-device")),
+            role: Some(GroupRoleView::Member),
+            signer_public_key_hex: None,
+            last_seen_at: Utc::now().to_rfc3339(),
+            presence_expires_at: presence_expires_at.to_owned(),
+        }
     }
 
     fn create_text_receiver_profile(
