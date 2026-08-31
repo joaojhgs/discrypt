@@ -888,7 +888,10 @@ struct DataChannelHub {
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     metrics: Arc<Mutex<DataTransportMetricsState>>,
     open: Arc<AtomicBool>,
-    open_notify: Arc<Notify>,
+    connection_ready: Arc<AtomicBool>,
+    unavailable: Arc<AtomicBool>,
+    terminal: Arc<AtomicBool>,
+    state_notify: Arc<Notify>,
     timeline: Arc<Mutex<DiagnosticTimelineState>>,
 }
 
@@ -898,6 +901,9 @@ impl DataChannelHub {
         Self {
             metrics: Arc::new(Mutex::new(DataTransportMetricsState::new(label.clone()))),
             open: Arc::new(AtomicBool::new(false)),
+            connection_ready: Arc::new(AtomicBool::new(false)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+            terminal: Arc::new(AtomicBool::new(false)),
             label,
             channels: Arc::new(Mutex::new(Vec::new())),
             channel_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -905,7 +911,7 @@ impl DataChannelHub {
             next_frame_id: Arc::new(AtomicU64::new(1)),
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
-            open_notify: Arc::new(Notify::new()),
+            state_notify: Arc::new(Notify::new()),
             timeline,
         }
     }
@@ -945,7 +951,10 @@ impl DataChannelHub {
         let inbound_tx = self.inbound_tx.clone();
         let metrics = Arc::clone(&self.metrics);
         let open = Arc::clone(&self.open);
-        let open_notify = Arc::clone(&self.open_notify);
+        let connection_ready = Arc::clone(&self.connection_ready);
+        let unavailable = Arc::clone(&self.unavailable);
+        let terminal = Arc::clone(&self.terminal);
+        let state_notify = Arc::clone(&self.state_notify);
         let timeline = Arc::clone(&self.timeline);
         let channels = Arc::clone(&self.channels);
         let channel_keys = Arc::clone(&self.channel_keys);
@@ -956,11 +965,23 @@ impl DataChannelHub {
                 match event {
                     DataChannelEvent::OnOpen => {
                         open.store(true, Ordering::Release);
+                        let terminal = terminal.load(Ordering::Acquire);
+                        let usable = connection_ready.load(Ordering::Acquire) && !terminal;
+                        if usable {
+                            unavailable.store(false, Ordering::Release);
+                        }
                         let mut metrics = metrics.lock().await;
-                        metrics.open = true;
-                        metrics.last_state = "open".to_owned();
+                        metrics.open = usable;
+                        if !terminal {
+                            metrics.last_state = if usable {
+                                "open"
+                            } else {
+                                "data_channel_open_waiting_for_peer"
+                            }
+                            .to_owned();
+                        }
                         drop(metrics);
-                        open_notify.notify_waiters();
+                        state_notify.notify_waiters();
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("open".to_owned());
@@ -1018,6 +1039,7 @@ impl DataChannelHub {
                     }
                     DataChannelEvent::OnClose => {
                         open.store(false, Ordering::Release);
+                        unavailable.store(true, Ordering::Release);
                         {
                             channel_keys.lock().await.remove(&channel_key);
                             let mut channels = channels.lock().await;
@@ -1031,26 +1053,35 @@ impl DataChannelHub {
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closed".to_owned());
                         record_timeline_event(&timeline, event).await;
+                        state_notify.notify_waiters();
                         break;
                     }
                     DataChannelEvent::OnClosing => {
                         open.store(false, Ordering::Release);
+                        unavailable.store(true, Ordering::Release);
                         let mut metrics = metrics.lock().await;
+                        metrics.open = false;
                         metrics.last_state = "closing".to_owned();
                         drop(metrics);
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closing".to_owned());
                         record_timeline_event(&timeline, event).await;
+                        state_notify.notify_waiters();
                     }
                     DataChannelEvent::OnError => {
                         open.store(false, Ordering::Release);
-                        metrics.lock().await.last_state = "error".to_owned();
+                        unavailable.store(true, Ordering::Release);
+                        let mut metrics = metrics.lock().await;
+                        metrics.open = false;
+                        metrics.last_state = "error".to_owned();
+                        drop(metrics);
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("error".to_owned());
                         event.failure_reason = Some("DataChannel event error".to_owned());
                         record_timeline_event(&timeline, event).await;
+                        state_notify.notify_waiters();
                     }
                     DataChannelEvent::OnBufferedAmountLow => {
                         metrics.lock().await.last_state = "buffered_amount_low".to_owned();
@@ -1064,28 +1095,38 @@ impl DataChannelHub {
     }
 
     async fn wait_open(&self, duration: Duration) -> Result<(), TransportError> {
-        if self.metrics.lock().await.open {
-            return Ok(());
+        let deadline = Instant::now() + duration;
+        loop {
+            let notified = self.state_notify.notified();
+            if self.is_usable() {
+                return Ok(());
+            }
+            if self.unavailable.load(Ordering::Acquire) {
+                return Err(self.unavailable_error());
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if timeout(remaining, notified).await.is_err() {
+                break;
+            }
         }
-        if timeout(duration, self.open_notify.notified())
-            .await
-            .is_err()
-        {
-            let mut event = diagnostic_event("failure");
-            event.peer_role = Some("local".to_owned());
-            event.failure_reason = Some("DataChannel did not open".to_owned());
-            record_timeline_event(&self.timeline, event).await;
-            return Err(TransportError::Unavailable(
-                "DataChannel did not open".to_owned(),
-            ));
-        }
-        Ok(())
+        let mut event = diagnostic_event("failure");
+        event.peer_role = Some("local".to_owned());
+        event.failure_reason = Some("DataChannel did not open".to_owned());
+        record_timeline_event(&self.timeline, event).await;
+        Err(TransportError::Unavailable(
+            "DataChannel did not open".to_owned(),
+        ))
     }
 
     async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
         let frame_id = self.next_frame_id.fetch_add(1, Ordering::Relaxed);
         let wire_messages = encode_data_channel_wire_messages(frame_id, &frame)?;
         self.wait_open(Duration::from_secs(10)).await?;
+        if !self.is_usable() {
+            return Err(self.unavailable_error());
+        }
         let _send_guard = self.send_lock.lock().await;
         let channels = self.channels.lock().await;
         let channel = channels
@@ -1120,11 +1161,21 @@ impl DataChannelHub {
     }
 
     async fn recv(&self) -> Result<Vec<u8>, TransportError> {
-        let mut inbound_rx = self.inbound_rx.lock().await;
-        inbound_rx
-            .recv()
-            .await
-            .ok_or_else(|| TransportError::Unavailable("DataChannel receive closed".to_owned()))
+        loop {
+            let notified = self.state_notify.notified();
+            if self.unavailable.load(Ordering::Acquire) {
+                return Err(self.unavailable_error());
+            }
+            let mut inbound_rx = self.inbound_rx.lock().await;
+            tokio::select! {
+                frame = inbound_rx.recv() => {
+                    return frame.ok_or_else(|| {
+                        TransportError::Unavailable("DataChannel receive closed".to_owned())
+                    });
+                }
+                () = notified => {}
+            }
+        }
     }
 
     async fn snapshot(&self) -> WebRtcDataTransportMetrics {
@@ -1135,7 +1186,7 @@ impl DataChannelHub {
         if let Ok(metrics) = self.metrics.try_lock() {
             return metrics.snapshot();
         }
-        let open = self.open.load(Ordering::Acquire);
+        let open = self.is_usable();
         WebRtcDataTransportMetrics {
             schema_version: WebRtcDataTransportMetrics::SCHEMA_VERSION,
             label: self.label.clone(),
@@ -1149,12 +1200,69 @@ impl DataChannelHub {
         }
     }
 
+    fn is_usable(&self) -> bool {
+        !self.terminal.load(Ordering::Acquire)
+            && self.open.load(Ordering::Acquire)
+            && self.connection_ready.load(Ordering::Acquire)
+    }
+
+    fn unavailable_error(&self) -> TransportError {
+        TransportError::Unavailable(
+            "WebRTC peer connection or DataChannel is no longer usable".to_owned(),
+        )
+    }
+
+    async fn set_peer_connection_state(&self, state: RTCPeerConnectionState) {
+        if state == RTCPeerConnectionState::Connected {
+            if self.terminal.load(Ordering::Acquire) {
+                return;
+            }
+            self.connection_ready.store(true, Ordering::Release);
+            if self.open.load(Ordering::Acquire) {
+                self.unavailable.store(false, Ordering::Release);
+            }
+        } else if matches!(
+            state,
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        ) {
+            self.mark_unavailable(format!("peer_connection_{state}"))
+                .await;
+            return;
+        } else {
+            return;
+        }
+        let usable = self.is_usable();
+        let mut metrics = self.metrics.lock().await;
+        metrics.open = usable;
+        metrics.last_state = if usable {
+            "open".to_owned()
+        } else {
+            format!("peer_connection_{state}")
+        };
+        drop(metrics);
+        self.state_notify.notify_waiters();
+    }
+
+    async fn mark_unavailable(&self, last_state: String) {
+        self.terminal.store(true, Ordering::Release);
+        self.connection_ready.store(false, Ordering::Release);
+        self.unavailable.store(true, Ordering::Release);
+        let mut metrics = self.metrics.lock().await;
+        metrics.open = false;
+        metrics.last_state = last_state;
+        drop(metrics);
+        self.state_notify.notify_waiters();
+    }
+
     async fn close_all(&self) -> Result<(), TransportError> {
         let channels = self.channels.lock().await.clone();
         for channel in channels {
             channel.close().await.map_err(data_channel_error)?;
         }
         self.open.store(false, Ordering::Release);
+        self.connection_ready.store(false, Ordering::Release);
+        self.unavailable.store(true, Ordering::Release);
+        self.terminal.store(true, Ordering::Release);
         let mut metrics = self.metrics.lock().await;
         metrics.open = false;
         metrics.last_state = "closed".to_owned();
@@ -1163,6 +1271,7 @@ impl DataChannelHub {
         event.peer_role = Some("local".to_owned());
         event.state = Some("closed".to_owned());
         record_timeline_event(&self.timeline, event).await;
+        self.state_notify.notify_waiters();
         Ok(())
     }
 }
@@ -2089,6 +2198,14 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-ice-connection-state state={state}");
         }
         self.metrics.lock().await.ice_connection_state = state;
+        if matches!(
+            state,
+            RTCIceConnectionState::Failed | RTCIceConnectionState::Closed
+        ) {
+            self.data_channels
+                .mark_unavailable(format!("ice_connection_{state}"))
+                .await;
+        }
         let mut event = diagnostic_event("ice_connection_state");
         event.peer_role = Some("local".to_owned());
         event.state = Some(state.to_string());
@@ -2100,6 +2217,7 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-peer-connection-state state={state}");
         }
         self.metrics.lock().await.peer_connection_state = state;
+        self.data_channels.set_peer_connection_state(state).await;
         let mut event = diagnostic_event("peer_connection_state");
         event.peer_role = Some("local".to_owned());
         event.state = Some(state.to_string());
@@ -2356,6 +2474,47 @@ mod tests {
             event.kind == "data_channel"
                 && event.state.as_deref() == Some("duplicate_attach_ignored")
         }));
+    }
+
+    #[tokio::test]
+    async fn data_channel_becomes_unusable_when_peer_connection_fails() -> Result<(), TransportError>
+    {
+        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
+        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
+        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
+            .await;
+        let channel: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
+            8,
+            "discrypt-text-control",
+            vec![DataChannelEvent::OnOpen],
+        ));
+        hub.attach(channel).await;
+        sleep(Duration::from_millis(25)).await;
+
+        assert!(hub.snapshot().await.open);
+        hub.send(b"connected frame".to_vec()).await?;
+
+        hub.set_peer_connection_state(RTCPeerConnectionState::Failed)
+            .await;
+        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
+            .await;
+
+        let metrics = hub.snapshot().await;
+        assert!(!metrics.open);
+        assert_eq!(metrics.last_state, "peer_connection_failed");
+        let Err(send_error) = hub.send(b"stale frame".to_vec()).await else {
+            return Err(TransportError::Unavailable(
+                "failed peer connection must reject DataChannel sends".to_owned(),
+            ));
+        };
+        assert!(send_error.to_string().contains("no longer usable"));
+        let Err(receive_error) = hub.recv().await else {
+            return Err(TransportError::Unavailable(
+                "failed peer connection must stop DataChannel receivers".to_owned(),
+            ));
+        };
+        assert!(receive_error.to_string().contains("no longer usable"));
+        Ok(())
     }
 
     #[test]
