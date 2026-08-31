@@ -1,4 +1,5 @@
 import { Browser, expect, Page, test } from "playwright/test";
+import { shouldMountRemoteAudioElement } from "../../src/voice-playback";
 
 type VoiceMediaEvidence = {
   getUserMediaCalls: number;
@@ -356,6 +357,20 @@ async function joinVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
 }
+
+test("native Rust WebAudio playback does not mount a duplicate HTML audio output", () => {
+  expect(
+    shouldMountRemoteAudioElement(
+      "voice-native-rust-audio-peer-portugal",
+      true,
+      false,
+    ),
+  ).toBe(false);
+  expect(
+    shouldMountRemoteAudioElement("voice-remote-audio-peer-portugal", true, false),
+  ).toBe(true);
+  expect(shouldMountRemoteAudioElement(null, false, true)).toBe(true);
+});
 
 test("two profiles attach local microphone tracks and surface remote audio playback", async ({
   browser,

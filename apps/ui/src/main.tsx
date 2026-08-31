@@ -86,6 +86,7 @@ import {
   startWebViewVoiceMediaSession,
   VoiceMediaSessionHandle,
 } from "./voice-media";
+import { shouldMountRemoteAudioElement } from "./voice-playback";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -4749,6 +4750,11 @@ function VoiceParticipantList({
           (track) => track.participant_id === participant.id,
         );
         const remoteStream = local ? null : remoteStreams[participant.id];
+        const mountRemoteAudio = shouldMountRemoteAudioElement(
+          remoteTrack?.playback_element_id,
+          Boolean(remoteTrack),
+          Boolean(remoteStream),
+        );
         return (
           <div
             key={participant.id}
@@ -4784,7 +4790,7 @@ function VoiceParticipantList({
                 mute
               </span>
             ) : null}
-            {!local && (remoteTrack || remoteStream) ? (
+            {!local && mountRemoteAudio ? (
               <RemoteAudioAttachment
                 participant={participant}
                 src={remoteTrack?.playback_element_id ? null : participant.remote_audio_src}
