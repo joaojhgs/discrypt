@@ -13800,7 +13800,6 @@ impl PersistedAppState {
                 Some(route_peer_id) => {
                     frame.route_peer_ids.contains(route_peer_id)
                         && !frame.receipted_route_peer_ids.contains(route_peer_id)
-                        && (wait_for_response || !frame.sent_route_peer_ids.contains(route_peer_id))
                 }
                 None => frame.route_peer_ids.is_empty(),
             })
@@ -33242,9 +33241,9 @@ mod tests {
     }
 
     #[test]
-    fn background_receiver_route_sends_once_per_attached_data_channel() -> Result<(), String> {
+    fn background_receiver_route_retries_unreceipted_frame_after_backoff() -> Result<(), String> {
         let _guard = test_lock();
-        let alice_path = reset_with_temp_state("text-control-background-route-single-send");
+        let alice_path = reset_with_temp_state("text-control-background-route-retry");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -33275,7 +33274,7 @@ mod tests {
             &group.group_id,
             &channel_id,
             &[(remote_member_id, "Bob")],
-            "send once while background receiver waits for receipt",
+            "retry after backoff while background receiver waits for receipt",
         )?;
         let remote_peer_id = route_peer_ids
             .first()
@@ -33321,6 +33320,18 @@ mod tests {
         assert!(first.failures.is_empty(), "{first:?}");
         assert_eq!(first.frames_sent, 1);
         assert_eq!(transport.sent_frames(), 1);
+        assert_eq!(transport.recv_calls(), 0);
+
+        let immediate_retry =
+            pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+                target: Some(target.clone()),
+                limit: Some(1),
+                operation_timeout_ms: Some(100),
+            });
+        assert!(immediate_retry.failures.is_empty(), "{immediate_retry:?}");
+        assert_eq!(immediate_retry.frames_sent, 0);
+        assert_eq!(transport.sent_frames(), 1);
+        assert_eq!(transport.recv_calls(), 0);
 
         {
             let service = app_service();
@@ -33342,14 +33353,15 @@ mod tests {
             operation_timeout_ms: Some(100),
         });
         assert!(retry.failures.is_empty(), "{retry:?}");
-        assert_eq!(retry.frames_sent, 0);
-        assert_eq!(transport.sent_frames(), 1);
+        assert_eq!(retry.frames_sent, 1);
+        assert_eq!(transport.sent_frames(), 2);
+        assert_eq!(transport.recv_calls(), 0);
         let outbox = load_state()
             .text_control_outbox
             .into_iter()
             .find(|record| record.message_id == message_id)
             .ok_or_else(|| "outbox missing after retry pump".to_owned())?;
-        assert_eq!(outbox.attempts, 1);
+        assert_eq!(outbox.attempts, 2);
         assert_eq!(outbox.sent_route_peer_ids, vec![remote_peer_id]);
         assert!(outbox.receipted_route_peer_ids.is_empty());
 
