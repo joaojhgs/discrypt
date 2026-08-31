@@ -104,6 +104,7 @@ export function startNativeRustVoiceMediaSession(
   let playbackTimer: number | null = null;
   let nextPlaybackTime = 0;
   let queuedSends = 0;
+  let transportReady = false;
   let pendingCaptureSamples: number[] = [];
   const audioContext = new AudioContextCtor({ sampleRate: 48_000 });
   const source = audioContext.createMediaStreamSource(options.localStream);
@@ -122,6 +123,7 @@ export function startNativeRustVoiceMediaSession(
     created_at_ms: Date.now(),
   })
     .then((response) => {
+      transportReady = response.status.data_channel_open && response.status.direct_path_ready;
       options.onState?.(response.state);
       options.onStatus?.(
         response.status.data_channel_open
@@ -149,6 +151,7 @@ export function startNativeRustVoiceMediaSession(
     pendingCaptureSamples.push(...normalized);
     while (pendingCaptureSamples.length >= 960) {
       const frame = pendingCaptureSamples.splice(0, 960);
+      if (!transportReady) continue;
       if (queuedSends >= 8) continue;
       const pcm_i16 = frame.map((sample) =>
         Math.max(-32768, Math.min(32767, Math.round(sample * 32767))),
@@ -193,6 +196,7 @@ export function startNativeRustVoiceMediaSession(
     })
       .then((response) => {
         if (closed) return;
+        transportReady = response.status.data_channel_open && response.status.direct_path_ready;
         for (const frame of response.frames) {
           scheduleNativeVoicePlaybackFrame(audioContext, frame, () => nextPlaybackTime, (time) => {
             nextPlaybackTime = time;

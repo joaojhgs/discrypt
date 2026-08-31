@@ -26,6 +26,8 @@ use webrtc::peer_connection::{
     StatsSelector,
 };
 
+const DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES: usize = 64 * 1024;
+
 /// Redacted WebRTC diagnostic timeline safe for logs, Tauri diagnostics, and issue evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WebRtcDiagnosticTimeline {
@@ -1108,6 +1110,7 @@ impl WebRtcNegotiator {
             )
             .with_media_engine(media)
             .with_interceptor_registry(registry)
+            .with_data_channel_send_buffer_limit(DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES)
             .with_handler(handler)
             .with_udp_addrs(config.udp_addrs.clone())
             .build()

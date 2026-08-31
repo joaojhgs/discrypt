@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 const WEBRTC_OPUS_SAMPLE_RATE_HZ: u32 = 48_000;
 const MIN_OPUS_PACKET_BYTES: usize = 3;
 const MAX_OPUS_PACKET_BYTES: usize = 1_275;
-const MAX_OPUS_FRAME_DATA_BYTES: usize = 1_274;
+#[cfg(test)]
+const MAX_MONO_20MS_REALTIME_OPUS_PACKET_BYTES: usize = 320;
 /// 1000 millipercent is unity gain for speaker playback volume.
 pub const SPEAKER_VOLUME_UNITY_MILLIPERCENT: u16 = 1_000;
 /// Keep local playback gain bounded to avoid clipping abuse or accidental runaway amplification.
@@ -192,11 +193,7 @@ impl OpusAudioEncoder {
         }
         let opus_payload = self
             .encoder
-            .encode_i16_with_frame_bytes(
-                &frame.pcm_i16,
-                self.format.samples_per_channel(),
-                MAX_OPUS_FRAME_DATA_BYTES,
-            )
+            .encode_i16(&frame.pcm_i16, self.format.samples_per_channel())
             .map_err(|error| MediaError::OpusEncodeFailed(error.to_string()))?;
         if opus_payload.len() < MIN_OPUS_PACKET_BYTES || opus_payload.len() > MAX_OPUS_PACKET_BYTES
         {
@@ -1027,7 +1024,11 @@ mod tests {
         assert_eq!(encoded.format, format);
         assert!(!encoded.opus_payload.is_empty());
         assert_ne!(encoded.opus_payload, b"encoded opus");
-        assert!(encoded.opus_payload.len() <= MAX_OPUS_PACKET_BYTES);
+        assert!(
+            encoded.opus_payload.len() <= MAX_MONO_20MS_REALTIME_OPUS_PACKET_BYTES,
+            "20 ms mono voice packets must remain suitable for real-time transport, got {} bytes",
+            encoded.opus_payload.len()
+        );
 
         let original_opus = encoded.opus_payload.clone();
         let mut verification_bridge = media_bridge()?;

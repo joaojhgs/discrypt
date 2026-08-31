@@ -1964,6 +1964,117 @@ pub struct NativeVoiceMediaSignalPayload {
     pub created_at_ms: u64,
 }
 
+const NATIVE_VOICE_DATA_CHANNEL_WIRE_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeVoiceDataChannelProtectedFrame {
+    #[serde(rename = "k")]
+    kid: String,
+    #[serde(rename = "c")]
+    counter: u64,
+    #[serde(rename = "b")]
+    bytes: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeVoiceDataChannelWireFrame {
+    #[serde(rename = "v")]
+    version: u8,
+    #[serde(rename = "r")]
+    rms_i16: u16,
+    #[serde(rename = "p")]
+    peak_i16: u16,
+    #[serde(rename = "q")]
+    speaking: bool,
+    #[serde(rename = "o")]
+    opus_payload_bytes: usize,
+    #[serde(rename = "m")]
+    mic_gain_percent: u16,
+    #[serde(rename = "a")]
+    app_output_volume_percent: u16,
+    #[serde(rename = "d")]
+    protected_frames: Vec<NativeVoiceDataChannelProtectedFrame>,
+    #[serde(rename = "x")]
+    created_at_ms: u64,
+}
+
+fn encode_native_voice_data_channel_frame(
+    payload: NativeVoiceMediaSignalPayload,
+) -> Result<Vec<u8>, String> {
+    let protected_frames = payload
+        .protected_frames
+        .into_iter()
+        .map(|frame| NativeVoiceDataChannelProtectedFrame {
+            kid: URL_SAFE_NO_PAD.encode(frame.kid),
+            counter: frame.counter,
+            bytes: URL_SAFE_NO_PAD.encode(frame.bytes),
+        })
+        .collect();
+    serde_json::to_vec(&NativeVoiceDataChannelWireFrame {
+        version: NATIVE_VOICE_DATA_CHANNEL_WIRE_VERSION,
+        rms_i16: payload.rms_i16,
+        peak_i16: payload.peak_i16,
+        speaking: payload.speaking,
+        opus_payload_bytes: payload.opus_payload_bytes,
+        mic_gain_percent: payload.mic_gain_percent,
+        app_output_volume_percent: payload.app_output_volume_percent,
+        protected_frames,
+        created_at_ms: payload.created_at_ms,
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn decode_native_voice_data_channel_frame(
+    received: &[u8],
+    codec: &NativeVoiceCodecState,
+) -> Result<NativeVoiceMediaSignalPayload, String> {
+    let wire: NativeVoiceDataChannelWireFrame =
+        serde_json::from_slice(received).map_err(|error| error.to_string())?;
+    if wire.version != NATIVE_VOICE_DATA_CHANNEL_WIRE_VERSION {
+        return Err("unsupported native voice DataChannel frame version".to_owned());
+    }
+    let protected_frames = wire
+        .protected_frames
+        .into_iter()
+        .map(|frame| {
+            Ok(NativeVoiceProtectedFrameView {
+                kid: URL_SAFE_NO_PAD
+                    .decode(frame.kid)
+                    .map_err(|error| error.to_string())?,
+                counter: frame.counter,
+                bytes: URL_SAFE_NO_PAD
+                    .decode(frame.bytes)
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let protected_frames_count = u16::try_from(protected_frames.len())
+        .map_err(|_| "native voice DataChannel frame count overflow".to_owned())?;
+    let protected_payload_bytes = protected_frames.iter().map(|frame| frame.bytes.len()).sum();
+    Ok(NativeVoiceMediaSignalPayload {
+        schema_version: "discrypt.native_voice_media.v1".to_owned(),
+        session_id: codec.session_id.clone(),
+        group_id: codec.group_id.clone(),
+        channel_id: codec.channel_id.clone(),
+        from_peer_id: codec.remote_peer_id.clone(),
+        to_peer_id: codec.local_peer_id.clone(),
+        media_path: "native_rust_webrtc_datachannel".to_owned(),
+        boundary: "rust-opus-sframe-over-provider-webrtc-datachannel".to_owned(),
+        capture_source: "webview-getusermedia-pcm".to_owned(),
+        rms_i16: wire.rms_i16,
+        peak_i16: wire.peak_i16,
+        speaking: wire.speaking,
+        opus_frames: protected_frames_count,
+        protected_frames_count,
+        opus_payload_bytes: wire.opus_payload_bytes,
+        protected_payload_bytes,
+        mic_gain_percent: wire.mic_gain_percent,
+        app_output_volume_percent: wire.app_output_volume_percent,
+        protected_frames,
+        created_at_ms: wire.created_at_ms,
+    })
+}
+
 /// Response returned after Rust creates a native media proof frame.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartNativeVoiceMediaSessionResponse {
@@ -8718,7 +8829,7 @@ pub fn send_native_voice_audio_frame(
             codec.encode_pcm_frame(request.pcm_i16, false, request.captured_at_ms)
         });
     let send_result = payload
-        .and_then(|payload| serde_json::to_vec(&payload).map_err(|error| error.to_string()))
+        .and_then(encode_native_voice_data_channel_frame)
         .and_then(|bytes| {
             executor
                 .block_on(async {
@@ -19503,21 +19614,22 @@ fn process_live_native_voice_frame(
     codec: &Arc<Mutex<NativeVoiceCodecState>>,
     received: Vec<u8>,
 ) -> Result<(), TransportError> {
-    let media: NativeVoiceMediaSignalPayload =
-        serde_json::from_slice(&received).map_err(|error| {
-            TransportError::Unavailable(format!(
-                "native voice DataChannel frame could not be decoded: {error}"
-            ))
-        })?;
+    let mut codec = codec
+        .lock()
+        .map_err(|_| TransportError::Unavailable("native voice codec lock poisoned".to_owned()))?;
+    let media = decode_native_voice_data_channel_frame(&received, &codec).map_err(|error| {
+        TransportError::Unavailable(format!(
+            "native voice DataChannel frame could not be decoded: {error}"
+        ))
+    })?;
     let remote_peer_id = media.from_peer_id.clone();
     let speaking = media.speaking;
     let received_frames = media.protected_frames_count;
     let attached_at_ms = media.created_at_ms;
     codec
-        .lock()
-        .map_err(|_| TransportError::Unavailable("native voice codec lock poisoned".to_owned()))?
         .receive_wire_frame(media)
         .map_err(TransportError::Unavailable)?;
+    drop(codec);
 
     let service = app_service();
     let mut guard = service
@@ -40510,6 +40622,50 @@ mod tests {
             bob.receive_wire_frame(first).is_err(),
             "SFrame replay must fail closed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_voice_datachannel_frame_fits_internet_path_mtu() -> Result<(), String> {
+        const MAX_INTERNET_SAFE_DATAGRAM_BYTES: usize = 1_200;
+
+        let format = AudioCaptureFormat::mono_20ms_48khz();
+        let mut codec = NativeVoiceCodecState::new_with_material(
+            &[29; 32],
+            3,
+            "group-native-voice",
+            "channel-native-voice",
+            "voice-session-native-voice",
+            "peer-alice",
+            "peer-bob",
+            100,
+            100,
+        )?;
+        let receiver = NativeVoiceCodecState::new_with_material(
+            &[29; 32],
+            3,
+            "group-native-voice",
+            "channel-native-voice",
+            "voice-session-native-voice",
+            "peer-bob",
+            "peer-alice",
+            100,
+            100,
+        )?;
+        let pcm = (0..format.interleaved_samples_per_frame())
+            .map(|index| (((index % 48) as i16) - 24) * 400)
+            .collect::<Vec<_>>();
+
+        let payload = codec.encode_pcm_frame(pcm, false, 1_000)?;
+        let wire = encode_native_voice_data_channel_frame(payload.clone())?;
+        let decoded = decode_native_voice_data_channel_frame(&wire, &receiver)?;
+
+        assert!(
+            wire.len() <= MAX_INTERNET_SAFE_DATAGRAM_BYTES,
+            "native voice frame must avoid SCTP fragmentation on Internet paths, got {} bytes",
+            wire.len()
+        );
+        assert_eq!(decoded, payload);
         Ok(())
     }
 
