@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -27,6 +28,189 @@ use webrtc::peer_connection::{
 };
 
 const DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES: usize = 64 * 1024;
+const DATA_CHANNEL_CHUNK_MAGIC: &[u8; 4] = b"DCR1";
+const DATA_CHANNEL_CHUNK_HEADER_BYTES: usize = 20;
+const DATA_CHANNEL_CHUNK_PAYLOAD_BYTES: usize = 900;
+const DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct PendingDataChannelFrame {
+    frame_id: u64,
+    total_len: usize,
+    chunk_count: u16,
+    next_chunk_index: u16,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct DataChannelFrameReassembler {
+    pending: Option<PendingDataChannelFrame>,
+}
+
+impl DataChannelFrameReassembler {
+    fn push(&mut self, message: Vec<u8>) -> Result<Option<Vec<u8>>, TransportError> {
+        if !message.starts_with(DATA_CHANNEL_CHUNK_MAGIC) {
+            self.pending = None;
+            if message.len() > DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES {
+                return Err(invalid_data_channel_chunk("raw frame exceeds size limit"));
+            }
+            return Ok(Some(message));
+        }
+
+        let parsed = parse_data_channel_chunk(&message);
+        let (frame_id, total_len, chunk_index, chunk_count, payload) = match parsed {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                self.pending = None;
+                return Err(error);
+            }
+        };
+
+        if chunk_index == 0 {
+            let mut bytes = Vec::with_capacity(total_len);
+            bytes.extend_from_slice(payload);
+            self.pending = Some(PendingDataChannelFrame {
+                frame_id,
+                total_len,
+                chunk_count,
+                next_chunk_index: 1,
+                bytes,
+            });
+            return Ok(None);
+        }
+
+        let Some(mut pending) = self.pending.take() else {
+            return Err(invalid_data_channel_chunk(
+                "continuation arrived without a first chunk",
+            ));
+        };
+        if pending.frame_id != frame_id
+            || pending.total_len != total_len
+            || pending.chunk_count != chunk_count
+            || pending.next_chunk_index != chunk_index
+        {
+            return Err(invalid_data_channel_chunk(
+                "chunk sequence does not match the pending frame",
+            ));
+        }
+        pending.bytes.extend_from_slice(payload);
+        pending.next_chunk_index = pending.next_chunk_index.saturating_add(1);
+        if pending.bytes.len() > pending.total_len {
+            return Err(invalid_data_channel_chunk(
+                "reassembled frame exceeds declared length",
+            ));
+        }
+        if chunk_index.saturating_add(1) == chunk_count {
+            if pending.bytes.len() != pending.total_len {
+                return Err(invalid_data_channel_chunk(
+                    "final chunk does not match declared length",
+                ));
+            }
+            return Ok(Some(pending.bytes));
+        }
+        self.pending = Some(pending);
+        Ok(None)
+    }
+}
+
+fn encode_data_channel_wire_messages(
+    frame_id: u64,
+    frame: &[u8],
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    if frame.is_empty() {
+        return Err(TransportError::Unavailable(
+            "text/control data frame is empty".to_owned(),
+        ));
+    }
+    if frame.len() > DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES {
+        return Err(TransportError::Unavailable(format!(
+            "text/control data frame exceeds {DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES} byte limit"
+        )));
+    }
+    if frame.len() <= DATA_CHANNEL_CHUNK_PAYLOAD_BYTES {
+        return Ok(vec![frame.to_vec()]);
+    }
+
+    let chunk_count = frame.len().div_ceil(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
+    let chunk_count = u16::try_from(chunk_count).map_err(|_| {
+        TransportError::Unavailable("text/control data frame requires too many chunks".to_owned())
+    })?;
+    let total_len = u32::try_from(frame.len()).map_err(|_| {
+        TransportError::Unavailable("text/control data frame length is unsupported".to_owned())
+    })?;
+    let mut messages = Vec::with_capacity(usize::from(chunk_count));
+    for (chunk_index, payload) in frame.chunks(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES).enumerate() {
+        let chunk_index = u16::try_from(chunk_index).map_err(|_| {
+            TransportError::Unavailable(
+                "text/control data frame chunk index is unsupported".to_owned(),
+            )
+        })?;
+        let mut message = Vec::with_capacity(DATA_CHANNEL_CHUNK_HEADER_BYTES + payload.len());
+        message.extend_from_slice(DATA_CHANNEL_CHUNK_MAGIC);
+        message.extend_from_slice(&frame_id.to_be_bytes());
+        message.extend_from_slice(&total_len.to_be_bytes());
+        message.extend_from_slice(&chunk_index.to_be_bytes());
+        message.extend_from_slice(&chunk_count.to_be_bytes());
+        message.extend_from_slice(payload);
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
+fn parse_data_channel_chunk(
+    message: &[u8],
+) -> Result<(u64, usize, u16, u16, &[u8]), TransportError> {
+    if message.len() < DATA_CHANNEL_CHUNK_HEADER_BYTES {
+        return Err(invalid_data_channel_chunk("header is truncated"));
+    }
+    let frame_id = u64::from_be_bytes(
+        message[4..12]
+            .try_into()
+            .map_err(|_| invalid_data_channel_chunk("frame id is malformed"))?,
+    );
+    let total_len = u32::from_be_bytes(
+        message[12..16]
+            .try_into()
+            .map_err(|_| invalid_data_channel_chunk("frame length is malformed"))?,
+    ) as usize;
+    let chunk_index = u16::from_be_bytes(
+        message[16..18]
+            .try_into()
+            .map_err(|_| invalid_data_channel_chunk("chunk index is malformed"))?,
+    );
+    let chunk_count = u16::from_be_bytes(
+        message[18..20]
+            .try_into()
+            .map_err(|_| invalid_data_channel_chunk("chunk count is malformed"))?,
+    );
+    if total_len <= DATA_CHANNEL_CHUNK_PAYLOAD_BYTES
+        || total_len > DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES
+    {
+        return Err(invalid_data_channel_chunk(
+            "declared frame length is outside chunked bounds",
+        ));
+    }
+    let expected_chunk_count = total_len.div_ceil(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
+    if chunk_count < 2 || usize::from(chunk_count) != expected_chunk_count {
+        return Err(invalid_data_channel_chunk("chunk count is inconsistent"));
+    }
+    if chunk_index >= chunk_count {
+        return Err(invalid_data_channel_chunk("chunk index is out of range"));
+    }
+    let payload = &message[DATA_CHANNEL_CHUNK_HEADER_BYTES..];
+    let offset = usize::from(chunk_index) * DATA_CHANNEL_CHUNK_PAYLOAD_BYTES;
+    let expected_payload_len = (total_len - offset).min(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
+    if payload.len() != expected_payload_len {
+        return Err(invalid_data_channel_chunk(
+            "chunk payload length is inconsistent",
+        ));
+    }
+    Ok((frame_id, total_len, chunk_index, chunk_count, payload))
+}
+
+fn invalid_data_channel_chunk(reason: &str) -> TransportError {
+    TransportError::Unavailable(format!("invalid WebRTC DataChannel chunk: {reason}"))
+}
 
 /// Redacted WebRTC diagnostic timeline safe for logs, Tauri diagnostics, and issue evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -579,6 +763,8 @@ struct DataChannelHub {
     label: String,
     channels: Arc<Mutex<Vec<Arc<dyn DataChannel>>>>,
     channel_keys: Arc<Mutex<HashSet<(String, u16)>>>,
+    send_lock: Arc<Mutex<()>>,
+    next_frame_id: Arc<AtomicU64>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     metrics: Arc<Mutex<DataTransportMetricsState>>,
@@ -594,6 +780,8 @@ impl DataChannelHub {
             label,
             channels: Arc::new(Mutex::new(Vec::new())),
             channel_keys: Arc::new(Mutex::new(HashSet::new())),
+            send_lock: Arc::new(Mutex::new(())),
+            next_frame_id: Arc::new(AtomicU64::new(1)),
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
             open_notify: Arc::new(Notify::new()),
@@ -641,6 +829,7 @@ impl DataChannelHub {
         let channel_keys = Arc::clone(&self.channel_keys);
         let channel_key = (label, channel.id());
         tokio::spawn(async move {
+            let mut reassembler = DataChannelFrameReassembler::default();
             while let Some(event) = channel.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
@@ -655,7 +844,28 @@ impl DataChannelHub {
                         record_timeline_event(&timeline, event).await;
                     }
                     DataChannelEvent::OnMessage(message) => {
-                        let bytes = message.data.to_vec();
+                        let bytes = match reassembler.push(message.data.to_vec()) {
+                            Ok(Some(bytes)) => bytes,
+                            Ok(None) => {
+                                metrics.lock().await.last_state = "chunk_received".to_owned();
+                                continue;
+                            }
+                            Err(error) => {
+                                metrics.lock().await.last_state = "message_rejected".to_owned();
+                                if webrtc_debug_enabled() {
+                                    eprintln!(
+                                        "discrypt-webrtc-data-channel event=reject reason={error}"
+                                    );
+                                }
+                                let mut event = diagnostic_event("data_channel");
+                                event.peer_role = Some("local".to_owned());
+                                event.direction = Some("remote".to_owned());
+                                event.state = Some("message_rejected".to_owned());
+                                event.failure_reason = Some(error.to_string());
+                                record_timeline_event(&timeline, event).await;
+                                continue;
+                            }
+                        };
                         let frames_received = {
                             let mut metrics = metrics.lock().await;
                             metrics.frames_received = metrics.frames_received.saturating_add(1);
@@ -747,12 +957,10 @@ impl DataChannelHub {
     }
 
     async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
-        if frame.is_empty() {
-            return Err(TransportError::Unavailable(
-                "text/control data frame is empty".to_owned(),
-            ));
-        }
+        let frame_id = self.next_frame_id.fetch_add(1, Ordering::Relaxed);
+        let wire_messages = encode_data_channel_wire_messages(frame_id, &frame)?;
         self.wait_open(Duration::from_secs(10)).await?;
+        let _send_guard = self.send_lock.lock().await;
         let channels = self.channels.lock().await;
         let channel = channels
             .first()
@@ -765,10 +973,12 @@ impl DataChannelHub {
             ));
         }
         let sent_len = frame.len();
-        channel
-            .send(BytesMut::from(frame.as_slice()))
-            .await
-            .map_err(data_channel_error)?;
+        for message in wire_messages {
+            channel
+                .send(BytesMut::from(message.as_slice()))
+                .await
+                .map_err(data_channel_error)?;
+        }
         let mut metrics = self.metrics.lock().await;
         metrics.frames_sent = metrics.frames_sent.saturating_add(1);
         metrics.bytes_sent = metrics.bytes_sent.saturating_add(sent_len as u64);
@@ -1921,6 +2131,55 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn data_channel_wire_framing_round_trips_large_frames_and_leaves_small_frames_raw(
+    ) -> Result<(), TransportError> {
+        let small = b"opaque-control-frame".to_vec();
+        let small_messages = encode_data_channel_wire_messages(7, &small)?;
+        assert_eq!(small_messages, vec![small]);
+
+        let large = (0_u8..=250).cycle().take(4_097).collect::<Vec<_>>();
+        let messages = encode_data_channel_wire_messages(9, &large)?;
+        assert!(messages.len() > 1);
+        assert!(messages.iter().all(|message| {
+            message.len() <= DATA_CHANNEL_CHUNK_HEADER_BYTES + DATA_CHANNEL_CHUNK_PAYLOAD_BYTES
+        }));
+        assert!(messages
+            .iter()
+            .all(|message| message.starts_with(DATA_CHANNEL_CHUNK_MAGIC)));
+
+        let (last_message, initial_messages) = messages.split_last().ok_or_else(|| {
+            TransportError::Unavailable("chunk encoder returned empty".to_owned())
+        })?;
+        let mut reassembler = DataChannelFrameReassembler::default();
+        for message in initial_messages {
+            assert_eq!(reassembler.push(message.clone())?, None);
+        }
+        assert_eq!(reassembler.push(last_message.clone())?, Some(large));
+        Ok(())
+    }
+
+    #[test]
+    fn data_channel_reassembler_rejects_interleaved_and_malformed_chunks(
+    ) -> Result<(), TransportError> {
+        let first_frame = vec![1_u8; DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 17];
+        let second_frame = vec![2_u8; DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 23];
+        let first_messages = encode_data_channel_wire_messages(11, &first_frame)?;
+        let second_messages = encode_data_channel_wire_messages(12, &second_frame)?;
+        let mut reassembler = DataChannelFrameReassembler::default();
+        assert_eq!(reassembler.push(first_messages[0].clone())?, None);
+        assert!(reassembler.push(second_messages[1].clone()).is_err());
+
+        let mut malformed = second_messages[0].clone();
+        malformed[18..20].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(reassembler.push(malformed).is_err());
+        assert_eq!(
+            reassembler.push(b"recovery-frame".to_vec())?,
+            Some(b"recovery-frame".to_vec())
+        );
+        Ok(())
+    }
+
     #[cfg_attr(
         not(target_os = "linux"),
         ignore = "live loopback WebRTC offer/answer datachannel readiness is runner-dependent outside Linux CI"
@@ -2170,7 +2429,7 @@ mod tests {
             .wait_text_control_transport_ready(Duration::from_secs(5))
             .await?;
 
-        let outbound = b"ciphertext:text-control-frame:v1".to_vec();
+        let outbound = (0_u8..=250).cycle().take(4_097).collect::<Vec<_>>();
         offerer.send_text_control_frame(outbound.clone()).await?;
         let received =
             tokio::time::timeout(Duration::from_secs(5), answerer.recv_text_control_frame())
@@ -2180,7 +2439,7 @@ mod tests {
                 })??;
         assert_eq!(received, outbound);
 
-        let ack = b"ciphertext:control-ack:v1".to_vec();
+        let ack = (0_u8..=250).rev().cycle().take(4_113).collect::<Vec<_>>();
         answerer.send_text_control_frame(ack.clone()).await?;
         let received_ack =
             tokio::time::timeout(Duration::from_secs(5), offerer.recv_text_control_frame())
@@ -2196,6 +2455,10 @@ mod tests {
         assert_eq!(offerer_metrics.frames_received, 1);
         assert_eq!(answerer_metrics.frames_sent, 1);
         assert_eq!(answerer_metrics.frames_received, 1);
+        assert_eq!(offerer_metrics.bytes_sent, outbound.len() as u64);
+        assert_eq!(offerer_metrics.bytes_received, ack.len() as u64);
+        assert_eq!(answerer_metrics.bytes_sent, ack.len() as u64);
+        assert_eq!(answerer_metrics.bytes_received, outbound.len() as u64);
 
         offerer.tear_down().await?;
         answerer.tear_down().await?;
