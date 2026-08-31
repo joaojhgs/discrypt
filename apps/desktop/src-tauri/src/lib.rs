@@ -2930,6 +2930,12 @@ struct TextControlRuntimeAttachInputs {
     ice_config: IceServerConfig,
 }
 
+const fn owned_text_control_runtime_uses_background_receiver(
+    _role: ProviderTextControlRuntimePeerRole,
+) -> bool {
+    cfg!(feature = "tauri-runtime")
+}
+
 fn derive_native_voice_runtime_material(
     domain: &[u8],
     source: &[u8],
@@ -4209,19 +4215,14 @@ impl TauriAppService {
         let owned_runtime = Arc::new(runtime);
         let transport = owned_runtime.transport();
         #[cfg(feature = "tauri-runtime")]
-        if role == ProviderTextControlRuntimePeerRole::Offerer {
-            start_text_control_offer_receiver_loop(
-                transport.clone(),
-                executor.clone(),
-                session_id.clone(),
-            );
-        }
+        start_text_control_receiver_loop(transport.clone(), executor.clone(), session_id.clone());
+        let inbound_receiver_owned = owned_text_control_runtime_uses_background_receiver(role);
         let runtime = TextControlTransportRuntime {
             lane: false,
             transport,
             owned_runtime: Some(owned_runtime),
             executor: Some(executor),
-            inbound_receiver_owned: true,
+            inbound_receiver_owned,
             session_id: session_id.clone(),
             role: Some(role),
             local_peer_id: Some(local_peer_id),
@@ -6007,7 +6008,7 @@ fn start_text_control_transport_runtime_pump(app_handle: tauri::AppHandle) {
 }
 
 #[cfg(feature = "tauri-runtime")]
-fn start_text_control_offer_receiver_loop(
+fn start_text_control_receiver_loop(
     transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
     executor: Arc<tokio::runtime::Runtime>,
     session_id: String,
@@ -33164,6 +33165,19 @@ mod tests {
         assert_eq!(message.state_key, "transport_frame_sent");
         clear_text_control_transport_runtime_for_test();
         Ok(())
+    }
+
+    #[test]
+    fn owned_text_control_background_receiver_is_symmetric_for_both_peer_roles() {
+        let offerer_owned = owned_text_control_runtime_uses_background_receiver(
+            ProviderTextControlRuntimePeerRole::Offerer,
+        );
+        let answerer_owned = owned_text_control_runtime_uses_background_receiver(
+            ProviderTextControlRuntimePeerRole::Answerer,
+        );
+
+        assert_eq!(offerer_owned, answerer_owned);
+        assert_eq!(offerer_owned, cfg!(feature = "tauri-runtime"));
     }
 
     #[test]
