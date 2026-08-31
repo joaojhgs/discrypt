@@ -254,6 +254,20 @@ impl BrokerControlLaneTransport {
         }
         Ok(opened)
     }
+
+    fn metrics_snapshot(&self) -> WebRtcDataTransportMetrics {
+        WebRtcDataTransportMetrics {
+            schema_version: WebRtcDataTransportMetrics::SCHEMA_VERSION,
+            label: BROKER_CONTROL_LANE_LABEL.to_owned(),
+            attached_channels: 1,
+            open: true,
+            frames_sent: self.frames_sent.load(Ordering::Relaxed),
+            frames_received: self.frames_received.load(Ordering::Relaxed),
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_state: "open".to_owned(),
+        }
+    }
 }
 
 #[async_trait]
@@ -286,17 +300,11 @@ impl crate::TextControlDataTransport for BrokerControlLaneTransport {
     }
 
     async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics {
-        WebRtcDataTransportMetrics {
-            schema_version: WebRtcDataTransportMetrics::SCHEMA_VERSION,
-            label: BROKER_CONTROL_LANE_LABEL.to_owned(),
-            attached_channels: 1,
-            open: true,
-            frames_sent: self.frames_sent.load(Ordering::Relaxed),
-            frames_received: self.frames_received.load(Ordering::Relaxed),
-            bytes_sent: 0,
-            bytes_received: 0,
-            last_state: "open".to_owned(),
-        }
+        self.metrics_snapshot()
+    }
+
+    fn text_control_transport_metrics_snapshot(&self) -> Option<WebRtcDataTransportMetrics> {
+        Some(self.metrics_snapshot())
     }
 }
 

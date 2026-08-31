@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -797,6 +797,15 @@ pub trait TextControlDataTransport: Send + Sync {
 
     /// Return current DataChannel transport metrics for UI/service state.
     async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics;
+
+    /// Return current transport metrics without waiting on an async runtime.
+    ///
+    /// Implementations should return `None` when they cannot produce a
+    /// nonblocking snapshot. Synchronous status renderers must not enter or
+    /// create a Tokio runtime to obtain metrics.
+    fn text_control_transport_metrics_snapshot(&self) -> Option<WebRtcDataTransportMetrics> {
+        None
+    }
 }
 
 /// DataChannel transport metrics visible to app-service adapters.
@@ -878,6 +887,7 @@ struct DataChannelHub {
     inbound_tx: mpsc::Sender<Vec<u8>>,
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     metrics: Arc<Mutex<DataTransportMetricsState>>,
+    open: Arc<AtomicBool>,
     open_notify: Arc<Notify>,
     timeline: Arc<Mutex<DiagnosticTimelineState>>,
 }
@@ -887,6 +897,7 @@ impl DataChannelHub {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         Self {
             metrics: Arc::new(Mutex::new(DataTransportMetricsState::new(label.clone()))),
+            open: Arc::new(AtomicBool::new(false)),
             label,
             channels: Arc::new(Mutex::new(Vec::new())),
             channel_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -933,6 +944,7 @@ impl DataChannelHub {
         record_timeline_event(&self.timeline, event).await;
         let inbound_tx = self.inbound_tx.clone();
         let metrics = Arc::clone(&self.metrics);
+        let open = Arc::clone(&self.open);
         let open_notify = Arc::clone(&self.open_notify);
         let timeline = Arc::clone(&self.timeline);
         let channels = Arc::clone(&self.channels);
@@ -943,6 +955,7 @@ impl DataChannelHub {
             while let Some(event) = channel.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
+                        open.store(true, Ordering::Release);
                         let mut metrics = metrics.lock().await;
                         metrics.open = true;
                         metrics.last_state = "open".to_owned();
@@ -1004,6 +1017,7 @@ impl DataChannelHub {
                         }
                     }
                     DataChannelEvent::OnClose => {
+                        open.store(false, Ordering::Release);
                         {
                             channel_keys.lock().await.remove(&channel_key);
                             let mut channels = channels.lock().await;
@@ -1020,6 +1034,7 @@ impl DataChannelHub {
                         break;
                     }
                     DataChannelEvent::OnClosing => {
+                        open.store(false, Ordering::Release);
                         let mut metrics = metrics.lock().await;
                         metrics.last_state = "closing".to_owned();
                         drop(metrics);
@@ -1029,6 +1044,7 @@ impl DataChannelHub {
                         record_timeline_event(&timeline, event).await;
                     }
                     DataChannelEvent::OnError => {
+                        open.store(false, Ordering::Release);
                         metrics.lock().await.last_state = "error".to_owned();
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
@@ -1115,11 +1131,30 @@ impl DataChannelHub {
         self.metrics.lock().await.snapshot()
     }
 
+    fn snapshot_nonblocking(&self) -> WebRtcDataTransportMetrics {
+        if let Ok(metrics) = self.metrics.try_lock() {
+            return metrics.snapshot();
+        }
+        let open = self.open.load(Ordering::Acquire);
+        WebRtcDataTransportMetrics {
+            schema_version: WebRtcDataTransportMetrics::SCHEMA_VERSION,
+            label: self.label.clone(),
+            attached_channels: u64::from(open),
+            open,
+            frames_sent: 0,
+            frames_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_state: if open { "open" } else { "closed" }.to_owned(),
+        }
+    }
+
     async fn close_all(&self) -> Result<(), TransportError> {
         let channels = self.channels.lock().await.clone();
         for channel in channels {
             channel.close().await.map_err(data_channel_error)?;
         }
+        self.open.store(false, Ordering::Release);
         let mut metrics = self.metrics.lock().await;
         metrics.open = false;
         metrics.last_state = "closed".to_owned();
@@ -1975,6 +2010,10 @@ impl TextControlDataTransport for WebRtcNegotiator {
         }
         metrics
     }
+
+    fn text_control_transport_metrics_snapshot(&self) -> Option<WebRtcDataTransportMetrics> {
+        Some(self.data_channels.snapshot_nonblocking())
+    }
 }
 
 impl WebRtcSessionDescription {
@@ -2639,6 +2678,12 @@ mod tests {
         let answerer_metrics = answerer.text_control_transport_metrics().await;
         assert!(offerer_metrics.open);
         assert!(answerer_metrics.open);
+        assert!(offerer
+            .text_control_transport_metrics_snapshot()
+            .is_some_and(|metrics| metrics.open));
+        assert!(answerer
+            .text_control_transport_metrics_snapshot()
+            .is_some_and(|metrics| metrics.open));
         assert_eq!(offerer_metrics.frames_sent, 1);
         assert_eq!(offerer_metrics.frames_received, 1);
         assert_eq!(answerer_metrics.frames_sent, 1);
@@ -2650,6 +2695,12 @@ mod tests {
 
         offerer.tear_down().await?;
         answerer.tear_down().await?;
+        assert!(offerer
+            .text_control_transport_metrics_snapshot()
+            .is_some_and(|metrics| !metrics.open));
+        assert!(answerer
+            .text_control_transport_metrics_snapshot()
+            .is_some_and(|metrics| !metrics.open));
         let offerer_timeline = offerer.diagnostic_timeline().await;
         assert!(offerer_timeline
             .events

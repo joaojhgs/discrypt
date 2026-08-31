@@ -3880,15 +3880,15 @@ impl TauriAppService {
                     .map(|metrics| metrics.open)
                     .unwrap_or(false)
             });
-        let data_channel_open = owned_evidence
+        let data_channel_open = metrics
             .as_ref()
-            .map(|evidence| evidence.data_channel_open)
-            .unwrap_or_else(|| {
-                metrics
+            .map(|metrics| metrics.open)
+            .or_else(|| {
+                owned_evidence
                     .as_ref()
-                    .map(|metrics| metrics.open)
-                    .unwrap_or(false)
-            });
+                    .map(|evidence| evidence.data_channel_open)
+            })
+            .unwrap_or(false);
         let turn_fallback_ready = latest_probe
             .map(|probe| {
                 data_channel_probe_configured_turn_ready(
@@ -5263,6 +5263,22 @@ impl discrypt_transport::TextControlDataTransport for HarnessOpenTextControlTran
             bytes_received: 0,
             last_state: "open".to_owned(),
         }
+    }
+
+    fn text_control_transport_metrics_snapshot(
+        &self,
+    ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
+        Some(discrypt_transport::WebRtcDataTransportMetrics {
+            schema_version: discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
+            label: "g009-harness-text-control".to_owned(),
+            attached_channels: 1,
+            open: true,
+            frames_sent: 0,
+            frames_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            last_state: "open".to_owned(),
+        })
     }
 }
 
@@ -20029,14 +20045,7 @@ fn attach_unambiguous_group_runtime_peer_members(
 fn text_control_runtime_metrics_snapshot(
     runtime: &TextControlTransportRuntime,
 ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
-    if let Some(executor) = &runtime.executor {
-        return Some(executor.block_on(runtime.transport.text_control_transport_metrics()));
-    }
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-    Some(executor.block_on(runtime.transport.text_control_transport_metrics()))
+    runtime.transport.text_control_transport_metrics_snapshot()
 }
 
 fn unavailable_route_graph_edge(
@@ -25194,6 +25203,17 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+
+        fn text_control_transport_metrics_snapshot(
+            &self,
+        ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
+            Some(
+                self.metrics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )
+        }
     }
 
     #[derive(Debug)]
@@ -25266,6 +25286,17 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+
+        fn text_control_transport_metrics_snapshot(
+            &self,
+        ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
+            Some(
+                self.metrics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )
+        }
     }
 
     #[derive(Debug)]
@@ -25318,6 +25349,38 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+
+        fn text_control_transport_metrics_snapshot(
+            &self,
+        ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
+            Some(
+                self.metrics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn text_control_metrics_snapshot_is_safe_inside_async_runtime() {
+        tokio::task::yield_now().await;
+        let runtime = TextControlTransportRuntime {
+            lane: false,
+            transport: Arc::new(FailingSendTextControlTransport::new()),
+            owned_runtime: None,
+            executor: None,
+            inbound_receiver_owned: false,
+            session_id: "nested-runtime-metrics-test".to_owned(),
+            role: None,
+            local_peer_id: None,
+            remote_peer_id: None,
+        };
+
+        let metrics = text_control_runtime_metrics_snapshot(&runtime)
+            .expect("test transport should expose a nonblocking metrics snapshot");
+        assert!(!metrics.open);
+        assert_eq!(metrics.last_state, "failed");
     }
 
     #[test]
