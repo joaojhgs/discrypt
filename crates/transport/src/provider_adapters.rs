@@ -30,7 +30,7 @@ use crate::{
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-use crate::{WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer};
+use crate::{WebRtcNegotiationId, WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,24 @@ use tokio::time::Instant;
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
 const PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+const PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS: i64 = 75;
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+const PROVIDER_NEGOTIATION_SIGNAL_CLOCK_SKEW_SECONDS: i64 = 300;
 
 /// End-to-end readiness state used by registry and fallback planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2424,6 +2442,8 @@ where
 
     let offer = SealedWebRtcNegotiationPayload {
         version: 1,
+        negotiation_id: None,
+        expires_at_unix_seconds: None,
         kind: crate::WebRtcNegotiationPayloadKind::Offer,
         nonce: [7_u8; 12],
         ciphertext: b"sealed-runtime-probe-offer".to_vec(),
@@ -2508,11 +2528,17 @@ where
     let alice_webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?);
     let bob_webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
+    let negotiation_id = WebRtcNegotiationId::generate();
+    let negotiation_expires_at = Utc::now().timestamp() + PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS;
 
     let offer = alice_webrtc
         .create_candidate_bundled_offer(PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
         .await?;
-    let sealed_offer = sealer.seal_description(&offer)?;
+    let sealed_offer = sealer.seal_description_for_negotiation_until(
+        &offer,
+        Some(negotiation_id),
+        Some(negotiation_expires_at),
+    )?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
@@ -2539,7 +2565,11 @@ where
                             PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT,
                         )
                         .await?;
-                    let sealed_answer = sealer.seal_description(&answer)?;
+                    let sealed_answer = sealer.seal_description_for_negotiation_until(
+                        &answer,
+                        signal.payload.negotiation_id,
+                        signal.payload.expires_at_unix_seconds,
+                    )?;
                     captured_sealed_answer = Some(sealed_answer.clone());
                     bob_room.send_signal(alice.clone(), sealed_answer).await?;
                 }
@@ -2573,14 +2603,22 @@ where
         }
 
         for candidate in alice_webrtc.drain_local_candidates().await {
-            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                Some(negotiation_id),
+                Some(negotiation_expires_at),
+            )?;
             offerer_ice_candidates.push(sealed_candidate.clone());
             alice_room
                 .send_signal(bob.clone(), sealed_candidate)
                 .await?;
         }
         for candidate in bob_webrtc.drain_local_candidates().await {
-            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                Some(negotiation_id),
+                Some(negotiation_expires_at),
+            )?;
             answerer_ice_candidates.push(sealed_candidate.clone());
             bob_room
                 .send_signal(alice.clone(), sealed_candidate)
@@ -2733,10 +2771,14 @@ where
 
     let webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
-    let sealed_offer = sealer.seal_description(
+    let negotiation_id = WebRtcNegotiationId::generate();
+    let negotiation_expires_at = Utc::now().timestamp() + PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS;
+    let sealed_offer = sealer.seal_description_for_negotiation_until(
         &webrtc
             .create_candidate_bundled_offer(PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
             .await?,
+        Some(negotiation_id),
+        Some(negotiation_expires_at),
     )?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
@@ -2782,7 +2824,11 @@ where
         }
 
         for candidate in webrtc.drain_local_candidates().await {
-            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                Some(negotiation_id),
+                Some(negotiation_expires_at),
+            )?;
             sealed_ice_candidates.push(sealed_candidate.clone());
             sealed_local_ice_candidates.push(sealed_candidate.clone());
             if provider_runtime_debug_enabled() {
@@ -2818,6 +2864,28 @@ where
                     redacted_peer_label(&signal.from_peer),
                     redacted_peer_label(&signal.to_peer)
                 );
+            }
+            if !provider_signal_matches_negotiation(&signal.payload, Some(negotiation_id)) {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=offerer event=ignore_signal_generation kind={} from={} to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer)
+                    );
+                }
+                continue;
+            }
+            if !provider_signal_is_current(&signal.payload, Utc::now().timestamp()) {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=offerer event=ignore_expired_signal kind={} from={} to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer)
+                    );
+                }
+                continue;
             }
             match signal.payload.kind {
                 WebRtcNegotiationPayloadKind::Answer if !answer_applied => {
@@ -2944,13 +3012,15 @@ where
         .join(scope.clone(), capability, local_peer_id.clone())
         .await?;
 
-    let webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config).await?);
+    let mut webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
     let mut captured_sealed_offer = None;
     let mut captured_sealed_answer: Option<SealedWebRtcNegotiationPayload> = None;
     let mut sealed_ice_candidates = Vec::new();
     let mut sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut answer_sent = false;
+    let mut active_negotiation_id = None;
+    let mut active_negotiation_expires_at = None;
     let mut pending_remote_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut last_answer_resend = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -3007,8 +3077,63 @@ where
                     redacted_peer_label(&signal.to_peer)
                 );
             }
+            let signal_negotiation_id = signal.payload.negotiation_id;
+            if signal_negotiation_id.is_none() {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=answerer event=ignore_legacy_signal kind={} from={} to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer)
+                    );
+                }
+                continue;
+            }
+            let now_unix_seconds = Utc::now().timestamp();
+            if !provider_signal_is_current(&signal.payload, now_unix_seconds) {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=answerer event=ignore_expired_signal kind={} from={} to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer)
+                    );
+                }
+                continue;
+            }
+            if active_negotiation_id.is_some()
+                && !provider_signal_matches_negotiation(&signal.payload, active_negotiation_id)
+                && signal.payload.kind != WebRtcNegotiationPayloadKind::Offer
+            {
+                if provider_runtime_debug_enabled() {
+                    eprintln!(
+                        "discrypt-provider-runtime role=answerer event=ignore_signal_generation kind={} from={} to={}",
+                        negotiation_payload_kind_label(&signal.payload.kind),
+                        redacted_peer_label(&signal.from_peer),
+                        redacted_peer_label(&signal.to_peer)
+                    );
+                }
+                continue;
+            }
             match signal.payload.kind {
-                WebRtcNegotiationPayloadKind::Offer if !answer_sent => {
+                WebRtcNegotiationPayloadKind::Offer
+                    if !answer_sent || signal_negotiation_id != active_negotiation_id =>
+                {
+                    if answer_sent && signal_negotiation_id != active_negotiation_id {
+                        if !provider_answerer_allows_offer_replacement(
+                            active_negotiation_id,
+                            signal_negotiation_id,
+                            webrtc.direct_path_metrics().await.direct_path_ready,
+                        ) {
+                            continue;
+                        }
+                        webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?);
+                        sealed_ice_candidates.clear();
+                        sealed_local_ice_candidates.clear();
+                        pending_remote_candidates.clear();
+                    }
+                    active_negotiation_id = signal_negotiation_id;
+                    active_negotiation_expires_at = signal.payload.expires_at_unix_seconds;
                     captured_sealed_offer = Some(signal.payload.clone());
                     let offer = sealer.open_description(&signal.payload)?;
                     let answer = webrtc
@@ -3017,7 +3142,11 @@ where
                             PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT,
                         )
                         .await?;
-                    let sealed_answer = sealer.seal_description(&answer)?;
+                    let sealed_answer = sealer.seal_description_for_negotiation_until(
+                        &answer,
+                        active_negotiation_id,
+                        active_negotiation_expires_at,
+                    )?;
                     captured_sealed_answer = Some(sealed_answer.clone());
                     if provider_runtime_debug_enabled() {
                         eprintln!(
@@ -3030,6 +3159,12 @@ where
                         .await?;
                     answer_sent = true;
                     for pending in pending_remote_candidates.drain(..) {
+                        if !provider_signal_matches_negotiation(&pending, active_negotiation_id) {
+                            continue;
+                        }
+                        if !provider_signal_is_current(&pending, now_unix_seconds) {
+                            continue;
+                        }
                         webrtc
                             .add_remote_candidate(sealer.open_candidate(&pending)?)
                             .await?;
@@ -3051,7 +3186,11 @@ where
         }
 
         for candidate in webrtc.drain_local_candidates().await {
-            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                active_negotiation_id,
+                active_negotiation_expires_at,
+            )?;
             sealed_ice_candidates.push(sealed_candidate.clone());
             sealed_local_ice_candidates.push(sealed_candidate.clone());
             if provider_runtime_debug_enabled() {
@@ -3241,11 +3380,17 @@ where
     let alice_webrtc = WebRtcNegotiator::new(alice_config).await?;
     let bob_webrtc = WebRtcNegotiator::new(bob_config).await?;
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
+    let negotiation_id = WebRtcNegotiationId::generate();
+    let negotiation_expires_at = Utc::now().timestamp() + PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS;
 
     let offer = alice_webrtc
         .create_candidate_bundled_offer(PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT)
         .await?;
-    let sealed_offer = sealer.seal_description(&offer)?;
+    let sealed_offer = sealer.seal_description_for_negotiation_until(
+        &offer,
+        Some(negotiation_id),
+        Some(negotiation_expires_at),
+    )?;
     let opaque_offer = sealed_offer.to_opaque_bytes()?;
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
@@ -3272,7 +3417,11 @@ where
                             PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT,
                         )
                         .await?;
-                    let sealed_answer = sealer.seal_description(&answer)?;
+                    let sealed_answer = sealer.seal_description_for_negotiation_until(
+                        &answer,
+                        signal.payload.negotiation_id,
+                        signal.payload.expires_at_unix_seconds,
+                    )?;
                     captured_sealed_answer = Some(sealed_answer.clone());
                     bob_room.send_signal(alice.clone(), sealed_answer).await?;
                 }
@@ -3306,14 +3455,22 @@ where
         }
 
         for candidate in alice_webrtc.drain_local_candidates().await {
-            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                Some(negotiation_id),
+                Some(negotiation_expires_at),
+            )?;
             offerer_ice_candidates.push(sealed_candidate.clone());
             alice_room
                 .send_signal(bob.clone(), sealed_candidate)
                 .await?;
         }
         for candidate in bob_webrtc.drain_local_candidates().await {
-            let sealed_candidate = sealer.seal_candidate(&candidate)?;
+            let sealed_candidate = sealer.seal_candidate_for_negotiation_until(
+                &candidate,
+                Some(negotiation_id),
+                Some(negotiation_expires_at),
+            )?;
             answerer_ice_candidates.push(sealed_candidate.clone());
             bob_room
                 .send_signal(alice.clone(), sealed_candidate)
@@ -3553,6 +3710,57 @@ fn negotiation_payload_kind_label(kind: &WebRtcNegotiationPayloadKind) -> &'stat
         WebRtcNegotiationPayloadKind::Answer => "answer",
         WebRtcNegotiationPayloadKind::Candidate => "candidate",
     }
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn provider_signal_matches_negotiation(
+    payload: &SealedWebRtcNegotiationPayload,
+    negotiation_id: Option<WebRtcNegotiationId>,
+) -> bool {
+    payload.negotiation_id == negotiation_id
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn provider_signal_is_current(
+    payload: &SealedWebRtcNegotiationPayload,
+    now_unix_seconds: i64,
+) -> bool {
+    payload.expires_at_unix_seconds.is_some_and(|expires_at| {
+        expires_at.saturating_add(PROVIDER_NEGOTIATION_SIGNAL_CLOCK_SKEW_SECONDS) > now_unix_seconds
+            && expires_at
+                <= now_unix_seconds
+                    .saturating_add(PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS)
+                    .saturating_add(PROVIDER_NEGOTIATION_SIGNAL_CLOCK_SKEW_SECONDS)
+    })
+}
+
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn provider_answerer_allows_offer_replacement(
+    active_negotiation_id: Option<WebRtcNegotiationId>,
+    incoming_negotiation_id: Option<WebRtcNegotiationId>,
+    direct_path_ready: bool,
+) -> bool {
+    incoming_negotiation_id.is_some()
+        && incoming_negotiation_id != active_negotiation_id
+        && !direct_path_ready
 }
 
 /// Production readiness for a provider adapter boundary.
@@ -7424,6 +7632,105 @@ mod tests {
         })
     }
 
+    #[test]
+    fn provider_signals_reject_stale_generations_for_same_peer() {
+        let now = Utc::now().timestamp();
+        let active_id = WebRtcNegotiationId::generate();
+        let stale_id = WebRtcNegotiationId::generate();
+        let active_answer = SealedWebRtcNegotiationPayload {
+            version: 1,
+            negotiation_id: Some(active_id),
+            expires_at_unix_seconds: Some(now + PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS),
+            kind: WebRtcNegotiationPayloadKind::Answer,
+            nonce: [1; 12],
+            ciphertext: b"active-answer".to_vec(),
+        };
+        let stale_answer = SealedWebRtcNegotiationPayload {
+            negotiation_id: Some(stale_id),
+            ciphertext: b"stale-answer".to_vec(),
+            ..active_answer.clone()
+        };
+        let stale_candidate = SealedWebRtcNegotiationPayload {
+            negotiation_id: Some(stale_id),
+            kind: WebRtcNegotiationPayloadKind::Candidate,
+            ciphertext: b"stale-candidate".to_vec(),
+            ..active_answer.clone()
+        };
+
+        assert!(provider_signal_matches_negotiation(
+            &active_answer,
+            Some(active_id)
+        ));
+        assert!(provider_signal_is_current(&active_answer, now));
+        assert!(!provider_signal_matches_negotiation(
+            &stale_answer,
+            Some(active_id)
+        ));
+        assert!(!provider_signal_matches_negotiation(
+            &stale_candidate,
+            Some(active_id)
+        ));
+    }
+
+    #[test]
+    fn provider_signals_reject_expired_and_implausibly_future_offers() {
+        let now = Utc::now().timestamp();
+        let stale_offer = SealedWebRtcNegotiationPayload {
+            version: 1,
+            negotiation_id: Some(WebRtcNegotiationId::generate()),
+            expires_at_unix_seconds: Some(now - PROVIDER_NEGOTIATION_SIGNAL_CLOCK_SKEW_SECONDS - 1),
+            kind: WebRtcNegotiationPayloadKind::Offer,
+            nonce: [2; 12],
+            ciphertext: b"stale-offer".to_vec(),
+        };
+        let fresh_offer = SealedWebRtcNegotiationPayload {
+            version: 1,
+            negotiation_id: Some(WebRtcNegotiationId::generate()),
+            expires_at_unix_seconds: Some(now + PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS),
+            kind: WebRtcNegotiationPayloadKind::Offer,
+            nonce: [3; 12],
+            ciphertext: b"fresh-offer".to_vec(),
+        };
+        let future_offer = SealedWebRtcNegotiationPayload {
+            version: 1,
+            negotiation_id: Some(WebRtcNegotiationId::generate()),
+            expires_at_unix_seconds: Some(
+                now + PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS
+                    + PROVIDER_NEGOTIATION_SIGNAL_CLOCK_SKEW_SECONDS
+                    + 1,
+            ),
+            kind: WebRtcNegotiationPayloadKind::Offer,
+            nonce: [4; 12],
+            ciphertext: b"future-offer".to_vec(),
+        };
+
+        assert!(!provider_signal_is_current(&stale_offer, now));
+        assert!(provider_signal_is_current(&fresh_offer, now));
+        assert!(!provider_signal_is_current(&future_offer, now));
+    }
+
+    #[test]
+    fn provider_answerer_replaces_unready_replayed_offer_with_fresh_generation() {
+        let replayed_id = WebRtcNegotiationId::generate();
+        let fresh_id = WebRtcNegotiationId::generate();
+
+        assert!(provider_answerer_allows_offer_replacement(
+            Some(replayed_id),
+            Some(fresh_id),
+            false
+        ));
+        assert!(!provider_answerer_allows_offer_replacement(
+            Some(replayed_id),
+            Some(fresh_id),
+            true
+        ));
+        assert!(!provider_answerer_allows_offer_replacement(
+            Some(replayed_id),
+            Some(replayed_id),
+            false
+        ));
+    }
+
     fn report_timeline(
         include_offer: bool,
         include_answer: bool,
@@ -8263,6 +8570,8 @@ mod tests {
             to_peer: SignalingPeerId::new("bob-device")?,
             payload: SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [9_u8; 12],
                 ciphertext: vec![0x91, 0x92, 0x93, 0x94],
@@ -8540,6 +8849,8 @@ mod tests {
 
         let offer = SealedWebRtcNegotiationPayload {
             version: 1,
+            negotiation_id: None,
+            expires_at_unix_seconds: None,
             kind: WebRtcNegotiationPayloadKind::Offer,
             nonce: [7; 12],
             ciphertext: b"sealed-ipfs-offer".to_vec(),
@@ -8645,6 +8956,8 @@ mod tests {
 
         let offer = SealedWebRtcNegotiationPayload {
             version: 1,
+            negotiation_id: None,
+            expires_at_unix_seconds: None,
             kind: WebRtcNegotiationPayloadKind::Offer,
             nonce: [3; 12],
             ciphertext: b"sealed-ipfs-direct-topic-peer-offer".to_vec(),
@@ -9481,6 +9794,8 @@ mod tests {
             to_peer: bob.clone(),
             payload: SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [7; 12],
                 ciphertext: b"ciphertext:sealed-offer".to_vec(),
@@ -9511,6 +9826,8 @@ mod tests {
             to_peer: bob.clone(),
             payload: SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [8; 12],
                 ciphertext: b"ciphertext:sealed-offer".to_vec(),
@@ -9527,6 +9844,8 @@ mod tests {
             to_peer: bob.clone(),
             payload: SealedWebRtcNegotiationPayload {
                 version: 2,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [9; 12],
                 ciphertext: b"ciphertext:sealed-offer".to_vec(),
@@ -9545,6 +9864,8 @@ mod tests {
             to_peer: bob.clone(),
             payload: SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [10; 12],
                 ciphertext: b"v=0\r\na=ice-ufrag:secret".to_vec(),
@@ -9831,6 +10152,8 @@ mod tests {
                 peer,
                 SealedWebRtcNegotiationPayload {
                     version: 1,
+                    negotiation_id: None,
+                    expires_at_unix_seconds: None,
                     kind: WebRtcNegotiationPayloadKind::Offer,
                     nonce: [9; 12],
                     ciphertext: b"ciphertext".to_vec(),
@@ -9982,12 +10305,16 @@ mod tests {
             expires_at_unix_seconds: now_unix_seconds.saturating_add(3600),
             sealed_offer: Some(SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [7; 12],
                 ciphertext: b"offer".to_vec(),
             }),
             sealed_answer: Some(SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Answer,
                 nonce: [8; 12],
                 ciphertext: b"answer".to_vec(),
@@ -10026,18 +10353,24 @@ mod tests {
             expires_at_unix_seconds: now_unix_seconds.saturating_add(3600),
             sealed_offer: Some(SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [7; 12],
                 ciphertext: b"offer".to_vec(),
             }),
             sealed_answer: Some(SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Answer,
                 nonce: [8; 12],
                 ciphertext: b"answer".to_vec(),
             }),
             sealed_ice_candidates: vec![SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Candidate,
                 nonce: [9; 12],
                 ciphertext: b"candidate".to_vec(),
@@ -10332,6 +10665,8 @@ mod tests {
                 SignalingPeerId::new("bob-device")?,
                 SealedWebRtcNegotiationPayload {
                     version: 1,
+                    negotiation_id: None,
+                    expires_at_unix_seconds: None,
                     kind: WebRtcNegotiationPayloadKind::Offer,
                     nonce: [1; 12],
                     ciphertext: b"v=0\r\na=ice-ufrag:raw\r\ncandidate:raw".to_vec(),

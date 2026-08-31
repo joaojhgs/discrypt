@@ -1,11 +1,26 @@
 import { Browser, expect, Page, test } from "playwright/test";
 import { shouldMountRemoteAudioElement } from "../../src/voice-playback";
 
+const ANSWERER_STALE_OFFER_SELECTION_WAIT_MS = 650;
+
+type VoiceHarnessBroadcastEntry = {
+  sourcePage: Page;
+  message: unknown;
+};
+
+const voiceHarnessBroadcastBacklog = new Map<
+  string,
+  VoiceHarnessBroadcastEntry[]
+>();
+const voiceHarnessBroadcastPages = new Map<string, Set<Page>>();
+
 type VoiceMediaEvidence = {
   getUserMediaCalls: number;
   getUserMediaConstraints: MediaStreamConstraints[];
   audioContextsCreated: number;
   localAudioTracksSent: number;
+  remoteDescriptionsApplied: number;
+  iceCandidatesApplied: number;
   remoteTrackEvents: number;
   playbackAttachments: number;
   peerConnectionsClosed: number;
@@ -15,224 +30,467 @@ type VoiceMediaEvidence = {
   gainValues: number[];
   nativePlaybackFrames: number;
   stoppedPlaybackTracks: number;
+  remoteDescriptionSdps: string[];
+  iceCandidateValues: string[];
+  sentVoiceSignals: VoiceHarnessSignal[];
 };
+
+type VoiceHarnessSignal = {
+  schema_version: 1;
+  session_id: string;
+  group_id: string;
+  channel_id: string;
+  negotiation_id?: string;
+  created_at_ms?: number;
+  from_peer_id: string;
+  to_peer_id: string;
+  sender_instance_id: string;
+  kind: "offer" | "answer" | "candidate";
+  description?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+};
+
+async function registerVoiceHarnessBroadcastPage(
+  channelName: string,
+  page: Page,
+) {
+  let pages = voiceHarnessBroadcastPages.get(channelName);
+  if (!pages) {
+    pages = new Set();
+    voiceHarnessBroadcastPages.set(channelName, pages);
+  }
+  pages.add(page);
+  const backlog = voiceHarnessBroadcastBacklog.get(channelName) ?? [];
+  await Promise.all(
+    backlog
+      .filter((entry) => entry.sourcePage !== page)
+      .map((entry) =>
+        deliverVoiceHarnessBroadcast(channelName, page, entry.message),
+      ),
+  );
+}
+
+async function postVoiceHarnessBroadcast(
+  channelName: string,
+  sourcePage: Page,
+  message: unknown,
+) {
+  const backlog = voiceHarnessBroadcastBacklog.get(channelName) ?? [];
+  backlog.push({ sourcePage, message });
+  voiceHarnessBroadcastBacklog.set(channelName, backlog.slice(-100));
+  const pages = voiceHarnessBroadcastPages.get(channelName) ?? new Set<Page>();
+  await Promise.all(
+    [...pages]
+      .filter((page) => page !== sourcePage)
+      .map((page) => deliverVoiceHarnessBroadcast(channelName, page, message)),
+  );
+}
+
+async function deliverVoiceHarnessBroadcast(
+  channelName: string,
+  page: Page,
+  message: unknown,
+) {
+  if (page.isClosed()) {
+    voiceHarnessBroadcastPages.get(channelName)?.delete(page);
+    return;
+  }
+  try {
+    await page.evaluate(
+      ({ deliveredChannelName, deliveredMessage }) => {
+        window.dispatchEvent(
+          new CustomEvent("__discryptVoiceHarnessBroadcast", {
+            detail: {
+              channelName: deliveredChannelName,
+              message: deliveredMessage,
+            },
+          }),
+        );
+      },
+      { deliveredChannelName: channelName, deliveredMessage: message },
+    );
+  } catch {
+    voiceHarnessBroadcastPages.get(channelName)?.delete(page);
+  }
+}
 
 async function installVoiceMediaHarness(
   page: Page,
   profile: string,
   anonymousUntilPermission = false,
 ) {
-  await page.addInitScript(({ profileName, anonymousBeforePermission }) => {
-    const evidence: VoiceMediaEvidence = {
-      getUserMediaCalls: 0,
-      getUserMediaConstraints: [],
-      audioContextsCreated: 0,
-      localAudioTracksSent: 0,
-      remoteTrackEvents: 0,
-      playbackAttachments: 0,
-      peerConnectionsClosed: 0,
-      trackEnabled: true,
-      trackStopCount: 0,
-      sinkIds: [],
-      gainValues: [],
-      nativePlaybackFrames: 0,
-      stoppedPlaybackTracks: 0,
-    };
-    Object.defineProperty(window, "__discryptVoiceMediaEvidence", {
-      configurable: true,
-      value: evidence,
-    });
+  await page.exposeBinding(
+    "__discryptVoiceHarnessRegisterBroadcast",
+    ({ page: sourcePage }, channelName: string) =>
+      registerVoiceHarnessBroadcastPage(channelName, sourcePage),
+  );
+  await page.exposeBinding(
+    "__discryptVoiceHarnessPostBroadcast",
+    ({ page: sourcePage }, channelName: string, message: unknown) =>
+      postVoiceHarnessBroadcast(channelName, sourcePage, message),
+  );
+  await page.addInitScript(
+    ({ profileName, anonymousBeforePermission }) => {
+      const evidence: VoiceMediaEvidence = {
+        getUserMediaCalls: 0,
+        getUserMediaConstraints: [],
+        audioContextsCreated: 0,
+        localAudioTracksSent: 0,
+        remoteDescriptionsApplied: 0,
+        iceCandidatesApplied: 0,
+        remoteTrackEvents: 0,
+        playbackAttachments: 0,
+        peerConnectionsClosed: 0,
+        trackEnabled: true,
+        trackStopCount: 0,
+        sinkIds: [],
+        gainValues: [],
+        nativePlaybackFrames: 0,
+        stoppedPlaybackTracks: 0,
+        remoteDescriptionSdps: [],
+        iceCandidateValues: [],
+        sentVoiceSignals: [],
+      };
+      Object.defineProperty(window, "__discryptVoiceMediaEvidence", {
+        configurable: true,
+        value: evidence,
+      });
 
-    const localAudioTrack = {
-      id: `${profileName.toLowerCase()}-local-audio`,
-      kind: "audio",
-      label: `${profileName} microphone`,
-      readyState: "live",
-      get enabled() {
-        return evidence.trackEnabled;
-      },
-      set enabled(value: boolean) {
-        evidence.trackEnabled = Boolean(value);
-      },
-      stop: () => {
-        evidence.trackStopCount += 1;
-        evidence.trackEnabled = false;
-      },
-    };
-    const localStream = {
-      id: `${profileName.toLowerCase()}-local-stream`,
-      getTracks: () => [localAudioTrack],
-      getAudioTracks: () => [localAudioTrack],
-    };
-    let permissionGranted = false;
-
-    Object.defineProperty(navigator, "mediaDevices", {
-      configurable: true,
-      value: {
-        getUserMedia: async (constraints: MediaStreamConstraints) => {
-          evidence.getUserMediaCalls += 1;
-          evidence.getUserMediaConstraints.push(constraints);
-          permissionGranted = true;
-          return localStream;
+      const localAudioTrack = {
+        id: `${profileName.toLowerCase()}-local-audio`,
+        kind: "audio",
+        label: `${profileName} microphone`,
+        readyState: "live",
+        get enabled() {
+          return evidence.trackEnabled;
         },
-        enumerateDevices: async () => {
-          if (anonymousBeforePermission && !permissionGranted) {
+        set enabled(value: boolean) {
+          evidence.trackEnabled = Boolean(value);
+        },
+        stop: () => {
+          evidence.trackStopCount += 1;
+          evidence.trackEnabled = false;
+        },
+      };
+      const localStream = {
+        id: `${profileName.toLowerCase()}-local-stream`,
+        getTracks: () => [localAudioTrack],
+        getAudioTracks: () => [localAudioTrack],
+      };
+      let permissionGranted = false;
+
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: {
+          getUserMedia: async (constraints: MediaStreamConstraints) => {
+            evidence.getUserMediaCalls += 1;
+            evidence.getUserMediaConstraints.push(constraints);
+            permissionGranted = true;
+            return localStream;
+          },
+          enumerateDevices: async () => {
+            if (anonymousBeforePermission && !permissionGranted) {
+              return [
+                {
+                  kind: "audioinput",
+                  deviceId: "",
+                  label: "",
+                  groupId: "",
+                  toJSON: () => ({}),
+                },
+              ];
+            }
             return [
               {
                 kind: "audioinput",
-                deviceId: "",
-                label: "",
-                groupId: "",
+                deviceId: `${profileName.toLowerCase()}-mic`,
+                label: `${profileName} E2E microphone`,
+                groupId: `${profileName.toLowerCase()}-audio`,
+                toJSON: () => ({}),
+              },
+              {
+                kind: "audiooutput",
+                deviceId: `${profileName.toLowerCase()}-speaker`,
+                label: `${profileName} E2E speaker`,
+                groupId: `${profileName.toLowerCase()}-audio`,
                 toJSON: () => ({}),
               },
             ];
-          }
-          return [
-            {
-              kind: "audioinput",
-              deviceId: `${profileName.toLowerCase()}-mic`,
-              label: `${profileName} E2E microphone`,
-              groupId: `${profileName.toLowerCase()}-audio`,
-              toJSON: () => ({}),
+          },
+        },
+      });
+
+      class E2EAudioContext {
+        currentTime = 0;
+        destination = {};
+        state = "running";
+        constructor() {
+          evidence.audioContextsCreated += 1;
+        }
+        createMediaStreamSource() {
+          return { connect: () => undefined, disconnect: () => undefined };
+        }
+        createOscillator() {
+          return {
+            frequency: { value: 0 },
+            connect: () => undefined,
+            start: () => undefined,
+            stop: () => undefined,
+          };
+        }
+        createAnalyser() {
+          return {
+            fftSize: 1024,
+            getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
+            disconnect: () => undefined,
+          };
+        }
+        createGain() {
+          const gain = {};
+          let value = 1;
+          Object.defineProperty(gain, "value", {
+            configurable: true,
+            get: () => value,
+            set: (nextValue: number) => {
+              value = nextValue;
+              evidence.gainValues.push(nextValue);
             },
-            {
-              kind: "audiooutput",
-              deviceId: `${profileName.toLowerCase()}-speaker`,
-              label: `${profileName} E2E speaker`,
-              groupId: `${profileName.toLowerCase()}-audio`,
-              toJSON: () => ({}),
+          });
+          return {
+            gain,
+            connect: () => undefined,
+            disconnect: () => undefined,
+          };
+        }
+        createScriptProcessor() {
+          return {
+            onaudioprocess: null,
+            connect: () => undefined,
+            disconnect: () => undefined,
+          };
+        }
+        createMediaStreamDestination() {
+          const destinationTrack = {
+            id: `${profileName.toLowerCase()}-processed-audio`,
+            kind: "audio",
+            label: `${profileName} processed microphone`,
+            readyState: "live",
+            enabled: true,
+            stop: () => {
+              evidence.stoppedPlaybackTracks += 1;
             },
+          };
+          return {
+            stream: {
+              id: `${profileName.toLowerCase()}-processed-stream`,
+              getTracks: () => [destinationTrack],
+              getAudioTracks: () => [destinationTrack],
+            },
+            disconnect: () => undefined,
+          };
+        }
+        createBuffer(_channels: number, length: number, sampleRate: number) {
+          return {
+            duration: length / sampleRate,
+            getChannelData: () => new Float32Array(length),
+          };
+        }
+        createBufferSource() {
+          return {
+            buffer: null,
+            connect: () => {
+              evidence.nativePlaybackFrames += 1;
+            },
+            start: () => undefined,
+          };
+        }
+        resume() {
+          return Promise.resolve();
+        }
+        close() {
+          return Promise.resolve();
+        }
+      }
+      Object.defineProperty(window, "AudioContext", {
+        configurable: true,
+        value: E2EAudioContext,
+      });
+
+      const srcObject = Symbol("srcObject");
+      Object.defineProperty(HTMLMediaElement.prototype, "srcObject", {
+        configurable: true,
+        get() {
+          return (this as HTMLMediaElement & { [srcObject]?: unknown })[
+            srcObject
           ];
         },
-      },
-    });
+        set(value: unknown) {
+          (this as HTMLMediaElement & { [srcObject]?: unknown })[srcObject] =
+            value;
+          if (this.tagName.toLowerCase() === "audio" && value) {
+            evidence.playbackAttachments += 1;
+          }
+        },
+      });
 
-    class E2EAudioContext {
-      currentTime = 0;
-      destination = {};
-      state = "running";
-      constructor() {
-        evidence.audioContextsCreated += 1;
-      }
-      createMediaStreamSource() {
-        return { connect: () => undefined, disconnect: () => undefined };
-      }
-      createOscillator() {
-        return {
-          frequency: { value: 0 },
-          connect: () => undefined,
-          start: () => undefined,
-          stop: () => undefined,
-        };
-      }
-      createAnalyser() {
-        return {
-          fftSize: 1024,
-          getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
-          disconnect: () => undefined,
-        };
-      }
-      createGain() {
-        const gain = {};
-        let value = 1;
-        Object.defineProperty(gain, "value", {
-          configurable: true,
-          get: () => value,
-          set: (nextValue: number) => {
-            value = nextValue;
-            evidence.gainValues.push(nextValue);
-          },
-        });
-        return {
-          gain,
-          connect: () => undefined,
-          disconnect: () => undefined,
-        };
-      }
-      createScriptProcessor() {
-        return {
-          onaudioprocess: null,
-          connect: () => undefined,
-          disconnect: () => undefined,
-        };
-      }
-      createMediaStreamDestination() {
-        const destinationTrack = {
-          id: `${profileName.toLowerCase()}-processed-audio`,
-          kind: "audio",
-          label: `${profileName} processed microphone`,
-          readyState: "live",
-          enabled: true,
-          stop: () => {
-            evidence.stoppedPlaybackTracks += 1;
-          },
-        };
-        return {
-          stream: {
-            id: `${profileName.toLowerCase()}-processed-stream`,
-            getTracks: () => [destinationTrack],
-            getAudioTracks: () => [destinationTrack],
-          },
-          disconnect: () => undefined,
-        };
-      }
-      createBuffer(_channels: number, length: number, sampleRate: number) {
-        return {
-          duration: length / sampleRate,
-          getChannelData: () => new Float32Array(length),
-        };
-      }
-      createBufferSource() {
-        return {
-          buffer: null,
-          connect: () => {
-            evidence.nativePlaybackFrames += 1;
-          },
-          start: () => undefined,
-        };
-      }
-      resume() {
-        return Promise.resolve();
-      }
-      close() {
-        return Promise.resolve();
-      }
-    }
-    Object.defineProperty(window, "AudioContext", {
-      configurable: true,
-      value: E2EAudioContext,
-    });
-
-    const srcObject = Symbol("srcObject");
-    Object.defineProperty(HTMLMediaElement.prototype, "srcObject", {
-      configurable: true,
-      get() {
-        return (this as HTMLMediaElement & { [srcObject]?: unknown })[
-          srcObject
-        ];
-      },
-      set(value: unknown) {
-        (this as HTMLMediaElement & { [srcObject]?: unknown })[srcObject] =
-          value;
-        if (this.tagName.toLowerCase() === "audio" && value) {
-          evidence.playbackAttachments += 1;
+      class E2EBroadcastChannel {
+        private channelName: string;
+        private listener: (event: Event) => void;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        constructor(name: string) {
+          this.channelName = name;
+          this.listener = (event) => {
+            const detail = (event as CustomEvent).detail as
+              { channelName?: string; message?: unknown } | undefined;
+            if (detail?.channelName !== this.channelName) return;
+            this.onmessage?.({ data: detail.message } as MessageEvent);
+          };
+          window.addEventListener(
+            "__discryptVoiceHarnessBroadcast",
+            this.listener,
+          );
+          const harnessWindow = window as Window & {
+            __discryptVoiceHarnessRegisterBroadcast?: (
+              channelName: string,
+            ) => Promise<void>;
+          };
+          void harnessWindow.__discryptVoiceHarnessRegisterBroadcast?.(name);
         }
-      },
-    });
+        postMessage(message: unknown) {
+          const signal = message as VoiceHarnessSignal;
+          if (signal?.schema_version === 1 && signal.kind) {
+            evidence.sentVoiceSignals.push(signal);
+          }
+          const harnessWindow = window as Window & {
+            __discryptVoiceHarnessPostBroadcast?: (
+              channelName: string,
+              message: unknown,
+            ) => Promise<void>;
+          };
+          void harnessWindow.__discryptVoiceHarnessPostBroadcast?.(
+            this.channelName,
+            message,
+          );
+        }
+        close() {
+          window.removeEventListener(
+            "__discryptVoiceHarnessBroadcast",
+            this.listener,
+          );
+        }
+      }
+      Object.defineProperty(window, "BroadcastChannel", {
+        configurable: true,
+        value: E2EBroadcastChannel,
+      });
 
-    class E2ERtcPeerConnection {
-      onicecandidate: ((event: unknown) => void) | null = null;
-      ontrack: ((event: unknown) => void) | null = null;
-      localDescription: unknown = null;
-      remoteDescription: unknown = null;
-      connectionState = "new";
-      iceConnectionState = "new";
+      let offerCounter = 0;
+      let answerCounter = 0;
 
-      addTrack(track: { kind?: string; id?: string }, stream: { id?: string }) {
-        if (track.kind === "audio") evidence.localAudioTracksSent += 1;
-        window.queueMicrotask(() => {
+      class E2ERtcPeerConnection {
+        onicecandidate: ((event: unknown) => void) | null = null;
+        ontrack: ((event: unknown) => void) | null = null;
+        localDescription: unknown = null;
+        remoteDescription: unknown = null;
+        connectionState = "new";
+        iceConnectionState = "new";
+        private remoteTrackEmitted = false;
+
+        addTrack(
+          track: { kind?: string; id?: string },
+          stream: { id?: string },
+        ) {
+          if (track.kind === "audio") evidence.localAudioTracksSent += 1;
+          return { track, stream };
+        }
+        createOffer() {
+          offerCounter += 1;
+          return Promise.resolve({
+            type: "offer",
+            sdp: `v=0\r\na=mid:audio\r\na=sendrecv\r\na=x-test-offer:${profileName}:${offerCounter}\r\n`,
+          });
+        }
+        createAnswer() {
+          answerCounter += 1;
+          return Promise.resolve({
+            type: "answer",
+            sdp: `v=0\r\na=mid:audio\r\na=sendrecv\r\na=x-test-answer:${profileName}:${answerCounter}\r\n`,
+          });
+        }
+        setLocalDescription(description: unknown) {
+          this.localDescription = description;
+          const kind =
+            typeof description === "object" &&
+            description !== null &&
+            "type" in description
+              ? String((description as { type?: unknown }).type)
+              : "local";
+          window.queueMicrotask(() => {
+            this.onicecandidate?.({
+              candidate: {
+                candidate: `candidate:${profileName}:${kind}`,
+                sdpMid: "audio",
+                sdpMLineIndex: 0,
+                toJSON: () => ({
+                  candidate: `candidate:${profileName}:${kind}`,
+                  sdpMid: "audio",
+                  sdpMLineIndex: 0,
+                }),
+              },
+            });
+          });
+          return Promise.resolve();
+        }
+        setRemoteDescription(description: unknown) {
+          evidence.remoteDescriptionsApplied += 1;
+          if (
+            typeof description === "object" &&
+            description !== null &&
+            "sdp" in description
+          ) {
+            evidence.remoteDescriptionSdps.push(
+              String((description as { sdp?: unknown }).sdp ?? ""),
+            );
+          }
+          this.remoteDescription = description;
           this.connectionState = "connected";
           this.iceConnectionState = "connected";
+          this.emitRemoteTrack();
+          return Promise.resolve();
+        }
+        addIceCandidate(candidate: RTCIceCandidateInit) {
+          evidence.iceCandidatesApplied += 1;
+          evidence.iceCandidateValues.push(candidate.candidate ?? "");
+          return Promise.resolve();
+        }
+        getStats() {
+          return Promise.resolve(
+            new Map([
+              [
+                `${profileName.toLowerCase()}-inbound-audio`,
+                {
+                  type: "inbound-rtp",
+                  kind: "audio",
+                  mediaType: "audio",
+                  packetsReceived: 12,
+                  samplesReceived: 480,
+                  audioLevel: 0.2,
+                },
+              ],
+            ]),
+          );
+        }
+        getSenders() {
+          return [{ track: localAudioTrack }];
+        }
+        close() {
+          evidence.peerConnectionsClosed += 1;
+          this.connectionState = "closed";
+          this.iceConnectionState = "closed";
+        }
+        private emitRemoteTrack() {
+          if (this.remoteTrackEmitted) return;
+          this.remoteTrackEmitted = true;
           const remoteTrack = {
             id: `${profileName.toLowerCase()}-remote-audio`,
             kind: "audio",
@@ -255,74 +513,26 @@ async function installVoiceMediaHarness(
             transceiver: { receiver: { track: remoteTrack } },
           });
           this.onicecandidate?.({ candidate: null });
-        });
-        return { track, stream };
+        }
       }
-      createOffer() {
-        return Promise.resolve({
-          type: "offer",
-          sdp: `v=0\r\na=mid:audio\r\na=sendrecv\r\n`,
-        });
-      }
-      createAnswer() {
-        return Promise.resolve({
-          type: "answer",
-          sdp: `v=0\r\na=mid:audio\r\na=sendrecv\r\n`,
-        });
-      }
-      setLocalDescription(description: unknown) {
-        this.localDescription = description;
-        return Promise.resolve();
-      }
-      setRemoteDescription(description: unknown) {
-        this.remoteDescription = description;
-        return Promise.resolve();
-      }
-      addIceCandidate() {
-        return Promise.resolve();
-      }
-      getStats() {
-        return Promise.resolve(
-          new Map([
-            [
-              `${profileName.toLowerCase()}-inbound-audio`,
-              {
-                type: "inbound-rtp",
-                kind: "audio",
-                mediaType: "audio",
-                packetsReceived: 12,
-                samplesReceived: 480,
-                audioLevel: 0.2,
-              },
-            ],
-          ]),
-        );
-      }
-      getSenders() {
-        return [{ track: localAudioTrack }];
-      }
-      close() {
-        evidence.peerConnectionsClosed += 1;
-        this.connectionState = "closed";
-        this.iceConnectionState = "closed";
-      }
-    }
-    Object.defineProperty(HTMLMediaElement.prototype, "setSinkId", {
-      configurable: true,
-      value(sinkId: string) {
-        evidence.sinkIds.push(sinkId);
-        return Promise.resolve();
-      },
-    });
+      Object.defineProperty(HTMLMediaElement.prototype, "setSinkId", {
+        configurable: true,
+        value(sinkId: string) {
+          evidence.sinkIds.push(sinkId);
+          return Promise.resolve();
+        },
+      });
 
-    Object.defineProperty(window, "RTCPeerConnection", {
-      configurable: true,
-      value: E2ERtcPeerConnection,
-    });
-  }, {
-    profileName: profile,
-    anonymousBeforePermission: anonymousUntilPermission,
-  });
+      Object.defineProperty(window, "RTCPeerConnection", {
+        configurable: true,
+        value: E2ERtcPeerConnection,
+      });
+    },
+    {
+      profileName: profile,
+      anonymousBeforePermission: anonymousUntilPermission,
+    },
+  );
 }
 
 async function readEvidence(page: Page): Promise<VoiceMediaEvidence> {
@@ -376,9 +586,10 @@ async function readLatestInvite(page: Page) {
   return matches.at(-1) ?? "";
 }
 
-
 async function openLauncher(page: Page) {
-  await page.getByRole("button", { name: "Add group or direct message", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Add group or direct message", exact: true })
+    .click();
 }
 
 async function openCreateGroupModal(page: Page) {
@@ -386,8 +597,13 @@ async function openCreateGroupModal(page: Page) {
   await page.getByRole("button", { name: /create a new group/i }).click();
 }
 
-async function openGroupInviteModal(page: Page, groupName = "G007 Voice Media Lab") {
-  await page.getByRole("button", { name: new RegExp(`Open ${groupName} group`, "i") }).click({ button: "right" });
+async function openGroupInviteModal(
+  page: Page,
+  groupName = "G007 Voice Media Lab",
+) {
+  await page
+    .getByRole("button", { name: new RegExp(`Open ${groupName} group`, "i") })
+    .click({ button: "right" });
   await page.getByRole("menuitem", { name: /create invite/i }).click();
 }
 
@@ -421,16 +637,40 @@ async function createInvite(page: Page) {
 async function joinInvite(page: Page, invite: string) {
   await openLauncher(page);
   await page.getByLabel("Invite URL or code").fill(invite);
-  await page
-    .getByLabel("Local label")
-    .fill("G007 Voice Media Lab");
+  await page.getByLabel("Local label").fill("G007 Voice Media Lab");
   await page.getByRole("button", { name: /join\/open group/i }).click();
   await expect(page.getByText(/G007 Voice Media Lab/i).first()).toBeVisible();
 }
 
 async function joinVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await expect(page.getByTestId("voice-local-participant").first()).toBeVisible();
+  await expect(
+    page.getByTestId("voice-local-participant").first(),
+  ).toBeVisible();
+}
+
+async function leaveVoice(page: Page) {
+  await page.getByRole("button", { name: /Leave voice call/i }).click();
+}
+
+async function postLocalDevVoiceSignals(
+  page: Page,
+  signals: VoiceHarnessSignal[],
+) {
+  await page.evaluate(async (signalsToPost) => {
+    for (const signal of signalsToPost) {
+      const harnessWindow = window as Window & {
+        __discryptVoiceHarnessPostBroadcast?: (
+          channelName: string,
+          message: unknown,
+        ) => Promise<void>;
+      };
+      await harnessWindow.__discryptVoiceHarnessPostBroadcast?.(
+        `discrypt-voice:${signal.group_id}:${signal.channel_id}`,
+        signal,
+      );
+    }
+  }, signals);
 }
 
 test("native Rust WebAudio playback does not mount a duplicate HTML audio output", () => {
@@ -442,9 +682,103 @@ test("native Rust WebAudio playback does not mount a duplicate HTML audio output
     ),
   ).toBe(false);
   expect(
-    shouldMountRemoteAudioElement("voice-remote-audio-peer-portugal", true, false),
+    shouldMountRemoteAudioElement(
+      "voice-remote-audio-peer-portugal",
+      true,
+      false,
+    ),
   ).toBe(true);
   expect(shouldMountRemoteAudioElement(null, false, true)).toBe(true);
+});
+
+test("sealed WebView voice signaling binds backend envelope metadata", async ({
+  browser,
+}) => {
+  const profile = await openProfile(browser, "Voice Seal", "Voice Seal Device");
+  try {
+    const result = await profile.page.evaluate(async () => {
+      const voiceMedia = (
+        window as Window & {
+          __discryptVoiceSignalCryptoTest?: {
+            seal: (
+              signal: VoiceHarnessSignal,
+              signalId: string,
+            ) => Promise<string>;
+            open: (message: {
+              signal_id: string;
+              session_id: string;
+              group_id: string;
+              channel_id: string;
+              sender_participant_id: string;
+              sender_peer_id: string;
+              recipient_peer_id: string;
+              signal_kind: string;
+              sealed_payload: string;
+              created_at_ms: number;
+            }) => Promise<unknown>;
+          };
+        }
+      ).__discryptVoiceSignalCryptoTest;
+      if (!voiceMedia) throw new Error("voice signal crypto test hook missing");
+      const signalId = "voice-signal-aad-test";
+      const signal = {
+        schema_version: 1 as const,
+        session_id: "voice-session-aad",
+        group_id: "group-aad",
+        channel_id: "channel-aad",
+        negotiation_id: "negotiation-aad",
+        created_at_ms: 1_750_000_000_000,
+        from_peer_id: "peer-alice",
+        to_peer_id: "peer-bob",
+        sender_instance_id: "instance-alice",
+        kind: "offer" as const,
+        description: { type: "offer" as const, sdp: "v=0\r\n" },
+      };
+      const sealedPayload = await voiceMedia.seal(signal, signalId);
+      const message = {
+        signal_id: signalId,
+        session_id: signal.session_id,
+        group_id: signal.group_id,
+        channel_id: signal.channel_id,
+        sender_participant_id: "participant-alice",
+        sender_peer_id: signal.from_peer_id,
+        recipient_peer_id: signal.to_peer_id,
+        signal_kind: signal.kind,
+        sealed_payload: sealedPayload,
+        created_at_ms: signal.created_at_ms,
+      };
+      const opened = await voiceMedia.open(message);
+      const tamperedMessages = [
+        { ...message, signal_kind: "answer" },
+        { ...message, signal_id: `${signalId}-tampered` },
+        { ...message, created_at_ms: signal.created_at_ms + 1 },
+      ];
+      const tamperingRejected = [];
+      for (const tampered of tamperedMessages) {
+        try {
+          await voiceMedia.open(tampered);
+          tamperingRejected.push(false);
+        } catch {
+          tamperingRejected.push(true);
+        }
+      }
+      const legacy = await voiceMedia.open({
+        ...message,
+        sealed_payload: "voice-signal-sealed:v1:legacy.payload",
+      });
+      return { opened, tamperingRejected, legacy };
+    });
+
+    expect(result.opened).toMatchObject({
+      negotiation_id: "negotiation-aad",
+      created_at_ms: 1_750_000_000_000,
+      description: { type: "offer", sdp: "v=0\r\n" },
+    });
+    expect(result.tamperingRejected).toEqual([true, true, true]);
+    expect(result.legacy).toBeNull();
+  } finally {
+    await profile.context.close();
+  }
 });
 
 test("native Rust WebAudio drains playback through one owned output", async ({
@@ -483,10 +817,14 @@ test("native Rust WebAudio drains playback through one owned output", async ({
         return state;
       };
       let playbackDrained = false;
-      Object.defineProperty(window, "__discryptTauriTwoProfileE2EForceNativeRustVoice", {
-        configurable: true,
-        value: true,
-      });
+      Object.defineProperty(
+        window,
+        "__discryptTauriTwoProfileE2EForceNativeRustVoice",
+        {
+          configurable: true,
+          value: true,
+        },
+      );
       Object.defineProperty(window, "__TAURI__", {
         configurable: true,
         value: {
@@ -589,8 +927,14 @@ test("native Rust WebAudio drains playback through one owned output", async ({
               if (command === "save_preferences") {
                 const state = withCursor(readState());
                 const request = args?.request ?? {};
-                state.preferences = { ...(state.preferences as object), ...request };
-                const snapshot = (state.snapshot ?? {}) as Record<string, unknown>;
+                state.preferences = {
+                  ...(state.preferences as object),
+                  ...request,
+                };
+                const snapshot = (state.snapshot ?? {}) as Record<
+                  string,
+                  unknown
+                >;
                 snapshot.preferences = {
                   ...((snapshot.preferences as object | undefined) ?? {}),
                   ...request,
@@ -613,7 +957,9 @@ test("native Rust WebAudio drains playback through one owned output", async ({
 
     await joinVoice(profile.page);
     await expect
-      .poll(async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null)
+      .poll(
+        async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null,
+      )
       .toBe("");
     await expect
       .poll(async () => (await readEvidence(profile.page)).nativePlaybackFrames)
@@ -626,7 +972,9 @@ test("native Rust WebAudio drains playback through one owned output", async ({
       .getByTestId("voice-output-selector")
       .selectOption({ index: 1 });
     await expect
-      .poll(async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null)
+      .poll(
+        async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null,
+      )
       .toMatch(/-speaker$/);
 
     const configDialog = profile.page.getByRole("dialog", { name: "Config" });
@@ -639,9 +987,13 @@ test("native Rust WebAudio drains playback through one owned output", async ({
       .toContain(0.37);
     await profile.page.getByRole("button", { name: /Close Config/i }).click();
 
-    await profile.page.getByRole("button", { name: /Leave voice call/i }).click();
+    await profile.page
+      .getByRole("button", { name: /Leave voice call/i })
+      .click();
     await expect
-      .poll(async () => (await readEvidence(profile.page)).stoppedPlaybackTracks)
+      .poll(
+        async () => (await readEvidence(profile.page)).stoppedPlaybackTracks,
+      )
       .toBeGreaterThan(0);
     expect(profile.errors).toEqual([]);
   } finally {
@@ -693,7 +1045,9 @@ test("two profiles attach local microphone tracks and surface remote audio playb
       await appOutputVolume.fill("37");
       await expect(appOutputVolume).toHaveValue("37");
 
-      await page.getByRole("button", { name: "Open app configuration", exact: true }).click();
+      await page
+        .getByRole("button", { name: "Open app configuration", exact: true })
+        .click();
       const outputDevice = page.getByTestId("voice-output-selector");
       await expect(outputDevice).toBeVisible();
       await outputDevice.selectOption({ index: 1 });
@@ -725,6 +1079,153 @@ test("two profiles attach local microphone tracks and surface remote audio playb
         .toBeGreaterThan(0);
     }
 
+    expect(alice.errors).toEqual([]);
+    expect(bob.errors).toEqual([]);
+  } finally {
+    await alice.context.close();
+    await bob.context.close();
+  }
+});
+
+test("WebView voice ignores stale signaling from a previous media attempt", async ({
+  browser,
+}) => {
+  test.setTimeout(180_000);
+  const alice = await openProfile(browser, "Alice Stale", "Alice Desktop");
+  const bob = await openProfile(browser, "Bob Stale", "Bob Laptop");
+  try {
+    const invite = await createInvite(alice.page);
+    await joinInvite(bob.page, invite);
+
+    await joinVoice(bob.page);
+    await joinVoice(alice.page);
+
+    await expect
+      .poll(
+        async () => (await readEvidence(alice.page)).remoteDescriptionsApplied,
+      )
+      .toBeGreaterThan(0);
+    await expect
+      .poll(async () => (await readEvidence(alice.page)).iceCandidatesApplied)
+      .toBeGreaterThan(0);
+    const beforeRejoin = await readEvidence(alice.page);
+
+    const oldAliceSignals = (await readEvidence(alice.page)).sentVoiceSignals;
+    const staleOffer = oldAliceSignals.find(
+      (signal) => signal.kind === "offer",
+    );
+    const staleAliceCandidate = oldAliceSignals.find(
+      (signal) => signal.kind === "candidate",
+    );
+    const oldBobSignals = (await readEvidence(bob.page)).sentVoiceSignals;
+    const staleAnswer = oldBobSignals.find(
+      (signal) => signal.kind === "answer",
+    );
+    const staleCandidate = oldBobSignals.find(
+      (signal) => signal.kind === "candidate",
+    );
+    expect(staleOffer?.negotiation_id).toBeTruthy();
+    expect(staleAliceCandidate?.candidate?.candidate).toBeTruthy();
+    expect(staleAnswer?.negotiation_id).toBeTruthy();
+    expect(staleCandidate?.negotiation_id).toBe(staleAnswer?.negotiation_id);
+
+    await leaveVoice(alice.page);
+    await leaveVoice(bob.page);
+
+    await joinVoice(bob.page);
+    const bobBeforeStaleOffer = await readEvidence(bob.page);
+    expect(staleOffer).toBeTruthy();
+    const bufferedNegotiationId = `fresh-buffered-${Date.now()}`;
+    const bufferedCreatedAtMs = Date.now();
+    const bufferedCandidateValue = `candidate:buffered-before-offer:${bufferedNegotiationId}`;
+    const bufferedOfferSdp = `${staleOffer?.description?.sdp ?? "v=0\r\n"}a=x-buffered-offer:${bufferedNegotiationId}\r\n`;
+    await postLocalDevVoiceSignals(alice.page, [
+      {
+        ...(staleOffer as VoiceHarnessSignal),
+        created_at_ms: 1,
+        sender_instance_id: `stale-replay:${staleOffer?.sender_instance_id}`,
+      },
+      {
+        ...(staleAliceCandidate as VoiceHarnessSignal),
+        negotiation_id: bufferedNegotiationId,
+        created_at_ms: bufferedCreatedAtMs,
+        sender_instance_id: `buffered-candidate:${staleAliceCandidate?.sender_instance_id}`,
+        candidate: {
+          ...staleAliceCandidate?.candidate,
+          candidate: bufferedCandidateValue,
+        },
+      },
+      {
+        ...(staleOffer as VoiceHarnessSignal),
+        negotiation_id: bufferedNegotiationId,
+        created_at_ms: bufferedCreatedAtMs,
+        sender_instance_id: `buffered-offer:${staleOffer?.sender_instance_id}`,
+        description: {
+          ...staleOffer?.description,
+          type: "offer",
+          sdp: bufferedOfferSdp,
+        },
+      },
+    ]);
+    await bob.page.waitForTimeout(ANSWERER_STALE_OFFER_SELECTION_WAIT_MS);
+    const bobAfterBufferedOffer = await readEvidence(bob.page);
+    expect(
+      bobAfterBufferedOffer.remoteDescriptionSdps.slice(
+        bobBeforeStaleOffer.remoteDescriptionSdps.length,
+      ),
+    ).toContain(bufferedOfferSdp);
+    expect(
+      bobAfterBufferedOffer.iceCandidateValues.slice(
+        bobBeforeStaleOffer.iceCandidateValues.length,
+      ),
+    ).toContain(bufferedCandidateValue);
+    expect(
+      bobAfterBufferedOffer.remoteDescriptionSdps.slice(
+        bobBeforeStaleOffer.remoteDescriptionSdps.length,
+      ),
+    ).not.toContain(staleOffer?.description?.sdp ?? "");
+
+    await joinVoice(alice.page);
+
+    await expect
+      .poll(
+        async () => (await readEvidence(alice.page)).remoteDescriptionsApplied,
+      )
+      .toBeGreaterThan(beforeRejoin.remoteDescriptionsApplied);
+    await expect
+      .poll(async () => (await readEvidence(alice.page)).iceCandidatesApplied)
+      .toBeGreaterThan(beforeRejoin.iceCandidatesApplied);
+    const bobAfterFreshOffer = await readEvidence(bob.page);
+    expect(bobAfterFreshOffer.remoteDescriptionsApplied).toBeGreaterThan(
+      bobAfterBufferedOffer.remoteDescriptionsApplied,
+    );
+    await alice.page.waitForTimeout(ANSWERER_STALE_OFFER_SELECTION_WAIT_MS);
+
+    const beforeReplay = await readEvidence(alice.page);
+    const descriptionsBeforeReplay = beforeReplay.remoteDescriptionsApplied;
+    const candidatesBeforeReplay = beforeReplay.iceCandidatesApplied;
+    const replayed = [staleAnswer, staleCandidate]
+      .filter((signal): signal is VoiceHarnessSignal => Boolean(signal))
+      .map((signal) => ({
+        ...signal,
+        sender_instance_id: `stale-replay:${signal.sender_instance_id}`,
+      }));
+
+    await postLocalDevVoiceSignals(bob.page, replayed);
+    await alice.page.waitForTimeout(250);
+
+    const afterReplay = await readEvidence(alice.page);
+    expect(afterReplay.remoteDescriptionsApplied).toBe(
+      descriptionsBeforeReplay,
+    );
+    expect(afterReplay.iceCandidatesApplied).toBe(candidatesBeforeReplay);
+
+    const finalAliceSignals = (await readEvidence(alice.page)).sentVoiceSignals;
+    const newOffer = finalAliceSignals.findLast(
+      (signal) => signal.kind === "offer",
+    );
+    expect(newOffer?.negotiation_id).toBeTruthy();
+    expect(newOffer?.negotiation_id).not.toBe(staleAnswer?.negotiation_id);
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);
   } finally {

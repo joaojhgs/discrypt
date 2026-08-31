@@ -43,6 +43,8 @@ type VoiceSignal = {
   session_id: string;
   group_id: string;
   channel_id: string;
+  negotiation_id: string;
+  created_at_ms: number;
   from_peer_id: string;
   to_peer_id: string;
   sender_instance_id: string;
@@ -91,6 +93,9 @@ type StartVoiceMediaSessionOptions = {
 
 const REMOTE_EVIDENCE_POLL_MS = 500;
 const REMOTE_EVIDENCE_TIMEOUT_MS = 15_000;
+const ANSWERER_OFFER_SELECTION_MS = 500;
+const MAX_PENDING_NEGOTIATIONS = 8;
+const MAX_PENDING_CANDIDATES_PER_NEGOTIATION = 64;
 
 export function startNativeRustVoiceMediaSession(
   options: Omit<StartVoiceMediaSessionOptions, "onRemoteMedia"> & {
@@ -139,7 +144,8 @@ export function startNativeRustVoiceMediaSession(
     created_at_ms: Date.now(),
   })
     .then((response) => {
-      transportReady = response.status.data_channel_open && response.status.direct_path_ready;
+      transportReady =
+        response.status.data_channel_open && response.status.direct_path_ready;
       options.onState?.(response.state);
       options.onStatus?.(
         response.status.data_channel_open
@@ -195,10 +201,16 @@ export function startNativeRustVoiceMediaSession(
               mode: "native_rust_webrtc_datachannel",
               localAudioTracksSentDelta: 1,
               iceConnected:
-                response.status.direct_path_ready && response.status.data_channel_open,
+                response.status.direct_path_ready &&
+                response.status.data_channel_open,
             });
-          } else if (response.status.state === "failed" && response.status.last_error) {
-            options.onStatus?.(`Native Rust voice send failed: ${response.status.last_error}`);
+          } else if (
+            response.status.state === "failed" &&
+            response.status.last_error
+          ) {
+            options.onStatus?.(
+              `Native Rust voice send failed: ${response.status.last_error}`,
+            );
           }
         })
         .catch((error) => {
@@ -222,7 +234,9 @@ export function startNativeRustVoiceMediaSession(
     })
       .then((response) => {
         if (closed) return;
-        transportReady = response.status.data_channel_open && response.status.direct_path_ready;
+        transportReady =
+          response.status.data_channel_open &&
+          response.status.direct_path_ready;
         for (const frame of response.frames) {
           scheduleNativeVoicePlaybackFrame(
             audioContext,
@@ -239,11 +253,14 @@ export function startNativeRustVoiceMediaSession(
             mode: "native_rust_webrtc_datachannel",
             remoteTrackEventsDelta: response.frames.length,
             iceConnected:
-              response.status.direct_path_ready && response.status.data_channel_open,
+              response.status.direct_path_ready &&
+              response.status.data_channel_open,
           });
         }
         if (response.status.state === "failed" && response.status.last_error) {
-          options.onStatus?.(`Native Rust voice receive failed: ${response.status.last_error}`);
+          options.onStatus?.(
+            `Native Rust voice receive failed: ${response.status.last_error}`,
+          );
         }
       })
       .catch((error) => {
@@ -283,7 +300,8 @@ export function startNativeRustVoiceMediaSession(
         __discryptTauriTwoProfileE2EVoiceEvidence?: { trackEnabled?: boolean };
       };
       if (evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence) {
-        evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence.trackEnabled = !muted;
+        evidenceTarget.__discryptTauriTwoProfileE2EVoiceEvidence.trackEnabled =
+          !muted;
       }
     },
     setInputGain: () => undefined,
@@ -315,7 +333,9 @@ function downmixAudioBuffer(buffer: AudioBuffer): Float32Array {
   const mono = new Float32Array(buffer.length);
   const channels = Math.max(1, buffer.numberOfChannels);
   for (let channel = 0; channel < channels; channel += 1) {
-    const samples = buffer.getChannelData(Math.min(channel, buffer.numberOfChannels - 1));
+    const samples = buffer.getChannelData(
+      Math.min(channel, buffer.numberOfChannels - 1),
+    );
     for (let index = 0; index < mono.length; index += 1) {
       mono[index] += samples[index] / channels;
     }
@@ -329,7 +349,10 @@ function resampleMonoPcm(
   targetRate: number,
 ): Float32Array {
   if (sourceRate === targetRate) return input;
-  const outputLength = Math.max(1, Math.round((input.length * targetRate) / sourceRate));
+  const outputLength = Math.max(
+    1,
+    Math.round((input.length * targetRate) / sourceRate),
+  );
   const output = new Float32Array(outputLength);
   const ratio = sourceRate / targetRate;
   for (let index = 0; index < outputLength; index += 1) {
@@ -356,7 +379,11 @@ function scheduleNativeVoicePlaybackFrame(
   const channels = Math.max(1, frame.channels);
   const samplesPerChannel = Math.floor(frame.pcm_i16.length / channels);
   if (samplesPerChannel === 0) return;
-  const buffer = context.createBuffer(channels, samplesPerChannel, frame.sample_rate_hz);
+  const buffer = context.createBuffer(
+    channels,
+    samplesPerChannel,
+    frame.sample_rate_hz,
+  );
   for (let channel = 0; channel < channels; channel += 1) {
     const output = buffer.getChannelData(channel);
     for (let index = 0; index < samplesPerChannel; index += 1) {
@@ -396,10 +423,24 @@ export function startWebViewVoiceMediaSession(
   const senderInstanceId =
     globalThis.crypto?.randomUUID?.() ??
     `voice-media-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let activeNegotiationId =
+    options.role === "offerer"
+      ? createVoiceNegotiationId(options.session.session_id, senderInstanceId)
+      : null;
+  let activeNegotiationCreatedAtMs: number | null = null;
   const pc = new RTCPeerConnection({
     iceServers: iceServersFromConnectivity(options.connectivity),
   });
-  const pendingCandidates: RTCIceCandidateInit[] = [];
+  const pendingCandidatesByNegotiationId = new Map<
+    string,
+    RTCIceCandidateInit[]
+  >();
+  let pendingAnswererOffer:
+    | (VoiceSignal & {
+        description: RTCSessionDescriptionInit;
+      })
+    | null = null;
+  let pendingAnswererOfferTimer: number | null = null;
   let closed = false;
 
   try {
@@ -440,8 +481,11 @@ export function startWebViewVoiceMediaSession(
 
   pc.onicecandidate = (event) => {
     if (!event.candidate || closed) return;
+    if (!activeNegotiationId) return;
     transport.send({
       ...signalBase,
+      negotiation_id: activeNegotiationId,
+      created_at_ms: Date.now(),
       kind: "candidate",
       candidate: event.candidate.toJSON(),
     });
@@ -483,8 +527,11 @@ export function startWebViewVoiceMediaSession(
       const offer = await pc.createOffer({ offerToReceiveAudio: true });
       await pc.setLocalDescription(offer);
       if (!pc.localDescription || closed) return;
+      if (!activeNegotiationId) return;
       transport.send({
         ...signalBase,
+        negotiation_id: activeNegotiationId,
+        created_at_ms: Date.now(),
         kind: "offer",
         description: sessionDescriptionToInit(pc.localDescription),
       });
@@ -500,33 +547,54 @@ export function startWebViewVoiceMediaSession(
   async function handleRemoteSignal(signal: VoiceSignal) {
     if (closed || signal.session_id !== options.session.session_id) return;
     if (signal.from_peer_id !== options.remotePeerId) return;
+    if (!signal.negotiation_id) return;
+    if (!Number.isFinite(signal.created_at_ms)) return;
     try {
       if (signal.kind === "offer" && signal.description) {
         if (options.role !== "answerer") return;
-        await pc.setRemoteDescription(signal.description);
-        await flushPendingCandidates();
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        if (!pc.localDescription || closed) return;
-        transport.send({
-          ...signalBase,
-          kind: "answer",
-          description: sessionDescriptionToInit(pc.localDescription),
-        });
+        const offerSignal = { ...signal, description: signal.description };
+        if (!activeNegotiationId) {
+          scheduleAnswererOffer(offerSignal);
+          return;
+        }
+        if (signal.negotiation_id === activeNegotiationId) {
+          await acceptAnswererOffer(offerSignal);
+          return;
+        }
+        if (
+          activeNegotiationCreatedAtMs !== null &&
+          signal.created_at_ms > activeNegotiationCreatedAtMs
+        ) {
+          await acceptAnswererOffer(offerSignal);
+        }
+        return;
+      }
+      if (signal.kind === "candidate" && signal.candidate) {
+        if (
+          activeNegotiationId !== signal.negotiation_id ||
+          !pc.remoteDescription
+        ) {
+          if (
+            options.role === "answerer" ||
+            activeNegotiationId === signal.negotiation_id
+          ) {
+            queuePendingCandidate(signal.negotiation_id, signal.candidate);
+          }
+          return;
+        }
+        await pc.addIceCandidate(signal.candidate);
+        return;
+      }
+      if (
+        !activeNegotiationId ||
+        signal.negotiation_id !== activeNegotiationId
+      ) {
         return;
       }
       if (signal.kind === "answer" && signal.description) {
         if (options.role !== "offerer") return;
         await pc.setRemoteDescription(signal.description);
-        await flushPendingCandidates();
-        return;
-      }
-      if (signal.kind === "candidate" && signal.candidate) {
-        if (!pc.remoteDescription) {
-          pendingCandidates.push(signal.candidate);
-          return;
-        }
-        await pc.addIceCandidate(signal.candidate);
+        await flushPendingCandidates(activeNegotiationId);
       }
     } catch (error) {
       options.onStatus?.(
@@ -537,16 +605,102 @@ export function startWebViewVoiceMediaSession(
     }
   }
 
-  async function flushPendingCandidates() {
-    while (pendingCandidates.length > 0) {
-      const candidate = pendingCandidates.shift();
+  function queuePendingCandidate(
+    negotiationId: string,
+    candidate: RTCIceCandidateInit,
+  ) {
+    let candidates = pendingCandidatesByNegotiationId.get(negotiationId);
+    if (!candidates) {
+      if (pendingCandidatesByNegotiationId.size >= MAX_PENDING_NEGOTIATIONS) {
+        const oldestNegotiationId = pendingCandidatesByNegotiationId
+          .keys()
+          .next().value;
+        if (oldestNegotiationId) {
+          pendingCandidatesByNegotiationId.delete(oldestNegotiationId);
+        }
+      }
+      candidates = [];
+      pendingCandidatesByNegotiationId.set(negotiationId, candidates);
+    }
+    if (
+      candidates.length < MAX_PENDING_CANDIDATES_PER_NEGOTIATION &&
+      !candidates.some(
+        (pending) =>
+          pending.candidate === candidate.candidate &&
+          pending.sdpMid === candidate.sdpMid &&
+          pending.sdpMLineIndex === candidate.sdpMLineIndex,
+      )
+    ) {
+      candidates.push(candidate);
+    }
+  }
+
+  async function flushPendingCandidates(negotiationId: string) {
+    const candidates =
+      pendingCandidatesByNegotiationId.get(negotiationId) ?? [];
+    pendingCandidatesByNegotiationId.delete(negotiationId);
+    while (candidates.length > 0) {
+      const candidate = candidates.shift();
       if (candidate) await pc.addIceCandidate(candidate);
     }
+  }
+
+  function scheduleAnswererOffer(
+    signal: VoiceSignal & { description: RTCSessionDescriptionInit },
+  ) {
+    if (
+      pendingAnswererOffer &&
+      pendingAnswererOffer.created_at_ms > signal.created_at_ms
+    ) {
+      return;
+    }
+    pendingAnswererOffer = signal;
+    if (pendingAnswererOfferTimer !== null) {
+      window.clearTimeout(pendingAnswererOfferTimer);
+    }
+    pendingAnswererOfferTimer = window.setTimeout(() => {
+      pendingAnswererOfferTimer = null;
+      const offer = pendingAnswererOffer;
+      pendingAnswererOffer = null;
+      if (offer && !closed && !activeNegotiationId) {
+        void acceptAnswererOffer(offer);
+      }
+    }, ANSWERER_OFFER_SELECTION_MS);
+  }
+
+  async function acceptAnswererOffer(
+    signal: VoiceSignal & { description: RTCSessionDescriptionInit },
+  ) {
+    if (activeNegotiationId !== signal.negotiation_id) {
+      for (const negotiationId of pendingCandidatesByNegotiationId.keys()) {
+        if (negotiationId !== signal.negotiation_id) {
+          pendingCandidatesByNegotiationId.delete(negotiationId);
+        }
+      }
+    }
+    activeNegotiationId = signal.negotiation_id;
+    activeNegotiationCreatedAtMs = signal.created_at_ms;
+    await pc.setRemoteDescription(signal.description);
+    await flushPendingCandidates(signal.negotiation_id);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    if (!pc.localDescription || closed || !activeNegotiationId) return;
+    transport.send({
+      ...signalBase,
+      negotiation_id: activeNegotiationId,
+      created_at_ms: Date.now(),
+      kind: "answer",
+      description: sessionDescriptionToInit(pc.localDescription),
+    });
   }
 
   return {
     close: () => {
       closed = true;
+      if (pendingAnswererOfferTimer !== null) {
+        window.clearTimeout(pendingAnswererOfferTimer);
+      }
+      pendingCandidatesByNegotiationId.clear();
       transport.close();
       pc.onicecandidate = null;
       pc.ontrack = null;
@@ -679,7 +833,8 @@ function recordTauriTwoProfileE2ENativeVoiceEvidence(update: {
   evidence.mode = update.mode;
   evidence.nativeRustVoiceRuntimeAvailable = true;
   evidence.localAudioTracksSent =
-    (evidence.localAudioTracksSent ?? 0) + (update.localAudioTracksSentDelta ?? 0);
+    (evidence.localAudioTracksSent ?? 0) +
+    (update.localAudioTracksSentDelta ?? 0);
   evidence.remoteTrackEvents =
     (evidence.remoteTrackEvents ?? 0) + (update.remoteTrackEventsDelta ?? 0);
   evidence.getUserMediaCalls =
@@ -751,16 +906,17 @@ function createVoiceSignalTransport({
   return {
     send: (signal) => {
       if (tauriVoiceSignalingAvailable()) {
-        void sealVoiceSignalPayload(signal)
+        const signalId = `${senderInstanceId}:${signal.negotiation_id}:${signal.kind}:${Date.now()}:${Math.random()
+          .toString(16)
+          .slice(2)}`;
+        void sealVoiceSignalPayload(signal, signalId)
           .then((sealedPayload) =>
             publishVoiceSignalingMessage({
               session_id: sessionId,
               signal_kind: signal.kind,
               sealed_payload: sealedPayload,
-              signal_id: `${senderInstanceId}:${signal.kind}:${Date.now()}:${Math.random()
-                .toString(16)
-                .slice(2)}`,
-              created_at_ms: Date.now(),
+              signal_id: signalId,
+              created_at_ms: signal.created_at_ms,
             }),
           )
           .catch((error) => {
@@ -833,6 +989,16 @@ function sessionDescriptionToInit(
   };
 }
 
+function createVoiceNegotiationId(
+  sessionId: string,
+  senderInstanceId: string,
+): string {
+  return `${sessionId}:${senderInstanceId}:negotiation:${
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}:${Math.random().toString(16).slice(2)}`
+  }`;
+}
+
 async function voiceSignalFromBackendMessage(
   message: VoiceSignalingMessageView,
   localPeerId: string,
@@ -850,10 +1016,14 @@ async function voiceSignalFromBackendMessage(
   };
   const payload = await openVoiceSignalPayload(message).catch(() => null);
   if (!payload) return null;
+  if (!payload.negotiation_id) return null;
+  if (!Number.isFinite(payload.created_at_ms)) return null;
   if (message.signal_kind === "offer" || message.signal_kind === "answer") {
     if (!payload.description?.sdp) return null;
     return {
       ...base,
+      negotiation_id: payload.negotiation_id,
+      created_at_ms: payload.created_at_ms,
       kind: message.signal_kind,
       description: payload.description,
     };
@@ -862,6 +1032,8 @@ async function voiceSignalFromBackendMessage(
     if (!payload.candidate?.candidate) return null;
     return {
       ...base,
+      negotiation_id: payload.negotiation_id,
+      created_at_ms: payload.created_at_ms,
       kind: "candidate",
       candidate: payload.candidate,
       native_media: payload.native_media,
@@ -870,13 +1042,28 @@ async function voiceSignalFromBackendMessage(
   return null;
 }
 
-type VoiceSignalPayload = Pick<VoiceSignal, "description" | "candidate" | "native_media">;
+type VoiceSignalPayload = Pick<
+  VoiceSignal,
+  | "negotiation_id"
+  | "created_at_ms"
+  | "description"
+  | "candidate"
+  | "native_media"
+>;
 
-const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v1:";
+const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v2:";
 
-async function sealVoiceSignalPayload(signal: VoiceSignal): Promise<string> {
+// This browser-local layer keeps raw SDP/ICE out of IPC and persisted state.
+// Peer authentication and provider confidentiality come from the backend-owned,
+// direct WebRTC text/control DataChannel that carries this envelope; this
+// metadata-derived key is not an independent identity-authentication boundary.
+export async function sealVoiceSignalPayload(
+  signal: VoiceSignal,
+  signalId: string,
+): Promise<string> {
   const crypto = globalThis.crypto;
-  if (!crypto?.subtle) throw new Error("Web Crypto is required for voice signaling sealing");
+  if (!crypto?.subtle)
+    throw new Error("Web Crypto is required for voice signaling sealing");
   const nonce = new Uint8Array(12);
   crypto.getRandomValues(nonce);
   const key = await voiceSignalCryptoKey(
@@ -888,21 +1075,42 @@ async function sealVoiceSignalPayload(signal: VoiceSignal): Promise<string> {
   );
   const plaintext = new TextEncoder().encode(
     JSON.stringify({
+      negotiation_id: signal.negotiation_id,
+      created_at_ms: signal.created_at_ms,
       description: signal.description,
       candidate: signal.candidate,
       native_media: signal.native_media,
     }),
   );
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plaintext);
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: nonce,
+      additionalData: voiceSignalAdditionalData({
+        sessionId: signal.session_id,
+        groupId: signal.group_id,
+        channelId: signal.channel_id,
+        senderPeerId: signal.from_peer_id,
+        recipientPeerId: signal.to_peer_id,
+        signalKind: signal.kind,
+        signalId,
+        createdAtMs: signal.created_at_ms,
+      }),
+    },
+    key,
+    plaintext,
+  );
   return `${VOICE_SIGNAL_SEALED_PREFIX}${base64UrlEncode(nonce)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
 }
 
-async function openVoiceSignalPayload(
+export async function openVoiceSignalPayload(
   message: VoiceSignalingMessageView,
 ): Promise<VoiceSignalPayload | null> {
   const sealed = message.sealed_payload ?? "";
   if (!sealed.startsWith(VOICE_SIGNAL_SEALED_PREFIX)) return null;
-  const [nonceText, ciphertextText] = sealed.slice(VOICE_SIGNAL_SEALED_PREFIX.length).split(".");
+  const [nonceText, ciphertextText] = sealed
+    .slice(VOICE_SIGNAL_SEALED_PREFIX.length)
+    .split(".");
   if (!nonceText || !ciphertextText) return null;
   const key = await voiceSignalCryptoKey(
     message.session_id,
@@ -912,11 +1120,58 @@ async function openVoiceSignalPayload(
     message.recipient_peer_id,
   );
   const plaintext = await globalThis.crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: base64UrlDecode(nonceText) },
+    {
+      name: "AES-GCM",
+      iv: base64UrlDecode(nonceText),
+      additionalData: voiceSignalAdditionalData({
+        sessionId: message.session_id,
+        groupId: message.group_id,
+        channelId: message.channel_id,
+        senderPeerId: message.sender_peer_id,
+        recipientPeerId: message.recipient_peer_id,
+        signalKind: message.signal_kind,
+        signalId: message.signal_id,
+        createdAtMs: message.created_at_ms,
+      }),
+    },
     key,
     base64UrlDecode(ciphertextText),
   );
   return JSON.parse(new TextDecoder().decode(plaintext)) as VoiceSignalPayload;
+}
+
+function voiceSignalAdditionalData({
+  channelId,
+  createdAtMs,
+  groupId,
+  recipientPeerId,
+  senderPeerId,
+  sessionId,
+  signalId,
+  signalKind,
+}: {
+  sessionId: string;
+  groupId: string;
+  channelId: string;
+  senderPeerId: string;
+  recipientPeerId: string;
+  signalKind: string;
+  signalId: string;
+  createdAtMs: number;
+}): ArrayBuffer {
+  return new TextEncoder().encode(
+    JSON.stringify([
+      "discrypt.voice-signal.v2",
+      sessionId,
+      groupId,
+      channelId,
+      senderPeerId,
+      recipientPeerId,
+      signalKind,
+      signalId,
+      createdAtMs,
+    ]),
+  ).buffer;
 }
 
 async function voiceSignalCryptoKey(
@@ -940,7 +1195,10 @@ async function voiceSignalCryptoKey(
 function base64UrlEncode(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function base64UrlDecode(value: string): ArrayBuffer {
@@ -1062,4 +1320,14 @@ function localAudioTracks(stream: MediaStream): MediaStreamTrack[] {
     return stream.getAudioTracks();
   }
   return stream.getTracks().filter((track) => track.kind === "audio");
+}
+
+if (LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED && typeof window !== "undefined") {
+  Object.defineProperty(window, "__discryptVoiceSignalCryptoTest", {
+    configurable: true,
+    value: {
+      open: openVoiceSignalPayload,
+      seal: sealVoiceSignalPayload,
+    },
+  });
 }

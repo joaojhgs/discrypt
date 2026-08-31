@@ -379,6 +379,36 @@ pub struct GroupRuntimePeerView {
     pub is_local: bool,
     /// Backend evidence source for this peer id.
     pub source: String,
+    /// Roster member this runtime peer maps to, only when backend state can resolve it uniquely.
+    #[serde(default)]
+    pub member_id: Option<String>,
+    /// Roster device this runtime peer maps to, only when backend state can resolve it uniquely.
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// Backend-owned runtime route proof for this peer, when a live provider WebRTC runtime proves it.
+    #[serde(default)]
+    pub route_evidence: Option<PeerRouteEvidenceView>,
+}
+
+/// Per-peer route proof shown in the roster. Absence means no backend route proof exists.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PeerRouteEvidenceView {
+    #[serde(default)]
+    pub route_kind: Option<String>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub route_label: Option<String>,
+    #[serde(default)]
+    pub route_status: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub evidence_source: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 /// Backend-authorized group role. UI labels must be derived from this state, not frontend strings.
@@ -445,6 +475,9 @@ pub struct GroupMemberView {
     pub revoked_at: Option<String>,
     #[serde(default)]
     pub revoked_by: Option<String>,
+    /// Backend-owned runtime route proof for this member, when a live provider WebRTC runtime proves it.
+    #[serde(default)]
+    pub route_evidence: Option<PeerRouteEvidenceView>,
 }
 
 /// Current group-wide role/admission policy.
@@ -3376,9 +3409,55 @@ impl TauriAppService {
 
     fn to_view(&self) -> AppStateView {
         let mut view = self.state.to_view();
+        self.attach_group_runtime_route_evidence(&mut view);
         view.transport_status
             .push(self.text_control_runtime_status_row());
         view
+    }
+
+    fn attach_group_runtime_route_evidence(&self, view: &mut AppStateView) {
+        let Some(active_group_id) = self
+            .state
+            .active_context
+            .as_ref()
+            .and_then(|context| context.group_id.as_deref())
+        else {
+            return;
+        };
+        let Some(text_session) = self.state.text_session.as_ref() else {
+            return;
+        };
+        let text_session_state = text_session.state();
+        if !text_session_state.is_connected() {
+            return;
+        }
+        let route_evidence_by_remote_peer = self
+            .text_control_transport_runtimes
+            .values()
+            .filter(|runtime| runtime.session_id == text_session.session_id)
+            .filter_map(|runtime| {
+                let provider_runtime = runtime.owned_runtime.as_ref()?;
+                let evidence = provider_runtime.evidence();
+                let metrics = text_control_runtime_metrics_snapshot(runtime)?;
+                let route_evidence = peer_route_evidence_from_provider_runtime(
+                    evidence,
+                    text_session_state,
+                    &metrics,
+                )?;
+                Some((evidence.remote_peer_id.0.clone(), route_evidence))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if route_evidence_by_remote_peer.is_empty() {
+            return;
+        }
+        let Some(group) = view
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == active_group_id)
+        else {
+            return;
+        };
+        attach_group_member_route_evidence(active_group_id, group, &route_evidence_by_remote_peer);
     }
 
     #[cfg(feature = "tauri-runtime")]
@@ -10744,6 +10823,7 @@ impl PersistedAppState {
                     presence_expires_at: None,
                     revoked_at: None,
                     revoked_by: None,
+                    route_evidence: None,
                 });
             }
             if let Some(local_member) = group.members.iter().find(|member| {
@@ -11356,6 +11436,7 @@ impl PersistedAppState {
             presence_expires_at: None,
             revoked_at: None,
             revoked_by: None,
+            route_evidence: None,
         });
         group.governance_log.push(GroupGovernanceLogEntryView {
             event_id: stable_id(
@@ -11561,6 +11642,7 @@ impl PersistedAppState {
                         presence_expires_at: None,
                         revoked_at: None,
                         revoked_by: None,
+                        route_evidence: None,
                     });
                 }
             }
@@ -18287,6 +18369,7 @@ fn initial_group_member(
         presence_expires_at: None,
         revoked_at: None,
         revoked_by: None,
+        route_evidence: None,
     }
 }
 
@@ -18344,7 +18427,10 @@ fn validate_voice_signal_payload(signal_kind: &str, sealed_payload: &str) -> Res
         _ => return Err("unsupported voice signal kind".to_owned()),
     }
     let payload = sealed_payload.trim();
-    if !payload.starts_with("voice-signal-sealed:v1:") || payload.len() < 48 {
+    if !(payload.starts_with("voice-signal-sealed:v1:")
+        || payload.starts_with("voice-signal-sealed:v2:"))
+        || payload.len() < 48
+    {
         return Err("voice signaling requires a WebView-sealed payload envelope".to_owned());
     }
     let lower = payload.to_ascii_lowercase();
@@ -19846,6 +19932,100 @@ fn runtime_role_label(role: Option<ProviderTextControlRuntimePeerRole>) -> &'sta
     }
 }
 
+fn peer_route_evidence_from_provider_runtime(
+    evidence: &discrypt_transport::ProviderTextControlRuntimePeerEvidence,
+    route_state: TransportSessionState,
+    metrics: &discrypt_transport::WebRtcDataTransportMetrics,
+) -> Option<PeerRouteEvidenceView> {
+    let route_kind =
+        provider_runtime_route_kind(route_state, evidence.direct_path_ready, metrics.open)?;
+    let detail = format!(
+        "backend-owned provider WebRTC runtime attached over {route_kind}; adapter={} profile={} role={} local_peer={} remote_peer={} channel_state={} provider_application_relay_used=false",
+        evidence.kind.canonical_name(),
+        evidence.profile_id,
+        runtime_role_label(Some(evidence.role)),
+        evidence.local_peer_id.0,
+        evidence.remote_peer_id.0,
+        metrics.last_state
+    );
+    Some(PeerRouteEvidenceView {
+        route_kind: Some(route_kind.to_owned()),
+        route: Some(route_kind.to_owned()),
+        route_label: Some(route_kind.to_owned()),
+        route_status: Some("connected".to_owned()),
+        status: Some("connected".to_owned()),
+        evidence_source: Some("backend_provider_webrtc_runtime".to_owned()),
+        detail: Some(detail),
+        updated_at: None,
+    })
+}
+
+fn provider_runtime_route_kind(
+    route_state: TransportSessionState,
+    direct_path_ready: bool,
+    data_channel_open: bool,
+) -> Option<&'static str> {
+    if data_channel_open && direct_path_ready && route_state == TransportSessionState::Direct {
+        Some("direct")
+    } else {
+        None
+    }
+}
+
+fn attach_group_member_route_evidence(
+    group_id: &str,
+    group: &mut GroupView,
+    route_evidence_by_remote_peer: &BTreeMap<String, PeerRouteEvidenceView>,
+) {
+    let member_route_map = group
+        .members
+        .iter()
+        .filter_map(|member| {
+            let route_peer_id = group_member_runtime_peer_id(group_id, member).ok()?;
+            route_evidence_by_remote_peer
+                .get(&route_peer_id)
+                .cloned()
+                .map(|evidence| (member.member_id.clone(), (route_peer_id, evidence)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for member in &mut group.members {
+        if let Some((_, evidence)) = member_route_map.get(&member.member_id) {
+            member.route_evidence = Some(evidence.clone());
+        }
+    }
+    attach_unambiguous_group_runtime_peer_members(group, &member_route_map);
+}
+
+fn attach_unambiguous_group_runtime_peer_members(
+    group: &mut GroupView,
+    member_route_map: &BTreeMap<String, (String, PeerRouteEvidenceView)>,
+) {
+    let member_snapshots = group.members.clone();
+    for peer in &mut group.runtime_peers {
+        let candidates = member_snapshots
+            .iter()
+            .filter(|member| group_role_label(&member.role) == peer.role)
+            .filter(|member| {
+                !matches!(
+                    member.status.as_str(),
+                    "pending" | "revoked" | "migration_default"
+                )
+            })
+            .collect::<Vec<_>>();
+        let [member] = candidates.as_slice() else {
+            peer.member_id = None;
+            peer.device_id = None;
+            peer.route_evidence = None;
+            continue;
+        };
+        peer.member_id = Some(member.member_id.clone());
+        peer.device_id = member.device_id.clone();
+        peer.route_evidence = member_route_map
+            .get(&member.member_id)
+            .map(|(_, evidence)| evidence.clone());
+    }
+}
+
 fn text_control_runtime_metrics_snapshot(
     runtime: &TextControlTransportRuntime,
 ) -> Option<discrypt_transport::WebRtcDataTransportMetrics> {
@@ -20949,12 +21129,18 @@ fn group_runtime_peers(
             role: "owner".to_owned(),
             is_local: local_is_owner,
             source: "signed_group_bootstrap_v1".to_owned(),
+            member_id: None,
+            device_id: None,
+            route_evidence: None,
         },
         GroupRuntimePeerView {
             peer_id: member_peer_id,
             role: "member".to_owned(),
             is_local: !local_is_owner,
             source: "signed_group_bootstrap_v1".to_owned(),
+            member_id: None,
+            device_id: None,
+            route_evidence: None,
         },
     ]
 }
@@ -20986,6 +21172,7 @@ fn initial_group_members(
         presence_expires_at: None,
         revoked_at: None,
         revoked_by: None,
+        route_evidence: None,
     }]
     .into_iter()
     .map(|mut member| {
@@ -21107,6 +21294,7 @@ fn ensure_group_governance_defaults(
             presence_expires_at: None,
             revoked_at: None,
             revoked_by: None,
+            route_evidence: None,
         });
     }
     if group.governance_log.is_empty() {
@@ -21702,6 +21890,7 @@ fn apply_group_presence_heartbeat(
             presence_expires_at: Some(event.presence_expires_at.to_owned()),
             revoked_at: None,
             revoked_by: None,
+            route_evidence: None,
         };
         group.members.push(member);
     }
@@ -23119,6 +23308,7 @@ mod tests {
             presence_expires_at: None,
             revoked_at: None,
             revoked_by: None,
+            route_evidence: None,
         });
     }
 
@@ -24521,6 +24711,7 @@ mod tests {
                         presence_expires_at: None,
                         revoked_at: None,
                         revoked_by: None,
+                        route_evidence: None,
                     });
                 }
             }
@@ -29712,6 +29903,197 @@ mod tests {
     }
 
     #[test]
+    fn group_member_route_view_uses_attached_runtime_peer_and_presence() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("group-member-route-view-runtime-presence");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Route View Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let mut group = created
+            .groups
+            .into_iter()
+            .next()
+            .ok_or_else(|| "created group missing from view".to_owned())?;
+        let expires_at = (Utc::now() + Duration::minutes(5)).to_rfc3339();
+        group.members.push(GroupMemberView {
+            member_id: "bob-notebook".to_owned(),
+            display_name: "Bob Notebook".to_owned(),
+            device_id: Some("bob-device".to_owned()),
+            role: GroupRoleView::Member,
+            status: "online".to_owned(),
+            signer_public_key_hex: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+            joined_at: Utc::now().to_rfc3339(),
+            last_seen_at: Some(Utc::now().to_rfc3339()),
+            presence_expires_at: Some(expires_at),
+            revoked_at: None,
+            revoked_by: None,
+            route_evidence: None,
+        });
+        group = group_with_effective_presence(group);
+        let bob_route_peer =
+            route_peer_id_for_member_in_state_group(&group_id, &group, "bob-notebook")?;
+        let mut route_evidence_by_peer = BTreeMap::new();
+        route_evidence_by_peer.insert(
+            bob_route_peer,
+            PeerRouteEvidenceView {
+                route_kind: Some("direct".to_owned()),
+                route: Some("direct".to_owned()),
+                route_label: Some("direct".to_owned()),
+                route_status: Some("connected".to_owned()),
+                status: Some("connected".to_owned()),
+                evidence_source: Some("backend_provider_webrtc_runtime".to_owned()),
+                detail: Some("unit test attached runtime route proof".to_owned()),
+                updated_at: None,
+            },
+        );
+
+        attach_group_member_route_evidence(&group_id, &mut group, &route_evidence_by_peer);
+
+        let bob = group
+            .members
+            .iter()
+            .find(|member| member.member_id == "bob-notebook")
+            .ok_or_else(|| "bob missing".to_owned())?;
+        assert_eq!(bob.display_name, "Bob Notebook");
+        assert_eq!(bob.device_id.as_deref(), Some("bob-device"));
+        assert_eq!(bob.status, "online");
+        assert_eq!(
+            bob.route_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.route_kind.as_deref()),
+            Some("direct")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_runtime_peer_member_mapping_fails_closed_for_ambiguous_role() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("group-runtime-peer-ambiguous-role-view");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Runtime Role Ambiguity Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let mut group = created
+            .groups
+            .into_iter()
+            .next()
+            .ok_or_else(|| "created group missing from view".to_owned())?;
+        let now = Utc::now().to_rfc3339();
+        for (member_id, signer) in [
+            (
+                "bob-member",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            (
+                "carol-member",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        ] {
+            group.members.push(GroupMemberView {
+                member_id: member_id.to_owned(),
+                display_name: member_id.to_owned(),
+                device_id: Some(format!("{member_id}-device")),
+                role: GroupRoleView::Member,
+                status: "online".to_owned(),
+                signer_public_key_hex: Some(signer.to_owned()),
+                joined_at: now.clone(),
+                last_seen_at: Some(now.clone()),
+                presence_expires_at: Some((Utc::now() + Duration::minutes(5)).to_rfc3339()),
+                revoked_at: None,
+                revoked_by: None,
+                route_evidence: None,
+            });
+        }
+        let bob_route_peer =
+            route_peer_id_for_member_in_state_group(&group_id, &group, "bob-member")?;
+        let mut route_evidence_by_peer = BTreeMap::new();
+        route_evidence_by_peer.insert(
+            bob_route_peer,
+            PeerRouteEvidenceView {
+                route_kind: Some("direct".to_owned()),
+                route: Some("direct".to_owned()),
+                route_label: Some("direct".to_owned()),
+                route_status: Some("connected".to_owned()),
+                status: Some("connected".to_owned()),
+                evidence_source: Some("backend_provider_webrtc_runtime".to_owned()),
+                detail: Some("unit test attached runtime route proof".to_owned()),
+                updated_at: None,
+            },
+        );
+
+        attach_group_member_route_evidence(&group_id, &mut group, &route_evidence_by_peer);
+
+        let member_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.role == "member")
+            .ok_or_else(|| "member runtime peer missing".to_owned())?;
+        assert_eq!(member_peer.member_id, None);
+        assert_eq!(member_peer.device_id, None);
+        assert_eq!(member_peer.route_evidence, None);
+        assert_eq!(
+            group
+                .members
+                .iter()
+                .find(|member| member.member_id == "bob-member")
+                .and_then(|member| member.route_evidence.as_ref())
+                .and_then(|evidence| evidence.route_kind.as_deref()),
+            Some("direct")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_member_route_view_does_not_infer_turn_from_session_state() {
+        assert_eq!(
+            provider_runtime_route_kind(TransportSessionState::TurnRelay, true, true),
+            None
+        );
+        assert_eq!(
+            provider_runtime_route_kind(TransportSessionState::Direct, true, true),
+            Some("direct")
+        );
+        assert_eq!(
+            provider_runtime_route_kind(TransportSessionState::Direct, true, false),
+            None
+        );
+    }
+
+    #[test]
     fn group_text_runtime_attachments_fail_closed_for_unadmitted_and_duplicate_peers(
     ) -> Result<(), String> {
         let _guard = test_lock();
@@ -29763,6 +30145,7 @@ mod tests {
                 presence_expires_at: None,
                 revoked_at: None,
                 revoked_by: None,
+                route_evidence: None,
             });
             group.members.push(GroupMemberView {
                 member_id: "revoked-member".to_owned(),
@@ -29778,6 +30161,7 @@ mod tests {
                 presence_expires_at: None,
                 revoked_at: Some(Utc::now().to_rfc3339()),
                 revoked_by: Some(local_user_id),
+                route_evidence: None,
             });
             guard.persist();
         }
@@ -30080,7 +30464,7 @@ mod tests {
         let queued = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
             session_id: session_id.clone(),
             signal_kind: "offer".to_owned(),
-            sealed_payload: "voice-signal-sealed:v1:test-offer-ciphertext-ref".to_owned(),
+            sealed_payload: "voice-signal-sealed:v2:test-offer-ciphertext-ref".to_owned(),
             signal_id: Some("voice-signal-offer-1".to_owned()),
             created_at_ms: 42,
         });
@@ -30118,7 +30502,7 @@ mod tests {
                     sender_peer_id: remote_peer.clone(),
                     recipient_peer_id: local_peer.clone(),
                     signal_kind: "answer".to_owned(),
-                    sealed_payload: "voice-signal-sealed:v1:test-answer-ciphertext-ref".to_owned(),
+                    sealed_payload: "voice-signal-sealed:v2:test-answer-ciphertext-ref".to_owned(),
                     created_at_ms: 43,
                 },
             },
@@ -34018,6 +34402,7 @@ mod tests {
                     presence_expires_at: None,
                     revoked_at: None,
                     revoked_by: None,
+                    route_evidence: None,
                 });
             }
         }
@@ -34105,6 +34490,19 @@ mod tests {
         group_member_runtime_peer_id(group_id, member)
     }
 
+    fn route_peer_id_for_member_in_state_group(
+        group_id: &str,
+        group: &GroupView,
+        member_id: &str,
+    ) -> Result<String, String> {
+        let member = group
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| "member missing for route lookup".to_owned())?;
+        group_member_runtime_peer_id(group_id, member)
+    }
+
     fn add_legacy_route_member_without_signer_for_test(
         group_id: &str,
         member_id: &str,
@@ -34156,6 +34554,7 @@ mod tests {
                 presence_expires_at: None,
                 revoked_at: None,
                 revoked_by: None,
+                route_evidence: None,
             });
         }
         Ok(())
@@ -41257,6 +41656,7 @@ mod tests {
                         presence_expires_at: None,
                         revoked_at: None,
                         revoked_by: None,
+                        route_evidence: None,
                     },
                     GroupMemberView {
                         member_id: remote_user.clone(),
@@ -41270,6 +41670,7 @@ mod tests {
                         presence_expires_at: None,
                         revoked_at: None,
                         revoked_by: None,
+                        route_evidence: None,
                     },
                 ],
                 role_policy: GroupRolePolicyView::default(),
@@ -41292,12 +41693,18 @@ mod tests {
                         role: "local".to_owned(),
                         is_local: true,
                         source: "voice lane test".to_owned(),
+                        member_id: None,
+                        device_id: None,
+                        route_evidence: None,
                     },
                     GroupRuntimePeerView {
                         peer_id: remote_peer.to_owned(),
                         role: "remote".to_owned(),
                         is_local: false,
                         source: "voice lane test".to_owned(),
+                        member_id: None,
+                        device_id: None,
+                        route_evidence: None,
                     },
                 ],
                 connectivity: Some(connectivity),

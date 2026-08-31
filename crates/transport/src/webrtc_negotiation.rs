@@ -493,11 +493,39 @@ pub enum WebRtcNegotiationPayloadKind {
     Candidate,
 }
 
+/// Opaque per-attempt identifier for a WebRTC offer/answer exchange.
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct WebRtcNegotiationId([u8; 16]);
+
+impl fmt::Debug for WebRtcNegotiationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WebRtcNegotiationId(<redacted>)")
+    }
+}
+
+impl WebRtcNegotiationId {
+    /// Generate a fresh negotiation id for one offer/answer generation.
+    #[must_use]
+    pub fn generate() -> Self {
+        use rand::RngCore;
+
+        let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        Self(id)
+    }
+}
+
 /// AES-GCM sealed WebRTC negotiation payload safe to hand to the signaling service.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SealedWebRtcNegotiationPayload {
     /// Wire format version.
     pub version: u8,
+    /// Opaque attempt id binding offers, answers, and candidates from one exchange.
+    #[serde(default)]
+    pub negotiation_id: Option<WebRtcNegotiationId>,
+    /// Sender-declared expiry for this negotiation generation.
+    #[serde(default)]
+    pub expires_at_unix_seconds: Option<i64>,
     /// Payload kind used as authenticated context.
     pub kind: WebRtcNegotiationPayloadKind,
     /// 96-bit AES-GCM nonce.
@@ -511,6 +539,8 @@ impl fmt::Debug for SealedWebRtcNegotiationPayload {
         formatter
             .debug_struct("SealedWebRtcNegotiationPayload")
             .field("version", &self.version)
+            .field("negotiation_id", &self.negotiation_id.map(|_| "<redacted>"))
+            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
             .field("kind", &self.kind)
             .field("nonce", &"<redacted>")
             .field(
@@ -563,11 +593,30 @@ impl WebRtcNegotiationSealer {
         &self,
         description: &WebRtcSessionDescription,
     ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
+        self.seal_description_for_negotiation(description, None)
+    }
+
+    /// Seal an SDP offer or answer bound to one offer/answer generation.
+    pub fn seal_description_for_negotiation(
+        &self,
+        description: &WebRtcSessionDescription,
+        negotiation_id: Option<WebRtcNegotiationId>,
+    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
+        self.seal_description_for_negotiation_until(description, negotiation_id, None)
+    }
+
+    /// Seal an SDP offer or answer bound to one offer/answer generation and expiry.
+    pub fn seal_description_for_negotiation_until(
+        &self,
+        description: &WebRtcSessionDescription,
+        negotiation_id: Option<WebRtcNegotiationId>,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
         let kind = match description.sdp_type {
             WebRtcSdpType::Offer => WebRtcNegotiationPayloadKind::Offer,
             WebRtcSdpType::Answer => WebRtcNegotiationPayloadKind::Answer,
         };
-        self.seal_json(kind, description)
+        self.seal_json(kind, negotiation_id, expires_at_unix_seconds, description)
     }
 
     /// Open a sealed SDP offer or answer.
@@ -590,7 +639,31 @@ impl WebRtcNegotiationSealer {
         &self,
         candidate: &WebRtcIceCandidate,
     ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
-        self.seal_json(WebRtcNegotiationPayloadKind::Candidate, candidate)
+        self.seal_candidate_for_negotiation(candidate, None)
+    }
+
+    /// Seal one trickled ICE candidate bound to one offer/answer generation.
+    pub fn seal_candidate_for_negotiation(
+        &self,
+        candidate: &WebRtcIceCandidate,
+        negotiation_id: Option<WebRtcNegotiationId>,
+    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
+        self.seal_candidate_for_negotiation_until(candidate, negotiation_id, None)
+    }
+
+    /// Seal one trickled ICE candidate bound to one offer/answer generation and expiry.
+    pub fn seal_candidate_for_negotiation_until(
+        &self,
+        candidate: &WebRtcIceCandidate,
+        negotiation_id: Option<WebRtcNegotiationId>,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
+        self.seal_json(
+            WebRtcNegotiationPayloadKind::Candidate,
+            negotiation_id,
+            expires_at_unix_seconds,
+            candidate,
+        )
     }
 
     /// Open one sealed trickled ICE candidate.
@@ -609,6 +682,8 @@ impl WebRtcNegotiationSealer {
     fn seal_json<T: Serialize>(
         &self,
         kind: WebRtcNegotiationPayloadKind,
+        negotiation_id: Option<WebRtcNegotiationId>,
+        expires_at_unix_seconds: Option<i64>,
         value: &T,
     ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
         use aes_gcm::aead::{Aead, Payload};
@@ -628,7 +703,7 @@ impl WebRtcNegotiationSealer {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: &plaintext,
-                    aad: aad_for_kind(kind).as_bytes(),
+                    aad: aad_for_payload(kind, negotiation_id, expires_at_unix_seconds).as_bytes(),
                 },
             )
             .map_err(|err| {
@@ -636,6 +711,8 @@ impl WebRtcNegotiationSealer {
             })?;
         Ok(SealedWebRtcNegotiationPayload {
             version: 1,
+            negotiation_id,
+            expires_at_unix_seconds,
             kind,
             nonce,
             ciphertext,
@@ -661,7 +738,12 @@ impl WebRtcNegotiationSealer {
                 Nonce::from_slice(&sealed.nonce),
                 Payload {
                     msg: &sealed.ciphertext,
-                    aad: aad_for_kind(sealed.kind).as_bytes(),
+                    aad: aad_for_payload(
+                        sealed.kind,
+                        sealed.negotiation_id,
+                        sealed.expires_at_unix_seconds,
+                    )
+                    .as_bytes(),
                 },
             )
             .map_err(|err| {
@@ -679,6 +761,29 @@ fn aad_for_kind(kind: WebRtcNegotiationPayloadKind) -> &'static str {
         WebRtcNegotiationPayloadKind::Answer => "discrypt-webrtc-negotiation-v1:answer",
         WebRtcNegotiationPayloadKind::Candidate => "discrypt-webrtc-negotiation-v1:candidate",
     }
+}
+
+fn aad_for_payload(
+    kind: WebRtcNegotiationPayloadKind,
+    negotiation_id: Option<WebRtcNegotiationId>,
+    expires_at_unix_seconds: Option<i64>,
+) -> String {
+    let mut aad = aad_for_kind(kind).to_owned();
+    if let Some(id) = negotiation_id {
+        aad.push_str(":generation:");
+        for byte in id.0 {
+            use std::fmt::Write;
+
+            let _ = write!(aad, "{byte:02x}");
+        }
+    }
+    if let Some(expires_at) = expires_at_unix_seconds {
+        use std::fmt::Write;
+
+        aad.push_str(":expires:");
+        let _ = write!(aad, "{expires_at}");
+    }
+    aad
 }
 
 /// App-facing text/control data transport over an established encrypted WebRTC DataChannel.
@@ -2699,6 +2804,87 @@ mod tests {
         let decoded = SealedWebRtcNegotiationPayload::from_opaque_bytes(&opaque)?;
         let opened = sealer.open_description(&decoded)?;
         assert_eq!(opened, offer);
+        negotiator.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sealer_binds_payloads_to_negotiation_generation() -> Result<(), TransportError> {
+        let negotiator =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let offer = negotiator.create_offer().await?;
+        let sealer = WebRtcNegotiationSealer::new([0x43; 32]);
+        let expected_id = WebRtcNegotiationId::generate();
+        let other_id = WebRtcNegotiationId::generate();
+        let expires_at = Utc::now().timestamp() + 60;
+        let sealed = sealer.seal_description_for_negotiation_until(
+            &offer,
+            Some(expected_id),
+            Some(expires_at),
+        )?;
+        assert_eq!(sealed.negotiation_id, Some(expected_id));
+        assert_eq!(sealed.expires_at_unix_seconds, Some(expires_at));
+        assert_eq!(sealer.open_description(&sealed)?, offer);
+
+        let mut tampered_id = sealed.clone();
+        tampered_id.negotiation_id = Some(other_id);
+        let id_error = match sealer.open_description(&tampered_id) {
+            Ok(_) => {
+                return Err(TransportError::Unavailable(
+                    "changed negotiation id must fail authentication".to_owned(),
+                ))
+            }
+            Err(error) => error,
+        };
+        assert!(id_error
+            .to_string()
+            .contains("open negotiation payload failed"));
+
+        let mut tampered_expiry = sealed;
+        tampered_expiry.expires_at_unix_seconds = Some(expires_at + 1);
+        let expiry_error = match sealer.open_description(&tampered_expiry) {
+            Ok(_) => {
+                return Err(TransportError::Unavailable(
+                    "changed negotiation expiry must fail authentication".to_owned(),
+                ))
+            }
+            Err(error) => error,
+        };
+        assert!(expiry_error
+            .to_string()
+            .contains("open negotiation payload failed"));
+
+        negotiator.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sealer_binds_description_to_negotiation_id() -> Result<(), TransportError> {
+        let negotiator =
+            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
+        let offer = negotiator.create_offer().await?;
+        let sealer = WebRtcNegotiationSealer::new([0x43; 32]);
+        let negotiation_id = WebRtcNegotiationId::generate();
+        let sealed = sealer.seal_description_for_negotiation(&offer, Some(negotiation_id))?;
+        let opaque = sealed.to_opaque_bytes()?;
+        let decoded = SealedWebRtcNegotiationPayload::from_opaque_bytes(&opaque)?;
+        assert_eq!(decoded.negotiation_id, Some(negotiation_id));
+        assert_eq!(sealer.open_description(&decoded)?, offer);
+
+        let mut missing_id = decoded.clone();
+        missing_id.negotiation_id = None;
+        assert!(
+            sealer.open_description(&missing_id).is_err(),
+            "dropping a bound negotiation id must invalidate the sealed SDP AAD"
+        );
+
+        let mut wrong_id = decoded;
+        wrong_id.negotiation_id = Some(WebRtcNegotiationId::generate());
+        assert!(
+            sealer.open_description(&wrong_id).is_err(),
+            "changing the bound negotiation id must invalidate the sealed SDP AAD"
+        );
+
         negotiator.close().await?;
         Ok(())
     }
