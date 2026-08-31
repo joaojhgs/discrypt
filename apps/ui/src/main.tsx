@@ -2664,28 +2664,25 @@ function App() {
       }
       const sessionId = joinedState.voice_session?.session_id;
       if (sessionId) {
-        if (voiceAccess.stream) {
-          stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
-            voiceAccess.stream,
-            (sample) => {
-              const trackEnabled = localAudioTracks(voiceAccess.stream).some(
-                (track) => track.enabled,
-              );
-              setLocalVoiceSpeaking(
-                trackEnabled &&
-                  (sample.activity_rms_i16 >= 512 ||
-                    sample.activity_peak_i16 >= 2048),
-              );
-              void applyCommand(
-                updateVoiceActivity({
-                  session_id: sessionId,
-                  rms_i16: sample.activity_rms_i16,
-                  peak_i16: sample.activity_peak_i16,
-                  captured_at_ms: sample.activity_captured_at_ms,
-                }),
-              );
-            },
+        const handleVoiceActivitySample = (sample: VoiceActivityReading) => {
+          if (!voiceAccess.stream) return;
+          const trackEnabled = localAudioTracks(voiceAccess.stream).some(
+            (track) => track.enabled,
           );
+          setLocalVoiceSpeaking(
+            trackEnabled &&
+              (sample.activity_rms_i16 >= 512 || sample.activity_peak_i16 >= 2048),
+          );
+          void applyCommand(
+            updateVoiceActivity({
+              session_id: sessionId,
+              rms_i16: sample.activity_rms_i16,
+              peak_i16: sample.activity_peak_i16,
+              captured_at_ms: sample.activity_captured_at_ms,
+            }),
+          );
+        };
+        if (voiceAccess.stream) {
           if (
             voiceAccess.activity_rms_i16 !== null &&
             voiceAccess.activity_peak_i16 !== null &&
@@ -2714,6 +2711,10 @@ function App() {
             localAudioTracks(voiceAccess.stream).length > 0,
           );
           if (canUseWebViewRtc && voiceAccess.stream) {
+            stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
+              voiceAccess.stream,
+              handleVoiceActivitySample,
+            );
             const mediaHandle = startWebViewVoiceMediaSession({
               session: voiceSession,
               localStream: voiceAccess.stream,
@@ -2770,6 +2771,7 @@ function App() {
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
+              onLocalActivity: handleVoiceActivitySample,
               onState: (state) => setCommandState(state as AppState),
               onStatus: (status) => {
                 if (!/Local DataChannel (is attaching|connected)/i.test(status)) {

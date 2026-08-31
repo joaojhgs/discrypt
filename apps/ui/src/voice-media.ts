@@ -77,6 +77,11 @@ type StartVoiceMediaSessionOptions = {
   }) => void;
   onStatus?: (status: string) => void;
   onState?: (state: unknown) => void;
+  onLocalActivity?: (reading: {
+    activity_rms_i16: number;
+    activity_peak_i16: number;
+    activity_captured_at_ms: number;
+  }) => void;
 };
 
 const REMOTE_EVIDENCE_POLL_MS = 500;
@@ -106,6 +111,7 @@ export function startNativeRustVoiceMediaSession(
   let queuedSends = 0;
   let transportReady = false;
   let pendingCaptureSamples: number[] = [];
+  let lastActivityReportAtMs = 0;
   const audioContext = new AudioContextCtor({ sampleRate: 48_000 });
   const source = audioContext.createMediaStreamSource(options.localStream);
   const captureProcessor = audioContext.createScriptProcessor(2048, 1, 1);
@@ -151,17 +157,27 @@ export function startNativeRustVoiceMediaSession(
     pendingCaptureSamples.push(...normalized);
     while (pendingCaptureSamples.length >= 960) {
       const frame = pendingCaptureSamples.splice(0, 960);
-      if (!transportReady) continue;
-      if (queuedSends >= 8) continue;
       const pcm_i16 = frame.map((sample) =>
         Math.max(-32768, Math.min(32767, Math.round(sample * 32767))),
       );
+      const capturedAtMs = Date.now();
+      if (capturedAtMs - lastActivityReportAtMs >= 500) {
+        const level = pcmI16Level(pcm_i16);
+        lastActivityReportAtMs = capturedAtMs;
+        options.onLocalActivity?.({
+          activity_rms_i16: level.rms,
+          activity_peak_i16: level.peak,
+          activity_captured_at_ms: capturedAtMs,
+        });
+      }
+      if (!transportReady) continue;
+      if (queuedSends >= 8) continue;
       queuedSends += 1;
       void sendNativeVoiceAudioFrame({
         session_id: options.session.session_id,
         pcm_i16,
         muted,
-        captured_at_ms: Date.now(),
+        captured_at_ms: capturedAtMs,
       })
         .then((response) => {
           if (response.accepted) {
@@ -254,6 +270,21 @@ export function startNativeRustVoiceMediaSession(
       }
     },
     setInputGain: () => undefined,
+  };
+}
+
+function pcmI16Level(samples: number[]): { rms: number; peak: number } {
+  if (samples.length === 0) return { rms: 0, peak: 0 };
+  let squareSum = 0;
+  let peak = 0;
+  for (const sample of samples) {
+    const bounded = Math.max(-32768, Math.min(32767, sample));
+    squareSum += bounded * bounded;
+    peak = Math.max(peak, Math.abs(bounded));
+  }
+  return {
+    rms: Math.min(32767, Math.round(Math.sqrt(squareSum / samples.length))),
+    peak: Math.min(32767, peak),
   };
 }
 

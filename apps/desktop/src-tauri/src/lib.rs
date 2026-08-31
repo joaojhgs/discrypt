@@ -128,6 +128,7 @@ const INVITE_CREATE_LIMIT: u32 = 5;
 const APP_CONFIG_SCHEMA_VERSION: u32 = 1;
 const APP_CONFIG_MIN_SUPPORTED_VERSION: u32 = 1;
 const APP_CONFIG_SIGNED_UPDATE_ENV: &str = "DISCRYPT_SIGNED_APP_CONFIG_JSON";
+const LOCAL_VOICE_ACTIVITY_HANGOVER_MS: u64 = 1_500;
 const APP_CONFIG_SIGNING_KEY_ID: &str = "discrypt-public-app-config-2026-06";
 const APP_CONFIG_SIGNING_PUBLIC_KEY_HEX: &str =
     "7475182439334672a07f694146bb659d032f0fa3da0b09f760c869dd6f8aa1c6";
@@ -1007,6 +1008,10 @@ pub struct VoiceSessionView {
     /// Permission-denied state copy, empty when capture is allowed.
     #[serde(default)]
     pub permission_denied_copy: String,
+    /// Backend-only speaking hangover anchor. This is deliberately excluded from
+    /// persistence and IPC because it is transient capture state, not room state.
+    #[serde(skip)]
+    local_activity_last_speaking_at_ms: Option<u64>,
 }
 
 /// Runtime event emitted by mutation commands and available through polling.
@@ -3264,6 +3269,8 @@ enum PersistedSchemaVersion {
 static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 static LAST_PANIC_LOG: OnceLock<Mutex<Option<PanicLogEntry>>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static LINUX_ALSA_PLAYBACK_FALLBACK: OnceLock<LinuxAlsaPlaybackDevice> = OnceLock::new();
 
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
 static STORAGE_UNLOCK: OnceLock<Mutex<ProductionStorageUnlockState>> = OnceLock::new();
@@ -9083,6 +9090,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
                 "Grant microphone permission and select an input device before joining voice"
                     .to_owned()
             },
+            local_activity_last_speaking_at_ms: None,
         });
         state.active_context = Some(ActiveContextView {
             kind: "voice_channel".to_owned(),
@@ -9253,6 +9261,22 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
     })
 }
 
+fn update_local_voice_activity_hangover(
+    last_speaking_at_ms: &mut Option<u64>,
+    rms_i16: u16,
+    peak_i16: u16,
+    captured_at_ms: u64,
+) -> (bool, bool) {
+    let evidence_speaking = rms_i16 >= 512 || peak_i16 >= 2_048;
+    if evidence_speaking {
+        *last_speaking_at_ms = Some(captured_at_ms);
+    }
+    let speaking = last_speaking_at_ms.is_some_and(|last_speaking_at_ms| {
+        captured_at_ms.saturating_sub(last_speaking_at_ms) <= LOCAL_VOICE_ACTIVITY_HANGOVER_MS
+    });
+    (evidence_speaking, speaking)
+}
+
 /// Tauri command: update local speaking state from real microphone level evidence.
 pub fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateView {
     mutate_app_service(|state| {
@@ -9279,9 +9303,14 @@ pub fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateVie
                 return;
             }
 
-            let evidence_speaking = request.rms_i16 >= 512 || request.peak_i16 >= 2_048;
+            let (evidence_speaking, activity_speaking) = update_local_voice_activity_hangover(
+                &mut session.local_activity_last_speaking_at_ms,
+                request.rms_i16,
+                request.peak_i16,
+                request.captured_at_ms,
+            );
             let self_muted = session.self_muted;
-            let speaking = evidence_speaking && !self_muted;
+            let speaking = activity_speaking && !self_muted;
             if let Some(participant) = session
                 .participants
                 .iter_mut()
@@ -9304,9 +9333,14 @@ pub fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateVie
                     "Local microphone level observed at {} ms (rms {}, peak {}) but self-mute suppresses speaking state",
                     request.captured_at_ms, request.rms_i16, request.peak_i16
                 )
-            } else if speaking {
+            } else if evidence_speaking {
                 format!(
                     "Local speaking indicator is driven by real microphone level evidence at {} ms (rms {}, peak {}); encrypted media transport remains gated by media-frame E2E",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                )
+            } else if speaking {
+                format!(
+                    "Local speaking indicator is held briefly after verified microphone activity to avoid capture-window flicker at {} ms (rms {}, peak {})",
                     request.captured_at_ms, request.rms_i16, request.peak_i16
                 )
             } else {
@@ -10266,6 +10300,8 @@ mod ipc_commands {
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    configure_linux_openal_fallback();
     install_discrypt_panic_hook();
     let result = tauri::Builder::<tauri::Wry>::default()
         .setup(|app| {
@@ -10348,6 +10384,114 @@ pub fn run() {
         eprintln!("error while running discrypt Tauri application: {error}");
         std::process::exit(1);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxAlsaPlaybackDevice {
+    card: u32,
+    device: u32,
+    label: String,
+    has_capture: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxAlsaPlaybackDevice {
+    #[cfg(any(test, feature = "tauri-runtime"))]
+    fn alsa_name(&self) -> String {
+        format!("plughw:{},{}", self.card, self.device)
+    }
+
+    fn display_label(&self) -> String {
+        format!(
+            "{} (ALSA card {}, device {})",
+            self.label, self.card, self.device
+        )
+    }
+
+    #[cfg(any(test, feature = "tauri-runtime"))]
+    fn preference_score(&self) -> u8 {
+        let normalized = self.label.to_ascii_lowercase();
+        u8::from(self.has_capture) * 8
+            + u8::from(normalized.contains("analog")) * 4
+            + u8::from(!normalized.contains("hdmi")) * 2
+            + u8::from(self.device == 0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(any(test, feature = "tauri-runtime"))]
+fn preferred_linux_alsa_playback_device(contents: &str) -> Option<LinuxAlsaPlaybackDevice> {
+    let mut devices = contents
+        .lines()
+        .filter_map(|line| {
+            let (address, description) = line.split_once(':')?;
+            if !description.contains("playback") {
+                return None;
+            }
+            let (card, device) = address.trim().split_once('-')?;
+            let card = card.parse().ok()?;
+            let device = device.parse().ok()?;
+            let label = description
+                .split(':')
+                .map(str::trim)
+                .find(|part| !part.is_empty())?
+                .to_owned();
+            Some(LinuxAlsaPlaybackDevice {
+                card,
+                device,
+                label,
+                has_capture: description.contains("capture"),
+            })
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by_key(|device| {
+        (
+            std::cmp::Reverse(device.preference_score()),
+            device.card,
+            device.device,
+        )
+    });
+    devices.into_iter().next()
+}
+
+#[cfg(all(feature = "tauri-runtime", target_os = "linux"))]
+fn configure_linux_openal_fallback() {
+    if std::env::var_os("ALSOFT_CONF").is_some() {
+        return;
+    }
+    if std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|runtime_dir| {
+        let runtime_dir = std::path::PathBuf::from(runtime_dir);
+        runtime_dir.join("pipewire-0").exists() || runtime_dir.join("pulse/native").exists()
+    }) {
+        return;
+    }
+    let Some(device) = std::fs::read_to_string("/proc/asound/pcm")
+        .ok()
+        .and_then(|contents| preferred_linux_alsa_playback_device(&contents))
+    else {
+        return;
+    };
+    let config_path = app_store_path().with_file_name("openal-alsoft.conf");
+    if let Some(parent) = config_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let alsa_name = device.alsa_name();
+    if std::fs::write(&config_path, format!("[alsa]\ndevice = {alsa_name}\n")).is_err() {
+        return;
+    }
+    std::env::set_var("ALSOFT_CONF", &config_path);
+    if std::env::var_os("ALSOFT_DRIVERS").is_none() {
+        std::env::set_var("ALSOFT_DRIVERS", "alsa");
+    }
+    eprintln!(
+        "discrypt-linux-audio-fallback output={} config={}",
+        device.display_label(),
+        config_path.display()
+    );
+    let _ = LINUX_ALSA_PLAYBACK_FALLBACK.set(device);
 }
 
 #[cfg(all(
@@ -12804,6 +12948,9 @@ impl PersistedAppState {
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| format!("channel text target group {group_id} is missing"))?;
         let local_member_id = self.local_user_id();
+        // Presence is delivered over this runtime, so an expired/offline TTL
+        // cannot be used to decide whether an admitted transport edge exists.
+        // Only governance states that remove admission may suppress an edge.
         let local_member = group
             .members
             .iter()
@@ -12812,7 +12959,6 @@ impl PersistedAppState {
                     && member.status != "pending"
                     && member.status != "revoked"
                     && member.status != "migration_default"
-                    && member.status != "offline"
             })
             .ok_or_else(|| {
                 format!("Group {group_id} has no admitted local member for text fanout")
@@ -12824,7 +12970,6 @@ impl PersistedAppState {
                 && member.status != "pending"
                 && member.status != "revoked"
                 && member.status != "migration_default"
-                && member.status != "offline"
         }) {
             let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
             if remote_peer_id == local_peer_id {
@@ -14795,6 +14940,8 @@ impl PersistedAppState {
                 )
             })?;
         let local_member_id = self.local_user_id();
+        // Presence is published over this transport, so offline is still an
+        // admitted governance state and must not create an attach deadlock.
         let local_member = group
             .members
             .iter()
@@ -14803,7 +14950,6 @@ impl PersistedAppState {
                     && member.status != "pending"
                     && member.status != "revoked"
                     && member.status != "migration_default"
-                    && member.status != "offline"
             })
             .ok_or_else(|| {
                 format!(
@@ -14820,7 +14966,6 @@ impl PersistedAppState {
                 && member.status != "pending"
                 && member.status != "revoked"
                 && member.status != "migration_default"
-                && member.status != "offline"
         }) {
             let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
             if remote_peer_id == local_peer_id.0 {
@@ -18725,17 +18870,21 @@ fn voice_device_selection(request: &JoinVoiceRequest) -> VoiceDeviceSelection {
         .as_ref()
         .or(request.output_device_label.as_ref())
         .map(|_| {
-            VoiceDeviceDescriptor::new(
-                request
-                    .output_device_id
-                    .clone()
-                    .unwrap_or_else(|| "default".to_owned()),
-                request
-                    .output_device_label
-                    .clone()
-                    .unwrap_or_else(|| "Default speaker".to_owned()),
-                VoiceDeviceKind::AudioOutput,
-            )
+            let device_id = request
+                .output_device_id
+                .clone()
+                .unwrap_or_else(|| "default".to_owned());
+            let mut label = request
+                .output_device_label
+                .clone()
+                .unwrap_or_else(|| "Default speaker".to_owned());
+            #[cfg(target_os = "linux")]
+            if device_id == "default" {
+                label = LINUX_ALSA_PLAYBACK_FALLBACK
+                    .get()
+                    .map_or(label, LinuxAlsaPlaybackDevice::display_label);
+            }
+            VoiceDeviceDescriptor::new(device_id, label, VoiceDeviceKind::AudioOutput)
         });
     VoiceDeviceSelection::new(permission, input_device, output_device)
 }
@@ -29024,6 +29173,57 @@ mod tests {
     }
 
     #[test]
+    fn group_text_runtime_attaches_admitted_members_before_presence_is_online() -> Result<(), String>
+    {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("group-runtime-offline-presence-bootstrap");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Offline Presence Bootstrap Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group_id = created
+            .groups
+            .first()
+            .map(|group| group.group_id.clone())
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let local_user_id = load_state_from_path(&path).local_user_id();
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+            guard.persist();
+        }
+        set_group_member_status_for_test(&group_id, &local_user_id, "offline")?;
+        set_group_member_status_for_test(&group_id, "bob-member", "offline")?;
+
+        let attachments =
+            load_state_from_path(&path).active_runtime_peer_attachments_for_text_control()?;
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].role,
+            ProviderTextControlRuntimePeerRole::Offerer
+        );
+        assert_ne!(attachments[0].local_peer_id, attachments[0].remote_peer_id);
+        Ok(())
+    }
+
+    #[test]
     fn group_text_runtime_attachments_fail_closed_for_unadmitted_and_duplicate_peers(
     ) -> Result<(), String> {
         let _guard = test_lock();
@@ -29948,6 +30148,42 @@ mod tests {
             .iter()
             .all(|participant| participant.role == "you"));
         Ok(())
+    }
+
+    #[test]
+    fn local_voice_activity_hangover_prevents_single_silent_window_flicker() {
+        let mut last_speaking_at_ms = None;
+        assert_eq!(
+            update_local_voice_activity_hangover(&mut last_speaking_at_ms, 1_200, 4_096, 1_000,),
+            (true, true)
+        );
+        assert_eq!(
+            update_local_voice_activity_hangover(&mut last_speaking_at_ms, 0, 0, 1_750),
+            (false, true),
+            "one silent capture window must not clear a verified speaking indicator"
+        );
+        assert_eq!(
+            update_local_voice_activity_hangover(&mut last_speaking_at_ms, 0, 0, 2_501),
+            (false, false),
+            "the indicator must clear after the bounded hangover expires"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_alsa_fallback_prefers_duplex_analog_output_over_hdmi() {
+        let pcm = "00-03: HDMI 0 : HDMI 0 : playback 1\n\
+                   01-00: USB Audio : USB Audio : playback 1\n\
+                   02-00: ALC287 Analog : ALC287 Analog : playback 1 : capture 1\n";
+        let selected = preferred_linux_alsa_playback_device(pcm)
+            .expect("a playback-capable ALSA device should be selected");
+        assert_eq!(selected.card, 2);
+        assert_eq!(selected.device, 0);
+        assert_eq!(selected.alsa_name(), "plughw:2,0");
+        assert_eq!(
+            selected.display_label(),
+            "ALC287 Analog (ALSA card 2, device 0)"
+        );
     }
 
     #[test]
