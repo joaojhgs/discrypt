@@ -2879,6 +2879,7 @@ struct TextControlTransportRuntime {
     transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
     owned_runtime: Option<Arc<discrypt_transport::ProviderTextControlRuntime>>,
     executor: Option<Arc<tokio::runtime::Runtime>>,
+    inbound_receiver_owned: bool,
     session_id: String,
     role: Option<ProviderTextControlRuntimePeerRole>,
     local_peer_id: Option<String>,
@@ -3059,6 +3060,7 @@ impl fmt::Debug for TextControlTransportRuntime {
             .field("role", &self.role)
             .field("local_peer_id", &self.local_peer_id)
             .field("remote_peer_id", &self.remote_peer_id)
+            .field("inbound_receiver_owned", &self.inbound_receiver_owned)
             .field("owns_provider_runtime", &self.owned_runtime.is_some())
             .field("owns_executor", &self.executor.is_some())
             .finish_non_exhaustive()
@@ -3144,6 +3146,8 @@ struct TextControlOutboxRecord {
     frame: TextControlFrameView,
     frame_sha256: String,
     attempts: u32,
+    #[serde(default)]
+    last_attempted_at_ms: Option<u64>,
     state_key: String,
     last_transport_session_id: Option<String>,
     #[serde(default)]
@@ -4180,6 +4184,7 @@ impl TauriAppService {
             transport,
             owned_runtime: None,
             executor: None,
+            inbound_receiver_owned: false,
             session_id: session_id.clone(),
             role: None,
             local_peer_id: None,
@@ -4216,12 +4221,21 @@ impl TauriAppService {
             transport,
             owned_runtime: Some(owned_runtime),
             executor: Some(executor),
+            inbound_receiver_owned: true,
             session_id: session_id.clone(),
             role: Some(role),
             local_peer_id: Some(local_peer_id),
             remote_peer_id: Some(remote_peer_id.clone()),
         };
-        let key = TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id);
+        let key = TextControlRuntimeMapKey::for_remote(session_id, remote_peer_id.clone());
+        for outbox in &mut self.state.text_control_outbox {
+            if outbox.state_key != "receipted"
+                && (outbox.route_peer_ids.is_empty()
+                    || outbox.route_peer_ids.contains(&remote_peer_id))
+            {
+                outbox.last_attempted_at_ms = None;
+            }
+        }
         self.pending_text_control_transport_runtimes.remove(&key);
         self.text_control_transport_runtimes.insert(key, runtime);
     }
@@ -4380,6 +4394,7 @@ impl TauriAppService {
                 transport: transport.clone(),
                 owned_runtime: None,
                 executor: Some(executor.clone()),
+                inbound_receiver_owned: false,
                 session_id: transport_session_id.clone(),
                 role: None,
                 local_peer_id: Some(local_peer_id.0.clone()),
@@ -4397,6 +4412,7 @@ impl TauriAppService {
                     transport: transport.clone(),
                     owned_runtime: None,
                     executor: Some(executor.clone()),
+                    inbound_receiver_owned: false,
                     session_id: transport_session_id.clone(),
                     role: None,
                     local_peer_id: Some(local_peer_id.0.clone()),
@@ -5055,14 +5071,25 @@ impl TauriAppService {
         for (route_peer_id, runtime) in route_runtimes {
             let transport = runtime.transport.clone();
             let report = executor.block_on(async {
-                self.state
-                    .pump_text_control_transport_once_for_route(
-                        transport.as_ref(),
-                        request.clone(),
-                        transport_session_id.clone(),
-                        route_peer_id.clone(),
-                    )
-                    .await
+                if runtime.inbound_receiver_owned {
+                    self.state
+                        .send_text_control_transport_once_for_route(
+                            transport.as_ref(),
+                            request.clone(),
+                            transport_session_id.clone(),
+                            route_peer_id.clone(),
+                        )
+                        .await
+                } else {
+                    self.state
+                        .pump_text_control_transport_once_for_route(
+                            transport.as_ref(),
+                            request.clone(),
+                            transport_session_id.clone(),
+                            route_peer_id.clone(),
+                        )
+                        .await
+                }
             });
             aggregate.frames_sent += report.frames_sent;
             aggregate.response_frames_received += report.response_frames_received;
@@ -7000,6 +7027,7 @@ pub fn refuse_group_admission_request(request: RefuseGroupAdmissionRequest) -> A
                 frame,
                 frame_sha256,
                 attempts: 0,
+                last_attempted_at_ms: None,
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
@@ -11213,6 +11241,7 @@ impl PersistedAppState {
                 frame,
                 frame_sha256,
                 attempts: 0,
+                last_attempted_at_ms: None,
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
@@ -12230,6 +12259,23 @@ impl PersistedAppState {
             );
             return;
         };
+        let route_already_selected = matches!(
+            (record.state(), selected_leg),
+            (TransportSessionState::Direct, FallbackLeg::Stun)
+                | (TransportSessionState::TurnRelay, FallbackLeg::Turn)
+        );
+        if route_already_selected {
+            self.push_event(
+                "transport.text_route_proof_refreshed",
+                format!(
+                    "Refreshed existing text session route proof from provider-signaled WebRTC DataChannel using {} profile {} over {}",
+                    probe.kind,
+                    probe.profile_id,
+                    Self::fallback_leg_label(selected_leg)
+                ),
+            );
+            return;
+        }
         let selected = (|| -> Result<(), String> {
             if matches!(record.state(), TransportSessionState::Signaling) {
                 record
@@ -12944,6 +12990,8 @@ impl PersistedAppState {
             existing.target = target.clone();
             existing.frame = frame;
             existing.frame_sha256 = frame_sha256;
+            existing.attempts = 0;
+            existing.last_attempted_at_ms = None;
             existing.state_key = "pending".to_owned();
             existing.route_peer_ids = route_peer_ids;
             existing
@@ -12960,6 +13008,7 @@ impl PersistedAppState {
             frame,
             frame_sha256,
             attempts: 0,
+            last_attempted_at_ms: None,
             state_key: "pending".to_owned(),
             last_transport_session_id: None,
             route_peer_ids,
@@ -13240,6 +13289,8 @@ impl PersistedAppState {
             existing.target = target;
             existing.frame = frame;
             existing.frame_sha256 = frame_sha256;
+            existing.attempts = 0;
+            existing.last_attempted_at_ms = None;
             existing.state_key = "pending".to_owned();
         } else {
             self.text_control_outbox.push(TextControlOutboxRecord {
@@ -13248,6 +13299,7 @@ impl PersistedAppState {
                 frame,
                 frame_sha256,
                 attempts: 0,
+                last_attempted_at_ms: None,
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
@@ -13492,6 +13544,34 @@ impl PersistedAppState {
         )
     }
 
+    fn text_control_outbox_retry_delay_ms(attempts: u32) -> u64 {
+        if attempts == 0 {
+            return 0;
+        }
+        const BASE_DELAY_MS: u64 = 2_000;
+        const MAX_DELAY_MS: u64 = 30_000;
+        let shift = attempts.saturating_sub(1).min(4);
+        BASE_DELAY_MS
+            .saturating_mul(1_u64 << shift)
+            .min(MAX_DELAY_MS)
+    }
+
+    fn text_control_outbox_retry_due(&self, message_id: &str, now_ms: u64) -> bool {
+        let Some(record) = self
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+        else {
+            return false;
+        };
+        record
+            .last_attempted_at_ms
+            .is_none_or(|last_attempted_at_ms| {
+                now_ms.saturating_sub(last_attempted_at_ms)
+                    >= Self::text_control_outbox_retry_delay_ms(record.attempts)
+            })
+    }
+
     fn mark_text_control_frame_sent(
         &mut self,
         request: MarkTextControlFrameSentRequest,
@@ -13512,6 +13592,8 @@ impl PersistedAppState {
                 return Err("outbox frame hash mismatch".to_owned());
             }
             outbox.attempts = outbox.attempts.saturating_add(1);
+            outbox.last_attempted_at_ms =
+                Some(u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default());
             if let Some(route_peer_id) = request.route_peer_id.as_ref() {
                 if !outbox.route_peer_ids.contains(route_peer_id) {
                     return Err(format!(
@@ -13631,6 +13713,48 @@ impl PersistedAppState {
     where
         T: discrypt_transport::TextControlDataTransport + ?Sized,
     {
+        self.drive_text_control_transport_once_for_route(
+            transport,
+            request,
+            transport_session_id,
+            route_peer_id,
+            true,
+        )
+        .await
+    }
+
+    async fn send_text_control_transport_once_for_route<T>(
+        &mut self,
+        transport: &T,
+        request: ListPendingTextControlFramesRequest,
+        transport_session_id: String,
+        route_peer_id: Option<String>,
+    ) -> TextControlTransportPumpReportView
+    where
+        T: discrypt_transport::TextControlDataTransport + ?Sized,
+    {
+        self.drive_text_control_transport_once_for_route(
+            transport,
+            request,
+            transport_session_id,
+            route_peer_id,
+            false,
+        )
+        .await
+    }
+
+    async fn drive_text_control_transport_once_for_route<T>(
+        &mut self,
+        transport: &T,
+        request: ListPendingTextControlFramesRequest,
+        transport_session_id: String,
+        route_peer_id: Option<String>,
+        wait_for_response: bool,
+    ) -> TextControlTransportPumpReportView
+    where
+        T: discrypt_transport::TextControlDataTransport + ?Sized,
+    {
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
         let pending = self
             .list_pending_text_control_frames(&request)
             .into_iter()
@@ -13640,6 +13764,9 @@ impl PersistedAppState {
                         && !frame.receipted_route_peer_ids.contains(route_peer_id)
                 }
                 None => frame.route_peer_ids.is_empty(),
+            })
+            .filter(|frame| {
+                wait_for_response || self.text_control_outbox_retry_due(&frame.message_id, now_ms)
             })
             .collect::<Vec<_>>();
         let mut frames_sent = 0_usize;
@@ -13693,6 +13820,9 @@ impl PersistedAppState {
                     "{}: mark text/control frame sent failed: {error}",
                     frame_ref
                 ));
+                continue;
+            }
+            if !wait_for_response {
                 continue;
             }
             let response_deadline = tokio::time::Instant::now() + operation_timeout;
@@ -13977,6 +14107,61 @@ impl PersistedAppState {
                 Ok((group_id, sender_key))
             })
             .and_then(|(group_id, sender_key)| {
+                if let Some(existing_envelope) = self
+                    .text_delivery_envelopes
+                    .iter()
+                    .find(|record| record.message_id == request.envelope.message_id)
+                {
+                    if existing_envelope.group_id != group_id
+                        || existing_envelope.sender_verifying_key_hex
+                            != request.sender_verifying_key_hex
+                        || existing_envelope.envelope != request.envelope
+                    {
+                        return Err(
+                            "duplicate text message id did not match the persisted signed envelope"
+                                .to_owned(),
+                        );
+                    }
+                    let recipient_signer = SigningKey::from_bytes(&self.identity_seed_bytes());
+                    let recipient_verifying_key_hex =
+                        hex::encode(recipient_signer.verifying_key().as_bytes());
+                    let existing_receipt = self
+                        .text_delivery_receipts
+                        .iter()
+                        .find(|record| {
+                            record.message_id == request.envelope.message_id
+                                && record.receipt.recipient_device_id == self.local_user_id()
+                        })
+                        .ok_or_else(|| {
+                            "persisted duplicate text envelope is missing its signed receipt"
+                                .to_owned()
+                        })?;
+                    if existing_receipt.recipient_verifying_key_hex
+                        != recipient_verifying_key_hex
+                    {
+                        return Err(
+                            "persisted duplicate text receipt does not match the local identity"
+                                .to_owned(),
+                        );
+                    }
+                    existing_receipt
+                        .receipt
+                        .verify(
+                            &group_id,
+                            &request.envelope,
+                            &recipient_signer.verifying_key(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let receipt = existing_receipt.receipt.clone();
+                    self.push_event(
+                        "message.envelope_duplicate_receipt_reissued",
+                        format!(
+                            "Verified duplicate encrypted peer envelope {} and reissued its persisted signed receipt",
+                            redacted_message_ref(&request.envelope.message_id)
+                        ),
+                    );
+                    return Ok((receipt, recipient_verifying_key_hex));
+                }
                 let plaintext_render =
                     self.receive_text_plaintext_render(&request, &group_id, &sender_key)?;
                 let recipient_leaf = request.recipient_leaf.unwrap_or(1);
@@ -14288,6 +14473,7 @@ impl PersistedAppState {
                     frame,
                     frame_sha256,
                     attempts: 0,
+                    last_attempted_at_ms: None,
                     state_key: "pending".to_owned(),
                     last_transport_session_id: None,
                     route_peer_ids: Vec::new(),
@@ -20930,6 +21116,7 @@ fn queue_group_governance_frame(
         frame,
         frame_sha256,
         attempts: 0,
+        last_attempted_at_ms: None,
         state_key: "pending".to_owned(),
         last_transport_session_id: None,
         route_peer_ids: Vec::new(),
@@ -22595,6 +22782,23 @@ mod tests {
         guard.attach_text_control_transport_runtime(transport, session_id);
     }
 
+    fn attach_background_receiver_text_control_transport_runtime_for_test(
+        transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+        session_id: impl Into<String>,
+    ) {
+        let session_id = session_id.into();
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.attach_text_control_transport_runtime(transport, session_id.clone());
+        guard
+            .text_control_transport_runtimes
+            .get_mut(&TextControlRuntimeMapKey::legacy(session_id))
+            .expect("test runtime should be attached")
+            .inbound_receiver_owned = true;
+    }
+
     fn attach_peer_text_control_transport_runtime_for_test(
         transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
         session_id: impl Into<String>,
@@ -22609,6 +22813,7 @@ mod tests {
             transport,
             owned_runtime: None,
             executor: None,
+            inbound_receiver_owned: false,
             session_id: session_id.clone(),
             role: Some(ProviderTextControlRuntimePeerRole::Offerer),
             local_peer_id: Some(local_peer_id),
@@ -24631,6 +24836,7 @@ mod tests {
     #[derive(Debug)]
     struct HangingResponseTextControlTransport {
         metrics: Mutex<discrypt_transport::WebRtcDataTransportMetrics>,
+        recv_calls: AtomicU64,
     }
 
     impl HangingResponseTextControlTransport {
@@ -24647,7 +24853,12 @@ mod tests {
                     bytes_received: 0,
                     last_state: "open".to_owned(),
                 }),
+                recv_calls: AtomicU64::new(0),
             }
+        }
+
+        fn recv_calls(&self) -> u64 {
+            self.recv_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -24670,6 +24881,7 @@ mod tests {
         async fn recv_text_control_frame(
             &self,
         ) -> Result<Vec<u8>, discrypt_transport::TransportError> {
+            self.recv_calls.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             Err(discrypt_transport::TransportError::Unavailable(
                 "hanging test transport unexpectedly woke".to_owned(),
@@ -32132,15 +32344,43 @@ mod tests {
             "Legacy Remote",
         )?;
 
-        let response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
+        let request = ReceiveTextDeliveryEnvelopeRequest {
             target,
             envelope,
             sender_verifying_key_hex: hex::encode(sender.verifying_key().as_bytes()),
             recipient_leaf: Some(2),
-        });
+        };
+        let response = receive_text_delivery_envelope(request.clone());
+        let duplicate = receive_text_delivery_envelope(request);
 
         assert!(response.receipt.is_some(), "{response:?}");
         assert!(response.state.last_command_error.is_none(), "{response:?}");
+        assert_eq!(duplicate.receipt, response.receipt, "{duplicate:?}");
+        assert_eq!(
+            duplicate.recipient_verifying_key_hex, response.recipient_verifying_key_hex,
+            "{duplicate:?}"
+        );
+        assert!(
+            duplicate.state.last_command_error.is_none(),
+            "{duplicate:?}"
+        );
+        assert_eq!(
+            duplicate
+                .state
+                .messages
+                .iter()
+                .filter(|message| message.message_id == "msg-openmls-plaintext")
+                .count(),
+            1
+        );
+        assert_eq!(
+            load_state()
+                .text_delivery_receipts
+                .iter()
+                .filter(|receipt| receipt.message_id == "msg-openmls-plaintext")
+                .count(),
+            1
+        );
         let message = response
             .state
             .messages
@@ -32816,6 +33056,93 @@ mod tests {
             .any(|receipt| receipt.message_id == message_id));
         clear_text_control_transport_runtime_for_test();
         Ok(())
+    }
+
+    #[test]
+    fn background_receiver_runtime_pump_never_competes_for_inbound_frames() -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-control-background-receiver-pump");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "send without stealing receiver frames".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        let message_id = sent.messages[0].message_id.clone();
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("text-control-background-receiver-pump".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "text session should be active".to_owned())?;
+        let transport = Arc::new(HangingResponseTextControlTransport::new());
+        attach_background_receiver_text_control_transport_runtime_for_test(
+            transport.clone(),
+            active_session_id,
+        );
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(1),
+            operation_timeout_ms: Some(100),
+        });
+
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 0);
+        assert_eq!(report.receipts_applied, 0);
+        assert_eq!(transport.recv_calls(), 0);
+        let message = load_state()
+            .messages
+            .into_iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "sent message row missing".to_owned())?;
+        assert_eq!(message.state_key, "transport_frame_sent");
+        clear_text_control_transport_runtime_for_test();
+        Ok(())
+    }
+
+    #[test]
+    fn text_control_retry_backoff_is_bounded_for_unreceipted_frames() {
+        assert_eq!(PersistedAppState::text_control_outbox_retry_delay_ms(0), 0);
+        assert_eq!(
+            PersistedAppState::text_control_outbox_retry_delay_ms(1),
+            2_000
+        );
+        assert_eq!(
+            PersistedAppState::text_control_outbox_retry_delay_ms(2),
+            4_000
+        );
+        assert_eq!(
+            PersistedAppState::text_control_outbox_retry_delay_ms(4),
+            16_000
+        );
+        assert_eq!(
+            PersistedAppState::text_control_outbox_retry_delay_ms(5),
+            30_000
+        );
+        assert_eq!(
+            PersistedAppState::text_control_outbox_retry_delay_ms(u32::MAX),
+            30_000
+        );
     }
 
     fn create_text_receiver_profile(
@@ -35828,9 +36155,28 @@ mod tests {
             alice_reloaded.voice_session.is_none(),
             "voice sessions are runtime-only and must not be restored as joined after reload"
         );
+        let reloaded_context = alice_reloaded
+            .active_context
+            .as_ref()
+            .ok_or_else(|| "reload should preserve the active group route".to_owned())?;
+        assert_eq!(reloaded_context.kind, "text_channel");
+        assert_eq!(
+            reloaded_context.group_id.as_deref(),
+            Some(group_id.as_str())
+        );
+        let reloaded_channel_id = reloaded_context
+            .channel_id
+            .as_deref()
+            .ok_or_else(|| "reload should select a group text channel".to_owned())?;
         assert!(
-            alice_reloaded.active_context.is_none(),
-            "a persisted voice-channel context must not reopen as an active joined channel"
+            alice_reloaded.groups.iter().any(|group| {
+                group.group_id == group_id
+                    && group.channels.iter().any(|channel| {
+                        channel.channel_id == reloaded_channel_id
+                            && channel.kind == ChannelKind::Text
+                    })
+            }),
+            "a persisted voice context must reopen on a real group text channel"
         );
 
         let bob_path = reset_with_temp_state("g004-persistent-state-bob");
@@ -39819,6 +40165,7 @@ mod tests {
                 frame,
                 frame_sha256,
                 attempts: 0,
+                last_attempted_at_ms: None,
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
