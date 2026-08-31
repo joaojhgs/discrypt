@@ -12,6 +12,9 @@ type VoiceMediaEvidence = {
   trackEnabled: boolean;
   trackStopCount: number;
   sinkIds: string[];
+  gainValues: number[];
+  nativePlaybackFrames: number;
+  stoppedPlaybackTracks: number;
 };
 
 async function installVoiceMediaHarness(
@@ -31,6 +34,9 @@ async function installVoiceMediaHarness(
       trackEnabled: true,
       trackStopCount: 0,
       sinkIds: [],
+      gainValues: [],
+      nativePlaybackFrames: 0,
+      stoppedPlaybackTracks: 0,
     };
     Object.defineProperty(window, "__discryptVoiceMediaEvidence", {
       configurable: true,
@@ -102,6 +108,8 @@ async function installVoiceMediaHarness(
     });
 
     class E2EAudioContext {
+      currentTime = 0;
+      destination = {};
       state = "running";
       constructor() {
         evidence.audioContextsCreated += 1;
@@ -109,11 +117,78 @@ async function installVoiceMediaHarness(
       createMediaStreamSource() {
         return { connect: () => undefined, disconnect: () => undefined };
       }
+      createOscillator() {
+        return {
+          frequency: { value: 0 },
+          connect: () => undefined,
+          start: () => undefined,
+          stop: () => undefined,
+        };
+      }
       createAnalyser() {
         return {
           fftSize: 1024,
           getByteTimeDomainData: (buffer: Uint8Array) => buffer.fill(180),
           disconnect: () => undefined,
+        };
+      }
+      createGain() {
+        const gain = {};
+        let value = 1;
+        Object.defineProperty(gain, "value", {
+          configurable: true,
+          get: () => value,
+          set: (nextValue: number) => {
+            value = nextValue;
+            evidence.gainValues.push(nextValue);
+          },
+        });
+        return {
+          gain,
+          connect: () => undefined,
+          disconnect: () => undefined,
+        };
+      }
+      createScriptProcessor() {
+        return {
+          onaudioprocess: null,
+          connect: () => undefined,
+          disconnect: () => undefined,
+        };
+      }
+      createMediaStreamDestination() {
+        const destinationTrack = {
+          id: `${profileName.toLowerCase()}-processed-audio`,
+          kind: "audio",
+          label: `${profileName} processed microphone`,
+          readyState: "live",
+          enabled: true,
+          stop: () => {
+            evidence.stoppedPlaybackTracks += 1;
+          },
+        };
+        return {
+          stream: {
+            id: `${profileName.toLowerCase()}-processed-stream`,
+            getTracks: () => [destinationTrack],
+            getAudioTracks: () => [destinationTrack],
+          },
+          disconnect: () => undefined,
+        };
+      }
+      createBuffer(_channels: number, length: number, sampleRate: number) {
+        return {
+          duration: length / sampleRate,
+          getChannelData: () => new Float32Array(length),
+        };
+      }
+      createBufferSource() {
+        return {
+          buffer: null,
+          connect: () => {
+            evidence.nativePlaybackFrames += 1;
+          },
+          start: () => undefined,
         };
       }
       resume() {
@@ -355,7 +430,7 @@ async function joinInvite(page: Page, invite: string) {
 
 async function joinVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await expect(page.getByTestId("voice-local-participant")).toHaveCount(1);
+  await expect(page.getByTestId("voice-local-participant").first()).toBeVisible();
 }
 
 test("native Rust WebAudio playback does not mount a duplicate HTML audio output", () => {
@@ -370,6 +445,208 @@ test("native Rust WebAudio playback does not mount a duplicate HTML audio output
     shouldMountRemoteAudioElement("voice-remote-audio-peer-portugal", true, false),
   ).toBe(true);
   expect(shouldMountRemoteAudioElement(null, false, true)).toBe(true);
+});
+
+test("native Rust WebAudio drains playback through one owned output", async ({
+  browser,
+}) => {
+  const profile = await openProfile(browser, "Native Speaker", "Linux Desktop");
+  try {
+    await createInvite(profile.page);
+    await profile.page.evaluate(() => {
+      const status = {
+        schema_version: 1,
+        session_id: "native-session",
+        state: "connected",
+        role: "offerer",
+        direct_path_ready: true,
+        data_channel_open: true,
+        configured_stun_servers: 1,
+        configured_turn_servers: 0,
+        frames_sent: 0,
+        frames_received: 1,
+        playback_queue_depth: 0,
+        last_error: null,
+      };
+      const storageKey = "discrypt.local-dev.app-state.v1";
+      const readState = () =>
+        JSON.parse(window.localStorage.getItem(storageKey) ?? "{}");
+      const writeState = (state: Record<string, unknown>) => {
+        window.localStorage.setItem(storageKey, JSON.stringify(state));
+        return state;
+      };
+      const withCursor = (state: Record<string, unknown>) => {
+        state.event_cursor = Math.max(
+          Number(state.event_cursor ?? 0) + 1,
+          Date.now(),
+        );
+        return state;
+      };
+      let playbackDrained = false;
+      Object.defineProperty(window, "__discryptTauriTwoProfileE2EForceNativeRustVoice", {
+        configurable: true,
+        value: true,
+      });
+      Object.defineProperty(window, "__TAURI__", {
+        configurable: true,
+        value: {
+          core: {
+            invoke: async (
+              command: string,
+              args?: { request?: Record<string, unknown> },
+            ) => {
+              if (command === "app_state") {
+                return readState();
+              }
+              if (command === "set_active_channel") {
+                const request = args?.request ?? {};
+                const state = withCursor(readState());
+                state.active_context = {
+                  kind: "channel",
+                  group_id: request.group_id,
+                  channel_id: request.channel_id,
+                  dm_id: null,
+                };
+                return writeState(state);
+              }
+              if (command === "join_voice") {
+                const request = args?.request ?? {};
+                const state = withCursor(readState());
+                state.voice_session = {
+                  session_id: "native-session",
+                  group_id: request.group_id,
+                  channel_id: request.channel_id,
+                  joined: true,
+                  self_muted: false,
+                  microphone_permission: "granted",
+                  input_device: {
+                    device_id: request.input_device_id,
+                    label: request.input_device_label,
+                    kind: "audio_input",
+                  },
+                  output_device: {
+                    device_id: request.output_device_id,
+                    label: request.output_device_label,
+                    kind: "audio_output",
+                  },
+                  media_runtime: {
+                    runtime_id: "native-rust-webrtc",
+                    boundary: "native-rust-webrtc-datachannel",
+                    local_capture_active: true,
+                    remote_transport_active: true,
+                    remote_audio: [],
+                    fail_closed_reason: "",
+                    status_copy: "Native Rust media path active",
+                  },
+                  signaling: {
+                    session_id: "native-session",
+                    local_peer_id: "local-peer",
+                    remote_peer_id: "remote-peer",
+                    role: "offerer",
+                    pending_local_signals: 0,
+                    received_remote_signals: 0,
+                    last_signal_kind: null,
+                    status_copy: "Native Rust media signaling active",
+                  },
+                  participants: [
+                    {
+                      id: "user-native-speaker",
+                      name: "Native Speaker",
+                      role: "you",
+                      speaking: false,
+                      muted: false,
+                      volume: 100,
+                    },
+                  ],
+                  route_copy: "Direct STUN ICE path; no TURN relay",
+                  status_copy: "Joined voice",
+                  permission_denied_copy: "",
+                };
+                return writeState(state);
+              }
+              if (command === "start_native_voice_stream") {
+                return { state: readState(), status };
+              }
+              if (command === "take_native_voice_playback_frames") {
+                const frames = playbackDrained
+                  ? []
+                  : [
+                      {
+                        from_peer_id: "remote-peer",
+                        counter: 1,
+                        sample_rate_hz: 48_000,
+                        channels: 1,
+                        frame_duration_ms: 20,
+                        pcm_i16: [0, 1200, -1200, 0],
+                      },
+                    ];
+                playbackDrained = true;
+                return { frames, status };
+              }
+              if (command === "send_native_voice_audio_frame") {
+                return { accepted: true, status };
+              }
+              if (command === "save_preferences") {
+                const state = withCursor(readState());
+                const request = args?.request ?? {};
+                state.preferences = { ...(state.preferences as object), ...request };
+                const snapshot = (state.snapshot ?? {}) as Record<string, unknown>;
+                snapshot.preferences = {
+                  ...((snapshot.preferences as object | undefined) ?? {}),
+                  ...request,
+                };
+                state.snapshot = snapshot;
+                return writeState(state);
+              }
+              if (
+                command === "update_voice_activity" ||
+                command === "stop_native_voice_stream"
+              ) {
+                return readState();
+              }
+              return readState();
+            },
+          },
+        },
+      });
+    });
+
+    await joinVoice(profile.page);
+    await expect
+      .poll(async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null)
+      .toBe("");
+    await expect
+      .poll(async () => (await readEvidence(profile.page)).nativePlaybackFrames)
+      .toBeGreaterThan(0);
+
+    await profile.page
+      .getByRole("button", { name: "Open app configuration", exact: true })
+      .click();
+    await profile.page
+      .getByTestId("voice-output-selector")
+      .selectOption({ index: 1 });
+    await expect
+      .poll(async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null)
+      .toMatch(/-speaker$/);
+
+    const configDialog = profile.page.getByRole("dialog", { name: "Config" });
+    const appOutputVolume = configDialog.getByRole("slider", {
+      name: /App output volume/i,
+    });
+    await appOutputVolume.fill("37");
+    await expect
+      .poll(async () => (await readEvidence(profile.page)).gainValues)
+      .toContain(0.37);
+    await profile.page.getByRole("button", { name: /Close Config/i }).click();
+
+    await profile.page.getByRole("button", { name: /Leave voice call/i }).click();
+    await expect
+      .poll(async () => (await readEvidence(profile.page)).stoppedPlaybackTracks)
+      .toBeGreaterThan(0);
+    expect(profile.errors).toEqual([]);
+  } finally {
+    await profile.context.close();
+  }
 });
 
 test("two profiles attach local microphone tracks and surface remote audio playback", async ({

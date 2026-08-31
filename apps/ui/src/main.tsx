@@ -223,6 +223,13 @@ function tauriTwoProfileE2EVoiceHarnessEnabled(): boolean {
 
 function generatedAutomationVoiceDeviceAccess(
   selectedInputDeviceId?: string,
+  selectedOutputDeviceId?: string,
+  availableOutputDevices: VoiceDeviceOption[] = [
+    {
+      device_id: "default",
+      label: "System default speaker",
+    },
+  ],
   stream: MediaStream | null = null,
   activity: VoiceActivitySample = {
     activity_rms_i16: 1150,
@@ -232,7 +239,17 @@ function generatedAutomationVoiceDeviceAccess(
 ): VoiceDeviceAccess {
   const selectedGeneratedDeviceId = selectedInputDeviceId?.trim()
     ? selectedInputDeviceId
-    : "tauri-two-profile-e2e-generated-audio-input";
+      : "tauri-two-profile-e2e-generated-audio-input";
+  const selectedGeneratedOutputId = selectedOutputDeviceId?.trim()
+    ? selectedOutputDeviceId
+    : "default";
+  const selectedGeneratedOutput =
+    availableOutputDevices.find(
+      (device) => device.device_id === selectedGeneratedOutputId,
+    ) ?? availableOutputDevices[0] ?? {
+      device_id: "default",
+      label: "System default speaker",
+    };
   const availableInputDevices = [
     {
       device_id: selectedGeneratedDeviceId,
@@ -254,29 +271,41 @@ function generatedAutomationVoiceDeviceAccess(
     failure: null,
     input_device_id: selectedGeneratedDeviceId,
     input_device_label: "Generated audio input",
-    output_device_id: "default",
-    output_device_label: "System default speaker",
+    output_device_id: selectedGeneratedOutput.device_id,
+    output_device_label: selectedGeneratedOutput.label,
     available_input_devices: availableInputDevices,
-    available_output_devices: [
-      {
-        device_id: "default",
-        label: "System default speaker",
-      },
-    ],
+    available_output_devices: availableOutputDevices,
     ...activity,
   };
 }
 
 async function requestGeneratedAutomationVoiceAccess(
   selectedInputDeviceId?: string,
+  selectedOutputDeviceId?: string,
 ): Promise<VoiceDeviceAccess | null> {
   if (!tauriTwoProfileE2EVoiceHarnessEnabled()) return null;
+  const availableOutputDevices = navigator.mediaDevices?.enumerateDevices
+    ? voiceOutputDeviceOptions(await navigator.mediaDevices.enumerateDevices())
+    : [];
+  const outputDevices =
+    availableOutputDevices.length > 0
+      ? availableOutputDevices
+      : [
+          {
+            device_id: "default",
+            label: "System default speaker",
+          },
+        ];
   const audioWindow = window as Window &
     typeof globalThis & { webkitAudioContext?: typeof AudioContext };
   const AudioContextCtor =
     window.AudioContext ?? audioWindow.webkitAudioContext;
   if (!AudioContextCtor) {
-    return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+    return generatedAutomationVoiceDeviceAccess(
+      selectedInputDeviceId,
+      selectedOutputDeviceId,
+      outputDevices,
+    );
   }
 
   try {
@@ -295,7 +324,11 @@ async function requestGeneratedAutomationVoiceAccess(
     const track = stream.getAudioTracks()[0];
     if (!track) {
       await context.close().catch(() => undefined);
-      return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+      return generatedAutomationVoiceDeviceAccess(
+        selectedInputDeviceId,
+        selectedOutputDeviceId,
+        outputDevices,
+      );
     }
     const stopTrack = track.stop.bind(track);
     track.stop = () => {
@@ -316,11 +349,17 @@ async function requestGeneratedAutomationVoiceAccess(
 
     return generatedAutomationVoiceDeviceAccess(
       selectedInputDeviceId,
+      selectedOutputDeviceId,
+      outputDevices,
       stream,
       activity,
     );
   } catch {
-    return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+    return generatedAutomationVoiceDeviceAccess(
+      selectedInputDeviceId,
+      selectedOutputDeviceId,
+      outputDevices,
+    );
   }
 }
 
@@ -758,7 +797,10 @@ async function requestVoiceDeviceAccess(
   selectedOutputDeviceId?: string,
 ): Promise<VoiceDeviceAccess> {
   const generatedAutomationAccess =
-    await requestGeneratedAutomationVoiceAccess(selectedInputDeviceId);
+    await requestGeneratedAutomationVoiceAccess(
+      selectedInputDeviceId,
+      selectedOutputDeviceId,
+    );
   if (generatedAutomationAccess) return generatedAutomationAccess;
 
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -1189,6 +1231,14 @@ function App() {
   useEffect(() => {
     voiceMediaSessionRef.current?.setInputGain?.(localMicGain);
   }, [localMicGain]);
+
+  useEffect(() => {
+    voiceMediaSessionRef.current?.setOutputDevice?.(selectedVoiceOutputId);
+  }, [selectedVoiceOutputId]);
+
+  useEffect(() => {
+    voiceMediaSessionRef.current?.setOutputVolume?.(appOutputVolume);
+  }, [appOutputVolume]);
 
   function updateEventCursor(nextCursor: number) {
     const cursor = Math.max(eventCursorRef.current, nextCursor);
@@ -2764,6 +2814,8 @@ function App() {
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
+              outputDeviceId: selectedVoiceOutputId,
+              outputVolume: appOutputVolume,
               onLocalActivity: handleVoiceActivitySample,
               onState: (state) => commitCommandState(state as AppState),
               onStatus: (status) => {

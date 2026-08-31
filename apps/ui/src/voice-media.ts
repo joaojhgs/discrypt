@@ -10,6 +10,7 @@ import {
   type VoiceSessionView,
   type VoiceSignalingMessageView,
 } from "./commands";
+import { createNativePlaybackOutput } from "./voice-playback";
 
 export type VoiceMediaRole = "offerer" | "answerer";
 
@@ -31,6 +32,8 @@ export type VoiceMediaSessionHandle = {
   close: () => void;
   setMuted: (muted: boolean) => void;
   setInputGain?: (gainPercent: number) => void;
+  setOutputDevice?: (deviceId: string | null | undefined) => void;
+  setOutputVolume?: (volumePercent: number) => void;
 };
 
 type VoiceSignalKind = "offer" | "answer" | "candidate";
@@ -66,6 +69,8 @@ type StartVoiceMediaSessionOptions = {
   remotePeerId: string;
   role: VoiceMediaRole;
   connectivity: ConnectivityPolicyView | null;
+  outputDeviceId?: string | null;
+  outputVolume?: number;
   onRemoteMedia: (evidence: VoiceRemoteMediaEvidence) => void;
   onRemoteTrack?: (track: {
     participant_id: string;
@@ -113,13 +118,18 @@ export function startNativeRustVoiceMediaSession(
   let pendingCaptureSamples: number[] = [];
   let lastActivityReportAtMs = 0;
   const audioContext = new AudioContextCtor({ sampleRate: 48_000 });
+  const playbackOutput = createNativePlaybackOutput(
+    audioContext,
+    options.outputDeviceId,
+    options.outputVolume ?? 100,
+  );
   const source = audioContext.createMediaStreamSource(options.localStream);
   const captureProcessor = audioContext.createScriptProcessor(2048, 1, 1);
   const silentOutput = audioContext.createGain();
   silentOutput.gain.value = 0;
   source.connect(captureProcessor);
   captureProcessor.connect(silentOutput);
-  silentOutput.connect(audioContext.destination);
+  silentOutput.connect(playbackOutput.destination);
 
   void startNativeVoiceStream({
     session_id: options.session.session_id,
@@ -214,9 +224,15 @@ export function startNativeRustVoiceMediaSession(
         if (closed) return;
         transportReady = response.status.data_channel_open && response.status.direct_path_ready;
         for (const frame of response.frames) {
-          scheduleNativeVoicePlaybackFrame(audioContext, frame, () => nextPlaybackTime, (time) => {
-            nextPlaybackTime = time;
-          });
+          scheduleNativeVoicePlaybackFrame(
+            audioContext,
+            playbackOutput.destination,
+            frame,
+            () => nextPlaybackTime,
+            (time) => {
+              nextPlaybackTime = time;
+            },
+          );
         }
         if (response.frames.length > 0) {
           recordTauriTwoProfileE2ENativeVoiceEvidence({
@@ -254,6 +270,7 @@ export function startNativeRustVoiceMediaSession(
       source.disconnect();
       captureProcessor.disconnect();
       silentOutput.disconnect();
+      playbackOutput.close();
       void audioContext.close();
       void stopNativeVoiceStream({ session_id: options.session.session_id });
     },
@@ -270,6 +287,12 @@ export function startNativeRustVoiceMediaSession(
       }
     },
     setInputGain: () => undefined,
+    setOutputDevice: (deviceId) => {
+      playbackOutput.setOutputDevice(deviceId);
+    },
+    setOutputVolume: (volumePercent) => {
+      playbackOutput.setOutputVolume(volumePercent);
+    },
   };
 }
 
@@ -321,6 +344,7 @@ function resampleMonoPcm(
 
 function scheduleNativeVoicePlaybackFrame(
   context: AudioContext,
+  destination: AudioNode,
   frame: {
     pcm_i16: number[];
     sample_rate_hz: number;
@@ -341,7 +365,7 @@ function scheduleNativeVoicePlaybackFrame(
   }
   const source = context.createBufferSource();
   source.buffer = buffer;
-  source.connect(context.destination);
+  source.connect(destination);
   const startAt = Math.max(context.currentTime + 0.02, getNextTime());
   source.start(startAt);
   setNextTime(startAt + buffer.duration);
