@@ -93,6 +93,15 @@ const PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT: Duration = Duration::from_secs(10);
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
+const PROVIDER_RUNTIME_DATA_CHANNEL_FINAL_GRACE: Duration = Duration::from_secs(5);
+#[cfg(any(
+    test,
+    feature = "harness",
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 const PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS: i64 = 75;
 #[cfg(any(
     test,
@@ -3074,7 +3083,16 @@ where
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    let data_metrics = webrtc.text_control_transport_metrics().await;
+    let mut data_metrics = webrtc.text_control_transport_metrics().await;
+    if provider_runtime_should_try_final_data_channel_grace(answer_applied, data_metrics.open) {
+        if provider_runtime_debug_enabled() {
+            eprintln!("discrypt-provider-runtime role=offerer event=data_channel_final_grace");
+        }
+        let _ = webrtc
+            .wait_text_control_transport_ready(PROVIDER_RUNTIME_DATA_CHANNEL_FINAL_GRACE)
+            .await;
+        data_metrics = webrtc.text_control_transport_metrics().await;
+    }
     if !data_metrics.open {
         if provider_runtime_debug_enabled() {
             eprintln!(
@@ -3379,7 +3397,16 @@ where
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    let data_metrics = webrtc.text_control_transport_metrics().await;
+    let mut data_metrics = webrtc.text_control_transport_metrics().await;
+    if provider_runtime_should_try_final_data_channel_grace(answer_sent, data_metrics.open) {
+        if provider_runtime_debug_enabled() {
+            eprintln!("discrypt-provider-runtime role=answerer event=data_channel_final_grace");
+        }
+        let _ = webrtc
+            .wait_text_control_transport_ready(PROVIDER_RUNTIME_DATA_CHANNEL_FINAL_GRACE)
+            .await;
+        data_metrics = webrtc.text_control_transport_metrics().await;
+    }
     if !data_metrics.open {
         if provider_runtime_debug_enabled() {
             eprintln!(
@@ -3676,6 +3703,24 @@ where
             });
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    if provider_runtime_should_try_final_data_channel_grace(
+        true,
+        peer.text_control_transport_metrics().await.open,
+    ) {
+        let _ = peer
+            .wait_text_control_transport_ready(PROVIDER_RUNTIME_DATA_CHANNEL_FINAL_GRACE)
+            .await;
+        if peer.text_control_transport_metrics().await.open {
+            return Ok(ProviderAnswererReplacementPeer {
+                peer,
+                negotiation_id,
+                expires_at,
+                sealed_answer,
+                sealed_local_ice_candidates,
+            });
+        }
     }
 
     Err(TransportError::Unavailable(
@@ -4163,6 +4208,20 @@ fn provider_answerer_allows_offer_replacement(
         && !seen_negotiation_ids.contains(&incoming_negotiation_id)
 }
 
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+fn provider_runtime_should_try_final_data_channel_grace(
+    negotiation_started: bool,
+    data_channel_open: bool,
+) -> bool {
+    negotiation_started && !data_channel_open
+}
+
 /// Production readiness for a provider adapter boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4629,6 +4688,7 @@ pub struct MqttProviderRoom {
     topics: MqttTopics,
     inbox: AsyncMutex<MqttInbox>,
     delivered_controls: AsyncMutex<DeliveredControls>,
+    eventloop_diagnostics: Arc<Mutex<MqttEventLoopDiagnostics>>,
     max_message_bytes: u32,
 }
 
@@ -4640,7 +4700,35 @@ type MqttEventReceiver = tokio::sync::mpsc::Receiver<MqttProviderEvent>;
 enum MqttProviderEvent {
     Publish { topic: String, payload: Vec<u8> },
     SubAck,
-    Error(String),
+    Error,
+}
+
+#[cfg(feature = "mqtt-adapter")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MqttEventLoopDiagnostics {
+    consecutive_errors: u32,
+}
+
+#[cfg(feature = "mqtt-adapter")]
+impl MqttEventLoopDiagnostics {
+    fn record_success(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    fn record_error(&mut self, consecutive_errors: u32) {
+        self.consecutive_errors = consecutive_errors;
+    }
+
+    fn timeout_context(&self) -> String {
+        if self.consecutive_errors == 0 {
+            String::new()
+        } else {
+            format!(
+                "; failure_class=mqtt_event_loop_retrying consecutive_errors={}",
+                self.consecutive_errors
+            )
+        }
+    }
 }
 
 #[cfg(feature = "mqtt-adapter")]
@@ -4878,6 +4966,12 @@ fn reject_forbidden_plaintext(bytes: &[u8]) -> Result<(), TransportError> {
 #[cfg(feature = "mqtt-adapter")]
 fn mqtt_err(context: &str, err: impl std::fmt::Display) -> TransportError {
     TransportError::SignalingAdapter(format!("mqtt {context} failed: {err}"))
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_provider_eventloop_backoff(consecutive_errors: u32) -> Duration {
+    let capped_errors = consecutive_errors.min(5);
+    Duration::from_millis(100_u64.saturating_mul(1_u64 << capped_errors))
 }
 
 #[cfg(feature = "nostr-adapter")]
@@ -6934,6 +7028,13 @@ impl RendezvousRoom for NostrProviderRoom {
 
 #[cfg(feature = "mqtt-adapter")]
 impl MqttProviderRoom {
+    fn eventloop_timeout_context(&self) -> String {
+        self.eventloop_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .timeout_context()
+    }
+
     async fn publish_envelope(
         &self,
         topic: String,
@@ -6961,7 +7062,8 @@ impl MqttProviderRoom {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(TransportError::SignalingAdapter(format!(
-                    "mqtt subscribe ack timeout: observed {acked}/{expected}"
+                    "mqtt subscribe ack timeout: observed {acked}/{expected}{}",
+                    self.eventloop_timeout_context()
                 )));
             }
             let event = {
@@ -6978,11 +7080,10 @@ impl MqttProviderRoom {
                 Ok(Some(MqttProviderEvent::Publish { topic, payload })) => {
                     self.record_publish(topic, payload).await?;
                 }
-                Ok(Some(MqttProviderEvent::Error(err))) => {
+                Ok(Some(MqttProviderEvent::Error)) => {
                     if provider_runtime_debug_enabled() {
-                        eprintln!("mqtt event error redacted");
+                        eprintln!("mqtt transient event loop error redacted");
                     }
-                    return Err(mqtt_err("event loop", err));
                 }
                 Ok(None) => {
                     return Err(TransportError::SignalingAdapter(
@@ -7021,11 +7122,10 @@ impl MqttProviderRoom {
                         eprintln!("mqtt late subscribe ack");
                     }
                 }
-                Ok(Some(MqttProviderEvent::Error(err))) => {
+                Ok(Some(MqttProviderEvent::Error)) => {
                     if provider_runtime_debug_enabled() {
-                        eprintln!("mqtt event error redacted");
+                        eprintln!("mqtt transient event loop error redacted");
                     }
-                    return Err(mqtt_err("event loop", err));
                 }
                 Ok(None) => {
                     return Err(TransportError::SignalingAdapter(
@@ -7055,7 +7155,11 @@ impl MqttProviderRoom {
                     Self::record_mqtt_envelope(&mut inbox, &self.local_peer_id, topic, payload)?;
                 }
                 MqttProviderEvent::SubAck => {}
-                MqttProviderEvent::Error(err) => return Err(mqtt_err("event loop", err)),
+                MqttProviderEvent::Error => {
+                    if provider_runtime_debug_enabled() {
+                        eprintln!("mqtt transient event loop error redacted");
+                    }
+                }
             }
         }
         Ok(())
@@ -7424,10 +7528,18 @@ impl AdapterSession for MqttProviderSession {
         let topics = mqtt_topics(&rendezvous, &local_peer_id);
         let (client, mut eventloop) = rumqttc::AsyncClient::builder(options).capacity(64).build();
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(128);
+        let eventloop_diagnostics = Arc::new(Mutex::new(MqttEventLoopDiagnostics::default()));
+        let task_eventloop_diagnostics = Arc::clone(&eventloop_diagnostics);
         tokio::spawn(async move {
+            let mut consecutive_errors = 0_u32;
             loop {
                 match eventloop.poll().await {
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                        consecutive_errors = 0;
+                        task_eventloop_diagnostics
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record_success();
                         if event_tx
                             .send(MqttProviderEvent::Publish {
                                 topic: String::from_utf8_lossy(publish.topic.as_ref()).into_owned(),
@@ -7440,16 +7552,33 @@ impl AdapterSession for MqttProviderSession {
                         }
                     }
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_))) => {
+                        consecutive_errors = 0;
+                        task_eventloop_diagnostics
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record_success();
                         if event_tx.send(MqttProviderEvent::SubAck).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {}
-                    Err(err) => {
-                        let _ = event_tx
-                            .send(MqttProviderEvent::Error(err.to_string()))
+                    Ok(_) => {
+                        consecutive_errors = 0;
+                        task_eventloop_diagnostics
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record_success();
+                    }
+                    Err(_err) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        task_eventloop_diagnostics
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record_error(consecutive_errors);
+                        if event_tx.send(MqttProviderEvent::Error).await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(mqtt_provider_eventloop_backoff(consecutive_errors))
                             .await;
-                        break;
                     }
                 }
             }
@@ -7477,6 +7606,7 @@ impl AdapterSession for MqttProviderSession {
             topics,
             inbox: AsyncMutex::new(MqttInbox::default()),
             delivered_controls: AsyncMutex::new(HashSet::new()),
+            eventloop_diagnostics,
             max_message_bytes: endpoint
                 .max_message_bytes
                 .unwrap_or(crate::DEFAULT_PROVIDER_MAX_MESSAGE_BYTES),
@@ -8132,6 +8262,52 @@ mod tests {
             Some(active_id),
             &seen_negotiation_ids
         ));
+    }
+
+    #[test]
+    fn provider_runtime_final_grace_only_follows_started_negotiation_without_open_data_channel() {
+        assert!(provider_runtime_should_try_final_data_channel_grace(
+            true, false
+        ));
+        assert!(!provider_runtime_should_try_final_data_channel_grace(
+            false, false
+        ));
+        assert!(!provider_runtime_should_try_final_data_channel_grace(
+            true, true
+        ));
+    }
+
+    #[cfg(feature = "mqtt-adapter")]
+    #[test]
+    fn mqtt_provider_eventloop_backoff_is_bounded() {
+        assert_eq!(
+            mqtt_provider_eventloop_backoff(1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            mqtt_provider_eventloop_backoff(5),
+            Duration::from_millis(3_200)
+        );
+        assert_eq!(
+            mqtt_provider_eventloop_backoff(20),
+            Duration::from_millis(3_200)
+        );
+    }
+
+    #[cfg(feature = "mqtt-adapter")]
+    #[test]
+    fn mqtt_provider_eventloop_diagnostics_are_redacted_and_clear_after_recovery() {
+        let mut diagnostics = MqttEventLoopDiagnostics::default();
+        assert_eq!(diagnostics.timeout_context(), "");
+
+        diagnostics.record_error(3);
+        assert_eq!(
+            diagnostics.timeout_context(),
+            "; failure_class=mqtt_event_loop_retrying consecutive_errors=3"
+        );
+
+        diagnostics.record_success();
+        assert_eq!(diagnostics.timeout_context(), "");
     }
 
     fn report_timeline(

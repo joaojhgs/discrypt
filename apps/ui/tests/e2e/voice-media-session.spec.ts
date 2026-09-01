@@ -896,7 +896,7 @@ test("sealed WebView voice signaling binds backend envelope metadata", async ({
   }
 });
 
-test("native Rust WebAudio drains playback through one owned output", async ({
+test("native Rust voice retries one failed attach and drains playback through one owned output", async ({
   browser,
 }) => {
   const profile = await openProfile(browser, "Native Speaker", "Linux Desktop");
@@ -917,6 +917,15 @@ test("native Rust WebAudio drains playback through one owned output", async ({
         playback_queue_depth: 0,
         last_error: null,
       };
+      const retryEvidence = {
+        startCalls: 0,
+        stopCalls: 0,
+        playbackPolls: 0,
+      };
+      Object.defineProperty(window, "__discryptNativeVoiceRetryEvidence", {
+        configurable: true,
+        value: retryEvidence,
+      });
       const storageKey = "discrypt.local-dev.app-state.v1";
       const readState = () =>
         JSON.parse(window.localStorage.getItem(storageKey) ?? "{}");
@@ -1018,9 +1027,34 @@ test("native Rust WebAudio drains playback through one owned output", async ({
                 return writeState(state);
               }
               if (command === "start_native_voice_stream") {
-                return { state: readState(), status };
+                retryEvidence.startCalls += 1;
+                return {
+                  state: readState(),
+                  status:
+                    retryEvidence.startCalls === 1
+                      ? {
+                          ...status,
+                          state: "attaching",
+                          direct_path_ready: false,
+                          data_channel_open: false,
+                        }
+                      : status,
+                };
               }
               if (command === "take_native_voice_playback_frames") {
+                retryEvidence.playbackPolls += 1;
+                if (retryEvidence.startCalls === 1) {
+                  return {
+                    frames: [],
+                    status: {
+                      ...status,
+                      state: "failed",
+                      direct_path_ready: false,
+                      data_channel_open: false,
+                      last_error: "simulated initial attach timeout",
+                    },
+                  };
+                }
                 const frames = playbackDrained
                   ? []
                   : [
@@ -1058,9 +1092,12 @@ test("native Rust WebAudio drains playback through one owned output", async ({
                 return writeState(state);
               }
               if (
-                command === "update_voice_activity" ||
-                command === "stop_native_voice_stream"
+                command === "update_voice_activity"
               ) {
+                return readState();
+              }
+              if (command === "stop_native_voice_stream") {
+                retryEvidence.stopCalls += 1;
                 return readState();
               }
               return readState();
@@ -1071,6 +1108,28 @@ test("native Rust WebAudio drains playback through one owned output", async ({
     });
 
     await joinVoice(profile.page);
+    await expect(
+      profile.page.getByText(
+        "Native Rust voice receive failed: simulated initial attach timeout — retrying automatically",
+        { exact: true },
+      ),
+    ).toHaveCount(1);
+    await expect
+      .poll(() =>
+        profile.page.evaluate(
+          () =>
+            (
+              window as Window & {
+                __discryptNativeVoiceRetryEvidence?: {
+                  startCalls: number;
+                  stopCalls: number;
+                  playbackPolls: number;
+                };
+              }
+            ).__discryptNativeVoiceRetryEvidence ?? null,
+        ),
+      )
+      .toMatchObject({ startCalls: 2, stopCalls: 1 });
     expect((await readEvidence(profile.page)).sinkIds).toEqual([]);
     expect((await readEvidence(profile.page)).playbackAttachments).toBe(0);
     expect((await readEvidence(profile.page)).stoppedPlaybackTracks).toBe(0);
@@ -1108,7 +1167,9 @@ test("native Rust WebAudio drains playback through one owned output", async ({
         async () => (await readEvidence(profile.page)).stoppedPlaybackTracks,
       )
       .toBeGreaterThan(0);
-    expect(profile.errors).toEqual([]);
+    expect(profile.errors).toEqual([
+      "[discrypt:command-error] command_error_reported",
+    ]);
   } finally {
     await profile.context.close();
   }

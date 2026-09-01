@@ -3503,6 +3503,11 @@ impl TauriAppService {
             .map(|(_, runtime)| runtime)
     }
 
+    fn active_text_control_runtime_owns_inbound(&self) -> bool {
+        self.text_control_runtime_for_pump()
+            .is_some_and(|runtime| runtime.inbound_receiver_owned)
+    }
+
     fn text_control_runtime_entry_for_pump(
         &self,
     ) -> Option<(&TextControlRuntimeMapKey, &TextControlTransportRuntime)> {
@@ -20332,6 +20337,22 @@ fn prepare_active_text_control_runtime_attach_jobs(
     Ok(jobs)
 }
 
+fn start_text_control_session_manager_after_attach(session_id: String) -> Result<(), String> {
+    connection::spawn_control_lane_session_manager(
+        session_id,
+        Box::new(connection::GlobalControlLaneSessionDriver),
+        connection::ControlLaneManagerConfig {
+            pump_interval_ms: Some(1_000),
+            drain_ms: Some(300),
+            backoff_initial_ms: Some(250),
+            backoff_max_ms: Some(5_000),
+            // A successfully attached direct session is lifecycle-owned. Keep
+            // supervising bounded retries until it is explicitly stopped.
+            backoff_max_attempts: Some(u32::MAX),
+        },
+    )
+}
+
 fn process_live_native_voice_frame(
     codec: &Arc<Mutex<NativeVoiceCodecState>>,
     received: Vec<u8>,
@@ -20714,6 +20735,7 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         #[cfg(feature = "tauri-runtime")]
         let previous_cursor = guard.state.latest_event_cursor();
+        let mut attached_session_id = None;
         match runtime_result {
             Ok(runtime) => {
                 if let Err(error) = guard.text_control_runtime_attach_still_current(
@@ -20754,6 +20776,7 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
                         runtime_role_label(Some(job.role))
                     ),
                 );
+                attached_session_id = Some(job.active_session_id.clone());
             }
             Err(error) => {
                 let key = TextControlRuntimeMapKey::for_attachment(
@@ -20771,11 +20794,48 @@ fn spawn_text_control_runtime_attach(job: TextControlRuntimeAttachJob) {
             }
         }
         guard.persist();
-        #[cfg(feature = "tauri-runtime")]
-        {
-            let state = guard.to_view();
+        if let Some(session_id) = attached_session_id {
             drop(guard);
-            emit_background_app_events(&state, previous_cursor);
+            let manager_result =
+                start_text_control_session_manager_after_attach(session_id.clone());
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match manager_result {
+                Ok(()) => {
+                    guard.state.push_event(
+                        "transport.control_session_started",
+                        format!(
+                            "Text/control session manager started for {}",
+                            redacted_observable_ref("session", &session_id)
+                        ),
+                    );
+                }
+                Err(error) => {
+                    guard.state.push_command_error(
+                        "transport.control_session_start_rejected",
+                        "attach_text_control_transport_runtime",
+                        "control_session_start_failed",
+                        error,
+                        "Retry after the backend runtime can spawn the control lane session manager",
+                    );
+                }
+            }
+            guard.persist();
+            #[cfg(feature = "tauri-runtime")]
+            {
+                let state = guard.to_view();
+                drop(guard);
+                emit_background_app_events(&state, previous_cursor);
+            }
+        } else {
+            #[cfg(feature = "tauri-runtime")]
+            {
+                let state = guard.to_view();
+                drop(guard);
+                emit_background_app_events(&state, previous_cursor);
+            }
         }
     });
 }
@@ -24418,7 +24478,8 @@ mod tests {
     }
 
     #[test]
-    fn governance_frame_replication_reconciles_after_offline_reconnect() -> Result<(), String> {
+    fn governance_reconnect_prunes_revoked_route_and_replay_remains_idempotent(
+    ) -> Result<(), String> {
         let _lock = test_lock();
         let owner_path = reset_with_temp_state("governance-replication-owner");
         create_user(CreateUserRequest {
@@ -24546,11 +24607,25 @@ mod tests {
             operation_timeout_ms: None,
         });
         assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.pending_before, queued_frames.len());
-        assert_eq!(report.frames_sent, queued_frames.len());
+        let owner_after_route_cleanup = load_state();
+        let closed_role_route = owner_after_route_cleanup
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == role_event_id)
+            .ok_or_else(|| "queued role-change route should remain auditable".to_owned())?;
+        assert_eq!(closed_role_route.state_key, "closed_route");
+        assert!(closed_role_route.route_peer_ids.is_empty());
+        let closed_routes = owner_after_route_cleanup
+            .text_control_outbox
+            .iter()
+            .filter(|record| record.state_key == "closed_route")
+            .count();
+        let deliverable_frames = queued_frames.len().saturating_sub(closed_routes);
+        assert_eq!(report.pending_before, deliverable_frames);
+        assert_eq!(report.frames_sent, deliverable_frames);
         assert!(
             report.response_frames_received >= 2,
-            "role and revoke governance frames should return acknowledgements: {report:?}"
+            "deliverable revoke governance frames should return acknowledgements: {report:?}"
         );
 
         let bob_after_reconnect = load_state_from_path(&bob_path);
@@ -24560,7 +24635,7 @@ mod tests {
         );
         assert_eq!(
             group_member_role(&bob_after_reconnect, &group_id, "member-bob"),
-            Some(GroupRoleView::Staff)
+            Some(GroupRoleView::Member)
         );
         assert_eq!(
             group_member_status(&bob_after_reconnect, &group_id, "member-bob"),
@@ -24577,7 +24652,7 @@ mod tests {
         );
         assert_eq!(
             governance_log_count(&bob_after_reconnect, &group_id, &role_event_id),
-            1
+            0
         );
         for event_id in &revoke_event_ids {
             assert_eq!(
@@ -24588,7 +24663,6 @@ mod tests {
 
         let mut bob_replay = TauriAppService::load_for_test_path(bob_path.clone());
         bob_replay.state.handle_text_control_frame(decision_frame);
-        bob_replay.state.handle_text_control_frame(role_frame);
         for frame in queued_frames
             .into_iter()
             .filter(|frame| matches!(frame, TextControlFrameView::GroupMemberRevoked { .. }))
@@ -24603,7 +24677,7 @@ mod tests {
         );
         assert_eq!(
             group_member_role(&bob_after_replay, &group_id, "member-bob"),
-            Some(GroupRoleView::Staff)
+            Some(GroupRoleView::Member)
         );
         assert_eq!(
             group_member_status(&bob_after_replay, &group_id, "member-bob"),
@@ -24620,7 +24694,7 @@ mod tests {
         );
         assert_eq!(
             governance_log_count(&bob_after_replay, &group_id, &role_event_id),
-            1
+            0
         );
         for event_id in &revoke_event_ids {
             assert_eq!(
@@ -41861,6 +41935,125 @@ mod tests {
         );
         std::fs::remove_file(owner_path).ok();
         std::fs::remove_file(joiner_path).ok();
+    }
+
+    #[test]
+    fn control_lane_session_manager_does_not_drain_inbound_owned_direct_runtime(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("control-lane-manager-direct-no-drain");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target,
+            body: "manager pumps direct runtime without stealing inbound".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(sent.last_command_error.is_none(), "{sent:?}");
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("control-lane-manager-direct-no-drain".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "text session should be active".to_owned())?;
+        let transport = Arc::new(HangingResponseTextControlTransport::new());
+        let mut service = TauriAppService::load_for_test_path(path.clone());
+        service.attach_text_control_transport_runtime(transport.clone(), session_id.clone());
+        service
+            .text_control_transport_runtimes
+            .get_mut(&TextControlRuntimeMapKey::legacy(session_id.clone()))
+            .ok_or_else(|| "test runtime should be attached".to_owned())?
+            .inbound_receiver_owned = true;
+        let service = Arc::new(Mutex::new(service));
+
+        connection::spawn_control_lane_session_manager(
+            session_id.clone(),
+            Box::new(connection::SharedControlLaneSessionDriver {
+                service: service.clone(),
+            }),
+            connection::ControlLaneManagerConfig {
+                pump_interval_ms: Some(50),
+                drain_ms: Some(100),
+                backoff_initial_ms: Some(10),
+                backoff_max_ms: Some(20),
+                backoff_max_attempts: Some(10),
+            },
+        )
+        .expect("manager starts");
+
+        for _ in 0..20 {
+            if transport.sent_frames() >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(transport.sent_frames(), 1);
+        assert_eq!(
+            transport.recv_calls(),
+            0,
+            "manager must not compete with the direct runtime's owned receiver"
+        );
+        let status = connection::control_lane_session_manager_snapshot(&session_id)
+            .ok_or_else(|| "manager status should be registered".to_owned())?;
+        assert!(status.running, "{status:?}");
+        assert_eq!(status.consecutive_failures, 0, "{status:?}");
+
+        assert!(connection::halt_control_lane_session_manager(&session_id));
+        std::fs::remove_file(path).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn start_text_control_session_manager_after_attach_registers_running_manager(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let _path = reset_with_temp_state("text-runtime-attach-starts-manager");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("text-runtime-attach-starts-manager".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "text session should be active".to_owned())?;
+        let transport = Arc::new(HangingResponseTextControlTransport::new());
+        attach_background_receiver_text_control_transport_runtime_for_test(
+            transport,
+            session_id.clone(),
+        );
+
+        start_text_control_session_manager_after_attach(session_id.clone())
+            .expect("attach-success manager start should register");
+        let status = connection::control_lane_session_manager_snapshot(&session_id)
+            .ok_or_else(|| "manager status should be registered".to_owned())?;
+        assert!(status.running, "{status:?}");
+
+        assert!(connection::halt_control_lane_session_manager(&session_id));
+        Ok(())
     }
 
     #[test]

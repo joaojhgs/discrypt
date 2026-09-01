@@ -50,12 +50,17 @@ fn drive_service_once(service: &mut TauriAppService, drain_ms: u64) -> ControlLa
         limit: Some(16),
         operation_timeout_ms: Some(5_000),
     });
-    let drain = service.drain_text_control_inbound_frames(Some(drain_ms), Some(2_000));
     let mut failures = pump.failures;
-    failures.extend(drain.failures);
+    let inbound_applied = if service.active_text_control_runtime_owns_inbound() {
+        0
+    } else {
+        let drain = service.drain_text_control_inbound_frames(Some(drain_ms), Some(2_000));
+        failures.extend(drain.failures);
+        drain.response_frames_received
+    };
     ControlLaneDriveReport {
         frames_sent: pump.frames_sent,
-        inbound_applied: drain.response_frames_received,
+        inbound_applied,
         failures,
     }
 }
