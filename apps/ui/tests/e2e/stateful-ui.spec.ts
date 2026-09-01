@@ -82,6 +82,21 @@ async function bootReadyShell(page) {
           disconnect: () => undefined,
         };
       }
+      createGain() {
+        return {
+          gain: { value: 1 },
+          connect: () => undefined,
+          disconnect: () => undefined,
+        };
+      }
+      createMediaStreamDestination() {
+        return {
+          stream: {
+            getTracks: () => [audioTrack],
+            getAudioTracks: () => [audioTrack],
+          },
+        };
+      }
       resume() {
         return Promise.resolve();
       }
@@ -648,6 +663,48 @@ test("message rows use compact Discord-like status tooltips", async ({
     fullPage: true,
     path: testInfo.outputPath("message-row-tooltip-mobile.png"),
   });
+});
+
+test("verified peer receipts render as delivered in the message timeline", async ({
+  page,
+}) => {
+  await openCreateGroupModal(page);
+  await page.getByLabel("Group name").fill("Receipt Status Lab");
+  await page
+    .getByRole("button", { name: /^Create group$/ })
+    .last()
+    .click();
+
+  const body = "signed receipt updates the delivery icon";
+  await page.getByRole("textbox", { name: "Message" }).fill(body);
+  await page.getByRole("button", { name: /^Send message$/ }).click();
+
+  await page.evaluate(
+    ([storageKey, messageBody]) => {
+      const raw = window.localStorage.getItem(storageKey);
+      if (!raw) throw new Error("missing fallback app state");
+      const state = JSON.parse(raw);
+      const message = state.messages.find(
+        (candidate) => candidate.body === messageBody,
+      );
+      if (!message) throw new Error("missing sent message");
+      message.state_key = "peer_receipt";
+      message.state_label = "Peer receipt";
+      message.state_detail =
+        "Signed receipt verified from the expected peer for every encrypted route";
+      window.localStorage.setItem(storageKey, JSON.stringify(state));
+    },
+    ["discrypt.local-dev.app-state.v1", body],
+  );
+  await page.reload();
+
+  const row = page.getByTestId("message-row").filter({ hasText: body });
+  await expect(row).toHaveAttribute("data-message-state", "peer_receipt");
+  const status = row.getByTestId("message-delivery-status");
+  await expect(status).toHaveText("✓");
+  await expect(status).toHaveAccessibleName(
+    /Peer receipt: Signed receipt verified from the expected peer for every encrypted route/i,
+  );
 });
 
 test("direct message send stays command-backed", async ({ page }) => {

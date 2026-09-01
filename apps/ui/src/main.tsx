@@ -198,6 +198,13 @@ type VoiceActivityReading = {
   activity_captured_at_ms: number;
 };
 
+function voiceActivityIsSpeaking(
+  rmsI16: number | null,
+  peakI16: number | null,
+): boolean {
+  return (rmsI16 ?? 0) >= 512 || (peakI16 ?? 0) >= 2048;
+}
+
 const TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY =
   "discrypt:tauri-two-profile-e2e:voice-harness";
 
@@ -2761,7 +2768,10 @@ function App() {
           );
           setLocalVoiceSpeaking(
             trackEnabled &&
-              (sample.activity_rms_i16 >= 512 || sample.activity_peak_i16 >= 2048),
+              voiceActivityIsSpeaking(
+                sample.activity_rms_i16,
+                sample.activity_peak_i16,
+              ),
           );
           void applyCommand(
             updateVoiceActivity({
@@ -2778,6 +2788,16 @@ function App() {
             voiceAccess.activity_peak_i16 !== null &&
             voiceAccess.activity_captured_at_ms !== null
           ) {
+            const trackEnabled = localAudioTracks(voiceAccess.stream).some(
+              (track) => track.enabled,
+            );
+            setLocalVoiceSpeaking(
+              trackEnabled &&
+                voiceActivityIsSpeaking(
+                  voiceAccess.activity_rms_i16,
+                  voiceAccess.activity_peak_i16,
+                ),
+            );
             void applyCommand(
               updateVoiceActivity({
                 session_id: sessionId,
@@ -8258,15 +8278,14 @@ function TextStateLegend({ states }: { states: TextStateView[] }) {
 function messageStateBadgeVariant(
   stateKey: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if (["sent_local", "received", "transport_probe_verified"].includes(stateKey))
+  if (
+    ["sent_local", "received", "peer_receipt", "transport_probe_verified"].includes(
+      stateKey,
+    )
+  )
     return "success";
   if (
-    [
-      "pending",
-      "locked",
-      "peer_receipt",
-      "transport_probe_unavailable",
-    ].includes(stateKey)
+    ["pending", "locked", "transport_probe_unavailable"].includes(stateKey)
   )
     return "warning";
   if (["failed", "shredded", "transport_probe_failed"].includes(stateKey))
@@ -8276,7 +8295,7 @@ function messageStateBadgeVariant(
 
 function messageStateIcon(stateKey: string): string {
   if (["failed", "shredded", "transport_probe_failed"].includes(stateKey)) return "!";
-  if (["pending", "locked", "peer_receipt", "transport_probe_unavailable"].includes(stateKey)) return "…";
+  if (["pending", "locked", "transport_probe_unavailable"].includes(stateKey)) return "…";
   return "✓";
 }
 
