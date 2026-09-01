@@ -1108,6 +1108,7 @@ test("native Rust voice retries one failed attach and drains playback through on
     });
 
     await joinVoice(profile.page);
+    expect((await readEvidence(profile.page)).getUserMediaCalls).toBe(0);
     await expect(
       profile.page.getByText(
         "Native Rust voice receive failed: simulated initial attach timeout — retrying automatically",

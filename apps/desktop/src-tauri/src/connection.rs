@@ -74,7 +74,21 @@ impl ControlLaneSessionDriver for GlobalControlLaneSessionDriver {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drive_service_once(&mut guard, drain_ms)
+        let report = drive_service_once(&mut guard, drain_ms);
+        let reconnect_session_id = guard.active_text_control_runtime_reconnect_session_id();
+        drop(guard);
+
+        if let Some(session_id) = reconnect_session_id {
+            super::attach_text_control_transport_runtime(
+                super::AttachTextControlTransportRuntimeRequest {
+                    session_id: Some(session_id),
+                    derive_from_state: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        report
     }
 
     fn on_manager_stopped(&self, reason: &str) {

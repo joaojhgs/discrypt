@@ -12,6 +12,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 #[cfg(test)]
 use discrypt_abuse::AbuseControls;
 use discrypt_admission::{
@@ -93,7 +94,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::{
     path::PathBuf,
@@ -2926,6 +2927,8 @@ struct TextControlRuntimeMapKey {
     remote_peer_id: Option<String>,
 }
 
+const TEXT_CONTROL_RUNTIME_PENDING_STALE_AFTER_MS: u64 = 60_000;
+
 impl TextControlRuntimeMapKey {
     fn legacy(session_id: impl Into<String>) -> Self {
         Self {
@@ -2952,6 +2955,7 @@ struct PendingTextControlTransportRuntime {
     role: ProviderTextControlRuntimePeerRole,
     local_peer_id: String,
     remote_peer_id: String,
+    started_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -3051,7 +3055,35 @@ struct NativeVoiceTransportRuntime {
     direct_path_ready: bool,
     data_channel_open: bool,
     frames_sent: Arc<AtomicU64>,
+    muted: Arc<AtomicBool>,
+    native_capture: Option<NativeVoiceCaptureRuntime>,
     receiver_abort: Option<tokio::task::AbortHandle>,
+}
+
+struct NativeVoiceCaptureRuntime {
+    device_label: String,
+    stop: std::sync::mpsc::SyncSender<()>,
+    _worker: std::thread::JoinHandle<()>,
+}
+
+impl Drop for NativeVoiceCaptureRuntime {
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+    }
+}
+
+struct NativeVoiceCapturedPcmFrame {
+    pcm_i16: Vec<i16>,
+    rms_i16: u16,
+    peak_i16: u16,
+    captured_at_ms: u64,
+}
+
+struct NativeVoiceOutgoingPcmFrame {
+    pcm_i16: Vec<i16>,
+    muted: bool,
+    captured_at_ms: u64,
+    capture_source: &'static str,
 }
 
 impl fmt::Debug for NativeVoiceTransportRuntime {
@@ -3066,6 +3098,14 @@ impl fmt::Debug for NativeVoiceTransportRuntime {
             .field("direct_path_ready", &self.direct_path_ready)
             .field("data_channel_open", &self.data_channel_open)
             .field("frames_sent", &self.frames_sent.load(Ordering::Relaxed))
+            .field("muted", &self.muted.load(Ordering::Relaxed))
+            .field(
+                "native_capture",
+                &self
+                    .native_capture
+                    .as_ref()
+                    .map(|capture| &capture.device_label),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -3506,6 +3546,43 @@ impl TauriAppService {
     fn active_text_control_runtime_owns_inbound(&self) -> bool {
         self.text_control_runtime_for_pump()
             .is_some_and(|runtime| runtime.inbound_receiver_owned)
+    }
+
+    fn active_text_control_runtime_reconnect_session_id(&self) -> Option<String> {
+        let session = self.state.transport_session(BackendTransportMode::Text)?;
+        let attachments = self
+            .state
+            .active_runtime_peer_attachments_for_text_control()
+            .ok()?;
+        if attachments.is_empty() {
+            return None;
+        }
+
+        for attachment in attachments {
+            let key = TextControlRuntimeMapKey::for_attachment(
+                session.session_id.clone(),
+                &attachment.remote_peer_id,
+            );
+            if self
+                .pending_text_control_transport_runtimes
+                .contains_key(&key)
+            {
+                continue;
+            }
+            let needs_reconnect =
+                self.text_control_transport_runtimes
+                    .get(&key)
+                    .is_none_or(|runtime| {
+                        text_control_runtime_metrics_snapshot(runtime).is_some_and(|metrics| {
+                            text_control_runtime_metrics_are_terminal(&metrics)
+                        })
+                    });
+            if needs_reconnect {
+                return Some(session.session_id.clone());
+            }
+        }
+
+        None
     }
 
     fn text_control_runtime_entry_for_pump(
@@ -4801,12 +4878,59 @@ impl TauriAppService {
         Ok(())
     }
 
+    fn remove_stale_pending_text_control_runtimes_for_attach(
+        &mut self,
+        active_session_id: &str,
+        key: &TextControlRuntimeMapKey,
+    ) -> bool {
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let stale_keys = self
+            .pending_text_control_transport_runtimes
+            .iter()
+            .filter_map(|(pending_key, pending)| {
+                if pending_key.session_id != active_session_id {
+                    return None;
+                }
+                if key.remote_peer_id.is_some() && pending_key != key {
+                    return None;
+                }
+                if now_ms.saturating_sub(pending.started_at_ms)
+                    < TEXT_CONTROL_RUNTIME_PENDING_STALE_AFTER_MS
+                {
+                    return None;
+                }
+                Some(pending_key.clone())
+            })
+            .collect::<Vec<_>>();
+        for stale_key in &stale_keys {
+            if let Some(pending) = self
+                .pending_text_control_transport_runtimes
+                .remove(stale_key)
+            {
+                self.state.push_event(
+                    "transport.text_runtime_stale_pending_removed",
+                    format!(
+                        "Removed stale pending text/control runtime attach session {} peer {:?} age_ms={} before starting a fresh attach",
+                        stale_key.session_id,
+                        stale_key.remote_peer_id,
+                        now_ms.saturating_sub(pending.started_at_ms)
+                    ),
+                );
+            }
+        }
+        if !stale_keys.is_empty() {
+            self.persist();
+        }
+        !stale_keys.is_empty()
+    }
+
     fn text_control_runtime_attach_already_active(
         &mut self,
         command_name: &'static str,
         active_session_id: &str,
         key: &TextControlRuntimeMapKey,
     ) -> bool {
+        self.remove_stale_pending_text_control_runtimes_for_attach(active_session_id, key);
         if key.remote_peer_id.is_none() {
             if let Some(pending) = self
                 .pending_text_control_transport_runtimes
@@ -5036,6 +5160,8 @@ impl TauriAppService {
         let mut route_runtimes = Vec::new();
         let mut route_failures = Vec::new();
         if route_peer_ids.is_empty() {
+            let key = TextControlRuntimeMapKey::legacy(transport_session_id.clone());
+            self.remove_stale_pending_text_control_runtimes_for_attach(&transport_session_id, &key);
             if let Some(pending) = self
                 .pending_text_control_transport_runtimes
                 .values()
@@ -5108,6 +5234,10 @@ impl TauriAppService {
                 let key = TextControlRuntimeMapKey::for_remote(
                     transport_session_id.clone(),
                     route_peer_id.clone(),
+                );
+                self.remove_stale_pending_text_control_runtimes_for_attach(
+                    &transport_session_id,
+                    &key,
                 );
                 if self
                     .pending_text_control_transport_runtimes
@@ -9017,12 +9147,56 @@ pub fn start_native_voice_stream(
     response
 }
 
+fn send_native_voice_pcm_frame_over_transport(
+    transport: &Arc<dyn discrypt_transport::TextControlDataTransport>,
+    executor: &Arc<tokio::runtime::Runtime>,
+    codec: &Arc<Mutex<NativeVoiceCodecState>>,
+    frames_sent: &Arc<AtomicU64>,
+    frame: NativeVoiceOutgoingPcmFrame,
+) -> Result<bool, String> {
+    if frame.muted {
+        return Ok(false);
+    }
+    let payload = codec
+        .lock()
+        .map_err(|_| "Native voice codec lock poisoned".to_owned())
+        .and_then(|mut codec| {
+            codec.encode_pcm_frame(
+                frame.pcm_i16,
+                false,
+                frame.captured_at_ms,
+                frame.capture_source,
+            )
+        })?;
+    encode_native_voice_data_channel_frame(payload).and_then(|bytes| {
+        executor
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    transport.send_text_control_frame(bytes),
+                )
+                .await
+            })
+            .map_err(|_| {
+                "Backend-verified native voice WebRTC DataChannel send timed out".to_owned()
+            })?
+            .map_err(|error| error.to_string())
+    })?;
+    let sent = frames_sent
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if sent.is_multiple_of(250) && std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some() {
+        let _ = executor.block_on(transport.text_control_transport_metrics());
+    }
+    Ok(true)
+}
+
 /// Tauri command: encode/protect and send real PCM over backend-verified WebRTC.
 pub fn send_native_voice_audio_frame(
     request: SendNativeVoiceAudioFrameRequest,
 ) -> SendNativeVoiceAudioFrameResponse {
     let service = app_service();
-    let (transport, executor, codec, frames_sent) = {
+    let (transport, executor, codec, frames_sent, runtime_muted) = {
         let guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9041,48 +9215,22 @@ pub fn send_native_voice_audio_frame(
             runtime.executor.clone(),
             runtime.codec.clone(),
             runtime.frames_sent.clone(),
+            runtime.muted.clone(),
         )
     };
 
-    if request.muted {
-        let guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        return SendNativeVoiceAudioFrameResponse {
-            accepted: false,
-            status: guard.native_voice_stream_status(&request.session_id),
-        };
-    }
-    let payload = codec
-        .lock()
-        .map_err(|_| "Native voice codec lock poisoned".to_owned())
-        .and_then(|mut codec| {
-            codec.encode_pcm_frame(request.pcm_i16, false, request.captured_at_ms)
-        });
-    let send_result = payload
-        .and_then(encode_native_voice_data_channel_frame)
-        .and_then(|bytes| {
-            executor
-                .block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        transport.send_text_control_frame(bytes),
-                    )
-                    .await
-                })
-                .map_err(|_| {
-                    "Backend-verified native voice WebRTC DataChannel send timed out".to_owned()
-                })?
-                .map_err(|error| error.to_string())
-        });
-    if send_result.is_ok() {
-        let sent = frames_sent
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        if sent % 250 == 0 && std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some() {
-            let _ = executor.block_on(transport.text_control_transport_metrics());
-        }
-    }
+    let send_result = send_native_voice_pcm_frame_over_transport(
+        &transport,
+        &executor,
+        &codec,
+        &frames_sent,
+        NativeVoiceOutgoingPcmFrame {
+            pcm_i16: request.pcm_i16,
+            muted: request.muted || runtime_muted.load(Ordering::Relaxed),
+            captured_at_ms: request.captured_at_ms,
+            capture_source: "webview-getusermedia-pcm",
+        },
+    );
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9090,7 +9238,7 @@ pub fn send_native_voice_audio_frame(
         guard.native_voice_transport_error = Some(error.clone());
     }
     SendNativeVoiceAudioFrameResponse {
-        accepted: send_result.is_ok(),
+        accepted: send_result.as_ref().is_ok_and(|accepted| *accepted),
         status: guard.native_voice_stream_status(&request.session_id),
     }
 }
@@ -9435,7 +9583,9 @@ pub fn leave_voice(request: LeaveVoiceRequest) -> AppStateView {
 
 /// Tauri command: persist local self-mute state.
 pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
-    mutate_app_service(|state| {
+    let session_id = request.session_id.clone();
+    let muted = request.muted;
+    let view = mutate_app_service(|state| {
         let local_user_id = state.local_user_id();
         if let Some(session) = &mut state.voice_session {
             if session.session_id == request.session_id {
@@ -9482,7 +9632,18 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
                 "Join a voice channel before muting yourself",
             );
         }
-    })
+    });
+    let service = app_service();
+    if let Ok(guard) = service.lock() {
+        if let Some(runtime) = guard
+            .native_voice_transport_runtime
+            .as_ref()
+            .filter(|runtime| runtime.session_id == session_id)
+        {
+            runtime.muted.store(muted, Ordering::Relaxed);
+        }
+    }
+    view
 }
 
 fn update_local_voice_activity_hangover(
@@ -18801,6 +18962,7 @@ impl NativeVoiceCodecState {
         mut pcm_i16: Vec<i16>,
         muted: bool,
         captured_at_ms: u64,
+        capture_source: &str,
     ) -> Result<NativeVoiceMediaSignalPayload, String> {
         let format = AudioCaptureFormat::mono_20ms_48khz();
         apply_microphone_gain_percent(&mut pcm_i16, self.mic_gain_percent)
@@ -18834,7 +18996,7 @@ impl NativeVoiceCodecState {
             to_peer_id: self.remote_peer_id.clone(),
             media_path: "native_rust_webrtc_datachannel".to_owned(),
             boundary: "rust-opus-sframe-over-provider-webrtc-datachannel".to_owned(),
-            capture_source: "webview-getusermedia-pcm".to_owned(),
+            capture_source: capture_source.to_owned(),
             rms_i16: report.audio_level.rms_i16,
             peak_i16: report.audio_level.peak_i16,
             speaking: report.audio_level.speaking,
@@ -20248,6 +20410,7 @@ fn prepare_text_control_runtime_attach_job(
         role: attachment.role,
         local_peer_id: attachment.local_peer_id.0.clone(),
         remote_peer_id: attachment.remote_peer_id.0.clone(),
+        started_at_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     };
     guard.pending_text_control_transport_runtimes.insert(
         TextControlRuntimeMapKey::for_attachment(
@@ -20457,6 +20620,331 @@ fn process_live_native_voice_frame(
     Ok(())
 }
 
+struct NativeVoiceCaptureAccumulator {
+    channels: usize,
+    source_rate_hz: u32,
+    source_cursor: f64,
+    source_samples: Vec<f32>,
+    target_samples: Vec<f32>,
+}
+
+impl NativeVoiceCaptureAccumulator {
+    fn new(channels: usize, source_rate_hz: u32) -> Self {
+        Self {
+            channels: channels.max(1),
+            source_rate_hz: source_rate_hz.max(1),
+            source_cursor: 0.0,
+            source_samples: Vec::new(),
+            target_samples: Vec::new(),
+        }
+    }
+
+    fn push_interleaved<T>(
+        &mut self,
+        data: &[T],
+        sample_to_f32: impl Fn(&T) -> f32,
+        sender: &std::sync::mpsc::SyncSender<NativeVoiceCapturedPcmFrame>,
+    ) {
+        for frame in data.chunks(self.channels) {
+            if frame.is_empty() {
+                continue;
+            }
+            let mono = frame.iter().map(&sample_to_f32).sum::<f32>() / frame.len() as f32;
+            self.source_samples.push(mono.clamp(-1.0, 1.0));
+        }
+        self.drain_resampled(sender);
+    }
+
+    fn drain_resampled(
+        &mut self,
+        sender: &std::sync::mpsc::SyncSender<NativeVoiceCapturedPcmFrame>,
+    ) {
+        let step = f64::from(self.source_rate_hz) / 48_000.0;
+        while self.source_cursor + 1.0 < self.source_samples.len() as f64 {
+            let lower = self.source_cursor.floor() as usize;
+            let upper = lower + 1;
+            let fraction = (self.source_cursor - lower as f64) as f32;
+            let sample = self.source_samples[lower] * (1.0 - fraction)
+                + self.source_samples[upper] * fraction;
+            self.target_samples.push(sample);
+            self.source_cursor += step;
+        }
+        let consumed = self.source_cursor.floor() as usize;
+        if consumed > 0 {
+            self.source_samples.drain(..consumed);
+            self.source_cursor -= consumed as f64;
+        }
+        while self.target_samples.len() >= 960 {
+            let frame = self
+                .target_samples
+                .drain(..960)
+                .map(|sample| (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)
+                .collect::<Vec<_>>();
+            let (rms_i16, peak_i16) = native_voice_pcm_i16_level(&frame);
+            let captured_at_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+            let _ = sender.try_send(NativeVoiceCapturedPcmFrame {
+                pcm_i16: frame,
+                rms_i16,
+                peak_i16,
+                captured_at_ms,
+            });
+        }
+    }
+}
+
+fn native_voice_pcm_i16_level(samples: &[i16]) -> (u16, u16) {
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    let mut square_sum = 0.0_f64;
+    let mut peak = 0_i32;
+    for sample in samples {
+        let magnitude = i32::from(*sample).unsigned_abs().min(i16::MAX as u32) as i32;
+        square_sum += f64::from(*sample) * f64::from(*sample);
+        peak = peak.max(magnitude);
+    }
+    let rms = (square_sum / samples.len() as f64)
+        .sqrt()
+        .round()
+        .min(f64::from(u16::MAX)) as u16;
+    (rms, peak.min(i32::from(u16::MAX)) as u16)
+}
+
+fn record_native_voice_capture_error(session_id: &str, error: String) {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard
+        .state
+        .voice_session
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id && session.joined)
+    {
+        guard.native_voice_transport_error = Some(error);
+        guard.persist();
+    }
+}
+
+fn select_native_voice_input_device(
+) -> Result<(cpal::Device, String, cpal::SupportedStreamConfig), String> {
+    let host = cpal::default_host();
+    let mut last_error = None;
+
+    if let Some(device) = host.default_input_device() {
+        let device_label = device
+            .name()
+            .unwrap_or_else(|_| "Native system microphone".to_owned());
+        match device.default_input_config() {
+            Ok(config) => return Ok((device, device_label, config)),
+            Err(error) => {
+                last_error = Some(format!(
+                    "Default native system microphone {device_label} has no usable input config: {error}"
+                ));
+            }
+        }
+    }
+
+    let devices = host
+        .input_devices()
+        .map_err(|error| format!("Could not enumerate native system microphones: {error}"))?;
+    for device in devices {
+        let device_label = device
+            .name()
+            .unwrap_or_else(|_| "Native system microphone".to_owned());
+        match device.default_input_config() {
+            Ok(config) => return Ok((device, device_label, config)),
+            Err(error) => {
+                last_error = Some(format!(
+                    "Native system microphone {device_label} has no usable input config: {error}"
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "No native system microphone is available to CPAL".to_owned()))
+}
+
+fn start_native_voice_capture_runtime(
+    session_id: String,
+    transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+    executor: Arc<tokio::runtime::Runtime>,
+    codec: Arc<Mutex<NativeVoiceCodecState>>,
+    frames_sent: Arc<AtomicU64>,
+    muted: Arc<AtomicBool>,
+) -> Result<NativeVoiceCaptureRuntime, String> {
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel::<Result<String, String>>(1);
+    let (stop_sender, stop_receiver) = std::sync::mpsc::sync_channel::<()>(1);
+    let worker_stop_sender = stop_sender.clone();
+    let worker = std::thread::spawn(move || {
+        let (device, device_label, supported_config) = match select_native_voice_input_device() {
+            Ok(selection) => selection,
+            Err(error) => {
+                let _ = ready_sender.send(Err(error));
+                return;
+            }
+        };
+        let sample_format = supported_config.sample_format();
+        let channels = usize::from(supported_config.channels());
+        let sample_rate_hz = supported_config.sample_rate().0;
+        let stream_config = supported_config.config();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<NativeVoiceCapturedPcmFrame>(64);
+        let mut last_activity_at_ms = 0_u64;
+        let worker_session_id = session_id.clone();
+        let sender_worker = std::thread::spawn(move || {
+            while let Ok(frame) = receiver.recv() {
+                if frame.captured_at_ms.saturating_sub(last_activity_at_ms) >= 500 {
+                    last_activity_at_ms = frame.captured_at_ms;
+                    let _ = update_voice_activity(UpdateVoiceActivityRequest {
+                        session_id: worker_session_id.clone(),
+                        rms_i16: frame.rms_i16,
+                        peak_i16: frame.peak_i16,
+                        captured_at_ms: frame.captured_at_ms,
+                    });
+                }
+                let muted_now = muted.load(Ordering::Relaxed);
+                match send_native_voice_pcm_frame_over_transport(
+                    &transport,
+                    &executor,
+                    &codec,
+                    &frames_sent,
+                    NativeVoiceOutgoingPcmFrame {
+                        pcm_i16: frame.pcm_i16,
+                        muted: muted_now,
+                        captured_at_ms: frame.captured_at_ms,
+                        capture_source: "native-system-cpal-pcm",
+                    },
+                ) {
+                    Ok(_) => {}
+                    Err(error) => record_native_voice_capture_error(&worker_session_id, error),
+                }
+            }
+        });
+        let build_error_session_id = session_id.clone();
+        let stream_result = match sample_format {
+            cpal::SampleFormat::F32 => {
+                let callback_sender = sender.clone();
+                let error_session_id = build_error_session_id.clone();
+                let mut accumulator = NativeVoiceCaptureAccumulator::new(channels, sample_rate_hz);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _| {
+                        accumulator.push_interleaved(data, |sample| *sample, &callback_sender)
+                    },
+                    move |error| {
+                        record_native_voice_capture_error(
+                            &error_session_id,
+                            format!("Native system microphone stream error: {error}"),
+                        );
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                let callback_sender = sender.clone();
+                let error_session_id = build_error_session_id.clone();
+                let mut accumulator = NativeVoiceCaptureAccumulator::new(channels, sample_rate_hz);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _| {
+                        accumulator.push_interleaved(
+                            data,
+                            |sample| f32::from(*sample) / f32::from(i16::MAX),
+                            &callback_sender,
+                        );
+                    },
+                    move |error| {
+                        record_native_voice_capture_error(
+                            &error_session_id,
+                            format!("Native system microphone stream error: {error}"),
+                        );
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                let callback_sender = sender.clone();
+                let error_session_id = build_error_session_id;
+                let mut accumulator = NativeVoiceCaptureAccumulator::new(channels, sample_rate_hz);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _| {
+                        accumulator.push_interleaved(
+                            data,
+                            |sample| (f32::from(*sample) - 32_768.0) / 32_768.0,
+                            &callback_sender,
+                        );
+                    },
+                    move |error| {
+                        record_native_voice_capture_error(
+                            &error_session_id,
+                            format!("Native system microphone stream error: {error}"),
+                        );
+                    },
+                    None,
+                )
+            }
+            other => {
+                let _ = ready_sender.send(Err(format!(
+                    "Native system microphone sample format {other:?} is not supported yet"
+                )));
+                drop(sender);
+                let _ = sender_worker.join();
+                return;
+            }
+        };
+        let stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = ready_sender.send(Err(format!(
+                    "Native system microphone stream could not start: {error}"
+                )));
+                drop(sender);
+                let _ = sender_worker.join();
+                return;
+            }
+        };
+        if let Err(error) = stream.play() {
+            let _ = ready_sender.send(Err(format!(
+                "Native system microphone stream could not play: {error}"
+            )));
+            drop(stream);
+            drop(sender);
+            let _ = sender_worker.join();
+            return;
+        }
+        if discrypt_webrtc_debug_enabled() {
+            eprintln!(
+                "discrypt-native-voice-capture device={} sample_rate={} channels={} sample_format={:?}",
+                device_label, sample_rate_hz, channels, sample_format
+            );
+        }
+        let _ = ready_sender.send(Ok(device_label));
+        let _ = stop_receiver.recv();
+        drop(stream);
+        drop(sender);
+        let _ = sender_worker.join();
+    });
+    let device_label = match ready_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(label)) => label,
+        Ok(Err(error)) => return Err(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = worker_stop_sender.try_send(());
+            return Err(
+                "Native system microphone stream did not become ready within 5 seconds".to_owned(),
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("Native system microphone stream worker exited before ready".to_owned());
+        }
+    };
+    Ok(NativeVoiceCaptureRuntime {
+        device_label,
+        stop: stop_sender,
+        _worker: worker,
+    })
+}
+
 fn start_role_split_native_voice_runtime(
     executor: Arc<tokio::runtime::Runtime>,
     inputs: TextControlRuntimeAttachInputs,
@@ -20630,8 +21118,36 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 } else {
                     None
                 };
+                let frames_sent = Arc::new(AtomicU64::new(0));
+                let muted = Arc::new(AtomicBool::new(job.request.muted));
+                let native_capture = match start_native_voice_capture_runtime(
+                    job.request.session_id.clone(),
+                    transport.clone(),
+                    executor.clone(),
+                    job.codec.clone(),
+                    frames_sent.clone(),
+                    muted.clone(),
+                ) {
+                    Ok(capture) => Some(capture),
+                    Err(error) => {
+                        guard.native_voice_transport_error = Some(error.clone());
+                        guard.state.push_command_error(
+                            "voice.native_capture_failed",
+                            "start_native_voice_stream",
+                            "native_voice_capture_unavailable",
+                            error,
+                            "Verify the OS default input device is available to the installed app; WebKit media-device enumeration is not required for backend-native voice capture",
+                        );
+                        None
+                    }
+                };
+                let native_capture_label = native_capture
+                    .as_ref()
+                    .map(|capture| capture.device_label.clone());
                 guard.pending_native_voice_transport_runtime = None;
-                guard.native_voice_transport_error = None;
+                if native_capture.is_some() {
+                    guard.native_voice_transport_error = None;
+                }
                 guard.native_voice_transport_runtime = Some(NativeVoiceTransportRuntime {
                     transport,
                     _owned_runtime: owned_runtime,
@@ -20644,17 +21160,38 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                     configured_stun_servers,
                     direct_path_ready: evidence.direct_path_ready,
                     data_channel_open: evidence.data_channel_open,
-                    frames_sent: Arc::new(AtomicU64::new(0)),
+                    frames_sent,
+                    muted,
+                    native_capture,
                     receiver_abort,
                 });
                 if let Some(session) = &mut guard.state.voice_session {
+                    if let Some(label) = native_capture_label.as_ref() {
+                        session.input_device = Some(VoiceDeviceDescriptor::new(
+                            "native-system-default-input".to_owned(),
+                            label.clone(),
+                            VoiceDeviceKind::AudioInput,
+                        ));
+                    }
                     session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
-                    session.media_runtime.status_copy =
-                        "Backend-verified native Rust WebRTC DataChannel is open over direct STUN ICE; real microphone PCM is ready for Opus/SFrame transport"
-                            .to_owned();
-                    session.media_runtime.fail_closed_reason =
+                    session.media_runtime.local_capture_active = native_capture_label.is_some();
+                    session.media_runtime.status_copy = native_capture_label
+                        .as_ref()
+                        .map(|label| {
+                            format!(
+                                "Backend-verified native Rust WebRTC DataChannel is open over direct STUN ICE; native system microphone capture is active from {label}"
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "Backend-verified native Rust WebRTC DataChannel is open, but native system microphone capture failed".to_owned()
+                        });
+                    session.media_runtime.fail_closed_reason = if native_capture_label.is_some() {
                         "Waiting for the first authenticated remote Opus/SFrame packet before enabling playback evidence"
-                            .to_owned();
+                            .to_owned()
+                    } else {
+                        "Native system microphone capture did not start; outbound voice remains fail-closed"
+                            .to_owned()
+                    };
                     session.route_copy =
                         "Direct native Rust WebRTC DataChannel connected with STUN and zero configured TURN servers"
                             .to_owned();
@@ -23318,6 +23855,20 @@ mod tests {
         local_peer_id: &str,
         remote_peer_id: &str,
     ) {
+        insert_pending_text_control_transport_runtime_started_at_for_test(
+            session_id,
+            local_peer_id,
+            remote_peer_id,
+            u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        );
+    }
+
+    fn insert_pending_text_control_transport_runtime_started_at_for_test(
+        session_id: &str,
+        local_peer_id: &str,
+        remote_peer_id: &str,
+        started_at_ms: u64,
+    ) {
         let service = app_service();
         let mut guard = service
             .lock()
@@ -23327,6 +23878,7 @@ mod tests {
             role: ProviderTextControlRuntimePeerRole::Offerer,
             local_peer_id: local_peer_id.to_owned(),
             remote_peer_id: remote_peer_id.to_owned(),
+            started_at_ms,
         };
         guard.pending_text_control_transport_runtimes.insert(
             TextControlRuntimeMapKey::for_remote(session_id.to_owned(), remote_peer_id.to_owned()),
@@ -36723,6 +37275,65 @@ mod tests {
     }
 
     #[test]
+    fn stale_pending_text_runtime_attach_is_reclaimed_before_reattach() {
+        let _guard = test_lock();
+        reset_with_temp_state("attach-text-control-runtime-stale-pending");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("attach-stale-pending".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        let stale_started_at_ms = u64::try_from(Utc::now().timestamp_millis())
+            .unwrap_or_default()
+            .saturating_sub(TEXT_CONTROL_RUNTIME_PENDING_STALE_AFTER_MS + 1);
+
+        insert_pending_text_control_transport_runtime_started_at_for_test(
+            &active_session_id,
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+            stale_started_at_ms,
+        );
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key =
+            TextControlRuntimeMapKey::for_remote(active_session_id.clone(), "bob-runtime-peer");
+        assert!(
+            !guard.text_control_runtime_attach_already_active(
+                "attach_text_control_transport_runtime",
+                &active_session_id,
+                &key,
+            ),
+            "expired pending attach must be reclaimed so a restarted peer can reattach"
+        );
+        assert!(
+            !guard
+                .pending_text_control_transport_runtimes
+                .contains_key(&key),
+            "expired pending attach must be removed from the pending map"
+        );
+        assert!(guard.state.events.iter().any(|event| {
+            event.kind == "transport.text_runtime_stale_pending_removed"
+                && event.summary.contains(&active_session_id)
+        }));
+    }
+
+    #[test]
     fn text_control_runtime_map_preserves_legacy_two_person_attachment() {
         let _guard = test_lock();
         reset_with_temp_state("text-control-runtime-map-legacy-two-person");
@@ -36905,6 +37516,114 @@ mod tests {
     }
 
     #[test]
+    fn active_text_runtime_reconnect_detects_missing_or_terminal_peer_runtime() {
+        let _guard = test_lock();
+        reset_with_temp_state("active-text-runtime-reconnect-health");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("reconnect-health".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        let attachment = {
+            let service = app_service();
+            let guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .state
+                .active_runtime_peer_attachments_for_text_control()
+                .expect("DM runtime attachment should derive from active state")
+                .into_iter()
+                .next()
+                .expect("DM runtime attachment should exist")
+        };
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.active_text_control_runtime_reconnect_session_id(),
+            Some(active_session_id.clone()),
+            "a missing peer runtime must schedule a derived-state reconnect"
+        );
+
+        let key = TextControlRuntimeMapKey::for_attachment(
+            active_session_id.clone(),
+            &attachment.remote_peer_id,
+        );
+        guard.pending_text_control_transport_runtimes.insert(
+            key.clone(),
+            PendingTextControlTransportRuntime {
+                session_id: active_session_id.clone(),
+                role: attachment.role,
+                local_peer_id: attachment.local_peer_id.0.clone(),
+                remote_peer_id: attachment.remote_peer_id.0.clone(),
+                started_at_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+            },
+        );
+        assert_eq!(
+            guard.active_text_control_runtime_reconnect_session_id(),
+            None,
+            "an active attach must suppress duplicate reconnect scheduling"
+        );
+
+        guard.pending_text_control_transport_runtimes.remove(&key);
+        guard.text_control_transport_runtimes.insert(
+            key.clone(),
+            TextControlTransportRuntime {
+                lane: false,
+                transport: Arc::new(HangingResponseTextControlTransport::new()),
+                owned_runtime: None,
+                executor: None,
+                inbound_receiver_owned: true,
+                session_id: active_session_id.clone(),
+                role: Some(attachment.role),
+                local_peer_id: Some(attachment.local_peer_id.0.clone()),
+                remote_peer_id: Some(attachment.remote_peer_id.0.clone()),
+            },
+        );
+        assert_eq!(
+            guard.active_text_control_runtime_reconnect_session_id(),
+            None,
+            "an open runtime must remain attached"
+        );
+
+        guard.text_control_transport_runtimes.insert(
+            key,
+            TextControlTransportRuntime {
+                lane: false,
+                transport: Arc::new(FailingSendTextControlTransport::new()),
+                owned_runtime: None,
+                executor: None,
+                inbound_receiver_owned: true,
+                session_id: active_session_id.clone(),
+                role: Some(attachment.role),
+                local_peer_id: Some(attachment.local_peer_id.0.clone()),
+                remote_peer_id: Some(attachment.remote_peer_id.0),
+            },
+        );
+        assert_eq!(
+            guard.active_text_control_runtime_reconnect_session_id(),
+            Some(active_session_id),
+            "a terminal peer runtime must schedule a derived-state reconnect"
+        );
+    }
+
+    #[test]
     fn stale_text_runtime_attach_completion_is_rejected_after_rapid_restart() {
         let _guard = test_lock();
         reset_with_temp_state("attach-text-control-runtime-stale-completion");
@@ -37035,6 +37754,81 @@ mod tests {
         );
         assert_eq!(report.metrics.label, "attaching-text-control-runtime");
         assert_eq!(load_state().last_command_error, None);
+    }
+
+    #[test]
+    fn text_control_pump_reclaims_expired_pending_runtime_attach() {
+        let _guard = test_lock();
+        reset_with_temp_state("text-control-runtime-expired-pending-pump");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_state = start_dm(StartDmRequest {
+            display_name: "Bob".to_owned(),
+        });
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            group_id: None,
+            channel_id: None,
+        };
+        let sent = send_message(SendMessageRequest {
+            target: target.clone(),
+            body: "queued after stale provider runtime attach".to_owned(),
+            transport_proof: false,
+            adapter_kind: None,
+        });
+        assert!(sent.last_command_error.is_none(), "{sent:?}");
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("expired-pending-runtime-pump".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active after start_text_session");
+        let stale_started_at_ms = u64::try_from(Utc::now().timestamp_millis())
+            .unwrap_or_default()
+            .saturating_sub(TEXT_CONTROL_RUNTIME_PENDING_STALE_AFTER_MS + 1);
+        insert_pending_text_control_transport_runtime_started_at_for_test(
+            &active_session_id,
+            "alice-runtime-peer",
+            "bob-runtime-peer",
+            stale_started_at_ms,
+        );
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(8),
+            operation_timeout_ms: Some(250),
+        });
+
+        assert_eq!(report.frames_sent, 0);
+        assert_eq!(report.metrics.label, "unattached-text-control-runtime");
+        assert_ne!(report.metrics.label, "attaching-text-control-runtime");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("runtime is not attached")),
+            "expired pending attach should be reclaimed before reporting missing runtime: {report:?}"
+        );
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.pending_text_control_transport_runtimes.is_empty(),
+            "expired pending attach must not keep the pump in attaching state"
+        );
+        assert!(guard.state.events.iter().any(|event| {
+            event.kind == "transport.text_runtime_stale_pending_removed"
+                && event.summary.contains(&active_session_id)
+        }));
     }
 
     #[test]
@@ -43004,8 +43798,9 @@ mod tests {
             .map(|index| (((index % 48) as i16) - 24) * 400)
             .collect::<Vec<_>>();
 
-        let first = alice.encode_pcm_frame(pcm.clone(), false, 1_000)?;
-        let second = alice.encode_pcm_frame(pcm, false, 1_020)?;
+        let first =
+            alice.encode_pcm_frame(pcm.clone(), false, 1_000, "webview-getusermedia-pcm")?;
+        let second = alice.encode_pcm_frame(pcm, false, 1_020, "webview-getusermedia-pcm")?;
         assert_eq!(first.capture_source, "webview-getusermedia-pcm");
         assert_eq!(first.protected_frames[0].counter, 0);
         assert_eq!(second.protected_frames[0].counter, 1);
@@ -43058,7 +43853,7 @@ mod tests {
             .map(|index| (((index % 48) as i16) - 24) * 400)
             .collect::<Vec<_>>();
 
-        let payload = codec.encode_pcm_frame(pcm, false, 1_000)?;
+        let payload = codec.encode_pcm_frame(pcm, false, 1_000, "webview-getusermedia-pcm")?;
         let wire = encode_native_voice_data_channel_frame(payload.clone())?;
         let decoded = decode_native_voice_data_channel_frame(&wire, &receiver)?;
 

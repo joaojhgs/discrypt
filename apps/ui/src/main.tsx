@@ -708,6 +708,10 @@ function normalizeVoiceDevicePreference(deviceId: string | null | undefined) {
     : normalized;
 }
 
+function nativeRustVoiceAvailable(): boolean {
+  return Boolean(window.__TAURI__?.core?.invoke);
+}
+
 function voiceInputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
   return voiceDeviceOptions(devices, "audioinput", "Microphone");
 }
@@ -795,6 +799,7 @@ async function measureLocalVoiceActivity(
 async function requestVoiceDeviceAccess(
   selectedInputDeviceId?: string,
   selectedOutputDeviceId?: string,
+  preferNativeCapture = false,
 ): Promise<VoiceDeviceAccess> {
   const generatedAutomationAccess =
     await requestGeneratedAutomationVoiceAccess(
@@ -803,7 +808,41 @@ async function requestVoiceDeviceAccess(
     );
   if (generatedAutomationAccess) return generatedAutomationAccess;
 
+  const nativeSystemAccess = async (): Promise<VoiceDeviceAccess> => {
+    const availableOutputDevices = navigator.mediaDevices?.enumerateDevices
+      ? voiceOutputDeviceOptions(
+          await navigator.mediaDevices.enumerateDevices().catch(() => []),
+        )
+      : [];
+    return {
+      stream: null,
+      microphone_permission: "granted",
+      failure: null,
+      input_device_id: "native-system-default-input",
+      input_device_label: "Native system microphone",
+      output_device_id: normalizeVoiceDevicePreference(selectedOutputDeviceId),
+      output_device_label: "Default speaker",
+      available_input_devices: [
+        {
+          device_id: "native-system-default-input",
+          label: "Native system microphone",
+        },
+      ],
+      available_output_devices: availableOutputDevices,
+      activity_rms_i16: null,
+      activity_peak_i16: null,
+      activity_captured_at_ms: null,
+    };
+  };
+
+  if (preferNativeCapture && nativeRustVoiceAvailable()) {
+    return nativeSystemAccess();
+  }
+
   if (!navigator.mediaDevices?.getUserMedia) {
+    if (nativeRustVoiceAvailable()) {
+      return nativeSystemAccess();
+    }
     return emptyVoiceDeviceAccess("unknown", {
       message:
         "Local WebRTC audio capture is unavailable — Install the required desktop media runtime and restart discrypt",
@@ -874,6 +913,9 @@ async function requestVoiceDeviceAccess(
     };
   } catch (error) {
     stopMediaStream(stream);
+    if (nativeRustVoiceAvailable()) {
+      return nativeSystemAccess();
+    }
     const failure = voiceDeviceFailure(error);
     const permission =
       error instanceof DOMException &&
@@ -2615,10 +2657,23 @@ function App() {
         reportCommandError("Voice channel creation did not return a channel.");
         return;
       }
+      const forceNativeRustVoice = Boolean(
+        (
+          window as typeof window & {
+            __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
+          }
+        ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
+          window.localStorage?.getItem(
+            "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+          ) === "1",
+      );
+      const canUseNativeRustVoice =
+        forceNativeRustVoice || nativeRustVoiceAvailable();
       stopLocalVoiceCapture();
       const voiceAccess = await requestVoiceDeviceAccess(
         selectedVoiceInputId,
         selectedVoiceOutputId,
+        canUseNativeRustVoice,
       );
       if (voiceAccess.available_input_devices.length > 0) {
         setVoiceInputDevices(voiceAccess.available_input_devices);
@@ -2647,21 +2702,9 @@ function App() {
         stopLocalVoiceCapture();
         return;
       }
-      const forceNativeRustVoice = Boolean(
-        (
-          window as typeof window & {
-            __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
-          }
-        ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
-        window.localStorage?.getItem(
-          "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
-        ) === "1",
-      );
-      const nativeRustVoiceAvailable = Boolean(window.__TAURI__?.core?.invoke);
       if (
-        !forceNativeRustVoice &&
-        typeof RTCPeerConnection === "undefined" &&
-        !nativeRustVoiceAvailable
+        !canUseNativeRustVoice &&
+        typeof RTCPeerConnection === "undefined"
       ) {
         reportCommandError(
           "Local WebRTC audio runtime is unavailable — Install the required desktop media runtime and restart discrypt",
@@ -2671,6 +2714,7 @@ function App() {
         return;
       }
       if (
+        !canUseNativeRustVoice &&
         (!voiceAccess.stream || localAudioTracks(voiceAccess.stream).length === 0)
       ) {
         reportCommandError(
@@ -2806,10 +2850,10 @@ function App() {
               stopLocalVoiceCapture();
               return;
             }
-          } else if ((forceNativeRustVoice || nativeRustVoiceAvailable) && voiceAccess.stream) {
+          } else if (canUseNativeRustVoice) {
             voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
               session: voiceSession,
-              localStream: voiceAccess.stream,
+              localStream: null,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),

@@ -65,7 +65,7 @@ const LOCAL_DEV_VOICE_SIGNAL_FALLBACK_ENABLED =
 
 type StartVoiceMediaSessionOptions = {
   session: VoiceSessionView;
-  localStream: MediaStream;
+  localStream: MediaStream | null;
   inputGain?: number;
   localPeerId: string;
   remotePeerId: string;
@@ -108,11 +108,10 @@ export function startNativeRustVoiceMediaSession(
   if (
     !options.session.joined ||
     !tauriVoiceSignalingAvailable() ||
-    !AudioContextCtor ||
-    localAudioTracks(options.localStream).length === 0
+    !AudioContextCtor
   ) {
     options.onStatus?.(
-      "Native Rust voice media did not start: joined Tauri backend, WebAudio, and a live microphone track are required",
+      "Native Rust voice media did not start: joined Tauri backend and WebAudio playback are required",
     );
     return null;
   }
@@ -135,13 +134,20 @@ export function startNativeRustVoiceMediaSession(
     options.outputDeviceId,
     options.outputVolume ?? 100,
   );
-  const source = audioContext.createMediaStreamSource(options.localStream);
-  const captureProcessor = audioContext.createScriptProcessor(2048, 1, 1);
-  const silentOutput = audioContext.createGain();
-  silentOutput.gain.value = 0;
-  source.connect(captureProcessor);
-  captureProcessor.connect(silentOutput);
-  silentOutput.connect(playbackOutput.destination);
+  const source =
+    options.localStream && localAudioTracks(options.localStream).length > 0
+      ? audioContext.createMediaStreamSource(options.localStream)
+      : null;
+  const captureProcessor = source
+    ? audioContext.createScriptProcessor(2048, 1, 1)
+    : null;
+  const silentOutput = source ? audioContext.createGain() : null;
+  if (source && captureProcessor && silentOutput) {
+    silentOutput.gain.value = 0;
+    source.connect(captureProcessor);
+    captureProcessor.connect(silentOutput);
+    silentOutput.connect(playbackOutput.destination);
+  }
 
   const clearRetryTimer = () => {
     if (retryTimer === null) return;
@@ -226,7 +232,6 @@ export function startNativeRustVoiceMediaSession(
         startEvidenceRecorded = true;
         recordTauriTwoProfileE2ENativeVoiceEvidence({
           mode: "native_rust_webrtc_datachannel",
-          getUserMediaCallsDelta: 1,
         });
       }
     } catch (error) {
@@ -243,66 +248,68 @@ export function startNativeRustVoiceMediaSession(
   };
   void startTransport();
 
-  captureProcessor.onaudioprocess = (event) => {
-    if (closed) return;
-    const inputBuffer = event.inputBuffer;
-    const mono = downmixAudioBuffer(inputBuffer);
-    const normalized = resampleMonoPcm(mono, inputBuffer.sampleRate, 48_000);
-    pendingCaptureSamples.push(...normalized);
-    while (pendingCaptureSamples.length >= 960) {
-      const frame = pendingCaptureSamples.splice(0, 960);
-      const pcm_i16 = frame.map((sample) =>
-        Math.max(-32768, Math.min(32767, Math.round(sample * 32767))),
-      );
-      const capturedAtMs = Date.now();
-      if (capturedAtMs - lastActivityReportAtMs >= 500) {
-        const level = pcmI16Level(pcm_i16);
-        lastActivityReportAtMs = capturedAtMs;
-        options.onLocalActivity?.({
-          activity_rms_i16: level.rms,
-          activity_peak_i16: level.peak,
-          activity_captured_at_ms: capturedAtMs,
-        });
-      }
-      if (!transportReady) continue;
-      if (queuedSends >= 8) continue;
-      queuedSends += 1;
-      void sendNativeVoiceAudioFrame({
-        session_id: options.session.session_id,
-        pcm_i16,
-        muted,
-        captured_at_ms: capturedAtMs,
-      })
-        .then((response) => {
-          if (response.accepted) {
-            recordTauriTwoProfileE2ENativeVoiceEvidence({
-              mode: "native_rust_webrtc_datachannel",
-              localAudioTracksSentDelta: 1,
-              iceConnected:
-                response.status.direct_path_ready &&
-                response.status.data_channel_open,
-            });
-          } else if (
-            response.status.state === "failed" &&
-            response.status.last_error
-          ) {
+  if (captureProcessor) {
+    captureProcessor.onaudioprocess = (event) => {
+      if (closed) return;
+      const inputBuffer = event.inputBuffer;
+      const mono = downmixAudioBuffer(inputBuffer);
+      const normalized = resampleMonoPcm(mono, inputBuffer.sampleRate, 48_000);
+      pendingCaptureSamples.push(...normalized);
+      while (pendingCaptureSamples.length >= 960) {
+        const frame = pendingCaptureSamples.splice(0, 960);
+        const pcm_i16 = frame.map((sample) =>
+          Math.max(-32768, Math.min(32767, Math.round(sample * 32767))),
+        );
+        const capturedAtMs = Date.now();
+        if (capturedAtMs - lastActivityReportAtMs >= 500) {
+          const level = pcmI16Level(pcm_i16);
+          lastActivityReportAtMs = capturedAtMs;
+          options.onLocalActivity?.({
+            activity_rms_i16: level.rms,
+            activity_peak_i16: level.peak,
+            activity_captured_at_ms: capturedAtMs,
+          });
+        }
+        if (!transportReady) continue;
+        if (queuedSends >= 8) continue;
+        queuedSends += 1;
+        void sendNativeVoiceAudioFrame({
+          session_id: options.session.session_id,
+          pcm_i16,
+          muted,
+          captured_at_ms: capturedAtMs,
+        })
+          .then((response) => {
+            if (response.accepted) {
+              recordTauriTwoProfileE2ENativeVoiceEvidence({
+                mode: "native_rust_webrtc_datachannel",
+                localAudioTracksSentDelta: 1,
+                iceConnected:
+                  response.status.direct_path_ready &&
+                  response.status.data_channel_open,
+              });
+            } else if (
+              response.status.state === "failed" &&
+              response.status.last_error
+            ) {
+              scheduleRetry(
+                `Native Rust voice send failed: ${response.status.last_error}`,
+              );
+            }
+          })
+          .catch((error) => {
             scheduleRetry(
-              `Native Rust voice send failed: ${response.status.last_error}`,
+              `Native Rust voice send failed: ${
+                error instanceof Error ? error.message : "unknown error"
+              }`,
             );
-          }
-        })
-        .catch((error) => {
-          scheduleRetry(
-            `Native Rust voice send failed: ${
-              error instanceof Error ? error.message : "unknown error"
-            }`,
-          );
-        })
-        .finally(() => {
-          queuedSends = Math.max(0, queuedSends - 1);
-        });
-    }
-  };
+          })
+          .finally(() => {
+            queuedSends = Math.max(0, queuedSends - 1);
+          });
+      }
+    };
+  }
 
   const pollPlayback = () => {
     if (closed) return;
@@ -365,10 +372,10 @@ export function startNativeRustVoiceMediaSession(
       closed = true;
       if (playbackTimer !== null) window.clearTimeout(playbackTimer);
       clearRetryTimer();
-      captureProcessor.onaudioprocess = null;
-      source.disconnect();
-      captureProcessor.disconnect();
-      silentOutput.disconnect();
+      if (captureProcessor) captureProcessor.onaudioprocess = null;
+      source?.disconnect();
+      captureProcessor?.disconnect();
+      silentOutput?.disconnect();
       playbackOutput.close();
       void audioContext.close();
       void stopNativeVoiceStream({ session_id: options.session.session_id });
@@ -483,6 +490,12 @@ function scheduleNativeVoicePlaybackFrame(
 export function startWebViewVoiceMediaSession(
   options: StartVoiceMediaSessionOptions,
 ): VoiceMediaSessionHandle | null {
+  if (!options.localStream) {
+    options.onStatus?.(
+      "WebView RTCPeerConnection voice media did not start: local audio stream is unavailable",
+    );
+    return null;
+  }
   const processedCapture = createGainControlledStream(
     options.localStream,
     options.inputGain ?? 100,
@@ -1397,7 +1410,8 @@ function iceServersFromConnectivity(
   return [...stun, ...turn];
 }
 
-function localAudioTracks(stream: MediaStream): MediaStreamTrack[] {
+function localAudioTracks(stream: MediaStream | null): MediaStreamTrack[] {
+  if (!stream) return [];
   if (typeof stream.getAudioTracks === "function") {
     return stream.getAudioTracks();
   }
