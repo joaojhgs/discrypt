@@ -57,6 +57,7 @@ export function createNativePlaybackOutput(
 
   const connectDirectOutput = () => {
     fallback = closeFallback(gain, fallback);
+    disconnectIfConnected(gain, context.destination);
     gain.connect(context.destination);
   };
 
@@ -67,13 +68,17 @@ export function createNativePlaybackOutput(
     const audio = document.createElement("audio") as HTMLAudioElement & {
       setSinkId?: (sinkId: string) => Promise<void>;
     };
+    if (!audio.setSinkId) {
+      mediaDestination.stream.getTracks().forEach((track) => track.stop());
+      mediaDestination.disconnect();
+      connectDirectOutput();
+      return;
+    }
     audio.autoplay = true;
     audio.setAttribute("playsinline", "true");
     audio.srcObject = mediaDestination.stream;
     gain.connect(mediaDestination);
-    if (audio.setSinkId) {
-      void audio.setSinkId(sinkIdForDevice(deviceId)).catch(() => undefined);
-    }
+    void audio.setSinkId(sinkIdForDevice(deviceId)).catch(() => undefined);
     void audio.play().catch(() => undefined);
     fallback = { audio, mediaDestination };
   };

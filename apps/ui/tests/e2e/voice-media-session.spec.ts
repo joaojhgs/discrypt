@@ -729,6 +729,7 @@ test("native Rust WebAudio default playback connects directly to the AudioContex
 
 test("native Rust WebAudio explicit playback sink uses AudioContext setSinkId when available", () => {
   const connectedNodes: unknown[] = [];
+  const disconnectedNodes: unknown[] = [];
   const sinkIds: string[] = [];
   const destination = { node: "context-output" };
   const gain = {
@@ -736,7 +737,9 @@ test("native Rust WebAudio explicit playback sink uses AudioContext setSinkId wh
     connect: (node: unknown) => {
       connectedNodes.push(node);
     },
-    disconnect: () => undefined,
+    disconnect: (node?: unknown) => {
+      disconnectedNodes.push(node);
+    },
   };
   const context = {
     destination,
@@ -755,8 +758,52 @@ test("native Rust WebAudio explicit playback sink uses AudioContext setSinkId wh
 
   expect(output.destination).toBe(gain);
   expect(connectedNodes).toEqual([destination, destination]);
+  expect(disconnectedNodes).toEqual([destination, destination]);
   expect(sinkIds).toEqual(["usb-headset", ""]);
   output.close();
+});
+
+test("native Rust WebAudio unsupported explicit sink stays on the single default output", () => {
+  const connectedNodes: unknown[] = [];
+  const stoppedTracks: string[] = [];
+  const destination = { node: "default-output" };
+  const mediaDestination = {
+    disconnect: () => undefined,
+    stream: {
+      getTracks: () => [{ stop: () => stoppedTracks.push("fallback-track") }],
+    },
+  };
+  const gain = {
+    gain: { value: 1 },
+    connect: (node: unknown) => connectedNodes.push(node),
+    disconnect: () => undefined,
+  };
+  const context = {
+    destination,
+    createGain: () => gain,
+    createMediaStreamDestination: () => mediaDestination,
+  } as unknown as AudioContext;
+  const originalDocument = globalThis.document;
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      createElement: () => ({ setSinkId: undefined }),
+    },
+  });
+
+  try {
+    const output = createNativePlaybackOutput(context, "usb-headset", 100);
+
+    expect(output.destination).toBe(gain);
+    expect(connectedNodes).toEqual([destination]);
+    expect(stoppedTracks).toEqual(["fallback-track"]);
+    output.close();
+  } finally {
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: originalDocument,
+    });
+  }
 });
 
 test("sealed WebView voice signaling binds backend envelope metadata", async ({
@@ -1024,11 +1071,9 @@ test("native Rust WebAudio drains playback through one owned output", async ({
     });
 
     await joinVoice(profile.page);
-    await expect
-      .poll(
-        async () => (await readEvidence(profile.page)).sinkIds.at(-1) ?? null,
-      )
-      .toBe("");
+    expect((await readEvidence(profile.page)).sinkIds).toEqual([]);
+    expect((await readEvidence(profile.page)).playbackAttachments).toBe(0);
+    expect((await readEvidence(profile.page)).stoppedPlaybackTracks).toBe(0);
     await expect
       .poll(async () => (await readEvidence(profile.page)).nativePlaybackFrames)
       .toBeGreaterThan(0);
