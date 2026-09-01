@@ -141,6 +141,7 @@ export function startNativeRustVoiceMediaSession(
   const captureProcessor = source
     ? audioContext.createScriptProcessor(2048, 1, 1)
     : null;
+  const webAudioCaptureActive = captureProcessor !== null;
   const silentOutput = source ? audioContext.createGain() : null;
   if (source && captureProcessor && silentOutput) {
     silentOutput.gain.value = 0;
@@ -202,6 +203,7 @@ export function startNativeRustVoiceMediaSession(
         local_peer_id: options.localPeerId,
         remote_peer_id: options.remotePeerId,
         muted,
+        use_webview_capture: webAudioCaptureActive,
         created_at_ms: Date.now(),
       });
       if (closed) return;

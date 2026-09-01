@@ -1941,6 +1941,9 @@ pub struct StartNativeVoiceMediaSessionRequest {
     /// Whether local mute should suppress the generated capture frame before Opus/SFrame.
     #[serde(default)]
     pub muted: bool,
+    /// Whether the WebView will submit real microphone PCM over IPC instead of starting CPAL.
+    #[serde(default)]
+    pub use_webview_capture: bool,
     /// Browser/native timestamp in milliseconds for correlation.
     pub created_at_ms: u64,
 }
@@ -3056,6 +3059,7 @@ struct NativeVoiceTransportRuntime {
     data_channel_open: bool,
     frames_sent: Arc<AtomicU64>,
     muted: Arc<AtomicBool>,
+    use_webview_capture: bool,
     native_capture: Option<NativeVoiceCaptureRuntime>,
     receiver_abort: Option<tokio::task::AbortHandle>,
 }
@@ -3099,6 +3103,7 @@ impl fmt::Debug for NativeVoiceTransportRuntime {
             .field("data_channel_open", &self.data_channel_open)
             .field("frames_sent", &self.frames_sent.load(Ordering::Relaxed))
             .field("muted", &self.muted.load(Ordering::Relaxed))
+            .field("use_webview_capture", &self.use_webview_capture)
             .field(
                 "native_capture",
                 &self
@@ -21120,32 +21125,37 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 };
                 let frames_sent = Arc::new(AtomicU64::new(0));
                 let muted = Arc::new(AtomicBool::new(job.request.muted));
-                let native_capture = match start_native_voice_capture_runtime(
-                    job.request.session_id.clone(),
-                    transport.clone(),
-                    executor.clone(),
-                    job.codec.clone(),
-                    frames_sent.clone(),
-                    muted.clone(),
-                ) {
-                    Ok(capture) => Some(capture),
-                    Err(error) => {
-                        guard.native_voice_transport_error = Some(error.clone());
-                        guard.state.push_command_error(
-                            "voice.native_capture_failed",
-                            "start_native_voice_stream",
-                            "native_voice_capture_unavailable",
-                            error,
-                            "Verify the OS default input device is available to the installed app; WebKit media-device enumeration is not required for backend-native voice capture",
-                        );
-                        None
+                let use_webview_capture = job.request.use_webview_capture;
+                let native_capture = if use_webview_capture {
+                    None
+                } else {
+                    match start_native_voice_capture_runtime(
+                        job.request.session_id.clone(),
+                        transport.clone(),
+                        executor.clone(),
+                        job.codec.clone(),
+                        frames_sent.clone(),
+                        muted.clone(),
+                    ) {
+                        Ok(capture) => Some(capture),
+                        Err(error) => {
+                            guard.native_voice_transport_error = Some(error.clone());
+                            guard.state.push_command_error(
+                                "voice.native_capture_failed",
+                                "start_native_voice_stream",
+                                "native_voice_capture_unavailable",
+                                error,
+                                "Verify the OS default input device is available to the installed app or select a WebView microphone",
+                            );
+                            None
+                        }
                     }
                 };
                 let native_capture_label = native_capture
                     .as_ref()
                     .map(|capture| capture.device_label.clone());
                 guard.pending_native_voice_transport_runtime = None;
-                if native_capture.is_some() {
+                if native_capture.is_some() || use_webview_capture {
                     guard.native_voice_transport_error = None;
                 }
                 guard.native_voice_transport_runtime = Some(NativeVoiceTransportRuntime {
@@ -21162,6 +21172,7 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                     data_channel_open: evidence.data_channel_open,
                     frames_sent,
                     muted,
+                    use_webview_capture,
                     native_capture,
                     receiver_abort,
                 });
@@ -21174,18 +21185,26 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                         ));
                     }
                     session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
-                    session.media_runtime.local_capture_active = native_capture_label.is_some();
-                    session.media_runtime.status_copy = native_capture_label
-                        .as_ref()
-                        .map(|label| {
+                    let local_capture_active =
+                        native_capture_label.is_some() || use_webview_capture;
+                    session.media_runtime.local_capture_active = local_capture_active;
+                    session.media_runtime.status_copy = if use_webview_capture {
+                        "Backend-verified native Rust WebRTC DataChannel is open over direct STUN ICE; WebView microphone PCM capture is active"
+                            .to_owned()
+                    } else {
+                        native_capture_label.as_ref().map_or_else(
+                            || {
+                                "Backend-verified native Rust WebRTC DataChannel is open, but native system microphone capture failed"
+                                    .to_owned()
+                            },
+                            |label| {
                             format!(
                                 "Backend-verified native Rust WebRTC DataChannel is open over direct STUN ICE; native system microphone capture is active from {label}"
                             )
-                        })
-                        .unwrap_or_else(|| {
-                            "Backend-verified native Rust WebRTC DataChannel is open, but native system microphone capture failed".to_owned()
-                        });
-                    session.media_runtime.fail_closed_reason = if native_capture_label.is_some() {
+                            },
+                        )
+                    };
+                    session.media_runtime.fail_closed_reason = if local_capture_active {
                         "Waiting for the first authenticated remote Opus/SFrame packet before enabling playback evidence"
                             .to_owned()
                     } else {
@@ -31931,6 +31950,7 @@ mod tests {
             local_peer_id: "peer-local".to_owned(),
             remote_peer_id: "peer-remote".to_owned(),
             muted: false,
+            use_webview_capture: false,
             created_at_ms: 40,
         });
         assert!(missing.native_media.is_none());
@@ -31992,6 +32012,7 @@ mod tests {
             local_peer_id,
             remote_peer_id,
             muted: false,
+            use_webview_capture: false,
             created_at_ms: 41,
         });
         assert!(unjoined.native_media.is_none());
@@ -32058,6 +32079,7 @@ mod tests {
             local_peer_id: "peer-ui-supplied-local".to_owned(),
             remote_peer_id: "peer-ui-supplied-remote".to_owned(),
             muted: false,
+            use_webview_capture: false,
             created_at_ms: 42,
         });
         assert!(rejected.native_media.is_none());
@@ -32134,6 +32156,7 @@ mod tests {
             local_peer_id: local_peer_id.clone(),
             remote_peer_id: remote_peer_id.clone(),
             muted: false,
+            use_webview_capture: false,
             created_at_ms: 42,
         });
         let local_media = started
@@ -32186,6 +32209,7 @@ mod tests {
                     local_peer_id: remote_peer_id,
                     remote_peer_id: local_peer_id,
                     muted: false,
+                    use_webview_capture: false,
                     created_at_ms: 43,
                 },
                 false,
@@ -32277,6 +32301,7 @@ mod tests {
             local_peer_id,
             remote_peer_id,
             muted: false,
+            use_webview_capture: false,
             created_at_ms: 4_200,
         });
         let media = started
@@ -32421,6 +32446,7 @@ mod tests {
                 local_peer_id: alice_peer_id.clone(),
                 remote_peer_id: bob_peer_id.clone(),
                 muted: false,
+                use_webview_capture: false,
                 created_at_ms: 1_700_000_000_056,
             });
         assert!(

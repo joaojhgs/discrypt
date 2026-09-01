@@ -842,7 +842,14 @@ async function requestVoiceDeviceAccess(
     };
   };
 
-  if (preferNativeCapture && nativeRustVoiceAvailable()) {
+  const selectedInput = normalizeVoiceDevicePreference(selectedInputDeviceId);
+  const requestedNativeSystemCapture =
+    selectedInput === "native-system-default-input";
+  if (
+    preferNativeCapture &&
+    nativeRustVoiceAvailable() &&
+    requestedNativeSystemCapture
+  ) {
     return nativeSystemAccess();
   }
 
@@ -858,9 +865,8 @@ async function requestVoiceDeviceAccess(
 
   let stream: MediaStream | null = null;
   try {
-    const selectedInput = normalizeVoiceDevicePreference(selectedInputDeviceId);
     const requestedDevice =
-      selectedInput !== "default"
+      selectedInput !== "default" && !requestedNativeSystemCapture
         ? selectedInput
         : null;
     stream = await navigator.mediaDevices.getUserMedia({
@@ -2873,7 +2879,7 @@ function App() {
           } else if (canUseNativeRustVoice) {
             voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
               session: voiceSession,
-              localStream: null,
+              localStream: voiceAccess.stream,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),

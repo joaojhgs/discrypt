@@ -21,7 +21,12 @@ type VoiceMediaEvidence = {
   getUserMediaCalls: number;
   getUserMediaConstraints: MediaStreamConstraints[];
   audioContextsCreated: number;
+  audioProcessHandlers: number;
+  audioProcessTicks: number;
   localAudioTracksSent: number;
+  nativeAudioFramesSent: number;
+  nativeVoiceCommandNames: string[];
+  nativeVoiceStartRequests: Record<string, unknown>[];
   remoteDescriptionsApplied: number;
   iceCandidatesApplied: number;
   remoteTrackEvents: number;
@@ -138,7 +143,12 @@ async function installVoiceMediaHarness(
         getUserMediaCalls: 0,
         getUserMediaConstraints: [],
         audioContextsCreated: 0,
+        audioProcessHandlers: 0,
+        audioProcessTicks: 0,
         localAudioTracksSent: 0,
+        nativeAudioFramesSent: 0,
+        nativeVoiceCommandNames: [],
+        nativeVoiceStartRequests: [],
         remoteDescriptionsApplied: 0,
         iceCandidatesApplied: 0,
         remoteTrackEvents: 0,
@@ -157,6 +167,13 @@ async function installVoiceMediaHarness(
       Object.defineProperty(window, "__discryptVoiceMediaEvidence", {
         configurable: true,
         value: evidence,
+      });
+      const audioProcessTicks: Array<() => void> = [];
+      Object.defineProperty(window, "__discryptVoiceHarnessAudioProcessTick", {
+        configurable: true,
+        value: () => {
+          for (const tick of audioProcessTicks) tick();
+        },
       });
 
       const localAudioTrack = {
@@ -266,11 +283,57 @@ async function installVoiceMediaHarness(
           };
         }
         createScriptProcessor() {
-          return {
-            onaudioprocess: null,
-            connect: () => undefined,
-            disconnect: () => undefined,
+          let handler: ((event: { inputBuffer: AudioBuffer }) => void) | null =
+            null;
+          let timer: number | null = null;
+          const sampleCount = 2048;
+          const inputBuffer = {
+            length: sampleCount,
+            numberOfChannels: 1,
+            sampleRate: 48_000,
+            getChannelData: () => {
+              const samples = new Float32Array(sampleCount);
+              for (let index = 0; index < sampleCount; index += 1) {
+                samples[index] = Math.sin(index / 8) * 0.35;
+              }
+              return samples;
+            },
+          } as AudioBuffer;
+          const stopTimer = () => {
+            if (timer === null) return;
+            window.clearInterval(timer);
+            timer = null;
           };
+          const tick = () => {
+            evidence.audioProcessTicks += 1;
+            handler?.({ inputBuffer });
+          };
+          audioProcessTicks.push(tick);
+          const processor = {
+            connect: () => undefined,
+            disconnect: () => {
+              stopTimer();
+              const index = audioProcessTicks.indexOf(tick);
+              if (index >= 0) audioProcessTicks.splice(index, 1);
+            },
+          };
+          Object.defineProperty(processor, "onaudioprocess", {
+            configurable: true,
+            get: () => handler,
+            set: (
+              nextHandler: ((event: { inputBuffer: AudioBuffer }) => void) | null,
+            ) => {
+              handler = nextHandler;
+              evidence.audioProcessHandlers = handler ? 1 : 0;
+              stopTimer();
+              if (typeof handler === "function") {
+                timer = window.setInterval(() => {
+                  tick();
+                }, 20);
+              }
+            },
+          });
+          return processor;
         }
         createMediaStreamDestination() {
           const destinationTrack = {
@@ -896,13 +959,19 @@ test("sealed WebView voice signaling binds backend envelope metadata", async ({
   }
 });
 
-test("native Rust voice retries a stale connected runtime with a backend error", async ({
+test("native Rust voice bridges WebAudio microphone PCM over the backend DataChannel and retries stale transport errors", async ({
   browser,
 }) => {
   const profile = await openProfile(browser, "Native Speaker", "Linux Desktop");
   try {
     await createInvite(profile.page);
     await profile.page.evaluate(() => {
+      const voiceEvidence = (
+        window as Window & {
+          __discryptVoiceMediaEvidence?: VoiceMediaEvidence;
+        }
+      ).__discryptVoiceMediaEvidence;
+      if (!voiceEvidence) throw new Error("voice media evidence missing");
       const status = {
         schema_version: 1,
         session_id: "native-session",
@@ -957,6 +1026,7 @@ test("native Rust voice retries a stale connected runtime with a backend error",
               command: string,
               args?: { request?: Record<string, unknown> },
             ) => {
+              voiceEvidence.nativeVoiceCommandNames.push(command);
               if (command === "app_state") {
                 return readState();
               }
@@ -1028,6 +1098,7 @@ test("native Rust voice retries a stale connected runtime with a backend error",
               }
               if (command === "start_native_voice_stream") {
                 retryEvidence.startCalls += 1;
+                voiceEvidence.nativeVoiceStartRequests.push(args?.request ?? {});
                 return {
                   state: readState(),
                   status:
@@ -1068,6 +1139,7 @@ test("native Rust voice retries a stale connected runtime with a backend error",
                 return { frames, status };
               }
               if (command === "send_native_voice_audio_frame") {
+                voiceEvidence.nativeAudioFramesSent += 1;
                 return { accepted: true, status };
               }
               if (command === "save_preferences") {
@@ -1105,13 +1177,6 @@ test("native Rust voice retries a stale connected runtime with a backend error",
     });
 
     await joinVoice(profile.page);
-    expect((await readEvidence(profile.page)).getUserMediaCalls).toBe(0);
-    await expect(
-      profile.page.getByText(
-        "Native Rust voice receive failed: simulated initial attach timeout — retrying automatically",
-        { exact: true },
-      ),
-    ).toHaveCount(1);
     await expect
       .poll(() =>
         profile.page.evaluate(
@@ -1134,6 +1199,34 @@ test("native Rust voice retries a stale connected runtime with a backend error",
     await expect
       .poll(async () => (await readEvidence(profile.page)).nativePlaybackFrames)
       .toBeGreaterThan(0);
+    await expect
+      .poll(async () => {
+        const evidence = await readEvidence(profile.page);
+        if (
+          evidence.nativeVoiceStartRequests.length >= 2 &&
+          evidence.nativeVoiceStartRequests.every(
+            (request) => request.use_webview_capture === true,
+          )
+        ) {
+          return "webview-capture-started";
+        }
+        return `commands=${evidence.nativeVoiceCommandNames.join(",")} starts=${JSON.stringify(evidence.nativeVoiceStartRequests)}`;
+      })
+      .toBe("webview-capture-started");
+    await expect
+      .poll(async () => {
+        await profile.page.evaluate(() => {
+          (
+            window as Window & {
+              __discryptVoiceHarnessAudioProcessTick?: () => void;
+            }
+          ).__discryptVoiceHarnessAudioProcessTick?.();
+        });
+        const evidence = await readEvidence(profile.page);
+        if (evidence.nativeAudioFramesSent > 0) return "sent";
+        return `waiting: handlers=${evidence.audioProcessHandlers} ticks=${evidence.audioProcessTicks} nativeFrames=${evidence.nativeAudioFramesSent}`;
+      })
+      .toBe("sent");
 
     await profile.page
       .getByRole("button", { name: "Open app configuration", exact: true })

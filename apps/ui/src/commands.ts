@@ -1039,6 +1039,7 @@ export type StartNativeVoiceMediaSessionRequest = {
   local_peer_id: string;
   remote_peer_id: string;
   muted?: boolean;
+  use_webview_capture?: boolean;
   created_at_ms: number;
 };
 
