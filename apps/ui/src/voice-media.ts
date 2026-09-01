@@ -206,7 +206,11 @@ export function startNativeRustVoiceMediaSession(
       });
       if (closed) return;
       options.onState?.(response.state);
-      if (
+      if (response.status.last_error) {
+        scheduleRetry(
+          `Native Rust voice media did not start: ${response.status.last_error}`,
+        );
+      } else if (
         response.status.data_channel_open &&
         response.status.direct_path_ready
       ) {
@@ -288,10 +292,7 @@ export function startNativeRustVoiceMediaSession(
                   response.status.direct_path_ready &&
                   response.status.data_channel_open,
               });
-            } else if (
-              response.status.state === "failed" &&
-              response.status.last_error
-            ) {
+            } else if (response.status.last_error) {
               scheduleRetry(
                 `Native Rust voice send failed: ${response.status.last_error}`,
               );
@@ -319,11 +320,18 @@ export function startNativeRustVoiceMediaSession(
     })
       .then((response) => {
         if (closed) return;
-        transportReady =
-          response.status.data_channel_open &&
-          response.status.direct_path_ready;
-        if (transportReady) {
-          markTransportReady();
+        if (response.status.last_error) {
+          transportReady = false;
+          scheduleRetry(
+            `Native Rust voice receive failed: ${response.status.last_error}`,
+          );
+        } else {
+          transportReady =
+            response.status.data_channel_open &&
+            response.status.direct_path_ready;
+          if (transportReady) {
+            markTransportReady();
+          }
         }
         for (const frame of response.frames) {
           scheduleNativeVoicePlaybackFrame(
@@ -344,11 +352,6 @@ export function startNativeRustVoiceMediaSession(
               response.status.direct_path_ready &&
               response.status.data_channel_open,
           });
-        }
-        if (response.status.state === "failed" && response.status.last_error) {
-          scheduleRetry(
-            `Native Rust voice receive failed: ${response.status.last_error}`,
-          );
         }
       })
       .catch((error) => {

@@ -896,7 +896,7 @@ test("sealed WebView voice signaling binds backend envelope metadata", async ({
   }
 });
 
-test("native Rust voice retries one failed attach and drains playback through one owned output", async ({
+test("native Rust voice retries a stale connected runtime with a backend error", async ({
   browser,
 }) => {
   const profile = await openProfile(browser, "Native Speaker", "Linux Desktop");
@@ -1048,9 +1048,6 @@ test("native Rust voice retries one failed attach and drains playback through on
                     frames: [],
                     status: {
                       ...status,
-                      state: "failed",
-                      direct_path_ready: false,
-                      data_channel_open: false,
                       last_error: "simulated initial attach timeout",
                     },
                   };
