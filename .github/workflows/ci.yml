@@ -134,6 +134,10 @@ jobs:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: apps/ui/package-lock.json
+      - name: Install Linux audio build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
       - run: npm ci
         working-directory: apps/ui
       - run: npm run build
