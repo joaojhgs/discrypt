@@ -1067,9 +1067,15 @@ impl TextReceiveState {
             envelope.sequence,
             envelope.message_id.clone(),
         );
-        if self.seen.iter().any(|(sender_leaf, sequence, _)| {
-            *sender_leaf == envelope.sender_leaf && *sequence == envelope.sequence
-        }) {
+        let range_start = (envelope.sender_leaf, envelope.sequence, String::new());
+        if self
+            .seen
+            .range(range_start..)
+            .next()
+            .is_some_and(|(sender_leaf, sequence, _)| {
+                *sender_leaf == envelope.sender_leaf && *sequence == envelope.sequence
+            })
+        {
             return Err(DeliveryError::TextReceiveReplay {
                 sender_leaf: envelope.sender_leaf,
                 sequence: envelope.sequence,

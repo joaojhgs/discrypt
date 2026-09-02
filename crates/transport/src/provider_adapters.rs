@@ -7082,7 +7082,7 @@ impl MqttProviderRoom {
                 }
                 Ok(Some(MqttProviderEvent::Error)) => {
                     if provider_runtime_debug_enabled() {
-                        eprintln!("mqtt transient event loop error redacted");
+                        eprintln!("mqtt event error redacted");
                     }
                 }
                 Ok(None) => {
@@ -7124,7 +7124,7 @@ impl MqttProviderRoom {
                 }
                 Ok(Some(MqttProviderEvent::Error)) => {
                     if provider_runtime_debug_enabled() {
-                        eprintln!("mqtt transient event loop error redacted");
+                        eprintln!("mqtt event error redacted");
                     }
                 }
                 Ok(None) => {
@@ -7157,7 +7157,7 @@ impl MqttProviderRoom {
                 MqttProviderEvent::SubAck => {}
                 MqttProviderEvent::Error => {
                     if provider_runtime_debug_enabled() {
-                        eprintln!("mqtt transient event loop error redacted");
+                        eprintln!("mqtt event error redacted");
                     }
                 }
             }
@@ -7172,7 +7172,11 @@ impl MqttProviderRoom {
         bytes: Vec<u8>,
     ) -> Result<(), TransportError> {
         if provider_runtime_debug_enabled() {
-            eprintln!("mqtt record_publish topic={topic} bytes={}", bytes.len());
+            eprintln!(
+                "mqtt record_publish {} bytes={}",
+                redacted_observable_label("topic", &topic),
+                bytes.len()
+            );
         }
         reject_forbidden_plaintext(&bytes)?;
         let envelope: MqttWireEnvelope =
@@ -7695,8 +7699,8 @@ impl RendezvousRoom for MqttProviderRoom {
         reject_forbidden_plaintext(&sealed_payload.bytes)?;
         if provider_runtime_debug_enabled() {
             eprintln!(
-                "mqtt control broadcast topic={} bytes={}",
-                self.topics.control,
+                "mqtt control broadcast {} bytes={}",
+                redacted_observable_label("topic", &self.topics.control),
                 sealed_payload.bytes.len()
             );
         }

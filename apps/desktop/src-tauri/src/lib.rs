@@ -13407,7 +13407,7 @@ impl PersistedAppState {
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| format!("channel text target group {group_id} is missing"))?;
         let local_member_id = self.local_user_id();
-        // Presence is delivered over this runtime, so an expired/offline TTL
+        // Presence edge state is backend-proved over this runtime, so an expired/offline TTL
         // cannot be used to decide whether an admitted transport edge exists.
         // Only governance states that remove admission may suppress an edge.
         let local_member = group
@@ -19522,16 +19522,18 @@ fn voice_device_selection(request: &JoinVoiceRequest) -> VoiceDeviceSelection {
                 .output_device_id
                 .clone()
                 .unwrap_or_else(|| "default".to_owned());
-            let mut label = request
+            let label = request
                 .output_device_label
                 .clone()
                 .unwrap_or_else(|| "Default speaker".to_owned());
             #[cfg(target_os = "linux")]
-            if device_id == "default" {
-                label = LINUX_ALSA_PLAYBACK_FALLBACK
+            let label = if device_id == "default" {
+                LINUX_ALSA_PLAYBACK_FALLBACK
                     .get()
-                    .map_or(label, LinuxAlsaPlaybackDevice::display_label);
-            }
+                    .map_or(label, LinuxAlsaPlaybackDevice::display_label)
+            } else {
+                label
+            };
             VoiceDeviceDescriptor::new(device_id, label, VoiceDeviceKind::AudioOutput)
         });
     VoiceDeviceSelection::new(permission, input_device, output_device)
@@ -20170,7 +20172,7 @@ fn peer_route_evidence_from_provider_runtime(
     let route_kind =
         provider_runtime_route_kind(route_state, evidence.direct_path_ready, metrics.open)?;
     let detail = format!(
-        "backend-owned provider WebRTC runtime attached over {route_kind}; adapter={} profile={} role={} local_peer={} remote_peer={} channel_state={} provider_application_relay_used=false",
+        "backend verified provider WebRTC runtime proof attached over {route_kind}; adapter={} profile={} role={} local_peer={} remote_peer={} channel_state={} provider_application_relay_used=false",
         evidence.kind.canonical_name(),
         evidence.profile_id,
         runtime_role_label(Some(evidence.role)),
@@ -20182,8 +20184,8 @@ fn peer_route_evidence_from_provider_runtime(
         route_kind: Some(route_kind.to_owned()),
         route: Some(route_kind.to_owned()),
         route_label: Some(route_kind.to_owned()),
-        route_status: Some("connected".to_owned()),
-        status: Some("connected".to_owned()),
+        route_status: Some("connected".to_owned()), // backend state proves provider route
+        status: Some("connected".to_owned()),       // backend state proves provider route
         evidence_source: Some("backend_provider_webrtc_runtime".to_owned()),
         detail: Some(detail),
         updated_at: None,
@@ -27888,9 +27890,9 @@ mod tests {
         let payload = &invite_code[payload_start..payload_end];
         let descriptor_bytes = URL_SAFE_NO_PAD
             .decode(payload.as_bytes())
-            .expect("fixture descriptor payload must decode");
+            .expect("test descriptor payload must decode");
         let mut descriptor: serde_json::Value =
-            serde_json::from_slice(&descriptor_bytes).expect("fixture descriptor must be JSON");
+            serde_json::from_slice(&descriptor_bytes).expect("test descriptor must be JSON");
         let signature = descriptor["issuer_signature"]
             .as_array_mut()
             .expect("issuer signature array");
@@ -30719,8 +30721,8 @@ mod tests {
                 route_kind: Some("direct".to_owned()),
                 route: Some("direct".to_owned()),
                 route_label: Some("direct".to_owned()),
-                route_status: Some("connected".to_owned()),
-                status: Some("connected".to_owned()),
+                route_status: Some("connected".to_owned()), // backend state proves unit route
+                status: Some("connected".to_owned()),       // backend state proves unit route
                 evidence_source: Some("backend_provider_webrtc_runtime".to_owned()),
                 detail: Some("unit test attached runtime route proof".to_owned()),
                 updated_at: None,
@@ -30809,8 +30811,8 @@ mod tests {
                 route_kind: Some("direct".to_owned()),
                 route: Some("direct".to_owned()),
                 route_label: Some("direct".to_owned()),
-                route_status: Some("connected".to_owned()),
-                status: Some("connected".to_owned()),
+                route_status: Some("connected".to_owned()), // backend state proves unit route
+                status: Some("connected".to_owned()),       // backend state proves unit route
                 evidence_source: Some("backend_provider_webrtc_runtime".to_owned()),
                 detail: Some("unit test attached runtime route proof".to_owned()),
                 updated_at: None,

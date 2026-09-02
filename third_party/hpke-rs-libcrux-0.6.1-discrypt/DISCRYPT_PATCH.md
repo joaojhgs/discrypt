@@ -1,13 +1,16 @@
 # Discrypt local patch
 
-This directory vendors `hpke-rs-libcrux` from crates.io release `0.6.1` and applies the smallest local metadata/dependency patch needed while upstream has no patched release that removes the `libcrux-chacha20poly1305 0.0.7` audit finding.
+This directory vendors `hpke-rs-libcrux` from crates.io release `0.6.1` and applies the smallest local dependency patch needed to keep the OpenMLS 0.8 provider on the current, vulnerability-free libcrux graph.
 
 Patch scope:
 
-- crate version suffix: `0.6.1+discrypt.1`
-- `libcrux-aead`: `0.0.7` -> `0.0.8`
-- `libcrux-traits`: kept on `0.0.7` to match the patched libcrux AEAD graph
+- crate version suffix: `0.6.1+discrypt.2`
+- `libcrux-aead`: `0.0.7` -> `0.0.9`
+- `libcrux-ecdh`: `0.0.6` -> `0.0.8`
+- `libcrux-hkdf`: `0.0.6` -> `0.0.8`
+- `libcrux-kem`: `0.0.7` -> `0.0.9`
+- `libcrux-traits`: `0.0.6` -> `0.0.8`
 
-No Rust source files were changed from the crates.io package in this local patch.
+Rust source changes are limited to compatibility with the updated libcrux APIs.
 
 Release rule: replace this local patch with an upstream `hpke-rs-libcrux` release as soon as one depends on the patched libcrux AEAD/chacha graph and passes the same MLS verification gates.

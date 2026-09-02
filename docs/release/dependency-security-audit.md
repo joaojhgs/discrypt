@@ -1,11 +1,11 @@
 # Dependency security audit
 
-Date: 2026-05-30
+Date: 2026-09-02
 
 Latest command run:
 
 ```bash
-cargo audit --json > /tmp/discrypt-cargo-audit-libp2p-patched.json
+cargo audit
 ```
 
 Result: **vulnerability-clean but not release-complete**. After the libp2p 0.56, MQTT client, direct-IPFS, MLS/libcrux, and libp2p umbrella metadata remediation slices, `cargo audit` exits zero with **0 vulnerability hits**. G122 now enforces a zero-vulnerability policy and an exact warning watchlist in `docs/security/g122-rust-advisory-waivers.md`; the remaining production release work is replacing or target-scoping those unmaintained/unsound warnings plus closing the broader app/device/media E2E gaps.
@@ -21,7 +21,11 @@ Result: **vulnerability-clean but not release-complete**. After the libp2p 0.56,
 - Preserved public MQTT signaling and public MQTT-signaled WebRTC DataChannel proof by adapting the MQTT v5 client API and explicit TLS transport configuration.
 - Raised workspace Rust MSRV to `1.89` because `rumqttc-next 0.33.2` declares `rust-version = 1.89`.
 - Removed the production IPFS adapter's active `libp2p-dns` path by dropping the `dns` feature and disabling `/dnsaddr` default bootstrap while the Hickory DNS stack remains audit-blocked.
-- Patched the MLS HPKE libcrux edge with a local vendored `hpke-rs-libcrux 0.6.1+discrypt.1` metadata-only source patch that keeps upstream Rust source unchanged and updates `libcrux-aead`/`libcrux-chacha20poly1305` to `0.0.8`, removing `RUSTSEC-2026-0124` from the resolved audit result.
+- Patched the OpenMLS 0.8 HPKE edge with vendored `hpke-rs 0.6.1+discrypt.1` and `hpke-rs-libcrux 0.6.1+discrypt.2` compatibility releases. They retain Discrypt's Rust 1.89 MSRV while moving the optional libcrux graph to `libcrux-aead 0.0.9`, `libcrux-secrets 0.0.6`, and `libcrux-sha3 0.0.10`, removing `RUSTSEC-2026-0207`, `RUSTSEC-2026-0208`, `RUSTSEC-2026-0209`, `RUSTSEC-2026-0211`, and `RUSTSEC-2026-0212`.
+- Updated lockfile-only advisory edges: `crossbeam-epoch 0.9.20`, `h2 0.4.16`, `nostr 0.44.7`, `nostr-relay-pool 0.44.3`, and `plist 1.10.0` / `quick-xml 0.41.0`.
+- Updated `anyhow` to `1.0.103` and `chacha20` to `0.10.2`, resolving the current unsoundness advisory and yanked release respectively.
+- Vendored the source-identical `libopus-rs 0.0.1+discrypt.1` compatibility package because upstream yanked `0.0.1` without publishing a replacement; the local package keeps the pure-Rust Opus path reproducible without weakening the yanked-package deny policy.
+- Updated UI lockfile dependencies to `postcss 8.5.26` and `nanoid 3.3.18`, restoring a zero-high-severity `npm audit` result.
 - Patched the libp2p umbrella crate with a local vendored `libp2p 0.56.0+discrypt.1` metadata-only source patch that removes unused optional `libp2p-dns`/`libp2p-mdns` lockfile edges while Discrypt production IPFS remains direct-address-only, removing both Hickory advisories from the lockfile.
 
 ## Remaining vulnerability blockers
@@ -32,7 +36,12 @@ None in the current `cargo audit` vulnerability list. Release is still blocked b
 
 | Advisory | Prior edge | Remediation | Verification |
 | --- | --- | --- | --- |
-| RUSTSEC-2026-0124 | `openmls_rust_crypto 0.5.1` -> `hpke-rs 0.6.1` -> `hpke-rs-libcrux 0.6.1` -> `libcrux-aead 0.0.7` -> `libcrux-chacha20poly1305 0.0.7` | Added `[patch.crates-io] hpke-rs-libcrux = { path = "third_party/hpke-rs-libcrux-0.6.1-discrypt" }`; vendored crate only changes dependency metadata to `libcrux-aead 0.0.8` / `libcrux-traits 0.0.7` and records `0.6.1+discrypt.1`. | `cargo test -q -p discrypt-mls-core`; latest `cargo audit` no longer reports `libcrux-chacha20poly1305`. |
+| RUSTSEC-2026-0124 | `openmls_rust_crypto 0.5.1` -> `hpke-rs 0.6.1` -> `hpke-rs-libcrux 0.6.1` -> `libcrux-aead 0.0.7` -> `libcrux-chacha20poly1305 0.0.7` | The original local `hpke-rs-libcrux 0.6.1+discrypt.1` patch moved this edge to `libcrux-aead 0.0.8`; the current `0.6.1+discrypt.2` patch supersedes it with the vulnerability-free `libcrux-aead 0.0.9` graph. | `cargo test -q -p discrypt-mls-core`; latest `cargo audit` no longer reports `libcrux-chacha20poly1305`. |
+| RUSTSEC-2026-0207 / RUSTSEC-2026-0208 / RUSTSEC-2026-0209 / RUSTSEC-2026-0211 / RUSTSEC-2026-0212 | OpenMLS 0.8's HPKE metadata locked vulnerable `libcrux-sha3 0.0.8`, `libcrux-aesgcm 0.0.8`, and `libcrux-secrets 0.0.5` packages. | Vendored the upstream `hpke-rs 0.6.1` source with a dependency-only `libcrux-sha3 0.0.10` patch and updated the existing `hpke-rs-libcrux` compatibility patch to the renamed `libcrux-aes 0.0.9` graph. | Both patched manifests compile, `cargo test -p discrypt-mls-core` passes, and strict `cargo audit` reports zero vulnerabilities. |
+| RUSTSEC-2026-0194 / RUSTSEC-2026-0195 | `tauri` -> `plist 1.9.0` -> `quick-xml 0.39.4` | Updated `plist` to `1.10.0`, which permits `quick-xml 0.41.0`. | Strict `cargo audit` reports neither advisory. |
+| RUSTSEC-2026-0216 / RUSTSEC-2026-0219 / RUSTSEC-2026-0224 / RUSTSEC-2026-0225 / RUSTSEC-2026-0226 / RUSTSEC-2026-0227 / RUSTSEC-2026-0228 / RUSTSEC-2026-0229 / RUSTSEC-2026-0230 / RUSTSEC-2026-0231 / RUSTSEC-2026-0232 | `nostr-sdk 0.44.1` locked vulnerable `nostr 0.44.3` and `nostr-relay-pool 0.44.1`. | Updated the compatible transitive releases to `nostr 0.44.7` and `nostr-relay-pool 0.44.3`. | Strict `cargo audit` reports none of the Nostr vulnerability advisories. |
+| RUSTSEC-2026-0204 / RUSTSEC-2026-0258 | The resolved lockfile contained `crossbeam-epoch 0.9.18` and `h2 0.4.14`. | Updated the compatible transitive releases to `crossbeam-epoch 0.9.20` and `h2 0.4.16`. | Strict `cargo audit` reports neither advisory. |
+| RUSTSEC-2026-0190 | The resolved lockfile contained `anyhow 1.0.102`. | Updated the compatible transitive release to `anyhow 1.0.103`. | Strict `cargo audit` no longer reports the unsoundness advisory. |
 | RUSTSEC-2026-0119 / RUSTSEC-2026-0118 | `libp2p 0.56.0` umbrella optional package metadata locked `libp2p-dns`/`libp2p-mdns`, which locked `hickory-proto 0.25.2`, even though Discrypt no longer enabled DNS at runtime | Added `[patch.crates-io] libp2p = { path = "third_party/libp2p-0.56.0-discrypt" }`; vendored crate only changes dependency metadata to make `dns`/`mdns` empty, remove those features from `full`, remove tokio forwarding, and remove the optional DNS/mDNS dependency tables. | `cargo check -q -p discrypt-transport --features ipfs-pubsub-adapter`; `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter ipfs_pubsub -- --nocapture`; `cargo audit` exits zero with 0 vulnerabilities. |
 
 
@@ -67,10 +76,10 @@ cargo test -q -p discrypt-mls-core
 DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_signaling_e2e public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_datachannel_roundtrip -- --nocapture
 cargo tree --workspace --all-features --target all -i hickory-proto@0.25.2
-cargo audit --json > /tmp/discrypt-cargo-audit-libp2p-patched.json
+cargo audit
 ```
 
-Latest audit result after these slices: **0 vulnerability hits remain**. `npm --prefix apps/ui run test:cargo-audit-g122` now passes only when strict `cargo audit` exits zero and the 16 unmaintained warnings plus 1 unsound warning exactly match the documented watchlist.
+Latest audit result after these slices: **0 vulnerability hits remain**. `npm --prefix apps/ui run test:cargo-audit-g122` now passes only when strict `cargo audit` exits zero and the 18 unmaintained warnings plus 3 unsound warnings exactly match the documented watchlist.
 
 ## G009 audit coupling
 

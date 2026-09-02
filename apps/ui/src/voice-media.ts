@@ -1155,7 +1155,7 @@ const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v2:";
 
 // This browser-local layer keeps raw SDP/ICE out of IPC and persisted state.
 // Peer authentication and provider confidentiality come from the backend-owned,
-// direct WebRTC text/control DataChannel that carries this envelope; this
+// backend verified direct WebRTC text/control DataChannel carries this envelope; this
 // metadata-derived key is not an independent identity-authentication boundary.
 export async function sealVoiceSignalPayload(
   signal: VoiceSignal,

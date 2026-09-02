@@ -100,7 +100,7 @@ for (const dep of [
   "gstreamer1.0-pulseaudio",
 ]) {
   if (!linuxRuntimeDependencies.deb.includes(dep)) {
-    fail(`Tauri Debian bundle must declare ${dep} because production-storage uses Linux Secret Service`);
+    fail(`Tauri Debian bundle must declare ${dep} for production storage and voice media`);
   }
 }
 for (const dep of [

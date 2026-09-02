@@ -24,6 +24,10 @@ on:
       - scripts/*package*.mjs
       - scripts/*desktop*.mjs
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   validate-package-ci:
     name: validate package workflow

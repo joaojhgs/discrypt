@@ -399,7 +399,7 @@ const expectedCommands = [
   {
     command: "start_native_voice_stream",
     exportName: "startNativeVoiceStream",
-    args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
+    args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "use_webview_capture", "created_at_ms"],
     returns: "StartNativeVoiceStreamResponse",
   },
   {
