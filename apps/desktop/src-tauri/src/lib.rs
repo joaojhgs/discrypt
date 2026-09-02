@@ -1803,7 +1803,9 @@ pub struct AttachBrokerControlLaneRuntimeRequest {
 /// Request to drain sealed inbound broker control frames for one pump window.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DrainTextControlInboundFramesRequest {
-    /// Drain window length in milliseconds. Clamped to 100..=30000.
+    /// Idle receive window in milliseconds. The window restarts after each valid frame and is
+    /// clamped to 100..=30000; each invocation receives at most 200 frames or 60 seconds of
+    /// receive activity.
     #[serde(default)]
     pub drain_ms: Option<u64>,
     /// Optional per-receive transport operation timeout in milliseconds.
@@ -2931,6 +2933,8 @@ struct TextControlRuntimeMapKey {
 }
 
 const TEXT_CONTROL_RUNTIME_PENDING_STALE_AFTER_MS: u64 = 60_000;
+const MAX_TEXT_CONTROL_DRAIN_FRAMES: usize = 200;
+const MAX_TEXT_CONTROL_DRAIN_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl TextControlRuntimeMapKey {
     fn legacy(session_id: impl Into<String>) -> Self {
@@ -4753,13 +4757,23 @@ impl TauriAppService {
             }
         };
         let transport = runtime.transport.clone();
-        let deadline = std::time::Instant::now() + drain_duration;
+        let hard_deadline = std::time::Instant::now() + MAX_TEXT_CONTROL_DRAIN_DURATION;
+        let mut deadline = std::time::Instant::now() + drain_duration;
+        let mut received_frames = 0_usize;
         let mut inbound_frames = 0_usize;
         let mut failures = Vec::new();
-        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        while received_frames < MAX_TEXT_CONTROL_DRAIN_FRAMES {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let Some(total_remaining) =
+                hard_deadline.checked_duration_since(std::time::Instant::now())
+            else {
+                break;
+            };
             let received = executor.block_on(async {
                 tokio::time::timeout(
-                    remaining.min(operation_timeout),
+                    remaining.min(operation_timeout).min(total_remaining),
                     transport.recv_text_control_frame(),
                 )
                 .await
@@ -4772,6 +4786,7 @@ impl TauriAppService {
                 }
                 Err(_) => break,
             };
+            received_frames += 1;
             let Ok(inbound_frame) = serde_json::from_slice::<TextControlFrameView>(&inbound) else {
                 failures.push("decode inbound text/control frame failed".to_owned());
                 continue;
@@ -4792,6 +4807,10 @@ impl TauriAppService {
                     }
                 }
             }
+            // Frame application can perform comparatively expensive MLS work. Give the next
+            // already-buffered frame a complete receive window instead of charging that work
+            // against the caller's receive budget.
+            deadline = std::time::Instant::now() + drain_duration;
         }
         let metrics = executor.block_on(transport.text_control_transport_metrics());
         self.state.push_event(

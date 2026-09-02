@@ -284,6 +284,7 @@ impl crate::TextControlDataTransport for BrokerControlLaneTransport {
     async fn recv_text_control_frame(&self) -> Result<Vec<u8>, TransportError> {
         loop {
             if let Some(frame) = self.inbound.lock().await.pop_front() {
+                self.frames_received.fetch_add(1, Ordering::Relaxed);
                 return Ok(frame);
             }
             let frames = self.take_remote_frames().await?;
