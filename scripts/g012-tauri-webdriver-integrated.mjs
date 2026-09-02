@@ -2,7 +2,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createConnection } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,43 +9,31 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const leaderRoot = process.env.OMX_TEAM_LEADER_CWD ? resolve(process.env.OMX_TEAM_LEADER_CWD) : repoRoot;
 const argv = process.argv.slice(2);
 const run = argv.includes("--run");
-const skipBuild = argv.includes("--skip-build") || process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_SKIP_BUILD === "1";
+const skipBuild = argv.includes("--skip-build") || process.env.DISCRYPT_G012_WEBDRIVER_SKIP_BUILD === "1";
 const requireNativeVoice = argv.includes("--require-native-voice") ||
-  process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_REQUIRE_NATIVE_VOICE === "1";
-const runId = valueAfter("--run-id") ?? process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_RUN_ID ?? `tauri-two-profile-e2e-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-const artifactRoot = resolve(repoRoot, valueAfter("--artifact-dir") ?? process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_ARTIFACT_DIR ?? `target/tauri-two-profile-group-text-voice-e2e/${runId}`);
+  process.env.DISCRYPT_G012_REQUIRE_NATIVE_VOICE === "1" ||
+  process.env.DISCRYPT_G012_WEBDRIVER_REQUIRE_NATIVE_VOICE === "1";
+const runId = valueAfter("--run-id") ?? process.env.DISCRYPT_G012_WEBDRIVER_RUN_ID ?? `g012-webdriver-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+const artifactRoot = resolve(repoRoot, valueAfter("--artifact-dir") ?? process.env.DISCRYPT_G012_WEBDRIVER_ARTIFACT_DIR ?? `target/g012-e2e/${runId}`);
 const logDir = resolve(artifactRoot, "logs");
 const profileDir = resolve(artifactRoot, "profiles");
 const screenshotDir = resolve(artifactRoot, "screenshots");
 for (const dir of [artifactRoot, logDir, profileDir, screenshotDir]) mkdirSync(dir, { recursive: true });
 
-const driverBinary = process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_TAURI_DRIVER || commandPath("tauri-driver");
-const nativeDriverBinary = process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_NATIVE_WEBDRIVER || commandPath("WebKitWebDriver") || firstExisting([
+const driverBinary = process.env.DISCRYPT_G012_TAURI_DRIVER || commandPath("tauri-driver");
+const nativeDriverBinary = process.env.DISCRYPT_G012_NATIVE_WEBDRIVER || commandPath("WebKitWebDriver") || firstExisting([
   resolve(repoRoot, "target/webdriver-deps/extracted/usr/bin/WebKitWebDriver"),
   resolve(leaderRoot, "target/webdriver-deps/extracted/usr/bin/WebKitWebDriver"),
 ]);
-const appBinary = process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_APP_BINARY
-  ? resolve(repoRoot, process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_APP_BINARY)
+const appBinary = process.env.DISCRYPT_G012_APP_BINARY
+  ? resolve(repoRoot, process.env.DISCRYPT_G012_APP_BINARY)
   : firstExisting([
       resolve(repoRoot, "target/debug/discrypt-desktop"),
       resolve(leaderRoot, "target/debug/discrypt-desktop"),
     ]);
-const basePort = Number(process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_BASE_PORT ?? valueAfter("--base-port") ?? 4510);
-const mqttPort = Number(process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_MQTT_PORT ?? basePort + 20);
-const configuredMqttEndpoint = valueAfter("--mqtt-endpoint") ?? process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_MQTT_ENDPOINT;
-const localMqttEndpoint = configuredMqttEndpoint ?? `mqtt://127.0.0.1:${mqttPort}`;
-const mqttBrokerBinary = configuredMqttEndpoint ? null : commandPath("rumqttd");
-const mqttBrokerConfigPath = resolve(artifactRoot, "rumqttd.toml");
-const mqttBrokerLogPath = resolve(logDir, "rumqttd.log");
-const disableSyntheticVoiceFallback = argv.includes("--disable-synthetic-voice-fallback") || process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_DISABLE_SYNTHETIC_VOICE_FALLBACK === "1";
+const basePort = Number(process.env.DISCRYPT_G012_WEBDRIVER_BASE_PORT ?? valueAfter("--base-port") ?? 4510);
+const disableSyntheticVoiceFallback = argv.includes("--disable-synthetic-voice-fallback") || process.env.DISCRYPT_G012_WEBDRIVER_DISABLE_SYNTHETIC_VOICE_FALLBACK === "1";
 if (!Number.isInteger(basePort) || basePort < 1024 || basePort > 65000) failCli("base port must be a valid high TCP port", 2);
-if (!configuredMqttEndpoint && (!Number.isInteger(mqttPort) || mqttPort < 1024 || mqttPort > 65535)) failCli("local MQTT port must be a valid high TCP port", 2);
-
-const harnessEnv = {
-  ...process.env,
-  DISCRYPT_DEFAULT_MQTT_ENDPOINT: localMqttEndpoint,
-  VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT: localMqttEndpoint,
-};
 
 const profiles = {
   alice: {
@@ -68,7 +55,7 @@ const profiles = {
 };
 for (const profile of Object.values(profiles)) mkdirSync(dirname(profile.state_path), { recursive: true });
 
-const workflowSteps = [
+const per97WorkflowSteps = [
   {
     id: "setup",
     description: "Create two isolated Tauri WebDriver sessions and complete local profile setup in each real WebView.",
@@ -81,13 +68,13 @@ const workflowSteps = [
   },
   {
     id: "approval",
-    description: "Approve Bob's pending admission through Alice's owner/staff UI and wait for persisted OpenMLS Welcome state.",
+    description: "Approve Bob's pending admission through the backend owner/staff command and wait for persisted OpenMLS Welcome state.",
     required_artifacts: ["openmls_admission_owner_approval", "OpenMLS handle epochs"],
   },
   {
     id: "text",
     description: "Send signed group text both ways after admission and record plaintext, envelope, and receipt evidence from persisted state.",
-    required_artifacts: ["text.evidence", "provider text/control runtime pump records"],
+    required_artifacts: ["text.evidence", "text_control_bridge_* or provider runtime pump records"],
   },
   {
     id: "voice",
@@ -106,19 +93,19 @@ const workflowSteps = [
   },
 ];
 
-const artifactContract = {
-  test: "Tauri two-profile group text and voice E2E",
+const per97ArtifactContract = {
+  issue: "PER-97 / P12-T02 Tauri WebDriver integrated two-profile",
   evidence_level: "Tauri WebDriver release harness evidence when run with --run on a display-capable runner",
   dry_run_boundary: "Dry-run writes the manifest/preflight contract only; it is not setup, invite, approval, text, voice, persistence, or production evidence.",
-  provider_policy: "The strict run uses the sealed MQTT broker control lane only for admission bootstrap, then provider-signaled direct WebRTC text/control runtimes for group text and voice signaling; it rejects manual command-bridge fallback.",
+  provider_policy: "MQTT/Nostr/IPFS/QUIC providers remain signaling/rendezvous only; manual command bridge fallback is labeled non-provider-runtime evidence and never a provider application relay.",
   membership_policy: "Invite parsing is not membership; protected text and voice evidence require backend approval plus persisted OpenMLS Welcome/add state.",
-  voice_policy: "Synthetic WebView peer-connection fallback is diagnostic only and cannot satisfy the strict E2E acceptance criteria.",
+  voice_policy: "Synthetic WebView peer-connection fallback is diagnostic only and cannot make production voice or G012 checkpoint claims.",
 };
 
-const manifestPath = resolve(artifactRoot, "tauri-two-profile-group-text-voice-e2e-manifest.json");
-const summaryPath = resolve(artifactRoot, "tauri-two-profile-group-text-voice-e2e-summary.json");
+const manifestPath = resolve(artifactRoot, "tauri-webdriver-integrated-manifest.json");
+const summaryPath = resolve(artifactRoot, "tauri-webdriver-integrated-summary.json");
 const manifest = {
-  schema_version: "discrypt.tauri_two_profile_group_text_voice_e2e.v1",
+  schema_version: "discrypt.g012.tauri_webdriver_integrated.v1",
   generated_at: new Date().toISOString(),
   mode: run ? "run" : "dry-run",
   run_id: runId,
@@ -128,17 +115,10 @@ const manifest = {
   native_webdriver: nativeDriverBinary,
   profile_isolation_env: "DISCRYPT_APP_STATE_PATH",
   automation_env: "TAURI_WEBVIEW_AUTOMATION=1",
-  local_mqtt: {
-    endpoint: localMqttEndpoint,
-    broker: configuredMqttEndpoint ? "externally_managed" : "rumqttd",
-    binary: mqttBrokerBinary,
-    config_path: configuredMqttEndpoint ? null : rel(mqttBrokerConfigPath),
-    log_path: configuredMqttEndpoint ? null : rel(mqttBrokerLogPath),
-  },
   require_native_voice: requireNativeVoice,
   boundary: "Drives two real Tauri WebViews through setup/group invite/text/voice UX. It reports remote text/media delivery truthfully and does not convert launch/UI smoke into a production network claim.",
-  workflow_steps: workflowSteps,
-  artifact_contract: artifactContract,
+  per97_workflow_steps: per97WorkflowSteps,
+  per97_artifact_contract: per97ArtifactContract,
   profiles,
   commands: [],
 };
@@ -151,7 +131,7 @@ function rel(path) {
   return path && path.startsWith(repoRoot) ? path.slice(repoRoot.length + 1) : path;
 }
 function failCli(message, code = 1) {
-  console.error(`tauri-two-profile-group-text-voice-e2e: ${message}`);
+  console.error(`g012-tauri-webdriver-integrated: ${message}`);
   process.exit(code);
 }
 function firstExisting(paths) {
@@ -246,88 +226,22 @@ function preflight() {
     app_binary_exists: existsSync(appBinary),
     skip_build: skipBuild,
     require_native_voice: requireNativeVoice,
-    mqtt_endpoint: localMqttEndpoint,
-    mqtt_broker_binary: mqttBrokerBinary,
-    mqtt_broker_managed_externally: Boolean(configuredMqttEndpoint),
     webkit_runtime: webkitRuntimeDiagnostics(),
   };
   const okDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
   if (!okDisplay) return { ok: false, reason: "No DISPLAY/WAYLAND_DISPLAY available for WebKit WebDriver", checks };
   if (!driverBinary) return { ok: false, reason: "tauri-driver is not installed; run cargo install tauri-driver --locked", checks };
-  if (!nativeDriverBinary || !existsSync(nativeDriverBinary)) return { ok: false, reason: "WebKitWebDriver is missing; install webkit2gtk-driver or set DISCRYPT_TAURI_TWO_PROFILE_E2E_NATIVE_WEBDRIVER", checks };
-  if (!configuredMqttEndpoint && !mqttBrokerBinary) return { ok: false, reason: "rumqttd is missing; install it with cargo install rumqttd --locked or set DISCRYPT_TAURI_TWO_PROFILE_E2E_MQTT_ENDPOINT", checks };
+  if (!nativeDriverBinary || !existsSync(nativeDriverBinary)) return { ok: false, reason: "WebKitWebDriver is missing; install webkit2gtk-driver or set DISCRYPT_G012_NATIVE_WEBDRIVER", checks };
   return { ok: true, checks };
 }
 function runCommand(label, command, args, cwd) {
   const logPath = resolve(logDir, `${label}.log`);
   manifest.commands.push({ label, command, args, cwd: rel(cwd), log_path: rel(logPath) });
   writeManifest("building");
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", env: harnessEnv, maxBuffer: 1024 * 1024 * 128 });
+  const result = spawnSync(command, args, { cwd, encoding: "utf8", env: process.env, maxBuffer: 1024 * 1024 * 128 });
   writeFileSync(logPath, `${result.stdout || ""}\n${result.stderr || ""}`);
   if (result.status !== 0) throw new Error(`${label} failed with ${result.status}; see ${rel(logPath)}`);
   return { log_path: rel(logPath), sha256: sha256IfExists(logPath) };
-}
-async function waitTcp(port, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  let last = "not attempted";
-  while (Date.now() < deadline) {
-    try {
-      await new Promise((resolveConnect, rejectConnect) => {
-        const socket = createConnection({ host: "127.0.0.1", port });
-        socket.setTimeout(1000);
-        socket.once("connect", () => {
-          socket.end();
-          resolveConnect();
-        });
-        socket.once("error", rejectConnect);
-        socket.once("timeout", () => {
-          socket.destroy();
-          rejectConnect(new Error("connection timed out"));
-        });
-      });
-      return;
-    } catch (error) {
-      last = error instanceof Error ? error.message : String(error);
-      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-    }
-  }
-  throw new Error(`Timed out waiting for local MQTT broker on ${port}: ${last}`);
-}
-function startLocalMqttBroker() {
-  if (configuredMqttEndpoint) {
-    return null;
-  }
-  const config = `id = 0
-
-[router]
-id = 0
-max_connections = 32
-max_outgoing_packet_count = 200
-max_segment_size = 1048576
-max_segment_count = 10
-
-[v5.1]
-name = "tauri-two-profile-e2e-local-v5"
-listen = "127.0.0.1:${mqttPort}"
-next_connection_delay_ms = 1
-
-[v5.1.connections]
-connection_timeout_ms = 60000
-max_payload_size = 1048576
-max_inflight_count = 100
-`;
-  writeFileSync(mqttBrokerConfigPath, config);
-  writeFileSync(mqttBrokerLogPath, `$ ${mqttBrokerBinary} -c ${mqttBrokerConfigPath}\nstarted_at=${new Date().toISOString()}\n`);
-  const child = spawn(mqttBrokerBinary, ["-c", mqttBrokerConfigPath], {
-    cwd: repoRoot,
-    env: harnessEnv,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: process.platform !== "win32",
-  });
-  child.stdout.on("data", (chunk) => writeFileSync(mqttBrokerLogPath, chunk, { flag: "a" }));
-  child.stderr.on("data", (chunk) => writeFileSync(mqttBrokerLogPath, chunk, { flag: "a" }));
-  child.on("exit", (code, signal) => writeFileSync(mqttBrokerLogPath, `\nexited_at=${new Date().toISOString()} code=${code} signal=${signal}\n`, { flag: "a" }));
-  return child;
 }
 async function waitHttp(port, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
@@ -349,7 +263,7 @@ function startDriver(profile) {
   const child = spawn(driverBinary, args, {
     cwd: repoRoot,
     env: {
-      ...harnessEnv,
+      ...process.env,
       DISCRYPT_APP_STATE_PATH: profile.state_path,
       TAURI_WEBVIEW_AUTOMATION: "1",
       WEBKIT_FORCE_SANDBOX: "0",
@@ -383,24 +297,13 @@ async function terminate(child) {
       try { child.kill("SIGKILL"); } catch {}
     }
   }
-  child.stdout?.destroy();
-  child.stderr?.destroy();
-  child.unref();
 }
-async function wd(
-  profile,
-  method,
-  path,
-  body,
-  timeoutMs = Number(
-    process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_COMMAND_TIMEOUT_MS ?? 30_000,
-  ),
-) {
+async function wd(profile, method, path, body) {
   const response = await fetch(`http://127.0.0.1:${profile.driver_port}${path}`, {
     method,
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(Number(process.env.DISCRYPT_G012_WEBDRIVER_COMMAND_TIMEOUT_MS ?? 30_000)),
   });
   const text = await response.text();
   let parsed;
@@ -419,8 +322,7 @@ async function createSession(profile) {
 }
 async function closeSession(profile) {
   if (profile.session_id) {
-    try { await wd(profile, "DELETE", `/session/${profile.session_id}`, undefined, 5_000); } catch {}
-    profile.session_id = null;
+    try { await wd(profile, "DELETE", `/session/${profile.session_id}`); } catch {}
   }
 }
 async function exec(profile, script, args = []) {
@@ -566,7 +468,7 @@ async function publishBackendNativeVoiceProof(profile) {
       session_id: session.session_id,
       signal_kind: "candidate",
       sealed_payload,
-      signal_id: `tauri-two-profile-e2e-native-rust-${profile.display_name.toLowerCase()}-${Date.now()}`,
+      signal_id: `g012-native-rust-${profile.display_name.toLowerCase()}-${Date.now()}`,
       created_at_ms: Date.now(),
     },
   });
@@ -593,7 +495,7 @@ async function publishBackendNativeVoiceProofs(profiles) {
     publishBackendNativeVoiceProof(profiles.alice),
     publishBackendNativeVoiceProof(profiles.bob),
   ]);
-  manifest.backend_native_voice_proofs = reports;
+  manifest.g012_backend_native_voice_proofs = reports;
   writeManifest(manifest.status || "running", {});
   return reports;
 }
@@ -607,7 +509,7 @@ async function acceptNativeVoiceSignalPayload(profile, signal) {
       });
       const runtime = state?.voice_session?.media_runtime || {};
       const accepted = Boolean(runtime.remote_transport_active || (runtime.remote_audio || []).length);
-      const evidence = window.__discryptTauriTwoProfileE2EVoiceEvidence;
+      const evidence = window.__discryptG012WebDriverVoiceEvidence;
       if (evidence && accepted) {
         evidence.mode = 'native_rust_webrtc_datachannel';
         evidence.nativeRustVoiceRuntimeAvailable = true;
@@ -693,23 +595,21 @@ async function readReleaseSmokeAudioPreferences(profiles, label) {
   return reports;
 }
 function providerRuntimeProofed(state) {
-  const runtime = state?.transport_status?.find(
-    (row) => row?.label === "text/control runtime",
-  );
-  return runtime?.status === "attached";
+  const diagnostics = state?.transport_diagnostics || {};
+  const probe = diagnostics.data_channel_probe || {};
+  return diagnostics.data_channel_probe_status === "webrtc-datachannel-proofed" &&
+    Boolean(probe.offerer_data_channel_open) &&
+    Boolean(probe.answerer_data_channel_open) &&
+    Boolean(probe.text_control_frame_roundtrip);
 }
 async function waitForProviderRuntime(profile, label, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
     const state = await appState(profile);
-    const runtime = state?.transport_status?.find(
-      (row) => row?.label === "text/control runtime",
-    );
     last = {
-      status: runtime?.status ?? null,
-      detail: runtime?.detail ?? null,
-      probe_status: state?.transport_diagnostics?.data_channel_probe_status ?? null,
+      status: state?.transport_diagnostics?.data_channel_probe_status ?? null,
+      detail: state?.transport_diagnostics?.data_channel_probe_detail ?? null,
       last_command_error: state?.last_command_error ?? null,
     };
     if (providerRuntimeProofed(state)) return state;
@@ -718,7 +618,7 @@ async function waitForProviderRuntime(profile, label, timeoutMs = 45_000) {
   throw new Error(`${profile.display_name} timed out waiting for provider text/control runtime ${label}; last=${JSON.stringify(last)}`);
 }
 async function startProviderTextControlRuntimePair(profiles, label) {
-  const request = { scope_label: `tauri-two-profile-e2e-provider-runtime-${label}`, data_channel_probe: true, adapter_kind: "mqtt" };
+  const request = { scope_label: `g012-provider-runtime-${label}`, data_channel_probe: true, adapter_kind: "mqtt" };
   const starts = await Promise.all([
     invokeTauriCommand(profiles.alice, "start_text_session", { request }),
     invokeTauriCommand(profiles.bob, "start_text_session", { request }),
@@ -735,10 +635,7 @@ async function startProviderTextControlRuntimePair(profiles, label) {
     label,
     starts: starts.map((state) => state?.transport_diagnostics ?? null),
     attaches: attaches.map((state) => state?.transport_diagnostics ?? null),
-    ready: ready.map((state) => ({
-      transport_status: state?.transport_status ?? null,
-      diagnostics: state?.transport_diagnostics ?? null,
-    })),
+    ready: ready.map((state) => state?.transport_diagnostics ?? null),
   };
   manifest[`provider_text_control_runtime_${label.replace(/\W+/g, "_")}`] = report;
   writeManifest(manifest.status || "running", {});
@@ -760,169 +657,7 @@ async function pumpProviderTextControlFramesOnce(profile, label) {
     diagnostics: report?.state?.transport_diagnostics ?? null,
   };
 }
-async function startProviderControlLanePair(profiles, label) {
-  const request = {
-    scope_label: `tauri-two-profile-e2e-provider-control-lane-${label}`,
-    data_channel_probe: false,
-    adapter_kind: "mqtt",
-  };
-  const starts = await Promise.all([
-    invokeTauriCommand(profiles.alice, "start_text_session", { request }),
-    invokeTauriCommand(profiles.bob, "start_text_session", { request }),
-  ]);
-  const attaches = await Promise.all([
-    invokeTauriCommand(profiles.alice, "attach_broker_control_lane_runtime", { request: { adapter_kind: "mqtt" } }),
-    invokeTauriCommand(profiles.bob, "attach_broker_control_lane_runtime", { request: { adapter_kind: "mqtt" } }),
-  ]);
-  const failures = attaches.flatMap((state, index) => {
-    const profile = index === 0 ? profiles.alice : profiles.bob;
-    const attached = state?.events?.some((event) => event?.kind === "transport.broker_control_lane_attached");
-    if (!state?.last_command_error && attached) return [];
-    return [{
-      profile: profile.display_name,
-      attached,
-      last_command_error: state?.last_command_error ?? null,
-    }];
-  });
-  if (failures.length > 0) {
-    throw new Error(`Provider control lane ${label} failed to attach: ${JSON.stringify(failures)}`);
-  }
-  await new Promise((resolveWait) => setTimeout(resolveWait, 500));
-  const report = {
-    label,
-    starts: starts.map((state) => state?.transport_diagnostics ?? null),
-    attached: attaches.map((state) => ({
-      last_command_error: state?.last_command_error ?? null,
-      broker_control_lane_attached: state?.events?.some((event) => event?.kind === "transport.broker_control_lane_attached") ?? false,
-    })),
-  };
-  manifest[`provider_control_lane_runtime_${label.replace(/\W+/g, "_")}`] = report;
-  writeManifest(manifest.status || "running", {});
-  return report;
-}
-async function drainProviderControlLaneOnce(profile, label) {
-  const report = await invokeTauriCommand(profile, "drain_text_control_inbound_frames", {
-    request: { drain_ms: 1_500, operation_timeout_ms: 1_000 },
-  });
-  return {
-    label,
-    profile: profile.display_name,
-    inbound_frames: report?.response_frames_received ?? 0,
-    failures: Array.isArray(report?.failures) ? report.failures : [],
-    metrics: report?.metrics ?? null,
-  };
-}
-function providerControlLaneEventCounters(state) {
-  const events = Array.isArray(state?.events) ? state.events : [];
-  let framesSent = 0;
-  let inboundFrames = 0;
-  for (const event of events) {
-    if (event?.kind === "message.transport_pump") {
-      framesSent += Number(String(event.summary ?? "").match(/sent (\d+) frame/)?.[1] ?? 0);
-    }
-    if (event?.kind === "message.transport_drain") {
-      inboundFrames += Number(String(event.summary ?? "").match(/applied (\d+) inbound frame/)?.[1] ?? 0);
-    }
-  }
-  return { frames_sent: framesSent, inbound_frames: inboundFrames };
-}
-async function providerControlLaneCountersForProfiles(profiles) {
-  const states = await Promise.all([
-    appState(profiles.alice),
-    appState(profiles.bob),
-  ]);
-  return states.map(providerControlLaneEventCounters);
-}
-async function pumpProviderControlLaneBidirectional(
-  profiles,
-  label,
-  rounds = 4,
-  evidenceBaseline = null,
-) {
-  const beforeStates = await Promise.all([
-    appState(profiles.alice),
-    appState(profiles.bob),
-  ]);
-  const beforeCounters = evidenceBaseline ?? beforeStates.map(providerControlLaneEventCounters);
-  const alreadyAttached = beforeStates.every((state) =>
-    !state?.last_command_error &&
-      state?.events?.some((event) => event?.kind === "transport.broker_control_lane_attached")
-  );
-  const runtime = alreadyAttached
-    ? {
-        label,
-        reused_ui_managed_runtime: true,
-        attached: beforeStates.map((state) => ({
-          last_command_error: state?.last_command_error ?? null,
-          broker_control_lane_attached: state?.events?.some((event) => event?.kind === "transport.broker_control_lane_attached") ?? false,
-          session_manager_started: state?.events?.some((event) => event?.kind === "transport.control_session_started") ?? false,
-        })),
-      }
-    : await startProviderControlLanePair(profiles, label);
-  const reports = [];
-  for (let round = 0; round < rounds; round += 1) {
-    const aliceSent = await pumpProviderTextControlFramesOnce(profiles.alice, `${label}-alice-send-${round}`);
-    const bobDrained = await drainProviderControlLaneOnce(profiles.bob, `${label}-bob-drain-${round}`);
-    const bobSent = await pumpProviderTextControlFramesOnce(profiles.bob, `${label}-bob-send-${round}`);
-    const aliceDrained = await drainProviderControlLaneOnce(profiles.alice, `${label}-alice-drain-${round}`);
-    reports.push(aliceSent, bobDrained, bobSent, aliceDrained);
-    const activity = aliceSent.frames_sent + bobSent.frames_sent + bobDrained.inbound_frames + aliceDrained.inbound_frames;
-    if (round > 0 && activity === 0) break;
-  }
-  const failures = reports.flatMap((report) => Array.isArray(report.failures) ? report.failures : []);
-  const afterStates = await Promise.all([
-    appState(profiles.alice),
-    appState(profiles.bob),
-  ]);
-  const afterCounters = afterStates.map(providerControlLaneEventCounters);
-  const eventFramesSent = afterCounters.reduce(
-    (sum, counter, index) => sum + Math.max(0, counter.frames_sent - beforeCounters[index].frames_sent),
-    0,
-  );
-  const eventInboundFrames = afterCounters.reduce(
-    (sum, counter, index) => sum + Math.max(0, counter.inbound_frames - beforeCounters[index].inbound_frames),
-    0,
-  );
-  const reportedFramesSent = reports.reduce((sum, report) => sum + (report.frames_sent || 0), 0);
-  const reportedInboundFrames = reports.reduce((sum, report) => sum + (report.inbound_frames || 0), 0);
-  const evidence = {
-    label,
-    runtime,
-    reports,
-    provider_runtime_used: true,
-    provider_runtime_kind: "sealed_broker_control_lane",
-    frames_sent: Math.max(reportedFramesSent, eventFramesSent),
-    inbound_frames: Math.max(reportedInboundFrames, eventInboundFrames),
-    evidence_sources: {
-      command_reports: {
-        frames_sent: reportedFramesSent,
-        inbound_frames: reportedInboundFrames,
-      },
-      persisted_backend_event_deltas: {
-        frames_sent: eventFramesSent,
-        inbound_frames: eventInboundFrames,
-      },
-    },
-    manual_command_bridge_used: false,
-  };
-  if (evidence.frames_sent === 0 || evidence.inbound_frames === 0 || failures.length > 0) {
-    throw new Error(`Provider control lane ${label} did not complete cleanly; frames_sent=${evidence.frames_sent} inbound_frames=${evidence.inbound_frames} failures=${JSON.stringify(failures)}`);
-  }
-  manifest[`provider_control_lane_pump_${label.replace(/\W+/g, "_")}`] = evidence;
-  writeManifest(manifest.status || "running", {});
-  return evidence;
-}
-async function pumpProviderTextControlFramesBidirectional(
-  profiles,
-  label,
-  rounds = 6,
-  evidenceBaseline = null,
-) {
-  const beforeStates = await Promise.all([
-    appState(profiles.alice),
-    appState(profiles.bob),
-  ]);
-  const beforeCounters = evidenceBaseline ?? beforeStates.map(providerControlLaneEventCounters);
+async function pumpProviderTextControlFramesBidirectional(profiles, label, rounds = 6) {
   const runtime = await startProviderTextControlRuntimePair(profiles, label);
   const reports = [];
   for (let round = 0; round < rounds; round += 1) {
@@ -941,41 +676,65 @@ async function pumpProviderTextControlFramesBidirectional(
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 250));
   }
-  const afterStates = await Promise.all([
-    appState(profiles.alice),
-    appState(profiles.bob),
-  ]);
-  const afterCounters = afterStates.map(providerControlLaneEventCounters);
-  const eventFramesSent = afterCounters.reduce(
-    (sum, counter, index) => sum + Math.max(0, counter.frames_sent - beforeCounters[index].frames_sent),
-    0,
-  );
-  const reportedFramesSent = reports.reduce(
-    (sum, report) => sum + (report.frames_sent || 0),
-    0,
-  );
   const evidence = {
     label,
     runtime,
     reports,
     provider_runtime_used: true,
-    frames_sent: Math.max(reportedFramesSent, eventFramesSent),
-    evidence_sources: {
-      command_reports: { frames_sent: reportedFramesSent },
-      persisted_backend_event_deltas: { frames_sent: eventFramesSent },
-    },
+    frames_sent: reports.reduce((sum, report) => sum + (report.frames_sent || 0), 0),
     native_voice_signals_accepted: reports.reduce((sum, report) => sum + (report.accepted || 0), 0),
     manual_command_bridge_used: false,
   };
-  const failures = reports.flatMap((report) => Array.isArray(report.failures) ? report.failures : []);
-  const acceptanceErrors = reports.flatMap((report) => Array.isArray(report.errors) ? report.errors : []);
-  if (evidence.frames_sent === 0 || failures.length > 0 || acceptanceErrors.length > 0) {
-    throw new Error(`Provider text/control pump ${label} did not complete cleanly; frames_sent=${evidence.frames_sent} failures=${JSON.stringify(failures)} acceptance_errors=${JSON.stringify(acceptanceErrors)}`);
-  }
   manifest[`provider_text_control_pump_${label.replace(/\W+/g, "_")}`] = evidence;
   writeManifest(manifest.status || "running", {});
   return evidence;
 }
+async function bridgeTextControlFramesOnce(fromProfile, toProfile, label) {
+  const pending = await invokeTauriCommand(fromProfile, "list_pending_text_control_frames", { request: { limit: 50, operation_timeout_ms: 1000 } });
+  const frames = Array.isArray(pending?.frames) ? pending.frames : [];
+  const report = { label, from: fromProfile.display_name, to: toProfile.display_name, pending: frames.length, delivered: 0, responses: 0, frame_kinds: [] };
+  for (const item of frames) {
+    if (!item?.frame || !item?.message_id || !item?.frame_sha256) continue;
+    report.frame_kinds.push(item.frame.kind || "unknown");
+    const handled = await invokeTauriCommand(toProfile, "handle_text_control_frame", { request: { frame: item.frame } });
+    if (item.frame.kind === "voice_signal") {
+      const nativeAccepted = await acceptNativeVoiceSignalPayload(toProfile, item.frame.signal).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      if (nativeAccepted?.accepted) {
+        report.native_media_accepted = (report.native_media_accepted || 0) + 1;
+      } else if (nativeAccepted?.error) {
+        report.native_media_errors = [...(report.native_media_errors || []), nativeAccepted.error];
+      }
+    }
+    await invokeTauriCommand(fromProfile, "mark_text_control_frame_sent", {
+      request: {
+        message_id: item.message_id,
+        frame_sha256: item.frame_sha256,
+        transport_session_id: `g012-webdriver-command-bridge-${label}`,
+      },
+    });
+    report.delivered += 1;
+    if (handled?.response_frame) {
+      await invokeTauriCommand(fromProfile, "handle_text_control_frame", { request: { frame: handled.response_frame } });
+      report.responses += 1;
+    }
+  }
+  return report;
+}
+async function bridgeTextControlFramesBidirectional(profiles, label, rounds = 6) {
+  const reports = [];
+  for (let round = 0; round < rounds; round += 1) {
+    const aliceToBob = await bridgeTextControlFramesOnce(profiles.alice, profiles.bob, `${label}-a2b-${round}`);
+    const bobToAlice = await bridgeTextControlFramesOnce(profiles.bob, profiles.alice, `${label}-b2a-${round}`);
+    reports.push(aliceToBob, bobToAlice);
+    if (aliceToBob.delivered === 0 && bobToAlice.delivered === 0) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  }
+  manifest[`text_control_bridge_${label.replace(/\W+/g, "_")}`] = reports;
+  manifest[`text_control_bridge_${label.replace(/\W+/g, "_")}_classification`] = "manual_command_bridge_not_per56_provider_runtime_evidence";
+  writeManifest(manifest.status || "running", {});
+  return reports;
+}
+
 async function waitForProfileState(profile, label, predicate, timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
@@ -1017,7 +776,7 @@ function pendingAdmissionRequest(state) {
   };
 }
 
-async function approvePendingAdmissionThroughUi(profile) {
+async function approvePendingAdmission(profile) {
   const deadline = Date.now() + 60_000;
   let pending = null;
   while (Date.now() < deadline) {
@@ -1030,30 +789,12 @@ async function approvePendingAdmissionThroughUi(profile) {
     manifest.openmls_admission_owner_approval = { approved: false, pending };
     throw new Error(`${profile.display_name} did not persist a pending OpenMLS admission request; last=${JSON.stringify(pending)}`);
   }
-  await click(profile, "Pending requests");
-  await waitUntil(
-    profile,
-    `pending admission card ${pending.request_id}`,
-    "return document.querySelector(`[data-testid=\"admission-request-${arguments[0]}\"]`) !== null;",
-    [pending.request_id],
-  );
-  const clicked = await exec(
-    profile,
-    "const button = document.querySelector(`[data-testid=\"admission-approve-${arguments[0]}\"]`); if (!button) return false; button.click(); return true;",
-    [pending.request_id],
-  );
-  if (!clicked) {
-    throw new Error(`${profile.display_name} could not click the admission approval UI for ${pending.request_id}`);
-  }
-  const approvedState = await waitForProfileState(
-    profile,
-    `approved admission ${pending.request_id}`,
-    (state) => state?.groups?.some((group) =>
-      group?.group_id === pending.group_id &&
-      group?.admission_requests?.some((request) => request?.request_id === pending.request_id && request?.status === "approved")
-    ) ?? false,
-    60_000,
-  );
+  const approvedState = await invokeTauriCommand(profile, "approve_group_admission_request", {
+    request: {
+      group_id: pending.group_id,
+      request_id: pending.request_id,
+    },
+  });
   const error = approvedState?.last_command_error ?? null;
   const approved = !error && approvedState?.groups?.some((group) =>
     group?.group_id === pending.group_id &&
@@ -1063,8 +804,7 @@ async function approvePendingAdmissionThroughUi(profile) {
     approved,
     pending,
     last_command_error: error,
-    interaction: "ui_click",
-    selector: `[data-testid=\"admission-approve-${pending.request_id}\"]`,
+    command: "approve_group_admission_request",
   };
   writeManifest(manifest.status || "running", {});
   if (!approved) {
@@ -1281,18 +1021,8 @@ async function setupProfile(profile) {
 async function createGroupInvite(profile) {
   await click(profile, "Create (a )?group");
   await fill(profile, "Group name", "Two Profile WebDriver Lab");
-  await fill(profile, "Signaling endpoint", localMqttEndpoint);
-  await fill(profile, "STUN servers", "");
   await click(profile, "^Create group$", { last: true });
   await waitUntil(profile, "created group", "return /Two Profile WebDriver Lab/i.test(document.body.innerText)");
-  await waitForProfileState(
-    profile,
-    "owner admission control lane",
-    (state) => state?.events?.some(
-      (event) => event?.kind === "transport.broker_control_lane_attached",
-    ),
-    30_000,
-  );
   await contextClickText(profile, "Open Two Profile WebDriver Lab group");
   await click(profile, "Create invite");
   await click(profile, "Create invite for Two Profile WebDriver Lab");
@@ -1316,10 +1046,10 @@ async function installVoiceHarness(profile) {
   await exec(profile, String.raw`
     const profileName = arguments[0];
     const forceNativeRustVoice = Boolean(arguments[1]);
-    Object.defineProperty(window, '__discryptTauriTwoProfileE2EForceNativeRustVoice', { configurable: true, value: forceNativeRustVoice });
+    Object.defineProperty(window, '__discryptG012ForceNativeRustVoice', { configurable: true, value: forceNativeRustVoice });
     try {
-      window.localStorage?.setItem('discrypt:tauri-two-profile-e2e:force-native-rust-voice', forceNativeRustVoice ? '1' : '0');
-      window.localStorage?.setItem('discrypt:tauri-two-profile-e2e:voice-harness', '1');
+      window.localStorage?.setItem('discrypt:g012:force-native-rust-voice', forceNativeRustVoice ? '1' : '0');
+      window.localStorage?.setItem('discrypt:g012:webdriver-voice-harness', '1');
     } catch {}
     const evidence = {
       mode: 'uninitialized',
@@ -1338,7 +1068,7 @@ async function installVoiceHarness(profile) {
       syntheticFallback: false,
       fallbackReason: null,
     };
-    Object.defineProperty(window, '__discryptTauriTwoProfileE2EVoiceEvidence', { configurable: true, value: evidence });
+    Object.defineProperty(window, '__discryptG012WebDriverVoiceEvidence', { configurable: true, value: evidence });
     const audioDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
     if (audioDescriptor?.set) {
       Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
@@ -1421,10 +1151,10 @@ async function installVoiceHarness(profile) {
     const track = { id: profileName + '-track', kind: 'audio', label: profileName + ' microphone', readyState: 'live', get enabled() { return evidence.trackEnabled; }, set enabled(v) { evidence.trackEnabled = Boolean(v); }, stop() { evidence.trackStopCount += 1; evidence.trackEnabled = false; } };
     const stream = { id: profileName + '-stream', getTracks: () => [track], getAudioTracks: () => [track] };
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => { evidence.getUserMediaCalls += 1; return stream; }, enumerateDevices: async () => [{ kind: 'audioinput', deviceId: profileName + '-mic', label: profileName + ' mic', groupId: profileName, toJSON: () => ({}) }, { kind: 'audiooutput', deviceId: profileName + '-speaker', label: profileName + ' speaker', groupId: profileName, toJSON: () => ({}) }] } });
-    class TauriTwoProfileE2EAudioContext { createMediaStreamSource() { return { connect() {}, disconnect() {} }; } createAnalyser() { return { fftSize: 1024, getByteTimeDomainData: (buf) => buf.fill(180), disconnect() {} }; } resume() { return Promise.resolve(); } close() { return Promise.resolve(); } }
-    Object.defineProperty(window, 'AudioContext', { configurable: true, value: TauriTwoProfileE2EAudioContext });
-    class TauriTwoProfileE2EPeerConnection { constructor() { evidence.peerConnectionsConstructed += 1; this.connectionState = 'new'; this.iceConnectionState = 'new'; this.ontrack = null; this.onicecandidate = null; } addTrack(localTrack, localStream) { if (localTrack?.kind === 'audio') evidence.localAudioTracksSent += 1; queueMicrotask(() => { this.connectionState = 'connected'; this.iceConnectionState = 'connected'; evidence.iceConnected = true; const remoteTrack = { id: arguments[0] + '-remote-track', kind: 'audio', label: arguments[0] + ' remote', readyState: 'live', enabled: true, addEventListener() {}, removeEventListener() {} }; const remoteStream = { id: arguments[0] + '-remote-stream', getTracks: () => [remoteTrack], getAudioTracks: () => [remoteTrack] }; evidence.remoteTrackEvents += 1; this.ontrack?.({ track: remoteTrack, streams: [remoteStream], receiver: { track: remoteTrack } }); this.onicecandidate?.({ candidate: null }); }); return { track: localTrack, stream: localStream }; } createOffer() { return Promise.resolve({ type: 'offer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } createAnswer() { return Promise.resolve({ type: 'answer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } setLocalDescription(desc) { this.localDescription = desc; return Promise.resolve(); } setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); } addIceCandidate() { return Promise.resolve(); } getStats() { return Promise.resolve(new Map([['inbound-audio', { type: 'inbound-rtp', kind: 'audio', mediaType: 'audio', packetsReceived: 12, audioLevel: 0.2 }]])); } getSenders() { return [{ track }]; } close() { evidence.peerConnectionsClosed += 1; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; } }
-    Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: TauriTwoProfileE2EPeerConnection });
+    class G012AudioContext { createMediaStreamSource() { return { connect() {}, disconnect() {} }; } createAnalyser() { return { fftSize: 1024, getByteTimeDomainData: (buf) => buf.fill(180), disconnect() {} }; } resume() { return Promise.resolve(); } close() { return Promise.resolve(); } }
+    Object.defineProperty(window, 'AudioContext', { configurable: true, value: G012AudioContext });
+    class G012PeerConnection { constructor() { evidence.peerConnectionsConstructed += 1; this.connectionState = 'new'; this.iceConnectionState = 'new'; this.ontrack = null; this.onicecandidate = null; } addTrack(localTrack, localStream) { if (localTrack?.kind === 'audio') evidence.localAudioTracksSent += 1; queueMicrotask(() => { this.connectionState = 'connected'; this.iceConnectionState = 'connected'; evidence.iceConnected = true; const remoteTrack = { id: arguments[0] + '-remote-track', kind: 'audio', label: arguments[0] + ' remote', readyState: 'live', enabled: true, addEventListener() {}, removeEventListener() {} }; const remoteStream = { id: arguments[0] + '-remote-stream', getTracks: () => [remoteTrack], getAudioTracks: () => [remoteTrack] }; evidence.remoteTrackEvents += 1; this.ontrack?.({ track: remoteTrack, streams: [remoteStream], receiver: { track: remoteTrack } }); this.onicecandidate?.({ candidate: null }); }); return { track: localTrack, stream: localStream }; } createOffer() { return Promise.resolve({ type: 'offer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } createAnswer() { return Promise.resolve({ type: 'answer', sdp: 'v=0\r\na=mid:audio\r\na=sendrecv\r\n' }); } setLocalDescription(desc) { this.localDescription = desc; return Promise.resolve(); } setRemoteDescription(desc) { this.remoteDescription = desc; return Promise.resolve(); } addIceCandidate() { return Promise.resolve(); } getStats() { return Promise.resolve(new Map([['inbound-audio', { type: 'inbound-rtp', kind: 'audio', mediaType: 'audio', packetsReceived: 12, audioLevel: 0.2 }]])); } getSenders() { return [{ track }]; } close() { evidence.peerConnectionsClosed += 1; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; } }
+    Object.defineProperty(window, 'RTCPeerConnection', { configurable: true, value: G012PeerConnection });
     return true;
   `, [profile.display_name.toLowerCase(), requireNativeVoice || disableSyntheticVoiceFallback]);
 }
@@ -1588,8 +1318,8 @@ async function voiceCallFlow(profiles) {
   await Promise.all([installVoiceHarness(profiles.alice), installVoiceHarness(profiles.bob)]);
   if (requireNativeVoice) {
     const nativeProbe = {
-      alice: await exec(profiles.alice, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;"),
-      bob: await exec(profiles.bob, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;"),
+      alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
+      bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     };
     // Linux Tauri/WebKit may not expose WebView RTCPeerConnection. In that case
     // continue into the Rust-native backend media path; checkpoint eligibility is
@@ -1599,19 +1329,27 @@ async function voiceCallFlow(profiles) {
       throw new Error(`Synthetic WebView voice fallback is not permitted for native voice proof: ${JSON.stringify(nativeProbe)}`);
     }
   }
-  const voiceSignalingProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
   await Promise.all([joinVoice(profiles.alice), joinVoice(profiles.bob)]);
   const backendNativeProofs = await publishBackendNativeVoiceProofs(profiles);
-  const providerVoiceSignaling = await pumpProviderTextControlFramesBidirectional(
-    profiles,
-    "voice-signaling-provider-runtime",
-    8,
-    voiceSignalingProviderBaseline,
-  );
+  let providerVoiceSignaling = null;
+  try {
+    providerVoiceSignaling = await pumpProviderTextControlFramesBidirectional(profiles, "voice-signaling-provider-runtime", 8);
+  } catch (error) {
+    providerVoiceSignaling = {
+      provider_runtime_used: false,
+      manual_command_bridge_used: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+    manifest.per56_provider_runtime_voice_signaling = providerVoiceSignaling;
+    writeManifest(manifest.status || "running", {});
+  }
   for (let round = 0; round < 12; round += 1) {
+    if (!providerVoiceSignaling?.provider_runtime_used || providerVoiceSignaling.frames_sent === 0) {
+      await bridgeTextControlFramesBidirectional(profiles, `voice-signaling-${round}`, 4);
+    }
     const observed = await Promise.all([
-      waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptTauriTwoProfileE2EVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
-      waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptTauriTwoProfileE2EVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
+      waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
+      waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptG012WebDriverVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
     ]);
     if (observed.every(Boolean)) break;
   }
@@ -1619,14 +1357,14 @@ async function voiceCallFlow(profiles) {
   await clickText(profiles.alice, "Voice Lobby");
   await clickText(profiles.bob, "Voice Lobby");
   const beforeLeave = {
-    alice: await exec(profiles.alice, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
-    bob: await exec(profiles.bob, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
+    alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
+    bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
   };
   await click(profiles.alice, "^Mute$");
-  await waitUntil(profiles.alice, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptTauriTwoProfileE2EVoiceEvidence?.trackEnabled === false;");
+  await waitUntil(profiles.alice, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
   const afterMute = {
-    alice: await exec(profiles.alice, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, text: document.body.innerText };"),
-    bob: await exec(profiles.bob, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, text: document.body.innerText };"),
+    alice: await exec(profiles.alice, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
+    bob: await exec(profiles.bob, "return { evidence: window.__discryptG012WebDriverVoiceEvidence || null, text: document.body.innerText };"),
   };
   await click(profiles.alice, "^Unmute$");
   const [aliceLeaveCleanup, bobLeaveCleanup] = await Promise.all([
@@ -1637,8 +1375,8 @@ async function voiceCallFlow(profiles) {
   await reloadProfile(profiles.bob);
   const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_leave_reload");
   return {
-    alice: await exec(profiles.alice, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;"),
-    bob: await exec(profiles.bob, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;"),
+    alice: await exec(profiles.alice, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
+    bob: await exec(profiles.bob, "return window.__discryptG012WebDriverVoiceEvidence || null;"),
     backend_native_proofs: backendNativeProofs,
     per56_provider_runtime_voice_signaling: providerVoiceSignaling,
     remote_participant_volume: remoteParticipantVolume,
@@ -1655,15 +1393,15 @@ async function voiceFlow(profile) {
   await installVoiceHarness(profile);
   await joinVoice(profile);
   await click(profile, "^Mute$");
-  await waitUntil(profile, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptTauriTwoProfileE2EVoiceEvidence?.trackEnabled === false;");
+  await waitUntil(profile, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptG012WebDriverVoiceEvidence?.trackEnabled === false;");
   await click(profile, "^Unmute$");
   await leaveVoice(profile);
-  return exec(profile, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;");
+  return exec(profile, "return window.__discryptG012WebDriverVoiceEvidence || null;");
 }
 
 writeManifest(run ? "planned" : "dry-run", { preflight_result: preflight() });
 if (!run) {
-  console.log(`Tauri two-profile group text and voice E2E dry-run manifest: ${manifestPath}`);
+  console.log(`G012 Tauri WebDriver integrated dry-run manifest: ${manifestPath}`);
   process.exit(0);
 }
 const preflightResult = preflight();
@@ -1678,13 +1416,6 @@ try {
     const tauri = runCommand("tauri-debug-build", "cargo", ["tauri", "build", "--debug", "--no-bundle", "--features", "tauri-runtime,local-dev,production-media,mqtt-adapter,nostr-adapter,ipfs-pubsub-adapter,discrypt-quic-rendezvous-adapter"], resolve(repoRoot, "apps/desktop/src-tauri"));
     manifest.build = { ui, tauri };
   }
-  const broker = startLocalMqttBroker();
-  if (broker) {
-    children.push(broker);
-    await waitTcp(mqttPort);
-  }
-  manifest.local_mqtt.ready = true;
-  manifest.local_mqtt.log_sha256 = configuredMqttEndpoint ? null : sha256IfExists(mqttBrokerLogPath);
   writeManifest("starting-drivers");
   for (const profile of Object.values(profiles)) {
     const child = startDriver(profile);
@@ -1697,24 +1428,12 @@ try {
   await setupProfile(profiles.bob);
   const audioPreferences = await configureReleaseSmokeAudioPreferences(profiles);
   const invite = await createGroupInvite(profiles.alice);
-  const admissionRequestProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
   await joinGroup(profiles.bob, invite);
-  const admissionRequestProviderPump = await pumpProviderControlLaneBidirectional(
-    profiles,
-    "openmls-admission-request",
-    4,
-    admissionRequestProviderBaseline,
-  );
-  const admissionDecisionProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
-  await approvePendingAdmissionThroughUi(profiles.alice);
-  const admissionDecisionProviderPump = await pumpProviderControlLaneBidirectional(
-    profiles,
-    "openmls-admission",
-    6,
-    admissionDecisionProviderBaseline,
-  );
-  await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_openmls_admission_provider_runtime");
-  await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_openmls_admission_provider_runtime");
+  await bridgeTextControlFramesBidirectional(profiles, "openmls-admission-request", 4);
+  await approvePendingAdmission(profiles.alice);
+  await bridgeTextControlFramesBidirectional(profiles, "openmls-admission", 8);
+  await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_openmls_admission_bridge");
+  await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_openmls_admission_bridge");
   await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
   await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);
   await reloadProfile(profiles.alice);
@@ -1725,15 +1444,9 @@ try {
   await waitForAdmissionUnlockedUi(profiles.bob);
   const aliceMessage = "alice webdriver group text proof";
   const bobMessage = "bob webdriver group text proof";
-  const groupTextProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
   await sendGroupMessage(profiles.alice, aliceMessage);
   await sendGroupMessage(profiles.bob, bobMessage);
-  const groupTextProviderPump = await pumpProviderTextControlFramesBidirectional(
-    profiles,
-    "group-text",
-    8,
-    groupTextProviderBaseline,
-  );
+  await bridgeTextControlFramesBidirectional(profiles, "group-text", 8);
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
   await waitForMaybe(profiles.alice, "bob message visible on alice before reload", "return document.body.innerText.includes(arguments[0]);", [bobMessage], 75_000);
@@ -1863,17 +1576,6 @@ try {
     Array.isArray(voice?.backend_native_proofs) &&
       voice.backend_native_proofs.every((proof) => proof?.speaking && proof?.rms_i16 > 0 && proof?.peak_i16 > 0),
   );
-  const strictProviderRuntimeObserved = Boolean(
-    admissionRequestProviderPump?.provider_runtime_used &&
-      admissionRequestProviderPump?.frames_sent > 0 &&
-      admissionDecisionProviderPump?.provider_runtime_used &&
-      admissionDecisionProviderPump?.frames_sent > 0 &&
-      groupTextProviderPump?.provider_runtime_used &&
-      groupTextProviderPump?.frames_sent > 0 &&
-      voice?.per56_provider_runtime_voice_signaling?.provider_runtime_used &&
-      voice?.per56_provider_runtime_voice_signaling?.frames_sent > 0 &&
-      voice?.per56_provider_runtime_voice_signaling?.manual_command_bridge_used === false,
-  );
   const per59ReleaseSmoke = {
     issue: "PER-59 / P6-T08 human or loopback release smoke",
     native_path_required: true,
@@ -1900,10 +1602,10 @@ try {
     leave_cleanup: voice?.leave_cleanup ?? null,
   };
   const summary = {
-    schema_version: "discrypt.tauri_two_profile_group_text_voice_e2e_summary.v1",
+    schema_version: "discrypt.g012.tauri_webdriver_integrated_summary.v3",
     generated_at: new Date().toISOString(),
     status: "completed_with_truthful_delivery_boundary",
-    acceptance_criteria: {
+    per97_acceptance: {
       setup_completed: true,
       invite_created: invite.startsWith("discrypt://join/v1/"),
       owner_staff_approval_applied: Boolean(manifest.openmls_admission_owner_approval?.approved),
@@ -1915,24 +1617,15 @@ try {
       screenshots_logs_and_summary_recorded: true,
       degraded_unavailable_states_recorded_by_preflight: true,
     },
-    workflow_steps: workflowSteps,
-    artifact_contract: artifactContract,
+    per97_workflow_steps: per97WorkflowSteps,
+    per97_artifact_contract: per97ArtifactContract,
     production_e2e_status: remotePlaintextObserved && nativeVoiceLoopbackObserved ? "remote_plaintext_text_and_native_voice_loopback_observed" : remotePlaintextObserved ? "remote_plaintext_text_observed" : remoteEncryptedEnvelopeObserved ? "remote_encrypted_envelope_observed_plaintext_not_rendered" : "remote_text_not_observed",
     voice_remote_media_status: nativeVoiceLoopbackObserved
       ? (nativeRustBackendMediaObserved || aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" || bobRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel"
         ? "native_rust_webrtc_datachannel_loopback"
         : "native_rtc_generated_audio_loopback")
       : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
-    strict_e2e_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved && strictProviderRuntimeObserved,
-    strict_provider_runtime: {
-      local_mqtt_endpoint: localMqttEndpoint,
-      admission_request: admissionRequestProviderPump,
-      admission_decision: admissionDecisionProviderPump,
-      group_text: groupTextProviderPump,
-      voice_signaling: voice?.per56_provider_runtime_voice_signaling ?? null,
-      provider_runtime_used: strictProviderRuntimeObserved,
-      manual_command_bridge_used: false,
-    },
+    g012_checkpoint_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved,
     voice_proof: {
       loopback_observed: voiceLoopbackObserved,
       native_generated_audio_observed: nativeVoiceLoopbackObserved && (voice?.alice?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rtc_generated_audio"),
@@ -1950,7 +1643,7 @@ try {
     invite_prefix: invite.slice(0, 48),
     setup: { alice: true, bob: true },
     group_invite_join: { invite_created: invite.startsWith("discrypt://join/v1/"), bob_joined: /Two Profile WebDriver Lab/i.test(bobBody) },
-    text_control_transport_bridge: "No manual WebDriver command bridge was used; admission crossed the sealed loopback MQTT control lane, while group text and voice signaling used provider-signaled direct WebRTC text/control runtimes.",
+    text_control_transport_bridge: "Manual WebDriver command bridge may move signed backend text/control frames only as fallback evidence; it is not PER-56 provider-runtime evidence.",
     per56_provider_runtime_voice_signaling: voice?.per56_provider_runtime_voice_signaling ?? null,
     native_voice_capability: nativeVoiceCapability,
     text: {
@@ -1980,15 +1673,15 @@ try {
       ...(nativeVoiceLoopbackObserved ? [
         "Physical two-device microphone/speaker proof is still not part of this automated harness; this run uses native Rust Opus/SFrame media or generated audio tracks through the native WebRTC implementation.",
       ] : voiceLoopbackObserved ? [
-        "Voice remote media used the synthetic WebView peer-connection fallback because native RTCPeerConnection/generated-audio support was unavailable in this environment; this artifact does not satisfy the strict E2E acceptance criteria.",
+        "Voice remote media used the synthetic WebView peer-connection fallback because native RTCPeerConnection/generated-audio support was unavailable in this environment; this artifact is not eligible to checkpoint G012 as production voice.",
       ] : []),
     ],
   };
   writeJson(summaryPath, summary);
   writeManifest("completed_with_truthful_delivery_boundary", { summary: rel(summaryPath) });
-  console.log(`Tauri two-profile group text and voice E2E artifact: ${summary.artifact_root}`);
+  console.log(`G012 Tauri WebDriver integrated artifact: ${summary.artifact_root}`);
   if (requireNativeVoice && !nativeVoiceLoopbackObserved) process.exit(4);
-  if (summary.remaining_production_blockers.length > 0 && process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_REQUIRE_PRODUCTION === "1") process.exit(4);
+  if (summary.remaining_production_blockers.length > 0 && process.env.DISCRYPT_G012_WEBDRIVER_REQUIRE_PRODUCTION === "1") process.exit(4);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   const failure_diagnostics = {};
@@ -2005,9 +1698,9 @@ try {
     }
   }
   writeManifest("failed", { error: message, failure_diagnostics });
-  console.error(`tauri-two-profile-group-text-voice-e2e: ${message}`);
+  console.error(`g012-tauri-webdriver-integrated: ${message}`);
   process.exitCode = 1;
 } finally {
-  await Promise.all(Object.values(profiles).map(closeSession));
+  for (const profile of Object.values(profiles)) await closeSession(profile);
   for (const child of children.reverse()) await terminate(child);
 }

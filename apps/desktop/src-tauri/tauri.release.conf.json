@@ -51,20 +51,12 @@
         "depends": [
           "gnome-keyring",
           "dbus-user-session",
-          "libpam-gnome-keyring",
-          "gstreamer1.0-alsa",
-          "gstreamer1.0-plugins-bad",
-          "gstreamer1.0-nice",
-          "gstreamer1.0-pulseaudio"
+          "libpam-gnome-keyring"
         ]
       },
       "rpm": {
         "depends": [
-          "gnome-keyring",
-          "gstreamer1-plugins-base",
-          "gstreamer1-plugins-good",
-          "gstreamer1-plugins-bad-free",
-          "libnice-gstreamer1"
+          "gnome-keyring"
         ]
       }
     }

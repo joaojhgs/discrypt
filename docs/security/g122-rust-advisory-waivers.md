@@ -12,8 +12,8 @@ The required scan is `cargo audit` over the committed `Cargo.lock`, enforced by
 gate no longer permits vulnerability waivers: any future vulnerability ID fails
 CI until the dependency graph is fixed or the release is explicitly held.
 
-The remaining `cargo audit` output is a documented warning watchlist: 18
-unmaintained warnings and 3 unsound warnings. These warnings are not vulnerability
+The remaining `cargo audit` output is a documented warning watchlist: 17
+unmaintained warnings and 1 unsound warning. These warnings are not vulnerability
 waivers and do not prove production readiness by themselves. They remain visible
 so release engineering can replace or target-scope the underlying GTK3/Tauri and
 parser/OpenMLS proof-tooling transitive dependencies before a production release
@@ -54,10 +54,7 @@ removed from the dependency graph and this document is updated.
 | RUSTSEC-2025-0080 | `unic-common` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive `tauri-utils`/`urlpattern` replacement or upstream fix. |
 | RUSTSEC-2025-0100 | `unic-ucd-ident` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive `tauri-utils`/`urlpattern` replacement or upstream fix. |
 | RUSTSEC-2025-0098 | `unic-ucd-version` | unmaintained | desktop runtime owner | 2026-07-31 | Transitive `tauri-utils`/`urlpattern` replacement or upstream fix. |
-| RUSTSEC-2026-0243 | `nostr-relay-pool` | unmaintained | transport dependency owner | 2026-10-31 | Migrate `nostr-sdk` to the maintained 0.45 client stack after adapter compatibility verification; the patched 0.44.3 relay pool remains required by the current 0.44 SDK. |
-| RUSTSEC-2026-0221 | `event-listener` | unsound | transport dependency owner | 2026-10-31 | Avoid non-`Send` listener tags and upgrade through the async dependency graph when a patched release is available. |
 | RUSTSEC-2024-0429 | `glib` | unsound | desktop runtime owner | 2026-07-31 | Tauri/wry/GTK stack upgrade; avoid direct use of `glib::VariantStrIter`; release must target-scope Linux GTK3 exposure. |
-| RUSTSEC-2026-0253 | `lru` | unsound | transport dependency owner | 2026-10-31 | Avoid panic-catching around `LruCache::pop`; upgrade the Nostr dependency graph when a patched release is available. |
 
 ## Release rule
 

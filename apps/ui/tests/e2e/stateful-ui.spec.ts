@@ -82,21 +82,6 @@ async function bootReadyShell(page) {
           disconnect: () => undefined,
         };
       }
-      createGain() {
-        return {
-          gain: { value: 1 },
-          connect: () => undefined,
-          disconnect: () => undefined,
-        };
-      }
-      createMediaStreamDestination() {
-        return {
-          stream: {
-            getTracks: () => [audioTrack],
-            getAudioTracks: () => [audioTrack],
-          },
-        };
-      }
       resume() {
         return Promise.resolve();
       }
@@ -545,30 +530,6 @@ test("main chat layout keeps document fixed and message list scrollable at requi
   }
 });
 
-test("message composer suppresses duplicate activation while send is in flight", async ({
-  page,
-}) => {
-  await openCreateGroupModal(page);
-  await page.getByLabel("Group name").fill("Single Send Lab");
-  await page
-    .getByRole("button", { name: /^Create group$/ })
-    .last()
-    .click();
-  await expect(
-    page.getByRole("heading", { name: "#general", exact: true }),
-  ).toBeVisible();
-
-  const body = "one activation creates one message";
-  await page.getByRole("textbox", { name: "Message" }).fill(body);
-  await page.getByRole("button", { name: /^Send message$/ }).evaluate((button) => {
-    (button as HTMLButtonElement).click();
-    (button as HTMLButtonElement).click();
-  });
-
-  await expect(page.getByTestId("message-row").filter({ hasText: body })).toHaveCount(1);
-  await expect(page.getByRole("textbox", { name: "Message" })).toHaveValue("");
-});
-
 test("theme tokens default dark and drive shadcn shell surfaces", async ({
   page,
 }, testInfo) => {
@@ -663,48 +624,6 @@ test("message rows use compact Discord-like status tooltips", async ({
     fullPage: true,
     path: testInfo.outputPath("message-row-tooltip-mobile.png"),
   });
-});
-
-test("verified peer receipts render as delivered in the message timeline", async ({
-  page,
-}) => {
-  await openCreateGroupModal(page);
-  await page.getByLabel("Group name").fill("Receipt Status Lab");
-  await page
-    .getByRole("button", { name: /^Create group$/ })
-    .last()
-    .click();
-
-  const body = "signed receipt updates the delivery icon";
-  await page.getByRole("textbox", { name: "Message" }).fill(body);
-  await page.getByRole("button", { name: /^Send message$/ }).click();
-
-  await page.evaluate(
-    ([storageKey, messageBody]) => {
-      const raw = window.localStorage.getItem(storageKey);
-      if (!raw) throw new Error("missing fallback app state");
-      const state = JSON.parse(raw);
-      const message = state.messages.find(
-        (candidate) => candidate.body === messageBody,
-      );
-      if (!message) throw new Error("missing sent message");
-      message.state_key = "peer_receipt";
-      message.state_label = "Peer receipt";
-      message.state_detail =
-        "Signed receipt verified from the expected peer for every encrypted route";
-      window.localStorage.setItem(storageKey, JSON.stringify(state));
-    },
-    ["discrypt.local-dev.app-state.v1", body],
-  );
-  await page.reload();
-
-  const row = page.getByTestId("message-row").filter({ hasText: body });
-  await expect(row).toHaveAttribute("data-message-state", "peer_receipt");
-  const status = row.getByTestId("message-delivery-status");
-  await expect(status).toHaveText("✓");
-  await expect(status).toHaveAccessibleName(
-    /Peer receipt: Signed receipt verified from the expected peer for every encrypted route/i,
-  );
 });
 
 test("direct message send stays command-backed", async ({ page }) => {
@@ -1342,56 +1261,6 @@ test("voice channel click fails closed when microphone permission is denied", as
   await expect(
     page.getByText(/Microphone permission\/input device required/i),
   ).toBeVisible();
-});
-
-test("voice channel reports a busy microphone separately from denied permission", async ({
-  page,
-}) => {
-  await openCreateGroupModal(page);
-  await page.getByLabel("Group name").fill("Voice Device Lab");
-  await page
-    .getByRole("button", { name: /^Create group$/ })
-    .last()
-    .click();
-
-  await page.evaluate(() => {
-    Object.defineProperty(navigator, "mediaDevices", {
-      configurable: true,
-      value: {
-        ...navigator.mediaDevices,
-        getUserMedia: async () => {
-          throw new DOMException("Device or resource busy", "NotReadableError");
-        },
-      },
-    });
-  });
-
-  await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await expect(page.getByText(/microphone could not be opened/i)).toBeVisible();
-  await expect(page.getByText(/permission\/input device required/i)).toHaveCount(0);
-  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
-});
-
-test("voice channel fails closed when the real WebRTC runtime is unavailable", async ({
-  page,
-}) => {
-  await openCreateGroupModal(page);
-  await page.getByLabel("Group name").fill("Voice WebRTC Lab");
-  await page
-    .getByRole("button", { name: /^Create group$/ })
-    .last()
-    .click();
-
-  await page.evaluate(() => {
-    Object.defineProperty(window, "RTCPeerConnection", {
-      configurable: true,
-      value: undefined,
-    });
-  });
-
-  await page.getByRole("button", { name: /Voice Lobby/ }).click();
-  await expect(page.getByText(/WebRTC audio runtime is unavailable/i)).toBeVisible();
-  await expect(page.getByTestId("voice-local-participant")).toHaveCount(0);
 });
 
 // Coverage note: transport status surfaces signaling not-ready state before invite metadata when the diagnostics inspector is explicitly enabled; production default keeps it hidden.

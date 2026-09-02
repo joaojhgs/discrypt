@@ -752,8 +752,6 @@ mod tests {
 
         let sealed = SealedWebRtcNegotiationPayload {
             version: 1,
-            negotiation_id: None,
-            expires_at_unix_seconds: None,
             kind: WebRtcNegotiationPayloadKind::Offer,
             nonce: [7; 12],
             ciphertext: b"opaque ciphertext".to_vec(),
@@ -824,8 +822,6 @@ mod tests {
 
             let sealed_dm_offer = SealedWebRtcNegotiationPayload {
                 version: 1,
-                negotiation_id: None,
-                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [kind as u8; 12],
                 ciphertext: format!("sealed-dm-offer-{}", kind.canonical_name()).into_bytes(),

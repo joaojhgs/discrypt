@@ -7,12 +7,11 @@
 
 #[cfg(feature = "nostr-adapter")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use discrypt_transport::{
-        AdapterTrustLabel, ConnectivityScopeLevel, Endpoint, OpaqueSignalingPayload,
-        ProviderMetadataPosture, SignalingAdapterCapabilities, SignalingAdapterKind,
-        SignalingAdapterProfile, SignalingEndpointSecurity, SignalingPeerId,
-        SignalingProviderEndpoint,
+    use discrypt_transport::signaling::{
+        AdapterTrustLabel, ControlBroadcast, ProviderMetadataPosture, SignalingAdapterCapabilities,
+        SignalingAdapterKind, SignalingAdapterProfile, SignalingEndpointSecurity, SignalingPeerId,
     };
+    use discrypt_transport::{Endpoint, SignalingProviderEndpoint};
 
     let relay = std::env::args()
         .nth(1)
@@ -37,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?,
         };
         let scope = discrypt_transport::ConversationScope::new(
-            ConnectivityScopeLevel::Group,
+            discrypt_transport::ConversationScopeLevel::Group,
             "probe-scope-id-commitment-0123456789abcdef".to_owned(),
         )
         .map_err(|err| format!("scope: {err:?}"))?;
@@ -67,9 +66,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|err| format!("room B join failed: {err:?}"))?;
         println!("room B joined");
 
-        let payload = OpaqueSignalingPayload::new(b"probe-control-payload".to_vec())?;
+        let payload =
+            discrypt_transport::OpaqueSignalingPayload::new(b"probe-control-payload".to_vec());
         room_a
-            .broadcast_control(payload)
+            .publish_control_payload(ControlBroadcast {
+                from_peer: peer_a.clone(),
+                payload,
+            })
             .await
             .map_err(|err| format!("A publish failed: {err:?}"))?;
         println!("A published a control payload");

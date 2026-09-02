@@ -13,9 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
@@ -23,199 +21,8 @@ use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit,
     RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy,
-    RTCPeerConnectionState, RTCSdpType, RTCSessionDescription, RTCStatsReportEntry, Registry,
-    StatsSelector,
+    RTCPeerConnectionState, RTCSdpType, RTCSessionDescription, Registry,
 };
-
-// Keep the SCTP window large enough for several 20 ms voice frames across a WAN RTT,
-// but small enough that a burst of retried control frames cannot monopolize the
-// bidirectional DataChannel before peer acknowledgements release queued bytes.
-const DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES: usize = 8 * 1024;
-const DATA_CHANNEL_CHUNK_MAGIC: &[u8; 4] = b"DCR1";
-const DATA_CHANNEL_CHUNK_HEADER_BYTES: usize = 20;
-const DATA_CHANNEL_CHUNK_PAYLOAD_BYTES: usize = 900;
-const DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES: usize = 1024 * 1024;
-const ICE_CANDIDATE_SETTLE_DURATION: Duration = Duration::from_millis(500);
-const ICE_CANDIDATE_POLL_DURATION: Duration = Duration::from_millis(50);
-
-#[derive(Debug)]
-struct PendingDataChannelFrame {
-    frame_id: u64,
-    total_len: usize,
-    chunk_count: u16,
-    next_chunk_index: u16,
-    bytes: Vec<u8>,
-}
-
-#[derive(Default)]
-struct DataChannelFrameReassembler {
-    pending: Option<PendingDataChannelFrame>,
-}
-
-impl DataChannelFrameReassembler {
-    fn push(&mut self, message: Vec<u8>) -> Result<Option<Vec<u8>>, TransportError> {
-        if !message.starts_with(DATA_CHANNEL_CHUNK_MAGIC) {
-            self.pending = None;
-            if message.len() > DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES {
-                return Err(invalid_data_channel_chunk("raw frame exceeds size limit"));
-            }
-            return Ok(Some(message));
-        }
-
-        let parsed = parse_data_channel_chunk(&message);
-        let (frame_id, total_len, chunk_index, chunk_count, payload) = match parsed {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                self.pending = None;
-                return Err(error);
-            }
-        };
-
-        if chunk_index == 0 {
-            let mut bytes = Vec::with_capacity(total_len);
-            bytes.extend_from_slice(payload);
-            self.pending = Some(PendingDataChannelFrame {
-                frame_id,
-                total_len,
-                chunk_count,
-                next_chunk_index: 1,
-                bytes,
-            });
-            return Ok(None);
-        }
-
-        let Some(mut pending) = self.pending.take() else {
-            return Err(invalid_data_channel_chunk(
-                "continuation arrived without a first chunk",
-            ));
-        };
-        if pending.frame_id != frame_id
-            || pending.total_len != total_len
-            || pending.chunk_count != chunk_count
-            || pending.next_chunk_index != chunk_index
-        {
-            return Err(invalid_data_channel_chunk(
-                "chunk sequence does not match the pending frame",
-            ));
-        }
-        pending.bytes.extend_from_slice(payload);
-        pending.next_chunk_index = pending.next_chunk_index.saturating_add(1);
-        if pending.bytes.len() > pending.total_len {
-            return Err(invalid_data_channel_chunk(
-                "reassembled frame exceeds declared length",
-            ));
-        }
-        if chunk_index.saturating_add(1) == chunk_count {
-            if pending.bytes.len() != pending.total_len {
-                return Err(invalid_data_channel_chunk(
-                    "final chunk does not match declared length",
-                ));
-            }
-            return Ok(Some(pending.bytes));
-        }
-        self.pending = Some(pending);
-        Ok(None)
-    }
-}
-
-fn encode_data_channel_wire_messages(
-    frame_id: u64,
-    frame: &[u8],
-) -> Result<Vec<Vec<u8>>, TransportError> {
-    if frame.is_empty() {
-        return Err(TransportError::Unavailable(
-            "text/control data frame is empty".to_owned(),
-        ));
-    }
-    if frame.len() > DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES {
-        return Err(TransportError::Unavailable(format!(
-            "text/control data frame exceeds {DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES} byte limit"
-        )));
-    }
-    if frame.len() <= DATA_CHANNEL_CHUNK_PAYLOAD_BYTES {
-        return Ok(vec![frame.to_vec()]);
-    }
-
-    let chunk_count = frame.len().div_ceil(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
-    let chunk_count = u16::try_from(chunk_count).map_err(|_| {
-        TransportError::Unavailable("text/control data frame requires too many chunks".to_owned())
-    })?;
-    let total_len = u32::try_from(frame.len()).map_err(|_| {
-        TransportError::Unavailable("text/control data frame length is unsupported".to_owned())
-    })?;
-    let mut messages = Vec::with_capacity(usize::from(chunk_count));
-    for (chunk_index, payload) in frame.chunks(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES).enumerate() {
-        let chunk_index = u16::try_from(chunk_index).map_err(|_| {
-            TransportError::Unavailable(
-                "text/control data frame chunk index is unsupported".to_owned(),
-            )
-        })?;
-        let mut message = Vec::with_capacity(DATA_CHANNEL_CHUNK_HEADER_BYTES + payload.len());
-        message.extend_from_slice(DATA_CHANNEL_CHUNK_MAGIC);
-        message.extend_from_slice(&frame_id.to_be_bytes());
-        message.extend_from_slice(&total_len.to_be_bytes());
-        message.extend_from_slice(&chunk_index.to_be_bytes());
-        message.extend_from_slice(&chunk_count.to_be_bytes());
-        message.extend_from_slice(payload);
-        messages.push(message);
-    }
-    Ok(messages)
-}
-
-fn parse_data_channel_chunk(
-    message: &[u8],
-) -> Result<(u64, usize, u16, u16, &[u8]), TransportError> {
-    if message.len() < DATA_CHANNEL_CHUNK_HEADER_BYTES {
-        return Err(invalid_data_channel_chunk("header is truncated"));
-    }
-    let frame_id = u64::from_be_bytes(
-        message[4..12]
-            .try_into()
-            .map_err(|_| invalid_data_channel_chunk("frame id is malformed"))?,
-    );
-    let total_len = u32::from_be_bytes(
-        message[12..16]
-            .try_into()
-            .map_err(|_| invalid_data_channel_chunk("frame length is malformed"))?,
-    ) as usize;
-    let chunk_index = u16::from_be_bytes(
-        message[16..18]
-            .try_into()
-            .map_err(|_| invalid_data_channel_chunk("chunk index is malformed"))?,
-    );
-    let chunk_count = u16::from_be_bytes(
-        message[18..20]
-            .try_into()
-            .map_err(|_| invalid_data_channel_chunk("chunk count is malformed"))?,
-    );
-    if total_len <= DATA_CHANNEL_CHUNK_PAYLOAD_BYTES
-        || total_len > DATA_CHANNEL_MAX_LOGICAL_FRAME_BYTES
-    {
-        return Err(invalid_data_channel_chunk(
-            "declared frame length is outside chunked bounds",
-        ));
-    }
-    let expected_chunk_count = total_len.div_ceil(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
-    if chunk_count < 2 || usize::from(chunk_count) != expected_chunk_count {
-        return Err(invalid_data_channel_chunk("chunk count is inconsistent"));
-    }
-    if chunk_index >= chunk_count {
-        return Err(invalid_data_channel_chunk("chunk index is out of range"));
-    }
-    let payload = &message[DATA_CHANNEL_CHUNK_HEADER_BYTES..];
-    let offset = usize::from(chunk_index) * DATA_CHANNEL_CHUNK_PAYLOAD_BYTES;
-    let expected_payload_len = (total_len - offset).min(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
-    if payload.len() != expected_payload_len {
-        return Err(invalid_data_channel_chunk(
-            "chunk payload length is inconsistent",
-        ));
-    }
-    Ok((frame_id, total_len, chunk_index, chunk_count, payload))
-}
-
-fn invalid_data_channel_chunk(reason: &str) -> TransportError {
-    TransportError::Unavailable(format!("invalid WebRTC DataChannel chunk: {reason}"))
-}
 
 /// Redacted WebRTC diagnostic timeline safe for logs, Tauri diagnostics, and issue evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -493,39 +300,11 @@ pub enum WebRtcNegotiationPayloadKind {
     Candidate,
 }
 
-/// Opaque per-attempt identifier for a WebRTC offer/answer exchange.
-#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub struct WebRtcNegotiationId([u8; 16]);
-
-impl fmt::Debug for WebRtcNegotiationId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("WebRtcNegotiationId(<redacted>)")
-    }
-}
-
-impl WebRtcNegotiationId {
-    /// Generate a fresh negotiation id for one offer/answer generation.
-    #[must_use]
-    pub fn generate() -> Self {
-        use rand::RngCore;
-
-        let mut id = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut id);
-        Self(id)
-    }
-}
-
 /// AES-GCM sealed WebRTC negotiation payload safe to hand to the signaling service.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SealedWebRtcNegotiationPayload {
     /// Wire format version.
     pub version: u8,
-    /// Opaque attempt id binding offers, answers, and candidates from one exchange.
-    #[serde(default)]
-    pub negotiation_id: Option<WebRtcNegotiationId>,
-    /// Sender-declared expiry for this negotiation generation.
-    #[serde(default)]
-    pub expires_at_unix_seconds: Option<i64>,
     /// Payload kind used as authenticated context.
     pub kind: WebRtcNegotiationPayloadKind,
     /// 96-bit AES-GCM nonce.
@@ -539,8 +318,6 @@ impl fmt::Debug for SealedWebRtcNegotiationPayload {
         formatter
             .debug_struct("SealedWebRtcNegotiationPayload")
             .field("version", &self.version)
-            .field("negotiation_id", &self.negotiation_id.map(|_| "<redacted>"))
-            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
             .field("kind", &self.kind)
             .field("nonce", &"<redacted>")
             .field(
@@ -593,30 +370,11 @@ impl WebRtcNegotiationSealer {
         &self,
         description: &WebRtcSessionDescription,
     ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
-        self.seal_description_for_negotiation(description, None)
-    }
-
-    /// Seal an SDP offer or answer bound to one offer/answer generation.
-    pub fn seal_description_for_negotiation(
-        &self,
-        description: &WebRtcSessionDescription,
-        negotiation_id: Option<WebRtcNegotiationId>,
-    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
-        self.seal_description_for_negotiation_until(description, negotiation_id, None)
-    }
-
-    /// Seal an SDP offer or answer bound to one offer/answer generation and expiry.
-    pub fn seal_description_for_negotiation_until(
-        &self,
-        description: &WebRtcSessionDescription,
-        negotiation_id: Option<WebRtcNegotiationId>,
-        expires_at_unix_seconds: Option<i64>,
-    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
         let kind = match description.sdp_type {
             WebRtcSdpType::Offer => WebRtcNegotiationPayloadKind::Offer,
             WebRtcSdpType::Answer => WebRtcNegotiationPayloadKind::Answer,
         };
-        self.seal_json(kind, negotiation_id, expires_at_unix_seconds, description)
+        self.seal_json(kind, description)
     }
 
     /// Open a sealed SDP offer or answer.
@@ -639,31 +397,7 @@ impl WebRtcNegotiationSealer {
         &self,
         candidate: &WebRtcIceCandidate,
     ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
-        self.seal_candidate_for_negotiation(candidate, None)
-    }
-
-    /// Seal one trickled ICE candidate bound to one offer/answer generation.
-    pub fn seal_candidate_for_negotiation(
-        &self,
-        candidate: &WebRtcIceCandidate,
-        negotiation_id: Option<WebRtcNegotiationId>,
-    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
-        self.seal_candidate_for_negotiation_until(candidate, negotiation_id, None)
-    }
-
-    /// Seal one trickled ICE candidate bound to one offer/answer generation and expiry.
-    pub fn seal_candidate_for_negotiation_until(
-        &self,
-        candidate: &WebRtcIceCandidate,
-        negotiation_id: Option<WebRtcNegotiationId>,
-        expires_at_unix_seconds: Option<i64>,
-    ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
-        self.seal_json(
-            WebRtcNegotiationPayloadKind::Candidate,
-            negotiation_id,
-            expires_at_unix_seconds,
-            candidate,
-        )
+        self.seal_json(WebRtcNegotiationPayloadKind::Candidate, candidate)
     }
 
     /// Open one sealed trickled ICE candidate.
@@ -682,8 +416,6 @@ impl WebRtcNegotiationSealer {
     fn seal_json<T: Serialize>(
         &self,
         kind: WebRtcNegotiationPayloadKind,
-        negotiation_id: Option<WebRtcNegotiationId>,
-        expires_at_unix_seconds: Option<i64>,
         value: &T,
     ) -> Result<SealedWebRtcNegotiationPayload, TransportError> {
         use aes_gcm::aead::{Aead, Payload};
@@ -703,7 +435,7 @@ impl WebRtcNegotiationSealer {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: &plaintext,
-                    aad: aad_for_payload(kind, negotiation_id, expires_at_unix_seconds).as_bytes(),
+                    aad: aad_for_kind(kind).as_bytes(),
                 },
             )
             .map_err(|err| {
@@ -711,8 +443,6 @@ impl WebRtcNegotiationSealer {
             })?;
         Ok(SealedWebRtcNegotiationPayload {
             version: 1,
-            negotiation_id,
-            expires_at_unix_seconds,
             kind,
             nonce,
             ciphertext,
@@ -738,12 +468,7 @@ impl WebRtcNegotiationSealer {
                 Nonce::from_slice(&sealed.nonce),
                 Payload {
                     msg: &sealed.ciphertext,
-                    aad: aad_for_payload(
-                        sealed.kind,
-                        sealed.negotiation_id,
-                        sealed.expires_at_unix_seconds,
-                    )
-                    .as_bytes(),
+                    aad: aad_for_kind(sealed.kind).as_bytes(),
                 },
             )
             .map_err(|err| {
@@ -763,29 +488,6 @@ fn aad_for_kind(kind: WebRtcNegotiationPayloadKind) -> &'static str {
     }
 }
 
-fn aad_for_payload(
-    kind: WebRtcNegotiationPayloadKind,
-    negotiation_id: Option<WebRtcNegotiationId>,
-    expires_at_unix_seconds: Option<i64>,
-) -> String {
-    let mut aad = aad_for_kind(kind).to_owned();
-    if let Some(id) = negotiation_id {
-        aad.push_str(":generation:");
-        for byte in id.0 {
-            use std::fmt::Write;
-
-            let _ = write!(aad, "{byte:02x}");
-        }
-    }
-    if let Some(expires_at) = expires_at_unix_seconds {
-        use std::fmt::Write;
-
-        aad.push_str(":expires:");
-        let _ = write!(aad, "{expires_at}");
-    }
-    aad
-}
-
 /// App-facing text/control data transport over an established encrypted WebRTC DataChannel.
 #[async_trait]
 pub trait TextControlDataTransport: Send + Sync {
@@ -797,15 +499,6 @@ pub trait TextControlDataTransport: Send + Sync {
 
     /// Return current DataChannel transport metrics for UI/service state.
     async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics;
-
-    /// Return current transport metrics without waiting on an async runtime.
-    ///
-    /// Implementations should return `None` when they cannot produce a
-    /// nonblocking snapshot. Synchronous status renderers must not enter or
-    /// create a Tokio runtime to obtain metrics.
-    fn text_control_transport_metrics_snapshot(&self) -> Option<WebRtcDataTransportMetrics> {
-        None
-    }
 }
 
 /// DataChannel transport metrics visible to app-service adapters.
@@ -882,17 +575,10 @@ struct DataChannelHub {
     label: String,
     channels: Arc<Mutex<Vec<Arc<dyn DataChannel>>>>,
     channel_keys: Arc<Mutex<HashSet<(String, u16)>>>,
-    open_channel_keys: Arc<Mutex<HashSet<(String, u16)>>>,
-    send_lock: Arc<Mutex<()>>,
-    next_frame_id: Arc<AtomicU64>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     metrics: Arc<Mutex<DataTransportMetricsState>>,
-    open: Arc<AtomicBool>,
-    connection_ready: Arc<AtomicBool>,
-    unavailable: Arc<AtomicBool>,
-    terminal: Arc<AtomicBool>,
-    state_notify: Arc<Notify>,
+    open_notify: Arc<Notify>,
     timeline: Arc<Mutex<DiagnosticTimelineState>>,
 }
 
@@ -901,19 +587,12 @@ impl DataChannelHub {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         Self {
             metrics: Arc::new(Mutex::new(DataTransportMetricsState::new(label.clone()))),
-            open: Arc::new(AtomicBool::new(false)),
-            connection_ready: Arc::new(AtomicBool::new(false)),
-            unavailable: Arc::new(AtomicBool::new(false)),
-            terminal: Arc::new(AtomicBool::new(false)),
             label,
             channels: Arc::new(Mutex::new(Vec::new())),
             channel_keys: Arc::new(Mutex::new(HashSet::new())),
-            open_channel_keys: Arc::new(Mutex::new(HashSet::new())),
-            send_lock: Arc::new(Mutex::new(())),
-            next_frame_id: Arc::new(AtomicU64::new(1)),
             inbound_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
-            state_notify: Arc::new(Notify::new()),
+            open_notify: Arc::new(Notify::new()),
             timeline,
         }
     }
@@ -952,83 +631,33 @@ impl DataChannelHub {
         record_timeline_event(&self.timeline, event).await;
         let inbound_tx = self.inbound_tx.clone();
         let metrics = Arc::clone(&self.metrics);
-        let connection_ready = Arc::clone(&self.connection_ready);
-        let unavailable = Arc::clone(&self.unavailable);
-        let terminal = Arc::clone(&self.terminal);
-        let state_notify = Arc::clone(&self.state_notify);
+        let open_notify = Arc::clone(&self.open_notify);
         let timeline = Arc::clone(&self.timeline);
-        let hub = self.clone();
+        let channels = Arc::clone(&self.channels);
+        let channel_keys = Arc::clone(&self.channel_keys);
         let channel_key = (label, channel.id());
         tokio::spawn(async move {
-            let mut reassembler = DataChannelFrameReassembler::default();
             while let Some(event) = channel.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
-                        let still_attached = hub.mark_data_channel_open(&channel_key).await;
-                        if !still_attached {
-                            break;
-                        }
-                        let terminal = terminal.load(Ordering::Acquire);
-                        let usable = connection_ready.load(Ordering::Acquire) && !terminal;
-                        if usable {
-                            unavailable.store(false, Ordering::Release);
-                        }
                         let mut metrics = metrics.lock().await;
-                        metrics.open = usable;
-                        if !terminal {
-                            metrics.last_state = if usable {
-                                "open"
-                            } else {
-                                "data_channel_open_waiting_for_peer"
-                            }
-                            .to_owned();
-                        }
+                        metrics.open = true;
+                        metrics.last_state = "open".to_owned();
                         drop(metrics);
-                        state_notify.notify_waiters();
+                        open_notify.notify_waiters();
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("open".to_owned());
                         record_timeline_event(&timeline, event).await;
                     }
                     DataChannelEvent::OnMessage(message) => {
-                        let bytes = match reassembler.push(message.data.to_vec()) {
-                            Ok(Some(bytes)) => bytes,
-                            Ok(None) => {
-                                metrics.lock().await.last_state = "chunk_received".to_owned();
-                                continue;
-                            }
-                            Err(error) => {
-                                metrics.lock().await.last_state = "message_rejected".to_owned();
-                                if webrtc_debug_enabled() {
-                                    eprintln!(
-                                        "discrypt-webrtc-data-channel event=reject reason={error}"
-                                    );
-                                }
-                                let mut event = diagnostic_event("data_channel");
-                                event.peer_role = Some("local".to_owned());
-                                event.direction = Some("remote".to_owned());
-                                event.state = Some("message_rejected".to_owned());
-                                event.failure_reason = Some(error.to_string());
-                                record_timeline_event(&timeline, event).await;
-                                continue;
-                            }
-                        };
-                        let frames_received = {
+                        let bytes = message.data.to_vec();
+                        {
                             let mut metrics = metrics.lock().await;
                             metrics.frames_received = metrics.frames_received.saturating_add(1);
                             metrics.bytes_received =
                                 metrics.bytes_received.saturating_add(bytes.len() as u64);
                             metrics.last_state = "message".to_owned();
-                            metrics.frames_received
-                        };
-                        if webrtc_debug_enabled()
-                            && (frames_received <= 3 || frames_received.is_multiple_of(250))
-                        {
-                            eprintln!(
-                                "discrypt-webrtc-data-channel event=receive frame={} bytes={}",
-                                frames_received,
-                                bytes.len()
-                            );
                         }
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
@@ -1041,32 +670,37 @@ impl DataChannelHub {
                         }
                     }
                     DataChannelEvent::OnClose => {
-                        hub.detach_data_channel(&channel_key, "closed").await;
+                        {
+                            channel_keys.lock().await.remove(&channel_key);
+                            let mut channels = channels.lock().await;
+                            channels.retain(|attached| attached.id() != channel_key.1);
+                            let mut metrics = metrics.lock().await;
+                            metrics.attached_channels = channels.len() as u64;
+                            metrics.open = false;
+                            metrics.last_state = "closed".to_owned();
+                        }
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closed".to_owned());
                         record_timeline_event(&timeline, event).await;
-                        state_notify.notify_waiters();
                         break;
                     }
                     DataChannelEvent::OnClosing => {
-                        hub.detach_data_channel(&channel_key, "closing").await;
+                        let mut metrics = metrics.lock().await;
+                        metrics.last_state = "closing".to_owned();
+                        drop(metrics);
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("closing".to_owned());
                         record_timeline_event(&timeline, event).await;
-                        state_notify.notify_waiters();
-                        break;
                     }
                     DataChannelEvent::OnError => {
-                        hub.detach_data_channel(&channel_key, "error").await;
+                        metrics.lock().await.last_state = "error".to_owned();
                         let mut event = diagnostic_event("data_channel");
                         event.peer_role = Some("local".to_owned());
                         event.state = Some("error".to_owned());
                         event.failure_reason = Some("DataChannel event error".to_owned());
                         record_timeline_event(&timeline, event).await;
-                        state_notify.notify_waiters();
-                        break;
                     }
                     DataChannelEvent::OnBufferedAmountLow => {
                         metrics.lock().await.last_state = "buffered_amount_low".to_owned();
@@ -1080,63 +714,47 @@ impl DataChannelHub {
     }
 
     async fn wait_open(&self, duration: Duration) -> Result<(), TransportError> {
-        let deadline = Instant::now() + duration;
-        loop {
-            let notified = self.state_notify.notified();
-            if self.is_usable() {
-                return Ok(());
-            }
-            if self.unavailable.load(Ordering::Acquire) {
-                return Err(self.unavailable_error());
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
-            if timeout(remaining, notified).await.is_err() {
-                break;
-            }
+        if self.metrics.lock().await.open {
+            return Ok(());
         }
-        let mut event = diagnostic_event("failure");
-        event.peer_role = Some("local".to_owned());
-        event.failure_reason = Some("DataChannel did not open".to_owned());
-        record_timeline_event(&self.timeline, event).await;
-        Err(TransportError::Unavailable(
-            "DataChannel did not open".to_owned(),
-        ))
+        if timeout(duration, self.open_notify.notified())
+            .await
+            .is_err()
+        {
+            let mut event = diagnostic_event("failure");
+            event.peer_role = Some("local".to_owned());
+            event.failure_reason = Some("DataChannel did not open".to_owned());
+            record_timeline_event(&self.timeline, event).await;
+            return Err(TransportError::Unavailable(
+                "DataChannel did not open".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
-        let frame_id = self.next_frame_id.fetch_add(1, Ordering::Relaxed);
-        let wire_messages = encode_data_channel_wire_messages(frame_id, &frame)?;
+        if frame.is_empty() {
+            return Err(TransportError::Unavailable(
+                "text/control data frame is empty".to_owned(),
+            ));
+        }
         self.wait_open(Duration::from_secs(10)).await?;
-        if !self.is_usable() {
-            return Err(self.unavailable_error());
+        let channels = self.channels.lock().await;
+        let channel = channels
+            .first()
+            .cloned()
+            .ok_or_else(|| TransportError::Unavailable("no DataChannel attached".to_owned()))?;
+        drop(channels);
+        if channel.ready_state().await.map_err(data_channel_error)? != RTCDataChannelState::Open {
+            return Err(TransportError::Unavailable(
+                "DataChannel is not open".to_owned(),
+            ));
         }
-        let _send_guard = self.send_lock.lock().await;
-        let open_channel_keys = self.open_channel_keys.lock().await.clone();
-        let channels = self.channels.lock().await.clone();
-        let mut selected = None;
-        for channel in channels {
-            let channel_key = (self.label.clone(), channel.id());
-            if !open_channel_keys.contains(&channel_key) {
-                continue;
-            }
-            if channel.ready_state().await.map_err(data_channel_error)? == RTCDataChannelState::Open
-            {
-                selected = Some(channel);
-                break;
-            }
-        }
-        let channel = selected.ok_or_else(|| {
-            TransportError::Unavailable("no open DataChannel attached".to_owned())
-        })?;
         let sent_len = frame.len();
-        for message in wire_messages {
-            channel
-                .send(BytesMut::from(message.as_slice()))
-                .await
-                .map_err(data_channel_error)?;
-        }
+        channel
+            .send(BytesMut::from(frame.as_slice()))
+            .await
+            .map_err(data_channel_error)?;
         let mut metrics = self.metrics.lock().await;
         metrics.frames_sent = metrics.frames_sent.saturating_add(1);
         metrics.bytes_sent = metrics.bytes_sent.saturating_add(sent_len as u64);
@@ -1151,131 +769,16 @@ impl DataChannelHub {
         Ok(())
     }
 
-    async fn detach_data_channel(&self, channel_key: &(String, u16), last_state: &str) {
-        self.channel_keys.lock().await.remove(channel_key);
-        self.open_channel_keys.lock().await.remove(channel_key);
-        let mut channels = self.channels.lock().await;
-        channels.retain(|attached| attached.id() != channel_key.1);
-        let attached_channels = channels.len() as u64;
-        drop(channels);
-
-        let has_open_channel = !self.open_channel_keys.lock().await.is_empty();
-        let terminal = self.terminal.load(Ordering::Acquire);
-        let usable = has_open_channel && self.connection_ready.load(Ordering::Acquire) && !terminal;
-        self.open.store(has_open_channel, Ordering::Release);
-        self.unavailable
-            .store(!has_open_channel || terminal, Ordering::Release);
-
-        let mut metrics = self.metrics.lock().await;
-        metrics.attached_channels = attached_channels;
-        metrics.open = usable;
-        metrics.last_state = last_state.to_owned();
-    }
-
-    async fn mark_data_channel_open(&self, channel_key: &(String, u16)) -> bool {
-        if !self.channel_keys.lock().await.contains(channel_key) {
-            return false;
-        }
-        self.open_channel_keys
-            .lock()
-            .await
-            .insert(channel_key.clone());
-        self.open.store(true, Ordering::Release);
-        true
-    }
-
     async fn recv(&self) -> Result<Vec<u8>, TransportError> {
-        loop {
-            let notified = self.state_notify.notified();
-            if self.unavailable.load(Ordering::Acquire) {
-                return Err(self.unavailable_error());
-            }
-            let mut inbound_rx = self.inbound_rx.lock().await;
-            tokio::select! {
-                frame = inbound_rx.recv() => {
-                    return frame.ok_or_else(|| {
-                        TransportError::Unavailable("DataChannel receive closed".to_owned())
-                    });
-                }
-                () = notified => {}
-            }
-        }
+        let mut inbound_rx = self.inbound_rx.lock().await;
+        inbound_rx
+            .recv()
+            .await
+            .ok_or_else(|| TransportError::Unavailable("DataChannel receive closed".to_owned()))
     }
 
     async fn snapshot(&self) -> WebRtcDataTransportMetrics {
         self.metrics.lock().await.snapshot()
-    }
-
-    fn snapshot_nonblocking(&self) -> WebRtcDataTransportMetrics {
-        if let Ok(metrics) = self.metrics.try_lock() {
-            return metrics.snapshot();
-        }
-        let open = self.is_usable();
-        WebRtcDataTransportMetrics {
-            schema_version: WebRtcDataTransportMetrics::SCHEMA_VERSION,
-            label: self.label.clone(),
-            attached_channels: u64::from(open),
-            open,
-            frames_sent: 0,
-            frames_received: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            last_state: if open { "open" } else { "closed" }.to_owned(),
-        }
-    }
-
-    fn is_usable(&self) -> bool {
-        !self.terminal.load(Ordering::Acquire)
-            && self.open.load(Ordering::Acquire)
-            && self.connection_ready.load(Ordering::Acquire)
-    }
-
-    fn unavailable_error(&self) -> TransportError {
-        TransportError::Unavailable(
-            "WebRTC peer connection or DataChannel is no longer usable".to_owned(),
-        )
-    }
-
-    async fn set_peer_connection_state(&self, state: RTCPeerConnectionState) {
-        if state == RTCPeerConnectionState::Connected {
-            if self.terminal.load(Ordering::Acquire) {
-                return;
-            }
-            self.connection_ready.store(true, Ordering::Release);
-            if self.open.load(Ordering::Acquire) {
-                self.unavailable.store(false, Ordering::Release);
-            }
-        } else if matches!(
-            state,
-            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-        ) {
-            self.mark_unavailable(format!("peer_connection_{state}"))
-                .await;
-            return;
-        } else {
-            return;
-        }
-        let usable = self.is_usable();
-        let mut metrics = self.metrics.lock().await;
-        metrics.open = usable;
-        metrics.last_state = if usable {
-            "open".to_owned()
-        } else {
-            format!("peer_connection_{state}")
-        };
-        drop(metrics);
-        self.state_notify.notify_waiters();
-    }
-
-    async fn mark_unavailable(&self, last_state: String) {
-        self.terminal.store(true, Ordering::Release);
-        self.connection_ready.store(false, Ordering::Release);
-        self.unavailable.store(true, Ordering::Release);
-        let mut metrics = self.metrics.lock().await;
-        metrics.open = false;
-        metrics.last_state = last_state;
-        drop(metrics);
-        self.state_notify.notify_waiters();
     }
 
     async fn close_all(&self) -> Result<(), TransportError> {
@@ -1283,11 +786,6 @@ impl DataChannelHub {
         for channel in channels {
             channel.close().await.map_err(data_channel_error)?;
         }
-        self.open.store(false, Ordering::Release);
-        self.connection_ready.store(false, Ordering::Release);
-        self.unavailable.store(true, Ordering::Release);
-        self.terminal.store(true, Ordering::Release);
-        self.open_channel_keys.lock().await.clear();
         let mut metrics = self.metrics.lock().await;
         metrics.open = false;
         metrics.last_state = "closed".to_owned();
@@ -1296,7 +794,6 @@ impl DataChannelHub {
         event.peer_role = Some("local".to_owned());
         event.state = Some("closed".to_owned());
         record_timeline_event(&self.timeline, event).await;
-        self.state_notify.notify_waiters();
         Ok(())
     }
 }
@@ -1547,7 +1044,6 @@ pub struct WebRtcNegotiator {
     ice_gathering_complete: Arc<Notify>,
     data_channels: DataChannelHub,
     data_channel_label: String,
-    external_candidates_configured: bool,
     turn_endpoints: Vec<Endpoint>,
 }
 
@@ -1600,7 +1096,6 @@ impl WebRtcNegotiator {
             )
             .with_media_engine(media)
             .with_interceptor_registry(registry)
-            .with_data_channel_send_buffer_limit(DATA_CHANNEL_SEND_BUFFER_LIMIT_BYTES)
             .with_handler(handler)
             .with_udp_addrs(config.udp_addrs.clone())
             .build()
@@ -1608,8 +1103,6 @@ impl WebRtcNegotiator {
             .map_err(|err| {
                 TransportError::Unavailable(format!("build WebRTC peer failed: {err}"))
             })?;
-        let external_candidates_configured = !config.ice_servers.stun_servers.is_empty()
-            || !config.ice_servers.turn_servers.is_empty();
         Ok(Self {
             peer_connection: Box::new(peer_connection),
             candidates,
@@ -1619,7 +1112,6 @@ impl WebRtcNegotiator {
             ice_gathering_complete,
             data_channels,
             data_channel_label: config.data_channel_label,
-            external_candidates_configured,
             turn_endpoints: config
                 .ice_servers
                 .turn_servers
@@ -1679,22 +1171,6 @@ impl WebRtcNegotiator {
         self.local_description().await
     }
 
-    /// Create a local offer whose SDP snapshots a stable gathered candidate set.
-    ///
-    /// Some native WebRTC implementations gather usable host and server-reflexive
-    /// candidates without ever reporting the terminal `Complete` state. Provider
-    /// signaling therefore waits for a quiet candidate interval, preferring an
-    /// external candidate when STUN or TURN is configured, and then keeps trickle
-    /// ICE active for candidates that arrive after the bundled SDP is sent.
-    pub async fn create_candidate_bundled_offer(
-        &self,
-        duration: Duration,
-    ) -> Result<WebRtcSessionDescription, TransportError> {
-        let _initial_offer = self.create_offer().await?;
-        self.wait_ice_candidate_snapshot(duration).await?;
-        self.local_description().await
-    }
-
     /// Apply a remote offer, then create and set a local SDP answer.
     pub async fn create_answer(
         &self,
@@ -1748,19 +1224,6 @@ impl WebRtcNegotiator {
     ) -> Result<WebRtcSessionDescription, TransportError> {
         let _initial_answer = self.create_answer(remote_offer).await?;
         self.wait_ice_gathering_complete(duration).await?;
-        self.local_description().await
-    }
-
-    /// Create a local answer whose SDP snapshots a stable gathered candidate set.
-    ///
-    /// This is the answer-side counterpart to [`Self::create_candidate_bundled_offer`].
-    pub async fn create_candidate_bundled_answer(
-        &self,
-        remote_offer: WebRtcSessionDescription,
-        duration: Duration,
-    ) -> Result<WebRtcSessionDescription, TransportError> {
-        let _initial_answer = self.create_answer(remote_offer).await?;
-        self.wait_ice_candidate_snapshot(duration).await?;
         self.local_description().await
     }
 
@@ -1897,51 +1360,6 @@ impl WebRtcNegotiator {
         }
     }
 
-    async fn wait_ice_candidate_snapshot(&self, duration: Duration) -> Result<(), TransportError> {
-        let deadline = Instant::now() + duration;
-        let mut last_candidate_count = 0;
-        let mut last_candidate_change = Instant::now();
-        loop {
-            let (candidate_count, has_external_candidate) = {
-                let candidates = self.candidates.lock().await;
-                (
-                    candidates.len(),
-                    candidates.iter().any(|candidate| {
-                        ice_candidate_type(candidate).is_some_and(|kind| kind != "host")
-                    }),
-                )
-            };
-            if candidate_count != last_candidate_count {
-                last_candidate_count = candidate_count;
-                last_candidate_change = Instant::now();
-            }
-
-            let gathering_complete =
-                self.metrics.lock().await.ice_gathering_state == RTCIceGatheringState::Complete;
-            let preferred_candidate_available = candidate_count > 0
-                && (!self.external_candidates_configured || has_external_candidate);
-            if candidate_count > 0
-                && (gathering_complete
-                    || (preferred_candidate_available
-                        && last_candidate_change.elapsed() >= ICE_CANDIDATE_SETTLE_DURATION))
-            {
-                return Ok(());
-            }
-
-            if Instant::now() >= deadline {
-                return if candidate_count > 0 {
-                    Ok(())
-                } else {
-                    Err(TransportError::Unavailable(format!(
-                        "ICE produced no local candidates within {} ms",
-                        duration.as_millis()
-                    )))
-                };
-            }
-            tokio::time::sleep(ICE_CANDIDATE_POLL_DURATION).await;
-        }
-    }
-
     /// Current direct ICE/WebRTC metrics for app-service/Tauri state surfaces.
     pub async fn direct_path_metrics(&self) -> WebRtcDirectPathMetrics {
         self.metrics.lock().await.snapshot()
@@ -2064,89 +1482,7 @@ impl TextControlDataTransport for WebRtcNegotiator {
     }
 
     async fn text_control_transport_metrics(&self) -> WebRtcDataTransportMetrics {
-        let metrics = self.data_channels.snapshot().await;
-        if webrtc_debug_enabled() {
-            let report = self
-                .peer_connection
-                .get_stats(Instant::now(), StatsSelector::None)
-                .await;
-            let transport = report.transport();
-            let selected_pair = transport.and_then(|transport| {
-                report
-                    .get(&transport.selected_candidate_pair_id)
-                    .and_then(|entry| {
-                        if let RTCStatsReportEntry::IceCandidatePair(pair) = entry {
-                            Some(pair)
-                        } else {
-                            None
-                        }
-                    })
-            });
-            let selected_local = selected_pair.and_then(|pair| {
-                report.get(&pair.local_candidate_id).and_then(|entry| {
-                    if let RTCStatsReportEntry::LocalCandidate(candidate) = entry {
-                        Some(candidate)
-                    } else {
-                        None
-                    }
-                })
-            });
-            let selected_remote = selected_pair.and_then(|pair| {
-                report.get(&pair.remote_candidate_id).and_then(|entry| {
-                    if let RTCStatsReportEntry::RemoteCandidate(candidate) = entry {
-                        Some(candidate)
-                    } else {
-                        None
-                    }
-                })
-            });
-            let (rtc_messages_sent, rtc_messages_received, rtc_bytes_sent, rtc_bytes_received) =
-                report
-                    .data_channels()
-                    .fold((0_u64, 0_u64, 0_u64, 0_u64), |totals, channel| {
-                        (
-                            totals.0.saturating_add(u64::from(channel.messages_sent)),
-                            totals
-                                .1
-                                .saturating_add(u64::from(channel.messages_received)),
-                            totals.2.saturating_add(channel.bytes_sent),
-                            totals.3.saturating_add(channel.bytes_received),
-                        )
-                    });
-            eprintln!(
-                "discrypt-webrtc-data-stats app_messages={}/{} app_bytes={}/{} rtc_messages={}/{} rtc_bytes={}/{} transport_packets={}/{} transport_bytes={}/{} pair_packets={}/{} pair_bytes={}/{} pair_state={:?} nominated={} pair_changes={} local={:?}:{:?}/{:?} remote={:?}:{:?}/{:?}",
-                metrics.frames_sent,
-                metrics.frames_received,
-                metrics.bytes_sent,
-                metrics.bytes_received,
-                rtc_messages_sent,
-                rtc_messages_received,
-                rtc_bytes_sent,
-                rtc_bytes_received,
-                transport.map_or(0, |stats| stats.packets_sent),
-                transport.map_or(0, |stats| stats.packets_received),
-                transport.map_or(0, |stats| stats.bytes_sent),
-                transport.map_or(0, |stats| stats.bytes_received),
-                selected_pair.map_or(0, |pair| pair.packets_sent),
-                selected_pair.map_or(0, |pair| pair.packets_received),
-                selected_pair.map_or(0, |pair| pair.bytes_sent),
-                selected_pair.map_or(0, |pair| pair.bytes_received),
-                selected_pair.map(|pair| pair.state),
-                selected_pair.is_some_and(|pair| pair.nominated),
-                transport.map_or(0, |stats| stats.selected_candidate_pair_changes),
-                selected_local.and_then(|candidate| candidate.address.as_deref()),
-                selected_local.map(|candidate| candidate.port),
-                selected_local.map(|candidate| candidate.candidate_type),
-                selected_remote.and_then(|candidate| candidate.address.as_deref()),
-                selected_remote.map(|candidate| candidate.port),
-                selected_remote.map(|candidate| candidate.candidate_type),
-            );
-        }
-        metrics
-    }
-
-    fn text_control_transport_metrics_snapshot(&self) -> Option<WebRtcDataTransportMetrics> {
-        Some(self.data_channels.snapshot_nonblocking())
+        self.data_channels.snapshot().await
     }
 }
 
@@ -2223,14 +1559,6 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-ice-connection-state state={state}");
         }
         self.metrics.lock().await.ice_connection_state = state;
-        if matches!(
-            state,
-            RTCIceConnectionState::Failed | RTCIceConnectionState::Closed
-        ) {
-            self.data_channels
-                .mark_unavailable(format!("ice_connection_{state}"))
-                .await;
-        }
         let mut event = diagnostic_event("ice_connection_state");
         event.peer_role = Some("local".to_owned());
         event.state = Some(state.to_string());
@@ -2242,7 +1570,6 @@ impl PeerConnectionEventHandler for CandidateCollector {
             eprintln!("discrypt-webrtc-peer-connection-state state={state}");
         }
         self.metrics.lock().await.peer_connection_state = state;
-        self.data_channels.set_peer_connection_state(state).await;
         let mut event = diagnostic_event("peer_connection_state");
         event.peer_role = Some("local".to_owned());
         event.state = Some(state.to_string());
@@ -2340,7 +1667,6 @@ mod tests {
     use crate::{Endpoint, TurnServerConfig};
     use chrono::Duration as ChronoDuration;
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicUsize;
     use tokio::time::{sleep, Duration, Instant};
     use webrtc::data_channel::RTCDataChannelId;
 
@@ -2348,26 +1674,14 @@ mod tests {
         id: RTCDataChannelId,
         label: String,
         events: Mutex<VecDeque<DataChannelEvent>>,
-        ready_state: Mutex<RTCDataChannelState>,
-        sends: AtomicUsize,
     }
 
     impl MockDataChannel {
         fn new(id: RTCDataChannelId, label: &str) -> Self {
-            Self::with_ready_state(id, label, RTCDataChannelState::Open)
-        }
-
-        fn with_ready_state(
-            id: RTCDataChannelId,
-            label: &str,
-            ready_state: RTCDataChannelState,
-        ) -> Self {
             Self {
                 id,
                 label: label.to_owned(),
                 events: Mutex::new(VecDeque::new()),
-                ready_state: Mutex::new(ready_state),
-                sends: AtomicUsize::new(0),
             }
         }
 
@@ -2376,13 +1690,7 @@ mod tests {
                 id,
                 label: label.to_owned(),
                 events: Mutex::new(VecDeque::from(events)),
-                ready_state: Mutex::new(RTCDataChannelState::Open),
-                sends: AtomicUsize::new(0),
             }
-        }
-
-        fn sent_count(&self) -> usize {
-            self.sends.load(Ordering::Acquire)
         }
     }
 
@@ -2417,7 +1725,7 @@ mod tests {
         }
 
         async fn ready_state(&self) -> webrtc::error::Result<RTCDataChannelState> {
-            Ok(*self.ready_state.lock().await)
+            Ok(RTCDataChannelState::Open)
         }
 
         async fn buffered_amount_high_threshold(&self) -> webrtc::error::Result<u32> {
@@ -2443,7 +1751,6 @@ mod tests {
         }
 
         async fn send(&self, _data: BytesMut) -> webrtc::error::Result<()> {
-            self.sends.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -2519,203 +1826,6 @@ mod tests {
             event.kind == "data_channel"
                 && event.state.as_deref() == Some("duplicate_attach_ignored")
         }));
-    }
-
-    #[tokio::test]
-    async fn data_channel_send_skips_stale_first_channel() -> Result<(), TransportError> {
-        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
-        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
-        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
-            .await;
-
-        let stale = Arc::new(MockDataChannel::with_ready_state(
-            7,
-            "discrypt-text-control",
-            RTCDataChannelState::Closing,
-        ));
-        let healthy = Arc::new(MockDataChannel::with_events(
-            8,
-            "discrypt-text-control",
-            vec![DataChannelEvent::OnOpen],
-        ));
-        let stale_channel: Arc<dyn DataChannel> = stale.clone();
-        let healthy_channel: Arc<dyn DataChannel> = healthy.clone();
-        hub.attach(stale_channel).await;
-        hub.attach(healthy_channel).await;
-        sleep(Duration::from_millis(25)).await;
-
-        hub.send(b"receipt over healthy channel".to_vec()).await?;
-
-        assert_eq!(
-            stale.sent_count(),
-            0,
-            "a stale first DataChannel must not receive outgoing frames"
-        );
-        assert_eq!(
-            healthy.sent_count(),
-            1,
-            "outgoing frames must use the open replacement DataChannel"
-        );
-        let metrics = hub.snapshot().await;
-        assert!(
-            metrics.open,
-            "a stale attached channel must not hide a healthy open DataChannel"
-        );
-        assert_eq!(metrics.attached_channels, 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn data_channel_closing_detaches_only_that_channel() -> Result<(), TransportError> {
-        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
-        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
-        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
-            .await;
-
-        let healthy = Arc::new(MockDataChannel::with_events(
-            8,
-            "discrypt-text-control",
-            vec![DataChannelEvent::OnOpen],
-        ));
-        let healthy_channel: Arc<dyn DataChannel> = healthy.clone();
-        hub.attach(healthy_channel).await;
-        sleep(Duration::from_millis(25)).await;
-
-        let closing_channel: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
-            9,
-            "discrypt-text-control",
-            vec![DataChannelEvent::OnClosing],
-        ));
-        hub.attach(closing_channel).await;
-        sleep(Duration::from_millis(25)).await;
-
-        let metrics = hub.snapshot().await;
-        assert!(
-            metrics.open,
-            "detaching one closing channel must preserve another open channel"
-        );
-        assert_eq!(metrics.attached_channels, 1);
-        hub.send(b"still usable after stale closing channel".to_vec())
-            .await?;
-        assert_eq!(healthy.sent_count(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn data_channel_closing_event_loop_cannot_reopen_detached_channel(
-    ) -> Result<(), TransportError> {
-        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
-        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
-        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
-            .await;
-
-        let closing_then_open: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
-            10,
-            "discrypt-text-control",
-            vec![DataChannelEvent::OnClosing, DataChannelEvent::OnOpen],
-        ));
-        hub.attach(closing_then_open).await;
-        sleep(Duration::from_millis(25)).await;
-
-        let metrics = hub.snapshot().await;
-        assert!(
-            !metrics.open,
-            "a detached DataChannel must not re-open the hub from later events"
-        );
-        assert_eq!(metrics.attached_channels, 0);
-        assert_eq!(metrics.last_state, "closing");
-        assert!(!hub.open.load(Ordering::Acquire));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn data_channel_becomes_unusable_when_peer_connection_fails() -> Result<(), TransportError>
-    {
-        let timeline = Arc::new(Mutex::new(DiagnosticTimelineState::default()));
-        let hub = DataChannelHub::new("discrypt-text-control".to_owned(), timeline);
-        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
-            .await;
-        let channel: Arc<dyn DataChannel> = Arc::new(MockDataChannel::with_events(
-            8,
-            "discrypt-text-control",
-            vec![DataChannelEvent::OnOpen],
-        ));
-        hub.attach(channel).await;
-        sleep(Duration::from_millis(25)).await;
-
-        assert!(hub.snapshot().await.open);
-        hub.send(b"connected frame".to_vec()).await?;
-
-        hub.set_peer_connection_state(RTCPeerConnectionState::Failed)
-            .await;
-        hub.set_peer_connection_state(RTCPeerConnectionState::Connected)
-            .await;
-
-        let metrics = hub.snapshot().await;
-        assert!(!metrics.open);
-        assert_eq!(metrics.last_state, "peer_connection_failed");
-        let Err(send_error) = hub.send(b"stale frame".to_vec()).await else {
-            return Err(TransportError::Unavailable(
-                "failed peer connection must reject DataChannel sends".to_owned(),
-            ));
-        };
-        assert!(send_error.to_string().contains("no longer usable"));
-        let Err(receive_error) = hub.recv().await else {
-            return Err(TransportError::Unavailable(
-                "failed peer connection must stop DataChannel receivers".to_owned(),
-            ));
-        };
-        assert!(receive_error.to_string().contains("no longer usable"));
-        Ok(())
-    }
-
-    #[test]
-    fn data_channel_wire_framing_round_trips_large_frames_and_leaves_small_frames_raw(
-    ) -> Result<(), TransportError> {
-        let small = b"opaque-control-frame".to_vec();
-        let small_messages = encode_data_channel_wire_messages(7, &small)?;
-        assert_eq!(small_messages, vec![small]);
-
-        let large = (0_u8..=250).cycle().take(4_097).collect::<Vec<_>>();
-        let messages = encode_data_channel_wire_messages(9, &large)?;
-        assert!(messages.len() > 1);
-        assert!(messages.iter().all(|message| {
-            message.len() <= DATA_CHANNEL_CHUNK_HEADER_BYTES + DATA_CHANNEL_CHUNK_PAYLOAD_BYTES
-        }));
-        assert!(messages
-            .iter()
-            .all(|message| message.starts_with(DATA_CHANNEL_CHUNK_MAGIC)));
-
-        let (last_message, initial_messages) = messages.split_last().ok_or_else(|| {
-            TransportError::Unavailable("chunk encoder returned empty".to_owned())
-        })?;
-        let mut reassembler = DataChannelFrameReassembler::default();
-        for message in initial_messages {
-            assert_eq!(reassembler.push(message.clone())?, None);
-        }
-        assert_eq!(reassembler.push(last_message.clone())?, Some(large));
-        Ok(())
-    }
-
-    #[test]
-    fn data_channel_reassembler_rejects_interleaved_and_malformed_chunks(
-    ) -> Result<(), TransportError> {
-        let first_frame = vec![1_u8; DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 17];
-        let second_frame = vec![2_u8; DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 23];
-        let first_messages = encode_data_channel_wire_messages(11, &first_frame)?;
-        let second_messages = encode_data_channel_wire_messages(12, &second_frame)?;
-        let mut reassembler = DataChannelFrameReassembler::default();
-        assert_eq!(reassembler.push(first_messages[0].clone())?, None);
-        assert!(reassembler.push(second_messages[1].clone()).is_err());
-
-        let mut malformed = second_messages[0].clone();
-        malformed[18..20].copy_from_slice(&1_u16.to_be_bytes());
-        assert!(reassembler.push(malformed).is_err());
-        assert_eq!(
-            reassembler.push(b"recovery-frame".to_vec())?,
-            Some(b"recovery-frame".to_vec())
-        );
-        Ok(())
     }
 
     #[cfg_attr(
@@ -2967,7 +2077,7 @@ mod tests {
             .wait_text_control_transport_ready(Duration::from_secs(5))
             .await?;
 
-        let outbound = (0_u8..=250).cycle().take(4_097).collect::<Vec<_>>();
+        let outbound = b"ciphertext:text-control-frame:v1".to_vec();
         offerer.send_text_control_frame(outbound.clone()).await?;
         let received =
             tokio::time::timeout(Duration::from_secs(5), answerer.recv_text_control_frame())
@@ -2977,7 +2087,7 @@ mod tests {
                 })??;
         assert_eq!(received, outbound);
 
-        let ack = (0_u8..=250).rev().cycle().take(4_113).collect::<Vec<_>>();
+        let ack = b"ciphertext:control-ack:v1".to_vec();
         answerer.send_text_control_frame(ack.clone()).await?;
         let received_ack =
             tokio::time::timeout(Duration::from_secs(5), offerer.recv_text_control_frame())
@@ -2989,29 +2099,13 @@ mod tests {
         let answerer_metrics = answerer.text_control_transport_metrics().await;
         assert!(offerer_metrics.open);
         assert!(answerer_metrics.open);
-        assert!(offerer
-            .text_control_transport_metrics_snapshot()
-            .is_some_and(|metrics| metrics.open));
-        assert!(answerer
-            .text_control_transport_metrics_snapshot()
-            .is_some_and(|metrics| metrics.open));
         assert_eq!(offerer_metrics.frames_sent, 1);
         assert_eq!(offerer_metrics.frames_received, 1);
         assert_eq!(answerer_metrics.frames_sent, 1);
         assert_eq!(answerer_metrics.frames_received, 1);
-        assert_eq!(offerer_metrics.bytes_sent, outbound.len() as u64);
-        assert_eq!(offerer_metrics.bytes_received, ack.len() as u64);
-        assert_eq!(answerer_metrics.bytes_sent, ack.len() as u64);
-        assert_eq!(answerer_metrics.bytes_received, outbound.len() as u64);
 
         offerer.tear_down().await?;
         answerer.tear_down().await?;
-        assert!(offerer
-            .text_control_transport_metrics_snapshot()
-            .is_some_and(|metrics| !metrics.open));
-        assert!(answerer
-            .text_control_transport_metrics_snapshot()
-            .is_some_and(|metrics| !metrics.open));
         let offerer_timeline = offerer.diagnostic_timeline().await;
         assert!(offerer_timeline
             .events
@@ -3166,87 +2260,6 @@ mod tests {
         let decoded = SealedWebRtcNegotiationPayload::from_opaque_bytes(&opaque)?;
         let opened = sealer.open_description(&decoded)?;
         assert_eq!(opened, offer);
-        negotiator.close().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sealer_binds_payloads_to_negotiation_generation() -> Result<(), TransportError> {
-        let negotiator =
-            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
-        let offer = negotiator.create_offer().await?;
-        let sealer = WebRtcNegotiationSealer::new([0x43; 32]);
-        let expected_id = WebRtcNegotiationId::generate();
-        let other_id = WebRtcNegotiationId::generate();
-        let expires_at = Utc::now().timestamp() + 60;
-        let sealed = sealer.seal_description_for_negotiation_until(
-            &offer,
-            Some(expected_id),
-            Some(expires_at),
-        )?;
-        assert_eq!(sealed.negotiation_id, Some(expected_id));
-        assert_eq!(sealed.expires_at_unix_seconds, Some(expires_at));
-        assert_eq!(sealer.open_description(&sealed)?, offer);
-
-        let mut tampered_id = sealed.clone();
-        tampered_id.negotiation_id = Some(other_id);
-        let id_error = match sealer.open_description(&tampered_id) {
-            Ok(_) => {
-                return Err(TransportError::Unavailable(
-                    "changed negotiation id must fail authentication".to_owned(),
-                ))
-            }
-            Err(error) => error,
-        };
-        assert!(id_error
-            .to_string()
-            .contains("open negotiation payload failed"));
-
-        let mut tampered_expiry = sealed;
-        tampered_expiry.expires_at_unix_seconds = Some(expires_at + 1);
-        let expiry_error = match sealer.open_description(&tampered_expiry) {
-            Ok(_) => {
-                return Err(TransportError::Unavailable(
-                    "changed negotiation expiry must fail authentication".to_owned(),
-                ))
-            }
-            Err(error) => error,
-        };
-        assert!(expiry_error
-            .to_string()
-            .contains("open negotiation payload failed"));
-
-        negotiator.close().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sealer_binds_description_to_negotiation_id() -> Result<(), TransportError> {
-        let negotiator =
-            WebRtcNegotiator::new(WebRtcNegotiationConfig::new(test_ice_config()?)).await?;
-        let offer = negotiator.create_offer().await?;
-        let sealer = WebRtcNegotiationSealer::new([0x43; 32]);
-        let negotiation_id = WebRtcNegotiationId::generate();
-        let sealed = sealer.seal_description_for_negotiation(&offer, Some(negotiation_id))?;
-        let opaque = sealed.to_opaque_bytes()?;
-        let decoded = SealedWebRtcNegotiationPayload::from_opaque_bytes(&opaque)?;
-        assert_eq!(decoded.negotiation_id, Some(negotiation_id));
-        assert_eq!(sealer.open_description(&decoded)?, offer);
-
-        let mut missing_id = decoded.clone();
-        missing_id.negotiation_id = None;
-        assert!(
-            sealer.open_description(&missing_id).is_err(),
-            "dropping a bound negotiation id must invalidate the sealed SDP AAD"
-        );
-
-        let mut wrong_id = decoded;
-        wrong_id.negotiation_id = Some(WebRtcNegotiationId::generate());
-        assert!(
-            sealer.open_description(&wrong_id).is_err(),
-            "changing the bound negotiation id must invalidate the sealed SDP AAD"
-        );
-
         negotiator.close().await?;
         Ok(())
     }

@@ -4,7 +4,6 @@
     feature = "ipfs-pubsub-adapter",
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
-#![allow(clippy::expect_used)]
 
 #[cfg(feature = "discrypt-quic-rendezvous-adapter")]
 use discrypt_transport::probe_provider_adapter_roundtrip;
@@ -432,8 +431,6 @@ async fn public_mqtt_two_peer_presence_and_signal_roundtrip() -> Result<(), Tran
 
     let offer = SealedWebRtcNegotiationPayload {
         version: 1,
-        negotiation_id: None,
-        expires_at_unix_seconds: None,
         kind: WebRtcNegotiationPayloadKind::Offer,
         nonce: random_bytes::<12>(),
         ciphertext: b"sealed-offer-ciphertext".to_vec(),
@@ -503,8 +500,6 @@ async fn run_public_nostr_two_peer_roundtrip(
 
     let offer = SealedWebRtcNegotiationPayload {
         version: 1,
-        negotiation_id: None,
-        expires_at_unix_seconds: None,
         kind: WebRtcNegotiationPayloadKind::Offer,
         nonce: random_bytes::<12>(),
         ciphertext: b"sealed-nostr-offer-ciphertext".to_vec(),
@@ -691,8 +686,6 @@ async fn public_ipfs_two_peer_signaling_smoke() -> Result<(), TransportError> {
 
     let offer = SealedWebRtcNegotiationPayload {
         version: 1,
-        negotiation_id: None,
-        expires_at_unix_seconds: None,
         kind: WebRtcNegotiationPayloadKind::Offer,
         nonce: random_bytes::<12>(),
         ciphertext: b"sealed-ipfs-offer-ciphertext".to_vec(),
