@@ -30,10 +30,7 @@ const requiredWarningIds = [
   "RUSTSEC-2025-0080",
   "RUSTSEC-2025-0100",
   "RUSTSEC-2025-0098",
-  "RUSTSEC-2026-0243",
-  "RUSTSEC-2026-0221",
   "RUSTSEC-2024-0429",
-  "RUSTSEC-2026-0253",
 ];
 
 function requireText(name, text, token) {

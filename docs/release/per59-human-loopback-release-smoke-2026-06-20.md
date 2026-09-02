@@ -12,9 +12,9 @@ Run on a display/audio-capable Linux runner with WebKitGTK/JSC 4.1,
 Discrypt Tauri binary:
 
 ```sh
-DISCRYPT_TAURI_TWO_PROFILE_E2E_REQUIRE_NATIVE_VOICE=1 \
+DISCRYPT_G012_REQUIRE_NATIVE_VOICE=1 \
   RUSTUP_TOOLCHAIN=1.89.0 \
-  node scripts/tauri-two-profile-group-text-voice-e2e.mjs \
+  node scripts/g012-tauri-webdriver-integrated.mjs \
     --run \
     --require-native-voice \
     --artifact-dir target/per59-release-smoke/native-tauri-webdriver
@@ -24,13 +24,13 @@ The Docker/Xvfb/Pulse helper remains available for a disposable display/audio
 runner:
 
 ```sh
-DISCRYPT_TAURI_TWO_PROFILE_E2E_ARTIFACT_DIR=target/per59-release-smoke/native-docker-gui-audio \
+DISCRYPT_G012_ARTIFACT_DIR=target/per59-release-smoke/native-docker-gui-audio \
   scripts/g012-docker-tauri-preflight.sh
 ```
 
 ## PASS Conditions
 
-The retained `tauri-two-profile-group-text-voice-e2e-summary.json` must show:
+The retained `tauri-webdriver-integrated-summary.json` must show:
 
 - `per59_release_smoke.join_proved: true`
 - `per59_release_smoke.mute_proved: true`

@@ -117,36 +117,6 @@
     {
       "path": "apps/desktop/src-tauri/src/lib.rs",
       "pattern": "local-dev",
-      "expected": "#[cfg(feature = \"local-dev\")]",
-      "reason": "Unsigned legacy invite compatibility is compiled only for explicit local-dev builds and remains excluded from production feature sets."
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/lib.rs",
-      "pattern": "local-dev",
-      "expected": "#[cfg(feature = \"local-dev\")]",
-      "reason": "Unsigned legacy invite compatibility is compiled only for explicit local-dev builds and remains excluded from production feature sets."
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/lib.rs",
-      "pattern": "local-dev",
-      "expected": "#[cfg(feature = \"local-dev\")]",
-      "reason": "Unsigned legacy invite compatibility is compiled only for explicit local-dev builds and remains excluded from production feature sets."
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/lib.rs",
-      "pattern": "local-dev",
-      "expected": "#[cfg(feature = \"local-dev\")]",
-      "reason": "Unsigned legacy invite compatibility is compiled only for explicit local-dev builds and remains excluded from production feature sets."
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/lib.rs",
-      "pattern": "local-dev",
-      "expected": "/// Security boundary: unsigned legacy invites are accepted only under `local-dev`;",
-      "reason": "The boundary comment documents that unsigned legacy invite support is explicitly local-dev only and excluded from production builds."
-    },
-    {
-      "path": "apps/desktop/src-tauri/src/lib.rs",
-      "pattern": "local-dev",
       "expected": "cfg!(any(test, feature = \"harness\", feature = \"local-dev\"))",
       "reason": "Desktop keeps explicit text runtime attachment behind test/harness/local-dev gates; production builds keep this development path disabled."
     },

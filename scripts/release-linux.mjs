@@ -90,29 +90,13 @@ const linuxRuntimeDependencies = {
   deb: tauriConfig.bundle?.linux?.deb?.depends ?? [],
   rpm: tauriConfig.bundle?.linux?.rpm?.depends ?? [],
 };
-for (const dep of [
-  "gnome-keyring",
-  "dbus-user-session",
-  "libpam-gnome-keyring",
-  "gstreamer1.0-alsa",
-  "gstreamer1.0-plugins-bad",
-  "gstreamer1.0-nice",
-  "gstreamer1.0-pulseaudio",
-]) {
+for (const dep of ["gnome-keyring", "dbus-user-session", "libpam-gnome-keyring"]) {
   if (!linuxRuntimeDependencies.deb.includes(dep)) {
-    fail(`Tauri Debian bundle must declare ${dep} for production storage and voice media`);
+    fail(`Tauri Debian bundle must declare ${dep} because production-storage uses Linux Secret Service`);
   }
 }
-for (const dep of [
-  "gnome-keyring",
-  "gstreamer1-plugins-base",
-  "gstreamer1-plugins-good",
-  "gstreamer1-plugins-bad-free",
-  "libnice-gstreamer1",
-]) {
-  if (!linuxRuntimeDependencies.rpm.includes(dep)) {
-    fail(`Tauri RPM bundle must declare ${dep} for production storage and voice media`);
-  }
+if (!linuxRuntimeDependencies.rpm.includes("gnome-keyring")) {
+  fail("Tauri RPM bundle must declare gnome-keyring because production-storage uses Linux Secret Service");
 }
 const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH ?? capture("git", ["log", "-1", "--format=%ct"]);
 const releaseEnv = { ...process.env, SOURCE_DATE_EPOCH: sourceDateEpoch };

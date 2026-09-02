@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
-const harness = read("scripts/tauri-two-profile-group-text-voice-e2e.mjs");
+const harness = read("scripts/g012-tauri-webdriver-integrated.mjs");
 const handoff = read("docs/release/handoff-2026-06-01.md");
 const failures = [];
 
@@ -24,20 +24,20 @@ for (const token of [
   "fallbackReason",
   "remote_plaintext_text_and_native_voice_loopback_observed",
   "synthetic_peerconnection_fallback_loopback",
-  "strict_e2e_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved && strictProviderRuntimeObserved",
+  "g012_checkpoint_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved",
   "production_claim_allowed: nativeVoiceLoopbackObserved",
-  "this artifact does not satisfy the strict E2E acceptance criteria",
+  "this artifact is not eligible to checkpoint G012 as production voice",
 ]) {
-  requireText("two-profile E2E harness", harness, token);
+  requireText("G012 WebDriver harness", harness, token);
 }
 
 rejectText(
-  "two-profile E2E harness",
+  "G012 WebDriver harness",
   harness,
   "remotePlaintextObserved && voiceLoopbackObserved ? \"remote_plaintext_text_and_voice_loopback_observed\"",
 );
 rejectText(
-  "two-profile E2E harness",
+  "G012 WebDriver harness",
   harness,
   "voiceLoopbackObserved ? \"browser_media_harness_loopback\"",
 );

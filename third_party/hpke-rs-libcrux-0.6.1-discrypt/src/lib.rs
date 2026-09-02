@@ -9,10 +9,10 @@ use zeroize::Zeroize;
 use hpke_rs_crypto::{
     error::Error,
     types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm},
-    CryptoRng as HpkeCryptoRng, HpkeCrypto, HpkeTestRng,
+    CryptoRng, HpkeCrypto, HpkeTestRng,
 };
 
-use rand::{rngs::SysRng, Rng, SeedableRng, TryCryptoRng, TryRng};
+use rand::{rngs::SysRng, Rng, SeedableRng};
 use rand_core::UnwrapErr;
 
 /// The Libcrux HPKE Provider
@@ -340,26 +340,7 @@ impl hpke_rs_crypto::RngCore for HpkeLibcruxPrng {
     }
 }
 
-impl HpkeCryptoRng for HpkeLibcruxPrng {}
-
-impl TryCryptoRng for HpkeLibcruxPrng {}
-
-impl TryRng for HpkeLibcruxPrng {
-    type Error = core::convert::Infallible;
-
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        Ok(self.rng.next_u32())
-    }
-
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.rng.next_u64())
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
-        self.rng.fill_bytes(dest);
-        Ok(())
-    }
-}
+impl CryptoRng for HpkeLibcruxPrng {}
 
 impl HpkeTestRng for HpkeLibcruxPrng {
     type Error = Error;
@@ -376,7 +357,9 @@ impl HpkeTestRng for HpkeLibcruxPrng {
 
     #[cfg(not(feature = "deterministic-prng"))]
     fn try_fill_test_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        hpke_rs_crypto::RngCore::fill_bytes(self, dest);
+        use hpke_rs_crypto::RngCore;
+
+        self.fill_bytes(dest);
         Ok(())
     }
 

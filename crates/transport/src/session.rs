@@ -179,9 +179,6 @@ impl ReconnectBackoffPolicy {
         let exponent = attempt.saturating_sub(1);
         let mut delay = self.initial_delay_ms;
         for _ in 0..exponent {
-            if delay >= self.max_delay_ms {
-                break;
-            }
             delay = delay.saturating_mul(self.multiplier).min(self.max_delay_ms);
         }
         delay.min(self.max_delay_ms)

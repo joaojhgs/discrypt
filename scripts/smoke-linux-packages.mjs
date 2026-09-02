@@ -124,10 +124,6 @@ dpkg-deb -f /tmp/discrypt.deb Depends | tee /tmp/deb-depends.log
 grep -q gnome-keyring /tmp/deb-depends.log
 grep -q dbus-user-session /tmp/deb-depends.log
 grep -q libpam-gnome-keyring /tmp/deb-depends.log
-grep -q gstreamer1.0-alsa /tmp/deb-depends.log
-grep -q gstreamer1.0-plugins-bad /tmp/deb-depends.log
-grep -q gstreamer1.0-nice /tmp/deb-depends.log
-grep -q gstreamer1.0-pulseaudio /tmp/deb-depends.log
 command -v gnome-keyring-daemon
 command -v discrypt-desktop
 rm -rf /tmp/discrypt-home
@@ -162,10 +158,6 @@ steps.push(
 set -euo pipefail
 rpm -qpR /tmp/discrypt.rpm >/tmp/rpm-requires.log
 grep -q '^gnome-keyring$' /tmp/rpm-requires.log
-grep -q '^gstreamer1-plugins-base$' /tmp/rpm-requires.log
-grep -q '^gstreamer1-plugins-good$' /tmp/rpm-requires.log
-grep -q '^gstreamer1-plugins-bad-free$' /tmp/rpm-requires.log
-grep -q '^libnice-gstreamer1$' /tmp/rpm-requires.log
 dnf install -y /tmp/discrypt.rpm xorg-x11-server-Xvfb dbus-x11 >/tmp/install.log 2>&1
 command -v gnome-keyring-daemon
 command -v discrypt-desktop
