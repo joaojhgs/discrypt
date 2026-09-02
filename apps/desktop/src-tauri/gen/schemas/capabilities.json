@@ -1,1 +1,1 @@
-{}
+{"main-app-events":{"identifier":"main-app-events","description":"Allow the main Discrypt window to subscribe to backend app-state events.","local":true,"windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-unlisten"]}}

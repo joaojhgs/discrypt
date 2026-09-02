@@ -30,6 +30,7 @@ async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+cpal = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 hex = "0.4"
 libopus-rs = "0.0.1"
@@ -58,5 +59,6 @@ unwrap_used = "warn"
 expect_used = "warn"
 [patch.crates-io]
 libp2p = { path = "third_party/libp2p-0.56.0-discrypt" }
+hpke-rs = { path = "third_party/hpke-rs-0.6.1-discrypt" }
 hpke-rs-libcrux = { path = "third_party/hpke-rs-libcrux-0.6.1-discrypt" }
-rtc-mdns = { path = "third_party/rtc-mdns-0.20.0-alpha.1-discrypt" }
+libopus-rs = { path = "third_party/libopus-rs-0.0.1-discrypt" }

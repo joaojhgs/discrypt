@@ -50,12 +50,17 @@ fn drive_service_once(service: &mut TauriAppService, drain_ms: u64) -> ControlLa
         limit: Some(16),
         operation_timeout_ms: Some(5_000),
     });
-    let drain = service.drain_text_control_inbound_frames(Some(drain_ms), Some(2_000));
     let mut failures = pump.failures;
-    failures.extend(drain.failures);
+    let inbound_applied = if service.active_text_control_runtime_owns_inbound() {
+        0
+    } else {
+        let drain = service.drain_text_control_inbound_frames(Some(drain_ms), Some(2_000));
+        failures.extend(drain.failures);
+        drain.response_frames_received
+    };
     ControlLaneDriveReport {
         frames_sent: pump.frames_sent,
-        inbound_applied: drain.response_frames_received,
+        inbound_applied,
         failures,
     }
 }
@@ -69,7 +74,21 @@ impl ControlLaneSessionDriver for GlobalControlLaneSessionDriver {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drive_service_once(&mut guard, drain_ms)
+        let report = drive_service_once(&mut guard, drain_ms);
+        let reconnect_session_id = guard.active_text_control_runtime_reconnect_session_id();
+        drop(guard);
+
+        if let Some(session_id) = reconnect_session_id {
+            super::attach_text_control_transport_runtime(
+                super::AttachTextControlTransportRuntimeRequest {
+                    session_id: Some(session_id),
+                    derive_from_state: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        report
     }
 
     fn on_manager_stopped(&self, reason: &str) {
@@ -327,17 +346,6 @@ pub fn control_lane_session_manager_snapshot(
     })
 }
 
-fn active_text_session_id() -> Option<String> {
-    let service = app_service();
-    let guard = service
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
-        .state
-        .transport_session(BackendTransportMode::Text)
-        .map(|session| session.session_id.clone())
-}
-
 /// Tauri command: start the backend-owned broker control lane session manager.
 pub fn start_control_lane_session_manager(
     request: StartControlLaneSessionManagerRequest,
@@ -346,7 +354,11 @@ pub fn start_control_lane_session_manager(
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(session_id) = active_text_session_id() else {
+    let Some(session_id) = guard
+        .state
+        .transport_session(BackendTransportMode::Text)
+        .map(|session| session.session_id.clone())
+    else {
         guard.state.push_command_error(
             "transport.control_session_start_rejected",
             "start_control_lane_session_manager",
@@ -399,7 +411,12 @@ pub fn stop_control_lane_session_manager(
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let session_id = request.session_id.or_else(active_text_session_id);
+    let session_id = request.session_id.or_else(|| {
+        guard
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .map(|session| session.session_id.clone())
+    });
     let Some(session_id) = session_id else {
         guard.state.push_event(
             "transport.control_session_stop_noop",
@@ -433,6 +450,17 @@ pub fn stop_control_lane_session_manager(
 pub fn control_lane_session_manager_status(
     request: ControlLaneSessionManagerStatusRequest,
 ) -> Option<ControlLaneSessionManagerStatusView> {
-    let session_id = request.session_id.or_else(active_text_session_id)?;
+    let session_id = if let Some(session_id) = request.session_id {
+        session_id
+    } else {
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .state
+            .transport_session(BackendTransportMode::Text)
+            .map(|session| session.session_id.clone())?
+    };
     control_lane_session_manager_snapshot(&session_id)
 }

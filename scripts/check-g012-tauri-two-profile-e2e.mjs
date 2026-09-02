@@ -46,7 +46,7 @@ for (const token of [
   "delegated WebDriver integrated E2E",
   "failed-preflight",
   "proven_by_delegated_webdriver_artifact",
-  "node scripts/g012-tauri-webdriver-integrated.mjs --run --require-native-voice",
+  "node scripts/tauri-two-profile-group-text-voice-e2e.mjs --run --require-native-voice",
 ]) requireText("G012 harness", harness, token);
 
 const dryRun = spawnSync(process.execPath, ["scripts/g012-tauri-two-profile-e2e.mjs"], {
@@ -94,7 +94,7 @@ try {
   const delegatedManifest = JSON.parse(readFileSync(resolve(repoRoot, "target/g012-e2e/contract-delegated-dry-run/tauri-two-profile-launch-manifest.json"), "utf8"));
   if (delegatedManifest.runner_mode !== "delegate-webdriver") failures.push("delegated dry-run manifest missing delegate runner mode");
   if (delegatedManifest.evidence_boundary?.evidence_mode !== "delegated-webdriver") failures.push("delegated dry-run manifest missing delegated evidence mode");
-  if (!delegatedManifest.planned_commands?.some((entry) => entry.label === "delegated WebDriver integrated E2E" && entry.rendered.includes("g012-tauri-webdriver-integrated.mjs --run --require-native-voice"))) {
+  if (!delegatedManifest.planned_commands?.some((entry) => entry.label === "delegated WebDriver integrated E2E" && entry.rendered.includes("tauri-two-profile-group-text-voice-e2e.mjs --run --require-native-voice"))) {
     failures.push("delegated dry-run missing integrated WebDriver planned command");
   }
   if (delegatedManifest.evidence_boundary?.production_claim_allowed !== false || delegatedManifest.evidence_boundary?.action_driven_evidence !== false) {

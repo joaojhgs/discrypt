@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "hpke-rs-libcrux"
-version = "0.6.1+discrypt.1"
+version = "0.6.1+discrypt.2"
 authors = ["Franziskus Kiefer <franziskuskiefer@gmail.com>"]
 build = false
 autolib = false
@@ -55,25 +55,27 @@ name = "bench_x25519"
 path = "benches/bench_x25519.rs"
 harness = false
 
+[workspace]
+
 [dependencies.hpke-rs-crypto]
 version = "0.6.1"
 
 [dependencies.libcrux-aead]
-version = "0.0.8"
+version = "0.0.9"
 
 [dependencies.libcrux-ecdh]
-version = "0.0.6"
+version = "0.0.8"
 default-features = false
 
 [dependencies.libcrux-hkdf]
-version = "0.0.6"
+version = "0.0.8"
 
 [dependencies.libcrux-kem]
-version = "0.0.7"
+version = "0.0.9"
 default-features = false
 
 [dependencies.libcrux-traits]
-version = "0.0.7"
+version = "0.0.8"
 default-features = false
 
 [dependencies.rand]

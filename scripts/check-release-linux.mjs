@@ -20,13 +20,29 @@ const failures = [];
 for (const bundle of ["deb", "rpm", "appimage"]) {
   if (!plan.bundles.includes(bundle)) failures.push(`missing Linux bundle target: ${bundle}`);
 }
-for (const dep of ["gnome-keyring", "dbus-user-session", "libpam-gnome-keyring"]) {
+for (const dep of [
+  "gnome-keyring",
+  "dbus-user-session",
+  "libpam-gnome-keyring",
+  "gstreamer1.0-alsa",
+  "gstreamer1.0-plugins-bad",
+  "gstreamer1.0-nice",
+  "gstreamer1.0-pulseaudio",
+]) {
   if (!plan.linuxRuntimeDependencies?.deb?.includes(dep)) {
     failures.push(`release plan missing Debian runtime dependency: ${dep}`);
   }
 }
-if (!plan.linuxRuntimeDependencies?.rpm?.includes("gnome-keyring")) {
-  failures.push("release plan missing RPM runtime dependency: gnome-keyring");
+for (const dep of [
+  "gnome-keyring",
+  "gstreamer1-plugins-base",
+  "gstreamer1-plugins-good",
+  "gstreamer1-plugins-bad-free",
+  "libnice-gstreamer1",
+]) {
+  if (!plan.linuxRuntimeDependencies?.rpm?.includes(dep)) {
+    failures.push(`release plan missing RPM runtime dependency: ${dep}`);
+  }
 }
 for (const feature of [
   "tauri-runtime",

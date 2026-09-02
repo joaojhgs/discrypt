@@ -1050,31 +1050,31 @@ pub trait TextReceiveEventSink {
     fn emit_text_receive_event(&mut self, event: TextReceiveEvent) -> Result<(), DeliveryError>;
 }
 
-/// Per-channel receive ordering and replay state.
+/// Per-channel receive replay state.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TextReceiveState {
     seen: BTreeSet<(u32, u64, String)>,
-    last_sequence_by_leaf: BTreeMap<u32, u64>,
 }
 
 impl TextReceiveState {
-    /// Validate and record one envelope's anti-replay/order key.
+    /// Validate and record one envelope's anti-replay key.
+    ///
+    /// Signed envelopes can arrive out of order across retries and reconnects. Reject an already
+    /// occupied sender sequence slot, but accept an unseen older slot from the current epoch.
     pub fn accept(&mut self, envelope: &TextMessageEnvelope) -> Result<(), DeliveryError> {
         let key = (
             envelope.sender_leaf,
             envelope.sequence,
             envelope.message_id.clone(),
         );
-        if self.seen.contains(&key) {
-            return Err(DeliveryError::TextReceiveReplay {
-                sender_leaf: envelope.sender_leaf,
-                sequence: envelope.sequence,
-            });
-        }
+        let range_start = (envelope.sender_leaf, envelope.sequence, String::new());
         if self
-            .last_sequence_by_leaf
-            .get(&envelope.sender_leaf)
-            .is_some_and(|last| envelope.sequence <= *last)
+            .seen
+            .range(range_start..)
+            .next()
+            .is_some_and(|(sender_leaf, sequence, _)| {
+                *sender_leaf == envelope.sender_leaf && *sequence == envelope.sequence
+            })
         {
             return Err(DeliveryError::TextReceiveReplay {
                 sender_leaf: envelope.sender_leaf,
@@ -1082,8 +1082,6 @@ impl TextReceiveState {
             });
         }
         self.seen.insert(key);
-        self.last_sequence_by_leaf
-            .insert(envelope.sender_leaf, envelope.sequence);
         Ok(())
     }
 }
@@ -2327,12 +2325,21 @@ mod tests {
     fn signed_envelope_for_receive(
         message_id: &str,
     ) -> Result<(TextMessageEnvelope, SigningKey), DeliveryError> {
+        signed_envelope_for_receive_at_sequence(message_id, 2)
+    }
+
+    fn signed_envelope_for_receive_at_sequence(
+        message_id: &str,
+        sequence: u64,
+    ) -> Result<(TextMessageEnvelope, SigningKey), DeliveryError> {
         let signer = signing_key(12);
         let mut log = InMemoryTextAuthorLog::default();
         let mut transport = InMemoryTextTransport::default();
         let mut events = InMemoryTextSendEvents::default();
+        let mut request = outbound_request(message_id);
+        request.sequence = sequence;
         let receipt = TextOutboundPipeline::new(&mut log, &mut transport, &mut events).send(
-            outbound_request(message_id),
+            request,
             selected_route(true),
             b"openmls-text-exporter-secret",
             &signer,
@@ -2400,6 +2407,69 @@ mod tests {
         assert!(matches!(renderable.state, TextRenderState::Locked { .. }));
         assert_eq!(store.entries.len(), 1);
         assert_eq!(events.events[0].kind, TextReceiveEventKind::Updated);
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_text_pipeline_accepts_unseen_out_of_order_sequence_slots(
+    ) -> Result<(), DeliveryError> {
+        let (later, signer) = signed_envelope_for_receive_at_sequence("msg-later", 8)?;
+        let (earlier, _) = signed_envelope_for_receive_at_sequence("msg-earlier", 5)?;
+        let (slot_fork, _) = signed_envelope_for_receive_at_sequence("msg-slot-fork", 5)?;
+        let mut state = TextReceiveState::default();
+        let mut store = InMemoryTextRecipientStore::default();
+        let mut events = InMemoryTextReceiveEvents::default();
+        let request = |envelope| TextInboundRequest {
+            group_id: "group/private-lab".to_owned(),
+            channel_id: "general".to_owned(),
+            current_epoch: 7,
+            authorized_sender_leaves: authorized_leaves(),
+            envelope,
+            received_at_ms: 2_000,
+            retention_allows_decrypt: true,
+        };
+        {
+            let mut pipeline = TextInboundPipeline::new(&mut state, &mut store, &mut events);
+            assert!(pipeline
+                .receive(
+                    request(later),
+                    b"openmls-text-exporter-secret",
+                    &signer.verifying_key(),
+                )
+                .is_ok());
+            assert!(pipeline
+                .receive(
+                    request(earlier.clone()),
+                    b"openmls-text-exporter-secret",
+                    &signer.verifying_key(),
+                )
+                .is_ok());
+            assert_eq!(
+                pipeline.receive(
+                    request(earlier),
+                    b"openmls-text-exporter-secret",
+                    &signer.verifying_key(),
+                ),
+                Err(DeliveryError::TextReceiveReplay {
+                    sender_leaf: 1,
+                    sequence: 5,
+                })
+            );
+            assert_eq!(
+                pipeline.receive(
+                    request(slot_fork),
+                    b"openmls-text-exporter-secret",
+                    &signer.verifying_key(),
+                ),
+                Err(DeliveryError::TextReceiveReplay {
+                    sender_leaf: 1,
+                    sequence: 5,
+                })
+            );
+        }
+        assert_eq!(store.entries.len(), 2);
+        assert_eq!(store.entries[0].envelope.sequence, 8);
+        assert_eq!(store.entries[1].envelope.sequence, 5);
         Ok(())
     }
 

@@ -24,6 +24,7 @@ import {
   GroupView,
   InviteView,
   JoinProgressStepView,
+  MessageTargetView,
   RuntimeModeView,
   SignalingAdapterKind,
   SetConnectivityPolicyRequest,
@@ -72,6 +73,9 @@ import {
   startSignalingSession,
   startTextSession,
   attachTextControlTransportRuntime,
+  attachBrokerControlLaneRuntime,
+  drainTextControlInboundFrames,
+  startControlLaneSessionManager,
   pumpTextControlTransportOnce,
   publishGroupPresence,
   startDm,
@@ -83,6 +87,7 @@ import {
   startWebViewVoiceMediaSession,
   VoiceMediaSessionHandle,
 } from "./voice-media";
+import { shouldMountRemoteAudioElement } from "./voice-playback";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -154,11 +159,14 @@ type CommandNotification = {
 };
 const APP_EVENT_FALLBACK_POLL_MS = 5_000;
 const APP_EVENT_HEALTH_RESYNC_MS = 10_000;
+const APP_EVENT_POLL_LIMIT = 256;
+const APP_EVENT_FALLBACK_MAX_PAGES = 8;
 const diagnosticsUiEnabled =
   import.meta.env.VITE_DISCRYPT_SHOW_DIAGNOSTICS === "1";
 type VoiceDeviceAccess = {
   stream: MediaStream | null;
   microphone_permission: "granted" | "denied" | "prompt" | "unknown";
+  failure: VoiceDeviceFailure | null;
   input_device_id: string | null;
   input_device_label: string | null;
   output_device_id: string | null;
@@ -168,6 +176,10 @@ type VoiceDeviceAccess = {
   activity_rms_i16: number | null;
   activity_peak_i16: number | null;
   activity_captured_at_ms: number | null;
+};
+
+type VoiceDeviceFailure = {
+  message: string;
 };
 
 type VoiceDeviceOption = {
@@ -186,25 +198,30 @@ type VoiceActivityReading = {
   activity_captured_at_ms: number;
 };
 
-type StopVoiceActivityCapture = () => void;
+function voiceActivityIsSpeaking(
+  rmsI16: number | null,
+  peakI16: number | null,
+): boolean {
+  return (rmsI16 ?? 0) >= 512 || (peakI16 ?? 0) >= 2048;
+}
 
-const G012_WEBDRIVER_VOICE_HARNESS_KEY =
-  "discrypt:g012:webdriver-voice-harness";
+const TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY =
+  "discrypt:tauri-two-profile-e2e:voice-harness";
 
-function g012WebDriverVoiceHarnessEnabled(): boolean {
+function tauriTwoProfileE2EVoiceHarnessEnabled(): boolean {
   const automationWindow = window as typeof window & {
-    __discryptG012ForceNativeRustVoice?: unknown;
-    __discryptG012WebDriverVoiceEvidence?: unknown;
+    __discryptTauriTwoProfileE2EForceNativeRustVoice?: unknown;
+    __discryptTauriTwoProfileE2EVoiceEvidence?: unknown;
   };
   if (
-    automationWindow.__discryptG012ForceNativeRustVoice !== undefined ||
-    automationWindow.__discryptG012WebDriverVoiceEvidence !== undefined
+    automationWindow.__discryptTauriTwoProfileE2EForceNativeRustVoice !== undefined ||
+    automationWindow.__discryptTauriTwoProfileE2EVoiceEvidence !== undefined
   ) {
     return true;
   }
   try {
     return (
-      window.localStorage?.getItem(G012_WEBDRIVER_VOICE_HARNESS_KEY) === "1"
+      window.localStorage?.getItem(TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY) === "1"
     );
   } catch {
     return false;
@@ -213,6 +230,13 @@ function g012WebDriverVoiceHarnessEnabled(): boolean {
 
 function generatedAutomationVoiceDeviceAccess(
   selectedInputDeviceId?: string,
+  selectedOutputDeviceId?: string,
+  availableOutputDevices: VoiceDeviceOption[] = [
+    {
+      device_id: "default",
+      label: "System default speaker",
+    },
+  ],
   stream: MediaStream | null = null,
   activity: VoiceActivitySample = {
     activity_rms_i16: 1150,
@@ -222,17 +246,27 @@ function generatedAutomationVoiceDeviceAccess(
 ): VoiceDeviceAccess {
   const selectedGeneratedDeviceId = selectedInputDeviceId?.trim()
     ? selectedInputDeviceId
-    : "g012-generated-audio-input";
+      : "tauri-two-profile-e2e-generated-audio-input";
+  const selectedGeneratedOutputId = selectedOutputDeviceId?.trim()
+    ? selectedOutputDeviceId
+    : "default";
+  const selectedGeneratedOutput =
+    availableOutputDevices.find(
+      (device) => device.device_id === selectedGeneratedOutputId,
+    ) ?? availableOutputDevices[0] ?? {
+      device_id: "default",
+      label: "System default speaker",
+    };
   const availableInputDevices = [
     {
       device_id: selectedGeneratedDeviceId,
       label: "Generated audio input",
     },
-    ...(selectedGeneratedDeviceId === "g012-generated-audio-input"
+    ...(selectedGeneratedDeviceId === "tauri-two-profile-e2e-generated-audio-input"
       ? []
       : [
           {
-            device_id: "g012-generated-audio-input",
+            device_id: "tauri-two-profile-e2e-generated-audio-input",
             label: "Generated audio input",
           },
         ]),
@@ -241,31 +275,44 @@ function generatedAutomationVoiceDeviceAccess(
   return {
     stream,
     microphone_permission: "granted",
+    failure: null,
     input_device_id: selectedGeneratedDeviceId,
     input_device_label: "Generated audio input",
-    output_device_id: "default",
-    output_device_label: "System default speaker",
+    output_device_id: selectedGeneratedOutput.device_id,
+    output_device_label: selectedGeneratedOutput.label,
     available_input_devices: availableInputDevices,
-    available_output_devices: [
-      {
-        device_id: "default",
-        label: "System default speaker",
-      },
-    ],
+    available_output_devices: availableOutputDevices,
     ...activity,
   };
 }
 
 async function requestGeneratedAutomationVoiceAccess(
   selectedInputDeviceId?: string,
+  selectedOutputDeviceId?: string,
 ): Promise<VoiceDeviceAccess | null> {
-  if (!g012WebDriverVoiceHarnessEnabled()) return null;
+  if (!tauriTwoProfileE2EVoiceHarnessEnabled()) return null;
+  const availableOutputDevices = navigator.mediaDevices?.enumerateDevices
+    ? voiceOutputDeviceOptions(await navigator.mediaDevices.enumerateDevices())
+    : [];
+  const outputDevices =
+    availableOutputDevices.length > 0
+      ? availableOutputDevices
+      : [
+          {
+            device_id: "default",
+            label: "System default speaker",
+          },
+        ];
   const audioWindow = window as Window &
     typeof globalThis & { webkitAudioContext?: typeof AudioContext };
   const AudioContextCtor =
     window.AudioContext ?? audioWindow.webkitAudioContext;
   if (!AudioContextCtor) {
-    return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+    return generatedAutomationVoiceDeviceAccess(
+      selectedInputDeviceId,
+      selectedOutputDeviceId,
+      outputDevices,
+    );
   }
 
   try {
@@ -284,7 +331,11 @@ async function requestGeneratedAutomationVoiceAccess(
     const track = stream.getAudioTracks()[0];
     if (!track) {
       await context.close().catch(() => undefined);
-      return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+      return generatedAutomationVoiceDeviceAccess(
+        selectedInputDeviceId,
+        selectedOutputDeviceId,
+        outputDevices,
+      );
     }
     const stopTrack = track.stop.bind(track);
     track.stop = () => {
@@ -305,11 +356,17 @@ async function requestGeneratedAutomationVoiceAccess(
 
     return generatedAutomationVoiceDeviceAccess(
       selectedInputDeviceId,
+      selectedOutputDeviceId,
+      outputDevices,
       stream,
       activity,
     );
   } catch {
-    return generatedAutomationVoiceDeviceAccess(selectedInputDeviceId);
+    return generatedAutomationVoiceDeviceAccess(
+      selectedInputDeviceId,
+      selectedOutputDeviceId,
+      outputDevices,
+    );
   }
 }
 
@@ -579,10 +636,12 @@ function textRuntimeRole(state: AppState): "offerer" | "answerer" {
 
 function emptyVoiceDeviceAccess(
   microphonePermission: VoiceDeviceAccess["microphone_permission"],
+  failure: VoiceDeviceFailure | null = null,
 ): VoiceDeviceAccess {
   return {
     stream: null,
     microphone_permission: microphonePermission,
+    failure,
     input_device_id: null,
     input_device_label: null,
     output_device_id: null,
@@ -595,6 +654,40 @@ function emptyVoiceDeviceAccess(
   };
 }
 
+function voiceDeviceFailure(error: unknown): VoiceDeviceFailure {
+  const name = error instanceof DOMException ? error.name : "";
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return {
+      message:
+        "Microphone permission/input device required before joining voice — Grant microphone permission and select an input device before joining voice",
+    };
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return {
+      message:
+        "No microphone was found — Connect or enable an input device before joining voice",
+    };
+  }
+  if (name === "NotReadableError" || name === "AbortError") {
+    return {
+      message:
+        "Microphone could not be opened — Close other audio apps and verify the device is available, then try again",
+    };
+  }
+  if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+    return {
+      message:
+        "The selected microphone is unavailable — Choose the system default or another input device",
+    };
+  }
+  const detail = error instanceof Error && error.message.trim()
+    ? `: ${error.message.trim()}`
+    : "";
+  return {
+    message: `Microphone capture failed${detail}`,
+  };
+}
+
 function voiceDeviceOptions(
   devices: MediaDeviceInfo[],
   kind: MediaDeviceKind,
@@ -603,8 +696,9 @@ function voiceDeviceOptions(
   const inputs = devices.filter((device) => device.kind === kind);
   const seen = new Set<string>();
   return inputs
+    .filter((device) => Boolean(device.deviceId))
     .map((device, index) => ({
-      device_id: device.deviceId || `${kind}-${index + 1}`,
+      device_id: device.deviceId,
       label: device.label || `${fallbackLabel} ${index + 1}`,
     }))
     .filter((device) => {
@@ -612,6 +706,17 @@ function voiceDeviceOptions(
       seen.add(device.device_id);
       return true;
     });
+}
+
+function normalizeVoiceDevicePreference(deviceId: string | null | undefined) {
+  const normalized = deviceId?.trim() || "default";
+  return /^audio(?:input|output)-\d+$/.test(normalized)
+    ? "default"
+    : normalized;
+}
+
+function nativeRustVoiceAvailable(): boolean {
+  return Boolean(window.__TAURI__?.core?.invoke);
 }
 
 function voiceInputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
@@ -625,10 +730,10 @@ function voiceOutputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption
 async function enumerateVoiceInputDevices(
   requestPermission = false,
 ): Promise<VoiceDeviceOption[]> {
-  if (g012WebDriverVoiceHarnessEnabled()) {
+  if (tauriTwoProfileE2EVoiceHarnessEnabled()) {
     return [
       {
-        device_id: "g012-generated-audio-input",
+        device_id: "tauri-two-profile-e2e-generated-audio-input",
         label: "Generated audio input",
       },
     ];
@@ -698,108 +803,71 @@ async function measureLocalVoiceActivity(
   }
 }
 
-function startLocalVoiceActivityCapture(
-  stream: MediaStream,
-  onSample: (sample: VoiceActivityReading) => void,
-): StopVoiceActivityCapture | null {
-  const audioWindow = window as Window &
-    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
-  const AudioContextCtor =
-    window.AudioContext ?? audioWindow.webkitAudioContext;
-  if (!AudioContextCtor) return null;
-
-  const context = new AudioContextCtor();
-  const source = context.createMediaStreamSource(stream);
-  const analyser = context.createAnalyser();
-  analyser.fftSize = 1024;
-  source.connect(analyser);
-
-  const buffer = new Uint8Array(analyser.fftSize);
-  let stopped = false;
-  let timer: number | null = null;
-
-  const sample = () => {
-    analyser.getByteTimeDomainData(buffer);
-    let squareSum = 0;
-    let peak = 0;
-    for (const frame of buffer) {
-      const centered = Math.abs(frame - 128) / 128;
-      squareSum += centered * centered;
-      peak = Math.max(peak, centered);
-    }
-    const rms = Math.sqrt(squareSum / buffer.length);
-    onSample({
-      activity_rms_i16: Math.round(Math.min(1, rms) * 32767),
-      activity_peak_i16: Math.round(Math.min(1, peak) * 32767),
-      activity_captured_at_ms: Date.now(),
-    });
-  };
-
-  const schedule = () => {
-    if (stopped) return;
-    timer = window.setTimeout(() => {
-      if (stopped) return;
-      sample();
-      schedule();
-    }, 750);
-  };
-
-  void context
-    .resume()
-    .catch(() => undefined)
-    .finally(schedule);
-
-  return () => {
-    stopped = true;
-    if (timer !== null) window.clearTimeout(timer);
-    source.disconnect?.();
-    analyser.disconnect?.();
-    void context.close().catch(() => undefined);
-  };
-}
-
 async function requestVoiceDeviceAccess(
   selectedInputDeviceId?: string,
   selectedOutputDeviceId?: string,
+  preferNativeCapture = false,
 ): Promise<VoiceDeviceAccess> {
   const generatedAutomationAccess =
-    await requestGeneratedAutomationVoiceAccess(selectedInputDeviceId);
+    await requestGeneratedAutomationVoiceAccess(
+      selectedInputDeviceId,
+      selectedOutputDeviceId,
+    );
   if (generatedAutomationAccess) return generatedAutomationAccess;
 
+  const nativeSystemAccess = async (): Promise<VoiceDeviceAccess> => {
+    const availableOutputDevices = navigator.mediaDevices?.enumerateDevices
+      ? voiceOutputDeviceOptions(
+          await navigator.mediaDevices.enumerateDevices().catch(() => []),
+        )
+      : [];
+    return {
+      stream: null,
+      microphone_permission: "granted",
+      failure: null,
+      input_device_id: "native-system-default-input",
+      input_device_label: "Native system microphone",
+      output_device_id: normalizeVoiceDevicePreference(selectedOutputDeviceId),
+      output_device_label: "Default speaker",
+      available_input_devices: [
+        {
+          device_id: "native-system-default-input",
+          label: "Native system microphone",
+        },
+      ],
+      available_output_devices: availableOutputDevices,
+      activity_rms_i16: null,
+      activity_peak_i16: null,
+      activity_captured_at_ms: null,
+    };
+  };
+
+  const selectedInput = normalizeVoiceDevicePreference(selectedInputDeviceId);
+  const requestedNativeSystemCapture =
+    selectedInput === "native-system-default-input";
+  if (
+    preferNativeCapture &&
+    nativeRustVoiceAvailable() &&
+    requestedNativeSystemCapture
+  ) {
+    return nativeSystemAccess();
+  }
+
   if (!navigator.mediaDevices?.getUserMedia) {
-    if (window.__TAURI__?.core?.invoke) {
-      return {
-        stream: null,
-        microphone_permission: "granted",
-        input_device_id: "native-rust-default-capture",
-        input_device_label: "Native Rust capture source",
-        output_device_id: "native-rust-default-playback",
-        output_device_label: "Native Rust playback sink",
-        available_input_devices: [
-          {
-            device_id: "native-rust-default-capture",
-            label: "Native Rust capture source",
-          },
-        ],
-        available_output_devices: [
-          {
-            device_id: "native-rust-default-playback",
-            label: "Native Rust playback sink",
-          },
-        ],
-        activity_rms_i16: null,
-        activity_peak_i16: null,
-        activity_captured_at_ms: null,
-      };
+    if (nativeRustVoiceAvailable()) {
+      return nativeSystemAccess();
     }
-    return emptyVoiceDeviceAccess("denied");
+    return emptyVoiceDeviceAccess("unknown", {
+      message:
+        "Local WebRTC audio capture is unavailable — Install the required desktop media runtime and restart discrypt",
+    });
   }
 
   let stream: MediaStream | null = null;
   try {
     const requestedDevice =
-      selectedInputDeviceId && selectedInputDeviceId !== "default"
-        ? selectedInputDeviceId
+      selectedInput !== "default" && !requestedNativeSystemCapture
+        ? selectedInput
         : null;
     stream = await navigator.mediaDevices.getUserMedia({
       audio: requestedDevice ? { deviceId: { exact: requestedDevice } } : true,
@@ -820,9 +888,10 @@ async function requestVoiceDeviceAccess(
         (device) => device.kind === "audioinput" && device.deviceId,
       ) ??
       devices.find((device) => device.kind === "audioinput");
+    const selectedOutput = normalizeVoiceDevicePreference(selectedOutputDeviceId);
     const requestedOutput =
-      selectedOutputDeviceId && selectedOutputDeviceId !== "default"
-        ? selectedOutputDeviceId
+      selectedOutput !== "default"
+        ? selectedOutput
         : null;
     const output =
       (requestedOutput
@@ -836,14 +905,17 @@ async function requestVoiceDeviceAccess(
         (device) => device.kind === "audiooutput" && device.deviceId,
       ) ??
       devices.find((device) => device.kind === "audiooutput");
-    const activity = await measureLocalVoiceActivity(stream).catch(() => ({
+    // The long-lived media session reports activity. Avoid opening a short-lived
+    // AudioContext here because direct ALSA devices allow only one output client.
+    const activity = {
       activity_rms_i16: null,
       activity_peak_i16: null,
       activity_captured_at_ms: null,
-    }));
+    };
     return {
       stream,
       microphone_permission: "granted",
+      failure: null,
       input_device_id: input?.deviceId || "default",
       input_device_label: input?.label || "Default microphone",
       output_device_id: output?.deviceId || "default",
@@ -852,9 +924,18 @@ async function requestVoiceDeviceAccess(
       available_output_devices: availableOutputs,
       ...activity,
     };
-  } catch {
+  } catch (error) {
     stopMediaStream(stream);
-    return emptyVoiceDeviceAccess("denied");
+    if (nativeRustVoiceAvailable()) {
+      return nativeSystemAccess();
+    }
+    const failure = voiceDeviceFailure(error);
+    const permission =
+      error instanceof DOMException &&
+      (error.name === "NotAllowedError" || error.name === "SecurityError")
+        ? "denied"
+        : "unknown";
+    return emptyVoiceDeviceAccess(permission, failure);
   }
 }
 
@@ -1095,7 +1176,12 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
+function tauriCommandRuntimeAvailable(): boolean {
+  return Boolean(window.__TAURI__?.core?.invoke);
+}
+
 function App() {
+  const hasTauriCommandRuntime = tauriCommandRuntimeAvailable();
   const [commandState, setCommandState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -1156,6 +1242,7 @@ function App() {
     null,
   );
   const [messageTransportProof, setMessageTransportProof] = useState(false);
+  const [messageSendInFlight, setMessageSendInFlight] = useState(false);
   const [localVoiceSpeaking, setLocalVoiceSpeaking] = useState(false);
   const [voiceInputDevices, setVoiceInputDevices] = useState<
     VoiceDeviceOption[]
@@ -1175,13 +1262,11 @@ function App() {
   >({});
   const eventCursorRef = useRef(0);
   const commandStateRef = useRef<AppState | null>(null);
+  const messageSendInFlightRef = useRef(false);
   const textRuntimeSyncInFlightRef = useRef(false);
   const groupPresenceInFlightRef = useRef(false);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
   const voiceMediaSessionRef = useRef<VoiceMediaSessionHandle | null>(null);
-  const stopVoiceActivityCaptureRef = useRef<StopVoiceActivityCapture | null>(
-    null,
-  );
 
   function cleanupVoiceMediaSession() {
     voiceMediaSessionRef.current?.close();
@@ -1193,24 +1278,55 @@ function App() {
     voiceMediaSessionRef.current?.close();
     voiceMediaSessionRef.current = null;
     setVoiceRemoteStreams({});
-    stopVoiceActivityCaptureRef.current?.();
-    stopVoiceActivityCaptureRef.current = null;
     stopMediaStream(voiceCaptureRef.current);
     voiceCaptureRef.current = null;
     setLocalVoiceSpeaking(false);
   }
 
   useEffect(() => {
-    commandStateRef.current = commandState;
-  }, [commandState]);
-
-  useEffect(() => {
     voiceMediaSessionRef.current?.setInputGain?.(localMicGain);
   }, [localMicGain]);
+
+  useEffect(() => {
+    voiceMediaSessionRef.current?.setOutputDevice?.(selectedVoiceOutputId);
+  }, [selectedVoiceOutputId]);
+
+  useEffect(() => {
+    voiceMediaSessionRef.current?.setOutputVolume?.(appOutputVolume);
+  }, [appOutputVolume]);
 
   function updateEventCursor(nextCursor: number) {
     const cursor = Math.max(eventCursorRef.current, nextCursor);
     eventCursorRef.current = cursor;
+  }
+
+  function commitCommandState(nextState: AppState, force = false): AppState {
+    const currentState = commandStateRef.current;
+    if (
+      !force &&
+      currentState &&
+      currentState.event_cursor > nextState.event_cursor
+    ) {
+      return currentState;
+    }
+    commandStateRef.current = nextState;
+    if (force) {
+      eventCursorRef.current = nextState.event_cursor;
+    } else {
+      updateEventCursor(nextState.event_cursor);
+    }
+    setCommandState((renderedState) => {
+      if (
+        !force &&
+        renderedState &&
+        renderedState.event_cursor > nextState.event_cursor
+      ) {
+        commandStateRef.current = renderedState;
+        return renderedState;
+      }
+      return nextState;
+    });
+    return nextState;
   }
 
   function reportCommandError(
@@ -1332,8 +1448,7 @@ function App() {
           }
           if (!mounted) return;
         }
-        setCommandState(initialState);
-        updateEventCursor(initialState.event_cursor);
+        commitCommandState(initialState);
         if (
           initialState.groups.length > 0 &&
           initialState.lifecycle !== "first_run"
@@ -1378,8 +1493,12 @@ function App() {
   useEffect(() => {
     const preferences = commandState?.preferences;
     if (!preferences) return;
-    setSelectedVoiceInputId(preferences.voice_input_device_id || "default");
-    setSelectedVoiceOutputId(preferences.voice_output_device_id || "default");
+    setSelectedVoiceInputId(
+      normalizeVoiceDevicePreference(preferences.voice_input_device_id),
+    );
+    setSelectedVoiceOutputId(
+      normalizeVoiceDevicePreference(preferences.voice_output_device_id),
+    );
     setLocalMicGain(clampPercent(preferences.mic_gain_percent, 0, 200, 100));
     setAppOutputVolume(
       clampPercent(preferences.app_output_volume_percent, 0, 100, 100),
@@ -1407,7 +1526,7 @@ function App() {
   }, [commandState?.voice_session?.self_muted]);
 
   useEffect(() => {
-    if (!commandState || commandState.runtime_mode.mode !== "native") {
+    if (!commandState || !hasTauriCommandRuntime) {
       return;
     }
 
@@ -1416,33 +1535,55 @@ function App() {
     let eventFallbackPoll: number | null = null;
     let eventHealthResync: number | null = null;
     let unlistenAppEvent: (() => void) | null = null;
+    let fallbackPollInFlight = false;
     const fallbackPollMs = tauriListen ? 30000 : 5000;
+
+    const loadCommandStateAfterEvents = (nextCursor: number) => {
+      void loadAppState()
+        .then((refreshed) => {
+          if (!cancelled) {
+            commitCommandState(refreshed);
+            updateEventCursor(nextCursor);
+          }
+        })
+        .catch(() => undefined);
+    };
 
     const refreshCommandState = (stream: AppEventStreamView) => {
       if (stream.events.length === 0) {
         updateEventCursor(stream.next_cursor);
         return;
       }
-      void loadAppState()
-        .then((refreshed) => {
-          if (!cancelled) {
-            setCommandState(refreshed);
-            updateEventCursor(
-              Math.max(stream.next_cursor, refreshed.event_cursor),
-            );
-          }
-        })
-        .catch(() => undefined);
+      loadCommandStateAfterEvents(stream.next_cursor);
     };
 
-    const pollAppEventFallback = () => {
-      void pollAppEvents({ after: eventCursorRef.current, limit: 32 })
-        .then((stream) => {
-          if (!cancelled) {
-            refreshCommandState(stream);
+    const pollAppEventFallback = (forceStateResync = false) => {
+      if (fallbackPollInFlight) return;
+      fallbackPollInFlight = true;
+      void (async () => {
+        let nextCursor = eventCursorRef.current;
+        let sawEvents = false;
+        for (let page = 0; page < APP_EVENT_FALLBACK_MAX_PAGES; page += 1) {
+          const stream = await pollAppEvents({
+            after: nextCursor,
+            limit: APP_EVENT_POLL_LIMIT,
+          });
+          if (cancelled) return;
+          sawEvents = sawEvents || stream.events.length > 0;
+          nextCursor = stream.next_cursor;
+          updateEventCursor(nextCursor);
+          if (!stream.has_more) {
+            break;
           }
-        })
-        .catch(() => undefined);
+        }
+        if (sawEvents || forceStateResync) {
+          loadCommandStateAfterEvents(nextCursor);
+        }
+      })()
+        .catch(() => undefined)
+        .finally(() => {
+          fallbackPollInFlight = false;
+        });
     };
 
     const startFallbackPolling = () => {
@@ -1464,10 +1605,13 @@ function App() {
           }
           unlistenAppEvent = unlisten;
         })
-        .catch(startFallbackPolling);
+        .catch(() => {
+          pollAppEventFallback();
+          startFallbackPolling();
+        });
       startFallbackPolling();
       eventHealthResync = window.setInterval(
-        pollAppEventFallback,
+        () => pollAppEventFallback(true),
         APP_EVENT_HEALTH_RESYNC_MS,
       );
     } else {
@@ -1484,16 +1628,17 @@ function App() {
         window.clearInterval(eventHealthResync);
       }
     };
-  }, [commandState?.runtime_mode.mode]);
+  }, [commandState?.runtime_mode.mode, hasTauriCommandRuntime]);
 
   async function applyCommand(
     command: Promise<AppState>,
-    success?: (state: AppState) => void,
+    success?: (state: AppState) => void | Promise<void>,
+    forceState = false,
   ): Promise<AppState | null> {
     try {
       setCommandError(null);
       const nextState = await command;
-      setCommandState(nextState);
+      commitCommandState(nextState, forceState);
       if (nextState.last_command_error) {
         const action = commandErrorToAction(nextState.last_command_error);
         const expectedInviteDenial =
@@ -1507,7 +1652,7 @@ function App() {
           !expectedInviteDenial,
         );
       }
-      success?.(nextState);
+      await success?.(nextState);
       return nextState;
     } catch (error: unknown) {
       reportCommandError(
@@ -1640,7 +1785,7 @@ function App() {
       }
       return stateForScope;
     }
-    setCommandState(started);
+    commitCommandState(started);
     if (started.last_command_error) {
       const action = commandErrorToAction(started.last_command_error);
       if (reportFailures) {
@@ -1652,6 +1797,86 @@ function App() {
         );
       }
       return started;
+    }
+    const activeGroupId = started.active_context?.group_id ?? null;
+    const activeGroup = activeGroupId
+      ? started.groups.find((group) => group.group_id === activeGroupId) ?? null
+      : null;
+    const localMember = activeGroup?.members?.find(
+      (member) => member.member_id === started.profile?.user_id,
+    );
+    const hasAdmittedRemoteMember = activeGroup?.members?.some(
+      (member) =>
+        member.member_id !== started.profile?.user_id &&
+        member.status !== "pending" &&
+        member.status !== "revoked",
+    ) ?? false;
+    const requiresAdmissionControlLane = Boolean(
+      activeGroup &&
+        (activeGroup.role === "pending" ||
+          localMember?.status === "pending" ||
+          !hasAdmittedRemoteMember),
+    );
+    if (requiresAdmissionControlLane) {
+      const attached = await attachBrokerControlLaneRuntime({
+        adapter_kind: null,
+      });
+      commitCommandState(attached);
+      if (attached.last_command_error) {
+        if (reportFailures) {
+          const action = commandErrorToAction(attached.last_command_error);
+          reportCommandError(
+            action
+              ? `${attached.last_command_error.message} — ${action}`
+              : attached.last_command_error.message,
+            attached.last_command_error.command,
+          );
+        }
+        return attached;
+      }
+      const sent = await pumpTextControlTransportOnce({
+        target: null,
+        limit: 8,
+        operation_timeout_ms: 5_000,
+      });
+      const drained = await drainTextControlInboundFrames({
+        drain_ms: 1_500,
+        operation_timeout_ms: 1_000,
+      });
+      if (reportFailures && (sent.failures.length > 0 || drained.failures.length > 0)) {
+        reportCommandError(
+          sent.failures[0] ?? drained.failures[0],
+          sent.failures.length > 0
+            ? "pump_text_control_transport_once"
+            : "drain_text_control_inbound_frames",
+        );
+      }
+      const managed = await startControlLaneSessionManager({
+        pump_interval_ms: 250,
+        drain_ms: 300,
+        backoff_initial_ms: 100,
+        backoff_max_ms: 2_000,
+        backoff_max_attempts: 5,
+      });
+      commitCommandState(managed);
+      if (managed.last_command_error) {
+        if (reportFailures) {
+          const action = commandErrorToAction(managed.last_command_error);
+          reportCommandError(
+            action
+              ? `${managed.last_command_error.message} — ${action}`
+              : managed.last_command_error.message,
+            managed.last_command_error.command,
+          );
+        }
+        return managed;
+      }
+      const refreshed = await loadAppState().catch(() => null);
+      if (refreshed) {
+        commitCommandState(refreshed);
+        return refreshed;
+      }
+      return managed;
     }
     const attached = await attachTextRuntime(started).catch((error: unknown) => {
       const message =
@@ -1691,7 +1916,7 @@ function App() {
     }
     const refreshed = await loadAppState().catch(() => null);
     if (refreshed) {
-      setCommandState(refreshed);
+      commitCommandState(refreshed);
       return refreshed;
     }
     return attached ?? started;
@@ -1728,8 +1953,7 @@ function App() {
       !activeGroupId ||
       commandState.lifecycle === "first_run" ||
       commandState.storage_security.status !== "ready" ||
-      commandState.runtime_mode.mode !== "native" ||
-      !window.__TAURI__?.core?.invoke
+      !hasTauriCommandRuntime
     ) {
       return;
     }
@@ -1758,8 +1982,7 @@ function App() {
           ttl_seconds: 120,
         });
         if (cancelled) return;
-        setCommandState(presenceState);
-        commandStateRef.current = presenceState;
+        commitCommandState(presenceState);
       } catch (_error) {
       } finally {
         groupPresenceInFlightRef.current = false;
@@ -1778,6 +2001,7 @@ function App() {
     commandState?.runtime_mode.mode,
     commandState?.storage_security.status,
     commandState?.profile?.user_id,
+    hasTauriCommandRuntime,
   ]);
 
   if (loadError) {
@@ -2001,6 +2225,7 @@ function App() {
         setDraftConfigAdmissionMode(group?.role_policy?.admission_mode ?? draftAdmissionMode);
         setWorkflow("channel");
         setActiveOverlay(null);
+        void syncTextRuntimeForState(state, true);
       },
     );
   }
@@ -2049,6 +2274,11 @@ function App() {
 
   function reviewPendingAdmissions() {
     setWorkflow("admission_requests");
+    void loadAppState()
+      .then((refreshed) => {
+        commitCommandState(refreshed);
+      })
+      .catch(() => undefined);
   }
 
   function openAuditLog() {
@@ -2247,6 +2477,46 @@ function App() {
     );
   }
 
+  function sendCommandText(target: MessageTargetView, body: string) {
+    if (messageSendInFlightRef.current) return;
+    messageSendInFlightRef.current = true;
+    setMessageSendInFlight(true);
+    setDraftMessage("");
+
+    const runtimeState = commandStateRef.current;
+    const requestTransportProof = messageTransportProof;
+    void (async () => {
+      let sent = false;
+      try {
+        let latestState = runtimeState;
+        if (runtimeState && window.__TAURI__?.core?.invoke) {
+          latestState =
+            (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
+        }
+        const result = await applyCommand(
+          sendMessage({
+            target,
+            body,
+            transport_proof: requestTransportProof,
+            adapter_kind: null,
+          }),
+          async (state) => {
+            if (latestState && window.__TAURI__?.core?.invoke) {
+              await syncTextRuntimeForState(state, false);
+            }
+          },
+        );
+        sent = Boolean(result && !result.last_command_error);
+      } finally {
+        if (!sent) {
+          setDraftMessage((currentDraft) => currentDraft || body);
+        }
+        messageSendInFlightRef.current = false;
+        setMessageSendInFlight(false);
+      }
+    })();
+  }
+
   function sendCommandMessage() {
     const body = draftMessage.trim();
     if (!body) return;
@@ -2254,67 +2524,29 @@ function App() {
       reportCommandError("Create a group text channel before sending a message.");
       return;
     }
-    const runtimeState = commandState;
-    const target = {
-      kind: "channel" as const,
-      dm_id: null,
-      group_id: activeGroup.group_id,
-      channel_id: activeTextChannel.channel_id,
-    };
-    const requestTransportProof = messageTransportProof;
-    void (async () => {
-      let latestState = runtimeState;
-      if (runtimeState && window.__TAURI__?.core?.invoke) {
-        latestState = (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
-      }
-      await applyCommand(
-        sendMessage({
-          target,
-          body,
-          transport_proof: requestTransportProof,
-          adapter_kind: null,
-        }),
-        async (state) => {
-          setDraftMessage("");
-          if (latestState && window.__TAURI__?.core?.invoke) {
-            await syncTextRuntimeForState(state, false);
-          }
-        },
-      );
-    })();
+    sendCommandText(
+      {
+        kind: "channel",
+        dm_id: null,
+        group_id: activeGroup.group_id,
+        channel_id: activeTextChannel.channel_id,
+      },
+      body,
+    );
   }
 
   function sendCommandDm() {
     const body = draftMessage.trim();
     if (!body || !activeDm) return;
-    const runtimeState = commandState;
-    const target = {
-      kind: "dm" as const,
-      dm_id: activeDm.dm_id,
-      group_id: null,
-      channel_id: null,
-    };
-    const requestTransportProof = messageTransportProof;
-    void (async () => {
-      let latestState = runtimeState;
-      if (runtimeState && window.__TAURI__?.core?.invoke) {
-        latestState = (await syncTextRuntimeForState(runtimeState, true)) ?? runtimeState;
-      }
-      await applyCommand(
-        sendMessage({
-          target,
-          body,
-          transport_proof: requestTransportProof,
-          adapter_kind: null,
-        }),
-        async (state) => {
-          setDraftMessage("");
-          if (latestState && window.__TAURI__?.core?.invoke) {
-            await syncTextRuntimeForState(state, false);
-          }
-        },
-      );
-    })();
+    sendCommandText(
+      {
+        kind: "dm",
+        dm_id: activeDm.dm_id,
+        group_id: null,
+        channel_id: null,
+      },
+      body,
+    );
   }
 
   function createCommandInvite() {
@@ -2426,7 +2658,7 @@ function App() {
           kind: "Voice",
           retention_status: "session",
         });
-        setCommandState(withVoice);
+        commitCommandState(withVoice);
         voiceChannel = getActiveVoiceChannel(
           withVoice,
           withVoice.groups.find(
@@ -2438,10 +2670,23 @@ function App() {
         reportCommandError("Voice channel creation did not return a channel.");
         return;
       }
+      const forceNativeRustVoice = Boolean(
+        (
+          window as typeof window & {
+            __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
+          }
+        ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
+          window.localStorage?.getItem(
+            "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+          ) === "1",
+      );
+      const canUseNativeRustVoice =
+        forceNativeRustVoice || nativeRustVoiceAvailable();
       stopLocalVoiceCapture();
       const voiceAccess = await requestVoiceDeviceAccess(
         selectedVoiceInputId,
         selectedVoiceOutputId,
+        canUseNativeRustVoice,
       );
       if (voiceAccess.available_input_devices.length > 0) {
         setVoiceInputDevices(voiceAccess.available_input_devices);
@@ -2465,6 +2710,33 @@ function App() {
           setSelectedVoiceOutputId("default");
         }
       }
+      if (voiceAccess.failure) {
+        reportCommandError(voiceAccess.failure.message, "join_voice");
+        stopLocalVoiceCapture();
+        return;
+      }
+      if (
+        !canUseNativeRustVoice &&
+        typeof RTCPeerConnection === "undefined"
+      ) {
+        reportCommandError(
+          "Local WebRTC audio runtime is unavailable — Install the required desktop media runtime and restart discrypt",
+          "join_voice",
+        );
+        stopLocalVoiceCapture();
+        return;
+      }
+      if (
+        !canUseNativeRustVoice &&
+        (!voiceAccess.stream || localAudioTracks(voiceAccess.stream).length === 0)
+      ) {
+        reportCommandError(
+          "Microphone capture did not provide a live audio track — Select another input device and try again",
+          "join_voice",
+        );
+        stopLocalVoiceCapture();
+        return;
+      }
       const joinedState = await joinVoice({
         group_id: runtimeGroup.group_id,
         channel_id: voiceChannel.channel_id,
@@ -2474,7 +2746,7 @@ function App() {
         output_device_id: voiceAccess.output_device_id,
         output_device_label: voiceAccess.output_device_label,
       });
-      setCommandState(joinedState);
+      commitCommandState(joinedState);
       setWorkflow(workflowAfterUpdate);
       voiceCaptureRef.current = voiceAccess.stream;
       if (joinedState.voice_session?.self_muted) {
@@ -2495,33 +2767,43 @@ function App() {
       }
       const sessionId = joinedState.voice_session?.session_id;
       if (sessionId) {
-        if (voiceAccess.stream) {
-          stopVoiceActivityCaptureRef.current = startLocalVoiceActivityCapture(
-            voiceAccess.stream,
-            (sample) => {
-              const trackEnabled = localAudioTracks(voiceAccess.stream).some(
-                (track) => track.enabled,
-              );
-              setLocalVoiceSpeaking(
-                trackEnabled &&
-                  (sample.activity_rms_i16 >= 512 ||
-                    sample.activity_peak_i16 >= 2048),
-              );
-              void applyCommand(
-                updateVoiceActivity({
-                  session_id: sessionId,
-                  rms_i16: sample.activity_rms_i16,
-                  peak_i16: sample.activity_peak_i16,
-                  captured_at_ms: sample.activity_captured_at_ms,
-                }),
-              );
-            },
+        const handleVoiceActivitySample = (sample: VoiceActivityReading) => {
+          if (!voiceAccess.stream) return;
+          const trackEnabled = localAudioTracks(voiceAccess.stream).some(
+            (track) => track.enabled,
           );
+          setLocalVoiceSpeaking(
+            trackEnabled &&
+              voiceActivityIsSpeaking(
+                sample.activity_rms_i16,
+                sample.activity_peak_i16,
+              ),
+          );
+          void applyCommand(
+            updateVoiceActivity({
+              session_id: sessionId,
+              rms_i16: sample.activity_rms_i16,
+              peak_i16: sample.activity_peak_i16,
+              captured_at_ms: sample.activity_captured_at_ms,
+            }),
+          );
+        };
+        if (voiceAccess.stream) {
           if (
             voiceAccess.activity_rms_i16 !== null &&
             voiceAccess.activity_peak_i16 !== null &&
             voiceAccess.activity_captured_at_ms !== null
           ) {
+            const trackEnabled = localAudioTracks(voiceAccess.stream).some(
+              (track) => track.enabled,
+            );
+            setLocalVoiceSpeaking(
+              trackEnabled &&
+                voiceActivityIsSpeaking(
+                  voiceAccess.activity_rms_i16,
+                  voiceAccess.activity_peak_i16,
+                ),
+            );
             void applyCommand(
               updateVoiceActivity({
                 session_id: sessionId,
@@ -2538,16 +2820,6 @@ function App() {
           : joinedState.voice_session;
         const voicePeers = textRuntimePeerDefaults(mediaState);
         if (voiceSession) {
-          const forceNativeRustVoice = Boolean(
-            (
-              window as typeof window & {
-                __discryptG012ForceNativeRustVoice?: boolean;
-              }
-            ).__discryptG012ForceNativeRustVoice ||
-            window.localStorage?.getItem(
-              "discrypt:g012:force-native-rust-voice",
-            ) === "1",
-          );
           const canUseWebViewRtc = Boolean(
             !forceNativeRustVoice &&
             voiceAccess.stream &&
@@ -2555,7 +2827,7 @@ function App() {
             localAudioTracks(voiceAccess.stream).length > 0,
           );
           if (canUseWebViewRtc && voiceAccess.stream) {
-            voiceMediaSessionRef.current = startWebViewVoiceMediaSession({
+            const mediaHandle = startWebViewVoiceMediaSession({
               session: voiceSession,
               localStream: voiceAccess.stream,
               inputGain: localMicGain,
@@ -2563,6 +2835,7 @@ function App() {
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
+              onLocalActivity: handleVoiceActivitySample,
               onRemoteTrack: (track) => {
                 if (isUsableMediaStream(track.stream)) {
                   setVoiceRemoteStreams((current) => ({
@@ -2596,20 +2869,46 @@ function App() {
               },
               onStatus: (status) => reportCommandError(status, "Voice media"),
             });
-          } else {
+            voiceMediaSessionRef.current = mediaHandle;
+            if (!mediaHandle) {
+              const leftState = await leaveVoice({ session_id: sessionId });
+              commitCommandState(leftState);
+              stopLocalVoiceCapture();
+              return;
+            }
+          } else if (canUseNativeRustVoice) {
             voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
               session: voiceSession,
+              localStream: voiceAccess.stream,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
               role: textRuntimeRole(mediaState),
               connectivity: voiceConnectivityForState(mediaState),
-              onState: (state) => setCommandState(state as AppState),
+              outputDeviceId: selectedVoiceOutputId,
+              outputVolume: appOutputVolume,
+              onLocalActivity: handleVoiceActivitySample,
+              onState: (state) => commitCommandState(state as AppState),
               onStatus: (status) => {
-                if (!/proof generated|proof received/i.test(status)) {
+                if (!/Local DataChannel (is attaching|connected)/i.test(status)) {
                   reportCommandError(status, "Voice media");
                 }
               },
             });
+            if (!voiceMediaSessionRef.current) {
+              const leftState = await leaveVoice({ session_id: sessionId });
+              commitCommandState(leftState);
+              stopLocalVoiceCapture();
+              return;
+            }
+          } else {
+            reportCommandError(
+              "Local WebRTC audio session could not start with the selected microphone",
+              "join_voice",
+            );
+            const leftState = await leaveVoice({ session_id: sessionId });
+            commitCommandState(leftState);
+            stopLocalVoiceCapture();
+            return;
           }
         }
       }
@@ -2681,12 +2980,16 @@ function App() {
   }
 
   function resetCommandState() {
-    void applyCommand(resetAppState({ confirmation: resetPhrase }), (state) => {
-      if (!state.last_command_error) {
-        setResetPhrase("");
-        setWorkflow("setup");
-      }
-    });
+    void applyCommand(
+      resetAppState({ confirmation: resetPhrase }),
+      (state) => {
+        if (!state.last_command_error) {
+          setResetPhrase("");
+          setWorkflow("setup");
+        }
+      },
+      true,
+    );
   }
 
   function chooseKeyringStorage() {
@@ -2794,7 +3097,7 @@ function App() {
         commandError={storageCommandError}
         onCreate={createCommandUser}
         onRecover={recoverCommandUser}
-        allowEmptyRecovery={appState.runtime_mode.mode !== "native"}
+        allowEmptyRecovery={!hasTauriCommandRuntime}
       />
     );
   }
@@ -2918,6 +3221,7 @@ function App() {
                 setDraftMessage={setDraftMessage}
                 onStartDm={startCommandDm}
                 onSendDm={sendCommandDm}
+                messageSendInFlight={messageSendInFlight}
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
@@ -2975,6 +3279,7 @@ function App() {
                 setDraftMessage={setDraftMessage}
                 onOpenCreateChannel={() => setInlineTextDraft("")}
                 onSendMessage={sendCommandMessage}
+                messageSendInFlight={messageSendInFlight}
                 transportProof={messageTransportProof}
                 setTransportProof={setMessageTransportProof}
                 diagnosticsEnabled={diagnosticsUiEnabled}
@@ -4633,6 +4938,11 @@ function VoiceParticipantList({
           (track) => track.participant_id === participant.id,
         );
         const remoteStream = local ? null : remoteStreams[participant.id];
+        const mountRemoteAudio = shouldMountRemoteAudioElement(
+          remoteTrack?.playback_element_id,
+          Boolean(remoteTrack),
+          Boolean(remoteStream),
+        );
         return (
           <div
             key={participant.id}
@@ -4668,7 +4978,7 @@ function VoiceParticipantList({
                 mute
               </span>
             ) : null}
-            {!local && (remoteTrack || remoteStream) ? (
+            {!local && mountRemoteAudio ? (
               <RemoteAudioAttachment
                 participant={participant}
                 src={remoteTrack?.playback_element_id ? null : participant.remote_audio_src}
@@ -5471,7 +5781,7 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
           <InfoRow
             title="Runtime"
             copy={
-              appState.runtime_mode.mode === "native"
+              tauriCommandRuntimeAvailable()
                 ? "Native Tauri commands"
                 : "Web runtime export"
             }
@@ -5951,6 +6261,7 @@ function DmPanel({
   setDraftMessage,
   onStartDm,
   onSendDm,
+  messageSendInFlight,
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
@@ -5964,6 +6275,7 @@ function DmPanel({
   setDraftMessage: (value: string) => void;
   onStartDm: () => void;
   onSendDm: () => void;
+  messageSendInFlight: boolean;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
@@ -6015,7 +6327,7 @@ function DmPanel({
         setDraftMessage={setDraftMessage}
         sendLabel="Send DM message"
         onSend={onSendDm}
-        disabled={!activeDm}
+        disabled={!activeDm || messageSendInFlight}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
         diagnosticsEnabled={diagnosticsEnabled}
@@ -6821,7 +7133,10 @@ function AdmissionRequestCard({
   actionInFlight: string | null;
 }) {
   return (
-    <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4">
+    <div
+      className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.24)] p-4"
+      data-testid={`admission-request-${request.request_id}`}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-base font-semibold">{request.display_name}</p>
@@ -6840,6 +7155,8 @@ function AdmissionRequestCard({
       <div className="mt-4 flex flex-wrap gap-2">
         <Button
           type="button"
+          aria-label={`Approve ${request.display_name} admission`}
+          data-testid={`admission-approve-${request.request_id}`}
           onClick={() => onApprove(request)}
           disabled={actionInFlight === `approve:${request.request_id}`}
         >
@@ -7772,6 +8089,7 @@ function ChannelPanel({
   setDraftMessage,
   onOpenCreateChannel,
   onSendMessage,
+  messageSendInFlight,
   transportProof,
   setTransportProof,
   diagnosticsEnabled,
@@ -7785,6 +8103,7 @@ function ChannelPanel({
   setDraftMessage: (value: string) => void;
   onOpenCreateChannel: () => void;
   onSendMessage: () => void;
+  messageSendInFlight: boolean;
   transportProof: boolean;
   setTransportProof: (value: boolean) => void;
   diagnosticsEnabled: boolean;
@@ -7834,7 +8153,7 @@ function ChannelPanel({
         setDraftMessage={setDraftMessage}
         sendLabel="Send message"
         onSend={onSendMessage}
-        disabled={admissionPending}
+        disabled={admissionPending || messageSendInFlight}
         composerNotice={admissionPending ? "Waiting for owner/staff approval before protected messages can be sent." : null}
         transportProof={transportProof}
         setTransportProof={setTransportProof}
@@ -7965,15 +8284,14 @@ function TextStateLegend({ states }: { states: TextStateView[] }) {
 function messageStateBadgeVariant(
   stateKey: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
-  if (["sent_local", "received", "transport_probe_verified"].includes(stateKey))
+  if (
+    ["sent_local", "received", "peer_receipt", "transport_probe_verified"].includes(
+      stateKey,
+    )
+  )
     return "success";
   if (
-    [
-      "pending",
-      "locked",
-      "peer_receipt",
-      "transport_probe_unavailable",
-    ].includes(stateKey)
+    ["pending", "locked", "transport_probe_unavailable"].includes(stateKey)
   )
     return "warning";
   if (["failed", "shredded", "transport_probe_failed"].includes(stateKey))
@@ -7983,7 +8301,7 @@ function messageStateBadgeVariant(
 
 function messageStateIcon(stateKey: string): string {
   if (["failed", "shredded", "transport_probe_failed"].includes(stateKey)) return "!";
-  if (["pending", "locked", "peer_receipt", "transport_probe_unavailable"].includes(stateKey)) return "…";
+  if (["pending", "locked", "transport_probe_unavailable"].includes(stateKey)) return "…";
   return "✓";
 }
 

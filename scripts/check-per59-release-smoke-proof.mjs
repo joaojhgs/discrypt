@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
-const harness = read("scripts/g012-tauri-webdriver-integrated.mjs");
+const harness = read("scripts/tauri-two-profile-group-text-voice-e2e.mjs");
 const ui = read("apps/ui/src/main.tsx");
 const desktop = read("apps/desktop/src-tauri/src/lib.rs");
 const releaseNote = read("docs/release/per59-human-loopback-release-smoke-2026-06-20.md");
@@ -39,8 +39,8 @@ for (const token of [
   "Create invite for Two Profile WebDriver Lab",
   "Join with invite",
   "Local label",
-  "approvePendingAdmission",
-  "approve_group_admission_request",
+  "approvePendingAdmissionThroughUi",
+  "admission-approve-${pending.request_id}",
   "openmls-admission-request",
   "openmls_admission_owner_approval",
   "waitForAdmissionUnlockedUi",
@@ -84,7 +84,7 @@ for (const token of [
   "voice.native_media_started",
   "voice.native_media_received",
 ]) {
-  requireText("G012 WebDriver harness", harness, token);
+  requireText("two-profile E2E harness", harness, token);
 }
 
 for (const token of [
@@ -109,7 +109,7 @@ for (const token of [
   "per59_release_smoke.production_claim_allowed: true",
   "Synthetic WebView media fallback",
   "raw Pulse capture",
-  "DISCRYPT_G012_REQUIRE_NATIVE_VOICE=1",
+  "DISCRYPT_TAURI_TWO_PROFILE_E2E_REQUIRE_NATIVE_VOICE=1",
   "scripts/g012-docker-tauri-preflight.sh",
 ]) {
   requireText("PER-59 release note", releaseNote, token);

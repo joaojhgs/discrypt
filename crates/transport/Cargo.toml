@@ -32,7 +32,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
-webrtc = { version = "0.20.0-alpha.1" }
+webrtc = { version = "0.20.0" }
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = { workspace = true }

@@ -244,6 +244,42 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "attach_broker_control_lane_runtime",
+    exportName: "attachBrokerControlLaneRuntime",
+    args: ["adapter_kind"],
+    returns: "AppState",
+  },
+  {
+    command: "drain_text_control_inbound_frames",
+    exportName: "drainTextControlInboundFrames",
+    args: ["drain_ms", "operation_timeout_ms"],
+    returns: "TextControlTransportPumpReportView",
+  },
+  {
+    command: "start_control_lane_session_manager",
+    exportName: "startControlLaneSessionManager",
+    args: [
+      "pump_interval_ms",
+      "drain_ms",
+      "backoff_initial_ms",
+      "backoff_max_ms",
+      "backoff_max_attempts",
+    ],
+    returns: "AppState",
+  },
+  {
+    command: "stop_control_lane_session_manager",
+    exportName: "stopControlLaneSessionManager",
+    args: ["session_id"],
+    returns: "AppState",
+  },
+  {
+    command: "control_lane_session_manager_status",
+    exportName: "controlLaneSessionManagerStatus",
+    args: ["session_id"],
+    returns: "OptionalControlLaneSessionManagerStatusView",
+  },
+  {
     command: "send_message",
     exportName: "sendMessage",
     args: ["target", "kind", "dm_id", "group_id", "channel_id", "body"],
@@ -359,6 +395,30 @@ const expectedCommands = [
     exportName: "startNativeVoiceMediaSession",
     args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
     returns: "StartNativeVoiceMediaSessionResponse",
+  },
+  {
+    command: "start_native_voice_stream",
+    exportName: "startNativeVoiceStream",
+    args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "use_webview_capture", "created_at_ms"],
+    returns: "StartNativeVoiceStreamResponse",
+  },
+  {
+    command: "send_native_voice_audio_frame",
+    exportName: "sendNativeVoiceAudioFrame",
+    args: ["session_id", "pcm_i16", "muted", "captured_at_ms"],
+    returns: "SendNativeVoiceAudioFrameResponse",
+  },
+  {
+    command: "take_native_voice_playback_frames",
+    exportName: "takeNativeVoicePlaybackFrames",
+    args: ["session_id", "limit"],
+    returns: "TakeNativeVoicePlaybackFramesResponse",
+  },
+  {
+    command: "stop_native_voice_stream",
+    exportName: "stopNativeVoiceStream",
+    args: ["session_id"],
+    returns: "AppState",
   },
   {
     command: "accept_native_voice_media_frame",
@@ -956,13 +1016,87 @@ if (!main.includes("window.__TAURI__?.event?.listen")) {
   failures.push("native UI must install a Tauri app_event listener");
 }
 if (
+  !main.includes(
+    "function tauriCommandRuntimeAvailable(): boolean",
+  ) ||
+  !main.includes("return Boolean(window.__TAURI__?.core?.invoke)") ||
+  !main.includes(
+    "const hasTauriCommandRuntime = tauriCommandRuntimeAvailable()",
+  ) ||
+  !main.includes("if (!commandState || !hasTauriCommandRuntime)")
+) {
+  failures.push(
+    "Tauri event synchronization must use IPC capability instead of a runtime copy label",
+  );
+}
+if (
+  main.includes('runtime_mode.mode !== "native"') ||
+  main.includes('runtime_mode.mode === "native"')
+) {
+  failures.push(
+    "runtime_mode labels must not be treated as the Tauri IPC capability boundary",
+  );
+}
+if (
   !main.includes("APP_EVENT_FALLBACK_POLL_MS") ||
   !main.includes("startFallbackPolling")
 ) {
   failures.push("poll_app_events must remain a named fallback path, not the primary native update path");
 }
+if (
+  !main.includes("const APP_EVENT_POLL_LIMIT = 256") ||
+  !main.includes("limit: APP_EVENT_POLL_LIMIT") ||
+  !main.includes("APP_EVENT_FALLBACK_MAX_PAGES") ||
+  !main.includes("stream.has_more") ||
+  !main.includes("updateEventCursor(nextCursor)")
+) {
+  failures.push(
+    "native app-event fallback must drain bounded retained backend event pages",
+  );
+}
+if (
+  !main.includes(".catch(() => {") ||
+  !main.includes("pollAppEventFallback();\n          startFallbackPolling();")
+) {
+  failures.push(
+    "native app-event listener rejection must trigger an immediate polling resync",
+  );
+}
 if (!main.includes("APP_EVENT_HEALTH_RESYNC_MS")) {
   failures.push("native app_event listener must retain a slow health-resync poll");
+}
+if (
+  !main.includes("function commitCommandState(nextState: AppState, force = false)") ||
+  !main.includes("currentState.event_cursor > nextState.event_cursor") ||
+  !main.includes("renderedState.event_cursor > nextState.event_cursor")
+) {
+  failures.push(
+    "native state reconciliation must reject snapshots older than the latest backend event cursor",
+  );
+}
+if (!main.includes("() => pollAppEventFallback(true)")) {
+  failures.push(
+    "native app_event health resync must reload state even when a push advanced the local cursor",
+  );
+}
+if (
+  !main.includes("if (messageSendInFlightRef.current) return") ||
+  !main.includes("messageSendInFlightRef.current = true") ||
+  !main.includes("messageSendInFlightRef.current = false")
+) {
+  failures.push(
+    "message composer must guard channel and DM sends against duplicate in-flight activation",
+  );
+}
+const tauriEventCapability = readFileSync(
+  new URL("../../desktop/src-tauri/capabilities/default.json", import.meta.url),
+  "utf8",
+);
+if (!tauriEventCapability.includes('"core:event:allow-listen"')) {
+  failures.push("main Tauri window capability must allow app_event listener registration");
+}
+if (!tauriEventCapability.includes('"core:event:allow-unlisten"')) {
+  failures.push("main Tauri window capability must allow app_event listener cleanup");
 }
 const voiceCleanupEffects =
   (
