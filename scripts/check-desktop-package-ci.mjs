@@ -20,6 +20,8 @@ for (const token of [
   "runs-on: windows-latest",
   "cargo-tools-${{ runner.os }}-package-release-v1",
   "Install package release cargo tools",
+  "libasound2-dev",
+  "pkg-config",
   "cargo install cargo-audit --locked || true",
   "cargo install cargo-deny --locked || true",
   "cargo install cargo-sbom --locked || true",
@@ -53,6 +55,21 @@ if (!workflow.includes("github.event_name == 'workflow_dispatch' && inputs.packa
 }
 if (!workflow.includes("github.event_name == 'workflow_dispatch' && inputs.package_windows")) {
   failures.push("Windows packaging job must be explicitly gated on workflow_dispatch input");
+}
+
+for (const scriptPath of [
+  "apps/ui/scripts/honesty-gates.mjs",
+  "apps/ui/scripts/production-copy-gate.mjs",
+  "apps/ui/scripts/g007-voice-media-e2e.mjs",
+  "apps/ui/scripts/g012-voice-media-proof.mjs",
+]) {
+  const script = readFileSync(resolve(repoRoot, scriptPath), "utf8");
+  if (!script.includes("fileURLToPath(import.meta.url)")) {
+    failures.push(`${scriptPath} must convert import.meta.url with fileURLToPath for Windows`);
+  }
+  if (/new URL\([^\n]*import\.meta\.url\)\.pathname/.test(script)) {
+    failures.push(`${scriptPath} must not use URL.pathname as a filesystem path`);
+  }
 }
 
 if (failures.length > 0) {

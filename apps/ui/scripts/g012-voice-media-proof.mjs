@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const uiRoot = resolve(new URL("..", import.meta.url).pathname);
+const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(uiRoot, "../..");
 const artifactRoot = resolve(repoRoot, "target/g012-e2e/voice-media-proof");
 const commandLogDir = resolve(artifactRoot, "command-logs");

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { relative, resolve, sep } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(new URL("../../..", import.meta.url).pathname);
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const failures = [];
 
 function repoPath(path) {

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { relative, resolve, sep } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(new URL("../../..", import.meta.url).pathname);
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const uiRoot = resolve(repoRoot, "apps/ui");
 const failures = [];
 
