@@ -708,6 +708,166 @@ async function joinInvite(page: Page, invite: string) {
   await expect(page.getByText(/G007 Voice Media Lab/i).first()).toBeVisible();
 }
 
+type AdvertisedVoicePeer = {
+  memberId: string;
+  displayName: string;
+  deviceId: string;
+  peerId: string;
+  role: "owner" | "member";
+};
+
+type AuthorityGroupSchema = {
+  groupId: string;
+  channels: Array<Record<string, unknown>>;
+  channelSchemaEpoch: number;
+  owner: AdvertisedVoicePeer;
+};
+
+async function readAuthorityGroupSchema(page: Page): Promise<AuthorityGroupSchema> {
+  return page.evaluate(() => {
+    const storageKey = "discrypt.local-dev.app-state.v1";
+    const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
+    const groupId = state?.active_context?.group_id;
+    const group = state?.groups?.find(
+      (candidate: { group_id?: string }) => candidate.group_id === groupId,
+    );
+    if (!state?.profile || !group || !Array.isArray(group.channels)) {
+      throw new Error("authority group state is unavailable");
+    }
+    return {
+      groupId: group.group_id,
+      channels: group.channels,
+      channelSchemaEpoch: group.channel_schema_epoch,
+      owner: {
+        memberId: state.profile.user_id,
+        displayName: state.profile.display_name,
+        deviceId: state.profile.device_name,
+        peerId: `provider-peer-${state.profile.user_id}`,
+        role: "owner" as const,
+      },
+    };
+  });
+}
+
+async function readMemberVoicePeer(page: Page): Promise<AdvertisedVoicePeer> {
+  return page.evaluate(() => {
+    const storageKey = "discrypt.local-dev.app-state.v1";
+    const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
+    if (!state?.profile) throw new Error("member profile state is unavailable");
+    return {
+      memberId: state.profile.user_id,
+      displayName: state.profile.display_name,
+      deviceId: state.profile.device_name,
+      peerId: `provider-peer-${state.profile.user_id}`,
+      role: "member" as const,
+    };
+  });
+}
+
+async function installAdvertisedGroupState(
+  page: Page,
+  schema: AuthorityGroupSchema,
+  localPeer: AdvertisedVoicePeer,
+  remotePeer: AdvertisedVoicePeer,
+) {
+  await page.evaluate(
+    ({ authoritySchema, local, remote }) => {
+      const storageKey = "discrypt.local-dev.app-state.v1";
+      const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
+      const group = state?.groups?.find(
+        (candidate: { group_id?: string }) =>
+          candidate.group_id === authoritySchema.groupId,
+      );
+      if (!state?.profile || !group) {
+        throw new Error("group state is unavailable for provider advertisement");
+      }
+      const now = new Date().toISOString();
+      const presenceExpiresAt = new Date(Date.now() + 10 * 60 * 1_000).toISOString();
+      const members = [local, remote].map((peer) => ({
+        member_id: peer.memberId,
+        display_name: peer.displayName,
+        device_id: peer.deviceId,
+        role: peer.role,
+        status: "online",
+        signer_public_key_hex: `test-signer-${peer.memberId}`,
+        runtime_peer_id: peer.peerId,
+        joined_at: now,
+        last_seen_at: now,
+        presence_expires_at: presenceExpiresAt,
+        revoked_at: null,
+        revoked_by: null,
+        route_evidence: {
+          route_kind: "provider_presence",
+          route_status: "current",
+          evidence_source:
+            peer.memberId === state.profile.user_id
+              ? "local_runtime_identity_v1"
+              : "sealed_provider_peer_advertisement_v1",
+          updated_at: now,
+        },
+      }));
+      group.channels = authoritySchema.channels;
+      group.channel_schema_epoch = authoritySchema.channelSchemaEpoch;
+      group.role = local.role;
+      group.members = members;
+      group.runtime_peers = members.map(
+        (member: {
+          member_id: string;
+          device_id: string;
+          role: string;
+          runtime_peer_id: string;
+          route_evidence: { evidence_source: string };
+        }) => ({
+          peer_id: member.runtime_peer_id,
+          role: member.role,
+          is_local: member.member_id === state.profile.user_id,
+          source: member.route_evidence.evidence_source,
+          member_id: member.member_id,
+          device_id: member.device_id,
+          route_evidence: member.route_evidence,
+        }),
+      );
+      state.active_context = {
+        kind: "group",
+        group_id: authoritySchema.groupId,
+        channel_id: null,
+        dm_id: null,
+      };
+      window.localStorage.setItem(storageKey, JSON.stringify(state));
+    },
+    {
+      authoritySchema: schema,
+      local: localPeer,
+      remote: remotePeer,
+    },
+  );
+}
+
+async function synchronizeAuthoritySchemaAndPeerAdvertisements(
+  ownerPage: Page,
+  memberPage?: Page,
+) {
+  const schema = await readAuthorityGroupSchema(ownerPage);
+  const member = memberPage
+    ? await readMemberVoicePeer(memberPage)
+    : {
+        memberId: "remote-member-voice-e2e",
+        displayName: "Remote peer",
+        deviceId: "remote-device-voice-e2e",
+        peerId: "remote-peer",
+        role: "member" as const,
+      };
+  await installAdvertisedGroupState(ownerPage, schema, schema.owner, member);
+  if (memberPage) {
+    await installAdvertisedGroupState(memberPage, schema, member, schema.owner);
+    await Promise.all([ownerPage.reload(), memberPage.reload()]);
+    await expect(memberPage.getByRole("button", { name: /Voice Lobby/ })).toBeVisible();
+  } else {
+    await ownerPage.reload();
+  }
+  await expect(ownerPage.getByRole("button", { name: /Voice Lobby/ })).toBeVisible();
+}
+
 async function joinVoice(page: Page) {
   await page.getByRole("button", { name: /Voice Lobby/ }).click();
   await expect(
@@ -940,11 +1100,11 @@ test("sealed WebView voice signaling binds backend envelope metadata", async ({
           tamperingRejected.push(true);
         }
       }
-      const legacy = await voiceMedia.open({
+      const unscopedSignal = await voiceMedia.open({
         ...message,
-        sealed_payload: "voice-signal-sealed:v1:legacy.payload",
+        sealed_payload: "voice-signal-sealed:v1:unscoped.payload",
       });
-      return { opened, tamperingRejected, legacy };
+      return { opened, tamperingRejected, unscopedSignal };
     });
 
     expect(result.opened).toMatchObject({
@@ -953,7 +1113,7 @@ test("sealed WebView voice signaling binds backend envelope metadata", async ({
       description: { type: "offer", sdp: "v=0\r\n" },
     });
     expect(result.tamperingRejected).toEqual([true, true, true]);
-    expect(result.legacy).toBeNull();
+    expect(result.unscopedSignal).toBeNull();
   } finally {
     await profile.context.close();
   }
@@ -965,6 +1125,7 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
   const profile = await openProfile(browser, "Native Speaker", "Linux Desktop");
   try {
     await createInvite(profile.page);
+    await synchronizeAuthoritySchemaAndPeerAdvertisements(profile.page);
     await profile.page.evaluate(() => {
       const voiceEvidence = (
         window as Window & {
@@ -1275,6 +1436,7 @@ test("two profiles attach local microphone tracks and surface remote audio playb
   try {
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
+    await synchronizeAuthoritySchemaAndPeerAdvertisements(alice.page, bob.page);
 
     await joinVoice(alice.page);
     await joinVoice(bob.page);
@@ -1361,6 +1523,7 @@ test("WebView voice ignores stale signaling from a previous media attempt", asyn
   try {
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
+    await synchronizeAuthoritySchemaAndPeerAdvertisements(alice.page, bob.page);
 
     await joinVoice(bob.page);
     await joinVoice(alice.page);

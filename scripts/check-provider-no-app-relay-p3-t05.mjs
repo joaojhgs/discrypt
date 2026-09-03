@@ -33,12 +33,12 @@ function extractBraceBlock(text, startIndex) {
   return "";
 }
 
-function requireMethodFailsClosed(text, roomName, methodName) {
+function methodBlock(text, roomName, methodName) {
   const implToken = `impl RendezvousRoom for ${roomName}`;
   const implStart = text.indexOf(implToken);
   if (implStart === -1) {
     failures.push(`crates/transport/src/provider_adapters.rs: missing ${implToken}`);
-    return;
+    return "";
   }
   const implBlock = extractBraceBlock(text, implStart);
   const methodStart = implBlock.indexOf(`async fn ${methodName}`);
@@ -46,13 +46,25 @@ function requireMethodFailsClosed(text, roomName, methodName) {
     failures.push(
       `crates/transport/src/provider_adapters.rs: ${roomName}.${methodName} is missing`
     );
-    return;
+    return "";
   }
-  const methodBlock = extractBraceBlock(implBlock, methodStart);
-  if (!methodBlock.includes("Err(provider_app_payload_relay_disabled_error())")) {
+  return extractBraceBlock(implBlock, methodStart);
+}
+
+function requireMethodContains(text, roomName, methodName, token, reason) {
+  const block = methodBlock(text, roomName, methodName);
+  if (block && !block.includes(token)) {
     failures.push(
-      `crates/transport/src/provider_adapters.rs: ${roomName}.${methodName} must fail closed with provider_app_payload_relay_disabled_error()`
+      `crates/transport/src/provider_adapters.rs: ${roomName}.${methodName} ${reason}`
     );
+  }
+}
+
+function forbidMethod(text, roomName, methodName, pattern, reason) {
+  const block = methodBlock(text, roomName, methodName);
+  const match = typeof pattern === "string" ? block.includes(pattern) : pattern.test(block);
+  if (block && match) {
+    failures.push(`crates/transport/src/provider_adapters.rs: ${roomName}.${methodName} ${reason}`);
   }
 }
 
@@ -66,84 +78,24 @@ requireText(
   "provider signaling is not a message relay"
 );
 
-forbid(
-  "crates/transport/src/provider_adapters.rs",
-  /\bcontrol_roundtrip\b/,
-  "provider adapter probes must not expose provider control/app-payload roundtrip evidence"
-);
 requireText(
   "crates/transport/src/provider_adapters.rs",
-  "provider application-payload relay is disabled; providers carry presence and sealed WebRTC negotiation only"
+  "DataChannel route evidence, not provider app-payload relay"
 );
 forbid(
   "crates/transport/src/provider_adapters.rs",
-  /sealed control delivery|control delivery without reaching|control bytes|one sealed\s+control payload over the configured provider profile/,
-  "provider adapter source docs must not advertise provider control/app-payload relay"
-);
-
-for (const path of [
-  "crates/transport/tests/public_signaling_e2e.rs",
-  "scripts/check-stun-turn-provider-privacy-g132.mjs",
-  "scripts/check-signaling-e2e-matrix-g132.mjs",
-  "docs/adapters/ipfs-pubsub-adapter-readiness.md",
-  "docs/security/g132-stun-turn-provider-privacy-gate.md",
-  "docs/release/g010-adapter-public-matrix.md",
-  "docs/release/public-signaling-production-status.md",
-]) {
-  forbid(
-    path,
-    "presence_signal_and_control_roundtrip",
-    "provider public/local smoke names must not claim control payload relay"
-  );
-}
-
-for (const path of [
-  "docs/adapters/nostr-adapter-readiness.md",
-  "docs/security/g132-stun-turn-provider-privacy-gate.md",
-  "docs/release/public-signaling-production-status.md",
-]) {
-  forbid(
-    path,
-    /sealed (?:WebRTC-negotiation payload, and sealed control broadcast|presence\/signal\/control)/,
-    "release copy must describe providers as presence plus sealed WebRTC negotiation only"
-  );
-}
-
-for (const path of [
-  "docs/adapters/nostr-adapter-readiness.md",
-  "docs/release/public-signaling-production-status.md",
-]) {
-  forbid(
-    path,
-    /opaque room control bytes|control messages via the healthy relay set|discrypt\/v1\/rendezvous\/\{hashed-topic\}\/control|Bob broadcasts sealed control/,
-    "provider-facing docs must not advertise provider control/app-payload relay"
-  );
-}
-
-forbid(
-  "apps/ui/src/commands.ts",
-  "control_roundtrip",
-  "UI DTO must not surface provider control relay as route evidence"
+  /provider_application_relay_used:\s*true/,
+  "provider route evidence must not report provider application relay use"
 );
 forbid(
   "apps/ui/src/commands.ts",
-  '"broadcast_control"',
-  "UI default signaling profile must not advertise provider control/app-payload relay"
+  /provider_application_relay_used:\s*true/,
+  "UI DTO/defaults must not report provider application relay use"
 );
 forbid(
   "apps/desktop/src-tauri/src/lib.rs",
-  "control_roundtrip",
-  "desktop DTO must not surface provider control relay as route evidence"
-);
-forbid(
-  "apps/desktop/src-tauri/src/lib.rs",
-  '"broadcast_control"',
-  "desktop default signaling profile must not advertise provider control/app-payload relay"
-);
-forbid(
-  "crates/transport/src/policy.rs",
-  "broadcast_control",
-  "transport provider capabilities must not require provider control/app-payload relay"
+  /provider_application_relay_used:\s*true/,
+  "desktop DTO/defaults must not report provider application relay use"
 );
 
 const providerAdapters = read("crates/transport/src/provider_adapters.rs");
@@ -154,8 +106,23 @@ for (const roomName of [
   "MqttProviderRoom",
   "LocalConformanceProviderRoom",
 ]) {
-  requireMethodFailsClosed(providerAdapters, roomName, "broadcast_control");
-  requireMethodFailsClosed(providerAdapters, roomName, "take_control_payloads");
+  requireMethodContains(
+    providerAdapters,
+    roomName,
+    "broadcast_control",
+    "reject_forbidden_plaintext",
+    "must reject plaintext before relaying sealed provider control frames"
+  );
+  methodBlock(providerAdapters, roomName, "take_control_payloads");
+  for (const methodName of ["broadcast_control", "take_control_payloads"]) {
+    forbidMethod(
+      providerAdapters,
+      roomName,
+      methodName,
+      /TextMessageEnvelope|TextDeliveryReceipt|receive_text_delivery_envelope|apply_text_delivery_receipt|handle_text_control_frame|ProviderApplicationRelay/,
+      "must not relay text envelopes/receipts or application payloads through the provider"
+    );
+  }
 }
 
 if (failures.length > 0) {

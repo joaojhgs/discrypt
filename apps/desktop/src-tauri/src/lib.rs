@@ -63,24 +63,15 @@ use discrypt_storage::{
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
 use discrypt_storage::{LinuxOsKeychain, ProductionAppDbKeychain};
-#[cfg(test)]
-use discrypt_transport::probe_provider_webrtc_datachannel_request_response_with_config_and_answerer;
-#[cfg(test)]
-use discrypt_transport::TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE;
 use discrypt_transport::{
-    broker_control_lane_key, join_provider_control_lane_room, BrokerControlLaneTransport,
-};
-use discrypt_transport::{
-    plan_signaling_adapter_fallback, probe_provider_adapter_roundtrip,
-    probe_provider_webrtc_datachannel_request_response_roundtrip,
+    broker_control_lane_key, join_provider_control_lane_room, plan_signaling_adapter_fallback,
+    probe_provider_adapter_roundtrip, probe_provider_webrtc_datachannel_request_response_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
-    resume_text_control_runtime_from_probe,
     start_provider_webrtc_text_control_answer_runtime_with_answerer,
     start_provider_webrtc_text_control_offer_runtime, AdapterFallbackBehavior, AdapterTrustLabel,
-    ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel, ConversationScope, Endpoint,
-    FallbackLeg, IceEndpointPolicy, IceServerConfig, ProviderMetadataPosture,
-    ProviderRetryBackoffPolicy, ProviderTextControlRuntimeAttachment,
-    ProviderTextControlRuntimePeerRole, ProviderTextControlRuntimeSpec,
+    BrokerControlLaneTransport, ConnectionAttempt, ConnectivityPlan, ConnectivityScopeLevel,
+    ConversationScope, Endpoint, FallbackLeg, IceEndpointPolicy, IceServerConfig,
+    ProviderMetadataPosture, ProviderRetryBackoffPolicy, ProviderTextControlRuntimePeerRole,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingPeerId, SignalingProviderEndpoint, TransportError,
     TransportRoute, TransportSession, TransportSessionSnapshot, TransportSessionState,
@@ -117,7 +108,9 @@ use webkit2gtk::{
     glib::ObjectExt, PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt,
 };
 
-const APP_STATE_SCHEMA_VERSION: u32 = 1;
+const APP_STATE_SCHEMA_VERSION: u32 = 2;
+const DEFAULT_GROUP_TEXT_CHANNEL_ID: &str = "channel-general";
+const DEFAULT_GROUP_VOICE_CHANNEL_ID: &str = "channel-voice-lobby";
 const APP_STATE_STORE_FILENAME: &str = "app-state.discrypt-store";
 const APP_STATE_PRODUCTION_DIR_NAME: &str = "discrypt";
 const APP_STATE_LOCAL_DEV_DIR_NAME: &str = "discrypt-local-dev";
@@ -136,23 +129,14 @@ const APP_CONFIG_SIGNING_PUBLIC_KEY_HEX: &str =
 const BUILTIN_APP_CONFIG_SIGNATURE_HEX: &str =
     "06cf84dca8e5746067c5e88ff700357e30b19ba09a7b052e7e7f81b3fe50ecc0d6ea9ae8b433be4e0497d040654cf5e14361595cc47f68569df0050806ccea03";
 const TEXT_SEND_LIMIT: u32 = 20;
-#[allow(dead_code)]
 const TEXT_EXPORTER_LABEL: &str = "discrypt/text";
-#[allow(dead_code)]
-const TEXT_EXPORTER_CONTEXT: &[u8] = b"discrypt-tauri-text-v1";
 const ADMISSION_HELPER_ATTEMPT_LIMIT: u32 = 5;
 const SIGNALING_ACTION_LIMIT: u32 = 60;
 const ABUSE_WINDOW_SECONDS: i64 = 60;
-#[cfg_attr(not(feature = "tauri-runtime"), allow(dead_code))]
+#[cfg(feature = "tauri-runtime")]
 const APP_EVENT_TAURI_TOPIC: &str = "app_event";
-const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
-    "Provider-backed long-lived attachment is intentionally disabled while this app-service only owns short-lived transport probes; add persisted negotiated offer/answer/ICE bootstrap handoff and a persistent installed-app receiver loop for peer routing before attaching";
 const GROUP_PRESENCE_DEFAULT_TTL_SECONDS: i64 = 90;
 const GROUP_PRESENCE_MAX_TTL_SECONDS: i64 = 300;
-
-fn default_app_state_schema_version() -> u32 {
-    APP_STATE_SCHEMA_VERSION
-}
 
 /// Lifecycle route for the desktop app shell.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -321,17 +305,27 @@ pub struct UserProfileView {
     pub recovery_status: String,
 }
 
-/// Signed runtime peer row for DM text/control attachment.
+/// Provider-advertised runtime peer row for DM text/control attachment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DmRuntimePeerView {
-    /// Stable provider peer id derived from signed DM bootstrap metadata.
+    /// Stable runtime peer id advertised over the sealed provider control lane.
     pub peer_id: String,
-    /// Role this peer represents for the current first-contact invite bootstrap.
+    /// `inviter` or `reply`, used to choose the provider-signaled WebRTC offerer.
     pub role: String,
     /// Whether this peer is the local device/profile role in this installed state.
     pub is_local: bool,
     /// Backend evidence source for this peer id.
     pub source: String,
+    /// Profile identity that signed the current route lease.
+    pub profile_id: String,
+    /// Ed25519 identity key that signed the current route lease.
+    pub signer_public_key_hex: String,
+    /// Device identifier bound into the current route lease.
+    pub device_id: String,
+    /// RFC3339 time when this peer last advertised the route.
+    pub last_seen_at: String,
+    /// RFC3339 expiry for the current route lease.
+    pub presence_expires_at: String,
 }
 
 /// Direct-message conversation row.
@@ -369,12 +363,24 @@ pub struct ChannelStateView {
     pub connectivity: Option<ConnectivityPolicyView>,
 }
 
+/// Signed, authority-issued complete channel schema used for admission and
+/// reconnect reconciliation. The invite intentionally carries no channel list.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupChannelSchemaSnapshotView {
+    pub schema_epoch: u64,
+    pub channels: Vec<ChannelStateView>,
+    pub actor_member_id: String,
+    pub actor_signer_public_key_hex: String,
+    pub created_at: String,
+    pub signature_hex: String,
+}
+
 /// Signed runtime peer row for group text/control attachment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GroupRuntimePeerView {
-    /// Stable provider peer id derived from signed group bootstrap metadata.
+    /// Current runtime peer id accepted from a signed provider advertisement.
     pub peer_id: String,
-    /// Role this peer represents for the current two-sided invite bootstrap.
+    /// Current admitted group role for this advertised peer.
     pub role: String,
     /// Whether this peer is the local device/profile role in this installed state.
     pub is_local: bool,
@@ -440,7 +446,7 @@ impl GroupRoleView {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupAdmissionModeView {
-    /// Preserve existing invite behavior unless an owner/staff peer switches to manual approval.
+    /// Automatically admit a signed invite when an authorized owner/staff peer is online.
     #[default]
     AutomaticWhenAuthorizedOnline,
     ManualApproval,
@@ -467,6 +473,9 @@ pub struct GroupMemberView {
     pub status: String,
     #[serde(default)]
     pub signer_public_key_hex: Option<String>,
+    /// Runtime route identifier advertised by this member over the sealed
+    /// provider control plane. It is never carried by an invite.
+    pub runtime_peer_id: Option<String>,
     pub joined_at: String,
     #[serde(default)]
     pub last_seen_at: Option<String>,
@@ -490,21 +499,6 @@ pub struct GroupRolePolicyView {
     pub updated_at: String,
 }
 
-impl Default for GroupRolePolicyView {
-    fn default() -> Self {
-        Self {
-            admission_mode: GroupAdmissionModeView::default(),
-            policy_epoch: 1,
-            updated_by: "migration".to_owned(),
-            updated_at: "1970-01-01T00:00:00+00:00".to_owned(),
-        }
-    }
-}
-
-fn default_group_role_policy_view() -> GroupRolePolicyView {
-    GroupRolePolicyView::default()
-}
-
 /// Durable pre-admission request row. Approval/refusal logic is implemented by admission commands.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GroupAdmissionRequestView {
@@ -517,6 +511,8 @@ pub struct GroupAdmissionRequestView {
     pub device_name: Option<String>,
     pub member_identity: String,
     pub signer_public_key_hex: String,
+    /// Profile identity key used to authorize later owner/staff governance.
+    pub identity_signer_public_key_hex: String,
     pub key_package: Vec<u8>,
     pub status: String,
     pub requested_at: String,
@@ -557,15 +553,16 @@ pub struct GroupView {
     pub group_id: String,
     /// Display name.
     pub name: String,
-    /// Legacy/current-member role label retained for compatibility; derive policy from `members`.
+    /// Current local member role summary; authorization is derived from `members`.
     pub role: String,
     /// Channels in this group.
     pub channels: Vec<ChannelStateView>,
+    /// Monotonic owner/staff-issued channel schema revision.
+    pub channel_schema_epoch: u64,
     /// Persisted roster containing backend-authorized group roles.
     #[serde(default)]
     pub members: Vec<GroupMemberView>,
     /// Persisted admission/role policy for this group.
-    #[serde(default = "default_group_role_policy_view")]
     pub role_policy: GroupRolePolicyView,
     /// Durable pending/decided invite admission requests.
     #[serde(default)]
@@ -761,7 +758,7 @@ pub struct GroupInviteBootstrapView {
 /// Persisted connectivity bootstrap policy for a DM or group scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConnectivityPolicyView {
-    /// Connectivity schema version for forward-compatible parsers.
+    /// Connectivity schema version enforced by strict parsers.
     pub connectivity_schema_version: u32,
     /// Scope kind: group_join or dm_contact.
     pub invite_kind: String,
@@ -783,14 +780,6 @@ pub struct ConnectivityPolicyView {
     pub group_bootstrap: Option<GroupInviteBootstrapView>,
 }
 
-fn default_connectivity_schema_version() -> u32 {
-    INVITE_CONNECTIVITY_SCHEMA_VERSION
-}
-
-fn default_invite_kind_group() -> String {
-    InviteKind::GroupJoin.canonical_name().to_owned()
-}
-
 /// Command-backed invite row.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteView {
@@ -808,10 +797,8 @@ pub struct InviteView {
     #[serde(default)]
     pub dm_id: Option<String>,
     /// Connectivity schema version for this invite descriptor.
-    #[serde(default = "default_connectivity_schema_version")]
     pub connectivity_schema_version: u32,
     /// Invite kind: group_join or dm_contact.
-    #[serde(default = "default_invite_kind_group")]
     pub invite_kind: String,
     /// Commitment to group/DM scope; never the display name.
     #[serde(default)]
@@ -972,9 +959,9 @@ impl Default for VoiceMediaRuntimeView {
 pub struct VoiceSignalingStateView {
     /// Voice session id this signaling state is scoped to.
     pub session_id: String,
-    /// Provider/runtime peer id derived from persisted invite/bootstrap state.
+    /// Local runtime peer id advertised over the provider control plane.
     pub local_peer_id: String,
-    /// Provider/runtime peer id for the remote participant derived from persisted state.
+    /// Current remote runtime peer id accepted from a signed provider advertisement.
     pub remote_peer_id: String,
     /// Local WebRTC negotiation role (`offerer` or `answerer`) derived from runtime peer state.
     pub role: String,
@@ -1283,7 +1270,7 @@ pub struct AppStateView {
     pub voice_states: Vec<VoiceStateView>,
     /// Runtime mode and service configuration state for copy gating.
     pub runtime_mode: RuntimeModeView,
-    /// Compatibility snapshot for existing harnesses and transitional UI.
+    /// Derived lightweight UI snapshot.
     pub snapshot: AppSnapshot,
 }
 
@@ -1528,6 +1515,14 @@ pub struct PublishGroupPresenceRequest {
     pub ttl_seconds: Option<i64>,
 }
 
+/// Request to publish this profile's signed DM runtime-route lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishDmPresenceRequest {
+    pub dm_id: String,
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+}
+
 /// Request to create an invite for a group.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CreateInviteRequest {
@@ -1642,6 +1637,8 @@ pub enum TextControlFrameView {
         member_identity: String,
         /// Joiner signer public key handle used to reload its private signer when applying Welcome.
         signer_public_key_hex: String,
+        /// Joiner profile identity key to bind to its admitted roster row.
+        identity_signer_public_key_hex: String,
         /// TLS-serialized OpenMLS KeyPackage bytes.
         key_package: Vec<u8>,
     },
@@ -1665,14 +1662,10 @@ pub enum TextControlFrameView {
     OpenMlsAdmissionWelcome {
         /// Target group id from the signed invite.
         group_id: String,
-        /// Owner/staff actor member id that issued the Welcome, when present.
-        #[serde(default)]
-        owner_member_id: Option<String>,
-        /// Owner signer public key handle.
-        owner_signer_public_key_hex: String,
+        /// Owner/staff actor member id that issued the Welcome.
+        owner_member_id: String,
         /// Owner identity signer used for subsequent signed governance frames.
-        #[serde(default)]
-        owner_identity_signer_public_key_hex: Option<String>,
+        owner_identity_signer_public_key_hex: String,
         /// Joiner signer public key handle expected to apply the Welcome.
         member_signer_public_key_hex: String,
         /// TLS-serialized OpenMLS Welcome bytes.
@@ -1681,6 +1674,9 @@ pub enum TextControlFrameView {
         epoch: u64,
         /// SHA-256 of the owner confirmation tag for joiner parity checking.
         confirmation_tag_sha256: String,
+        /// Current authority-issued channels, attached after invite admission
+        /// rather than embedded in the invite descriptor.
+        channel_schema: GroupChannelSchemaSnapshotView,
     },
     /// Signed encrypted text envelope from a peer.
     Envelope {
@@ -1724,6 +1720,12 @@ pub enum TextControlFrameView {
         #[serde(default)]
         openmls_confirmation_tag_sha256: Option<String>,
     },
+    /// Complete signed channel schema issued by an admitted owner/staff member.
+    GroupChannelSchemaUpdated {
+        group_id: String,
+        event_id: String,
+        snapshot: GroupChannelSchemaSnapshotView,
+    },
     /// MLS-protected signed presence heartbeat with backend TTL semantics.
     GroupPresenceHeartbeat {
         group_id: String,
@@ -1733,12 +1735,29 @@ pub enum TextControlFrameView {
         display_name: Option<String>,
         #[serde(default)]
         device_id: Option<String>,
-        #[serde(default)]
-        role: Option<GroupRoleView>,
-        #[serde(default)]
-        signer_public_key_hex: Option<String>,
+        signer_public_key_hex: String,
+        runtime_peer_id: String,
+        /// Sender's current channel schema revision and digest. Authorities use
+        /// this to repair stale or divergent peers after reconnect.
+        channel_schema_epoch: u64,
+        channel_schema_sha256: String,
         last_seen_at: String,
         presence_expires_at: String,
+        signature_hex: String,
+    },
+    /// Signed DM runtime-route lease exchanged over the provider control lane.
+    DmPresenceHeartbeat {
+        scope_id_commitment: String,
+        event_id: String,
+        profile_id: String,
+        display_name: String,
+        device_id: String,
+        role: String,
+        signer_public_key_hex: String,
+        runtime_peer_id: String,
+        last_seen_at: String,
+        presence_expires_at: String,
+        signature_hex: String,
     },
     /// Recipient acknowledgement that a governance frame was applied to local app state.
     GroupGovernanceAck {
@@ -1936,7 +1955,7 @@ pub struct TakePendingVoiceSignalingMessagesResponse {
 pub struct StartNativeVoiceMediaSessionRequest {
     /// Active voice session id.
     pub session_id: String,
-    /// Provider/runtime peer id for this profile, derived from signed invite/bootstrap state.
+    /// Local runtime peer id advertised over the provider control plane.
     pub local_peer_id: String,
     /// Provider/runtime peer id expected to receive the native media proof frame.
     pub remote_peer_id: String,
@@ -2361,25 +2380,6 @@ pub struct AttachTextControlTransportRuntimeRequest {
     /// active text session does not match, attach is rejected.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Optional runtime role for a real role-split attach (`offerer` or `answerer`).
-    ///
-    /// When omitted, the command preserves the legacy fail-closed probe-resume
-    /// behavior so older clients do not accidentally block waiting for a peer.
-    #[serde(default)]
-    pub runtime_role: Option<String>,
-    /// Stable, scoped local peer id for provider-visible routing.
-    #[serde(default)]
-    pub local_peer_id: Option<String>,
-    /// Stable, scoped remote peer id for provider-visible routing.
-    #[serde(default)]
-    pub remote_peer_id: Option<String>,
-    /// Derive runtime role and peer ids from persisted DM/group invite state.
-    ///
-    /// This is the production UI path: users never type peer ids manually.
-    /// Legacy callers that omit this flag and omit explicit role/peer ids still
-    /// hit the fail-closed probe-resume boundary.
-    #[serde(default)]
-    pub derive_from_state: bool,
 }
 
 /// Request to set self mute state.
@@ -2470,7 +2470,7 @@ fn normalize_app_output_volume_percent(percent: u16) -> u16 {
 /// by backend state and Cargo production features.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandHealth {
-    /// Compatibility snapshot command can serialize the current backend state.
+    /// Snapshot command can serialize the current backend state.
     pub snapshot_ready: bool,
     /// Safety verification command can derive and compare the current backend safety number.
     pub verification_ready: bool,
@@ -2727,9 +2727,6 @@ pub struct ProviderWebRtcDataChannelProbeView {
     /// SHA-256 of the opaque return receipt/control frame used for the proof.
     #[serde(default)]
     pub receipt_frame_sha256: String,
-    /// Versioned provider runtime handoff material captured by the backend probe.
-    #[serde(default)]
-    pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
     /// Offerer redacted ICE/DTLS/DataChannel timeline.
     #[serde(default)]
     pub offerer_diagnostic_timeline: Option<discrypt_transport::WebRtcDiagnosticTimeline>,
@@ -2766,7 +2763,6 @@ impl From<discrypt_transport::ProviderWebRtcDataChannelProbe>
             text_control_frame_sha256: probe.text_control_frame_sha256,
             receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
             receipt_frame_sha256: probe.receipt_frame_sha256,
-            runtime_spec: probe.runtime_spec,
             offerer_diagnostic_timeline: probe.offerer_diagnostic_timeline,
             answerer_diagnostic_timeline: probe.answerer_diagnostic_timeline,
         }
@@ -2802,7 +2798,6 @@ impl ProviderWebRtcDataChannelProbeView {
             text_control_frame_sha256: self.text_control_frame_sha256.clone(),
             receipt_frame_roundtrip: self.receipt_frame_roundtrip,
             receipt_frame_sha256: self.receipt_frame_sha256.clone(),
-            runtime_spec: self.runtime_spec.clone(),
             offerer_diagnostic_timeline: self.offerer_diagnostic_timeline.clone(),
             answerer_diagnostic_timeline: self.answerer_diagnostic_timeline.clone(),
         };
@@ -2937,7 +2932,7 @@ const MAX_TEXT_CONTROL_DRAIN_FRAMES: usize = 200;
 const MAX_TEXT_CONTROL_DRAIN_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl TextControlRuntimeMapKey {
-    fn legacy(session_id: impl Into<String>) -> Self {
+    fn unscoped(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
             remote_peer_id: None,
@@ -3149,7 +3144,6 @@ impl fmt::Debug for TextControlTransportRuntime {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReceivedTextRender {
     Pipeline(TextRenderState),
@@ -3157,7 +3151,6 @@ enum ReceivedTextRender {
     DecryptFailed,
 }
 
-#[allow(dead_code)]
 impl ReceivedTextRender {
     fn message_fields(
         &self,
@@ -3258,16 +3251,17 @@ struct OpenMlsGroupHandleRecord {
     status_copy: String,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 struct OpenMlsAdmissionKeyPackage {
     group_id: String,
     member_identity: String,
     signer_public_key_hex: String,
+    identity_signer_public_key_hex: String,
     package: OpenMlsMemberPackage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
+#[cfg(test)]
 struct OpenMlsAdmissionWelcome {
     group_id: String,
     owner_signer_public_key_hex: String,
@@ -3294,7 +3288,6 @@ enum AdmissionDecisionApplyStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedAppState {
-    #[serde(default = "default_app_state_schema_version")]
     schema_version: u32,
     lifecycle: AppLifecycle,
     profile: Option<UserProfileView>,
@@ -3347,13 +3340,15 @@ struct PersistedAppState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PersistedSchemaVersion {
     Current,
-    Legacy { version: u32, missing: bool },
+    Missing,
+    Unsupported(u32),
     Future(u32),
     Invalid,
 }
 
 static APP_SERVICE: OnceLock<Mutex<TauriAppService>> = OnceLock::new();
 static LAST_PANIC_LOG: OnceLock<Mutex<Option<PanicLogEntry>>> = OnceLock::new();
+#[cfg(feature = "tauri-runtime")]
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 #[cfg(target_os = "linux")]
 static LINUX_ALSA_PLAYBACK_FALLBACK: OnceLock<LinuxAlsaPlaybackDevice> = OnceLock::new();
@@ -3377,7 +3372,7 @@ struct TauriAppService {
     native_voice_transport_runtime: Option<NativeVoiceTransportRuntime>,
     pending_native_voice_transport_runtime: Option<PendingNativeVoiceTransportRuntime>,
     native_voice_transport_error: Option<String>,
-    #[cfg(any(test, feature = "harness"))]
+    #[cfg(test)]
     state_path_override: Option<PathBuf>,
 }
 
@@ -3415,13 +3410,12 @@ impl TauriAppService {
             native_voice_transport_runtime: None,
             pending_native_voice_transport_runtime: None,
             native_voice_transport_error: None,
-            #[cfg(any(test, feature = "harness"))]
+            #[cfg(test)]
             state_path_override: None,
         }
     }
 
-    #[cfg(any(test, feature = "harness"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn load_for_test_path(path: PathBuf) -> Self {
         Self {
             state: load_state_from_path(&path),
@@ -3538,6 +3532,7 @@ impl TauriAppService {
             .is_empty()
     }
 
+    #[cfg(any(feature = "tauri-runtime", test))]
     fn text_control_runtime_for_session(
         &self,
         session_id: &str,
@@ -3818,7 +3813,6 @@ impl TauriAppService {
                 member.member_id == local_member_id
                     && member.status != "pending"
                     && member.status != "revoked"
-                    && member.status != "migration_default"
                     && member.status != "offline"
             }) else {
                 unavailable_reasons.push(format!(
@@ -3842,7 +3836,6 @@ impl TauriAppService {
                     member.member_id != local_member_id
                         && member.status != "pending"
                         && member.status != "revoked"
-                        && member.status != "migration_default"
                         && member.status != "offline"
                 })
                 .collect::<Vec<_>>();
@@ -4138,42 +4131,63 @@ impl TauriAppService {
                 "Start and attach the backend text/control runtime before publishing online presence".to_owned(),
             ));
         };
-        if !session.state().is_connected()
-            && !self.broker_control_lane_attached_for_session(&session.session_id)
-        {
+        if !self.broker_control_lane_attached_for_session(&session.session_id) {
             return Err((
-                "text_session_not_connected",
+                "provider_control_lane_not_attached",
                 format!(
-                    "Text/control transport session {} is {}",
-                    session.session_id,
-                    PersistedAppState::transport_state_label(session.state())
+                    "Provider control lane is not attached for text session {}",
+                    session.session_id
                 ),
-                "Complete route establishment before publishing online presence".to_owned(),
+                "Attach the signaling-provider control room before publishing presence".to_owned(),
             ));
         }
-        let Some(runtime) = self.text_control_runtime_for_session(&session.session_id) else {
+        Ok(())
+    }
+
+    fn dm_presence_route_evidence(
+        &self,
+        dm_id: &str,
+    ) -> Result<(), (&'static str, String, String)> {
+        let Some(context) = self.state.active_context.as_ref() else {
             return Err((
-                "text_runtime_not_attached",
-                "No backend-owned text/control runtime is attached for group presence".to_owned(),
-                "Attach the group text/control runtime before publishing online presence"
+                "active_dm_missing",
+                "No active DM context is selected for route publication".to_owned(),
+                "Open the DM and attach its provider control lane before publishing a runtime route"
                     .to_owned(),
             ));
         };
-        if runtime.session_id != session.session_id {
+        if context.dm_id.as_deref() != Some(dm_id) {
             return Err((
-                "text_runtime_session_mismatch",
+                "active_dm_mismatch",
                 format!(
-                    "Attached text/control runtime {} does not match active text session {}",
-                    runtime.session_id, session.session_id
+                    "DM {} is not the active backend context",
+                    redacted_observable_ref("dm", dm_id)
                 ),
-                "Restart or reattach the text/control runtime before publishing online presence"
+                "Select the target DM before publishing its runtime route".to_owned(),
+            ));
+        }
+        let Some(session) = self.state.transport_session(BackendTransportMode::Text) else {
+            return Err((
+                "text_session_missing",
+                "No text/control transport session exists for DM route publication".to_owned(),
+                "Start the text session and attach its provider control lane".to_owned(),
+            ));
+        };
+        if !self.broker_control_lane_attached_for_session(&session.session_id) {
+            return Err((
+                "provider_control_lane_not_attached",
+                format!(
+                    "Provider control lane is not attached for text session {}",
+                    session.session_id
+                ),
+                "Attach the signaling-provider control room before publishing the DM route"
                     .to_owned(),
             ));
         }
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn openmls_store_path(&self) -> PathBuf {
         #[cfg(test)]
         if let Some(path) = &self.state_path_override {
@@ -4182,7 +4196,7 @@ impl TauriAppService {
         app_openmls_store_path()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn request_openmls_admission_key_package(
         &mut self,
         group_id: &str,
@@ -4195,6 +4209,11 @@ impl TauriAppService {
             .generate_member_package(member_identity.as_bytes())
             .map_err(|error| format!("OpenMLS key package could not be generated: {error}"))?;
         let signer_public_key_hex = hex::encode(package.signer_public_key());
+        let identity_signer_public_key_hex = hex::encode(
+            SigningKey::from_bytes(&self.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
         self.state.push_event(
             "mls.admission_key_package_created",
             format!(
@@ -4207,11 +4226,12 @@ impl TauriAppService {
             group_id: group_id.to_owned(),
             member_identity,
             signer_public_key_hex,
+            identity_signer_public_key_hex,
             package,
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn issue_openmls_admission_welcome(
         &mut self,
         key_package: &OpenMlsAdmissionKeyPackage,
@@ -4279,7 +4299,7 @@ impl TauriAppService {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn join_openmls_group_from_welcome(
         &mut self,
         welcome: &OpenMlsAdmissionWelcome,
@@ -4327,7 +4347,6 @@ impl TauriAppService {
         {
             group.role = "member".to_owned();
         }
-        self.state.ensure_group_governance_defaults();
         self.state.push_event(
             "mls.admission_welcome_joined",
             format!(
@@ -4353,7 +4372,7 @@ impl TauriAppService {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(test, feature = "harness"))]
     fn attach_text_control_transport_runtime(
         &mut self,
         transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
@@ -4374,7 +4393,7 @@ impl TauriAppService {
         self.pending_text_control_transport_runtimes
             .retain(|key, _| key.session_id != session_id);
         self.text_control_transport_runtimes
-            .insert(TextControlRuntimeMapKey::legacy(session_id), runtime);
+            .insert(TextControlRuntimeMapKey::unscoped(session_id), runtime);
     }
 
     fn attach_owned_text_control_transport_runtime(
@@ -4443,47 +4462,20 @@ impl TauriAppService {
                 .ok_or_else(|| {
                     format!("Active group {group_id} is missing for the broker control lane")
                 })?;
-            let local_role = runtime_role_for_group(group, &state.local_user_id())
-                .cloned()
-                .ok_or_else(|| {
-                    format!("Active group {group_id} has no local member role for the broker control lane")
-                })?;
-            let runtime_peers =
-                group_runtime_peers(group.connectivity.as_ref(), group_role_label(&local_role));
-            let local = runtime_peers
+            let local_member_id = state.local_user_id();
+            let local = group
+                .members
                 .iter()
-                .find(|peer| peer.is_local)
+                .find(|member| member.member_id == local_member_id)
                 .ok_or_else(|| {
-                    format!("Active group {group_id} has no local runtime peer for the broker control lane")
+                    format!(
+                        "Active group {group_id} has no local member for the broker control lane"
+                    )
                 })?;
-            return SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string());
+            return SignalingPeerId::new(group_member_runtime_peer_id(group_id, local)?)
+                .map_err(|error| error.to_string());
         }
         Err("Active context is not a DM or group for the broker control lane".to_owned())
-    }
-
-    fn broker_lane_remote_peer_ids(&self) -> Vec<SignalingPeerId> {
-        let state = &self.state;
-        let Some(context) = state.active_context.as_ref() else {
-            return Vec::new();
-        };
-        let Some(group_id) = &context.group_id else {
-            return Vec::new();
-        };
-        let Some(group) = state
-            .groups
-            .iter()
-            .find(|group| &group.group_id == group_id)
-        else {
-            return Vec::new();
-        };
-        let Some(local_role) = runtime_role_for_group(group, &state.local_user_id()) else {
-            return Vec::new();
-        };
-        group_runtime_peers(group.connectivity.as_ref(), group_role_label(local_role))
-            .iter()
-            .filter(|peer| !peer.is_local)
-            .filter_map(|peer| SignalingPeerId::new(peer.peer_id.clone()).ok())
-            .collect()
     }
 
     #[allow(clippy::type_complexity)]
@@ -4561,7 +4553,7 @@ impl TauriAppService {
         self.pending_text_control_transport_runtimes
             .retain(|key, _| key.session_id != transport_session_id);
         self.text_control_transport_runtimes.insert(
-            TextControlRuntimeMapKey::legacy(transport_session_id.clone()),
+            TextControlRuntimeMapKey::unscoped(transport_session_id.clone()),
             TextControlTransportRuntime {
                 lane: true,
                 transport: transport.clone(),
@@ -4574,25 +4566,6 @@ impl TauriAppService {
                 remote_peer_id: None,
             },
         );
-        for remote in self.broker_lane_remote_peer_ids() {
-            self.text_control_transport_runtimes.insert(
-                TextControlRuntimeMapKey::for_remote(
-                    transport_session_id.clone(),
-                    remote.0.clone(),
-                ),
-                TextControlTransportRuntime {
-                    lane: true,
-                    transport: transport.clone(),
-                    owned_runtime: None,
-                    executor: Some(executor.clone()),
-                    inbound_receiver_owned: false,
-                    session_id: transport_session_id.clone(),
-                    role: None,
-                    local_peer_id: Some(local_peer_id.0.clone()),
-                    remote_peer_id: Some(remote.0),
-                },
-            );
-        }
     }
 
     fn attach_broker_control_lane_runtime(
@@ -4704,14 +4677,19 @@ impl TauriAppService {
             return report;
         }
         let transport_session_id = session.session_id.clone();
-        let Some(runtime) = self.text_control_runtime_for_pump().cloned() else {
-            let message = "text/control runtime is not attached".to_owned();
+        let Some(runtime) = self
+            .text_control_transport_runtimes
+            .values()
+            .find(|runtime| runtime.session_id == transport_session_id && runtime.lane)
+            .cloned()
+        else {
+            let message = "provider control lane runtime is not attached".to_owned();
             self.state.push_command_error(
                 "message.transport_drain_unavailable",
                 "drain_text_control_inbound_frames",
                 "transport_runtime_missing",
                 message.clone(),
-                "Attach a direct or broker control lane runtime before draining inbound frames",
+                "Attach the provider control lane before draining inbound control frames",
             );
             let report = failure_report("unattached-text-control-runtime", message);
             self.persist();
@@ -4791,6 +4769,13 @@ impl TauriAppService {
                 failures.push("decode inbound text/control frame failed".to_owned());
                 continue;
             };
+            if text_control_frame_plane(&inbound_frame) != TextControlFramePlane::ProviderControl {
+                failures.push(
+                    "provider control lane rejected a direct text payload or receipt frame"
+                        .to_owned(),
+                );
+                continue;
+            }
             inbound_frames += 1;
             self.state.last_command_error = None;
             if let Some(response_frame) = self.state.handle_text_control_frame(inbound_frame) {
@@ -4832,7 +4817,7 @@ impl TauriAppService {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn clear_text_control_transport_runtime(&mut self) {
         self.text_control_transport_runtimes.clear();
         self.pending_text_control_transport_runtimes.clear();
@@ -4964,7 +4949,7 @@ impl TauriAppService {
                 self.state.push_event(
                     "transport.text_runtime_attach_deduped",
                     format!(
-                        "Text/control runtime attach for session {} is already pending as {} local_peer={} remote_peer={}; legacy duplicate request was ignored",
+                        "Text/control runtime attach for session {} is already pending as {} local_peer={} remote_peer={}; duplicate request was ignored",
                         active_session_id,
                         runtime_role_label(Some(pending.role)),
                         pending.local_peer_id,
@@ -4983,7 +4968,7 @@ impl TauriAppService {
                 self.state.push_event(
                     "transport.text_runtime_attach_deduped",
                     format!(
-                        "Text/control runtime session {} is already attached for {}; legacy duplicate request was ignored",
+                        "Text/control runtime session {} is already attached for {}; duplicate request was ignored",
                         active_session_id, command_name
                     ),
                 );
@@ -5173,8 +5158,23 @@ impl TauriAppService {
             }
         }
         let pending_frames = self.state.list_pending_text_control_frames(&request);
+        let has_provider_control = pending_frames.iter().any(|frame| {
+            text_control_frame_plane(&frame.frame) == TextControlFramePlane::ProviderControl
+        });
+        let has_unscoped_direct_peer = pending_frames.iter().any(|frame| {
+            text_control_frame_plane(&frame.frame) == TextControlFramePlane::DirectPeer
+                && frame.route_peer_ids.is_empty()
+                && frame.target.kind != "channel"
+        });
+        let has_unrouted_group_direct_peer = pending_frames.iter().any(|frame| {
+            text_control_frame_plane(&frame.frame) == TextControlFramePlane::DirectPeer
+                && frame.route_peer_ids.is_empty()
+                && frame.target.kind == "channel"
+        });
         let mut route_peer_ids = BTreeSet::new();
-        for frame in &pending_frames {
+        for frame in pending_frames.iter().filter(|frame| {
+            text_control_frame_plane(&frame.frame) == TextControlFramePlane::DirectPeer
+        }) {
             for peer_id in &frame.route_peer_ids {
                 if !frame.receipted_route_peer_ids.contains(peer_id) {
                     route_peer_ids.insert(peer_id.clone());
@@ -5183,139 +5183,158 @@ impl TauriAppService {
         }
         let mut route_runtimes = Vec::new();
         let mut route_failures = Vec::new();
-        if route_peer_ids.is_empty() {
-            let key = TextControlRuntimeMapKey::legacy(transport_session_id.clone());
-            self.remove_stale_pending_text_control_runtimes_for_attach(&transport_session_id, &key);
-            if let Some(pending) = self
-                .pending_text_control_transport_runtimes
-                .values()
-                .find(|pending| pending.session_id == transport_session_id)
-                .cloned()
-            {
-                let report = TextControlTransportPumpReportView {
-                    pending_before: pending_frames.len(),
-                    frames_sent: 0,
-                    response_frames_received: 0,
-                    receipts_applied: 0,
-                    failures: Vec::new(),
-                    metrics: discrypt_transport::WebRtcDataTransportMetrics {
-                        schema_version:
-                            discrypt_transport::WebRtcDataTransportMetrics::SCHEMA_VERSION,
-                        label: "attaching-text-control-runtime".to_owned(),
-                        attached_channels: 0,
-                        open: false,
-                        frames_sent: 0,
-                        frames_received: 0,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        last_state: format!(
-                            "attaching:{}:{}->{}",
-                            runtime_role_label(Some(pending.role)),
-                            pending.local_peer_id,
-                            pending.remote_peer_id
-                        ),
-                    },
-                };
-                self.persist();
-                return report;
-            }
-
-            let Some((runtime_key, runtime)) = self
-                .text_control_runtime_entry_for_pump()
+        let mut direct_runtime_attach_pending = false;
+        if has_provider_control {
+            match self
+                .text_control_transport_runtimes
+                .iter()
+                .find(|(_, runtime)| runtime.session_id == transport_session_id && runtime.lane)
                 .map(|(key, runtime)| (key.clone(), runtime.clone()))
-            else {
-                let message = "text/control direct data-channel runtime is not attached; provider signaling is not a message relay".to_owned();
-                self.state.push_command_error(
-                    "message.transport_pump_unavailable",
-                    "pump_text_control_transport_once",
-                    "transport_runtime_missing",
-                    message.clone(),
-                    "Start the text session and attach a direct runtime. Configure TURN explicitly if direct ICE cannot connect; MQTT/Nostr providers are used for signaling only and never relay messages.",
-                );
-                let report = failure_report("unattached-text-control-runtime", message);
-                self.persist();
-                return report;
-            };
-            if runtime.session_id != transport_session_id {
-                let message = format!(
-                    "text transport runtime session id {} does not match active text session {}",
-                    runtime.session_id, transport_session_id
-                );
-                self.state.push_command_error(
-                    "message.transport_pump_unavailable",
-                    "pump_text_control_transport_once",
-                    "text_session_id_mismatch",
-                    message.clone(),
-                    "Stop the previous session and restart the text session before pumping",
-                );
-                let report = failure_report("text-control-runtime-session-mismatch", message);
-                self.persist();
-                return report;
+            {
+                Some((key, runtime)) => route_runtimes.push((
+                    TextControlFramePlane::ProviderControl,
+                    None,
+                    key,
+                    runtime,
+                )),
+                None => route_failures.push(
+                    "provider control lane is not attached for pending group control frames"
+                        .to_owned(),
+                ),
             }
-            route_runtimes.push((None, runtime_key, runtime));
-        } else {
-            for route_peer_id in route_peer_ids {
-                let key = TextControlRuntimeMapKey::for_remote(
-                    transport_session_id.clone(),
-                    route_peer_id.clone(),
-                );
+        }
+        if has_unscoped_direct_peer {
+            let pending_keys = self
+                .pending_text_control_transport_runtimes
+                .keys()
+                .filter(|key| key.session_id == transport_session_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in pending_keys {
                 self.remove_stale_pending_text_control_runtimes_for_attach(
                     &transport_session_id,
                     &key,
                 );
-                if self
-                    .pending_text_control_transport_runtimes
-                    .contains_key(&key)
+            }
+            direct_runtime_attach_pending = self
+                .pending_text_control_transport_runtimes
+                .keys()
+                .any(|key| key.session_id == transport_session_id);
+            if !direct_runtime_attach_pending {
+                match self
+                    .text_control_transport_runtimes
+                    .iter()
+                    .find(|(_, runtime)| {
+                        runtime.session_id == transport_session_id && !runtime.lane
+                    })
+                    .map(|(key, runtime)| (key.clone(), runtime.clone()))
                 {
-                    route_failures.push(format!(
-                        "route peer {route_peer_id}: text/control runtime attach is still pending"
-                    ));
-                    continue;
-                }
-                match self.text_control_transport_runtimes.get(&key).cloned() {
-                    Some(runtime) if runtime.session_id == transport_session_id => {
-                        route_runtimes.push((Some(route_peer_id), key, runtime));
+                    Some((key, runtime)) => {
+                        route_runtimes.push((TextControlFramePlane::DirectPeer, None, key, runtime))
                     }
-                    Some(runtime) => route_failures.push(format!(
-                        "route peer {route_peer_id}: runtime session {} does not match active text session {}",
-                        runtime.session_id, transport_session_id
-                    )),
                     None => {
-                        // The attached broker control lane broadcasts topic-wide;
-                        // fall back to it for route-targeted frames when no
-                        // per-peer direct/TURN runtime exists for this peer.
-                        let lane_fallback = self
-                            .text_control_runtime_entry_for_pump()
-                            .filter(|(_, runtime)| runtime.session_id == transport_session_id)
-                            .map(|(key, runtime)| (key.clone(), runtime.clone()));
-                        match lane_fallback {
-                            Some((runtime_key, runtime)) => {
-                                route_runtimes.push((Some(route_peer_id), runtime_key, runtime));
-                            }
-                            None => route_failures.push(format!(
-                                "route peer {route_peer_id}: missing direct/TURN text/control runtime; provider signaling is not a message relay"
-                            )),
+                        if let Some(attached_session_id) = self
+                            .text_control_transport_runtimes
+                            .values()
+                            .find(|runtime| !runtime.lane)
+                            .map(|runtime| runtime.session_id.as_str())
+                        {
+                            route_failures.push(format!(
+                                "provider-signaled direct WebRTC runtime session {attached_session_id} does not match active text session {transport_session_id}"
+                            ));
+                        } else {
+                            route_failures.push(
+                                "provider-signaled direct WebRTC runtime is not attached for pending peer payloads"
+                                    .to_owned(),
+                            );
                         }
                     }
                 }
             }
-            if route_runtimes.is_empty() {
-                self.state.push_command_error(
-                    "message.transport_pump_unavailable",
-                    "pump_text_control_transport_once",
-                    "text_route_runtime_missing",
-                    route_failures.join("; "),
-                    "Attach direct or explicitly configured TURN-backed WebRTC runtimes for each admitted route peer before claiming group delivery",
-                );
-                let mut report = failure_report(
-                    "group-text-control-route-runtime-missing",
-                    "no eligible group text/control runtime routes are attached".to_owned(),
-                );
-                report.pending_before = pending_frames.len();
-                report.failures = route_failures;
-                self.persist();
-                return report;
+        }
+        for route_peer_id in route_peer_ids {
+            let key = TextControlRuntimeMapKey::for_remote(
+                transport_session_id.clone(),
+                route_peer_id.clone(),
+            );
+            self.remove_stale_pending_text_control_runtimes_for_attach(&transport_session_id, &key);
+            if self
+                .pending_text_control_transport_runtimes
+                .contains_key(&key)
+            {
+                route_failures.push(format!(
+                    "route peer {route_peer_id}: direct WebRTC runtime attach is still pending"
+                ));
+                continue;
             }
+            match self.text_control_transport_runtimes.get(&key).cloned() {
+                Some(runtime)
+                    if runtime.session_id == transport_session_id && !runtime.lane =>
+                {
+                    route_runtimes.push((
+                        TextControlFramePlane::DirectPeer,
+                        Some(route_peer_id),
+                        key,
+                        runtime,
+                    ));
+                }
+                Some(_) => route_failures.push(format!(
+                    "route peer {route_peer_id}: only a provider control lane is attached; peer payload relay is forbidden"
+                )),
+                None => route_failures.push(format!(
+                    "route peer {route_peer_id}: missing provider-signaled direct WebRTC runtime"
+                )),
+            }
+        }
+        if route_runtimes.is_empty()
+            && has_unrouted_group_direct_peer
+            && !has_provider_control
+            && !has_unscoped_direct_peer
+        {
+            let mut report = failure_report(
+                "waiting-provider-peer-advertisement",
+                "group peer payload remains queued until a signed runtime route advertisement arrives"
+                    .to_owned(),
+            );
+            report.pending_before = pending_frames.len();
+            report.failures.clear();
+            self.persist();
+            return report;
+        }
+        if route_runtimes.is_empty() && direct_runtime_attach_pending {
+            let mut report = failure_report(
+                "attaching-text-control-runtime",
+                "direct WebRTC runtime attachment is still pending".to_owned(),
+            );
+            report.pending_before = pending_frames.len();
+            report.failures.clear();
+            self.persist();
+            return report;
+        }
+        if route_runtimes.is_empty() && !pending_frames.is_empty() {
+            let error_code = if route_failures
+                .iter()
+                .any(|failure| failure.contains("does not match active text session"))
+            {
+                "text_session_id_mismatch"
+            } else {
+                "transport_plane_runtime_missing"
+            };
+            self.state.push_command_error(
+                "message.transport_pump_unavailable",
+                "pump_text_control_transport_once",
+                error_code,
+                route_failures.join("; "),
+                "Attach the provider control lane for signaling state and provider-signaled direct WebRTC routes for text payloads and receipts",
+            );
+            let mut report = failure_report(
+                "text-control-plane-runtime-missing",
+                "no eligible provider-control or direct-peer runtime is attached".to_owned(),
+            );
+            report.pending_before = pending_frames.len();
+            report.failures = route_failures;
+            self.persist();
+            return report;
         }
         let executor = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5355,10 +5374,18 @@ impl TauriAppService {
             },
         };
         let mut stale_runtime_keys = BTreeSet::new();
-        for (route_peer_id, runtime_key, runtime) in route_runtimes {
+        for (plane, route_peer_id, runtime_key, runtime) in route_runtimes {
             let transport = runtime.transport.clone();
             let report = executor.block_on(async {
-                if runtime.inbound_receiver_owned {
+                if plane == TextControlFramePlane::ProviderControl {
+                    self.state
+                        .send_provider_control_transport_once(
+                            transport.as_ref(),
+                            request.clone(),
+                            transport_session_id.clone(),
+                        )
+                        .await
+                } else if runtime.inbound_receiver_owned {
                     self.state
                         .send_text_control_transport_once_for_route(
                             transport.as_ref(),
@@ -5526,7 +5553,6 @@ pub fn attach_harness_text_control_route_for_harness() -> AppStateView {
         text_control_frame_sha256: "c".repeat(64),
         receipt_frame_roundtrip: true,
         receipt_frame_sha256: "d".repeat(64),
-        runtime_spec: None,
         offerer_diagnostic_timeline: None,
         answerer_diagnostic_timeline: None,
     };
@@ -5541,7 +5567,6 @@ pub fn attach_harness_text_control_route_for_harness() -> AppStateView {
     guard.to_view()
 }
 
-/// Tauri command: return the transitional compatibility snapshot for older clients.
 pub fn app_snapshot() -> AppSnapshot {
     with_state(|state| state.to_snapshot())
 }
@@ -5619,7 +5644,6 @@ pub fn export_diagnostics_log() -> String {
         "runtime_mode": &view.runtime_mode,
         "webrtc_env": {
             "ice_mode": std::env::var("DISCRYPT_WEBRTC_ICE_MODE").unwrap_or_else(|_| "default".to_owned()),
-            "host_only_legacy": std::env::var("DISCRYPT_WEBRTC_HOST_ONLY").unwrap_or_else(|_| "unset".to_owned()),
             "udp_addrs_configured": std::env::var("DISCRYPT_WEBRTC_UDP_ADDRS").is_ok(),
             "debug_enabled": std::env::var("DISCRYPT_WEBRTC_DEBUG").is_ok() || std::env::var("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_ok(),
         },
@@ -5765,9 +5789,8 @@ pub fn configure_storage_security(request: ConfigureStorageSecurityRequest) -> A
     if existing.is_none() {
         if let Some(error) = view.last_command_error.as_ref() {
             // Do not let a failed first mode selection become durable for an existing
-            // production store. This keeps migrated/previous-release data recoverable
-            // by trying the other configured storage mode instead of pinning the UI
-            // to the wrong keyring/vault choice. The data store itself is preserved.
+            // production store. Preserve the current store instead of pinning the UI
+            // to the wrong keyring/vault choice.
             let _ = std::fs::remove_file(production_storage_config_path());
             if had_existing_store {
                 production_storage_unlock_state()
@@ -5781,7 +5804,7 @@ pub fn configure_storage_security(request: ConfigureStorageSecurityRequest) -> A
                     "The selected storage mode could not open Discrypt storage: {}",
                     error.message
                 ),
-                "Existing local state was preserved. Try the other storage mode if this is a migrated install; recovery and migration flows are tracked in the roadmap.",
+                "Existing local state was preserved. Select the storage mode that originally created this profile, or reset the profile explicitly.",
             );
         }
     }
@@ -5973,9 +5996,8 @@ pub fn stop_text_session(request: StopTextSessionRequest) -> AppStateView {
 }
 
 /// Tauri command: bind an app-service text/control runtime to the active text
-/// session. DM/group requests derive role-split peer ids from backend-owned
-/// signed invite metadata; legacy no-scope requests remain fail-closed rather
-/// than resuming stale probe SDP.
+/// session. DM/group requests select runtime peer IDs only from current signed
+/// provider advertisements.
 pub fn attach_text_control_transport_runtime(
     request: AttachTextControlTransportRuntimeRequest,
 ) -> AppStateView {
@@ -5998,7 +6020,6 @@ pub fn attach_text_control_transport_runtime(
     };
 
     let active_session_id = session.session_id.clone();
-    let active_session_state = session.state();
 
     if let Some(expected_session_id) = request.session_id.as_deref() {
         if expected_session_id != active_session_id {
@@ -6017,268 +6038,75 @@ pub fn attach_text_control_transport_runtime(
         }
     }
 
-    let has_explicit_runtime_attachment = request.runtime_role.is_some()
-        || request.local_peer_id.is_some()
-        || request.remote_peer_id.is_some();
-    if has_explicit_runtime_attachment && !explicit_text_runtime_attachment_allowed() {
-        guard.state.push_command_error(
-            "transport.text_runtime_attach_rejected",
-            "attach_text_control_transport_runtime",
-            "text_runtime_explicit_attach_not_allowed",
-            "Production builds must derive text/control runtime role and peer ids from persisted DM/group invite state",
-            "Retry with derive_from_state=true after opening the signed DM or group context; explicit peer-id attachment is reserved for test/harness builds",
-        );
-        guard.persist();
-        return guard.to_view();
-    }
-
-    let derived_attachments = if request.derive_from_state {
-        match guard
-            .state
-            .active_runtime_peer_attachments_for_text_control()
-        {
-            Ok(attachments) => Some(attachments),
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "attach_text_control_transport_runtime",
-                    "text_runtime_scope_unavailable",
-                    error,
-                    "Open a DM/group context created from signed invite/connectivity metadata before attaching the backend runtime",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
-        }
-    } else {
-        None
-    };
-
-    let explicit_attachment = if let Some(runtime_role) = request.runtime_role.as_deref() {
-        let role = match parse_text_control_runtime_role(runtime_role) {
-            Ok(role) => role,
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "attach_text_control_transport_runtime",
-                    "text_runtime_role_invalid",
-                    error,
-                    "Use runtime_role=offerer or runtime_role=answerer with scoped local/remote peer ids",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
-        };
-        let Some(local_peer_id) = request.local_peer_id.as_deref() else {
+    let attachments = match guard
+        .state
+        .active_runtime_peer_attachments_for_text_control()
+    {
+        Ok(attachments) => attachments,
+        Err(error) => {
             guard.state.push_command_error(
                 "transport.text_runtime_attach_rejected",
                 "attach_text_control_transport_runtime",
-                "text_runtime_local_peer_missing",
-                "Role-split runtime attach requires a local peer id",
-                "Pass a stable scoped local_peer_id derived from the local device/user for this DM or group",
+                "text_runtime_scope_unavailable",
+                error,
+                "Wait for the remote peer's signed provider route advertisement before attaching the backend runtime",
             );
             guard.persist();
-            return guard.to_view();
-        };
-        let Some(remote_peer_id) = request.remote_peer_id.as_deref() else {
-            guard.state.push_command_error(
-                "transport.text_runtime_attach_rejected",
-                "attach_text_control_transport_runtime",
-                "text_runtime_remote_peer_missing",
-                "Role-split runtime attach requires a remote peer id",
-                "Pass a stable scoped remote_peer_id from the DM/group invite or membership state",
-            );
-            guard.persist();
-            return guard.to_view();
-        };
-        let local_peer_id = match SignalingPeerId::new(local_peer_id.to_owned()) {
-            Ok(peer_id) => peer_id,
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "attach_text_control_transport_runtime",
-                    "text_runtime_local_peer_invalid",
-                    error.to_string(),
-                    "Use a trimmed ASCII token for local_peer_id",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
-        };
-        let remote_peer_id = match SignalingPeerId::new(remote_peer_id.to_owned()) {
-            Ok(peer_id) => peer_id,
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "attach_text_control_transport_runtime",
-                    "text_runtime_remote_peer_invalid",
-                    error.to_string(),
-                    "Use a trimmed ASCII token for remote_peer_id",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
-        };
-        Some(TextControlRuntimePeerAttachment {
-            role,
-            local_peer_id,
-            remote_peer_id,
-        })
-    } else {
-        None
-    };
-
-    if let Some(attachment) = explicit_attachment {
-        let key = TextControlRuntimeMapKey::for_attachment(
-            active_session_id.clone(),
-            &attachment.remote_peer_id,
-        );
-        if guard.text_control_runtime_attach_already_active(
-            "attach_text_control_transport_runtime",
-            &active_session_id,
-            &key,
-        ) {
             return guard.to_view();
         }
-        let runtime_inputs = match guard
-            .state
-            .text_control_runtime_inputs_for_active_scope(None)
-        {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "attach_text_control_transport_runtime",
-                    "text_runtime_scope_unavailable",
-                    error,
-                    "Open a DM/group/invite context with a configured signaling profile before attaching runtime",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
-        };
-        let job = prepare_text_control_runtime_attach_job(
-            &mut guard,
-            "attach_text_control_transport_runtime",
-            active_session_id.clone(),
-            runtime_inputs,
-            attachment,
-        );
-        let view = guard.to_view();
-        drop(guard);
-        spawn_text_control_runtime_attach(job);
-        return view;
-    }
-
-    if let Some(attachments) = derived_attachments {
-        let runtime_inputs = match guard
-            .state
-            .text_control_runtime_inputs_for_active_scope(None)
-        {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                guard.state.push_command_error(
-                    "transport.text_runtime_attach_rejected",
-                    "attach_text_control_transport_runtime",
-                    "text_runtime_scope_unavailable",
-                    error,
-                    "Open a DM/group/invite context with a configured signaling profile before attaching runtime",
-                );
-                guard.persist();
-                return guard.to_view();
-            }
-        };
-        let mut jobs = Vec::new();
-        for attachment in attachments {
+    };
+    let attachments_to_start = attachments
+        .into_iter()
+        .filter(|attachment| {
             let key = TextControlRuntimeMapKey::for_attachment(
                 active_session_id.clone(),
                 &attachment.remote_peer_id,
             );
-            if guard.text_control_runtime_attach_already_active(
+            !guard.text_control_runtime_attach_already_active(
                 "attach_text_control_transport_runtime",
                 &active_session_id,
                 &key,
-            ) {
-                continue;
-            }
-            jobs.push(prepare_text_control_runtime_attach_job(
-                &mut guard,
-                "attach_text_control_transport_runtime",
-                active_session_id.clone(),
-                runtime_inputs.clone(),
-                attachment,
-            ));
-        }
-        let view = guard.to_view();
-        drop(guard);
-        for job in jobs {
-            spawn_text_control_runtime_attach(job);
-        }
-        return view;
-    }
-
-    let key = TextControlRuntimeMapKey::legacy(active_session_id.clone());
-    if guard.text_control_runtime_attach_already_active(
-        "attach_text_control_transport_runtime",
-        &active_session_id,
-        &key,
-    ) {
-        return guard.to_view();
-    }
-
-    if !active_session_state.is_connected() {
-        guard.state.push_command_error(
-            "transport.text_runtime_attach_rejected",
-            "attach_text_control_transport_runtime",
-            "text_session_not_connected",
-            format!(
-                "text transport session {} is {}",
-                active_session_id,
-                PersistedAppState::transport_state_label(active_session_state)
-            ),
-            "Complete a provider DataChannel proof and route transition before binding a legacy probe-resume runtime, or use derive_from_state for backend-owned DM/group runtime attach",
-        );
+            )
+        })
+        .collect::<Vec<_>>();
+    if attachments_to_start.is_empty() {
         guard.persist();
         return guard.to_view();
     }
 
-    let attachment = guard.state.latest_data_channel_probe.as_ref().map_or_else(
-        || ProviderTextControlRuntimeAttachment {
-            adapter_kind: "unknown".to_owned(),
-            profile_id: String::new(),
-            endpoint_label: "unknown-endpoint".to_owned(),
-            rendezvous_topic: "unknown-topic".to_owned(),
-            scope_commitment: String::new(),
-            runtime_spec: None,
-        },
-        |probe| ProviderTextControlRuntimeAttachment {
-            adapter_kind: probe.kind.clone(),
-            profile_id: probe.profile_id.clone(),
-            endpoint_label: probe.endpoint_label.clone(),
-            rendezvous_topic: probe.rendezvous_topic.clone(),
-            scope_commitment: probe.scope_commitment.clone(),
-            runtime_spec: probe.runtime_spec.clone().map(Box::new),
-        },
-    );
-    let reason = match resume_text_control_runtime_from_probe(attachment) {
-        Ok(_) => unreachable!("text-control runtime seam should remain unavailable in this slice"),
-        Err(TransportError::Unavailable(message)) => {
-            (message, TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT)
+    let runtime_inputs = match guard
+        .state
+        .text_control_runtime_inputs_for_active_scope(None)
+    {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            guard.state.push_command_error(
+                "transport.text_runtime_attach_rejected",
+                "attach_text_control_transport_runtime",
+                "text_runtime_scope_unavailable",
+                error,
+                "Open a DM/group context with a configured signaling profile before attaching runtime",
+            );
+            guard.persist();
+            return guard.to_view();
         }
-        Err(error) => (
-            error.to_string(),
-            TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
-        ),
     };
-    guard.state.push_command_error(
-        "transport.text_runtime_attach_unavailable",
-        "attach_text_control_transport_runtime",
-        "transport_runtime_not_supported",
-        &reason.0,
-        reason.1,
-    );
-    guard.persist();
-    guard.to_view()
+    let mut jobs = Vec::new();
+    for attachment in attachments_to_start {
+        jobs.push(prepare_text_control_runtime_attach_job(
+            &mut guard,
+            "attach_text_control_transport_runtime",
+            active_session_id.clone(),
+            runtime_inputs.clone(),
+            attachment,
+        ));
+    }
+    let view = guard.to_view();
+    drop(guard);
+    for job in jobs {
+        spawn_text_control_runtime_attach(job);
+    }
+    view
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -6360,6 +6188,15 @@ fn start_text_control_offer_receiver_loop(
                     continue;
                 }
             };
+            if text_control_frame_plane(&inbound_frame) != TextControlFramePlane::DirectPeer {
+                if discrypt_webrtc_debug_enabled() {
+                    eprintln!(
+                        "text_control_offer_receiver: session_id={} rejected_provider_control_frame_on_direct_peer_plane",
+                        redacted_message_ref(&session_id)
+                    );
+                }
+                continue;
+            }
             let service = app_service();
             let (response_frame, state, previous_cursor) = {
                 let mut guard = service
@@ -6655,11 +6492,11 @@ pub fn set_connectivity_policy(request: SetConnectivityPolicyRequest) -> AppStat
                     .clone()
                     .unwrap_or_else(|| dm_connectivity_policy(&dm.dm_id, &dm.participant_id));
                 let policy = normalize_connectivity_policy_override(base, &request)?;
-                dm.runtime_peers = dm_runtime_peers(Some(&policy), "inviter");
                 dm.connectivity = Some(policy);
                 Ok(format!("Updated connectivity for DM {}", dm.display_name))
             }
             "group" => {
+                let local_member_id = state.local_user_id();
                 let group_id = request
                     .group_id
                     .clone()
@@ -6680,7 +6517,8 @@ pub fn set_connectivity_policy(request: SetConnectivityPolicyRequest) -> AppStat
                     .clone()
                     .unwrap_or_else(|| group_connectivity_policy(&group.group_id));
                 let policy = normalize_connectivity_policy_override(base, &request)?;
-                group.runtime_peers = group_runtime_peers(Some(&policy), &group.role);
+                group.runtime_peers =
+                    advertised_group_runtime_peers(&group.members, &local_member_id);
                 group.connectivity = Some(policy);
                 Ok(format!("Updated connectivity for group {}", group.name))
             }
@@ -6765,7 +6603,11 @@ pub fn start_dm(request: StartDmRequest) -> AppStateView {
                 dm_connectivity_policy(&dm_id, &participant_id),
                 &state.connectivity_defaults,
             );
-            let runtime_peers = dm_runtime_peers(Some(&connectivity), "inviter");
+            let runtime_peers = vec![local_dm_runtime_peer(
+                state,
+                &connectivity.scope_id_commitment,
+                "inviter",
+            )];
             state.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
                 participant_id: participant_id.clone(),
@@ -6811,7 +6653,6 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
                 connectivity =
                     apply_app_connectivity_defaults(connectivity, &state.connectivity_defaults);
             }
-            let runtime_peers = group_runtime_peers(Some(&connectivity), "owner");
             let created_at = Utc::now().to_rfc3339();
             let local_member_id = state.local_user_id();
             let display_name = state
@@ -6836,12 +6677,16 @@ pub fn create_group(request: CreateGroupRequest) -> AppStateView {
                 &created_at,
             );
             owner_member.signer_public_key_hex = Some(owner_signer_public_key_hex);
+            owner_member.runtime_peer_id = Some(local_group_runtime_peer_id(state, &group_id));
+            let members = vec![owner_member];
+            let runtime_peers = advertised_group_runtime_peers(&members, &local_member_id);
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "owner".to_owned(),
-                channels: default_group_channels(state.next_sequence),
-                members: vec![owner_member],
+                channels: default_group_channels(),
+                channel_schema_epoch: 1,
+                members,
                 role_policy: initial_group_role_policy(
                     request.admission_mode.clone().unwrap_or_default(),
                     &local_member_id,
@@ -7091,15 +6936,20 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
             request.group_name.clone(),
             Some(&parsed_invite),
         );
-        let group_id = parsed_invite
-            .group_id
-            .clone()
-            .unwrap_or_else(|| stable_id("group", &name, state.next_sequence));
+        let Some(group_id) = parsed_invite.group_id.clone() else {
+            state.push_command_error(
+                "invite.rejected",
+                "join_group",
+                "group_id_missing",
+                "Signed group invite link is missing its group identifier",
+                "Request a fresh invite link from the group owner or staff",
+            );
+            return;
+        };
+        let local_member_id = state.local_user_id();
         if !state.groups.iter().any(|group| group.group_id == group_id) {
             let connectivity = parsed_invite.connectivity.clone();
-            let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
             let created_at = Utc::now().to_rfc3339();
-            let local_member_id = state.local_user_id();
             let display_name = state
                 .profile
                 .as_ref()
@@ -7119,12 +6969,16 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                 &created_at,
             );
             local_member.status = "pending".to_owned();
+            local_member.runtime_peer_id = None;
+            let members = vec![local_member];
+            let runtime_peers = advertised_group_runtime_peers(&members, &local_member_id);
             state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: name.clone(),
                 role: "pending".to_owned(),
-                channels: default_group_channels(state.next_sequence),
-                members: vec![local_member],
+                channels: Vec::new(),
+                channel_schema_epoch: 0,
+                members,
                 role_policy: initial_group_role_policy(
                     GroupAdmissionModeView::default(),
                     &local_member_id,
@@ -7157,11 +7011,10 @@ pub fn join_group(request: JoinGroupRequest) -> AppStateView {
                     "pending".to_owned()
                 };
                 existing_group.runtime_peers =
-                    group_runtime_peers(Some(&parsed_invite.connectivity), "member");
+                    advertised_group_runtime_peers(&existing_group.members, &local_member_id);
                 existing_group.connectivity = Some(parsed_invite.connectivity.clone());
             }
         }
-        state.ensure_group_governance_defaults();
         let active_group_id = group_id.clone();
         state.active_context = Some(ActiveContextView {
             kind: "group".to_owned(),
@@ -7948,10 +7801,23 @@ pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateV
         return guard.to_view();
     }
     guard.mutate(|state| {
+        let local_member_id = state.local_user_id();
         let member_id = request
             .member_id
             .clone()
-            .unwrap_or_else(|| state.local_user_id());
+            .unwrap_or_else(|| local_member_id.clone());
+        if member_id != local_member_id {
+            state.push_command_error(
+                "group.presence_rejected",
+                "publish_group_presence",
+                "member_identity_mismatch",
+                "A profile can publish presence only for its own admitted member identity",
+                "Publish presence without overriding member_id",
+            );
+            return;
+        }
+        let signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+        let local_signer_public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
         let now = Utc::now();
         let ttl = request
             .ttl_seconds
@@ -7966,79 +7832,138 @@ pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateV
             &member_id,
             state.next_sequence,
         );
-        let Some(group) = state
-            .groups
-            .iter_mut()
-            .find(|group| group.group_id == request.group_id)
-        else {
-            state.push_command_error(
-                "group.presence_rejected",
-                "publish_group_presence",
-                "group_not_found",
-                "Requested group does not exist",
-                "Select an existing group before publishing presence",
-            );
-            return;
+        let presence_fields = {
+            let Some(group) = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == request.group_id)
+            else {
+                state.push_command_error(
+                    "group.presence_rejected",
+                    "publish_group_presence",
+                    "group_not_found",
+                    "Requested group does not exist",
+                    "Select an existing group before publishing presence",
+                );
+                return;
+            };
+            let Some(member) = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == member_id)
+            else {
+                state.push_command_error(
+                    "group.presence_rejected",
+                    "publish_group_presence",
+                    "member_not_found",
+                    "Presence member is not in this group",
+                    "Refresh group membership before publishing presence",
+                );
+                return;
+            };
+            if member.status == "pending" {
+                state.push_event(
+                    "group.presence_deferred",
+                    "Deferred presence while local member is waiting for admission approval",
+                );
+                return;
+            }
+            if member.status == "revoked" {
+                state.push_command_error(
+                    "group.presence_rejected",
+                    "publish_group_presence",
+                    "member_revoked",
+                    "Revoked members cannot publish presence",
+                    "Ask an owner/staff member to re-admit this profile",
+                );
+                return;
+            }
+            if member.signer_public_key_hex.as_deref() != Some(local_signer_public_key_hex.as_str())
+            {
+                state.push_command_error(
+                    "group.presence_rejected",
+                    "publish_group_presence",
+                    "member_signer_mismatch",
+                    "Local profile key does not match the admitted member roster key",
+                    "Rejoin the group with the current profile before publishing presence",
+                );
+                return;
+            }
+            let Some(runtime_peer_id) = member
+                .runtime_peer_id
+                .as_deref()
+                .filter(|peer_id| !peer_id.trim().is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                state.push_command_error(
+                    "group.presence_rejected",
+                    "publish_group_presence",
+                    "runtime_peer_id_missing",
+                    "Local member has no runtime route identifier to advertise",
+                    "Restart the profile and rejoin the group",
+                );
+                return;
+            };
+            member.status = "online".to_owned();
+            member.last_seen_at = Some(now_string.clone());
+            member.presence_expires_at = Some(expires_string.clone());
+            let channel_schema_sha256 = match group_channel_schema_sha256(&group.channels) {
+                Ok(sha256) => sha256,
+                Err(error) => {
+                    state.push_command_error(
+                        "group.presence_rejected",
+                        "publish_group_presence",
+                        "channel_schema_hash_failed",
+                        error,
+                        "Retry after the current channel schema can be serialized",
+                    );
+                    return;
+                }
+            };
+            (
+                member.display_name.clone(),
+                member.device_id.clone(),
+                runtime_peer_id,
+                group.channel_schema_epoch,
+                channel_schema_sha256,
+            )
         };
-        let Some(member) = group
-            .members
-            .iter_mut()
-            .find(|member| member.member_id == member_id)
-        else {
-            state.push_command_error(
-                "group.presence_rejected",
-                "publish_group_presence",
-                "member_not_found",
-                "Presence member is not in this group",
-                "Refresh group membership before publishing presence",
-            );
-            return;
-        };
-        if member.status == "pending" {
-            state.push_event(
-                "group.presence_deferred",
-                "Deferred presence while local member is waiting for admission approval",
-            );
-            return;
-        }
-        if member.status == "revoked" {
-            state.push_command_error(
-                "group.presence_rejected",
-                "publish_group_presence",
-                "member_revoked",
-                "Revoked members cannot publish presence",
-                "Ask an owner/staff member to re-admit this profile",
-            );
-            return;
-        }
-        member.status = "online".to_owned();
-        member.last_seen_at = Some(now_string.clone());
-        member.presence_expires_at = Some(expires_string.clone());
-        let member_display_name = member.display_name.clone();
-        let member_device_id = member.device_id.clone();
-        let member_role = member.role.clone();
-        let member_signer_public_key_hex = member.signer_public_key_hex.clone();
-        group.governance_log.push(governance_log_entry(
-            &event_id,
-            &request.group_id,
-            "presence.heartbeat",
-            &member_id,
-            Some(&member_id),
-            None,
-            None,
-            &now_string,
-            "Published TTL-backed group presence heartbeat",
-        ));
+        let (
+            member_display_name,
+            member_device_id,
+            runtime_peer_id,
+            channel_schema_epoch,
+            channel_schema_sha256,
+        ) = presence_fields;
+        let signature_hex = sign_group_presence(
+            &signing_key,
+            GroupPresenceSignaturePayload {
+                group_id: &request.group_id,
+                event_id: &event_id,
+                member_id: &member_id,
+                display_name: Some(&member_display_name),
+                device_id: member_device_id.as_deref(),
+                signer_public_key_hex: &local_signer_public_key_hex,
+                runtime_peer_id: &runtime_peer_id,
+                channel_schema_epoch,
+                channel_schema_sha256: &channel_schema_sha256,
+                last_seen_at: &now_string,
+                presence_expires_at: &expires_string,
+            },
+        );
         let frame = TextControlFrameView::GroupPresenceHeartbeat {
             group_id: request.group_id.clone(),
             event_id: event_id.clone(),
             member_id: member_id.clone(),
             display_name: Some(member_display_name),
             device_id: member_device_id,
-            role: Some(member_role),
-            signer_public_key_hex: member_signer_public_key_hex,
+            signer_public_key_hex: local_signer_public_key_hex,
+            runtime_peer_id,
+            channel_schema_epoch,
+            channel_schema_sha256,
             last_seen_at: now_string.clone(),
             presence_expires_at: expires_string,
+            signature_hex,
         };
         if let Err(error) = queue_group_governance_frame(state, &request.group_id, &event_id, frame)
         {
@@ -8051,11 +7976,186 @@ pub fn publish_group_presence(request: PublishGroupPresenceRequest) -> AppStateV
             );
             return;
         }
+        if let Some(group) = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == request.group_id)
+        {
+            group.governance_log.push(governance_log_entry(
+                &event_id,
+                &request.group_id,
+                "presence.heartbeat",
+                &member_id,
+                Some(&member_id),
+                None,
+                None,
+                &now_string,
+                "Published signed TTL-backed group presence and runtime route advertisement",
+            ));
+            group.runtime_peers = advertised_group_runtime_peers(&group.members, &local_member_id);
+        }
         state.push_event(
             "group.presence",
             format!(
                 "Published presence for {}",
                 redacted_observable_ref("member", &member_id)
+            ),
+        );
+    })
+}
+
+/// Tauri command: publish a signed TTL-backed DM runtime-route lease.
+pub fn publish_dm_presence(request: PublishDmPresenceRequest) -> AppStateView {
+    let service = app_service();
+    let mut guard = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.state.last_command_error = None;
+    guard.state.ensure_ready_profile();
+    if let Err((code, message, recovery_hint)) = guard.dm_presence_route_evidence(&request.dm_id) {
+        guard.state.push_command_error(
+            "dm.presence_rejected",
+            "publish_dm_presence",
+            code,
+            message,
+            recovery_hint,
+        );
+        guard.persist();
+        return guard.to_view();
+    }
+    guard.mutate(|state| {
+        let signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+        let signer_public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
+        let Some(profile) = state.profile.clone() else {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "profile_missing",
+                "No local profile is available to sign the DM runtime route",
+                "Complete profile setup before opening the DM",
+            );
+            return;
+        };
+        let now = Utc::now();
+        let ttl = request
+            .ttl_seconds
+            .unwrap_or(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)
+            .clamp(30, GROUP_PRESENCE_MAX_TTL_SECONDS);
+        let expires = now + chrono::Duration::seconds(ttl);
+        let last_seen_at = now.to_rfc3339();
+        let presence_expires_at = expires.to_rfc3339();
+        let Some(dm_index) = state.dms.iter().position(|dm| dm.dm_id == request.dm_id) else {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "dm_not_found",
+                "Requested DM does not exist",
+                "Select an existing DM before publishing its runtime route",
+            );
+            return;
+        };
+        let Some(connectivity) = state.dms[dm_index].connectivity.as_ref() else {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "dm_connectivity_missing",
+                "Requested DM has no provider connectivity policy",
+                "Recreate the DM contact and attach its provider control lane",
+            );
+            return;
+        };
+        let scope_id_commitment = connectivity.scope_id_commitment.clone();
+        let Some(local_peer_index) = state.dms[dm_index]
+            .runtime_peers
+            .iter()
+            .position(|peer| peer.is_local)
+        else {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "local_runtime_peer_missing",
+                "Requested DM has no local runtime route identity",
+                "Recreate the DM contact with the current profile",
+            );
+            return;
+        };
+        let local_peer = &mut state.dms[dm_index].runtime_peers[local_peer_index];
+        if local_peer.signer_public_key_hex != signer_public_key_hex
+            || local_peer.profile_id != profile.user_id
+        {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "local_runtime_signer_mismatch",
+                "The local DM route identity does not match this profile",
+                "Recreate the DM contact with the current profile",
+            );
+            return;
+        }
+        let role = local_peer.role.clone();
+        if role != "inviter" && role != "reply" {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "local_runtime_role_invalid",
+                "The local DM route role is invalid",
+                "Recreate the DM contact from a signed invite",
+            );
+            return;
+        }
+        local_peer.source = "sealed_provider_peer_advertisement_v1".to_owned();
+        local_peer.last_seen_at = last_seen_at.clone();
+        local_peer.presence_expires_at = presence_expires_at.clone();
+        let device_id = local_peer.device_id.clone();
+        let runtime_peer_id = local_peer.peer_id.clone();
+        let event_id = stable_id(
+            "dm-presence",
+            &format!("{scope_id_commitment}:{}", profile.user_id),
+            state.next_sequence,
+        );
+        let signature_hex = sign_dm_presence(
+            &signing_key,
+            DmPresenceSignaturePayload {
+                scope_id_commitment: &scope_id_commitment,
+                event_id: &event_id,
+                profile_id: &profile.user_id,
+                display_name: &profile.display_name,
+                device_id: &device_id,
+                role: &role,
+                signer_public_key_hex: &signer_public_key_hex,
+                runtime_peer_id: &runtime_peer_id,
+                last_seen_at: &last_seen_at,
+                presence_expires_at: &presence_expires_at,
+            },
+        );
+        let frame = TextControlFrameView::DmPresenceHeartbeat {
+            scope_id_commitment,
+            event_id: event_id.clone(),
+            profile_id: profile.user_id,
+            display_name: profile.display_name,
+            device_id,
+            role,
+            signer_public_key_hex,
+            runtime_peer_id,
+            last_seen_at,
+            presence_expires_at,
+            signature_hex,
+        };
+        if let Err(error) = queue_dm_control_frame(state, &request.dm_id, &event_id, frame) {
+            state.push_command_error(
+                "dm.presence_rejected",
+                "publish_dm_presence",
+                "provider_control_frame_queue_failed",
+                error,
+                "Retry after the provider control lane is attached",
+            );
+            return;
+        }
+        state.push_event(
+            "dm.presence",
+            format!(
+                "Published DM route for {}",
+                redacted_observable_ref("dm", &request.dm_id)
             ),
         );
     })
@@ -8604,7 +8704,11 @@ pub fn accept_dm_invite(request: AcceptDmInviteRequest) -> AppStateView {
                 .map(|policy| &policy.scope_id_commitment)
                 == Some(&parsed.connectivity.scope_id_commitment)
         }) {
-            let runtime_peers = dm_runtime_peers(Some(&parsed.connectivity), "reply");
+            let runtime_peers = vec![local_dm_runtime_peer(
+                state,
+                &parsed.connectivity.scope_id_commitment,
+                "reply",
+            )];
             state.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
                 participant_id,
@@ -8677,63 +8781,11 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
     mutate_app_service(|state| {
         state.ensure_ready_profile();
         let local_member_id = state.local_user_id();
-        let local_display = profile_display_name(state);
-        ensure_group_governance_defaults(state, &request.group_id, &local_member_id, local_display);
-        if let Some(group) = state
+        let Some(group_index) = state
             .groups
             .iter()
-            .find(|group| group.group_id == request.group_id)
-        {
-            let allowed = local_role_for_group(group, &local_member_id)
-                .is_some_and(GroupRoleView::can_manage_members);
-            if !allowed {
-                state.push_command_error(
-                    "channel.rejected",
-                    "create_channel",
-                    "staff_required",
-                    "Only owner or staff can create group channels",
-                    "Ask an owner/staff member to create the channel",
-                );
-                return;
-            }
-        }
-        let channel_id = stable_id("channel", &request.name, state.next_sequence);
-        let channel = ChannelStateView {
-            channel_id: channel_id.clone(),
-            name: normalize_channel_name(&request.name, request.kind),
-            kind: request.kind,
-            retention_status: normalize_label(&request.retention_status, "7 days"),
-            connectivity: None,
-        };
-        if let Some(group) = state
-            .groups
-            .iter_mut()
-            .find(|group| group.group_id == request.group_id)
-        {
-            if !group
-                .channels
-                .iter()
-                .any(|existing| existing.name == channel.name)
-            {
-                group.channels.push(channel.clone());
-            }
-            state.active_context = Some(ActiveContextView {
-                kind: match channel.kind {
-                    ChannelKind::Text => "text_channel".to_owned(),
-                    ChannelKind::Voice => "voice_channel".to_owned(),
-                },
-                group_id: Some(request.group_id),
-                channel_id: Some(channel.channel_id),
-                dm_id: None,
-            });
-            state.push_event(
-                "channel.created",
-                format!(
-                    "Created channel {}",
-                    redacted_observable_ref("channel", &channel.name)
-                ),
-            );
-        } else {
+            .position(|group| group.group_id == request.group_id)
+        else {
             state.push_command_error(
                 "channel.rejected",
                 "create_channel",
@@ -8741,7 +8793,151 @@ pub fn create_channel(request: CreateChannelRequest) -> AppStateView {
                 "No matching group for channel creation",
                 "Select an existing group before adding a text or voice channel",
             );
+            return;
+        };
+        let actor_signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+        let actor_signer_public_key_hex = hex::encode(actor_signing_key.verifying_key().as_bytes());
+        let group = &state.groups[group_index];
+        let allowed = local_role_for_group(group, &local_member_id)
+            .is_some_and(GroupRoleView::can_manage_members);
+        if !allowed {
+            state.push_command_error(
+                "channel.rejected",
+                "create_channel",
+                "staff_required",
+                "Only owner or staff can create group channels",
+                "Ask an owner/staff member to create the channel",
+            );
+            return;
         }
+        let actor_signer_matches = group
+            .members
+            .iter()
+            .find(|member| member.member_id == local_member_id)
+            .and_then(|member| member.signer_public_key_hex.as_deref())
+            == Some(actor_signer_public_key_hex.as_str());
+        if !actor_signer_matches {
+            state.push_command_error(
+                "channel.rejected",
+                "create_channel",
+                "actor_signer_mismatch",
+                "Owner/staff roster signer does not match this local profile",
+                "Refresh group admission state before changing the channel schema",
+            );
+            return;
+        }
+        let channel_name = normalize_channel_name(&request.name, request.kind);
+        if let Some(existing) = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == request.kind && channel.name == channel_name)
+        {
+            state.active_context = Some(ActiveContextView {
+                kind: match existing.kind {
+                    ChannelKind::Text => "text_channel".to_owned(),
+                    ChannelKind::Voice => "voice_channel".to_owned(),
+                },
+                group_id: Some(request.group_id),
+                channel_id: Some(existing.channel_id.clone()),
+                dm_id: None,
+            });
+            return;
+        }
+        let created_at = Utc::now().to_rfc3339();
+        let channel_commitment = hash_commitment(
+            "discrypt-group-channel-id-v1",
+            &[
+                &request.group_id,
+                &local_member_id,
+                &channel_name,
+                &created_at,
+                &state.next_sequence.to_string(),
+            ],
+        );
+        let channel_id = format!("channel-{}", &channel_commitment[..24]);
+        let channel = ChannelStateView {
+            channel_id: channel_id.clone(),
+            name: channel_name,
+            kind: request.kind,
+            retention_status: normalize_label(&request.retention_status, "7 days"),
+            connectivity: None,
+        };
+        let previous_channels = group.channels.clone();
+        let previous_epoch = group.channel_schema_epoch;
+        let group = &mut state.groups[group_index];
+        group.channels.push(channel.clone());
+        group.channel_schema_epoch = group.channel_schema_epoch.saturating_add(1).max(2);
+        let event_id = governance_event_id(
+            &request.group_id,
+            "channel.schema_updated",
+            &channel.channel_id,
+            state.next_sequence,
+        );
+        let snapshot =
+            match signed_group_channel_schema_snapshot(state, &request.group_id, &created_at) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let group = &mut state.groups[group_index];
+                    group.channels = previous_channels;
+                    group.channel_schema_epoch = previous_epoch;
+                    state.push_command_error(
+                        "channel.rejected",
+                        "create_channel",
+                        "channel_schema_sign_failed",
+                        error,
+                        "Retry with an admitted owner/staff profile whose roster signer is current",
+                    );
+                    return;
+                }
+            };
+        let frame = TextControlFrameView::GroupChannelSchemaUpdated {
+            group_id: request.group_id.clone(),
+            event_id: event_id.clone(),
+            snapshot,
+        };
+        if let Err(error) = queue_group_governance_frame(state, &request.group_id, &event_id, frame)
+        {
+            let group = &mut state.groups[group_index];
+            group.channels = previous_channels;
+            group.channel_schema_epoch = previous_epoch;
+            state.push_command_error(
+                "channel.rejected",
+                "create_channel",
+                "governance_frame_queue_failed",
+                error,
+                "Retry after text/control channel schema serialization is available",
+            );
+            return;
+        }
+        state.groups[group_index]
+            .governance_log
+            .push(governance_log_entry(
+                &event_id,
+                &request.group_id,
+                "channel.schema_updated",
+                &local_member_id,
+                None,
+                None,
+                None,
+                &created_at,
+                "Created a channel and published the signed channel schema",
+            ));
+        state.active_context = Some(ActiveContextView {
+            kind: match channel.kind {
+                ChannelKind::Text => "text_channel".to_owned(),
+                ChannelKind::Voice => "voice_channel".to_owned(),
+            },
+            group_id: Some(request.group_id),
+            channel_id: Some(channel.channel_id),
+            dm_id: None,
+        });
+        state.push_event(
+            "channel.created",
+            format!(
+                "Created channel {} and queued authority replication",
+                redacted_observable_ref("channel", &channel.name)
+            ),
+        );
     })
 }
 
@@ -9046,7 +9242,7 @@ pub fn publish_voice_signaling_message(
                 "publish_voice_signaling_message",
                 "voice_signal_queue_failed",
                 error,
-                "Join voice with provider-derived runtime peers before queueing SDP/ICE; send queued frames only over the backend text/control transport",
+                "Join voice with provider-advertised runtime peers before queueing SDP/ICE; send queued frames only over the backend text/control transport",
             );
         }
     })
@@ -9096,7 +9292,7 @@ pub fn start_native_voice_stream(
             || attachment.remote_peer_id.0 != request.remote_peer_id
         {
             return Err(
-                "Native Rust voice stream peer ids must match backend-derived runtime peers"
+                "Native Rust voice stream peer ids must match current provider-advertised runtime peers"
                     .to_owned(),
             );
         }
@@ -9339,7 +9535,7 @@ pub fn start_native_voice_media_session(
                     session.media_runtime.local_capture_active = true;
                     session.media_runtime.fail_closed_reason = "Remote native Rust media proof has not been received yet; playback claims remain gated until a non-local protected frame arrives over backend signaling".to_owned();
                     session.media_runtime.status_copy = format!(
-                        "Native Rust voice media generated {} Opus/SFrame frame(s) for provider-derived peer {}; waiting for remote proof",
+                        "Native Rust voice media generated {} Opus/SFrame frame(s) for provider-advertised peer {}; waiting for remote proof",
                         native_media.protected_frames_count, request.remote_peer_id
                     );
                     session.signaling.local_peer_id = request.local_peer_id.clone();
@@ -9359,7 +9555,7 @@ pub fn start_native_voice_media_session(
                     "start_native_voice_media_session",
                     "native_voice_media_start_failed",
                     error,
-                    "Join voice with backend-derived runtime peers before starting the native Rust media path",
+                    "Join voice after current provider-advertised runtime peers are available",
                 );
                 None
             }
@@ -9464,7 +9660,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             signaling: VoiceSignalingStateView {
                 session_id: session_id.clone(),
                 status_copy: if capture_allowed {
-                    "Voice signaling waits for provider-derived peer ids before SDP/ICE exchange"
+                    "Voice signaling waits for provider-advertised peer ids before SDP/ICE exchange"
                         .to_owned()
                 } else {
                     "Voice signaling did not start because capture permission/device gates failed"
@@ -9498,19 +9694,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             let voice_runtime_attachment = state
                 .voice_session
                 .clone()
-                .and_then(|session| match state.native_voice_runtime_peer_attachment(&session) {
-                    Ok(attachment) => Some(attachment),
-                    Err(error) => {
-                        state.push_command_error(
-                            "voice.signaling_rejected",
-                            "join_voice",
-                            "voice_runtime_peer_boundary_missing",
-                            error,
-                            "Join voice only after backend-derived runtime peers are available for the authorized group role",
-                        );
-                        None
-                    }
-                });
+                .and_then(|session| state.native_voice_runtime_peer_attachment(&session).ok());
             if let (Some(session), Some(attachment)) =
                 (&mut state.voice_session, voice_runtime_attachment)
             {
@@ -9519,7 +9703,7 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
                     local_peer_id: attachment.local_peer_id.0,
                     remote_peer_id: attachment.remote_peer_id.0,
                     role: runtime_role_label(Some(attachment.role)).to_owned(),
-                    status_copy: "Voice signaling is ready with backend-derived runtime peer ids before SDP/ICE exchange".to_owned(),
+                    status_copy: "Voice signaling is ready with provider-advertised runtime peer ids before SDP/ICE exchange".to_owned(),
                     ..VoiceSignalingStateView::default()
                 };
             }
@@ -10112,11 +10296,6 @@ mod ipc_commands {
     use super::*;
 
     #[tauri::command]
-    pub(super) fn app_snapshot() -> AppSnapshot {
-        super::app_snapshot()
-    }
-
-    #[tauri::command]
     pub(super) fn app_state() -> AppStateView {
         super::app_state()
     }
@@ -10376,6 +10555,16 @@ mod ipc_commands {
     ) -> AppStateView {
         super::run_app_state_command_with_event_emit(&app_handle, || {
             super::publish_group_presence(request)
+        })
+    }
+
+    #[tauri::command]
+    pub(super) fn publish_dm_presence(
+        app_handle: tauri::AppHandle,
+        request: PublishDmPresenceRequest,
+    ) -> AppStateView {
+        super::run_app_state_command_with_event_emit(&app_handle, || {
+            super::publish_dm_presence(request)
         })
     }
 
@@ -10721,7 +10910,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            ipc_commands::app_snapshot,
             ipc_commands::app_state,
             ipc_commands::export_diagnostics_log,
             ipc_commands::configure_storage_security,
@@ -10751,6 +10939,7 @@ pub fn run() {
             ipc_commands::demote_group_staff_to_member,
             ipc_commands::revoke_group_member_access,
             ipc_commands::publish_group_presence,
+            ipc_commands::publish_dm_presence,
             ipc_commands::create_invite,
             ipc_commands::create_dm_invite,
             ipc_commands::accept_dm_invite,
@@ -11033,81 +11222,6 @@ impl PersistedAppState {
         }
     }
 
-    fn ensure_group_governance_defaults(&mut self) {
-        let migrated_at = Utc::now().to_rfc3339();
-        let local_member_id = self.local_user_id();
-        let local_display_name = self
-            .profile
-            .as_ref()
-            .map(|profile| profile.display_name.clone())
-            .unwrap_or_else(|| "Local member".to_owned());
-        let local_device_id = self
-            .devices
-            .iter()
-            .find(|device| device.local)
-            .map(|device| device.device_id.clone());
-        let sequence = self.next_sequence;
-
-        for group in &mut self.groups {
-            if group.role_policy.updated_by == "migration"
-                || group.role_policy.updated_at == "1970-01-01T00:00:00+00:00"
-            {
-                group.role_policy.updated_by = local_member_id.clone();
-                group.role_policy.updated_at = migrated_at.clone();
-            }
-            if group.role_policy.policy_epoch == 0 {
-                group.role_policy.policy_epoch = 1;
-            }
-            if group.members.is_empty() {
-                group.members.push(GroupMemberView {
-                    member_id: local_member_id.clone(),
-                    display_name: local_display_name.clone(),
-                    device_id: local_device_id.clone(),
-                    role: group_role_from_legacy_label(&group.role),
-                    status: "migration_default".to_owned(),
-                    signer_public_key_hex: None,
-                    joined_at: migrated_at.clone(),
-                    last_seen_at: None,
-                    presence_expires_at: None,
-                    revoked_at: None,
-                    revoked_by: None,
-                    route_evidence: None,
-                });
-            }
-            if let Some(local_member) = group.members.iter().find(|member| {
-                member.member_id == local_member_id
-                    && member.revoked_at.is_none()
-                    && member.status != "pending"
-            }) {
-                group.role = group_role_label(&local_member.role).to_owned();
-            }
-            if group.governance_log.is_empty() {
-                group.governance_log.push(GroupGovernanceLogEntryView {
-                    event_id: stable_id(
-                        "governance",
-                        &format!("{}:initialized", group.group_id),
-                        sequence,
-                    ),
-                    group_id: group.group_id.clone(),
-                    event_kind: "group_governance_initialized".to_owned(),
-                    actor_member_id: local_member_id.clone(),
-                    target_member_id: Some(local_member_id.clone()),
-                    request_id: None,
-                    role_before: None,
-                    role_after: group
-                        .members
-                        .iter()
-                        .find(|member| member.member_id == local_member_id)
-                        .map(|member| member.role.clone()),
-                    created_at: migrated_at.clone(),
-                    summary:
-                        "Initialized persisted governance defaults for an existing local group"
-                            .to_owned(),
-                });
-            }
-        }
-    }
-
     fn ensure_openmls_group(&mut self, group_id: &str) -> Result<(), String> {
         if self
             .openmls_groups
@@ -11353,7 +11467,7 @@ impl PersistedAppState {
             .iter()
             .find(|member| member.member_id == local_member_id)
             .ok_or_else(|| {
-                "Local member is not in this group roster; refusing legacy role fallback".to_owned()
+                "Local member is not in this group roster; refusing role fallback".to_owned()
             })?;
         if matches!(member.status.as_str(), "pending" | "revoked") {
             return Err("Pending or revoked members cannot decide admission requests".to_owned());
@@ -11412,6 +11526,7 @@ impl PersistedAppState {
         group_id: &str,
         member_identity: &str,
         signer_public_key_hex: &str,
+        identity_signer_public_key_hex: &str,
         key_package: &[u8],
     ) -> Result<String, String> {
         let group = self
@@ -11428,6 +11543,7 @@ impl PersistedAppState {
         {
             if existing.status == "pending" {
                 existing.key_package = key_package.to_vec();
+                existing.identity_signer_public_key_hex = identity_signer_public_key_hex.to_owned();
             }
             return Ok(request_id);
         }
@@ -11440,6 +11556,7 @@ impl PersistedAppState {
             device_name: None,
             member_identity: member_identity.to_owned(),
             signer_public_key_hex: signer_public_key_hex.to_owned(),
+            identity_signer_public_key_hex: identity_signer_public_key_hex.to_owned(),
             key_package: key_package.to_vec(),
             status: "pending".to_owned(),
             requested_at: requested_at.clone(),
@@ -11596,6 +11713,11 @@ impl PersistedAppState {
             .generate_member_package(member_identity.as_bytes())
             .map_err(|error| format!("OpenMLS key package could not be generated: {error}"))?;
         let signer_public_key_hex = hex::encode(package.signer_public_key());
+        let identity_signer_public_key_hex = hex::encode(
+            SigningKey::from_bytes(&self.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
         let key_package = package
             .key_package_bytes()
             .map_err(|error| format!("OpenMLS key package could not be serialized: {error}"))?;
@@ -11603,6 +11725,7 @@ impl PersistedAppState {
             group_id: group_id.to_owned(),
             member_identity,
             signer_public_key_hex,
+            identity_signer_public_key_hex,
             key_package,
         };
         let frame_sha256 = text_control_frame_sha256(&frame)?;
@@ -11641,13 +11764,32 @@ impl PersistedAppState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn upsert_admitted_group_member(
         &mut self,
         group_id: &str,
         member_identity: &str,
         signer_public_key_hex: &str,
     ) {
+        self.upsert_admitted_group_member_with_governance_signer(
+            group_id,
+            member_identity,
+            signer_public_key_hex,
+            signer_public_key_hex,
+        );
+    }
+
+    fn upsert_admitted_group_member_with_governance_signer(
+        &mut self,
+        group_id: &str,
+        member_identity: &str,
+        _openmls_signer_public_key_hex: &str,
+        identity_signer_public_key_hex: &str,
+    ) {
+        let governance_signer_public_key_hex = identity_signer_public_key_hex;
         let actor_member_id = self.local_user_id();
+        let local_runtime_peer_id = (member_identity == actor_member_id)
+            .then(|| local_group_runtime_peer_id(self, group_id));
         let created_at = Utc::now().to_rfc3339();
         let sequence = self.next_sequence;
         let Some(group) = self
@@ -11663,13 +11805,15 @@ impl PersistedAppState {
             .find(|member| member.member_id == member_identity)
         {
             member.role = GroupRoleView::Member;
-            member.signer_public_key_hex = Some(signer_public_key_hex.to_owned());
+            member.signer_public_key_hex = Some(governance_signer_public_key_hex.to_owned());
             member.status = "unknown".to_owned();
             member.revoked_at = None;
             member.revoked_by = None;
-            if member_identity == actor_member_id {
+            if let Some(runtime_peer_id) = local_runtime_peer_id {
+                member.runtime_peer_id = Some(runtime_peer_id);
                 group.role = "member".to_owned();
             }
+            group.runtime_peers = advertised_group_runtime_peers(&group.members, &actor_member_id);
             return;
         }
         group.members.push(GroupMemberView {
@@ -11678,7 +11822,8 @@ impl PersistedAppState {
             device_id: None,
             role: GroupRoleView::Member,
             status: "unknown".to_owned(),
-            signer_public_key_hex: Some(signer_public_key_hex.to_owned()),
+            signer_public_key_hex: Some(governance_signer_public_key_hex.to_owned()),
+            runtime_peer_id: local_runtime_peer_id,
             joined_at: created_at.clone(),
             last_seen_at: None,
             presence_expires_at: None,
@@ -11694,7 +11839,7 @@ impl PersistedAppState {
             ),
             group_id: group_id.to_owned(),
             event_kind: "member_admitted".to_owned(),
-            actor_member_id,
+            actor_member_id: actor_member_id.clone(),
             target_member_id: Some(member_identity.to_owned()),
             request_id: None,
             role_before: None,
@@ -11702,6 +11847,7 @@ impl PersistedAppState {
             created_at,
             summary: "Admitted member by issuing an OpenMLS Welcome".to_owned(),
         });
+        group.runtime_peers = advertised_group_runtime_peers(&group.members, &actor_member_id);
     }
 
     fn openmls_admission_welcome_from_frame(
@@ -11709,6 +11855,7 @@ impl PersistedAppState {
         group_id: &str,
         member_identity: &str,
         signer_public_key_hex: &str,
+        identity_signer_public_key_hex: &str,
         key_package_bytes: &[u8],
     ) -> Result<TextControlFrameView, String> {
         let owner_record = self
@@ -11755,7 +11902,12 @@ impl PersistedAppState {
             record.status_copy =
                 format!("OpenMLS owner admitted {member_identity} from text/control key package");
         }
-        self.upsert_admitted_group_member(group_id, member_identity, signer_public_key_hex);
+        self.upsert_admitted_group_member_with_governance_signer(
+            group_id,
+            member_identity,
+            signer_public_key_hex,
+            identity_signer_public_key_hex,
+        );
         self.push_event(
             "mls.admission_welcome_created",
             format!(
@@ -11768,15 +11920,17 @@ impl PersistedAppState {
                 .verifying_key()
                 .as_bytes(),
         );
+        let channel_schema =
+            signed_group_channel_schema_snapshot(self, group_id, &Utc::now().to_rfc3339())?;
         Ok(TextControlFrameView::OpenMlsAdmissionWelcome {
             group_id: group_id.to_owned(),
-            owner_member_id: Some(self.local_user_id()),
-            owner_signer_public_key_hex: owner_record.signer_public_key_hex,
-            owner_identity_signer_public_key_hex: Some(owner_identity_signer_public_key_hex),
+            owner_member_id: self.local_user_id(),
+            owner_identity_signer_public_key_hex,
             member_signer_public_key_hex: signer_public_key_hex.to_owned(),
             welcome_bytes,
             epoch: result.state.epoch,
             confirmation_tag_sha256,
+            channel_schema,
         })
     }
 
@@ -11787,12 +11941,12 @@ impl PersistedAppState {
         let TextControlFrameView::OpenMlsAdmissionWelcome {
             group_id,
             owner_member_id,
-            owner_signer_public_key_hex,
             owner_identity_signer_public_key_hex,
             member_signer_public_key_hex,
             welcome_bytes,
             epoch,
             confirmation_tag_sha256,
+            channel_schema,
         } = frame
         else {
             return Err("OpenMLS admission join requires a Welcome frame".to_owned());
@@ -11848,11 +12002,18 @@ impl PersistedAppState {
             },
         );
         let local_member_id = self.local_user_id();
-        self.upsert_admitted_group_member(group_id, &local_member_id, member_signer_public_key_hex);
-        if let Some(owner_member_id) = owner_member_id
-            .as_deref()
-            .filter(|member_id| *member_id != local_member_id)
-        {
+        let local_identity_signer_public_key_hex = hex::encode(
+            SigningKey::from_bytes(&self.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        self.upsert_admitted_group_member_with_governance_signer(
+            group_id,
+            &local_member_id,
+            member_signer_public_key_hex,
+            &local_identity_signer_public_key_hex,
+        );
+        if owner_member_id != &local_member_id {
             let created_at = Utc::now().to_rfc3339();
             if let Some(group) = self
                 .groups
@@ -11862,15 +12023,12 @@ impl PersistedAppState {
                 if let Some(owner_member) = group
                     .members
                     .iter_mut()
-                    .find(|member| member.member_id == owner_member_id)
+                    .find(|member| member.member_id == *owner_member_id)
                 {
                     owner_member.role = GroupRoleView::Owner;
                     owner_member.status = "unknown".to_owned();
-                    owner_member.signer_public_key_hex = Some(
-                        owner_identity_signer_public_key_hex
-                            .clone()
-                            .unwrap_or_else(|| owner_signer_public_key_hex.to_owned()),
-                    );
+                    owner_member.signer_public_key_hex =
+                        Some(owner_identity_signer_public_key_hex.clone());
                     owner_member.revoked_at = None;
                     owner_member.revoked_by = None;
                 } else {
@@ -11880,11 +12038,8 @@ impl PersistedAppState {
                         device_id: None,
                         role: GroupRoleView::Owner,
                         status: "unknown".to_owned(),
-                        signer_public_key_hex: Some(
-                            owner_identity_signer_public_key_hex
-                                .clone()
-                                .unwrap_or_else(|| owner_signer_public_key_hex.to_owned()),
-                        ),
+                        signer_public_key_hex: Some(owner_identity_signer_public_key_hex.clone()),
+                        runtime_peer_id: None,
                         joined_at: created_at,
                         last_seen_at: None,
                         presence_expires_at: None,
@@ -11895,6 +12050,17 @@ impl PersistedAppState {
                 }
             }
         }
+        let schema_event_id = format!(
+            "mls-admission-channel-schema-{}",
+            channel_schema.schema_epoch
+        );
+        apply_group_channel_schema_snapshot(
+            self,
+            group_id,
+            &schema_event_id,
+            channel_schema.clone(),
+        )
+        .map_err(|(_, error, _)| error)?;
         self.push_event(
             "mls.admission_welcome_joined",
             format!(
@@ -11973,6 +12139,7 @@ impl PersistedAppState {
     }
 
     fn to_view(&self) -> AppStateView {
+        let local_member_id = self.local_user_id();
         let storage_security = storage_security_view(self.last_command_error.as_ref());
         let storage_diagnostic_report =
             storage_diagnostic_report_view(&storage_security, self.last_command_error.as_ref());
@@ -11991,7 +12158,7 @@ impl PersistedAppState {
                 .groups
                 .iter()
                 .cloned()
-                .map(group_with_effective_presence)
+                .map(|group| group_with_effective_presence(group, &local_member_id))
                 .collect(),
             connectivity_defaults: self.connectivity_defaults.clone(),
             active_context: self.active_context.clone(),
@@ -12296,7 +12463,6 @@ impl PersistedAppState {
     fn fallback_leg_label(leg: FallbackLeg) -> &'static str {
         match leg {
             FallbackLeg::Stun => "stun",
-            FallbackLeg::RelayOverlay => "unsupported_overlay",
             FallbackLeg::Turn => "turn",
         }
     }
@@ -12347,8 +12513,7 @@ impl PersistedAppState {
                                 return Ok(existing.session_id.clone());
                             }
                         }
-                        TransportSessionState::OverlayRelay
-                        | TransportSessionState::Disconnected
+                        TransportSessionState::Disconnected
                         | TransportSessionState::Failed
                         | TransportSessionState::Cancelled => {
                             // Intentionally recreate to represent a fresh session lifecycle.
@@ -12510,7 +12675,6 @@ impl PersistedAppState {
             ),
             receipt_frame_roundtrip: evidence.data_channel_open,
             receipt_frame_sha256: redacted_observable_token("receipt", &evidence.rendezvous_topic),
-            runtime_spec: Some(evidence.runtime_spec.clone()),
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -12806,7 +12970,6 @@ impl PersistedAppState {
             text_control_frame_sha256: probe.text_control_frame_sha256,
             receipt_frame_roundtrip: probe.receipt_frame_roundtrip,
             receipt_frame_sha256: probe.receipt_frame_sha256,
-            runtime_spec: probe.runtime_spec,
             offerer_diagnostic_timeline: probe.offerer_diagnostic_timeline,
             answerer_diagnostic_timeline: probe.answerer_diagnostic_timeline,
         };
@@ -12865,306 +13028,6 @@ impl PersistedAppState {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
-    fn prove_text_delivery_receipt_over_data_channel_with_receiver(
-        &mut self,
-        receiver: &PersistedAppState,
-        message_id: &str,
-        requested_kind: Option<&str>,
-    ) -> Result<ProviderWebRtcDataChannelProbeView, String> {
-        let outbox_frame = self
-            .text_control_outbox
-            .iter()
-            .find(|record| record.message_id == message_id && record.state_key == "pending")
-            .map(TextControlOutboxFrameView::from)
-            .ok_or_else(|| {
-                "no pending persisted text/control outbox frame for message id".to_owned()
-            })?;
-        let mut envelope_frame = outbox_frame.frame.clone();
-        if let TextControlFrameView::Envelope { recipient_leaf, .. } = &mut envelope_frame {
-            *recipient_leaf = Some(2);
-        }
-        let envelope_frame_bytes = serde_json::to_vec(&envelope_frame)
-            .map_err(|error| format!("could not encode text envelope frame: {error}"))?;
-        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
-            "No active DM/group/invite connectivity policy is available for WebRTC data-channel proof"
-                .to_owned()
-        })?;
-        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
-        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
-        else {
-            return Err(
-                "No signaling profile matches the requested adapter kind and build readiness"
-                    .to_owned(),
-            );
-        };
-        let profile = transport_profile_from_view(&profile_view)?;
-        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
-            .map_err(|error| error.to_string())?;
-        let ice_config =
-            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
-        let bootstrap_secret = self.probe_material(
-            "discrypt-runtime-webrtc-probe-bootstrap-v1",
-            &connectivity.scope_id_commitment,
-            &profile.profile_id,
-            32,
-        );
-        let random_entropy = self.probe_material(
-            "discrypt-runtime-webrtc-probe-entropy-v1",
-            &connectivity.scope_id_commitment,
-            &profile.profile_id,
-            16,
-        );
-        let mut receiver_state = receiver.clone();
-        let receipt_slot = Arc::new(Mutex::new(None::<TextControlFrameView>));
-        let answerer_receipt_slot = receipt_slot.clone();
-        let probe = run_provider_webrtc_data_channel_request_response_probe_with_answerer(
-            profile,
-            scope,
-            bootstrap_secret,
-            random_entropy,
-            ice_config,
-            envelope_frame_bytes,
-            move |received| {
-                let received_frame: TextControlFrameView = serde_json::from_slice(&received)
-                    .map_err(|error| {
-                        format!(
-                            "receiver could not decode local delivered text/control frame: {error}"
-                        )
-                    })?;
-                let receipt_frame = receiver_state
-                    .handle_text_control_frame(received_frame)
-                    .ok_or_else(|| {
-                        "receiver did not accept local delivered envelope or generate receipt frame"
-                            .to_owned()
-                    })?;
-                *answerer_receipt_slot
-                    .lock()
-                    .map_err(|_| "receipt slot lock poisoned".to_owned())? =
-                    Some(receipt_frame.clone());
-                serde_json::to_vec(&receipt_frame)
-                    .map_err(|error| format!("could not encode text receipt frame: {error}"))
-            },
-        )?;
-        if !probe.text_control_frame_roundtrip || !probe.receipt_frame_roundtrip {
-            return Err(
-                "provider-signaled DataChannel did not carry both envelope and receipt frames"
-                    .to_owned(),
-            );
-        }
-        let receipt_frame = receipt_slot
-            .lock()
-            .map_err(|_| "receipt slot lock poisoned".to_owned())?
-            .clone()
-            .ok_or_else(|| "receiver receipt frame was not produced after delivery".to_owned())?;
-        self.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
-            message_id: message_id.to_owned(),
-            frame_sha256: outbox_frame.frame_sha256,
-            transport_session_id: Some(format!(
-                "{}:{}",
-                probe.kind.canonical_name(),
-                probe.profile_id
-            )),
-            route_peer_id: None,
-        })?;
-        if self.handle_text_control_frame(receipt_frame).is_some() {
-            return Err("receipt frame unexpectedly generated a response frame".to_owned());
-        }
-        Ok(ProviderWebRtcDataChannelProbeView::from(probe))
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
-        &mut self,
-        receiver: TauriAppService,
-        message_id: &str,
-        requested_kind: Option<&str>,
-        transport_session_id: impl Into<String>,
-    ) -> Result<
-        (
-            discrypt_transport::ProviderTextControlRuntimeEvidence,
-            TextControlTransportPumpReportView,
-            PersistedAppState,
-        ),
-        String,
-    > {
-        let outbox_frame = self
-            .text_control_outbox
-            .iter()
-            .find(|record| record.message_id == message_id && record.state_key == "pending")
-            .map(TextControlOutboxFrameView::from)
-            .ok_or_else(|| {
-                "no pending persisted text/control outbox frame for live runtime pump".to_owned()
-            })?;
-        let (scope_level, connectivity) = self.active_connectivity_policy().ok_or_else(|| {
-            "No active DM/group/invite connectivity policy is available for live text/control runtime"
-                .to_owned()
-        })?;
-        let requested_kind = requested_kind.and_then(transport_adapter_kind_from_name);
-        let Some(profile_view) = self.select_signaling_profile(&connectivity, requested_kind)
-        else {
-            return Err(
-                "No signaling profile matches the requested adapter kind and build readiness"
-                    .to_owned(),
-            );
-        };
-        let profile = transport_profile_from_view(&profile_view)?;
-        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
-            .map_err(|error| error.to_string())?;
-        let ice_config =
-            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
-        let bootstrap_secret = shared_runtime_material(
-            "discrypt-live-role-split-runtime-bootstrap-v1",
-            &connectivity,
-            &profile.profile_id,
-            32,
-        );
-        let random_entropy = shared_runtime_material(
-            "discrypt-live-role-split-runtime-entropy-v1",
-            &connectivity,
-            &profile.profile_id,
-            16,
-        );
-        let mut sender_state = self.clone();
-        let target = outbox_frame.target.clone();
-        let transport_session_id = transport_session_id.into();
-        let (sender_peer_id, receiver_peer_id) = self.active_runtime_peer_ids_for_text_control()?;
-        let (receiver_local_peer_id, receiver_remote_peer_id) =
-            receiver.state.active_runtime_peer_ids_for_text_control()?;
-        if receiver_local_peer_id != receiver_peer_id || receiver_remote_peer_id != sender_peer_id {
-            return Err(format!(
-                "live runtime peer bootstrap mismatch: sender local={} remote={}, receiver local={} remote={}",
-                sender_peer_id.0,
-                receiver_peer_id.0,
-                receiver_local_peer_id.0,
-                receiver_remote_peer_id.0
-            ));
-        }
-        let receiver_service = Arc::new(Mutex::new(receiver));
-
-        let (updated_sender, receiver_state, evidence, report) = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|error| {
-                    format!("Could not start live text/control runtime-pair pump: {error}")
-                })?;
-            runtime.block_on(async move {
-                let answerer_service = receiver_service.clone();
-                let receiver_after = receiver_service.clone();
-                let answerer_profile = profile.clone();
-                let answerer_scope = scope.clone();
-                let answerer_bootstrap_secret = bootstrap_secret.clone();
-                let answerer_random_entropy = random_entropy.clone();
-                let answerer_ice_config = ice_config.clone();
-                let answerer_local_peer_id = receiver_peer_id.clone();
-                let answerer_remote_peer_id = sender_peer_id.clone();
-                let answerer_task = tokio::spawn(async move {
-                    start_provider_webrtc_text_control_answer_runtime_with_answerer(
-                        answerer_profile,
-                        answerer_scope,
-                        &answerer_bootstrap_secret,
-                        &answerer_random_entropy,
-                        discrypt_transport::WebRtcNegotiationConfig::new(answerer_ice_config),
-                        answerer_local_peer_id,
-                        answerer_remote_peer_id,
-                        move |received| {
-                            let frame: TextControlFrameView = serde_json::from_slice(&received)
-                                .map_err(|error| {
-                                    TransportError::Unavailable(format!(
-                                        "receiver could not decode live text/control frame: {error}"
-                                    ))
-                                })?;
-                            let mut response_frame = None;
-                            answerer_service
-                                .lock()
-                                .map_err(|_| {
-                                    TransportError::Unavailable(
-                                        "live runtime receiver service lock poisoned".to_owned(),
-                                    )
-                                })?
-                                .mutate(|state| {
-                                    response_frame = state.handle_text_control_frame(frame);
-                                });
-                            let Some(response_frame) = response_frame else {
-                                return Ok(Vec::new());
-                            };
-                            serde_json::to_vec(&response_frame).map_err(|error| {
-                                TransportError::Unavailable(format!(
-                                    "could not encode live text/control response frame: {error}"
-                                ))
-                            })
-                        },
-                    )
-                    .await
-                });
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let offerer = start_provider_webrtc_text_control_offer_runtime(
-                    profile,
-                    scope,
-                    &bootstrap_secret,
-                    &random_entropy,
-                    discrypt_transport::WebRtcNegotiationConfig::new(ice_config),
-                    sender_peer_id,
-                    receiver_peer_id,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                let answerer =
-                    tokio::time::timeout(std::time::Duration::from_secs(50), answerer_task)
-                        .await
-                        .map_err(|_| {
-                            "timed out waiting for role-split receiver runtime attach".to_owned()
-                        })?
-                        .map_err(|error| {
-                            format!("role-split receiver runtime task failed: {error}")
-                        })?
-                        .map_err(|error| error.to_string())?;
-                let offerer_evidence = offerer.evidence().clone();
-                let answerer_evidence = answerer.evidence().clone();
-                let evidence = discrypt_transport::ProviderTextControlRuntimeEvidence {
-                    kind: offerer_evidence.kind,
-                    profile_id: offerer_evidence.profile_id,
-                    endpoint_label: offerer_evidence.endpoint_label,
-                    scope_commitment: offerer_evidence.scope_commitment,
-                    rendezvous_topic: offerer_evidence.rendezvous_topic,
-                    offerer_direct_path_ready: offerer_evidence.direct_path_ready,
-                    answerer_direct_path_ready: answerer_evidence.direct_path_ready,
-                    offerer_data_channel_open: offerer_evidence.data_channel_open,
-                    answerer_data_channel_open: answerer_evidence.data_channel_open,
-                    runtime_spec: offerer_evidence.runtime_spec,
-                };
-                let report = sender_state
-                    .pump_text_control_transport_once(
-                        offerer.transport().as_ref(),
-                        ListPendingTextControlFramesRequest {
-                            target: Some(target),
-                            limit: Some(1),
-                            operation_timeout_ms: Some(10_000),
-                        },
-                        transport_session_id,
-                    )
-                    .await;
-                offerer.close().await.map_err(|error| error.to_string())?;
-                answerer.close().await.map_err(|error| error.to_string())?;
-                let receiver_state = receiver_after
-                    .lock()
-                    .map_err(|_| "live runtime receiver service lock poisoned".to_owned())?
-                    .state
-                    .clone();
-                Ok::<_, String>((sender_state, receiver_state, evidence, report))
-            })
-        })
-        .join()
-        .map_err(|_| "live text/control runtime-pair pump thread panicked".to_owned())??;
-
-        *self = updated_sender;
-        Ok((evidence, report, receiver_state))
-    }
-
-    #[allow(dead_code)]
     fn openmls_text_exporter_secret(&self, group_id: &str) -> Result<Vec<u8>, String> {
         let (secret, _epoch) = self.openmls_exporter_secret(
             group_id,
@@ -13232,39 +13095,6 @@ impl PersistedAppState {
         Ok((secret, snapshot.epoch))
     }
 
-    #[allow(dead_code)]
-    fn selected_text_route_for_outbox(&self, message_id: &str) -> TextSelectedRoute {
-        let (session_id, route_label, overlay_hops) = self
-            .text_session
-            .as_ref()
-            .map(|session| {
-                (
-                    session.session_id.clone(),
-                    match session.state() {
-                        TransportSessionState::TurnRelay => "turn-ciphertext",
-                        TransportSessionState::OverlayRelay => "unsupported-overlay",
-                        TransportSessionState::Direct => "direct-ciphertext",
-                        _ => "pending-text-control-outbox",
-                    }
-                    .to_owned(),
-                    0,
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    format!("text-control-outbox:{message_id}"),
-                    "pending-text-control-outbox".to_owned(),
-                    0,
-                )
-            });
-        TextSelectedRoute {
-            session_id,
-            route_label,
-            overlay_hops,
-            ciphertext_only: true,
-        }
-    }
-
     fn text_delivery_envelope_record(
         &mut self,
         target: &MessageTargetView,
@@ -13298,7 +13128,7 @@ impl PersistedAppState {
                 };
                 let route = TextSelectedRoute {
                     session_id: "app-service-text-control-outbox".to_owned(),
-                    route_label: "provider-backed-text-control".to_owned(),
+                    route_label: "provider-signaled-direct-webrtc-text-control".to_owned(),
                     overlay_hops: 0,
                     ciphertext_only: true,
                 };
@@ -13413,8 +13243,29 @@ impl PersistedAppState {
         &self,
         target: &MessageTargetView,
     ) -> Result<Vec<String>, String> {
+        if target.kind == "dm" {
+            let dm_id = target
+                .dm_id
+                .as_deref()
+                .ok_or_else(|| "DM text target is missing dm_id for route selection".to_owned())?;
+            let dm = self
+                .dms
+                .iter()
+                .find(|dm| dm.dm_id == dm_id)
+                .ok_or_else(|| format!("DM text target {dm_id} is missing"))?;
+            let remote = dm
+                .runtime_peers
+                .iter()
+                .find(|peer| !peer.is_local && dm_runtime_peer_route_is_current(peer, Utc::now()));
+            return Ok(remote
+                .map(|peer| vec![peer.peer_id.clone()])
+                .unwrap_or_default());
+        }
         if target.kind != "channel" {
-            return Ok(Vec::new());
+            return Err(format!(
+                "unsupported text target kind {} for route selection",
+                target.kind
+            ));
         }
         let group_id = target
             .group_id
@@ -13426,9 +13277,6 @@ impl PersistedAppState {
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| format!("channel text target group {group_id} is missing"))?;
         let local_member_id = self.local_user_id();
-        // Presence edge state is backend-proved over this runtime, so an expired/offline TTL
-        // cannot be used to decide whether an admitted transport edge exists.
-        // Only governance states that remove admission may suppress an edge.
         let local_member = group
             .members
             .iter()
@@ -13436,20 +13284,25 @@ impl PersistedAppState {
                 member.member_id == local_member_id
                     && member.status != "pending"
                     && member.status != "revoked"
-                    && member.status != "migration_default"
             })
             .ok_or_else(|| {
                 format!("Group {group_id} has no admitted local member for text fanout")
             })?;
         let local_peer_id = group_member_runtime_peer_id(group_id, local_member)?;
         let mut route_peer_ids = BTreeSet::new();
+        let now = Utc::now();
         for remote in group.members.iter().filter(|member| {
             member.member_id != local_member_id
-                && member.status != "pending"
-                && member.status != "revoked"
-                && member.status != "migration_default"
+                && group_member_runtime_route_is_current(member, &local_member_id, now)
         }) {
-            let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
+            let Some(remote_peer_id) = remote
+                .runtime_peer_id
+                .as_deref()
+                .filter(|peer_id| !peer_id.trim().is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
             if remote_peer_id == local_peer_id {
                 return Err(format!(
                     "Group {group_id} remote member runtime peer id matches the local peer"
@@ -13462,6 +13315,67 @@ impl PersistedAppState {
             }
         }
         Ok(route_peer_ids.into_iter().collect())
+    }
+
+    fn refresh_text_control_outbox_routes_for_group(
+        &mut self,
+        group_id: &str,
+    ) -> Result<(), String> {
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id.to_owned()),
+            channel_id: None,
+        };
+        let route_peer_ids = self.route_peer_ids_for_text_target(&target)?;
+        for record in self.text_control_outbox.iter_mut().filter(|record| {
+            text_control_frame_plane(&record.frame) == TextControlFramePlane::DirectPeer
+                && record.target.group_id.as_deref() == Some(group_id)
+        }) {
+            record.route_peer_ids = route_peer_ids.clone();
+            record
+                .sent_route_peer_ids
+                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            record
+                .receipted_route_peer_ids
+                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            record.state_key = if !record.route_peer_ids.is_empty()
+                && record
+                    .route_peer_ids
+                    .iter()
+                    .all(|peer_id| record.receipted_route_peer_ids.contains(peer_id))
+            {
+                "receipted".to_owned()
+            } else {
+                "pending".to_owned()
+            };
+        }
+        Ok(())
+    }
+
+    fn refresh_text_control_outbox_routes_for_dm(&mut self, dm_id: &str) -> Result<(), String> {
+        let target = MessageTargetView {
+            kind: "dm".to_owned(),
+            dm_id: Some(dm_id.to_owned()),
+            group_id: None,
+            channel_id: None,
+        };
+        let route_peer_ids = self.route_peer_ids_for_text_target(&target)?;
+        for record in self.text_control_outbox.iter_mut().filter(|record| {
+            record.state_key == "pending"
+                && record.target.kind == "dm"
+                && record.target.dm_id.as_deref() == Some(dm_id)
+                && matches!(record.frame, TextControlFrameView::Envelope { .. })
+        }) {
+            record.route_peer_ids = route_peer_ids.clone();
+            record
+                .sent_route_peer_ids
+                .retain(|peer_id| route_peer_ids.contains(peer_id));
+            record
+                .receipted_route_peer_ids
+                .retain(|peer_id| route_peer_ids.contains(peer_id));
+        }
+        Ok(())
     }
 
     fn cleanup_text_control_outbox_routes_for_target(
@@ -13565,10 +13479,7 @@ impl PersistedAppState {
                 member.member_id
             ));
         }
-        if matches!(
-            member.status.as_str(),
-            "pending" | "revoked" | "migration_default" | "offline"
-        ) {
+        if matches!(member.status.as_str(), "pending" | "revoked" | "offline") {
             return Err(format!(
                 "Group {group_id} route sender {} is not currently admitted/online for text route authority (status={})",
                 member.member_id, member.status
@@ -13589,10 +13500,7 @@ impl PersistedAppState {
                 member.member_id
             ));
         }
-        if matches!(
-            member.status.as_str(),
-            "pending" | "revoked" | "migration_default" | "offline"
-        ) {
+        if matches!(member.status.as_str(), "pending" | "revoked" | "offline") {
             return Err(format!(
                 "Group {group_id} route member {} is not currently admitted/online for text route cleanup (status={})",
                 member.member_id, member.status
@@ -13603,10 +13511,7 @@ impl PersistedAppState {
             .iter()
             .find(|candidate| {
                 candidate.member_id == self.local_user_id()
-                    && !matches!(
-                        candidate.status.as_str(),
-                        "pending" | "revoked" | "migration_default" | "offline"
-                    )
+                    && !matches!(candidate.status.as_str(), "pending" | "revoked" | "offline")
             })
             .ok_or_else(|| {
                 format!("Group {group_id} has no current admitted local member for route cleanup")
@@ -13628,7 +13533,7 @@ impl PersistedAppState {
     ) -> Result<(), String> {
         let session = self
             .voice_session
-            .as_ref()
+            .clone()
             .ok_or_else(|| "No active voice session for voice signaling".to_owned())?;
         if session.session_id != request.session_id {
             return Err(
@@ -13640,7 +13545,7 @@ impl PersistedAppState {
         }
         let signal_kind = normalize_voice_signal_kind(&request.signal_kind)?;
         validate_voice_signal_payload(&signal_kind, &request.sealed_payload)?;
-        let attachment = self.active_runtime_peer_attachment_for_text_control()?;
+        let attachment = self.native_voice_runtime_peer_attachment(&session)?;
         let local_user_id = self.local_user_id();
         let signal_id = request
             .signal_id
@@ -13701,7 +13606,7 @@ impl PersistedAppState {
                 received_remote_signals: session.signaling.received_remote_signals,
                 last_signal_kind: Some(signal_kind.clone()),
                 status_copy: format!(
-                    "Queued voice {signal_kind} through provider-derived text/control signaling; browser RTCPeerConnection may send it only via the attached backend transport"
+                    "Queued voice {signal_kind} through provider-advertised text/control signaling; browser RTCPeerConnection may send it only via the attached backend transport"
                 ),
             };
         }
@@ -13836,17 +13741,34 @@ impl PersistedAppState {
         if channel.kind != ChannelKind::Voice {
             return Err("Pre-join voice signal channel is not a voice channel".to_owned());
         }
-        let local_peer_ok = group
-            .runtime_peers
+        let local_member_id = self.local_user_id();
+        let now = Utc::now();
+        let local_member = group
+            .members
             .iter()
-            .any(|peer| peer.is_local && peer.peer_id == signal.recipient_peer_id);
-        let remote_peer_ok = group
-            .runtime_peers
+            .find(|member| {
+                member.member_id == local_member_id
+                    && group_member_runtime_route_is_current(member, &local_member_id, now)
+            })
+            .ok_or_else(|| {
+                "Pre-join voice signal has no admitted local group member for runtime peers"
+                    .to_owned()
+            })?;
+        let remote_member = group
+            .members
             .iter()
-            .any(|peer| !peer.is_local && peer.peer_id == signal.sender_peer_id);
-        if !local_peer_ok || !remote_peer_ok {
+            .find(|member| {
+                member.member_id == signal.sender_participant_id
+                    && group_member_runtime_route_is_current(member, &local_member_id, now)
+            })
+            .ok_or_else(|| {
+                "Pre-join voice signal sender is not an admitted group member".to_owned()
+            })?;
+        let local_peer_id = group_member_runtime_peer_id(&signal.group_id, local_member)?;
+        let remote_peer_id = group_member_runtime_peer_id(&signal.group_id, remote_member)?;
+        if signal.recipient_peer_id != local_peer_id || signal.sender_peer_id != remote_peer_id {
             return Err(
-                "Pre-join voice signal peer ids did not match signed group runtime peers"
+                "Pre-join voice signal peer ids did not match provider-advertised group member runtime peers"
                     .to_owned(),
             );
         }
@@ -14068,26 +13990,6 @@ impl PersistedAppState {
         Ok(Some(group_member_runtime_peer_id(group_id, member)?))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn pump_text_control_transport_once<T>(
-        &mut self,
-        transport: &T,
-        request: ListPendingTextControlFramesRequest,
-        transport_session_id: impl Into<String>,
-    ) -> TextControlTransportPumpReportView
-    where
-        T: discrypt_transport::TextControlDataTransport + ?Sized,
-    {
-        let transport_session_id = transport_session_id.into();
-        self.pump_text_control_transport_once_for_route(
-            transport,
-            request,
-            transport_session_id,
-            None,
-        )
-        .await
-    }
-
     pub(crate) async fn pump_text_control_transport_once_for_route<T>(
         &mut self,
         transport: &T,
@@ -14103,6 +14005,7 @@ impl PersistedAppState {
             request,
             transport_session_id,
             route_peer_id,
+            TextControlFramePlane::DirectPeer,
             true,
         )
         .await
@@ -14123,6 +14026,27 @@ impl PersistedAppState {
             request,
             transport_session_id,
             route_peer_id,
+            TextControlFramePlane::DirectPeer,
+            false,
+        )
+        .await
+    }
+
+    async fn send_provider_control_transport_once<T>(
+        &mut self,
+        transport: &T,
+        request: ListPendingTextControlFramesRequest,
+        transport_session_id: String,
+    ) -> TextControlTransportPumpReportView
+    where
+        T: discrypt_transport::TextControlDataTransport + ?Sized,
+    {
+        self.drive_text_control_transport_once_for_route(
+            transport,
+            request,
+            transport_session_id,
+            None,
+            TextControlFramePlane::ProviderControl,
             false,
         )
         .await
@@ -14134,6 +14058,7 @@ impl PersistedAppState {
         request: ListPendingTextControlFramesRequest,
         transport_session_id: String,
         route_peer_id: Option<String>,
+        plane: TextControlFramePlane,
         wait_for_response: bool,
     ) -> TextControlTransportPumpReportView
     where
@@ -14146,6 +14071,9 @@ impl PersistedAppState {
         let mut retries = Vec::new();
         for record in &self.text_control_outbox {
             if text_control_frame_is_expired_presence(&record.frame, now) {
+                continue;
+            }
+            if text_control_frame_plane(&record.frame) != plane {
                 continue;
             }
             let target_matches = request
@@ -14312,6 +14240,13 @@ impl PersistedAppState {
                         break;
                     }
                 };
+                if text_control_frame_plane(&inbound_frame) != plane {
+                    failures.push(format!(
+                        "{}: received a frame on the wrong transport plane",
+                        frame_ref
+                    ));
+                    break;
+                }
                 let receipt_response = matches!(
                     &inbound_frame,
                     TextControlFrameView::Receipt { message_id, .. } if message_id == &frame.message_id
@@ -14841,6 +14776,7 @@ impl PersistedAppState {
             &pending.group_id,
             &pending.member_identity,
             &pending.signer_public_key_hex,
+            &pending.identity_signer_public_key_hex,
             &pending.key_package,
         ) {
             Ok(frame) => frame,
@@ -14938,6 +14874,7 @@ impl PersistedAppState {
                 group_id,
                 member_identity,
                 signer_public_key_hex,
+                identity_signer_public_key_hex,
                 key_package,
             } => {
                 let admission_mode = self
@@ -14951,6 +14888,7 @@ impl PersistedAppState {
                         &group_id,
                         &member_identity,
                         &signer_public_key_hex,
+                        &identity_signer_public_key_hex,
                         &key_package,
                     ) {
                         self.push_command_error(
@@ -14967,6 +14905,7 @@ impl PersistedAppState {
                         &group_id,
                         &member_identity,
                         &signer_public_key_hex,
+                        &identity_signer_public_key_hex,
                         &key_package,
                     ) {
                         Ok(request_id) => request_id,
@@ -15013,6 +14952,7 @@ impl PersistedAppState {
                         &group_id,
                         &member_identity,
                         &signer_public_key_hex,
+                        &identity_signer_public_key_hex,
                         &key_package,
                     ) {
                         Ok(frame) => frame,
@@ -15305,6 +15245,35 @@ impl PersistedAppState {
                     created_at: Utc::now().to_rfc3339(),
                 })
             }
+            TextControlFrameView::GroupChannelSchemaUpdated {
+                group_id,
+                event_id,
+                snapshot,
+            } => {
+                let status =
+                    match apply_group_channel_schema_snapshot(self, &group_id, &event_id, snapshot)
+                    {
+                        Ok(true) => "channel_schema_applied",
+                        Ok(false) => "channel_schema_current",
+                        Err((code, message, hint)) => {
+                            self.push_command_error(
+                                "channel.schema_rejected",
+                                "handle_text_control_frame",
+                                code,
+                                message,
+                                hint,
+                            );
+                            "channel_schema_rejected"
+                        }
+                    };
+                Some(TextControlFrameView::GroupGovernanceAck {
+                    group_id,
+                    event_id,
+                    applied_by_member_id: self.local_user_id(),
+                    status: status.to_owned(),
+                    created_at: Utc::now().to_rfc3339(),
+                })
+            }
             TextControlFrameView::GroupGovernanceAck {
                 group_id,
                 event_id,
@@ -15325,29 +15294,107 @@ impl PersistedAppState {
                 let _ = group_id;
                 None
             }
+            TextControlFrameView::DmPresenceHeartbeat {
+                scope_id_commitment,
+                event_id,
+                profile_id,
+                display_name,
+                device_id,
+                role,
+                signer_public_key_hex,
+                runtime_peer_id,
+                last_seen_at,
+                presence_expires_at,
+                signature_hex,
+            } => {
+                if let Err((code, message, hint)) = apply_dm_presence_heartbeat(
+                    self,
+                    DmPresenceHeartbeatEvent {
+                        scope_id_commitment: &scope_id_commitment,
+                        event_id: &event_id,
+                        profile_id: &profile_id,
+                        display_name: &display_name,
+                        device_id: &device_id,
+                        role: &role,
+                        signer_public_key_hex: &signer_public_key_hex,
+                        runtime_peer_id: &runtime_peer_id,
+                        last_seen_at: &last_seen_at,
+                        presence_expires_at: &presence_expires_at,
+                        signature_hex: &signature_hex,
+                    },
+                ) {
+                    self.push_command_error(
+                        "dm.presence_rejected",
+                        "handle_text_control_frame",
+                        code,
+                        message,
+                        hint,
+                    );
+                }
+                None
+            }
             TextControlFrameView::GroupPresenceHeartbeat {
                 group_id,
                 event_id,
                 member_id,
                 display_name,
                 device_id,
-                role: _,
-                signer_public_key_hex: _,
+                signer_public_key_hex,
+                runtime_peer_id,
+                channel_schema_epoch,
+                channel_schema_sha256,
                 last_seen_at,
                 presence_expires_at,
+                signature_hex,
             } => {
-                apply_group_presence_heartbeat(
+                let applied = apply_group_presence_heartbeat(
                     self,
                     GroupPresenceHeartbeatEvent {
                         group_id: &group_id,
                         event_id: &event_id,
                         member_id: &member_id,
-                        display_name,
-                        device_id,
+                        display_name: display_name.as_deref(),
+                        device_id: device_id.as_deref(),
+                        signer_public_key_hex: &signer_public_key_hex,
+                        runtime_peer_id: &runtime_peer_id,
+                        channel_schema_epoch,
+                        channel_schema_sha256: &channel_schema_sha256,
                         last_seen_at: &last_seen_at,
                         presence_expires_at: &presence_expires_at,
+                        signature_hex: &signature_hex,
                     },
                 );
+                if let Err((code, message, hint)) = applied {
+                    self.push_command_error(
+                        "group.presence_rejected",
+                        "handle_text_control_frame",
+                        code,
+                        message,
+                        hint,
+                    );
+                    return None;
+                }
+                let local_schema = self
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == group_id)
+                    .and_then(|group| {
+                        group_channel_schema_sha256(&group.channels)
+                            .ok()
+                            .map(|sha256| (group.channel_schema_epoch, sha256))
+                    });
+                let peer_is_stale_or_divergent =
+                    local_schema
+                        .as_ref()
+                        .is_some_and(|(local_epoch, local_sha256)| {
+                            channel_schema_epoch != *local_epoch
+                                || channel_schema_sha256 != *local_sha256
+                        });
+                if member_id != self.local_user_id() && peer_is_stale_or_divergent {
+                    if let Ok(frame) = current_group_channel_schema_frame(self, &group_id) {
+                        return Some(frame);
+                    }
+                }
                 None
             }
             TextControlFrameView::VoiceSignal { signal } => {
@@ -15454,14 +15501,6 @@ impl PersistedAppState {
             })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn active_runtime_peer_ids_for_text_control(
-        &self,
-    ) -> Result<(SignalingPeerId, SignalingPeerId), String> {
-        let attachment = self.active_runtime_peer_attachment_for_text_control()?;
-        Ok((attachment.local_peer_id, attachment.remote_peer_id))
-    }
-
     fn active_runtime_peer_attachment_for_text_control(
         &self,
     ) -> Result<TextControlRuntimePeerAttachment, String> {
@@ -15481,18 +15520,14 @@ impl PersistedAppState {
                 .runtime_peers
                 .iter()
                 .find(|peer| peer.is_local)
-                .ok_or_else(|| {
-                    format!(
-                        "Active DM {dm_id} has no local runtime peer from signed bootstrap metadata"
-                    )
-                })?;
+                .ok_or_else(|| format!("Active DM {dm_id} has no local profile runtime peer"))?;
             let remote = dm
                 .runtime_peers
                 .iter()
-                .find(|peer| !peer.is_local)
+                .find(|peer| !peer.is_local && dm_runtime_peer_route_is_current(peer, Utc::now()))
                 .ok_or_else(|| {
                     format!(
-                        "Active DM {dm_id} has no remote runtime peer from signed bootstrap metadata"
+                        "Active DM {dm_id} is waiting for a current provider-advertised remote runtime peer"
                     )
                 })?;
             return Ok(TextControlRuntimePeerAttachment {
@@ -15504,71 +15539,13 @@ impl PersistedAppState {
             });
         }
         if let Some(group_id) = &context.group_id {
-            let group = self
-                .groups
-                .iter()
-                .find(|group| &group.group_id == group_id)
-                .ok_or_else(|| {
-                    format!(
-                        "Active group {group_id} is missing for text/control runtime peer attachment"
-                    )
-                })?;
-            let local_role = runtime_role_for_group(group, &self.local_user_id())
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "Active group {group_id} has no current backend-governed local member role for text/control runtime peer attachment"
-                    )
-                })?;
-            let local_role_label = group_role_label(&local_role);
-            let runtime_peers = group_runtime_peers(group.connectivity.as_ref(), local_role_label);
-            if runtime_peers.len() != 2 {
+            let attachments = self.active_runtime_peer_attachments_for_text_control()?;
+            let [attachment] = attachments.as_slice() else {
                 return Err(format!(
-                    "Active group {group_id} has no signed group bootstrap peer ids for text/control runtime peer attachment"
+                    "Active group {group_id} requires exactly one provider-advertised remote peer for a single runtime attachment"
                 ));
-            }
-            let local = runtime_peers
-                .iter()
-                .find(|peer| peer.is_local)
-                .ok_or_else(|| {
-                    format!(
-                        "Active group {group_id} has no local runtime peer from signed bootstrap metadata"
-                    )
-                })?;
-            let remote = runtime_peers
-                .iter()
-                .find(|peer| !peer.is_local)
-                .ok_or_else(|| {
-                    format!(
-                        "Active group {group_id} has no remote runtime peer from signed bootstrap metadata"
-                    )
-                })?;
-            if discrypt_webrtc_debug_enabled() && group.runtime_peers != runtime_peers {
-                eprintln!(
-                    "discrypt-text-runtime-peer-repair group={} local_member_role={} persisted_local_role={} derived_local_role={} local_peer={} remote_peer={}",
-                    group_id,
-                    local_role_label,
-                    group.runtime_peers
-                        .iter()
-                        .find(|peer| peer.is_local)
-                        .map(|peer| peer.role.as_str())
-                        .unwrap_or("missing"),
-                    local.role,
-                    local.peer_id,
-                    remote.peer_id
-                );
-            }
-            return Ok(TextControlRuntimePeerAttachment {
-                role: group_text_control_runtime_role(
-                    &local_role,
-                    &local.peer_id,
-                    &remote.peer_id,
-                )?,
-                local_peer_id: SignalingPeerId::new(local.peer_id.clone())
-                    .map_err(|error| error.to_string())?,
-                remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
-                    .map_err(|error| error.to_string())?,
-            });
+            };
+            return Ok(attachment.clone());
         }
         Err(
             "Active context is not a DM or group for text/control runtime peer attachment"
@@ -15602,6 +15579,7 @@ impl PersistedAppState {
                 )
             })?;
         let local_member_id = self.local_user_id();
+        let now = Utc::now();
         // Presence is published over this transport, so offline is still an
         // admitted governance state and must not create an attach deadlock.
         let local_member = group
@@ -15609,9 +15587,7 @@ impl PersistedAppState {
             .iter()
             .find(|member| {
                 member.member_id == local_member_id
-                    && member.status != "pending"
-                    && member.status != "revoked"
-                    && member.status != "migration_default"
+                    && group_member_runtime_route_is_current(member, &local_member_id, now)
             })
             .ok_or_else(|| {
                 format!(
@@ -15625,9 +15601,7 @@ impl PersistedAppState {
         let mut attachments = Vec::new();
         for remote in group.members.iter().filter(|member| {
             member.member_id != local_member_id
-                && member.status != "pending"
-                && member.status != "revoked"
-                && member.status != "migration_default"
+                && group_member_runtime_route_is_current(member, &local_member_id, now)
         }) {
             let remote_peer_id = group_member_runtime_peer_id(group_id, remote)?;
             if remote_peer_id == local_peer_id.0 {
@@ -15655,7 +15629,7 @@ impl PersistedAppState {
         }
         if attachments.is_empty() {
             return Err(format!(
-                "Active group {group_id} has no admitted remote peers for per-peer text/control runtime attach"
+                "Active group {group_id} has no current provider-advertised remote peers for per-peer text/control runtime attach"
             ));
         }
         Ok(attachments)
@@ -15681,41 +15655,53 @@ impl PersistedAppState {
                     .to_owned(),
             );
         }
-        let local_role = runtime_role_for_group(group, &self.local_user_id())
-            .cloned()
+        let local_member_id = self.local_user_id();
+        let now = Utc::now();
+        let local_member = group
+            .members
+            .iter()
+            .find(|member| {
+                member.member_id == local_member_id
+                    && group_member_runtime_route_is_current(member, &local_member_id, now)
+            })
             .ok_or_else(|| {
-                "Active voice session has no backend-governed local member role for native Rust media"
+                "Active voice session has no admitted local group member for native Rust media"
                     .to_owned()
             })?;
-        let runtime_peers =
-            group_runtime_peers(group.connectivity.as_ref(), group_role_label(&local_role));
-        if runtime_peers.len() != 2 {
+        let local_peer_id = group_member_runtime_peer_id(&session.group_id, local_member)?;
+        let remote_members = group
+            .members
+            .iter()
+            .filter(|member| {
+                member.member_id != local_member_id
+                    && group_member_runtime_route_is_current(member, &local_member_id, now)
+            })
+            .collect::<Vec<_>>();
+        if let [remote_member] = remote_members.as_slice() {
+            let remote_peer_id = group_member_runtime_peer_id(&session.group_id, remote_member)?;
+            return Ok(TextControlRuntimePeerAttachment {
+                role: group_text_control_runtime_role_for_edge(
+                    &local_member.role,
+                    &local_peer_id,
+                    &remote_member.role,
+                    &remote_peer_id,
+                )?,
+                local_peer_id: SignalingPeerId::new(local_peer_id)
+                    .map_err(|error| error.to_string())?,
+                remote_peer_id: SignalingPeerId::new(remote_peer_id)
+                    .map_err(|error| error.to_string())?,
+            });
+        }
+        if remote_members.len() > 1 {
             return Err(
-                "Active voice session has no signed group bootstrap peer ids for native Rust media"
+                "Active voice session has multiple admitted remote group members; select one remote voice peer before opening a single native Rust media runtime"
                     .to_owned(),
             );
         }
-        let local = runtime_peers
-            .iter()
-            .find(|peer| peer.is_local)
-            .ok_or_else(|| {
-                "Active voice session has no local runtime peer from signed bootstrap metadata"
-                    .to_owned()
-            })?;
-        let remote = runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| {
-                "Active voice session has no remote runtime peer from signed bootstrap metadata"
-                    .to_owned()
-            })?;
-        Ok(TextControlRuntimePeerAttachment {
-            role: group_text_control_runtime_role(&local_role, &local.peer_id, &remote.peer_id)?,
-            local_peer_id: SignalingPeerId::new(local.peer_id.clone())
-                .map_err(|error| error.to_string())?,
-            remote_peer_id: SignalingPeerId::new(remote.peer_id.clone())
-                .map_err(|error| error.to_string())?,
-        })
+        Err(format!(
+            "Active group {} has no admitted remote member with a provider-advertised runtime peer id",
+            session.group_id
+        ))
     }
 
     fn select_signaling_profile(
@@ -16039,7 +16025,6 @@ impl PersistedAppState {
             TransportSessionState::IceGathering => "ice_gathering",
             TransportSessionState::Checking => "checking",
             TransportSessionState::Direct => "direct",
-            TransportSessionState::OverlayRelay => "unsupported_overlay",
             TransportSessionState::TurnRelay => "turn_relay",
             TransportSessionState::Reconnecting => "reconnecting",
             TransportSessionState::Disconnected => "disconnected",
@@ -16338,7 +16323,11 @@ impl PersistedAppState {
                 dm_connectivity_policy(&dm_id, &participant_id),
                 &self.connectivity_defaults,
             );
-            let runtime_peers = dm_runtime_peers(Some(&connectivity), "inviter");
+            let runtime_peers = vec![local_dm_runtime_peer(
+                self,
+                &connectivity.scope_id_commitment,
+                "inviter",
+            )];
             self.dms.push(DirectConversationView {
                 dm_id: dm_id.clone(),
                 participant_id: participant_id.clone(),
@@ -16488,7 +16477,6 @@ impl PersistedAppState {
                 group_connectivity_policy(&group_id),
                 &self.connectivity_defaults,
             );
-            let runtime_peers = group_runtime_peers(Some(&connectivity), "member");
             let created_at = Utc::now().to_rfc3339();
             let local_member_id = self.local_user_id();
             let display_name = self
@@ -16502,18 +16490,28 @@ impl PersistedAppState {
                 .find(|device| device.local)
                 .map(|device| device.device_id.clone());
             let role = GroupRoleView::Member;
+            let mut local_member = initial_group_member(
+                &local_member_id,
+                &display_name,
+                device_id,
+                role.clone(),
+                &created_at,
+            );
+            local_member.signer_public_key_hex = Some(hex::encode(
+                SigningKey::from_bytes(&self.identity_seed_bytes())
+                    .verifying_key()
+                    .as_bytes(),
+            ));
+            local_member.runtime_peer_id = Some(local_group_runtime_peer_id(self, &group_id));
+            let members = vec![local_member];
+            let runtime_peers = advertised_group_runtime_peers(&members, &local_member_id);
             self.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: room_name,
                 role: "member".to_owned(),
-                channels: default_group_channels(self.next_sequence),
-                members: vec![initial_group_member(
-                    &local_member_id,
-                    &display_name,
-                    device_id,
-                    role.clone(),
-                    &created_at,
-                )],
+                channels: Vec::new(),
+                channel_schema_epoch: 0,
+                members,
                 role_policy: initial_group_role_policy(
                     GroupAdmissionModeView::default(),
                     &local_member_id,
@@ -16745,6 +16743,207 @@ fn verify_group_member_role_change_signature(
         .map_err(|error| format!("Role-change governance signature verification failed: {error}"))
 }
 
+struct GroupChannelSchemaSignaturePayload<'a> {
+    group_id: &'a str,
+    schema_epoch: u64,
+    channels_sha256: &'a str,
+    actor_member_id: &'a str,
+    actor_signer_public_key_hex: &'a str,
+    created_at: &'a str,
+}
+
+fn group_channel_schema_sha256(channels: &[ChannelStateView]) -> Result<String, String> {
+    let encoded = serde_json::to_vec(channels)
+        .map_err(|error| format!("could not encode group channel schema: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"discrypt:group-channel-schema:v1");
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn group_channel_schema_signature_payload(
+    payload: GroupChannelSchemaSignaturePayload<'_>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"discrypt:group-channel-schema-signature:v1");
+    bytes.push(0);
+    bytes.extend_from_slice(payload.group_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&payload.schema_epoch.to_be_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.channels_sha256.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.actor_member_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.actor_signer_public_key_hex.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.created_at.as_bytes());
+    bytes
+}
+
+fn sign_group_channel_schema(
+    signing_key: &SigningKey,
+    payload: GroupChannelSchemaSignaturePayload<'_>,
+) -> String {
+    hex::encode(
+        signing_key
+            .sign(&group_channel_schema_signature_payload(payload))
+            .to_bytes(),
+    )
+}
+
+fn verify_group_channel_schema_signature(
+    snapshot: &GroupChannelSchemaSnapshotView,
+    group_id: &str,
+) -> Result<(), String> {
+    let channels_sha256 = group_channel_schema_sha256(&snapshot.channels)?;
+    let verifying_key = verifying_key_from_hex(&snapshot.actor_signer_public_key_hex)
+        .ok_or_else(|| "Channel schema signer key is invalid".to_owned())?;
+    let signature_bytes = hex::decode(&snapshot.signature_hex)
+        .map_err(|error| format!("Channel schema signature is invalid hex: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("Channel schema signature is malformed: {error}"))?;
+    verifying_key
+        .verify(
+            &group_channel_schema_signature_payload(GroupChannelSchemaSignaturePayload {
+                group_id,
+                schema_epoch: snapshot.schema_epoch,
+                channels_sha256: &channels_sha256,
+                actor_member_id: &snapshot.actor_member_id,
+                actor_signer_public_key_hex: &snapshot.actor_signer_public_key_hex,
+                created_at: &snapshot.created_at,
+            }),
+            &signature,
+        )
+        .map_err(|error| format!("Channel schema signature verification failed: {error}"))
+}
+
+struct GroupPresenceSignaturePayload<'a> {
+    group_id: &'a str,
+    event_id: &'a str,
+    member_id: &'a str,
+    display_name: Option<&'a str>,
+    device_id: Option<&'a str>,
+    signer_public_key_hex: &'a str,
+    runtime_peer_id: &'a str,
+    channel_schema_epoch: u64,
+    channel_schema_sha256: &'a str,
+    last_seen_at: &'a str,
+    presence_expires_at: &'a str,
+}
+
+fn group_presence_signature_payload(payload: GroupPresenceSignaturePayload<'_>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"discrypt:group-presence-heartbeat:v1");
+    for component in [
+        payload.group_id,
+        payload.event_id,
+        payload.member_id,
+        payload.display_name.unwrap_or(""),
+        payload.device_id.unwrap_or(""),
+        payload.signer_public_key_hex,
+        payload.runtime_peer_id,
+    ] {
+        bytes.push(0);
+        bytes.extend_from_slice(component.as_bytes());
+    }
+    bytes.push(0);
+    bytes.extend_from_slice(&payload.channel_schema_epoch.to_be_bytes());
+    for component in [
+        payload.channel_schema_sha256,
+        payload.last_seen_at,
+        payload.presence_expires_at,
+    ] {
+        bytes.push(0);
+        bytes.extend_from_slice(component.as_bytes());
+    }
+    bytes
+}
+
+fn sign_group_presence(
+    signing_key: &SigningKey,
+    payload: GroupPresenceSignaturePayload<'_>,
+) -> String {
+    hex::encode(
+        signing_key
+            .sign(&group_presence_signature_payload(payload))
+            .to_bytes(),
+    )
+}
+
+fn verify_group_presence_signature(
+    verifying_key_hex: &str,
+    signature_hex: &str,
+    payload: GroupPresenceSignaturePayload<'_>,
+) -> Result<(), String> {
+    let verifying_key = verifying_key_from_hex(verifying_key_hex)
+        .ok_or_else(|| "Presence signer key is invalid".to_owned())?;
+    let signature_bytes = hex::decode(signature_hex)
+        .map_err(|error| format!("Presence signature is invalid hex: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("Presence signature is malformed: {error}"))?;
+    verifying_key
+        .verify(&group_presence_signature_payload(payload), &signature)
+        .map_err(|error| format!("Presence signature verification failed: {error}"))
+}
+
+struct DmPresenceSignaturePayload<'a> {
+    scope_id_commitment: &'a str,
+    event_id: &'a str,
+    profile_id: &'a str,
+    display_name: &'a str,
+    device_id: &'a str,
+    role: &'a str,
+    signer_public_key_hex: &'a str,
+    runtime_peer_id: &'a str,
+    last_seen_at: &'a str,
+    presence_expires_at: &'a str,
+}
+
+fn dm_presence_signature_payload(payload: DmPresenceSignaturePayload<'_>) -> Vec<u8> {
+    let mut bytes = b"discrypt:dm-presence-heartbeat:v1".to_vec();
+    for component in [
+        payload.scope_id_commitment,
+        payload.event_id,
+        payload.profile_id,
+        payload.display_name,
+        payload.device_id,
+        payload.role,
+        payload.signer_public_key_hex,
+        payload.runtime_peer_id,
+        payload.last_seen_at,
+        payload.presence_expires_at,
+    ] {
+        bytes.push(0);
+        bytes.extend_from_slice(component.as_bytes());
+    }
+    bytes
+}
+
+fn sign_dm_presence(signing_key: &SigningKey, payload: DmPresenceSignaturePayload<'_>) -> String {
+    hex::encode(
+        signing_key
+            .sign(&dm_presence_signature_payload(payload))
+            .to_bytes(),
+    )
+}
+
+fn verify_dm_presence_signature(
+    verifying_key_hex: &str,
+    signature_hex: &str,
+    payload: DmPresenceSignaturePayload<'_>,
+) -> Result<(), String> {
+    let verifying_key = verifying_key_from_hex(verifying_key_hex)
+        .ok_or_else(|| "DM presence signer key is invalid".to_owned())?;
+    let signature_bytes = hex::decode(signature_hex)
+        .map_err(|error| format!("DM presence signature is invalid hex: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("DM presence signature is malformed: {error}"))?;
+    verifying_key
+        .verify(&dm_presence_signature_payload(payload), &signature)
+        .map_err(|error| format!("DM presence signature verification failed: {error}"))
+}
+
 fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> {
     match target.kind.as_str() {
         "dm" => target
@@ -16767,7 +16966,6 @@ fn text_delivery_group_id(target: &MessageTargetView) -> Result<String, String> 
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn upsert_openmls_group_handle(state: &mut PersistedAppState, record: OpenMlsGroupHandleRecord) {
     if let Some(existing) = state
         .openmls_groups
@@ -16851,7 +17049,7 @@ fn last_panic_log() -> &'static Mutex<Option<PanicLogEntry>> {
     LAST_PANIC_LOG.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg_attr(not(feature = "tauri-runtime"), allow(dead_code))]
+#[cfg(feature = "tauri-runtime")]
 fn install_discrypt_panic_hook() {
     PANIC_HOOK_INSTALLED.get_or_init(|| {
         std::panic::set_hook(Box::new(|info| {
@@ -16860,6 +17058,7 @@ fn install_discrypt_panic_hook() {
     });
 }
 
+#[cfg(any(test, feature = "tauri-runtime"))]
 fn record_panic_hook_info(info: &std::panic::PanicHookInfo<'_>) {
     let entry = panic_log_entry_from_parts(
         panic_payload_summary(info.payload()),
@@ -16872,6 +17071,7 @@ fn record_panic_hook_info(info: &std::panic::PanicHookInfo<'_>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
 }
 
+#[cfg(any(test, feature = "tauri-runtime"))]
 fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_owned()
@@ -16882,6 +17082,7 @@ fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[cfg(any(test, feature = "tauri-runtime"))]
 fn panic_log_entry_from_parts(
     message: impl Into<String>,
     location: Option<(&str, u32, u32)>,
@@ -16914,6 +17115,7 @@ fn panic_log_entry_from_parts(
     }
 }
 
+#[cfg(any(test, feature = "tauri-runtime"))]
 fn structured_panic_log_line(entry: &PanicLogEntry) -> String {
     serde_json::to_string(entry).unwrap_or_else(|json_error| {
         format!(
@@ -17473,7 +17675,7 @@ fn storage_diagnostic_recovery_hint(failure_class: &str, source_hint: &str) -> S
         "password_vault_unlock_failed" => "Re-enter the same Discrypt storage password used for this profile. Discrypt stopped before writing replacement vault material over the existing store.",
         "password_vault_corrupt" => "Keep the existing vault and profile files for recovery; retry only with the original files and password.",
         "password_vault_missing_key" => "Restore the original vault file next to this profile before retrying; Discrypt stopped before generating replacement key material over existing state.",
-        "schema_future" => "Open this profile with a newer compatible Discrypt build; this build will not downgrade or overwrite the store.",
+        "schema_future" => "This profile uses an unsupported schema version; this build will not downgrade or overwrite the store.",
         "schema_invalid" | "app_state_decode_failed" => "Keep the existing store for recovery or quarantine analysis; Discrypt did not treat it as a first-run profile.",
         "storage_preserve_failed" => "Fix filesystem permissions or disk availability so Discrypt can preserve the existing store before changing storage mode.",
         "storage_config_failed" => "Fix the storage security config file before creating or unlocking an account.",
@@ -17637,7 +17839,7 @@ fn mutate_app_service_with_result<T>(
     (view, result)
 }
 
-#[cfg_attr(not(any(test, feature = "tauri-runtime")), allow(dead_code))]
+#[cfg(any(test, feature = "tauri-runtime"))]
 fn app_event_stream_after_view(state: &AppStateView, cursor: u64) -> AppEventStreamView {
     let events = state
         .events
@@ -17767,7 +17969,7 @@ fn load_state() -> PersistedAppState {
 
 fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
     match store.load_app_state() {
-        Ok(Some(bytes)) => load_state_from_bytes(store, &bytes),
+        Ok(Some(bytes)) => load_state_from_bytes(&bytes),
         Ok(None) => PersistedAppState::initial(),
         Err(error) => initial_state_with_persistence_error(
             "state_load_failed",
@@ -17777,11 +17979,22 @@ fn load_state_from_store(store: &mut impl AppStore) -> PersistedAppState {
     }
 }
 
-fn load_state_from_bytes(store: &mut impl AppStore, bytes: &[u8]) -> PersistedAppState {
+fn load_state_from_bytes(bytes: &[u8]) -> PersistedAppState {
     match persisted_schema_version(bytes) {
         Ok(PersistedSchemaVersion::Current) => decode_current_app_state(bytes),
-        Ok(PersistedSchemaVersion::Legacy { version, missing }) => {
-            migrate_legacy_app_state(store, bytes, version, missing)
+        Ok(PersistedSchemaVersion::Missing) => initial_state_with_persistence_error(
+            "state_schema_missing",
+            "Stored app state has no schema_version field.",
+            "Delete the unreleased development profile and create a new one with this build.",
+        ),
+        Ok(PersistedSchemaVersion::Unsupported(version)) => {
+            initial_state_with_persistence_error(
+                "state_schema_unsupported",
+                format!(
+                    "Stored app state schema version {version} is not supported by this pre-release build."
+                ),
+                "Delete the unreleased development profile and create a new one with this build.",
+            )
         }
         Ok(PersistedSchemaVersion::Future(version)) => initial_state_with_persistence_error(
             "state_schema_future",
@@ -17806,10 +18019,7 @@ fn load_state_from_bytes(store: &mut impl AppStore, bytes: &[u8]) -> PersistedAp
 fn persisted_schema_version(bytes: &[u8]) -> Result<PersistedSchemaVersion, serde_json::Error> {
     let value = serde_json::from_slice::<serde_json::Value>(bytes)?;
     let Some(raw_version) = value.get("schema_version") else {
-        return Ok(PersistedSchemaVersion::Legacy {
-            version: 0,
-            missing: true,
-        });
+        return Ok(PersistedSchemaVersion::Missing);
     };
     let Some(version) = raw_version
         .as_u64()
@@ -17820,10 +18030,7 @@ fn persisted_schema_version(bytes: &[u8]) -> Result<PersistedSchemaVersion, serd
     if version == APP_STATE_SCHEMA_VERSION {
         Ok(PersistedSchemaVersion::Current)
     } else if version < APP_STATE_SCHEMA_VERSION {
-        Ok(PersistedSchemaVersion::Legacy {
-            version,
-            missing: false,
-        })
+        Ok(PersistedSchemaVersion::Unsupported(version))
     } else {
         Ok(PersistedSchemaVersion::Future(version))
     }
@@ -17834,7 +18041,6 @@ fn decode_current_app_state(bytes: &[u8]) -> PersistedAppState {
         Ok(mut state) => {
             state.schema_version = APP_STATE_SCHEMA_VERSION;
             state.clear_non_persistent_voice_runtime();
-            state.ensure_group_governance_defaults();
             state
         }
         Err(error) => initial_state_with_persistence_error(
@@ -17843,41 +18049,6 @@ fn decode_current_app_state(bytes: &[u8]) -> PersistedAppState {
             "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
         ),
     }
-}
-
-fn migrate_legacy_app_state(
-    store: &mut impl AppStore,
-    bytes: &[u8],
-    version: u32,
-    missing: bool,
-) -> PersistedAppState {
-    let mut state = match serde_json::from_slice::<PersistedAppState>(bytes) {
-        Ok(state) => state,
-        Err(error) => {
-            return initial_state_with_persistence_error(
-                "state_decode_failed",
-                format!("Stored legacy app state version {version} could not be decoded: {error}"),
-                "Keep the existing store quarantined for recovery; do not silently treat this as a first-run profile.",
-            )
-        }
-    };
-    state.schema_version = APP_STATE_SCHEMA_VERSION;
-    state.clear_non_persistent_voice_runtime();
-    state.ensure_group_governance_defaults();
-
-    let source = if missing {
-        "missing schema_version"
-    } else {
-        "schema_version below current"
-    };
-    if let Err(error) = persist_state_to_store(store, &state) {
-        state.last_command_error = Some(*error);
-    } else {
-        eprintln!(
-            "[Discrypt persistence] migrated legacy app state ({source}, version {version}) to schema {APP_STATE_SCHEMA_VERSION}"
-        );
-    }
-    state
 }
 
 fn persist_state(state: &PersistedAppState) -> Result<(), Box<CommandErrorView>> {
@@ -18422,12 +18593,7 @@ fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
     load_state_from_store(&mut store)
 }
 
-#[cfg(all(
-    any(test, feature = "harness"),
-    target_os = "linux",
-    feature = "production-storage"
-))]
-#[allow(dead_code)]
+#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
@@ -18445,11 +18611,7 @@ fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
     load_state_from_store(&mut store)
 }
 
-#[cfg(all(
-    any(test, feature = "harness"),
-    not(all(target_os = "linux", feature = "production-storage"))
-))]
-#[allow(dead_code)]
+#[cfg(all(test, not(all(target_os = "linux", feature = "production-storage"))))]
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
@@ -18486,10 +18648,6 @@ fn env_app_state_override_allowed() -> bool {
     ))
 }
 
-fn explicit_text_runtime_attachment_allowed() -> bool {
-    cfg!(any(test, feature = "harness", feature = "local-dev"))
-}
-
 fn discrypt_webrtc_debug_enabled() -> bool {
     std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some()
         || std::env::var_os("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_some()
@@ -18519,7 +18677,7 @@ fn app_store_path_with_options(allow_env_override: bool, domain: AppStatePathDom
     app_store_path_in_dir(domain.dir_name())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn production_app_store_path() -> PathBuf {
     app_store_path_with_options(false, AppStatePathDomain::Production)
 }
@@ -18550,31 +18708,23 @@ fn app_store_path_in_dir(app_dir: &str) -> PathBuf {
     PathBuf::from(app_dir).join(APP_STATE_STORE_FILENAME)
 }
 
-fn default_group_channels(sequence: u64) -> Vec<ChannelStateView> {
+fn default_group_channels() -> Vec<ChannelStateView> {
     vec![
         ChannelStateView {
-            channel_id: stable_id("channel", "general", sequence),
+            channel_id: DEFAULT_GROUP_TEXT_CHANNEL_ID.to_owned(),
             name: "#general".to_owned(),
             kind: ChannelKind::Text,
             retention_status: "7 days".to_owned(),
             connectivity: None,
         },
         ChannelStateView {
-            channel_id: stable_id("channel", "Voice Lobby", sequence),
+            channel_id: DEFAULT_GROUP_VOICE_CHANNEL_ID.to_owned(),
             name: "Voice Lobby".to_owned(),
             kind: ChannelKind::Voice,
             retention_status: "session".to_owned(),
             connectivity: None,
         },
     ]
-}
-
-fn group_role_from_legacy_label(role: &str) -> GroupRoleView {
-    match role.trim().to_ascii_lowercase().as_str() {
-        "owner" => GroupRoleView::Owner,
-        "staff" => GroupRoleView::Staff,
-        _ => GroupRoleView::Member,
-    }
 }
 
 fn group_role_label(role: &GroupRoleView) -> &'static str {
@@ -18612,6 +18762,7 @@ fn initial_group_member(
         role,
         status: "unknown".to_owned(),
         signer_public_key_hex: None,
+        runtime_peer_id: None,
         joined_at: joined_at.to_owned(),
         last_seen_at: None,
         presence_expires_at: None,
@@ -18959,7 +19110,7 @@ impl NativeVoiceCodecState {
             || attachment.remote_peer_id.0 != request.remote_peer_id
         {
             return Err(
-                "Native Rust voice stream peer ids must match backend-derived runtime peers"
+                "Native Rust voice stream peer ids must match current provider-advertised runtime peers"
                     .to_owned(),
             );
         }
@@ -19123,7 +19274,7 @@ fn build_native_voice_media_signal_with_peer_boundary(
         || request.local_peer_id == request.remote_peer_id
     {
         return Err(
-            "Native Rust voice media requires distinct provider-derived peer ids".to_owned(),
+            "Native Rust voice media requires distinct provider-advertised peer ids".to_owned(),
         );
     }
     if enforce_backend_peer_boundary {
@@ -19132,7 +19283,7 @@ fn build_native_voice_media_signal_with_peer_boundary(
             || runtime_attachment.remote_peer_id.0 != request.remote_peer_id
         {
             return Err(
-                "Native Rust voice media peer ids must match the backend-derived voice runtime peers"
+                "Native Rust voice media peer ids must match current provider-advertised voice runtime peers"
                     .to_owned(),
             );
         }
@@ -20256,12 +20407,7 @@ fn attach_unambiguous_group_runtime_peer_members(
         let candidates = member_snapshots
             .iter()
             .filter(|member| group_role_label(&member.role) == peer.role)
-            .filter(|member| {
-                !matches!(
-                    member.status.as_str(),
-                    "pending" | "revoked" | "migration_default"
-                )
-            })
+            .filter(|member| !matches!(member.status.as_str(), "pending" | "revoked"))
             .collect::<Vec<_>>();
         let [member] = candidates.as_slice() else {
             peer.member_id = None;
@@ -20340,16 +20486,6 @@ fn unavailable_route_graph_edge(
     }
 }
 
-fn parse_text_control_runtime_role(
-    role: &str,
-) -> Result<ProviderTextControlRuntimePeerRole, String> {
-    match role {
-        "offerer" => Ok(ProviderTextControlRuntimePeerRole::Offerer),
-        "answerer" => Ok(ProviderTextControlRuntimePeerRole::Answerer),
-        other => Err(format!("Unsupported text/control runtime role {other}")),
-    }
-}
-
 fn dm_text_control_runtime_role(local_role: &str) -> ProviderTextControlRuntimePeerRole {
     if local_role == "reply" {
         ProviderTextControlRuntimePeerRole::Answerer
@@ -20358,45 +20494,55 @@ fn dm_text_control_runtime_role(local_role: &str) -> ProviderTextControlRuntimeP
     }
 }
 
-fn group_text_control_runtime_role(
-    local_role: &GroupRoleView,
-    local_peer_id: &str,
-    remote_peer_id: &str,
-) -> Result<ProviderTextControlRuntimePeerRole, String> {
-    if local_peer_id == remote_peer_id {
-        return Err(
-            "Text/control runtime role is ambiguous because local and remote peer ids match"
-                .to_owned(),
-        );
-    }
-    Ok(match local_role {
-        GroupRoleView::Owner | GroupRoleView::Staff => ProviderTextControlRuntimePeerRole::Offerer,
-        GroupRoleView::Member => ProviderTextControlRuntimePeerRole::Answerer,
-    })
-}
-
 fn group_member_runtime_peer_id(
-    group_id: &str,
+    _group_id: &str,
     member: &GroupMemberView,
 ) -> Result<String, String> {
-    if member.status == "pending"
-        || member.status == "revoked"
-        || member.status == "migration_default"
-    {
+    if !group_member_is_admitted_for_runtime(member) {
         return Err(format!(
             "Group member {} is not admitted for text/control runtime attach",
             redacted_observable_ref("member", &member.member_id)
         ));
     }
-    let commitment = member
-        .signer_public_key_hex
+    member
+        .runtime_peer_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(&member.member_id);
-    Ok(runtime_peer_id_from_commitment(
-        "group-admitted-member-runtime-peer",
-        &format!("{group_id}:{commitment}"),
-    ))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "Group member {} has not advertised a runtime peer id over the provider control plane",
+                redacted_observable_ref("member", &member.member_id)
+            )
+        })
+}
+
+fn group_member_is_admitted_for_runtime(member: &GroupMemberView) -> bool {
+    member.status != "pending" && member.status != "revoked"
+}
+
+fn group_member_runtime_route_is_current(
+    member: &GroupMemberView,
+    local_member_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    if !group_member_is_admitted_for_runtime(member)
+        || member
+            .runtime_peer_id
+            .as_deref()
+            .is_none_or(|peer_id| peer_id.trim().is_empty())
+    {
+        return false;
+    }
+    if member.member_id == local_member_id {
+        return true;
+    }
+    member.status == "online"
+        && member
+            .presence_expires_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > now)
 }
 
 fn group_text_control_runtime_role_for_edge(
@@ -21578,47 +21724,6 @@ fn run_provider_webrtc_data_channel_request_response_probe(
     .map_err(|_| "Provider WebRTC data-channel request/response probe thread panicked".to_owned())?
 }
 
-#[cfg(test)]
-fn run_provider_webrtc_data_channel_request_response_probe_with_answerer<F>(
-    profile: SignalingAdapterProfile,
-    scope: ConversationScope,
-    bootstrap_secret: Vec<u8>,
-    random_entropy: Vec<u8>,
-    ice_servers: IceServerConfig,
-    text_control_frame: Vec<u8>,
-    answerer: F,
-) -> Result<discrypt_transport::ProviderWebRtcDataChannelProbe, String>
-where
-    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, String> + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                format!("Could not start WebRTC data-channel answerer probe runtime: {error}")
-            })?;
-        runtime
-            .block_on(
-                probe_provider_webrtc_datachannel_request_response_with_config_and_answerer(
-                    profile,
-                    scope,
-                    &bootstrap_secret,
-                    &random_entropy,
-                    discrypt_transport::WebRtcNegotiationConfig::new(ice_servers),
-                    text_control_frame,
-                    move |received| answerer(received).map_err(TransportError::SignalingAdapter),
-                ),
-            )
-            .map_err(|error| error.to_string())
-    })
-    .join()
-    .map_err(|_| {
-        "Provider WebRTC data-channel answerer callback probe thread panicked".to_owned()
-    })?
-}
-
 fn ice_config_from_connectivity(
     connectivity: &ConnectivityPolicyView,
 ) -> Result<IceServerConfig, discrypt_transport::TransportError> {
@@ -21765,148 +21870,85 @@ fn runtime_peer_id_from_commitment(label: &str, commitment: &str) -> String {
     format!("peer-{short}")
 }
 
-fn dm_runtime_peers(
-    connectivity: Option<&ConnectivityPolicyView>,
-    local_role: &str,
-) -> Vec<DmRuntimePeerView> {
-    let Some(dm_bootstrap) = connectivity.and_then(|policy| policy.dm_bootstrap.as_ref()) else {
-        return Vec::new();
-    };
-    let inviter_peer_id = runtime_peer_id_from_commitment(
-        "dm-inviter-runtime-peer",
-        &dm_bootstrap.inviter_identity_commitment,
-    );
-    let reply_peer_id = runtime_peer_id_from_commitment(
-        "dm-reply-runtime-peer",
-        &dm_bootstrap.reply_rendezvous_commitment,
-    );
-    let local_is_inviter = local_role == "inviter";
-    vec![
-        DmRuntimePeerView {
-            peer_id: inviter_peer_id,
-            role: "inviter".to_owned(),
-            is_local: local_is_inviter,
-            source: "signed_dm_bootstrap_v1".to_owned(),
-        },
-        DmRuntimePeerView {
-            peer_id: reply_peer_id,
-            role: "reply".to_owned(),
-            is_local: !local_is_inviter,
-            source: "signed_dm_bootstrap_v1".to_owned(),
-        },
-    ]
-}
-
-fn group_runtime_peers(
-    connectivity: Option<&ConnectivityPolicyView>,
-    local_role: &str,
-) -> Vec<GroupRuntimePeerView> {
-    let Some(group_bootstrap) = connectivity.and_then(|policy| policy.group_bootstrap.as_ref())
-    else {
-        return Vec::new();
-    };
-    let owner_peer_id = runtime_peer_id_from_commitment(
-        "group-owner-runtime-peer",
-        &group_bootstrap.group_identity_commitment,
-    );
-    let member_commitment = format!(
-        "{}:{}",
-        group_bootstrap.role_admission_policy_commitment, group_bootstrap.channel_policy_commitment
-    );
-    let member_peer_id =
-        runtime_peer_id_from_commitment("group-member-runtime-peer", &member_commitment);
-    // The signed group bootstrap is a two-sided control-plane: the authorized
-    // side (owner/staff) creates offers and admits members; the member side
-    // answers and submits admission key packages.  Persisted runtime_peers can
-    // be stale after role changes, so callers should pass the current local
-    // governance role rather than trusting old per-group peer rows.
-    let local_is_owner = matches!(local_role, "owner" | "staff");
-    vec![
-        GroupRuntimePeerView {
-            peer_id: owner_peer_id,
-            role: "owner".to_owned(),
-            is_local: local_is_owner,
-            source: "signed_group_bootstrap_v1".to_owned(),
-            member_id: None,
-            device_id: None,
-            route_evidence: None,
-        },
-        GroupRuntimePeerView {
-            peer_id: member_peer_id,
-            role: "member".to_owned(),
-            is_local: !local_is_owner,
-            source: "signed_group_bootstrap_v1".to_owned(),
-            member_id: None,
-            device_id: None,
-            route_evidence: None,
-        },
-    ]
-}
-
-fn profile_display_name(state: &PersistedAppState) -> String {
-    state
-        .profile
-        .as_ref()
-        .map(|profile| profile.display_name.clone())
-        .unwrap_or_else(|| "Local member".to_owned())
-}
-
-fn initial_group_members(
-    group_id: &str,
-    local_member_id: &str,
-    display_name: String,
-    role: GroupRoleView,
-) -> Vec<GroupMemberView> {
-    let now = Utc::now().to_rfc3339();
-    vec![GroupMemberView {
-        member_id: local_member_id.to_owned(),
-        display_name,
-        device_id: None,
-        role,
-        status: "offline".to_owned(),
-        signer_public_key_hex: None,
-        joined_at: now,
-        last_seen_at: None,
-        presence_expires_at: None,
-        revoked_at: None,
-        revoked_by: None,
-        route_evidence: None,
-    }]
-    .into_iter()
-    .map(|mut member| {
-        if member.display_name.trim().is_empty() {
-            member.display_name = redacted_observable_ref("member", group_id);
-        }
-        member
-    })
-    .collect()
-}
-
-fn initial_governance_log_entry(
-    group_id: &str,
-    actor_member_id: &str,
-    event_kind: &str,
-    summary: &str,
-) -> GroupGovernanceLogEntryView {
-    let now = Utc::now().to_rfc3339();
-    let event_id = format!(
-        "gov-{}",
-        &hash_commitment(
-            "discrypt-governance-initial-event-v1",
-            &[group_id, actor_member_id, event_kind]
-        )[..16]
-    );
-    governance_log_entry(
-        &event_id,
-        group_id,
-        event_kind,
-        actor_member_id,
-        None,
-        None,
-        None,
-        &now,
-        summary,
+fn local_group_runtime_peer_id(state: &mut PersistedAppState, group_id: &str) -> String {
+    let identity_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+    let identity_public_key = hex::encode(identity_key.verifying_key().as_bytes());
+    let device_id = state
+        .devices
+        .iter()
+        .find(|device| device.local)
+        .map(|device| device.device_id.as_str())
+        .unwrap_or("local-device");
+    runtime_peer_id_from_commitment(
+        "group-provider-advertised-runtime-peer-v1",
+        &format!("{group_id}:{identity_public_key}:{device_id}"),
     )
+}
+
+fn local_dm_runtime_peer(
+    state: &mut PersistedAppState,
+    scope_id_commitment: &str,
+    role: &str,
+) -> DmRuntimePeerView {
+    let signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+    let signer_public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
+    let profile_id = state.local_user_id();
+    let device_id = state
+        .devices
+        .iter()
+        .find(|device| device.local)
+        .map(|device| device.device_id.clone())
+        .unwrap_or_else(|| "local-device".to_owned());
+    let peer_id = runtime_peer_id_from_commitment(
+        "dm-provider-advertised-runtime-peer-v1",
+        &format!("{scope_id_commitment}:{signer_public_key_hex}:{device_id}"),
+    );
+    DmRuntimePeerView {
+        peer_id,
+        role: role.to_owned(),
+        is_local: true,
+        source: "local_profile_runtime_peer_v1".to_owned(),
+        profile_id,
+        signer_public_key_hex,
+        device_id,
+        last_seen_at: String::new(),
+        presence_expires_at: String::new(),
+    }
+}
+
+fn dm_runtime_peer_route_is_current(peer: &DmRuntimePeerView, now: DateTime<Utc>) -> bool {
+    if peer.is_local {
+        return true;
+    }
+    DateTime::parse_from_rfc3339(&peer.presence_expires_at)
+        .map(|expires_at| expires_at.with_timezone(&Utc) > now)
+        .unwrap_or(false)
+}
+
+fn advertised_group_runtime_peers(
+    members: &[GroupMemberView],
+    local_member_id: &str,
+) -> Vec<GroupRuntimePeerView> {
+    let now = Utc::now();
+    members
+        .iter()
+        .filter(|member| group_member_runtime_route_is_current(member, local_member_id, now))
+        .filter_map(|member| {
+            member
+                .runtime_peer_id
+                .as_ref()
+                .filter(|peer_id| !peer_id.trim().is_empty())
+                .map(|peer_id| GroupRuntimePeerView {
+                    peer_id: peer_id.clone(),
+                    role: group_role_label(&member.role).to_owned(),
+                    is_local: member.member_id == local_member_id,
+                    source: "sealed_provider_peer_advertisement_v1".to_owned(),
+                    member_id: Some(member.member_id.clone()),
+                    device_id: member.device_id.clone(),
+                    route_evidence: member.route_evidence.clone(),
+                })
+        })
+        .collect()
 }
 
 fn governance_event_id(
@@ -21948,63 +21990,6 @@ fn governance_log_entry(
     }
 }
 
-fn ensure_group_governance_defaults(
-    state: &mut PersistedAppState,
-    group_id: &str,
-    local_member_id: &str,
-    display_name: String,
-) {
-    let Some(group) = state
-        .groups
-        .iter_mut()
-        .find(|group| group.group_id == group_id)
-    else {
-        return;
-    };
-    if group.members.is_empty() {
-        let role = match group.role.as_str() {
-            "owner" => GroupRoleView::Owner,
-            "staff" => GroupRoleView::Staff,
-            _ => GroupRoleView::Member,
-        };
-        group.members =
-            initial_group_members(group_id, local_member_id, display_name.clone(), role);
-    }
-    if !group
-        .members
-        .iter()
-        .any(|member| member.member_id == local_member_id)
-    {
-        let role = match group.role.as_str() {
-            "owner" => GroupRoleView::Owner,
-            "staff" => GroupRoleView::Staff,
-            _ => GroupRoleView::Member,
-        };
-        group.members.push(GroupMemberView {
-            member_id: local_member_id.to_owned(),
-            display_name,
-            device_id: None,
-            role,
-            status: "offline".to_owned(),
-            signer_public_key_hex: None,
-            joined_at: Utc::now().to_rfc3339(),
-            last_seen_at: None,
-            presence_expires_at: None,
-            revoked_at: None,
-            revoked_by: None,
-            route_evidence: None,
-        });
-    }
-    if group.governance_log.is_empty() {
-        group.governance_log.push(initial_governance_log_entry(
-            group_id,
-            local_member_id,
-            "governance.defaults_restored",
-            "Restored governance roster defaults for legacy persisted group",
-        ));
-    }
-}
-
 fn local_role_for_group<'a>(
     group: &'a GroupView,
     local_member_id: &str,
@@ -22020,57 +22005,6 @@ fn local_role_for_group<'a>(
         .map(|member| &member.role)
 }
 
-fn runtime_role_for_group<'a>(
-    group: &'a GroupView,
-    local_member_id: &str,
-) -> Option<&'a GroupRoleView> {
-    let debug = std::env::var_os("DISCRYPT_NOSTR_DEBUG").is_some();
-    let member = group.members.iter().find(|member| {
-        member.member_id == local_member_id
-            && member.status != "revoked"
-            && member.status != "migration_default"
-    });
-    if debug {
-        eprintln!(
-            "runtime_role: group={} local_id={local_member_id} members={:?} gov={:?}",
-            group.group_id,
-            group
-                .members
-                .iter()
-                .map(|m| (m.member_id.as_str(), m.status.as_str(), m.role.clone()))
-                .collect::<Vec<_>>(),
-            group
-                .governance_log
-                .iter()
-                .map(|e| {
-                    (
-                        e.event_kind.as_str(),
-                        e.target_member_id.as_deref().unwrap_or(""),
-                        e.role_after.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-    let member = member?;
-    let has_role_evidence = group.governance_log.iter().any(|entry| {
-        entry.target_member_id.as_deref() == Some(local_member_id)
-            && entry.role_after.as_ref() == Some(&member.role)
-            && !matches!(
-                entry.event_kind.as_str(),
-                "group_governance_initialized" | "governance.defaults_restored"
-            )
-    });
-    if debug {
-        eprintln!("runtime_role: has_role_evidence={has_role_evidence}");
-    }
-    if has_role_evidence {
-        Some(&member.role)
-    } else {
-        None
-    }
-}
-
 fn local_member_is_revoked(group: &GroupView, local_member_id: &str) -> bool {
     group
         .members
@@ -22082,8 +22016,24 @@ fn text_control_frame_delivery_priority(frame: &TextControlFrameView) -> u8 {
     match frame {
         TextControlFrameView::Envelope { .. } => 0,
         TextControlFrameView::VoiceSignal { .. } => 1,
-        TextControlFrameView::GroupPresenceHeartbeat { .. } => 3,
+        TextControlFrameView::GroupPresenceHeartbeat { .. }
+        | TextControlFrameView::DmPresenceHeartbeat { .. } => 3,
         _ => 2,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextControlFramePlane {
+    ProviderControl,
+    DirectPeer,
+}
+
+fn text_control_frame_plane(frame: &TextControlFrameView) -> TextControlFramePlane {
+    match frame {
+        TextControlFrameView::Envelope { .. } | TextControlFrameView::Receipt { .. } => {
+            TextControlFramePlane::DirectPeer
+        }
+        _ => TextControlFramePlane::ProviderControl,
     }
 }
 
@@ -22091,12 +22041,16 @@ fn text_control_frame_is_expired_presence(
     frame: &TextControlFrameView,
     now: DateTime<Utc>,
 ) -> bool {
-    let TextControlFrameView::GroupPresenceHeartbeat {
-        presence_expires_at,
-        ..
-    } = frame
-    else {
-        return false;
+    let presence_expires_at = match frame {
+        TextControlFrameView::GroupPresenceHeartbeat {
+            presence_expires_at,
+            ..
+        }
+        | TextControlFrameView::DmPresenceHeartbeat {
+            presence_expires_at,
+            ..
+        } => presence_expires_at,
+        _ => return false,
     };
     DateTime::parse_from_rfc3339(presence_expires_at)
         .map(|expires_at| expires_at.with_timezone(&Utc) <= now)
@@ -22109,14 +22063,42 @@ fn queue_group_governance_frame(
     event_id: &str,
     frame: TextControlFrameView,
 ) -> Result<(), String> {
-    let frame_sha256 = text_control_frame_sha256(&frame)?;
     let target = MessageTargetView {
         kind: "channel".to_owned(),
         dm_id: None,
         group_id: Some(group_id.to_owned()),
         channel_id: None,
     };
-    let route_peer_ids = state.route_peer_ids_for_text_target(&target)?;
+    queue_provider_control_frame(state, target, event_id, frame)
+}
+
+fn queue_dm_control_frame(
+    state: &mut PersistedAppState,
+    dm_id: &str,
+    event_id: &str,
+    frame: TextControlFrameView,
+) -> Result<(), String> {
+    let target = MessageTargetView {
+        kind: "dm".to_owned(),
+        dm_id: Some(dm_id.to_owned()),
+        group_id: None,
+        channel_id: None,
+    };
+    queue_provider_control_frame(state, target, event_id, frame)
+}
+
+fn queue_provider_control_frame(
+    state: &mut PersistedAppState,
+    target: MessageTargetView,
+    event_id: &str,
+    frame: TextControlFrameView,
+) -> Result<(), String> {
+    if text_control_frame_plane(&frame) != TextControlFramePlane::ProviderControl {
+        return Err(
+            "Direct peer payload cannot be queued on the provider control plane".to_owned(),
+        );
+    }
+    let frame_sha256 = text_control_frame_sha256(&frame)?;
     if state
         .text_control_outbox
         .iter()
@@ -22142,6 +22124,23 @@ fn queue_group_governance_frame(
             )
         });
     }
+    if let TextControlFrameView::DmPresenceHeartbeat {
+        scope_id_commitment,
+        profile_id,
+        ..
+    } = &frame
+    {
+        state.text_control_outbox.retain(|record| {
+            !matches!(
+                &record.frame,
+                TextControlFrameView::DmPresenceHeartbeat {
+                    scope_id_commitment: existing_scope,
+                    profile_id: existing_profile,
+                    ..
+                } if existing_scope == scope_id_commitment && existing_profile == profile_id
+            )
+        });
+    }
     state.text_control_outbox.push(TextControlOutboxRecord {
         message_id: event_id.to_owned(),
         target,
@@ -22151,11 +22150,231 @@ fn queue_group_governance_frame(
         last_attempted_at_ms: None,
         state_key: "pending".to_owned(),
         last_transport_session_id: None,
-        route_peer_ids,
+        route_peer_ids: Vec::new(),
         sent_route_peer_ids: Vec::new(),
         receipted_route_peer_ids: Vec::new(),
     });
     Ok(())
+}
+
+fn signed_group_channel_schema_snapshot(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    created_at: &str,
+) -> Result<GroupChannelSchemaSnapshotView, String> {
+    let actor_member_id = state.local_user_id();
+    let signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+    let actor_signer_public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
+    let group = state
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .ok_or_else(|| "Channel schema group does not exist".to_owned())?;
+    let actor = group
+        .members
+        .iter()
+        .find(|member| {
+            member.member_id == actor_member_id && group_member_is_admitted_for_runtime(member)
+        })
+        .ok_or_else(|| "Channel schema actor is not an admitted group member".to_owned())?;
+    if !actor.role.can_manage_members() {
+        return Err("Only an owner or staff member can publish a channel schema".to_owned());
+    }
+    if actor.signer_public_key_hex.as_deref() != Some(actor_signer_public_key_hex.as_str()) {
+        return Err(
+            "Channel schema actor roster signer does not match the local profile signing key"
+                .to_owned(),
+        );
+    }
+    validate_group_channel_schema(&group.channels)?;
+    let channels_sha256 = group_channel_schema_sha256(&group.channels)?;
+    let signature_hex = sign_group_channel_schema(
+        &signing_key,
+        GroupChannelSchemaSignaturePayload {
+            group_id,
+            schema_epoch: group.channel_schema_epoch,
+            channels_sha256: &channels_sha256,
+            actor_member_id: &actor_member_id,
+            actor_signer_public_key_hex: &actor_signer_public_key_hex,
+            created_at,
+        },
+    );
+    Ok(GroupChannelSchemaSnapshotView {
+        schema_epoch: group.channel_schema_epoch,
+        channels: group.channels.clone(),
+        actor_member_id,
+        actor_signer_public_key_hex,
+        created_at: created_at.to_owned(),
+        signature_hex,
+    })
+}
+
+fn current_group_channel_schema_frame(
+    state: &mut PersistedAppState,
+    group_id: &str,
+) -> Result<TextControlFrameView, String> {
+    let created_at = Utc::now().to_rfc3339();
+    let snapshot = signed_group_channel_schema_snapshot(state, group_id, &created_at)?;
+    let channels_sha256 = group_channel_schema_sha256(&snapshot.channels)?;
+    let event_id = format!(
+        "channel-schema-{}-{}",
+        snapshot.schema_epoch,
+        &channels_sha256[..16]
+    );
+    Ok(TextControlFrameView::GroupChannelSchemaUpdated {
+        group_id: group_id.to_owned(),
+        event_id,
+        snapshot,
+    })
+}
+
+fn validate_group_channel_schema(channels: &[ChannelStateView]) -> Result<(), String> {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for channel in channels {
+        if channel.channel_id.trim().is_empty() || channel.name.trim().is_empty() {
+            return Err("Channel schema contains an empty id or name".to_owned());
+        }
+        if !ids.insert(channel.channel_id.as_str()) {
+            return Err("Channel schema contains a duplicate channel id".to_owned());
+        }
+        let kind_key = match channel.kind {
+            ChannelKind::Text => "text",
+            ChannelKind::Voice => "voice",
+        };
+        if !names.insert((kind_key, channel.name.as_str())) {
+            return Err("Channel schema contains a duplicate channel name and kind".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn apply_group_channel_schema_snapshot(
+    state: &mut PersistedAppState,
+    group_id: &str,
+    event_id: &str,
+    snapshot: GroupChannelSchemaSnapshotView,
+) -> Result<bool, (&'static str, String, &'static str)> {
+    validate_group_channel_schema(&snapshot.channels).map_err(|error| {
+        (
+            "channel_schema_invalid",
+            error,
+            "Accept only a complete channel schema with unique non-empty channel ids and names",
+        )
+    })?;
+    verify_group_channel_schema_signature(&snapshot, group_id).map_err(|error| {
+        (
+            "signature_invalid",
+            error,
+            "Accept only channel schemas signed by an admitted owner or staff roster key",
+        )
+    })?;
+    let Some(group_index) = state
+        .groups
+        .iter()
+        .position(|group| group.group_id == group_id)
+    else {
+        return Err((
+            "group_not_found",
+            "Channel schema targets an unknown group".to_owned(),
+            "Join the group before applying its channel schema",
+        ));
+    };
+    let group = &state.groups[group_index];
+    let Some(actor) = group.members.iter().find(|member| {
+        member.member_id == snapshot.actor_member_id && group_member_is_admitted_for_runtime(member)
+    }) else {
+        return Err((
+            "actor_not_found",
+            "Channel schema actor is not an admitted group member".to_owned(),
+            "Refresh group membership before applying the channel schema",
+        ));
+    };
+    if !actor.role.can_manage_members() {
+        return Err((
+            "staff_required",
+            "Channel schema actor is not an owner or staff member".to_owned(),
+            "Accept channel schemas only from admitted owner/staff members",
+        ));
+    }
+    if actor.signer_public_key_hex.as_deref() != Some(snapshot.actor_signer_public_key_hex.as_str())
+    {
+        return Err((
+            "actor_signer_mismatch",
+            "Channel schema signer does not match the actor roster key".to_owned(),
+            "Refresh group membership before applying the channel schema",
+        ));
+    }
+    let current_sha256 = group_channel_schema_sha256(&group.channels).map_err(|error| {
+        (
+            "channel_schema_hash_failed",
+            error,
+            "Retry after the current channel schema can be serialized",
+        )
+    })?;
+    let incoming_sha256 = group_channel_schema_sha256(&snapshot.channels).map_err(|error| {
+        (
+            "channel_schema_hash_failed",
+            error,
+            "Retry after the incoming channel schema can be serialized",
+        )
+    })?;
+    if snapshot.schema_epoch < group.channel_schema_epoch
+        || (snapshot.schema_epoch == group.channel_schema_epoch
+            && incoming_sha256 == current_sha256)
+    {
+        return Ok(false);
+    }
+    if snapshot.schema_epoch == group.channel_schema_epoch && actor.role != GroupRoleView::Owner {
+        return Err((
+            "channel_schema_conflict",
+            "Equal-revision channel schemas diverged and the incoming actor is not the owner"
+                .to_owned(),
+            "Reconnect to the owner so its signed channel schema can resolve the conflict",
+        ));
+    }
+
+    let group = &mut state.groups[group_index];
+    group.channels = snapshot.channels;
+    group.channel_schema_epoch = snapshot.schema_epoch;
+    if !group
+        .governance_log
+        .iter()
+        .any(|entry| entry.event_id == event_id)
+    {
+        group.governance_log.push(governance_log_entry(
+            event_id,
+            group_id,
+            "channel.schema_updated",
+            &snapshot.actor_member_id,
+            None,
+            None,
+            None,
+            &snapshot.created_at,
+            "Applied signed owner/staff channel schema snapshot",
+        ));
+    }
+
+    let active_channel_missing = state
+        .active_context
+        .as_ref()
+        .filter(|context| context.group_id.as_deref() == Some(group_id))
+        .and_then(|context| context.channel_id.as_deref())
+        .is_some_and(|channel_id| {
+            !group
+                .channels
+                .iter()
+                .any(|channel| channel.channel_id == channel_id)
+        });
+    if active_channel_missing {
+        state.active_context = Some(ActiveContextView {
+            kind: "group".to_owned(),
+            group_id: Some(group_id.to_owned()),
+            channel_id: None,
+            dm_id: None,
+        });
+    }
+    Ok(true)
 }
 
 fn ensure_group_sender_not_revoked(
@@ -22271,7 +22490,7 @@ fn ensure_channel_target_openmls_ready_for_send(
     Ok(())
 }
 
-fn group_with_effective_presence(mut group: GroupView) -> GroupView {
+fn group_with_effective_presence(mut group: GroupView, local_member_id: &str) -> GroupView {
     let now = Utc::now();
     for member in &mut group.members {
         if member.status == "online" {
@@ -22286,6 +22505,7 @@ fn group_with_effective_presence(mut group: GroupView) -> GroupView {
             }
         }
     }
+    group.runtime_peers = advertised_group_runtime_peers(&group.members, local_member_id);
     group
 }
 
@@ -22306,8 +22526,6 @@ fn apply_group_member_role_changed(
     event: GroupMemberRoleChangedEvent<'_>,
 ) -> Result<(), (&'static str, String, &'static str)> {
     let local_member_id = state.local_user_id();
-    let local_display = profile_display_name(state);
-    ensure_group_governance_defaults(state, event.group_id, &local_member_id, local_display);
     let Some(group) = state
         .groups
         .iter_mut()
@@ -22463,8 +22681,6 @@ fn apply_group_member_revoked(
     crypto_removal_status: &str,
 ) {
     let local_member_id = state.local_user_id();
-    let local_display = profile_display_name(state);
-    ensure_group_governance_defaults(state, group_id, &local_member_id, local_display);
     if target_member_id == local_member_id {
         state
             .openmls_groups
@@ -22523,77 +22739,371 @@ fn apply_group_member_revoked(
     }
 }
 
+struct DmPresenceHeartbeatEvent<'a> {
+    scope_id_commitment: &'a str,
+    event_id: &'a str,
+    profile_id: &'a str,
+    display_name: &'a str,
+    device_id: &'a str,
+    role: &'a str,
+    signer_public_key_hex: &'a str,
+    runtime_peer_id: &'a str,
+    last_seen_at: &'a str,
+    presence_expires_at: &'a str,
+    signature_hex: &'a str,
+}
+
+fn apply_dm_presence_heartbeat(
+    state: &mut PersistedAppState,
+    event: DmPresenceHeartbeatEvent<'_>,
+) -> Result<bool, (&'static str, String, &'static str)> {
+    let Some(dm_index) = state.dms.iter().position(|dm| {
+        dm.connectivity
+            .as_ref()
+            .is_some_and(|policy| policy.scope_id_commitment == event.scope_id_commitment)
+    }) else {
+        return Err((
+            "dm_scope_not_found",
+            "DM presence targets an unknown provider scope".to_owned(),
+            "Accept the signed DM invite before accepting runtime route advertisements",
+        ));
+    };
+    let local_profile_id = state.local_user_id();
+    if event.profile_id == local_profile_id {
+        return Ok(false);
+    }
+    if event.role != "inviter" && event.role != "reply" {
+        return Err((
+            "dm_runtime_role_invalid",
+            "DM runtime advertisement has an invalid peer role".to_owned(),
+            "Accept only inviter or reply runtime roles",
+        ));
+    }
+    let Some(local_peer) = state.dms[dm_index]
+        .runtime_peers
+        .iter()
+        .find(|peer| peer.is_local)
+    else {
+        return Err((
+            "local_runtime_peer_missing",
+            "DM has no local runtime identity for role validation".to_owned(),
+            "Recreate the DM contact with the current profile",
+        ));
+    };
+    let expected_remote_role = if local_peer.role == "inviter" {
+        "reply"
+    } else {
+        "inviter"
+    };
+    if event.role != expected_remote_role {
+        return Err((
+            "dm_runtime_role_conflict",
+            "DM runtime advertisement conflicts with the local peer role".to_owned(),
+            "Reject ambiguous runtime roles and request a fresh signed advertisement",
+        ));
+    }
+    SignalingPeerId::new(event.runtime_peer_id.to_owned()).map_err(|error| {
+        (
+            "runtime_peer_id_invalid",
+            format!("DM runtime peer id is invalid: {error}"),
+            "Accept only valid provider-advertised runtime peer identifiers",
+        )
+    })?;
+    let expected_runtime_peer_id = runtime_peer_id_from_commitment(
+        "dm-provider-advertised-runtime-peer-v1",
+        &format!(
+            "{}:{}:{}",
+            event.scope_id_commitment, event.signer_public_key_hex, event.device_id
+        ),
+    );
+    if event.runtime_peer_id != expected_runtime_peer_id {
+        return Err((
+            "runtime_peer_id_binding_invalid",
+            "DM runtime peer id is not bound to the signed profile and device".to_owned(),
+            "Reject the route and request a fresh provider advertisement",
+        ));
+    }
+    if local_peer.peer_id == event.runtime_peer_id {
+        return Err((
+            "runtime_peer_id_collision",
+            "Remote DM runtime peer id matches the local peer".to_owned(),
+            "Reject ambiguous route advertisements",
+        ));
+    }
+    if let Some(existing) = state.dms[dm_index]
+        .runtime_peers
+        .iter()
+        .find(|peer| !peer.is_local)
+    {
+        if existing.profile_id != event.profile_id
+            || existing.signer_public_key_hex != event.signer_public_key_hex
+        {
+            return Err((
+                "dm_remote_identity_changed",
+                "DM runtime advertisement signer does not match the established remote identity"
+                    .to_owned(),
+                "Verify the contact safety number before replacing the DM identity",
+            ));
+        }
+    }
+    let last_seen_at = DateTime::parse_from_rfc3339(event.last_seen_at)
+        .map_err(|error| {
+            (
+                "presence_timestamp_invalid",
+                format!("DM presence timestamp is invalid: {error}"),
+                "Accept only RFC3339 presence timestamps",
+            )
+        })?
+        .with_timezone(&Utc);
+    let presence_expires_at = DateTime::parse_from_rfc3339(event.presence_expires_at)
+        .map_err(|error| {
+            (
+                "presence_expiry_invalid",
+                format!("DM presence expiry is invalid: {error}"),
+                "Accept only RFC3339 presence expiry timestamps",
+            )
+        })?
+        .with_timezone(&Utc);
+    let ttl = presence_expires_at.signed_duration_since(last_seen_at);
+    if ttl <= chrono::Duration::zero()
+        || ttl > chrono::Duration::seconds(GROUP_PRESENCE_MAX_TTL_SECONDS)
+        || presence_expires_at <= Utc::now()
+    {
+        return Err((
+            "presence_ttl_invalid",
+            "DM presence lease is expired or outside the allowed TTL".to_owned(),
+            "Accept only current bounded runtime-route leases",
+        ));
+    }
+    verify_dm_presence_signature(
+        event.signer_public_key_hex,
+        event.signature_hex,
+        DmPresenceSignaturePayload {
+            scope_id_commitment: event.scope_id_commitment,
+            event_id: event.event_id,
+            profile_id: event.profile_id,
+            display_name: event.display_name,
+            device_id: event.device_id,
+            role: event.role,
+            signer_public_key_hex: event.signer_public_key_hex,
+            runtime_peer_id: event.runtime_peer_id,
+            last_seen_at: event.last_seen_at,
+            presence_expires_at: event.presence_expires_at,
+        },
+    )
+    .map_err(|error| {
+        (
+            "signature_invalid",
+            error,
+            "Accept only DM route advertisements signed by the advertised identity",
+        )
+    })?;
+    if state.dms[dm_index]
+        .runtime_peers
+        .iter()
+        .find(|peer| !peer.is_local)
+        .is_some_and(|peer| {
+            peer.peer_id == event.runtime_peer_id
+                && peer.role == event.role
+                && peer.profile_id == event.profile_id
+                && peer.signer_public_key_hex == event.signer_public_key_hex
+                && peer.device_id == event.device_id
+                && peer.last_seen_at == event.last_seen_at
+                && peer.presence_expires_at == event.presence_expires_at
+        })
+    {
+        return Ok(false);
+    }
+    let dm_id = state.dms[dm_index].dm_id.clone();
+    let peer = DmRuntimePeerView {
+        peer_id: event.runtime_peer_id.to_owned(),
+        role: event.role.to_owned(),
+        is_local: false,
+        source: "sealed_provider_peer_advertisement_v1".to_owned(),
+        profile_id: event.profile_id.to_owned(),
+        signer_public_key_hex: event.signer_public_key_hex.to_owned(),
+        device_id: event.device_id.to_owned(),
+        last_seen_at: event.last_seen_at.to_owned(),
+        presence_expires_at: event.presence_expires_at.to_owned(),
+    };
+    if let Some(existing) = state.dms[dm_index]
+        .runtime_peers
+        .iter_mut()
+        .find(|peer| !peer.is_local)
+    {
+        *existing = peer;
+    } else {
+        state.dms[dm_index].runtime_peers.push(peer);
+    }
+    state
+        .refresh_text_control_outbox_routes_for_dm(&dm_id)
+        .map_err(|error| {
+            (
+                "text_route_refresh_failed",
+                error,
+                "Retry after the provider-advertised DM route is available",
+            )
+        })?;
+    state.push_event(
+        "dm.presence_received",
+        format!(
+            "Accepted signed DM route for {}",
+            redacted_observable_ref("profile", event.profile_id)
+        ),
+    );
+    Ok(true)
+}
+
 struct GroupPresenceHeartbeatEvent<'a> {
     group_id: &'a str,
     event_id: &'a str,
     member_id: &'a str,
-    display_name: Option<String>,
-    device_id: Option<String>,
+    display_name: Option<&'a str>,
+    device_id: Option<&'a str>,
+    signer_public_key_hex: &'a str,
+    runtime_peer_id: &'a str,
+    channel_schema_epoch: u64,
+    channel_schema_sha256: &'a str,
     last_seen_at: &'a str,
     presence_expires_at: &'a str,
+    signature_hex: &'a str,
 }
 
 fn apply_group_presence_heartbeat(
     state: &mut PersistedAppState,
     event: GroupPresenceHeartbeatEvent<'_>,
-) {
+) -> Result<bool, (&'static str, String, &'static str)> {
     let local_member_id = state.local_user_id();
-    let local_display = profile_display_name(state);
-    ensure_group_governance_defaults(state, event.group_id, &local_member_id, local_display);
     let Some(group) = state
         .groups
         .iter_mut()
         .find(|group| group.group_id == event.group_id)
     else {
-        return;
+        return Err((
+            "group_not_found",
+            "Presence heartbeat targets an unknown group".to_owned(),
+            "Join the group before accepting presence advertisements",
+        ));
     };
     if group
         .governance_log
         .iter()
         .any(|entry| entry.event_id == event.event_id)
     {
-        return;
+        return Ok(false);
     }
-    if let Some(member) = group
+    let Some(member_index) = group
         .members
-        .iter_mut()
-        .find(|member| member.member_id == event.member_id)
-    {
-        if member.status != "revoked" {
-            if let Some(display_name) = event
-                .display_name
-                .as_ref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                member.display_name = display_name.clone();
-            }
-            if event.device_id.is_some() {
-                member.device_id = event.device_id.clone();
-            }
-            member.status = "online".to_owned();
-            member.last_seen_at = Some(event.last_seen_at.to_owned());
-            member.presence_expires_at = Some(event.presence_expires_at.to_owned());
-        }
-    } else {
-        let member = GroupMemberView {
-            member_id: event.member_id.to_owned(),
-            display_name: event
-                .display_name
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| redacted_observable_ref("member", event.member_id)),
-            device_id: event.device_id,
-            role: GroupRoleView::Member,
-            status: "online".to_owned(),
-            signer_public_key_hex: None,
-            joined_at: event.last_seen_at.to_owned(),
-            last_seen_at: Some(event.last_seen_at.to_owned()),
-            presence_expires_at: Some(event.presence_expires_at.to_owned()),
-            revoked_at: None,
-            revoked_by: None,
-            route_evidence: None,
-        };
-        group.members.push(member);
+        .iter()
+        .position(|member| member.member_id == event.member_id)
+    else {
+        return Err((
+            "member_not_admitted",
+            "Presence heartbeat sender is not in the admitted group roster".to_owned(),
+            "Accept runtime route advertisements only from admitted roster members",
+        ));
+    };
+    let member = &group.members[member_index];
+    if !group_member_is_admitted_for_runtime(member) {
+        return Err((
+            "member_not_admitted",
+            "Pending or revoked members cannot advertise presence or runtime routes".to_owned(),
+            "Complete admission before accepting this presence heartbeat",
+        ));
     }
+    if member.signer_public_key_hex.as_deref() != Some(event.signer_public_key_hex) {
+        return Err((
+            "member_signer_mismatch",
+            "Presence signer does not match the admitted roster key".to_owned(),
+            "Refresh the roster through authorized admission before accepting presence",
+        ));
+    }
+    SignalingPeerId::new(event.runtime_peer_id.to_owned()).map_err(|error| {
+        (
+            "runtime_peer_id_invalid",
+            format!("Presence runtime peer id is invalid: {error}"),
+            "Accept only valid provider-advertised runtime peer identifiers",
+        )
+    })?;
+    if group.members.iter().enumerate().any(|(index, member)| {
+        index != member_index
+            && member.runtime_peer_id.as_deref() == Some(event.runtime_peer_id)
+            && group_member_is_admitted_for_runtime(member)
+    }) {
+        return Err((
+            "runtime_peer_id_collision",
+            "Presence runtime peer id is already bound to another admitted member".to_owned(),
+            "Reject ambiguous route advertisements and request a fresh heartbeat",
+        ));
+    }
+    let last_seen_at = DateTime::parse_from_rfc3339(event.last_seen_at)
+        .map_err(|error| {
+            (
+                "presence_timestamp_invalid",
+                format!("Presence last-seen timestamp is invalid: {error}"),
+                "Accept only RFC3339 presence timestamps",
+            )
+        })?
+        .with_timezone(&Utc);
+    let presence_expires_at = DateTime::parse_from_rfc3339(event.presence_expires_at)
+        .map_err(|error| {
+            (
+                "presence_expiry_invalid",
+                format!("Presence expiry timestamp is invalid: {error}"),
+                "Accept only RFC3339 presence expiry timestamps",
+            )
+        })?
+        .with_timezone(&Utc);
+    let ttl = presence_expires_at.signed_duration_since(last_seen_at);
+    if ttl <= chrono::Duration::zero()
+        || ttl > chrono::Duration::seconds(GROUP_PRESENCE_MAX_TTL_SECONDS)
+    {
+        return Err((
+            "presence_ttl_invalid",
+            "Presence heartbeat TTL is outside the allowed range".to_owned(),
+            "Accept only bounded positive presence leases",
+        ));
+    }
+    verify_group_presence_signature(
+        event.signer_public_key_hex,
+        event.signature_hex,
+        GroupPresenceSignaturePayload {
+            group_id: event.group_id,
+            event_id: event.event_id,
+            member_id: event.member_id,
+            display_name: event.display_name,
+            device_id: event.device_id,
+            signer_public_key_hex: event.signer_public_key_hex,
+            runtime_peer_id: event.runtime_peer_id,
+            channel_schema_epoch: event.channel_schema_epoch,
+            channel_schema_sha256: event.channel_schema_sha256,
+            last_seen_at: event.last_seen_at,
+            presence_expires_at: event.presence_expires_at,
+        },
+    )
+    .map_err(|error| {
+        (
+            "signature_invalid",
+            error,
+            "Accept only presence advertisements signed by the admitted roster key",
+        )
+    })?;
+    let member = &mut group.members[member_index];
+    if let Some(display_name) = event.display_name.filter(|value| !value.trim().is_empty()) {
+        member.display_name = display_name.to_owned();
+    }
+    if let Some(device_id) = event.device_id.filter(|value| !value.trim().is_empty()) {
+        member.device_id = Some(device_id.to_owned());
+    }
+    member.status = if presence_expires_at > Utc::now() {
+        "online"
+    } else {
+        "offline"
+    }
+    .to_owned();
+    member.runtime_peer_id = Some(event.runtime_peer_id.to_owned());
+    member.last_seen_at = Some(event.last_seen_at.to_owned());
+    member.presence_expires_at = Some(event.presence_expires_at.to_owned());
     group.governance_log.push(governance_log_entry(
         event.event_id,
         event.group_id,
@@ -22603,8 +23113,19 @@ fn apply_group_presence_heartbeat(
         None,
         None,
         event.last_seen_at,
-        "Applied replicated TTL-backed presence heartbeat",
+        "Applied signed provider presence and runtime route advertisement",
     ));
+    group.runtime_peers = advertised_group_runtime_peers(&group.members, &local_member_id);
+    state
+        .refresh_text_control_outbox_routes_for_group(event.group_id)
+        .map_err(|error| {
+            (
+                "text_route_refresh_failed",
+                error,
+                "Retry after the provider-advertised peer roster is available",
+            )
+        })?;
+    Ok(true)
 }
 
 fn group_connectivity_policy_from_request(
@@ -23226,17 +23747,12 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
         let ice_turn_servers = ice_turn_server_views(&ice_config);
         let consumed_uses = descriptor.consumed_uses;
         let revoked = descriptor.revoked();
-        let connectivity = descriptor
-            .bootstrap_metadata
-            .as_ref()
-            .map(|bootstrap| {
-                connectivity_from_bootstrap(
-                    bootstrap,
-                    ice_stun_servers.clone(),
-                    ice_turn_servers.clone(),
-                )
-            })
-            .unwrap_or_else(|| group_connectivity_policy(&descriptor.invite_id));
+        let bootstrap = descriptor.bootstrap_metadata.as_ref()?;
+        let connectivity = connectivity_from_bootstrap(
+            bootstrap,
+            ice_stun_servers.clone(),
+            ice_turn_servers.clone(),
+        );
         return Some(ParsedInviteMetadata {
             invite_key: descriptor.invite_id,
             descriptor_schema_version: Some(descriptor.descriptor_schema_version),
@@ -23263,81 +23779,7 @@ fn parse_invite_metadata(invite_code: &str) -> Option<ParsedInviteMetadata> {
             revoked,
         });
     }
-    #[cfg(feature = "local-dev")]
-    if let Some(parsed) = parse_legacy_invite_metadata(_prefix, query) {
-        return Some(parsed);
-    }
     None
-}
-
-/// Security boundary: unsigned legacy invites are accepted only under `local-dev`;
-/// production membership flows require signed `d=` descriptors.
-#[cfg(feature = "local-dev")]
-fn parse_legacy_invite_metadata(prefix: &str, query: &str) -> Option<ParsedInviteMetadata> {
-    let invite_key = prefix.rsplit('/').next()?.to_owned();
-    let endpoint = query_value(query, "endpoint")
-        .and_then(percent_decode)
-        .filter(|value| !value.is_empty())?;
-    let endpoint_policy = query_value(query, "policy")
-        .and_then(percent_decode)
-        .filter(|value| !value.is_empty())?;
-    let signaling_trust_fingerprint = query_value(query, "trust_fp")
-        .and_then(percent_decode)
-        .filter(|value| value.len() == 64)?;
-    let signaling_trust_status = query_value(query, "trust")
-        .and_then(percent_decode)
-        .filter(|value| !value.is_empty())?;
-    let room_secret_hash = query_value(query, "commitment")
-        .and_then(percent_decode)
-        .unwrap_or_default();
-    let expires_at = query_value(query, "exp")
-        .and_then(percent_decode)
-        .unwrap_or_default();
-    let max_uses = query_value(query, "max")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-    let legacy_scope =
-        hash_commitment("discrypt-legacy-invite-scope-commitment-v1", &[&invite_key]);
-    Some(ParsedInviteMetadata {
-        invite_key: invite_key.clone(),
-        descriptor_schema_version: None,
-        group_id: query_value(query, "gid").and_then(percent_decode),
-        group_name: query_value(query, "gname")
-            .or_else(|| query_value(query, "name"))
-            .and_then(percent_decode)
-            .map(|value| normalize_label(&value, "joined group"))
-            .filter(|value| !value.trim().is_empty()),
-        room_secret_hash,
-        signaling_endpoint: endpoint,
-        signaling_trust_fingerprint,
-        signaling_trust_status,
-        endpoint_policy,
-        ice_stun_servers: Vec::new(),
-        ice_turn_servers: Vec::new(),
-        connectivity: ConnectivityPolicyView {
-            connectivity_schema_version: INVITE_CONNECTIVITY_SCHEMA_VERSION,
-            invite_kind: InviteKind::GroupJoin.canonical_name().to_owned(),
-            scope_id_commitment: legacy_scope.clone(),
-            signaling_profiles: default_signaling_profiles(&legacy_scope),
-            ice_stun_servers: Vec::new(),
-            ice_turn_servers: Vec::new(),
-            privacy_label: "Compatibility invite parsed without signed bootstrap policy; group/contact names are not used as provider topics".to_owned(),
-            dm_bootstrap: None,
-            group_bootstrap: Some(GroupInviteBootstrapView {
-                group_identity_commitment: legacy_scope.clone(),
-                role_admission_policy_commitment: hash_commitment("discrypt-legacy-admission-policy-v1", &[&invite_key]),
-                channel_policy_commitment: hash_commitment("discrypt-legacy-channel-policy-v1", &[&invite_key]),
-            }),
-        },
-        admission_snapshot: None,
-        revocation_policy: None,
-        password_policy: None,
-        expires_at,
-        max_uses,
-        consumed_uses: 0,
-        revoked: false,
-    })
 }
 
 fn ice_stun_server_views(config: &discrypt_transport::IceServerConfig) -> Vec<String> {
@@ -23714,12 +24156,15 @@ mod tests {
             .iter()
             .find(|peer| peer.is_local)
             .ok_or_else(|| "local backend runtime peer missing".to_owned())?;
-        let remote = group
-            .runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| "remote backend runtime peer missing".to_owned())?;
-        Ok((local.peer_id.clone(), remote.peer_id.clone()))
+        if let Some(remote) = group.runtime_peers.iter().find(|peer| !peer.is_local) {
+            return Ok((local.peer_id.clone(), remote.peer_id.clone()));
+        }
+        let remote_member_id = format!("test-remote-{}", group.group_id);
+        let remote_peer_id =
+            runtime_peer_id_from_commitment("test-provider-advertised-peer", &remote_member_id);
+        add_test_member(&group.group_id, &remote_member_id, GroupRoleView::Member);
+        advertise_test_member_runtime_peer(&group.group_id, &remote_member_id, &remote_peer_id)?;
+        Ok((local.peer_id.clone(), remote_peer_id))
     }
 
     fn reload_global_app_service_from_path(path: &std::path::Path) {
@@ -23761,7 +24206,6 @@ mod tests {
         Ok((path.clone(), TauriAppService::load_for_test_path(path)))
     }
 
-    #[allow(dead_code)]
     fn join_group_invite_as_test_profile_with_optional_name(
         profile_name: &str,
         display_name: &str,
@@ -23787,21 +24231,105 @@ mod tests {
         Ok((path.clone(), TauriAppService::load_for_test_path(path)))
     }
 
-    #[allow(dead_code)]
-    fn join_group_invite_as_test_profile(
-        profile_name: &str,
-        display_name: &str,
-        device_name: &str,
-        invite_code: String,
-        group_name: &str,
-    ) -> Result<(PathBuf, TauriAppService), String> {
-        join_group_invite_as_test_profile_with_optional_name(
-            profile_name,
-            display_name,
-            device_name,
-            invite_code,
-            Some(group_name),
-        )
+    fn seed_remote_dm_runtime_peer_for_test(
+        state: &mut PersistedAppState,
+        dm_id: &str,
+        peer_id: &str,
+    ) -> Result<(), String> {
+        let dm = state
+            .dms
+            .iter_mut()
+            .find(|dm| dm.dm_id == dm_id)
+            .ok_or_else(|| format!("test DM {dm_id} is missing"))?;
+        let local_role = dm
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .map(|peer| peer.role.as_str())
+            .ok_or_else(|| "test DM local runtime peer is missing".to_owned())?;
+        let remote_role = if local_role == "inviter" {
+            "reply"
+        } else {
+            "inviter"
+        };
+        dm.runtime_peers.retain(|peer| peer.is_local);
+        dm.runtime_peers.push(DmRuntimePeerView {
+            peer_id: peer_id.to_owned(),
+            role: remote_role.to_owned(),
+            is_local: false,
+            source: "sealed_provider_peer_advertisement_v1".to_owned(),
+            profile_id: "test-remote-profile".to_owned(),
+            signer_public_key_hex: "00".repeat(32),
+            device_id: "test-remote-device".to_owned(),
+            last_seen_at: Utc::now().to_rfc3339(),
+            presence_expires_at: (Utc::now() + Duration::minutes(2)).to_rfc3339(),
+        });
+        Ok(())
+    }
+
+    fn signed_dm_presence_frame_for_test(
+        state: &mut PersistedAppState,
+        dm_id: &str,
+    ) -> Result<TextControlFrameView, String> {
+        let signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
+        let signer_public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
+        let profile = state
+            .profile
+            .clone()
+            .ok_or_else(|| "test profile is missing".to_owned())?;
+        let dm = state
+            .dms
+            .iter()
+            .find(|dm| dm.dm_id == dm_id)
+            .ok_or_else(|| format!("test DM {dm_id} is missing"))?;
+        let scope_id_commitment = dm
+            .connectivity
+            .as_ref()
+            .map(|policy| policy.scope_id_commitment.clone())
+            .ok_or_else(|| "test DM connectivity is missing".to_owned())?;
+        let local_peer = dm
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .cloned()
+            .ok_or_else(|| "test DM local runtime peer is missing".to_owned())?;
+        let now = Utc::now();
+        let last_seen_at = now.to_rfc3339();
+        let presence_expires_at =
+            (now + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339();
+        let event_id = stable_id(
+            "dm-presence-test",
+            &format!("{scope_id_commitment}:{}", profile.user_id),
+            state.next_sequence,
+        );
+        let signature_hex = sign_dm_presence(
+            &signing_key,
+            DmPresenceSignaturePayload {
+                scope_id_commitment: &scope_id_commitment,
+                event_id: &event_id,
+                profile_id: &profile.user_id,
+                display_name: &profile.display_name,
+                device_id: &local_peer.device_id,
+                role: &local_peer.role,
+                signer_public_key_hex: &signer_public_key_hex,
+                runtime_peer_id: &local_peer.peer_id,
+                last_seen_at: &last_seen_at,
+                presence_expires_at: &presence_expires_at,
+            },
+        );
+        Ok(TextControlFrameView::DmPresenceHeartbeat {
+            scope_id_commitment,
+            event_id,
+            profile_id: profile.user_id,
+            display_name: profile.display_name,
+            device_id: local_peer.device_id,
+            role: local_peer.role,
+            signer_public_key_hex,
+            runtime_peer_id: local_peer.peer_id,
+            last_seen_at,
+            presence_expires_at,
+            signature_hex,
+        })
     }
 
     fn attach_text_control_transport_runtime_for_test(
@@ -23813,6 +24341,23 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.attach_text_control_transport_runtime(transport, session_id);
+    }
+
+    fn attach_broker_control_transport_runtime_for_test(
+        transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
+        session_id: impl Into<String>,
+    ) {
+        let session_id = session_id.into();
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.attach_text_control_transport_runtime(transport, session_id.clone());
+        guard
+            .text_control_transport_runtimes
+            .get_mut(&TextControlRuntimeMapKey::unscoped(session_id))
+            .expect("test broker control runtime should be attached")
+            .lane = true;
     }
 
     fn attach_background_receiver_text_control_transport_runtime_for_test(
@@ -23827,7 +24372,7 @@ mod tests {
         guard.attach_text_control_transport_runtime(transport, session_id.clone());
         guard
             .text_control_transport_runtimes
-            .get_mut(&TextControlRuntimeMapKey::legacy(session_id))
+            .get_mut(&TextControlRuntimeMapKey::unscoped(session_id))
             .expect("test runtime should be attached")
             .inbound_receiver_owned = true;
     }
@@ -23949,7 +24494,6 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
-            runtime_spec: None,
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -24018,6 +24562,7 @@ mod tests {
             role,
             status: "offline".to_owned(),
             signer_public_key_hex: None,
+            runtime_peer_id: None,
             joined_at: Utc::now().to_rfc3339(),
             last_seen_at: None,
             presence_expires_at: None,
@@ -24025,6 +24570,38 @@ mod tests {
             revoked_by: None,
             route_evidence: None,
         });
+    }
+
+    fn advertise_test_member_runtime_peer(
+        group_id: &str,
+        member_id: &str,
+        runtime_peer_id: &str,
+    ) -> Result<(), String> {
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_member_id = guard.state.local_user_id();
+        let group = guard
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "test group missing for runtime advertisement".to_owned())?;
+        let member = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| "test member missing for runtime advertisement".to_owned())?;
+        let now = Utc::now();
+        member.runtime_peer_id = Some(runtime_peer_id.to_owned());
+        member.status = "online".to_owned();
+        member.last_seen_at = Some(now.to_rfc3339());
+        member.presence_expires_at =
+            Some((now + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339());
+        group.runtime_peers = advertised_group_runtime_peers(&group.members, &local_member_id);
+        guard.persist();
+        Ok(())
     }
 
     fn set_local_test_member_role(group_id: &str, role: GroupRoleView) {
@@ -24099,7 +24676,16 @@ mod tests {
             profile.user_id = member_id.to_owned();
         }
         group.role = group_role_label(&role).to_owned();
-        group.runtime_peers = group_runtime_peers(group.connectivity.as_ref(), &group.role);
+        let local_runtime_peer_id =
+            local_group_runtime_peer_id(&mut service.state, &group.group_id);
+        if let Some(local_member) = group
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == member_id)
+        {
+            local_member.runtime_peer_id = Some(local_runtime_peer_id);
+        }
+        group.runtime_peers = advertised_group_runtime_peers(&group.members, member_id);
         service.state.groups = vec![group];
         service.persist();
         path
@@ -24244,6 +24830,7 @@ mod tests {
                     group_id,
                     member_identity,
                     "abababababababababababababababababababababababababababababababab",
+                    "abababababababababababababababababababababababababababababababab",
                     format!("{member_identity}-key-package").as_bytes(),
                 )
                 .expect("pending request should be queued");
@@ -24278,6 +24865,7 @@ mod tests {
                     group_id,
                     &key_package.member_identity,
                     &key_package.signer_public_key_hex,
+                    &key_package.identity_signer_public_key_hex,
                     &key_package_bytes,
                 )
                 .expect("OpenMLS pending request should be queued");
@@ -24564,7 +25152,7 @@ mod tests {
     #[test]
     fn authorization_matrix_admission_decision_requires_backend_roster_role() {
         let _lock = test_lock();
-        let group_id = create_authorization_matrix_group("authorization-matrix-no-legacy-fallback");
+        let group_id = create_authorization_matrix_group("authorization-matrix-no-role-fallback");
         let approve_request_id = upsert_test_admission_request(&group_id, "joiner-approve");
         let refuse_request_id = upsert_test_admission_request(&group_id, "joiner-refuse");
         remove_local_test_member_row(&group_id);
@@ -24585,7 +25173,7 @@ mod tests {
         let refused = refuse_group_admission_request(RefuseGroupAdmissionRequest {
             group_id: group_id.clone(),
             request_id: refuse_request_id,
-            reason: Some("legacy role must not authorize".to_owned()),
+            reason: Some("unverified role must not authorize".to_owned()),
         });
         assert_eq!(
             refused
@@ -24718,14 +25306,14 @@ mod tests {
         );
 
         {
-            let mut legacy_owner = TauriAppService::load_for_test_path(owner_path.clone());
-            let owner_member = legacy_owner.state.groups[0]
+            let mut owner_without_signer = TauriAppService::load_for_test_path(owner_path.clone());
+            let owner_member = owner_without_signer.state.groups[0]
                 .members
                 .iter_mut()
                 .find(|member| member.member_id == owner_member_id)
                 .expect("owner member exists");
             owner_member.signer_public_key_hex = None;
-            legacy_owner.persist();
+            owner_without_signer.persist();
         }
         reload_global_app_service_from_path(&owner_path);
         let missing_local_signer_rejected =
@@ -24798,10 +25386,13 @@ mod tests {
             member_id: owner_member_id.clone(),
             display_name: Some("Mallory Owner".to_owned()),
             device_id: None,
-            role: Some(GroupRoleView::Member),
-            signer_public_key_hex: Some(malicious_signer_public_key_hex.clone()),
+            signer_public_key_hex: malicious_signer_public_key_hex.clone(),
+            runtime_peer_id: "peer-malicious-owner-route".to_owned(),
+            channel_schema_epoch: 1,
+            channel_schema_sha256: "00".repeat(32),
             last_seen_at: poison_seen_at.clone(),
             presence_expires_at: poison_seen_at,
+            signature_hex: "00".repeat(64),
         };
         let _ = handle_text_control_frame(HandleTextControlFrameRequest {
             frame: poison_presence,
@@ -24994,27 +25585,27 @@ mod tests {
 
         reload_global_app_service_from_path(&observer_path);
         {
-            let mut observer_legacy = TauriAppService::load_for_test_path(observer_path.clone());
-            let owner_member = observer_legacy.state.groups[0]
+            let mut observer_without_signer =
+                TauriAppService::load_for_test_path(observer_path.clone());
+            let owner_member = observer_without_signer.state.groups[0]
                 .members
                 .iter_mut()
                 .find(|member| member.member_id == owner_member_id)
                 .expect("observer owner member exists");
             owner_member.signer_public_key_hex = None;
-            observer_legacy.persist();
+            observer_without_signer.persist();
         }
         reload_global_app_service_from_path(&observer_path);
-        let legacy_missing_signer_rejected =
-            handle_text_control_frame(HandleTextControlFrameRequest {
-                frame: role_frame.clone(),
-            });
+        let missing_signer_rejected = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: role_frame.clone(),
+        });
         assert!(matches!(
-            legacy_missing_signer_rejected.response_frame,
+            missing_signer_rejected.response_frame,
             Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
                 if status == "role_changed_rejected"
         ));
         assert_eq!(
-            legacy_missing_signer_rejected
+            missing_signer_rejected
                 .state
                 .last_command_error
                 .as_ref()
@@ -25114,6 +25705,7 @@ mod tests {
                     &group_id,
                     "joiner-replayed",
                     "abababababababababababababababababababababababababababababababab",
+                    "abababababababababababababababababababababababababababababababab",
                     b"joiner-replayed-key-package",
                 )
                 .map_err(|error| format!("bob pending request setup failed: {error}"))?;
@@ -25185,7 +25777,7 @@ mod tests {
         let bob_receiver = Arc::new(ReceiverBackedTextControlTransport::new(
             TauriAppService::load_for_test_path(bob_path.clone()),
         ));
-        attach_text_control_transport_runtime_for_test(bob_receiver.clone(), active_session_id);
+        attach_broker_control_transport_runtime_for_test(bob_receiver.clone(), active_session_id);
 
         let target = MessageTargetView {
             kind: "channel".to_owned(),
@@ -25200,24 +25792,19 @@ mod tests {
         });
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         let owner_after_route_cleanup = load_state();
-        let closed_role_route = owner_after_route_cleanup
+        let sent_role_frame = owner_after_route_cleanup
             .text_control_outbox
             .iter()
             .find(|record| record.message_id == role_event_id)
             .ok_or_else(|| "queued role-change route should remain auditable".to_owned())?;
-        assert_eq!(closed_role_route.state_key, "closed_route");
-        assert!(closed_role_route.route_peer_ids.is_empty());
-        let closed_routes = owner_after_route_cleanup
-            .text_control_outbox
-            .iter()
-            .filter(|record| record.state_key == "closed_route")
-            .count();
-        let deliverable_frames = queued_frames.len().saturating_sub(closed_routes);
+        assert_eq!(sent_role_frame.state_key, "sent");
+        assert!(sent_role_frame.route_peer_ids.is_empty());
+        let deliverable_frames = queued_frames.len();
         assert_eq!(report.pending_before, deliverable_frames);
         assert_eq!(report.frames_sent, deliverable_frames);
-        assert!(
-            report.response_frames_received >= 2,
-            "deliverable revoke governance frames should return acknowledgements: {report:?}"
+        assert_eq!(
+            report.response_frames_received, 0,
+            "provider control publication is fire-and-forget; acknowledgements return as separate control frames"
         );
 
         let bob_after_reconnect = load_state_from_path(&bob_path);
@@ -25227,7 +25814,7 @@ mod tests {
         );
         assert_eq!(
             group_member_role(&bob_after_reconnect, &group_id, "member-bob"),
-            Some(GroupRoleView::Member)
+            Some(GroupRoleView::Staff)
         );
         assert_eq!(
             group_member_status(&bob_after_reconnect, &group_id, "member-bob"),
@@ -25244,7 +25831,7 @@ mod tests {
         );
         assert_eq!(
             governance_log_count(&bob_after_reconnect, &group_id, &role_event_id),
-            0
+            1
         );
         for event_id in &revoke_event_ids {
             assert_eq!(
@@ -25269,7 +25856,7 @@ mod tests {
         );
         assert_eq!(
             group_member_role(&bob_after_replay, &group_id, "member-bob"),
-            Some(GroupRoleView::Member)
+            Some(GroupRoleView::Staff)
         );
         assert_eq!(
             group_member_status(&bob_after_replay, &group_id, "member-bob"),
@@ -25286,7 +25873,7 @@ mod tests {
         );
         assert_eq!(
             governance_log_count(&bob_after_replay, &group_id, &role_event_id),
-            0
+            1
         );
         for event_id in &revoke_event_ids {
             assert_eq!(
@@ -25435,6 +26022,7 @@ mod tests {
                         role: GroupRoleView::Member,
                         status: "offline".to_owned(),
                         signer_public_key_hex: None,
+                        runtime_peer_id: None,
                         joined_at: Utc::now().to_rfc3339(),
                         last_seen_at: None,
                         presence_expires_at: None,
@@ -25626,6 +26214,9 @@ mod tests {
         });
         let group_id = created.groups[0].group_id.clone();
         let channel_id = created.groups[0].channels[0].channel_id.clone();
+        let mut alice_member = created.groups[0].members[0].clone();
+        alice_member.role = GroupRoleView::Member;
+        alice_member.status = "unknown".to_owned();
         let rejected_without_route = publish_group_presence(PublishGroupPresenceRequest {
             group_id: group_id.clone(),
             member_id: None,
@@ -25645,7 +26236,7 @@ mod tests {
             display_name: "Bob".to_owned(),
             device_name: Some("Bob laptop".to_owned()),
         });
-        create_group(CreateGroupRequest {
+        let receiver_group = create_group(CreateGroupRequest {
             name: "Presence Lab".to_owned(),
             retention: "7 days".to_owned(),
             admission_mode: None,
@@ -25653,6 +26244,10 @@ mod tests {
             signaling_endpoint: None,
             ice_stun_servers: None,
             ice_turn_servers: None,
+        });
+        assert_eq!(receiver_group.groups[0].group_id, group_id);
+        mutate_app_service(|state| {
+            state.groups[0].members.push(alice_member.clone());
         });
         reload_global_app_service_from_path(&_path);
         let transport = Arc::new(ReceiverBackedTextControlTransport::new(
@@ -25670,7 +26265,7 @@ mod tests {
             .map(|session| session.session_id.clone())
             .expect("text session should be active for presence");
         mark_active_text_session_direct_route_for_test();
-        attach_text_control_transport_runtime_for_test(transport, active_session_id);
+        attach_broker_control_transport_runtime_for_test(transport, active_session_id);
         let present = publish_group_presence(PublishGroupPresenceRequest {
             group_id: group_id.clone(),
             member_id: None,
@@ -25696,7 +26291,7 @@ mod tests {
                 .members
                 .iter()
                 .any(|member| member.display_name == "Alice" && member.status == "online"),
-            "presence frames should replicate unknown roster members with display/role metadata"
+            "presence frames should update only the pre-admitted roster member"
         );
         {
             let mut receiver = TauriAppService::load_for_test_path(other_path.clone());
@@ -25770,7 +26365,7 @@ mod tests {
     }
 
     #[test]
-    fn group_presence_without_role_does_not_promote_unknown_member_to_owner() {
+    fn group_presence_rejects_unknown_member_without_creating_roster_state() {
         let _lock = test_lock();
         let path = reset_with_temp_state("presence-role-none-no-owner-promotion");
         create_user(CreateUserRequest {
@@ -25790,28 +26385,34 @@ mod tests {
         {
             let mut service = TauriAppService::load_for_test_path(path.clone());
             service.state.groups[0].role = "member".to_owned();
-            apply_group_presence_heartbeat(
+            let result = apply_group_presence_heartbeat(
                 &mut service.state,
                 GroupPresenceHeartbeatEvent {
                     group_id: &group_id,
                     event_id: "presence-event-without-role",
                     member_id: "member-charlie",
-                    display_name: Some("Charlie".to_owned()),
-                    device_id: Some("Charlie laptop".to_owned()),
+                    display_name: Some("Charlie"),
+                    device_id: Some("Charlie laptop"),
+                    signer_public_key_hex:
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    runtime_peer_id: "peer-charlie-advertised-route",
+                    channel_schema_epoch: 1,
+                    channel_schema_sha256:
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                     last_seen_at: "2026-06-05T00:00:00Z",
                     presence_expires_at: "2026-06-05T00:05:00Z",
+                    signature_hex:
+                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
                 },
             );
+            assert!(matches!(result, Err(("member_not_admitted", _, _))));
             service.persist();
         }
         let state = load_state_from_path(&path);
-        let charlie = state.groups[0]
+        assert!(state.groups[0]
             .members
             .iter()
-            .find(|member| member.member_id == "member-charlie")
-            .expect("presence-created member missing");
-        assert_eq!(charlie.role, GroupRoleView::Member);
-        assert_eq!(charlie.status, "online");
+            .all(|member| member.member_id != "member-charlie"));
     }
 
     #[derive(Debug)]
@@ -25846,6 +26447,17 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .state_path_override
                 .clone()
+        }
+
+        fn take_queued_response_frame(&self) -> Result<TextControlFrameView, String> {
+            let bytes = self
+                .queued_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .ok_or_else(|| "queued text/control response frame missing".to_owned())?;
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("queued text/control response frame was invalid: {error}"))
         }
     }
 
@@ -26425,7 +27037,7 @@ mod tests {
             .into_iter()
             .find(|record| record.message_id == message_id)
             .ok_or_else(|| "persisted envelope missing for group message".to_owned())?;
-        add_legacy_route_member_without_signer_to_state_for_test(
+        add_admitted_test_route_member_to_state(
             &mut bob.state,
             &group_id,
             &alice_user_id,
@@ -26693,6 +27305,7 @@ mod tests {
             .find(|record| record.message_id == alice_message.message_id)
             .ok_or_else(|| "alice native text envelope missing".to_owned())?;
 
+        let _ = backend_group_runtime_peer_ids(&alice_group)?;
         let alice_voice_joined = join_voice(JoinVoiceRequest {
             group_id: alice_group_id.clone(),
             channel_id: alice_voice_channel_id.clone(),
@@ -26765,11 +27378,7 @@ mod tests {
             joined_group.last_command_error.is_none(),
             "{joined_group:?}"
         );
-        add_legacy_route_member_without_signer_for_test(
-            &alice_group_id,
-            &alice_profile_id,
-            "Alice G010",
-        )?;
+        add_admitted_test_route_member(&alice_group_id, &alice_profile_id, "Alice G010")?;
         let bob_group = joined_group
             .groups
             .iter()
@@ -26786,24 +27395,14 @@ mod tests {
                 && policy.ice_stun_servers == group_invite.ice_stun_servers
                 && policy.ice_turn_servers == group_invite.ice_turn_servers
         }));
-        let bob_text_channel_id = bob_group
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Text)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "bob native text channel missing".to_owned())?;
-        let bob_voice_channel_id = bob_group
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Voice)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "bob native voice channel missing".to_owned())?;
+        assert!(bob_group.channels.is_empty());
+        assert_eq!(bob_group.channel_schema_epoch, 0);
         let bob_sent = send_message(SendMessageRequest {
             target: MessageTargetView {
                 kind: "channel".to_owned(),
                 dm_id: None,
                 group_id: Some(bob_group.group_id.clone()),
-                channel_id: Some(bob_text_channel_id),
+                channel_id: Some(alice_text_channel_id.clone()),
             },
             body: "g010 bob local text remains local".to_owned(),
             transport_proof: false,
@@ -26836,13 +27435,14 @@ mod tests {
         let receipt = receipt_response
             .receipt
             .ok_or_else(|| "bob native receipt missing".to_owned())?;
+        let receipt_device_id = receipt.recipient_device_id.clone();
         let receipt_key = receipt_response
             .recipient_verifying_key_hex
             .ok_or_else(|| "bob native receipt key missing".to_owned())?;
 
         let bob_voice_joined = join_voice(JoinVoiceRequest {
             group_id: bob_group.group_id.clone(),
-            channel_id: bob_voice_channel_id,
+            channel_id: alice_voice_channel_id,
             microphone_permission: "granted".to_owned(),
             input_device_id: Some("bob-native-mic".to_owned()),
             input_device_label: Some("Bob native microphone".to_owned()),
@@ -26873,6 +27473,21 @@ mod tests {
         }));
 
         reload_global_app_service_from_path(&alice_path);
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            let group = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == alice_group_id)
+                .ok_or_else(|| "alice group missing before receipt".to_owned())?;
+            let remote = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id != alice_profile_id)
+                .ok_or_else(|| "alice voice test remote missing before receipt".to_owned())?;
+            remote.device_id = Some(receipt_device_id.clone());
+            Ok(())
+        })
+        .1?;
         let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
             message_id: alice_message.message_id.clone(),
             receipt,
@@ -27275,11 +27890,7 @@ mod tests {
             joined_group.last_command_error.is_none(),
             "{joined_group:?}"
         );
-        add_legacy_route_member_without_signer_for_test(
-            &group_id,
-            &alice_profile_id,
-            "Alice G004",
-        )?;
+        add_admitted_test_route_member(&group_id, &alice_profile_id, "Alice G004")?;
         let receipt_response = receive_text_delivery_envelope(ReceiveTextDeliveryEnvelopeRequest {
             target: target.clone(),
             envelope: envelope_record.envelope.clone(),
@@ -27695,29 +28306,247 @@ mod tests {
             .any(|message| message.body == "hello encrypted local shell"));
     }
 
-    #[cfg(feature = "local-dev")]
     #[test]
-    fn production_invite_parser_surfaces_endpoint_and_trust_without_room_secret() {
-        let code = "discrypt://join/v1/invite-a?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2026-05-29T00%3A00%3A00Z&max=3";
-        let parsed = parse_invite_metadata(code);
-        assert!(parsed.is_some());
-        let Some(parsed) = parsed else {
-            return;
-        };
-        assert_eq!(
-            parsed.signaling_endpoint,
-            "https://signal.example.invalid/v1".to_owned()
+    fn group_invite_installs_no_channel_schema_before_welcome() -> Result<(), String> {
+        let _guard = test_lock();
+        let _owner_path = reset_with_temp_state("group-channel-ids-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice desktop".to_owned()),
+        });
+        let owner = create_group(CreateGroupRequest {
+            name: "Stable channel ids".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = owner
+            .groups
+            .iter()
+            .find(|group| group.name == "Stable channel ids")
+            .ok_or_else(|| "owner group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        assert!(!group.channels.is_empty());
+        let invite = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "5".to_owned(),
+            password_gate: None,
+        })
+        .invites
+        .last()
+        .map(|invite| invite.code.clone())
+        .ok_or_else(|| "group invite missing".to_owned())?;
+
+        let joiner_path = reset_with_temp_state("group-channel-ids-joiner");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: Some("Bob laptop".to_owned()),
+        });
+        start_dm(StartDmRequest {
+            display_name: "Sequence diverger".to_owned(),
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code: invite,
+            group_name: Some("Stable channel ids".to_owned()),
+        });
+        if let Some(error) = joined.last_command_error {
+            return Err(format!("joiner could not join group: {error:?}"));
+        }
+        let joiner = load_state_from_path(&joiner_path);
+        let joiner_group = joiner
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "joiner group missing".to_owned())?;
+        assert!(joiner_group.channels.is_empty());
+        assert_eq!(joiner_group.channel_schema_epoch, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_channel_schema_catches_up_a_reconnecting_member() -> Result<(), String> {
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("channel-schema-reconnect-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice desktop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Channel schema sync".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        add_test_member(&group_id, "member-bob", GroupRoleView::Member);
+        persist_current_test_state();
+        let baseline_group = load_state_from_path(&owner_path)
+            .groups
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "owner baseline group missing".to_owned())?;
+        let baseline_epoch = baseline_group.channel_schema_epoch;
+        let baseline_sha256 = group_channel_schema_sha256(&baseline_group.channels)?;
+        let bob_path = create_test_profile_state_with_group(
+            "channel-schema-reconnect-bob",
+            "Bob Member",
+            "member-bob",
+            GroupRoleView::Member,
+            baseline_group,
         );
+        let mut bob_service = TauriAppService::load_for_test_path(bob_path.clone());
+        let bob_signing_key = SigningKey::from_bytes(&bob_service.state.identity_seed_bytes());
+        let bob_signer_public_key_hex = hex::encode(bob_signing_key.verifying_key().as_bytes());
+        let bob_runtime_peer_id = bob_service.state.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == "member-bob")
+            .and_then(|member| member.runtime_peer_id.clone())
+            .ok_or_else(|| "Bob runtime route advertisement missing".to_owned())?;
+        bob_service.state.groups[0]
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == "member-bob")
+            .ok_or_else(|| "Bob member row missing".to_owned())?
+            .signer_public_key_hex = Some(bob_signer_public_key_hex.clone());
+        bob_service.persist();
+        let mut owner_service = TauriAppService::load_for_test_path(owner_path.clone());
+        let owner_bob = owner_service.state.groups[0]
+            .members
+            .iter_mut()
+            .find(|member| member.member_id == "member-bob")
+            .ok_or_else(|| "owner Bob member row missing".to_owned())?;
+        owner_bob.signer_public_key_hex = Some(bob_signer_public_key_hex.clone());
+        owner_bob.runtime_peer_id = Some(bob_runtime_peer_id.clone());
+        owner_service.persist();
+
+        reload_global_app_service_from_path(&owner_path);
+        let owner_after_create = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "Operations".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "30 days".to_owned(),
+        });
         assert_eq!(
-            parsed.signaling_trust_fingerprint,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+            owner_after_create.last_command_error, None,
+            "{owner_after_create:?}"
         );
-        assert_eq!(parsed.signaling_trust_status, "signed endpoint".to_owned());
-        assert_eq!(parsed.endpoint_policy, "production_tls".to_owned());
-        assert!(parsed.ice_stun_servers.is_empty());
-        assert!(parsed.ice_turn_servers.is_empty());
-        assert_eq!(parsed.max_uses, 3);
-        assert!(!code.contains("room_secret="));
+        let owner_group = owner_after_create
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "updated owner group missing".to_owned())?;
+        assert_eq!(owner_group.channel_schema_epoch, baseline_epoch + 1);
+        assert!(owner_group
+            .channels
+            .iter()
+            .any(|channel| channel.name == "#Operations"));
+        assert!(load_state_from_path(&owner_path)
+            .text_control_outbox
+            .iter()
+            .any(|record| matches!(
+                record.frame,
+                TextControlFrameView::GroupChannelSchemaUpdated { .. }
+            )));
+
+        let now = Utc::now();
+        let now_string = now.to_rfc3339();
+        let expires_string = (now + Duration::seconds(120)).to_rfc3339();
+        let event_id = "bob-reconnected-with-stale-channel-schema";
+        let signature_hex = sign_group_presence(
+            &bob_signing_key,
+            GroupPresenceSignaturePayload {
+                group_id: &group_id,
+                event_id,
+                member_id: "member-bob",
+                display_name: Some("Bob Member"),
+                device_id: Some("Bob laptop"),
+                signer_public_key_hex: &bob_signer_public_key_hex,
+                runtime_peer_id: &bob_runtime_peer_id,
+                channel_schema_epoch: baseline_epoch,
+                channel_schema_sha256: &baseline_sha256,
+                last_seen_at: &now_string,
+                presence_expires_at: &expires_string,
+            },
+        );
+        let catchup = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: TextControlFrameView::GroupPresenceHeartbeat {
+                group_id: group_id.clone(),
+                event_id: event_id.to_owned(),
+                member_id: "member-bob".to_owned(),
+                display_name: Some("Bob Member".to_owned()),
+                device_id: Some("Bob laptop".to_owned()),
+                signer_public_key_hex: bob_signer_public_key_hex,
+                runtime_peer_id: bob_runtime_peer_id,
+                channel_schema_epoch: baseline_epoch,
+                channel_schema_sha256: baseline_sha256,
+                last_seen_at: now_string,
+                presence_expires_at: expires_string,
+                signature_hex,
+            },
+        });
+        let schema_frame = catchup
+            .response_frame
+            .ok_or_else(|| "owner did not return a channel schema catch-up frame".to_owned())?;
+        assert!(matches!(
+            schema_frame,
+            TextControlFrameView::GroupChannelSchemaUpdated { .. }
+        ));
+
+        reload_global_app_service_from_path(&bob_path);
+        let mut tampered_frame = schema_frame.clone();
+        if let TextControlFrameView::GroupChannelSchemaUpdated { snapshot, .. } =
+            &mut tampered_frame
+        {
+            snapshot
+                .channels
+                .last_mut()
+                .ok_or_else(|| "schema channel missing".to_owned())?
+                .name = "#Forged".to_owned();
+        }
+        let rejected = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: tampered_frame,
+        });
+        assert!(matches!(
+            rejected.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "channel_schema_rejected"
+        ));
+        assert_eq!(
+            rejected
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("signature_invalid")
+        );
+        let applied = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: schema_frame,
+        });
+        assert!(matches!(
+            applied.response_frame,
+            Some(TextControlFrameView::GroupGovernanceAck { ref status, .. })
+                if status == "channel_schema_applied"
+        ));
+        let bob_group = applied
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "updated member group missing".to_owned())?;
+        assert_eq!(
+            bob_group.channel_schema_epoch,
+            owner_group.channel_schema_epoch
+        );
+        assert_eq!(bob_group.channels, owner_group.channels);
+        Ok(())
     }
 
     #[test]
@@ -27823,40 +28652,6 @@ mod tests {
                 group.name == format!("Rejected {}", case.label) || group.role == "pending"
             }));
         }
-    }
-
-    #[cfg(feature = "local-dev")]
-    #[test]
-    fn expired_parsed_invite_fails_before_pending_group_state() {
-        let _guard = test_lock();
-        let _path = reset_with_temp_state("expired-parsed-invite-fail");
-        create_user(CreateUserRequest {
-            display_name: "Bob".to_owned(),
-            device_name: None,
-        });
-        let expired_code = "discrypt://join/v1/invite-expired?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2000-01-01T00%3A00%3A00Z&max=3";
-
-        let rejected = join_group(JoinGroupRequest {
-            invite_code: expired_code.to_owned(),
-            group_name: Some("Should Not Exist".to_owned()),
-        });
-
-        assert_eq!(
-            rejected
-                .last_command_error
-                .as_ref()
-                .map(|error| error.code.as_str()),
-            Some("invite_expired")
-        );
-        assert!(rejected.groups.is_empty());
-        assert!(
-            rejected
-                .groups
-                .iter()
-                .all(|group| group.name != "Should Not Exist" && group.role != "pending"),
-            "expired parsed invite must not leave a pending compatibility group"
-        );
-        assert!(rejected.invites.is_empty());
     }
 
     #[test]
@@ -28589,9 +29384,9 @@ mod tests {
     }
 
     #[test]
-    fn dm_invite_accept_persists_signed_runtime_peers() -> Result<(), String> {
+    fn dm_runtime_routes_require_reciprocal_signed_provider_advertisements() -> Result<(), String> {
         let _guard = test_lock();
-        reset_with_temp_state("dm-runtime-peers-alice");
+        let alice_path = reset_with_temp_state("dm-runtime-peers-alice");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -28605,23 +29400,20 @@ mod tests {
             .iter()
             .find(|dm| dm.display_name == "Bob")
             .ok_or_else(|| "inviter DM missing".to_owned())?;
-        assert_eq!(inviter_dm.runtime_peers.len(), 2);
+        assert_eq!(inviter_dm.runtime_peers.len(), 1);
+        assert!(inviter_dm.runtime_peers.iter().all(|peer| peer.is_local));
         let inviter_local_peer = inviter_dm
             .runtime_peers
             .iter()
             .find(|peer| peer.is_local)
             .ok_or_else(|| "inviter local runtime peer missing".to_owned())?;
         assert_eq!(inviter_local_peer.role, "inviter");
-        assert_eq!(inviter_local_peer.source, "signed_dm_bootstrap_v1");
-        let inviter_remote_peer = inviter_dm
-            .runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| "inviter remote runtime peer missing".to_owned())?;
-        assert_eq!(inviter_remote_peer.role, "reply");
+        assert_eq!(inviter_local_peer.source, "local_profile_runtime_peer_v1");
+        let inviter_dm_id = inviter_dm.dm_id.clone();
+        let inviter_local_peer_id = inviter_local_peer.peer_id.clone();
 
         let invited = create_dm_invite(CreateDmInviteRequest {
-            dm_id: Some(inviter_dm.dm_id.clone()),
+            dm_id: Some(inviter_dm_id.clone()),
             expires: "1 day".to_owned(),
             max_use: "1".to_owned(),
         });
@@ -28631,45 +29423,161 @@ mod tests {
             .last()
             .map(|invite| invite.code.clone())
             .ok_or_else(|| "DM invite code missing".to_owned())?;
+        assert!(!invite_code.contains(&inviter_local_peer_id));
+        let mut alice_service = TauriAppService::load_for_test_path(alice_path.clone());
 
-        reset_with_temp_state("dm-runtime-peers-bob");
-        create_user(CreateUserRequest {
-            display_name: "Bob".to_owned(),
-            device_name: Some("Bob laptop".to_owned()),
-        });
-        let accepted = accept_dm_invite(AcceptDmInviteRequest {
+        let (bob_path, mut bob_service) = accept_dm_invite_as_test_profile(
+            "dm-runtime-peers-bob",
+            "Bob",
+            "Bob laptop",
             invite_code,
-            display_name: Some("Alice".to_owned()),
-        });
-        assert!(accepted.last_command_error.is_none(), "{accepted:?}");
-        let reply_dm = accepted
+            "Alice",
+        )?;
+        let reply_dm = bob_service
+            .state
             .dms
             .iter()
             .find(|dm| dm.display_name == "Alice")
             .ok_or_else(|| "reply DM missing".to_owned())?;
-        assert_eq!(reply_dm.runtime_peers.len(), 2);
+        assert_eq!(reply_dm.runtime_peers.len(), 1);
+        assert!(reply_dm.runtime_peers.iter().all(|peer| peer.is_local));
         let reply_local_peer = reply_dm
             .runtime_peers
             .iter()
             .find(|peer| peer.is_local)
             .ok_or_else(|| "reply local runtime peer missing".to_owned())?;
         assert_eq!(reply_local_peer.role, "reply");
-        assert_eq!(reply_local_peer.peer_id, inviter_remote_peer.peer_id);
+        let reply_dm_id = reply_dm.dm_id.clone();
+        let reply_local_peer_id = reply_local_peer.peer_id.clone();
+
+        assert!(alice_service
+            .state
+            .active_runtime_peer_attachment_for_text_control()
+            .is_err());
+        assert!(bob_service
+            .state
+            .active_runtime_peer_attachment_for_text_control()
+            .is_err());
+
+        let alice_presence =
+            signed_dm_presence_frame_for_test(&mut alice_service.state, &inviter_dm_id)?;
+        let bob_presence = signed_dm_presence_frame_for_test(&mut bob_service.state, &reply_dm_id)?;
+
+        let mut tampered_alice_presence = alice_presence.clone();
+        let TextControlFrameView::DmPresenceHeartbeat {
+            runtime_peer_id, ..
+        } = &mut tampered_alice_presence
+        else {
+            return Err("test DM presence helper returned the wrong frame".to_owned());
+        };
+        runtime_peer_id.push_str("-tampered");
+        assert!(bob_service
+            .state
+            .handle_text_control_frame(tampered_alice_presence)
+            .is_none());
+        assert_eq!(
+            bob_service
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("runtime_peer_id_binding_invalid")
+        );
+        assert!(bob_service
+            .state
+            .dms
+            .iter()
+            .find(|dm| dm.dm_id == reply_dm_id)
+            .ok_or_else(|| "reply DM missing after tampered presence".to_owned())?
+            .runtime_peers
+            .iter()
+            .all(|peer| peer.is_local));
+        bob_service.state.last_command_error = None;
+
+        assert!(alice_service
+            .state
+            .handle_text_control_frame(bob_presence)
+            .is_none());
+        assert!(bob_service
+            .state
+            .handle_text_control_frame(alice_presence.clone())
+            .is_none());
+        assert!(alice_service.state.last_command_error.is_none());
+        assert!(bob_service.state.last_command_error.is_none());
+
+        let inviter_dm = alice_service
+            .state
+            .dms
+            .iter()
+            .find(|dm| dm.dm_id == inviter_dm_id)
+            .ok_or_else(|| "advertised inviter DM missing".to_owned())?;
+        let inviter_remote_peer = inviter_dm
+            .runtime_peers
+            .iter()
+            .find(|peer| !peer.is_local)
+            .ok_or_else(|| "provider-advertised reply runtime peer missing".to_owned())?;
+        assert_eq!(inviter_remote_peer.peer_id, reply_local_peer_id);
+        assert_eq!(
+            inviter_remote_peer.source,
+            "sealed_provider_peer_advertisement_v1"
+        );
+        let reply_dm = bob_service
+            .state
+            .dms
+            .iter()
+            .find(|dm| dm.dm_id == reply_dm_id)
+            .ok_or_else(|| "advertised reply DM missing".to_owned())?;
         let reply_remote_peer = reply_dm
             .runtime_peers
             .iter()
             .find(|peer| !peer.is_local)
-            .ok_or_else(|| "reply remote runtime peer missing".to_owned())?;
-        assert_eq!(reply_remote_peer.role, "inviter");
-        assert_eq!(reply_remote_peer.peer_id, inviter_local_peer.peer_id);
+            .ok_or_else(|| "provider-advertised inviter runtime peer missing".to_owned())?;
+        assert_eq!(reply_remote_peer.peer_id, inviter_local_peer_id);
+        assert_eq!(
+            reply_remote_peer.source,
+            "sealed_provider_peer_advertisement_v1"
+        );
+        let inviter_runtime_peers = inviter_dm.runtime_peers.clone();
+        let reply_runtime_peers = reply_dm.runtime_peers.clone();
+        assert!(bob_service
+            .state
+            .handle_text_control_frame(alice_presence)
+            .is_none());
+        assert_eq!(
+            bob_service
+                .state
+                .dms
+                .iter()
+                .find(|dm| dm.dm_id == reply_dm_id)
+                .ok_or_else(|| "reply DM missing after replay".to_owned())?
+                .runtime_peers
+                .iter()
+                .filter(|peer| !peer.is_local)
+                .count(),
+            1,
+            "replaying a signed provider advertisement must be idempotent"
+        );
 
-        let reloaded = load_state().to_view();
-        let persisted_dm = reloaded
-            .dms
-            .iter()
-            .find(|dm| dm.display_name == "Alice")
-            .ok_or_else(|| "persisted reply DM missing".to_owned())?;
-        assert_eq!(persisted_dm.runtime_peers, reply_dm.runtime_peers);
+        alice_service.persist();
+        bob_service.persist();
+        assert_eq!(
+            load_state_from_path(&alice_path)
+                .dms
+                .into_iter()
+                .find(|dm| dm.dm_id == inviter_dm_id)
+                .ok_or_else(|| "persisted inviter DM missing".to_owned())?
+                .runtime_peers,
+            inviter_runtime_peers
+        );
+        assert_eq!(
+            load_state_from_path(&bob_path)
+                .dms
+                .into_iter()
+                .find(|dm| dm.dm_id == reply_dm_id)
+                .ok_or_else(|| "persisted reply DM missing".to_owned())?
+                .runtime_peers,
+            reply_runtime_peers
+        );
         Ok(())
     }
 
@@ -28866,6 +29774,7 @@ mod tests {
                     &group_id,
                     "bob-refused-user",
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     b"bob-refused-key-package",
                 )
                 .expect("pending request should be queued")
@@ -28946,6 +29855,8 @@ mod tests {
             member_identity: "joiner-pending-shared".to_owned(),
             signer_public_key_hex:
                 "abababababababababababababababababababababababababababababababab".to_owned(),
+            identity_signer_public_key_hex:
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_owned(),
             key_package: b"joiner-pending-shared-key-package".to_vec(),
         };
 
@@ -29184,6 +30095,28 @@ mod tests {
             .last()
             .map(|invite| invite.code.clone())
             .ok_or_else(|| "manual admission invite missing".to_owned())?;
+        let post_invite_channel = create_channel(CreateChannelRequest {
+            group_id: group_id.clone(),
+            name: "post-invite-operations".to_owned(),
+            kind: ChannelKind::Text,
+            retention_status: "24 hours".to_owned(),
+        });
+        assert!(
+            post_invite_channel.last_command_error.is_none(),
+            "{post_invite_channel:?}"
+        );
+        let post_invite_channel_id = post_invite_channel
+            .groups
+            .iter()
+            .find(|candidate| candidate.group_id == group_id)
+            .and_then(|candidate| {
+                candidate
+                    .channels
+                    .iter()
+                    .find(|channel| channel.name == "#post-invite-operations")
+            })
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "post-invite owner channel missing".to_owned())?;
 
         let (bob_path, _) = join_group_invite_as_test_profile_with_optional_name(
             "g007-manual-admission-bob",
@@ -29200,11 +30133,18 @@ mod tests {
             .ok_or_else(|| "Bob local admission group missing".to_owned())?;
         assert_eq!(
             bob_requested_group.role, "pending",
-            "joiner compatibility role must remain pending before Welcome"
+            "joiner role must remain pending before Welcome"
         );
         assert_eq!(
             bob_requested_group.members[0].status, "pending",
             "joiners must stay pending until an OpenMLS Welcome is applied"
+        );
+        assert!(
+            bob_requested_group
+                .channels
+                .iter()
+                .all(|channel| channel.channel_id != post_invite_channel_id),
+            "the invite must not persist a channel snapshot before admission"
         );
         assert!(
             bob_requested
@@ -29273,7 +30213,7 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "Bob admission transport session missing".to_owned())?;
-        attach_text_control_transport_runtime_for_test(admission_receiver, admission_session_id);
+        attach_broker_control_transport_runtime_for_test(admission_receiver, admission_session_id);
         let admission_report =
             pump_text_control_transport_once(ListPendingTextControlFramesRequest {
                 target: None,
@@ -29390,6 +30330,13 @@ mod tests {
             .members
             .iter()
             .any(|member| member.status != "pending"));
+        assert!(
+            bob_admitted_group
+                .channels
+                .iter()
+                .any(|channel| channel.channel_id == post_invite_channel_id),
+            "the post-admission Welcome must install the owner's latest signed channel schema"
+        );
 
         reload_global_app_service_from_path(&bob_path);
         let bob_reloaded_after_welcome = load_state();
@@ -29502,7 +30449,7 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "Bob admission transport session missing".to_owned())?;
-        attach_text_control_transport_runtime_for_test(
+        attach_broker_control_transport_runtime_for_test(
             offline_receiver.clone(),
             offline_session_id,
         );
@@ -29566,7 +30513,7 @@ mod tests {
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "owner presence transport session missing".to_owned())?;
         mark_active_text_session_direct_route_for_test();
-        attach_text_control_transport_runtime_for_test(presence_transport, presence_session_id);
+        attach_broker_control_transport_runtime_for_test(presence_transport, presence_session_id);
         let present = publish_group_presence(PublishGroupPresenceRequest {
             group_id: group_id.clone(),
             member_id: None,
@@ -29607,7 +30554,10 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "Charlie admission transport session missing".to_owned())?;
-        attach_text_control_transport_runtime_for_test(online_receiver, online_session_id);
+        attach_broker_control_transport_runtime_for_test(
+            online_receiver.clone(),
+            online_session_id,
+        );
         let online_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: None,
             limit: Some(8),
@@ -29619,7 +30569,7 @@ mod tests {
             online_report.failures
         );
         assert_eq!(online_report.frames_sent, 1);
-        assert_eq!(online_report.response_frames_received, 1);
+        assert_eq!(online_report.response_frames_received, 0);
         clear_text_control_transport_runtime_for_test();
 
         let alice_after_online_request = load_state_from_path(&alice_path);
@@ -29646,6 +30596,16 @@ mod tests {
         assert_eq!(
             approved_request.admission_mode_at_request,
             Some(GroupAdmissionModeView::AutomaticWhenAuthorizedOnline)
+        );
+
+        let welcome_frame = online_receiver.take_queued_response_frame()?;
+        reload_global_app_service_from_path(&charlie_path);
+        let welcome_result = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: welcome_frame,
+        });
+        assert_eq!(
+            welcome_result.state.last_command_error, None,
+            "{welcome_result:?}"
         );
 
         let charlie_after_welcome = load_state_from_path(&charlie_path);
@@ -29846,6 +30806,12 @@ mod tests {
             .first()
             .ok_or_else(|| "owner group missing".to_owned())?
             .clone();
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "owner text channel missing".to_owned())?;
         let invite = create_invite(CreateInviteRequest {
             group_id: Some(group.group_id.clone()),
             expires: "1 day".to_owned(),
@@ -29875,12 +30841,10 @@ mod tests {
         assert_eq!(bob_group.name, "pending send lab");
         assert_eq!(bob_group.role, "pending");
         assert_eq!(bob_group.members[0].status, "pending");
-        let channel_id = bob_group
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Text)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "pending group text channel missing".to_owned())?;
+        assert!(
+            bob_group.channels.is_empty(),
+            "unsigned invite parsing must not install the group channel schema"
+        );
 
         let rejected = send_message(SendMessageRequest {
             target: MessageTargetView {
@@ -30245,7 +31209,7 @@ mod tests {
     }
 
     #[test]
-    fn group_invite_join_persists_signed_runtime_peers() -> Result<(), String> {
+    fn group_invite_does_not_carry_or_infer_remote_runtime_peer_ids() -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("group-runtime-peers-alice");
         create_user(CreateUserRequest {
@@ -30265,21 +31229,20 @@ mod tests {
         let owner_group = created
             .groups
             .first()
-            .ok_or_else(|| "owner group missing".to_owned())?;
-        assert_eq!(owner_group.runtime_peers.len(), 2);
+            .ok_or_else(|| "owner group missing".to_owned())?
+            .clone();
+        assert_eq!(owner_group.runtime_peers.len(), 1);
         let owner_local_peer = owner_group
             .runtime_peers
             .iter()
             .find(|peer| peer.is_local)
             .ok_or_else(|| "owner local runtime peer missing".to_owned())?;
         assert_eq!(owner_local_peer.role, "owner");
-        assert_eq!(owner_local_peer.source, "signed_group_bootstrap_v1");
-        let owner_remote_peer = owner_group
-            .runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| "owner remote runtime peer missing".to_owned())?;
-        assert_eq!(owner_remote_peer.role, "member");
+        assert_eq!(
+            owner_local_peer.source,
+            "sealed_provider_peer_advertisement_v1"
+        );
+        assert!(owner_group.runtime_peers.iter().all(|peer| peer.is_local));
 
         let invited = create_invite(CreateInviteRequest {
             group_id: Some(owner_group.group_id.clone()),
@@ -30293,6 +31256,7 @@ mod tests {
             .last()
             .map(|invite| invite.code.clone())
             .ok_or_else(|| "group invite code missing".to_owned())?;
+        assert!(!invite_code.contains(&owner_local_peer.peer_id));
 
         reset_with_temp_state("group-runtime-peers-bob");
         create_user(CreateUserRequest {
@@ -30308,21 +31272,10 @@ mod tests {
             .groups
             .first()
             .ok_or_else(|| "member group missing".to_owned())?;
-        assert_eq!(member_group.runtime_peers.len(), 2);
-        let member_local_peer = member_group
-            .runtime_peers
-            .iter()
-            .find(|peer| peer.is_local)
-            .ok_or_else(|| "member local runtime peer missing".to_owned())?;
-        assert_eq!(member_local_peer.role, "member");
-        assert_eq!(member_local_peer.peer_id, owner_remote_peer.peer_id);
-        let member_remote_peer = member_group
-            .runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| "member remote runtime peer missing".to_owned())?;
-        assert_eq!(member_remote_peer.role, "owner");
-        assert_eq!(member_remote_peer.peer_id, owner_local_peer.peer_id);
+        assert!(
+            member_group.runtime_peers.is_empty(),
+            "pending invite parsing must not invent either local or remote runtime routes"
+        );
 
         let reloaded = load_state().to_view();
         let persisted_group = reloaded
@@ -30362,29 +31315,9 @@ mod tests {
             .find(|peer| peer.role == "owner")
             .map(|peer| peer.peer_id.clone())
             .ok_or_else(|| "owner peer missing".to_owned())?;
-        let member_peer = group
-            .runtime_peers
-            .iter()
-            .find(|peer| peer.role == "member")
-            .map(|peer| peer.peer_id.clone())
-            .ok_or_else(|| "member peer missing".to_owned())?;
-
-        {
-            let service = app_service();
-            let mut guard = service
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let active_group = guard
-                .state
-                .groups
-                .iter_mut()
-                .find(|candidate| candidate.group_id == group.group_id)
-                .ok_or_else(|| "active group missing".to_owned())?;
-            active_group.role = "member".to_owned();
-            active_group.runtime_peers =
-                group_runtime_peers(active_group.connectivity.as_ref(), "member");
-            guard.persist();
-        }
+        let member_peer = "peer-member-advertised-owner-test";
+        add_test_member(&group.group_id, "member-bob", GroupRoleView::Member);
+        advertise_test_member_runtime_peer(&group.group_id, "member-bob", member_peer)?;
 
         let attachment =
             load_state_from_path(&path).active_runtime_peer_attachment_for_text_control()?;
@@ -30423,12 +31356,9 @@ mod tests {
             .find(|peer| peer.role == "owner")
             .map(|peer| peer.peer_id.clone())
             .ok_or_else(|| "owner peer missing".to_owned())?;
-        let member_peer = group
-            .runtime_peers
-            .iter()
-            .find(|peer| peer.role == "member")
-            .map(|peer| peer.peer_id.clone())
-            .ok_or_else(|| "member peer missing".to_owned())?;
+        let member_peer = "peer-member-advertised-staff-test";
+        add_test_member(&group.group_id, "member-bob", GroupRoleView::Member);
+        advertise_test_member_runtime_peer(&group.group_id, "member-bob", member_peer)?;
 
         {
             let service = app_service();
@@ -30442,9 +31372,7 @@ mod tests {
                 .iter_mut()
                 .find(|candidate| candidate.group_id == group.group_id)
                 .ok_or_else(|| "active group missing".to_owned())?;
-            active_group.role = "member".to_owned();
-            active_group.runtime_peers =
-                group_runtime_peers(active_group.connectivity.as_ref(), "member");
+            active_group.role = "staff".to_owned();
             let local_member = active_group
                 .members
                 .iter_mut()
@@ -30512,12 +31440,6 @@ mod tests {
             .find(|peer| peer.role == "owner")
             .map(|peer| peer.peer_id.clone())
             .ok_or_else(|| "owner peer missing".to_owned())?;
-        let member_peer = owner_group
-            .runtime_peers
-            .iter()
-            .find(|peer| peer.role == "member")
-            .map(|peer| peer.peer_id.clone())
-            .ok_or_else(|| "member peer missing".to_owned())?;
         let invited = create_invite(CreateInviteRequest {
             group_id: Some(owner_group.group_id.clone()),
             expires: "1 day".to_owned(),
@@ -30541,6 +31463,8 @@ mod tests {
             group_name: Some("Runtime Invite Lab".to_owned()),
         });
         assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let local_member_id = load_state_from_path(&bob_path).local_user_id();
+        let member_peer = "peer-bob-provider-advertised-member-test";
 
         {
             let service = app_service();
@@ -30553,11 +31477,38 @@ mod tests {
                 .iter_mut()
                 .find(|candidate| candidate.group_id == owner_group.group_id)
                 .ok_or_else(|| "joined group missing".to_owned())?;
-            active_group.role = "owner".to_owned();
-            active_group.runtime_peers =
-                group_runtime_peers(active_group.connectivity.as_ref(), "owner");
+            let local_member = active_group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == local_member_id)
+                .ok_or_else(|| "joined local member missing".to_owned())?;
+            local_member.role = GroupRoleView::Member;
+            local_member.status = "unknown".to_owned();
+            active_group.role = "member".to_owned();
+            active_group.members.push(GroupMemberView {
+                member_id: "member-alice-owner".to_owned(),
+                display_name: "Alice Owner".to_owned(),
+                device_id: Some("alice-device".to_owned()),
+                role: GroupRoleView::Owner,
+                status: "unknown".to_owned(),
+                signer_public_key_hex: Some("aa".repeat(32)),
+                runtime_peer_id: None,
+                joined_at: Utc::now().to_rfc3339(),
+                last_seen_at: None,
+                presence_expires_at: None,
+                revoked_at: None,
+                revoked_by: None,
+                route_evidence: None,
+            });
+            active_group.runtime_peers.clear();
             guard.persist();
         }
+        advertise_test_member_runtime_peer(&owner_group.group_id, &local_member_id, member_peer)?;
+        advertise_test_member_runtime_peer(
+            &owner_group.group_id,
+            "member-alice-owner",
+            &owner_peer,
+        )?;
 
         let attachment =
             load_state_from_path(&bob_path).active_runtime_peer_attachment_for_text_control()?;
@@ -30594,7 +31545,6 @@ mod tests {
             .first()
             .map(|group| group.group_id.clone())
             .ok_or_else(|| "created group missing".to_owned())?;
-
         {
             let service = app_service();
             let mut guard = service
@@ -30612,6 +31562,8 @@ mod tests {
             );
             guard.persist();
         }
+        advertise_test_member_runtime_peer(&group_id, "bob-member", "peer-bob-full-mesh")?;
+        advertise_test_member_runtime_peer(&group_id, "carol-member", "peer-carol-full-mesh")?;
 
         let state = load_state_from_path(&path);
         let attachments = state.active_runtime_peer_attachments_for_text_control()?;
@@ -30635,7 +31587,7 @@ mod tests {
     }
 
     #[test]
-    fn group_text_runtime_attaches_admitted_members_before_presence_is_online() -> Result<(), String>
+    fn group_text_runtime_rejects_remote_route_without_current_presence_lease() -> Result<(), String>
     {
         let _guard = test_lock();
         let path = reset_with_temp_state("group-runtime-offline-presence-bootstrap");
@@ -30658,6 +31610,17 @@ mod tests {
             .first()
             .map(|group| group.group_id.clone())
             .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = created
+            .groups
+            .first()
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Text)
+                    .map(|channel| channel.channel_id.clone())
+            })
+            .ok_or_else(|| "created text channel missing".to_owned())?;
         let local_user_id = load_state_from_path(&path).local_user_id();
         {
             let service = app_service();
@@ -30671,17 +31634,48 @@ mod tests {
             );
             guard.persist();
         }
+        advertise_test_member_runtime_peer(
+            &group_id,
+            "bob-member",
+            "peer-bob-last-advertised-offline",
+        )?;
         set_group_member_status_for_test(&group_id, &local_user_id, "offline")?;
-        set_group_member_status_for_test(&group_id, "bob-member", "offline")?;
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let remote = guard
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .and_then(|group| {
+                    group
+                        .members
+                        .iter_mut()
+                        .find(|member| member.member_id == "bob-member")
+                })
+                .ok_or_else(|| "remote test member missing".to_owned())?;
+            remote.presence_expires_at = Some("2000-01-01T00:00:00Z".to_owned());
+            guard.persist();
+        }
 
-        let attachments =
-            load_state_from_path(&path).active_runtime_peer_attachments_for_text_control()?;
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(
-            attachments[0].role,
-            ProviderTextControlRuntimePeerRole::Offerer
+        let error = load_state_from_path(&path)
+            .active_runtime_peer_attachments_for_text_control()
+            .expect_err("offline remote runtime route must not attach");
+        assert!(error.contains("no current provider-advertised remote peers"));
+        let target = MessageTargetView {
+            kind: "channel".to_owned(),
+            dm_id: None,
+            group_id: Some(group_id),
+            channel_id: Some(channel_id),
+        };
+        let route_peer_ids = load_state_from_path(&path).route_peer_ids_for_text_target(&target)?;
+        assert!(
+            route_peer_ids.is_empty(),
+            "text send fanout must not select an expired provider-presence route"
         );
-        assert_ne!(attachments[0].local_peer_id, attachments[0].remote_peer_id);
         Ok(())
     }
 
@@ -30708,6 +31702,11 @@ mod tests {
             .first()
             .map(|group| group.group_id.clone())
             .ok_or_else(|| "created group missing".to_owned())?;
+        let local_member_id = created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "created profile missing".to_owned())?;
         let mut group = created
             .groups
             .into_iter()
@@ -30723,6 +31722,7 @@ mod tests {
             signer_public_key_hex: Some(
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             ),
+            runtime_peer_id: Some("peer-bob-notebook-advertised".to_owned()),
             joined_at: Utc::now().to_rfc3339(),
             last_seen_at: Some(Utc::now().to_rfc3339()),
             presence_expires_at: Some(expires_at),
@@ -30730,7 +31730,7 @@ mod tests {
             revoked_by: None,
             route_evidence: None,
         });
-        group = group_with_effective_presence(group);
+        group = group_with_effective_presence(group, &local_member_id);
         let bob_route_peer =
             route_peer_id_for_member_in_state_group(&group_id, &group, "bob-notebook")?;
         let mut route_evidence_by_peer = BTreeMap::new();
@@ -30768,7 +31768,222 @@ mod tests {
     }
 
     #[test]
-    fn group_runtime_peer_member_mapping_fails_closed_for_ambiguous_role() -> Result<(), String> {
+    fn voice_join_without_remote_peer_waits_without_error() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("voice-join-waits-for-provider-remote-peer");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Voice Waiting Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let voice_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "created voice channel missing".to_owned())?;
+
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group.group_id,
+            channel_id: voice_channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("alice-mic".to_owned()),
+            input_device_label: Some("Alice microphone".to_owned()),
+            output_device_id: Some("alice-speaker".to_owned()),
+            output_device_label: Some("Alice speaker".to_owned()),
+        });
+
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let session = joined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        assert!(session.joined);
+        assert_eq!(session.participants.len(), 1);
+        assert!(session.signaling.local_peer_id.is_empty());
+        assert!(session.signaling.remote_peer_id.is_empty());
+        assert!(session
+            .signaling
+            .status_copy
+            .contains("waits for provider-advertised peer ids"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_voice_runtime_uses_admitted_group_member_route_peers() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("native-voice-admitted-member-route-peers");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Voice Runtime Route Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let local_member_id = created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "created profile missing".to_owned())?;
+        let voice_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "created voice channel missing".to_owned())?;
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+            guard.persist();
+        }
+        advertise_test_member_runtime_peer(&group_id, "bob-member", "peer-bob-native-voice")?;
+        let state = load_state();
+        let expected_local =
+            route_peer_id_for_member_in_state(&state, &group_id, &local_member_id)?;
+        let expected_remote = route_peer_id_for_member_in_state(&state, &group_id, "bob-member")?;
+
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group_id.clone(),
+            channel_id: voice_channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("alice-mic".to_owned()),
+            input_device_label: Some("Alice microphone".to_owned()),
+            output_device_id: Some("alice-speaker".to_owned()),
+            output_device_label: Some("Alice speaker".to_owned()),
+        });
+
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let signaling = joined
+            .voice_session
+            .as_ref()
+            .map(|session| &session.signaling)
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        assert_eq!(signaling.local_peer_id, expected_local);
+        assert_eq!(signaling.remote_peer_id, expected_remote);
+        assert_eq!(signaling.role, "offerer");
+        Ok(())
+    }
+
+    #[test]
+    fn prejoin_voice_signal_accepts_admitted_group_member_route_peers() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("prejoin-voice-admitted-member-route-peers");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Prejoin Voice Route Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        assert!(created.last_command_error.is_none(), "{created:?}");
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let group_id = group.group_id.clone();
+        let local_member_id = created
+            .profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .ok_or_else(|| "created profile missing".to_owned())?;
+        let voice_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "created voice channel missing".to_owned())?;
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+            guard.persist();
+        }
+        advertise_test_member_runtime_peer(&group_id, "bob-member", "peer-bob-prejoin-voice")?;
+        let state = load_state();
+        let local_peer_id = route_peer_id_for_member_in_state(&state, &group_id, &local_member_id)?;
+        let remote_peer_id = route_peer_id_for_member_in_state(&state, &group_id, "bob-member")?;
+        let session_id = stable_voice_session_id(&group_id, &voice_channel_id);
+
+        let response = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: TextControlFrameView::VoiceSignal {
+                signal: VoiceSignalingMessageView {
+                    signal_id: "signal-prejoin-bob-offer".to_owned(),
+                    session_id: session_id.clone(),
+                    group_id,
+                    channel_id: voice_channel_id,
+                    sender_participant_id: "bob-member".to_owned(),
+                    sender_peer_id: remote_peer_id,
+                    recipient_peer_id: local_peer_id,
+                    signal_kind: "offer".to_owned(),
+                    sealed_payload:
+                        "voice-signal-sealed:v1:aaaaaaaaaaaaaaaa.opaque-ciphertext-placeholder"
+                            .to_owned(),
+                    created_at_ms: 1,
+                },
+            },
+        });
+
+        assert!(response.state.last_command_error.is_none(), "{response:?}");
+        let state = load_state();
+        assert_eq!(state.voice_signaling_inbox.len(), 1);
+        assert!(state.events.iter().any(|event| {
+            event.kind == "voice.signal_prejoin_queued"
+                && event
+                    .summary
+                    .contains(&redacted_observable_ref("voice_session", &session_id))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn group_runtime_peer_member_mapping_uses_explicit_advertised_ids() -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("group-runtime-peer-ambiguous-role-view");
         create_user(CreateUserRequest {
@@ -30813,6 +32028,7 @@ mod tests {
                 role: GroupRoleView::Member,
                 status: "online".to_owned(),
                 signer_public_key_hex: Some(signer.to_owned()),
+                runtime_peer_id: Some(format!("peer-{member_id}")),
                 joined_at: now.clone(),
                 last_seen_at: Some(now.clone()),
                 presence_expires_at: Some((Utc::now() + Duration::minutes(5)).to_rfc3339()),
@@ -30840,14 +32056,23 @@ mod tests {
 
         attach_group_member_route_evidence(&group_id, &mut group, &route_evidence_by_peer);
 
+        group.runtime_peers =
+            advertised_group_runtime_peers(&group.members, &load_state().local_user_id());
         let member_peer = group
             .runtime_peers
             .iter()
-            .find(|peer| peer.role == "member")
+            .find(|peer| peer.member_id.as_deref() == Some("bob-member"))
             .ok_or_else(|| "member runtime peer missing".to_owned())?;
-        assert_eq!(member_peer.member_id, None);
-        assert_eq!(member_peer.device_id, None);
-        assert_eq!(member_peer.route_evidence, None);
+        assert_eq!(member_peer.peer_id, "peer-bob-member");
+        assert_eq!(member_peer.member_id.as_deref(), Some("bob-member"));
+        assert_eq!(member_peer.device_id.as_deref(), Some("bob-member-device"));
+        assert_eq!(
+            member_peer
+                .route_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.route_kind.as_deref()),
+            Some("direct")
+        );
         assert_eq!(
             group
                 .members
@@ -30923,6 +32148,7 @@ mod tests {
                 signer_public_key_hex: Some(
                     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
                 ),
+                runtime_peer_id: Some("peer-pending-member".to_owned()),
                 joined_at: now.clone(),
                 last_seen_at: None,
                 presence_expires_at: None,
@@ -30939,6 +32165,7 @@ mod tests {
                 signer_public_key_hex: Some(
                     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
                 ),
+                runtime_peer_id: Some("peer-revoked-member".to_owned()),
                 joined_at: now,
                 last_seen_at: None,
                 presence_expires_at: None,
@@ -30953,7 +32180,7 @@ mod tests {
             .active_runtime_peer_attachments_for_text_control()
             .expect_err("pending/revoked peers must not create attach edges");
         assert!(
-            no_admitted_remote.contains("no admitted remote peers"),
+            no_admitted_remote.contains("no current provider-advertised remote peers"),
             "{no_admitted_remote}"
         );
 
@@ -30974,6 +32201,16 @@ mod tests {
             );
             guard.persist();
         }
+        advertise_test_member_runtime_peer(
+            &group_id,
+            "bob-member",
+            "peer-duplicate-advertisement",
+        )?;
+        advertise_test_member_runtime_peer(
+            &group_id,
+            "carol-member",
+            "peer-duplicate-advertisement",
+        )?;
 
         let duplicate = load_state_from_path(&path)
             .active_runtime_peer_attachments_for_text_control()
@@ -31021,20 +32258,33 @@ mod tests {
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "text session should be active after start_text_session".to_owned())?;
 
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            );
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "carol-member",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            );
+            guard.persist();
+        }
+        for (member_id, runtime_peer_id) in [
+            ("bob-member", "peer-bob-independent-route"),
+            ("carol-member", "peer-carol-independent-route"),
+        ] {
+            advertise_test_member_runtime_peer(&group_id, member_id, runtime_peer_id)?;
+        }
         let service = app_service();
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.state.upsert_admitted_group_member(
-            &group_id,
-            "bob-member",
-            "1111111111111111111111111111111111111111111111111111111111111111",
-        );
-        guard.state.upsert_admitted_group_member(
-            &group_id,
-            "carol-member",
-            "2222222222222222222222222222222222222222222222222222222222222222",
-        );
         let attachments = guard
             .state
             .active_runtime_peer_attachments_for_text_control()?;
@@ -31111,36 +32361,33 @@ mod tests {
                 .ok_or_else(|| "active group missing".to_owned())?;
             active_group.role = "owner".to_owned();
             active_group.members.clear();
-            active_group.runtime_peers =
-                group_runtime_peers(active_group.connectivity.as_ref(), "owner");
+            active_group.runtime_peers.clear();
             guard.persist();
         }
 
-        let error =
-            match load_state_from_path(&path).active_runtime_peer_attachment_for_text_control() {
-                Ok(_) => {
-                    return Err("runtime attachment unexpectedly used stale legacy role".to_owned())
-                }
-                Err(error) => error,
-            };
-        assert!(
-            error.contains("no current backend-governed local member role"),
-            "{error}"
-        );
+        let error = match load_state_from_path(&path)
+            .active_runtime_peer_attachment_for_text_control()
+        {
+            Ok(_) => {
+                return Err("runtime attachment unexpectedly ignored the empty roster".to_owned())
+            }
+            Err(error) => error,
+        };
+        assert!(error.contains("no admitted local member"), "{error}");
         Ok(())
     }
 
     #[test]
-    fn group_text_runtime_attachment_fails_without_signed_bootstrap_peer_ids() -> Result<(), String>
+    fn group_text_runtime_attachment_fails_without_advertised_remote_peer_id() -> Result<(), String>
     {
         let _guard = test_lock();
-        let path = reset_with_temp_state("group-runtime-peer-contract-missing-bootstrap");
+        let path = reset_with_temp_state("group-runtime-peer-contract-missing-advertisement");
         create_user(CreateUserRequest {
-            display_name: "Alice Missing Bootstrap".to_owned(),
+            display_name: "Alice Missing Advertisement".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
         });
         let created = create_group(CreateGroupRequest {
-            name: "Runtime Missing Bootstrap Lab".to_owned(),
+            name: "Runtime Missing Advertisement Lab".to_owned(),
             retention: "24 hours".to_owned(),
             admission_mode: None,
             adapter_kind: None,
@@ -31160,16 +32407,11 @@ mod tests {
             let mut guard = service
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let active_group = guard
-                .state
-                .groups
-                .iter_mut()
-                .find(|candidate| candidate.group_id == group_id)
-                .ok_or_else(|| "active group missing".to_owned())?;
-            active_group.role = "member".to_owned();
-            active_group.runtime_peers =
-                group_runtime_peers(active_group.connectivity.as_ref(), "member");
-            active_group.connectivity = None;
+            guard.state.upsert_admitted_group_member(
+                &group_id,
+                "bob-member",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
             guard.persist();
         }
 
@@ -31178,13 +32420,13 @@ mod tests {
         {
             Ok(_) => {
                 return Err(
-                    "runtime attachment unexpectedly used stale persisted runtime peers".to_owned(),
+                    "runtime attachment unexpectedly inferred a remote runtime peer id".to_owned(),
                 )
             }
             Err(error) => error,
         };
         assert!(
-            error.contains("no signed group bootstrap peer ids"),
+            error.contains("no current provider-advertised remote peers"),
             "{error}"
         );
         Ok(())
@@ -31210,6 +32452,7 @@ mod tests {
         let group = created
             .groups
             .first()
+            .cloned()
             .ok_or_else(|| "group missing".to_owned())?;
         let local_peer = group
             .runtime_peers
@@ -31218,13 +32461,9 @@ mod tests {
             .ok_or_else(|| "local runtime peer missing".to_owned())?
             .peer_id
             .clone();
-        let remote_peer = group
-            .runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| "remote runtime peer missing".to_owned())?
-            .peer_id
-            .clone();
+        let remote_peer = "peer-remote-member".to_owned();
+        add_test_member(&group.group_id, "remote-member", GroupRoleView::Member);
+        advertise_test_member_runtime_peer(&group.group_id, "remote-member", &remote_peer)?;
         let voice_channel = group
             .channels
             .iter()
@@ -31342,6 +32581,7 @@ mod tests {
         let group = created
             .groups
             .first()
+            .cloned()
             .ok_or_else(|| "group missing".to_owned())?;
         let local_peer = group
             .runtime_peers
@@ -31350,13 +32590,9 @@ mod tests {
             .ok_or_else(|| "local runtime peer missing".to_owned())?
             .peer_id
             .clone();
-        let remote_peer = group
-            .runtime_peers
-            .iter()
-            .find(|peer| !peer.is_local)
-            .ok_or_else(|| "remote runtime peer missing".to_owned())?
-            .peer_id
-            .clone();
+        let remote_peer = "peer-remote-member".to_owned();
+        add_test_member(&group.group_id, "remote-member", GroupRoleView::Member);
+        advertise_test_member_runtime_peer(&group.group_id, "remote-member", &remote_peer)?;
         let voice_channel = group
             .channels
             .iter()
@@ -32068,6 +33304,7 @@ mod tests {
             ice_stun_servers: None,
             ice_turn_servers: None,
         });
+        let _ = backend_group_runtime_peer_ids(&group_state.groups[0])?;
         let group_id = group_state.groups[0].group_id.clone();
         let channel_state = create_channel(CreateChannelRequest {
             group_id: group_id.clone(),
@@ -32110,7 +33347,7 @@ mod tests {
             .as_ref()
             .map(|error| error
                 .message
-                .contains("must match the backend-derived voice runtime peers"))
+                .contains("must match current provider-advertised voice runtime peers"))
             .unwrap_or(false));
         assert!(!rejected
             .state
@@ -32992,7 +34229,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_state_without_schema_version_migrates_to_current_schema() {
+    fn persisted_state_without_schema_version_is_rejected_without_overwrite() {
         let _guard = test_lock();
         let path = fresh_state_path("missing-schema-version-state");
         let mut value =
@@ -33003,26 +34240,24 @@ mod tests {
             .remove("schema_version");
         fs::write(
             &path,
-            serde_json::to_vec(&value).expect("legacy state encodes"),
+            serde_json::to_vec(&value).expect("schema-less state encodes"),
         )
-        .expect("write legacy app state");
+        .expect("write schema-less app state");
 
         let mut store = FileAppStore::new(&path);
+        let original = fs::read(&path).expect("schema-less store reads");
         let state = load_state_from_store(&mut store);
-        assert_eq!(state.schema_version, APP_STATE_SCHEMA_VERSION);
-        assert!(
-            state.last_command_error.is_none(),
-            "{:?}",
-            state.last_command_error
-        );
-        let persisted = fs::read(&path).expect("migrated store persists");
         assert_eq!(
-            persisted_schema_version(&persisted).expect("migrated schema parses"),
-            PersistedSchemaVersion::Current
+            state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("state_schema_missing")
         );
-        let decoded: PersistedAppState =
-            serde_json::from_slice(&persisted).expect("migrated state decodes");
-        assert_eq!(decoded.schema_version, APP_STATE_SCHEMA_VERSION);
+        assert_eq!(
+            fs::read(&path).expect("schema-less store remains readable"),
+            original
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -33137,7 +34372,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_old_schema_version_migrates_to_current_schema() {
+    fn persisted_old_schema_version_is_rejected_without_overwrite() {
         let _guard = test_lock();
         let path = fresh_state_path("old-schema-version-state");
         let mut value =
@@ -33148,22 +34383,23 @@ mod tests {
             .insert("schema_version".to_owned(), serde_json::json!(0));
         fs::write(
             &path,
-            serde_json::to_vec(&value).expect("legacy state encodes"),
+            serde_json::to_vec(&value).expect("unsupported state encodes"),
         )
         .expect("write old app state");
 
         let mut store = FileAppStore::new(&path);
+        let original = fs::read(&path).expect("old store reads");
         let state = load_state_from_store(&mut store);
-        assert_eq!(state.schema_version, APP_STATE_SCHEMA_VERSION);
-        assert!(
-            state.last_command_error.is_none(),
-            "{:?}",
-            state.last_command_error
-        );
-        let persisted = fs::read(&path).expect("migrated store persists");
         assert_eq!(
-            persisted_schema_version(&persisted).expect("migrated schema parses"),
-            PersistedSchemaVersion::Current
+            state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("state_schema_unsupported")
+        );
+        assert_eq!(
+            fs::read(&path).expect("old store remains readable"),
+            original
         );
         let _ = fs::remove_file(path);
     }
@@ -33773,11 +35009,7 @@ mod tests {
             &text_exporter_secret,
             &sender,
         )?;
-        add_legacy_route_member_without_signer_for_test(
-            &group_id,
-            "remote-device",
-            "Legacy Remote",
-        )?;
+        add_admitted_test_route_member(&group_id, "remote-device", "Remote Member")?;
 
         let request = ReceiveTextDeliveryEnvelopeRequest {
             target,
@@ -33970,11 +35202,7 @@ mod tests {
             group_id: Some(group_id.clone()),
             channel_id: Some(channel_id.clone()),
         };
-        add_legacy_route_member_without_signer_for_test(
-            &group_id,
-            "remote-device",
-            "Legacy Remote",
-        )?;
+        add_admitted_test_route_member(&group_id, "remote-device", "Remote Member")?;
         let invalid_signer_envelope = openmls_text_envelope_for_test(
             &group_id,
             &channel_id,
@@ -35082,7 +36310,8 @@ mod tests {
     }
 
     #[test]
-    fn group_governance_frame_queues_for_scoped_admitted_route() -> Result<(), String> {
+    fn group_governance_frame_uses_provider_control_lane_without_peer_route() -> Result<(), String>
+    {
         let _guard = test_lock();
         let alice_path = reset_with_temp_state("group-governance-scoped-route-alice");
         create_user(CreateUserRequest {
@@ -35103,7 +36332,7 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| "created group missing".to_owned())?;
-        let (_bob_path, bob_service, bob_id) =
+        let (_bob_path, bob_service, _bob_id) =
             create_text_receiver_profile("group-governance-scoped-route-bob", "Bob Route")?;
         reload_global_app_service_from_path(&alice_path);
         mutate_app_service_with_result(|state| -> Result<(), String> {
@@ -35113,21 +36342,6 @@ mod tests {
                 .iter_mut()
                 .find(|candidate| candidate.group_id == group.group_id)
                 .ok_or_else(|| "sender group missing".to_owned())?;
-            assert_ne!(bob_id, local_user_id);
-            group.members.push(GroupMemberView {
-                member_id: bob_id.clone(),
-                display_name: "Bob Route".to_owned(),
-                device_id: Some("Bob laptop".to_owned()),
-                role: GroupRoleView::Member,
-                status: "online".to_owned(),
-                signer_public_key_hex: None,
-                joined_at: Utc::now().to_rfc3339(),
-                last_seen_at: None,
-                presence_expires_at: None,
-                revoked_at: None,
-                revoked_by: None,
-                route_evidence: None,
-            });
             let group_id = group.group_id.clone();
             let event_id = "presence-scoped-route";
             let expires = (Utc::now() + Duration::seconds(120)).to_rfc3339();
@@ -35141,13 +36355,12 @@ mod tests {
         .1?;
 
         let loaded = load_state();
-        let bob_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, &bob_id)?;
         let outbox = loaded
             .text_control_outbox
             .iter()
             .find(|record| record.message_id == "presence-scoped-route")
             .ok_or_else(|| "queued governance frame missing".to_owned())?;
-        assert_eq!(outbox.route_peer_ids, vec![bob_route.clone()]);
+        assert!(outbox.route_peer_ids.is_empty());
         assert!(outbox.sent_route_peer_ids.is_empty());
         assert_eq!(outbox.attempts, 0);
 
@@ -35162,23 +36375,9 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "active text session missing".to_owned())?;
-        let local_peer_id = loaded
-            .groups
-            .iter()
-            .find(|candidate| candidate.group_id == group.group_id)
-            .and_then(|candidate| {
-                candidate
-                    .members
-                    .iter()
-                    .find(|member| member.role == GroupRoleView::Owner)
-                    .and_then(|member| group_member_runtime_peer_id(&group.group_id, member).ok())
-            })
-            .ok_or_else(|| "local runtime peer id missing".to_owned())?;
-        attach_peer_text_control_transport_runtime_for_test(
+        attach_broker_control_transport_runtime_for_test(
             Arc::new(ReceiverBackedTextControlTransport::new(bob_service)),
             active_session_id,
-            local_peer_id,
-            bob_route.clone(),
         );
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: None,
@@ -35195,7 +36394,8 @@ mod tests {
             .iter()
             .find(|record| record.message_id == "presence-scoped-route")
             .ok_or_else(|| "sent governance frame missing".to_owned())?;
-        assert_eq!(outbox.sent_route_peer_ids, vec![bob_route]);
+        assert!(outbox.sent_route_peer_ids.is_empty());
+        assert_eq!(outbox.state_key, "sent");
         assert_eq!(outbox.attempts, 1);
         clear_text_control_transport_runtime_for_test();
         Ok(())
@@ -35238,10 +36438,19 @@ mod tests {
             member_id: member_id.to_owned(),
             display_name: Some(member_id.to_owned()),
             device_id: Some(format!("{member_id}-device")),
-            role: Some(GroupRoleView::Member),
-            signer_public_key_hex: None,
+            signer_public_key_hex:
+                "abababababababababababababababababababababababababababababababab"
+                    .to_owned(),
+            runtime_peer_id: format!("peer-{member_id}"),
+            channel_schema_epoch: 1,
+            channel_schema_sha256:
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+                    .to_owned(),
             last_seen_at: Utc::now().to_rfc3339(),
             presence_expires_at: presence_expires_at.to_owned(),
+            signature_hex:
+                "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+                    .to_owned(),
         }
     }
 
@@ -35286,7 +36495,10 @@ mod tests {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = Utc::now().to_rfc3339();
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        let presence_expires_at =
+            (now_dt + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339();
         let local_user_id = guard.state.local_user_id();
         let group = guard
             .state
@@ -35295,27 +36507,36 @@ mod tests {
             .find(|group| group.group_id == group_id)
             .ok_or_else(|| "sender group missing".to_owned())?;
         for (member_id, display_name) in route_members {
-            if !group
+            let runtime_peer_id =
+                runtime_peer_id_from_commitment("test-provider-advertised-peer", member_id);
+            if let Some(member) = group
                 .members
-                .iter()
-                .any(|member| &member.member_id == member_id)
+                .iter_mut()
+                .find(|member| &member.member_id == member_id)
             {
+                member.status = "online".to_owned();
+                member.runtime_peer_id = Some(runtime_peer_id);
+                member.last_seen_at = Some(now.clone());
+                member.presence_expires_at = Some(presence_expires_at.clone());
+            } else {
                 group.members.push(GroupMemberView {
                     member_id: (*member_id).to_owned(),
                     display_name: (*display_name).to_owned(),
                     device_id: None,
                     role: GroupRoleView::Member,
                     status: "online".to_owned(),
-                    signer_public_key_hex: None,
+                    signer_public_key_hex: Some("bb".repeat(32)),
+                    runtime_peer_id: Some(runtime_peer_id),
                     joined_at: now.clone(),
-                    last_seen_at: None,
-                    presence_expires_at: None,
+                    last_seen_at: Some(now.clone()),
+                    presence_expires_at: Some(presence_expires_at.clone()),
                     revoked_at: None,
                     revoked_by: None,
                     route_evidence: None,
                 });
             }
         }
+        group.runtime_peers = advertised_group_runtime_peers(&group.members, &local_user_id);
         let message_id = stable_id("p7-t04-fanout-message", group_id, guard.state.next_sequence);
         let sequence = guard.state.next_sequence;
         let signing_key = SigningKey::from_bytes(&guard.state.identity_seed_bytes());
@@ -35413,7 +36634,7 @@ mod tests {
         group_member_runtime_peer_id(group_id, member)
     }
 
-    fn add_legacy_route_member_without_signer_for_test(
+    fn add_admitted_test_route_member(
         group_id: &str,
         member_id: &str,
         display_name: &str,
@@ -35422,7 +36643,7 @@ mod tests {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        add_legacy_route_member_without_signer_to_state_for_test(
+        add_admitted_test_route_member_to_state(
             &mut guard.state,
             group_id,
             member_id,
@@ -35432,7 +36653,7 @@ mod tests {
         Ok(())
     }
 
-    fn add_legacy_route_member_without_signer_to_state_for_test(
+    fn add_admitted_test_route_member_to_state(
         state: &mut PersistedAppState,
         group_id: &str,
         member_id: &str,
@@ -35443,9 +36664,9 @@ mod tests {
             .groups
             .iter_mut()
             .find(|group| group.group_id == group_id)
-            .ok_or_else(|| "group missing for legacy route member insert".to_owned())?;
+            .ok_or_else(|| "group missing for test route member insert".to_owned())?;
         if member_id == local_user_id {
-            return Err("legacy route member must be remote".to_owned());
+            return Err("test route member must be remote".to_owned());
         }
         if !group
             .members
@@ -35458,7 +36679,11 @@ mod tests {
                 device_id: None,
                 role: GroupRoleView::Member,
                 status: "unknown".to_owned(),
-                signer_public_key_hex: None,
+                signer_public_key_hex: Some("aa".repeat(32)),
+                runtime_peer_id: Some(runtime_peer_id_from_commitment(
+                    "test-provider-advertised-peer",
+                    member_id,
+                )),
                 joined_at: Utc::now().to_rfc3339(),
                 last_seen_at: None,
                 presence_expires_at: None,
@@ -36433,18 +37658,6 @@ mod tests {
             !group_invite.code.contains("gname="),
             "production group invites must not trust unsigned display labels"
         );
-        let old_style_invite_code = group_invite.code.clone();
-        let old_style_metadata = parse_invite_metadata(&old_style_invite_code)
-            .ok_or_else(|| "old-style signed invite metadata did not parse".to_owned())?;
-        let old_style_name = invite_group_name_from_metadata(
-            &old_style_invite_code,
-            None,
-            Some(&old_style_metadata),
-        );
-        assert_eq!(
-            old_style_name, "g012 text lab",
-            "old signed invites without gname must recover a sane label from gid, not the invite uuid"
-        );
         let presence_receiver_path = fresh_state_path("g012-presence-route-receiver");
         let _ = fs::remove_file(&presence_receiver_path);
         let presence_transport = Arc::new(ReceiverBackedTextControlTransport::new(
@@ -36465,7 +37678,7 @@ mod tests {
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "presence text session missing".to_owned())?;
         mark_active_text_session_direct_route_for_test();
-        attach_text_control_transport_runtime_for_test(presence_transport, presence_session_id);
+        attach_broker_control_transport_runtime_for_test(presence_transport, presence_session_id);
         let alice_online = publish_group_presence(PublishGroupPresenceRequest {
             group_id: alice_group_id.clone(),
             member_id: None,
@@ -36503,6 +37716,7 @@ mod tests {
             None,
         )?;
         let bob_loaded = TauriAppService::load_for_test_path(bob_path.clone());
+        let bob_member_id = bob_loaded.state.local_user_id();
         let bob_group = bob_loaded
             .state
             .to_view()
@@ -36512,12 +37726,11 @@ mod tests {
             .ok_or_else(|| "bob joined group missing".to_owned())?;
         assert_eq!(bob_group.name, "g012 text lab");
         let bob_group_id = bob_group.group_id.clone();
-        let bob_channel_id = bob_group
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Text)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "bob text channel missing".to_owned())?;
+        assert!(
+            bob_group.channels.is_empty(),
+            "an invite must not install group channel schema before a signed Welcome"
+        );
+        assert_eq!(bob_group.channel_schema_epoch, 0);
         assert_eq!(
             bob_group_id, alice_group_id,
             "signed invite must install the inviter's OpenMLS group id"
@@ -36552,7 +37765,7 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "bob admission text session missing".to_owned())?;
-        attach_text_control_transport_runtime_for_test(
+        attach_broker_control_transport_runtime_for_test(
             admission_receiver.clone(),
             admission_session_id,
         );
@@ -36568,11 +37781,65 @@ mod tests {
             admission_report.failures
         );
         assert_eq!(admission_report.frames_sent, 1);
-        assert_eq!(admission_report.response_frames_received, 1);
+        assert_eq!(admission_report.response_frames_received, 0);
         assert_eq!(admission_report.receipts_applied, 0);
         clear_text_control_transport_runtime_for_test();
+        let welcome_frame = admission_receiver.take_queued_response_frame()?;
+        reload_global_app_service_from_path(&bob_path);
+        let welcome_result = handle_text_control_frame(HandleTextControlFrameRequest {
+            frame: welcome_frame,
+        });
+        assert_eq!(
+            welcome_result.state.last_command_error, None,
+            "{welcome_result:?}"
+        );
         let alice_after_admission = load_state_from_path(&alice_path);
         let bob_after_admission = load_state_from_path(&bob_path);
+        let bob_channel_id = bob_after_admission
+            .groups
+            .iter()
+            .find(|group| group.group_id == alice_group_id)
+            .and_then(|group| {
+                group
+                    .channels
+                    .iter()
+                    .find(|channel| channel.kind == ChannelKind::Text)
+            })
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "signed Welcome did not install Bob's text channel".to_owned())?;
+        assert_eq!(bob_channel_id, alice_channel_id);
+        let alice_runtime_peer_id = alice_after_admission
+            .groups
+            .iter()
+            .find(|group| group.group_id == alice_group_id)
+            .and_then(|group| {
+                group
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == alice_member_id)
+            })
+            .and_then(|member| member.runtime_peer_id.clone())
+            .ok_or_else(|| "owner runtime advertisement missing".to_owned())?;
+        let bob_runtime_peer_id = bob_after_admission
+            .groups
+            .iter()
+            .find(|group| group.group_id == alice_group_id)
+            .and_then(|group| {
+                group
+                    .members
+                    .iter()
+                    .find(|member| member.member_id == bob_member_id)
+            })
+            .and_then(|member| member.runtime_peer_id.clone())
+            .ok_or_else(|| "joiner runtime advertisement missing".to_owned())?;
+        reload_global_app_service_from_path(&alice_path);
+        advertise_test_member_runtime_peer(&alice_group_id, &bob_member_id, &bob_runtime_peer_id)?;
+        reload_global_app_service_from_path(&bob_path);
+        advertise_test_member_runtime_peer(
+            &alice_group_id,
+            &alice_member_id,
+            &alice_runtime_peer_id,
+        )?;
         assert!(
             alice_after_admission
                 .openmls_groups
@@ -36744,21 +38011,18 @@ mod tests {
             .map(|session| session.session_id.clone())
             .ok_or_else(|| "bob text session missing".to_owned())?;
         let bob_route_state = load_state();
-        if let Some(bob_to_alice_route) = bob_route_state
+        let bob_to_alice_route = bob_route_state
             .text_control_outbox
             .iter()
             .find(|record| record.message_id == bob_message_id)
             .and_then(|record| record.route_peer_ids.first().cloned())
-        {
-            attach_peer_text_control_transport_runtime_for_test(
-                bob_receiver.clone(),
-                bob_session_id,
-                "g012-bob-local-route",
-                bob_to_alice_route,
-            );
-        } else {
-            attach_text_control_transport_runtime_for_test(bob_receiver.clone(), bob_session_id);
-        }
+            .ok_or_else(|| "bob-to-alice advertised route missing from outbox".to_owned())?;
+        attach_peer_text_control_transport_runtime_for_test(
+            bob_receiver.clone(),
+            bob_session_id,
+            bob_runtime_peer_id,
+            bob_to_alice_route,
+        );
         let bob_report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(bob_target),
             limit: Some(8),
@@ -36926,10 +38190,8 @@ mod tests {
         });
 
         assert!(
-            report
-                .failures
-                .iter()
-                .any(|failure| failure.contains("direct data-channel runtime is not attached")),
+            report.failures.iter().any(|failure| failure
+                .contains("provider-signaled direct WebRTC runtime is not attached")),
             "expected missing-runtime failure detail",
         );
         assert_eq!(
@@ -36954,9 +38216,11 @@ mod tests {
             .last_command_error
             .expect("missing transport runtime should be reported as a command error");
         assert_eq!(command_error.command, "pump_text_control_transport_once");
-        assert_eq!(command_error.code, "transport_runtime_missing");
+        assert_eq!(command_error.code, "transport_plane_runtime_missing");
         assert!(
-            command_error.recovery_hint.contains("never relay messages"),
+            command_error
+                .recovery_hint
+                .contains("provider-signaled direct WebRTC routes"),
             "missing-runtime recovery hint must make the no-provider-message-relay policy explicit: {command_error:?}"
         );
     }
@@ -37207,7 +38471,6 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: None,
-                ..Default::default()
             });
         let command_error = state
             .last_command_error
@@ -37248,7 +38511,6 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some("stale-text-session".to_owned()),
-                ..Default::default()
             });
         let command_error = state
             .last_command_error
@@ -37280,8 +38542,17 @@ mod tests {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
         });
-        start_dm(StartDmRequest {
+        let opened = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
+        });
+        let dm_id = opened
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .expect("active DM should exist");
+        mutate_app_service(|state| {
+            seed_remote_dm_runtime_peer_for_test(state, &dm_id, "bob-runtime-peer")
+                .expect("test remote DM route should seed");
         });
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("attach-idempotent-pending".to_owned()),
@@ -37295,16 +38566,21 @@ mod tests {
             .map(|session| session.session_id.clone())
             .expect("text session should be active after start_text_session");
 
+        let attachment = load_state()
+            .active_runtime_peer_attachments_for_text_control()
+            .expect("DM runtime attachment should derive from active state")
+            .into_iter()
+            .next()
+            .expect("DM runtime attachment should exist");
         insert_pending_text_control_transport_runtime_for_test(
             &active_session_id,
-            "alice-runtime-peer",
-            "bob-runtime-peer",
+            &attachment.local_peer_id.0,
+            &attachment.remote_peer_id.0,
         );
 
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(active_session_id.clone()),
-                ..Default::default()
             });
         assert!(state.last_command_error.is_none(), "{state:?}");
         assert!(state.events.iter().any(|event| {
@@ -37381,9 +38657,9 @@ mod tests {
     }
 
     #[test]
-    fn text_control_runtime_map_preserves_legacy_two_person_attachment() {
+    fn text_control_runtime_map_preserves_unscoped_test_attachment() {
         let _guard = test_lock();
-        reset_with_temp_state("text-control-runtime-map-legacy-two-person");
+        reset_with_temp_state("text-control-runtime-map-unscoped-test");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -37392,7 +38668,7 @@ mod tests {
             display_name: "Bob".to_owned(),
         });
         let started = start_text_session(StartTextSessionRequest {
-            scope_label: Some("legacy-two-person-runtime-map".to_owned()),
+            scope_label: Some("unscoped-test-runtime-map".to_owned()),
             data_channel_probe: false,
             adapter_kind: None,
         });
@@ -37402,7 +38678,7 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .expect("text session should be active after start_text_session");
-        let receiver_path = fresh_state_path("text-control-runtime-map-legacy-bob");
+        let receiver_path = fresh_state_path("text-control-runtime-map-unscoped-bob");
         let _ = fs::remove_file(&receiver_path);
         let transport = Arc::new(ReceiverBackedTextControlTransport::new(
             TauriAppService::load_for_test_path(receiver_path),
@@ -37414,16 +38690,16 @@ mod tests {
         let guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = TextControlRuntimeMapKey::legacy(active_session_id.clone());
+        let key = TextControlRuntimeMapKey::unscoped(active_session_id.clone());
         assert!(
             guard.text_control_transport_runtimes.contains_key(&key),
-            "legacy two-person attach should migrate into the session-only runtime map key"
+            "unscoped test attach should use the session-only runtime map key"
         );
         assert!(
             guard
                 .text_control_runtime_for_session(&active_session_id)
                 .is_some(),
-            "legacy two-person runtime must remain selectable by active session"
+            "unscoped test runtime must remain selectable by active session"
         );
     }
 
@@ -37543,18 +38819,18 @@ mod tests {
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let legacy_key = TextControlRuntimeMapKey::legacy(active_session_id.clone());
+        let unscoped_key = TextControlRuntimeMapKey::unscoped(active_session_id.clone());
         assert!(
             !guard.text_control_runtime_attach_already_active(
                 "attach_text_control_transport_runtime",
                 &active_session_id,
-                &legacy_key,
+                &unscoped_key,
             ),
-            "terminal session runtime must not dedupe legacy reattach"
+            "terminal session runtime must not dedupe an unscoped reattach"
         );
         assert!(
             guard.text_control_transport_runtimes.is_empty(),
-            "terminal legacy-scoped cleanup must remove stale session runtimes"
+            "terminal unscoped cleanup must remove stale session runtimes"
         );
         assert!(guard.state.events.iter().any(|event| {
             event.kind == "transport.text_runtime_stale_removed"
@@ -37570,8 +38846,17 @@ mod tests {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
         });
-        start_dm(StartDmRequest {
+        let opened = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
+        });
+        let dm_id = opened
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .expect("active DM should exist");
+        mutate_app_service(|state| {
+            seed_remote_dm_runtime_peer_for_test(state, &dm_id, "bob-runtime-peer")
+                .expect("test remote DM route should seed");
         });
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("reconnect-health".to_owned()),
@@ -37855,13 +39140,14 @@ mod tests {
         });
 
         assert_eq!(report.frames_sent, 0);
-        assert_eq!(report.metrics.label, "unattached-text-control-runtime");
+        assert_eq!(report.metrics.label, "text-control-plane-runtime-missing");
         assert_ne!(report.metrics.label, "attaching-text-control-runtime");
         assert!(
             report
                 .failures
                 .iter()
-                .any(|failure| failure.contains("runtime is not attached")),
+                .any(|failure| failure
+                    .contains("provider-signaled direct WebRTC runtime is not attached")),
             "expired pending attach should be reclaimed before reporting missing runtime: {report:?}"
         );
         let service = app_service();
@@ -37879,7 +39165,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_text_control_transport_runtime_rejects_when_text_session_not_connected() {
+    fn attach_text_control_transport_runtime_requires_provider_advertisement() {
         let _guard = test_lock();
         reset_with_temp_state("attach-text-control-runtime-not-connected");
         create_user(CreateUserRequest {
@@ -37906,16 +39192,15 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(active_session_id),
-                ..Default::default()
             });
         let command_error = state
             .last_command_error
-            .expect("attach should fail while text session is not connected");
-        assert_eq!(command_error.code, "text_session_not_connected");
+            .expect("attach should reject a missing provider advertisement");
+        assert_eq!(command_error.code, "text_runtime_scope_unavailable");
     }
 
     #[test]
-    fn attach_text_control_transport_runtime_exposes_missing_provider_implementation() {
+    fn route_proof_does_not_replace_provider_peer_advertisement() {
         let _guard = test_lock();
         reset_with_temp_state("attach-text-control-runtime-missing-implementation");
         create_user(CreateUserRequest {
@@ -37954,7 +39239,6 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
-            runtime_spec: None,
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -37979,35 +39263,30 @@ mod tests {
         let state =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(session_id),
-                ..Default::default()
             });
         let command_error = state
             .last_command_error
-            .expect("attach should fail until provider runtime path is wired");
+            .expect("attach should reject a missing provider advertisement");
         assert_eq!(
             command_error.command,
             "attach_text_control_transport_runtime"
         );
-        assert_eq!(command_error.code, "transport_runtime_not_supported");
+        assert_eq!(command_error.code, "text_runtime_scope_unavailable");
         assert!(command_error
             .recovery_hint
-            .contains("persisted negotiated offer/answer/ICE bootstrap handoff"));
-        assert_eq!(
-            command_error.message,
-            TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE
-        );
+            .contains("signed provider route advertisement"));
         let service = app_service();
         let guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
             guard.text_control_transport_runtimes.is_empty(),
-            "unsupported attach path must remain fail-closed"
+            "rejected attach path must remain fail-closed"
         );
     }
 
     #[test]
-    fn text_control_runtime_status_remains_not_attached_after_missing_implementation() {
+    fn text_control_runtime_status_remains_not_attached_without_provider_advertisement() {
         let _guard = test_lock();
         reset_with_temp_state("text-control-runtime-status-not-attached");
         create_user(CreateUserRequest {
@@ -38045,7 +39324,6 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
-            runtime_spec: None,
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -38075,12 +39353,11 @@ mod tests {
         let attached =
             attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
                 session_id: Some(session_id.clone()),
-                ..Default::default()
             });
         let command_error = attached
             .last_command_error
-            .expect("attach should fail until provider runtime path is wired");
-        assert_eq!(command_error.code, "transport_runtime_not_supported");
+            .expect("attach should reject a missing provider advertisement");
+        assert_eq!(command_error.code, "text_runtime_scope_unavailable");
         let text_control_status = attached
             .transport_status
             .into_iter()
@@ -38100,7 +39377,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
             guard.text_control_transport_runtimes.is_empty(),
-            "missing provider implementation must not attach runtime state"
+            "a missing provider advertisement must not attach runtime state"
         );
         let active_session_id = guard
             .state
@@ -38115,9 +39392,10 @@ mod tests {
     }
 
     #[test]
-    fn live_role_split_runtime_material_is_invite_shared_not_profile_local() -> Result<(), String> {
+    fn provider_rendezvous_material_comes_from_signed_connectivity_not_profile_local(
+    ) -> Result<(), String> {
         let _guard = test_lock();
-        reset_with_temp_state("role-split-shared-material-alice");
+        reset_with_temp_state("signed-connectivity-material-alice");
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -38145,7 +39423,7 @@ mod tests {
         let alice_inputs =
             alice_state.text_control_runtime_inputs_for_active_scope(Some("mqtt"))?;
 
-        reset_with_temp_state("role-split-shared-material-bob");
+        reset_with_temp_state("signed-connectivity-material-bob");
         create_user(CreateUserRequest {
             display_name: "Bob".to_owned(),
             device_name: Some("Bob laptop".to_owned()),
@@ -38171,71 +39449,18 @@ mod tests {
         assert_eq!(alice_inputs.ice_config, bob_inputs.ice_config);
         assert_eq!(
             alice_inputs.bootstrap_secret, bob_inputs.bootstrap_secret,
-            "role-split peers must derive the same provider rendezvous bootstrap from signed invite/connectivity metadata, not local profile identity"
+            "peers must derive the same provider rendezvous bootstrap from signed connectivity metadata, not local profile identity"
         );
         assert_eq!(
             alice_inputs.random_entropy, bob_inputs.random_entropy,
-            "role-split peers must derive the same provider rendezvous entropy from signed invite/connectivity metadata, not local profile identity"
+            "peers must derive the same provider rendezvous entropy from signed connectivity metadata, not local profile identity"
         );
         Ok(())
     }
 
     #[test]
-    fn live_runtime_peer_ids_are_signed_invite_reciprocals() -> Result<(), String> {
-        let _guard = test_lock();
-        let alice_path = reset_with_temp_state("role-split-runtime-peers-alice");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let dm = start_dm(StartDmRequest {
-            display_name: "Bob".to_owned(),
-        });
-        let active_dm_id = dm
-            .active_context
-            .as_ref()
-            .and_then(|context| context.dm_id.clone())
-            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
-        let invite = create_dm_invite(CreateDmInviteRequest {
-            dm_id: Some(active_dm_id),
-            expires: "24 hours".to_owned(),
-            max_use: "1 use".to_owned(),
-        });
-        assert!(invite.last_command_error.is_none(), "{invite:?}");
-        let invite_code = invite
-            .invites
-            .last()
-            .map(|invite| invite.code.clone())
-            .ok_or_else(|| "DM invite code missing".to_owned())?;
-        let alice_state = load_state();
-
-        let (_bob_path, bob_service) = accept_dm_invite_as_test_profile(
-            "role-split-runtime-peers-bob",
-            "Bob",
-            "Bob laptop",
-            invite_code,
-            "Alice",
-        )?;
-        reload_global_app_service_from_path(&alice_path);
-
-        let (alice_local, alice_remote) = alice_state.active_runtime_peer_ids_for_text_control()?;
-        let (bob_local, bob_remote) = bob_service
-            .state
-            .active_runtime_peer_ids_for_text_control()?;
-        assert_eq!(
-            alice_local, bob_remote,
-            "Bob must route to Alice's persisted signed bootstrap runtime peer"
-        );
-        assert_eq!(
-            alice_remote, bob_local,
-            "Alice must route to Bob's persisted signed bootstrap runtime peer"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn backend_derives_text_runtime_attachment_without_manual_pairing_fields() -> Result<(), String>
-    {
+    fn backend_derives_text_runtime_attachment_only_after_provider_route_advertisement(
+    ) -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("backend-derived-runtime-attachment");
         create_user(CreateUserRequest {
@@ -38247,16 +39472,26 @@ mod tests {
         });
 
         let state = load_state();
-        let attachment = state.active_runtime_peer_attachment_for_text_control()?;
         let active_dm_id = state
             .active_context
             .as_ref()
-            .and_then(|context| context.dm_id.as_ref())
+            .and_then(|context| context.dm_id.clone())
             .ok_or_else(|| "expected active DM context".to_owned())?;
+        let missing_remote = state
+            .active_runtime_peer_attachment_for_text_control()
+            .expect_err("runtime attachment must wait for a provider-advertised remote route");
+        assert!(missing_remote.contains("provider-advertised remote runtime peer"));
+
+        mutate_app_service(|state| {
+            seed_remote_dm_runtime_peer_for_test(state, &active_dm_id, "bob-runtime-peer")
+                .expect("test provider route should seed");
+        });
+        let state = load_state();
+        let attachment = state.active_runtime_peer_attachment_for_text_control()?;
         let dm = state
             .dms
             .iter()
-            .find(|dm| &dm.dm_id == active_dm_id)
+            .find(|dm| dm.dm_id == active_dm_id)
             .ok_or_else(|| "expected active DM".to_owned())?;
         let local = dm
             .runtime_peers
@@ -38486,6 +39721,12 @@ mod tests {
             Some("peer_receipt")
         );
 
+        let current_group = load_state()
+            .groups
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing before voice join".to_owned())?;
+        let _ = backend_group_runtime_peer_ids(&current_group)?;
         let voice_joined = join_voice(JoinVoiceRequest {
             group_id: group_id.clone(),
             channel_id: voice_channel_id.clone(),
@@ -38892,11 +40133,6 @@ mod tests {
         }
         let _guard = test_lock();
         let _alice_path = reset_with_temp_state("public-nostr-two-profile-receipt-alice");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
-                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
-        );
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -39353,7 +40589,6 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: false,
             receipt_frame_sha256: String::new(),
-            runtime_spec: None,
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -39451,7 +40686,6 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
-            runtime_spec: None,
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -39574,7 +40808,6 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
-            runtime_spec: None,
             offerer_diagnostic_timeline: None,
             answerer_diagnostic_timeline: None,
         };
@@ -39672,11 +40905,6 @@ mod tests {
         }
         let _guard = test_lock();
         let _path = reset_with_temp_state("desktop-public-nostr-text-session");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
-                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
-        );
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Desktop".to_owned()),
@@ -39985,11 +41213,6 @@ mod tests {
         }
         let _guard = test_lock();
         let alice_path = reset_with_temp_state("desktop-public-nostr-live-runtime-pair-alice");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
-                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
-        );
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -40107,11 +41330,6 @@ mod tests {
         }
         let _guard = test_lock();
         let alice_path = reset_with_temp_state("desktop-public-nostr-group-runtime-pair-alice");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
-                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
-        );
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Alice laptop".to_owned()),
@@ -40395,11 +41613,6 @@ mod tests {
         }
         let _guard = test_lock();
         let _path = reset_with_temp_state("desktop-public-nostr-message-proof");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_NOSTR_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_NOSTR_ENDPOINT")
-                .unwrap_or_else(|_| "wss://nos.lol".to_owned()),
-        );
         create_user(CreateUserRequest {
             display_name: "Alice".to_owned(),
             device_name: Some("Desktop".to_owned()),
@@ -40463,8 +41676,6 @@ mod tests {
         let _guard = test_lock();
         std::env::remove_var("DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINTS");
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
-        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
-        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
         std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
 
         let profiles = default_signaling_profiles("configured-defaults-only");
@@ -40676,8 +41887,6 @@ mod tests {
             "/dnsaddr/bootstrap.libp2p.io",
         );
         std::env::remove_var("DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT");
-        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINT");
-        std::env::remove_var("DISCRYPT_DEFAULT_NOSTR_ENDPOINTS");
         std::env::remove_var(APP_CONFIG_SIGNED_UPDATE_ENV);
 
         let profiles = default_signaling_profiles("ipfs-default-block");
@@ -41677,6 +42886,7 @@ mod tests {
                     device_name: Some("Joiner laptop".to_owned()),
                     member_identity: "member-secret-should-not-leak".to_owned(),
                     signer_public_key_hex: "feedfacecafebeef".to_owned(),
+                    identity_signer_public_key_hex: "facefeedfacefeed".to_owned(),
                     key_package: b"welcome-payload-should-not-leak".to_vec(),
                     status: "approved".to_owned(),
                     requested_at: Utc::now().to_rfc3339(),
@@ -42609,6 +43819,7 @@ mod tests {
             group_id: "group-lane-pump".to_owned(),
             member_identity: "member-1".to_owned(),
             signer_public_key_hex: "aa".repeat(32),
+            identity_signer_public_key_hex: "bb".repeat(32),
             key_package: b"key-package-bytes".to_vec(),
         };
         let frame_sha256 = text_control_frame_sha256(&frame).expect("frame hash");
@@ -42819,7 +44030,7 @@ mod tests {
         service.attach_text_control_transport_runtime(transport.clone(), session_id.clone());
         service
             .text_control_transport_runtimes
-            .get_mut(&TextControlRuntimeMapKey::legacy(session_id.clone()))
+            .get_mut(&TextControlRuntimeMapKey::unscoped(session_id.clone()))
             .ok_or_else(|| "test runtime should be attached".to_owned())?
             .inbound_receiver_owned = true;
         let service = Arc::new(Mutex::new(service));
@@ -42926,6 +44137,8 @@ mod tests {
         let text_channel = "channel-voice-lane-text".to_owned();
         let voice_channel = "channel-voice-lane-voice".to_owned();
         let now = Utc::now().to_rfc3339();
+        let presence_expires_at =
+            (Utc::now() + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339();
         for (service, local_peer, remote_peer, local_role, remote_role) in [
             (
                 &mut owner_service,
@@ -42970,6 +44183,39 @@ mod tests {
                 channel_id: Some(voice_channel.clone()),
                 dm_id: None,
             });
+            let members = vec![
+                GroupMemberView {
+                    member_id: local_user.clone(),
+                    display_name: "local".to_owned(),
+                    device_id: None,
+                    role: local_role.clone(),
+                    status: "online".to_owned(),
+                    signer_public_key_hex: Some("aa".repeat(32)),
+                    runtime_peer_id: Some(local_peer.to_owned()),
+                    joined_at: now.clone(),
+                    last_seen_at: Some(now.clone()),
+                    presence_expires_at: Some(presence_expires_at.clone()),
+                    revoked_at: None,
+                    revoked_by: None,
+                    route_evidence: None,
+                },
+                GroupMemberView {
+                    member_id: remote_user.clone(),
+                    display_name: "remote".to_owned(),
+                    device_id: None,
+                    role: remote_role,
+                    status: "online".to_owned(),
+                    signer_public_key_hex: Some("bb".repeat(32)),
+                    runtime_peer_id: Some(remote_peer.to_owned()),
+                    joined_at: now.clone(),
+                    last_seen_at: Some(now.clone()),
+                    presence_expires_at: Some(presence_expires_at.clone()),
+                    revoked_at: None,
+                    revoked_by: None,
+                    route_evidence: None,
+                },
+            ];
+            let runtime_peers = advertised_group_runtime_peers(&members, &local_user);
             service.state.groups.push(GroupView {
                 group_id: group_id.clone(),
                 name: "voice lane lab".to_owned(),
@@ -42994,37 +44240,13 @@ mod tests {
                         connectivity: None,
                     },
                 ],
-                members: vec![
-                    GroupMemberView {
-                        member_id: local_user.clone(),
-                        display_name: "local".to_owned(),
-                        device_id: None,
-                        role: local_role.clone(),
-                        status: "online".to_owned(),
-                        signer_public_key_hex: None,
-                        joined_at: now.clone(),
-                        last_seen_at: None,
-                        presence_expires_at: None,
-                        revoked_at: None,
-                        revoked_by: None,
-                        route_evidence: None,
-                    },
-                    GroupMemberView {
-                        member_id: remote_user.clone(),
-                        display_name: "remote".to_owned(),
-                        device_id: None,
-                        role: remote_role,
-                        status: "online".to_owned(),
-                        signer_public_key_hex: None,
-                        joined_at: now.clone(),
-                        last_seen_at: None,
-                        presence_expires_at: None,
-                        revoked_at: None,
-                        revoked_by: None,
-                        route_evidence: None,
-                    },
-                ],
-                role_policy: GroupRolePolicyView::default(),
+                channel_schema_epoch: 1,
+                members,
+                role_policy: initial_group_role_policy(
+                    GroupAdmissionModeView::AutomaticWhenAuthorizedOnline,
+                    &local_user,
+                    &now,
+                ),
                 admission_requests: Vec::new(),
                 governance_log: vec![GroupGovernanceLogEntryView {
                     event_id: format!("{group_id}-created"),
@@ -43038,26 +44260,7 @@ mod tests {
                     created_at: now.clone(),
                     summary: "voice lane lab roster".to_owned(),
                 }],
-                runtime_peers: vec![
-                    GroupRuntimePeerView {
-                        peer_id: local_peer.to_owned(),
-                        role: "local".to_owned(),
-                        is_local: true,
-                        source: "voice lane test".to_owned(),
-                        member_id: None,
-                        device_id: None,
-                        route_evidence: None,
-                    },
-                    GroupRuntimePeerView {
-                        peer_id: remote_peer.to_owned(),
-                        role: "remote".to_owned(),
-                        is_local: false,
-                        source: "voice lane test".to_owned(),
-                        member_id: None,
-                        device_id: None,
-                        route_evidence: None,
-                    },
-                ],
+                runtime_peers,
                 connectivity: Some(connectivity),
             });
         }
@@ -43393,7 +44596,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_control_lane_three_member_automatic_admission_text_and_revoke() {
+    fn broker_control_lane_three_member_admission_and_revoke_without_payload_relay() {
         use discrypt_transport::{
             AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
             SignalingAdapter,
@@ -43634,13 +44837,13 @@ mod tests {
             "both joiners must be admitted members; deferrals: {deferrals:?}"
         );
 
-        // The owner's text fans out to both admitted route peers through the
-        // pump's lane fallback (no per-peer direct/TURN runtimes exist).
+        // Group text remains queued until peers advertise routes and direct
+        // provider-signaled WebRTC runtimes attach. The provider lane must never relay it.
         let target = MessageTargetView {
             kind: "channel".to_owned(),
             dm_id: None,
             group_id: Some(group_id.clone()),
-            channel_id: Some("channel-general-3".to_owned()),
+            channel_id: Some(DEFAULT_GROUP_TEXT_CHANNEL_ID.to_owned()),
         };
         // The owner's protected text: the public command path with the global
         // state swapped to this detached profile (the send mutates the swapped-in
@@ -43672,34 +44875,21 @@ mod tests {
                 limit: Some(8),
                 operation_timeout_ms: Some(1_000),
             });
-        // Single-threaded harness: joiners drain after this pump returns, so the
-        // per-frame receipt wait legitimately times out; receipts are covered by
-        // the concurrent-process E2E run.
-        assert_eq!(owner_pump.frames_sent, 2, "{owner_pump:?}");
-
-        // Both joiners drain the owner's text; each returns a signed receipt.
-        for service in [&mut joiner1_service, &mut joiner2_service] {
-            let drain = service.drain_text_control_inbound_frames(Some(2_000), Some(1_000));
-            assert!(drain.failures.is_empty(), "{drain:?}");
-            assert!(
-                drain.response_frames_received >= 1,
-                "joiner must receive the owner text: {drain:?}"
-            );
-        }
-        let owner_receipt_drain =
-            owner_service.drain_text_control_inbound_frames(Some(2_000), Some(1_000));
-        assert!(
-            owner_receipt_drain.failures.is_empty(),
-            "{owner_receipt_drain:?}"
+        assert_eq!(owner_pump.frames_sent, 0, "{owner_pump:?}");
+        assert!(owner_pump.failures.is_empty(), "{owner_pump:?}");
+        assert_eq!(
+            owner_pump.metrics.label,
+            "waiting-provider-peer-advertisement"
         );
-        assert!(
-            owner_receipt_drain.response_frames_received >= 1,
-            "owner must receive joiner receipts: {owner_receipt_drain:?}"
-        );
-        owner_service
+        assert!(owner_service
             .state
             .text_control_outbox
-            .retain(|record| !(record.state_key == "pending" && record.target == target));
+            .iter()
+            .any(|record| {
+                record.target == target
+                    && record.state_key == "pending"
+                    && matches!(record.frame, TextControlFrameView::Envelope { .. })
+            }));
 
         // The owner revokes one member mid-session; the governance frame
         // crosses the lane and the revoked member's state flips.

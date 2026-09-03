@@ -43,7 +43,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compatibility_exports_rank_and_hop_limit() {
+    fn crate_root_exports_rank_and_hop_limit() {
         let peers = rank(vec![
             RelayMetrics {
                 peer_id: "bad".into(),

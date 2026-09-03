@@ -739,7 +739,7 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
         if args.control_lane {
             start_and_attach_control_lane(args)?;
         } else {
-            let attached = start_and_attach_runtime_derived_or_relay()?;
+            let attached = start_and_attach_provider_runtime()?;
             if !attached {
                 return Err("manual admission key-package route did not attach".into());
             }
@@ -773,7 +773,7 @@ fn run_joiner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Erro
         start_and_attach_control_lane(args)?;
         (false, true)
     } else {
-        start_and_attach_runtime_derived_or_relay()?;
+        start_and_attach_provider_runtime()?;
         (true, false)
     };
     let admission = if args.admission_mode == GroupAdmissionModeView::ManualApproval {
@@ -904,7 +904,7 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
         start_and_attach_control_lane(args)?;
         (false, true)
     } else {
-        start_and_attach_runtime_derived_or_relay()?;
+        start_and_attach_provider_runtime()?;
         (true, false)
     };
     let group = app_state()
@@ -1094,7 +1094,7 @@ fn run_owner(args: &Args) -> Result<serde_json::Value, Box<dyn std::error::Error
     }))
 }
 
-fn start_and_attach_runtime_derived_or_relay() -> Result<bool, Box<dyn std::error::Error>> {
+fn start_and_attach_provider_runtime() -> Result<bool, Box<dyn std::error::Error>> {
     let started = start_text_session(StartTextSessionRequest {
         scope_label: Some("g009-split-machine-app-flow".to_owned()),
         data_channel_probe: false,
@@ -1104,10 +1104,6 @@ fn start_and_attach_runtime_derived_or_relay() -> Result<bool, Box<dyn std::erro
     let attached =
         attach_text_control_transport_runtime(AttachTextControlTransportRuntimeRequest {
             session_id: None,
-            runtime_role: None,
-            local_peer_id: None,
-            remote_peer_id: None,
-            derive_from_state: true,
         });
     if let Some(error) = attached.last_command_error {
         return Err(format!(

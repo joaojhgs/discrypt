@@ -27,8 +27,8 @@ for (const token of [
   "nativeMedia.mic_gain_percent",
   "nativeMedia.app_output_volume_percent",
   "adjustRemoteParticipantVolumes",
-  "backendRuntimePeerIdFromCommitment",
-  "backend-derived-signed-group-bootstrap",
+  "runtimePeersFromAppState",
+  "persisted-runtime-peers",
   "voice-session-signaling",
   "media_runtime?.local_capture_active",
   "profile ready or trust setup screen",
@@ -88,21 +88,39 @@ for (const token of [
 }
 
 for (const token of [
-  "localGovernedGroupRole",
+  "hasCurrentAdvertisedRemoteGroupRuntimePeer",
   "voiceSignaling?.local_peer_id",
   "groupRuntimePeers.find",
-  "peer.role === localGroupPeerRole",
+  "peer.source !== \"sealed_provider_peer_advertisement_v1\"",
   "startNativeRustVoiceMediaSession",
 ]) {
   requireText("Discrypt UI native voice peer selection", ui, token);
 }
 
 for (const token of [
-  "voice_runtime_peer_boundary_missing",
-  "Voice signaling is ready with backend-derived runtime peer ids before SDP/ICE exchange",
+  "native_voice_runtime_peer_attachment",
+  "Voice signaling is ready with provider-advertised runtime peer ids before SDP/ICE exchange",
   "joined_session.signaling.local_peer_id",
+  "voice_join_without_remote_peer_waits_without_error",
 ]) {
   requireText("Discrypt backend native voice peer seeding", desktop, token);
+}
+
+if (desktop.includes("voice_runtime_peer_boundary_missing")) {
+  failures.push(
+    "Discrypt backend retains obsolete voice join failure for a temporarily absent remote peer",
+  );
+}
+
+for (const token of [
+  "backendRuntimePeerIdFromCommitment",
+  "backend-derived-signed-group-bootstrap",
+  "group-owner-runtime-peer",
+  "group-member-runtime-peer",
+]) {
+  if (harness.includes(token)) {
+    failures.push(`two-profile E2E harness retains obsolete runtime-peer derivation: ${token}`);
+  }
 }
 
 for (const token of [

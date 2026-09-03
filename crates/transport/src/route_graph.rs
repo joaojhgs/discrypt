@@ -239,16 +239,6 @@ impl GroupRouteGraph {
         })
     }
 
-    /// Build the legacy two-person graph shape used by existing pairwise flows.
-    pub fn two_person(
-        scope: RouteGraphScope,
-        local_peer_id: SignalingPeerId,
-        remote_peer_id: SignalingPeerId,
-        intent: RouteIntent,
-    ) -> Result<Self, TransportError> {
-        Self::new(scope, local_peer_id, [remote_peer_id], intent)
-    }
-
     /// Number of admitted remote peer edges.
     #[must_use]
     pub fn edge_count(&self) -> usize {
@@ -386,17 +376,15 @@ mod tests {
         let attempted_legs = match selected {
             FallbackLeg::Stun => vec![FallbackLeg::Stun],
             FallbackLeg::Turn => vec![FallbackLeg::Stun, FallbackLeg::Turn],
-            FallbackLeg::RelayOverlay => vec![FallbackLeg::RelayOverlay],
         };
         RouteReport {
             selected,
             endpoint: Endpoint::new(match selected {
                 FallbackLeg::Stun => "stun:direct.example:3478",
                 FallbackLeg::Turn => "turns:relay.example:5349",
-                FallbackLeg::RelayOverlay => "overlay:unsupported",
             }),
             attempted_legs,
-            ciphertext_only_relay_legs: selected != FallbackLeg::RelayOverlay,
+            ciphertext_only_relay_legs: true,
             limitation: "deterministic local-process route graph unit proof".to_owned(),
         }
     }
@@ -498,31 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn two_person_graph_round_trips_as_stable_json() -> Result<(), Box<dyn std::error::Error>> {
-        let graph = GroupRouteGraph::two_person(
-            scope()?,
-            peer(0)?,
-            peer(1)?,
-            RouteIntent::direct_webrtc(Some(route_report(FallbackLeg::Stun)))?,
-        )?;
-
-        let value = serde_json::to_value(&graph)?;
-        assert_eq!(
-            value.get("schema_version"),
-            Some(&serde_json::json!(ROUTE_GRAPH_SCHEMA_VERSION))
-        );
-        assert_eq!(
-            value.pointer("/edges/peer-01/intent/kind"),
-            Some(&serde_json::json!("direct_webrtc"))
-        );
-
-        let decoded: GroupRouteGraph = serde_json::from_value(value)?;
-        decoded.validate()?;
-        assert_eq!(decoded, graph);
-        Ok(())
-    }
-
-    #[test]
     fn rejects_unadmitted_duplicate_local_and_unconfigured_turn_edges() -> Result<(), TransportError>
     {
         let duplicate = GroupRouteGraph::new(
@@ -550,11 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_provider_or_overlay_route_report_as_application_route() -> Result<(), TransportError>
-    {
-        let overlay = RouteIntent::direct_webrtc(Some(route_report(FallbackLeg::RelayOverlay)));
-        assert!(overlay.is_err());
-
+    fn rejects_mismatched_route_report_as_application_route() -> Result<(), TransportError> {
         let mismatched_turn = RouteIntent::configured_turn_webrtc(
             Endpoint::new("turns:relay.example:5349"),
             Some(route_report(FallbackLeg::Stun)),

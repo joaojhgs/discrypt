@@ -14,7 +14,7 @@ platform keychain replacement.
     and confirms restart loads the same state through the `AppStore` boundary.
   - It scans DB, WAL, and temp sidecar paths for forbidden plaintext profile,
     message, and content-key bytes.
-  - It overwrites the store with malformed legacy JSON and requires load to fail
+  - It overwrites the store with malformed JSON and requires load to fail
     closed instead of silently reseeding application state.
   - It verifies secure delete fails until DB, WAL, and keychain material are all
     included in the deletion set.
@@ -51,5 +51,6 @@ cargo run -p discrypt-multinode-harness --quiet
 
 - The deterministic harness keychain is not an OS keychain and does not satisfy
   the platform-keychain checklist by itself.
-- Corrupt legacy JSON is rejected by the encrypted store gate; forward/backward
-  schema migrations remain covered by the storage migration lane.
+- Malformed persisted JSON is rejected by the encrypted store gate. Clean-v1
+  storage creates the current schema for an empty store and rejects any other
+  existing schema version.

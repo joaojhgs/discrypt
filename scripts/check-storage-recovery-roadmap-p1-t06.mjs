@@ -33,7 +33,7 @@ for (const token of [
 for (const token of [
   "No storage restore flow exists yet",
   "Discrypt preserves existing unreadable",
-  "leaves recovery/migration on the roadmap",
+  "requires an explicit reset before starting over",
   "No storage restore exists yet for a lost password",
 ]) {
   requireToken("storage UI copy", main, token);

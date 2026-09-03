@@ -142,7 +142,6 @@ fn failure_flow_reports_no_viable_path_when_direct_and_turn_fail() {
     };
     let unreachable_nat = SimulatedNat {
         stun_available: false,
-        overlay_available: false,
         turn_available: false,
     };
 

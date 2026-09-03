@@ -8,13 +8,13 @@
 
 ## Hardened Contract
 - G009 artifacts now use schema `discrypt.g009.split_machine_app_flow.v2`.
-- Manual approval is the default admission mode; `--admission-mode automatic` remains available for compatibility.
+- Manual approval is the default harness admission mode; `--admission-mode automatic` covers the automatic signed-admission path.
 - Owner evidence records manual pending-request approval, Welcome/decision pump, protected owner text, staff promotion, revoke, presence, voice proof classification, and no provider application relay fallback.
 - Joiner evidence records pending-before-approval state, pre-approval send denial, post-approval role state, protected joiner text, received owner text, staff promotion, revoked state, revoked send denial, presence, voice proof classification, and no provider application relay fallback.
 - Voice proof is classified as `remote_media_transport`, `local_native_capture_boundary`, `voice_session_without_media_capture`, or `no_voice_session` so local capture cannot be mistaken for remote media proof.
 - Provider application relay fallback is explicitly recorded as disabled; allowed delivery remains direct WebRTC DataChannel or configured TURN-backed WebRTC DataChannel.
 - The default `owner` and `joiner` roles remain live-provider/split-machine roles. They require a configured provider/WebRTC runtime and a peer online in the same scope; default builds do not synthesize runtime success.
-- `--role local-pair` is a harness-only fallback for runtimes without SSH/provider setup. It drives two isolated app-state files through backend text/control frame handlers and writes separate owner/joiner artifacts without claiming public provider readiness.
+- `--role local-pair` is a harness-only local proof mode for runtimes without SSH/provider setup. It drives two isolated app-state files through backend text/control frame handlers and writes separate owner/joiner artifacts without claiming public provider readiness.
 
 ## Local Verification
 - `RUSTUP_TOOLCHAIN=1.89.0 cargo fmt --check` passed.

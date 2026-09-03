@@ -206,6 +206,11 @@ export type DmRuntimePeerView = {
   role: string;
   is_local: boolean;
   source: string;
+  profile_id: string;
+  signer_public_key_hex: string;
+  device_id: string;
+  last_seen_at: string;
+  presence_expires_at: string;
 };
 
 export type DirectConversationView = {
@@ -260,6 +265,7 @@ export type GroupMemberView = {
   role: GroupRoleView;
   status: "online" | "offline" | "unknown" | "revoked" | string;
   signer_public_key_hex?: string | null;
+  runtime_peer_id?: string | null;
   joined_at: string;
   last_seen_at?: string | null;
   presence_expires_at?: string | null;
@@ -283,6 +289,7 @@ export type GroupAdmissionRequestView = {
   device_name?: string | null;
   member_identity: string;
   signer_public_key_hex: string;
+  identity_signer_public_key_hex: string;
   key_package: number[];
   status: "pending" | "approved" | "refused" | "superseded" | string;
   requested_at: string;
@@ -309,9 +316,10 @@ export type GroupGovernanceLogEntryView = {
 export type GroupView = {
   group_id: string;
   name: string;
-  /** Legacy/current-member role label; backend-authorized role state lives in members. */
+  /** Current-member role label; backend-authorized role state lives in members. */
   role: string;
   channels: ChannelStateView[];
+  channel_schema_epoch: number;
   members?: GroupMemberView[];
   role_policy?: GroupRolePolicyView;
   admission_requests?: GroupAdmissionRequestView[];
@@ -857,6 +865,11 @@ export type PublishGroupPresenceRequest = {
   ttl_seconds?: number | null;
 };
 
+export type PublishDmPresenceRequest = {
+  dm_id: string;
+  ttl_seconds?: number | null;
+};
+
 export type GroupAdmissionDecisionRequest = ApproveGroupAdmissionRequest & {
   reason?: string | null;
 };
@@ -942,10 +955,6 @@ export type StopTextSessionRequest = {
 
 export type AttachTextControlTransportRuntimeRequest = {
   session_id?: string | null;
-  runtime_role?: "offerer" | "answerer" | null;
-  local_peer_id?: string | null;
-  remote_peer_id?: string | null;
-  derive_from_state?: boolean;
 };
 
 export type SendMessageRequest = {
@@ -1134,7 +1143,6 @@ export type TextControlFrameView =
   | {
       kind: "open_mls_admission_welcome";
       group_id: string;
-      owner_signer_public_key_hex: string;
       member_signer_public_key_hex: string;
       welcome_bytes: number[];
       epoch: number;
@@ -1609,6 +1617,7 @@ function ensureGroupGovernance(
       role: localRole,
       status: "unknown",
       signer_public_key_hex: null,
+      runtime_peer_id: null,
       joined_at: now,
       last_seen_at: null,
       presence_expires_at: null,
@@ -1638,6 +1647,7 @@ function ensureGroupGovernance(
       summary: `Initialized ${group.name} governance state`,
     });
   }
+  group.runtime_peers = groupRuntimePeers(group, state);
   return group;
 }
 
@@ -1848,7 +1858,9 @@ function syncSnapshot(state: AppState): AppState {
     channel:
       state.groups
         .flatMap((group) => group.channels)
-        .find((channel) => channel.channel_id === message.target.channel_id)
+        .find(
+          (channel) => channel.channel_id === message.target.channel_id,
+        )
         ?.name ??
       message.target.dm_id ??
       "#general",
@@ -2473,13 +2485,15 @@ function initialGroupMember(
   role: GroupRoleView,
   joinedAt: string,
 ): GroupMemberView {
+  const memberId = localUserId(state);
   return {
-    member_id: localUserId(state),
+    member_id: memberId,
     display_name: localDisplayName(state),
     device_id: localDeviceId(state),
     role,
     status: "unknown",
     signer_public_key_hex: null,
+    runtime_peer_id: null,
     joined_at: joinedAt,
     last_seen_at: null,
     presence_expires_at: null,
@@ -2525,38 +2539,14 @@ function initialGroupGovernanceLog(
 }
 
 function ensureGroupGovernanceDefaults(state: AppState): void {
-  const now = new Date().toISOString();
   for (const group of state.groups) {
-    const role = normalizeGroupRole(group.role);
-    group.members ??= [initialGroupMember(state, role, now)];
-    if (group.members.length === 0) {
-      group.members.push(initialGroupMember(state, role, now));
-    }
-    group.role_policy ??= initialGroupRolePolicy(
-      state,
-      "automatic_when_authorized_online",
-      now,
-    );
-    group.role_policy.policy_epoch ||= 1;
-    group.admission_requests ??= [];
-    group.governance_log ??= initialGroupGovernanceLog(
-      state,
-      group.group_id,
-      group.members.find((member) => member.member_id === localUserId(state))?.role ??
-        role,
-      now,
-    );
-    if (group.governance_log.length === 0) {
-      group.governance_log.push(
-        ...initialGroupGovernanceLog(state, group.group_id, role, now),
-      );
-    }
-    const localMember = group.members.find(
+    const localMember = (group.members ?? []).find(
       (member) => member.member_id === localUserId(state) && !member.revoked_at,
     );
     if (localMember) {
       group.role = normalizeGroupRole(localMember.role);
     }
+    group.runtime_peers = groupRuntimePeers(group, state);
   }
 }
 
@@ -2759,12 +2749,29 @@ function decodeBase64UrlJson(payload: string): Record<string, any> | null {
   }
 }
 
+function encodeBase64UrlJson(value: Record<string, unknown>): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return globalThis
+    .btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
 function hexFromByteArray(value: unknown): string {
   return Array.isArray(value)
     ? value
         .map((byte) => Number(byte).toString(16).padStart(2, "0"))
         .join("")
     : "";
+}
+
+function strictString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed && trimmed === value ? value : null;
 }
 
 function endpointPolicyName(value: unknown): string {
@@ -2807,8 +2814,7 @@ export function defaultSignalingEndpointForAdapter(
       "mqtts://broker.emqx.io:8883";
   }
   if (adapterKind === "nostr") {
-    return import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
-      "wss://relay.damus.io";
+    return defaultNostrEndpoints()[0];
   }
   if (adapterKind === "ipfs_pubsub") {
     const configured =
@@ -2823,8 +2829,19 @@ export function defaultSignalingEndpointForAdapter(
   if (adapterKind === "discrypt_quic_rendezvous") {
     return import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT ?? "";
   }
-  return import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
-    "wss://relay.damus.io";
+  return defaultNostrEndpoints()[0];
+}
+
+function defaultNostrEndpoints(): string[] {
+  const configured = String(
+    import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINTS ?? "",
+  )
+    .split(",")
+    .map((endpoint) => endpoint.trim())
+    .filter(Boolean);
+  return configured.length
+    ? [...new Set(configured)]
+    : ["wss://relay.damus.io", "wss://nos.lol"];
 }
 
 function defaultSignalingEndpoint(connectivity?: ConnectivityPolicyView): string {
@@ -2858,16 +2875,33 @@ function signalingProfileForEndpoint(
   endpoint: string,
   profileId = `${adapterKind}-custom`,
 ): SignalingProfileView {
+  return signalingProfileForEndpoints(
+    scopeCommitment,
+    adapterKind,
+    [endpoint],
+    profileId,
+  );
+}
+
+function signalingProfileForEndpoints(
+  scopeCommitment: string,
+  adapterKind: string,
+  endpoints: string[],
+  profileId: string,
+): SignalingProfileView {
+  const normalizedEndpoints = [
+    ...new Set(endpoints.map((endpoint) => endpoint.trim()).filter(Boolean)),
+  ];
   return {
     profile_id: profileId,
     adapter_kind: adapterKind,
-    endpoints: [endpoint],
+    endpoints: normalizedEndpoints,
     room_topic_commitment: hashCommitment(
       "discrypt-rendezvous-topic-commitment-v1",
       [scopeCommitment, adapterKind],
     ),
     trust_fingerprint: stableHash(
-      `external-signaling-endpoint-fingerprint-v1:${endpoint}`,
+      `external-signaling-endpoint-fingerprint-v1:${normalizedEndpoints.join(",")}`,
     ),
     ttl_seconds: 300,
     metadata_posture: "hashed_topic",
@@ -2878,12 +2912,12 @@ function signalingProfileForEndpoint(
     backoff_multiplier: 2,
     backoff_max_attempts: 5,
     provider_policy_version: 1,
-    endpoint_allowlist_commitments: [
+    endpoint_allowlist_commitments: normalizedEndpoints.map((endpoint) =>
       hashCommitment("discrypt-provider-endpoint-allowlist-v1", [
         adapterKind,
         endpoint,
       ]),
-    ],
+    ),
     provider_rotation_policy:
       "rotate by issuing a fresh signed invite/connectivity policy when endpoint trust, rate limits, or availability changes",
     capabilities: [
@@ -2895,104 +2929,70 @@ function signalingProfileForEndpoint(
 }
 
 function defaultSignalingProfiles(scopeCommitment: string): SignalingProfileView[] {
-  const endpoints: Array<[string, string]> = [
-    [
+  const profiles = [
+    signalingProfileForEndpoints(
+      scopeCommitment,
       "nostr",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINT ??
-        "wss://relay.damus.io",
-    ],
-    [
+      defaultNostrEndpoints(),
+      "nostr-default",
+    ),
+    signalingProfileForEndpoint(
+      scopeCommitment,
       "mqtt",
       import.meta.env.VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT ??
         "mqtts://broker.emqx.io:8883",
-    ],
+      "mqtt-default",
+    ),
   ];
   if (import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT) {
-    endpoints.push([
-      "ipfs_pubsub",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT,
-    ]);
+    profiles.push(
+      signalingProfileForEndpoint(
+        scopeCommitment,
+        "ipfs_pubsub",
+        import.meta.env.VITE_DISCRYPT_DEFAULT_IPFS_BOOTSTRAP_ENDPOINT,
+        "ipfs_pubsub-default",
+      ),
+    );
   }
   if (import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT) {
-    endpoints.push([
-      "discrypt_quic_rendezvous",
-      import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT,
-    ]);
+    profiles.push(
+      signalingProfileForEndpoint(
+        scopeCommitment,
+        "discrypt_quic_rendezvous",
+        import.meta.env.VITE_DISCRYPT_DEFAULT_QUIC_RENDEZVOUS_ENDPOINT,
+        "discrypt_quic_rendezvous-default",
+      ),
+    );
   }
-  return endpoints.map(([adapterKind, endpoint]) =>
-    signalingProfileForEndpoint(
-      scopeCommitment,
-      adapterKind,
-      endpoint,
-      `${adapterKind}-default`,
-    ),
-  );
-}
-
-function runtimePeerIdFromCommitment(label: string, commitment: string): string {
-  return `peer-${hashCommitment("discrypt-runtime-peer-id-v1", [label, commitment]).slice(0, 16)}`;
-}
-
-function dmRuntimePeers(
-  connectivity: ConnectivityPolicyView | null | undefined,
-  localRole: "inviter" | "reply" | string,
-): DmRuntimePeerView[] {
-  const bootstrap = connectivity?.dm_bootstrap;
-  if (!bootstrap) return [];
-  const inviterPeerId = runtimePeerIdFromCommitment(
-    "dm-inviter-runtime-peer",
-    bootstrap.inviter_identity_commitment,
-  );
-  const replyPeerId = runtimePeerIdFromCommitment(
-    "dm-reply-runtime-peer",
-    bootstrap.reply_rendezvous_commitment,
-  );
-  const localIsInviter = localRole === "inviter";
-  return [
-    {
-      peer_id: inviterPeerId,
-      role: "inviter",
-      is_local: localIsInviter,
-      source: "signed_dm_bootstrap_v1",
-    },
-    {
-      peer_id: replyPeerId,
-      role: "reply",
-      is_local: !localIsInviter,
-      source: "signed_dm_bootstrap_v1",
-    },
-  ];
+  return profiles;
 }
 
 function groupRuntimePeers(
-  connectivity: ConnectivityPolicyView | null | undefined,
-  localRole: "owner" | "member" | string,
+  group: Pick<GroupView, "members">,
+  state: AppState,
 ): GroupRuntimePeerView[] {
-  const bootstrap = connectivity?.group_bootstrap;
-  if (!bootstrap) return [];
-  const ownerPeerId = runtimePeerIdFromCommitment(
-    "group-owner-runtime-peer",
-    bootstrap.group_identity_commitment,
-  );
-  const memberPeerId = runtimePeerIdFromCommitment(
-    "group-member-runtime-peer",
-    `${bootstrap.role_admission_policy_commitment}:${bootstrap.channel_policy_commitment}`,
-  );
-  const localIsOwner = localRole === "owner";
-  return [
-    {
-      peer_id: ownerPeerId,
-      role: "owner",
-      is_local: localIsOwner,
-      source: "signed_group_bootstrap_v1",
-    },
-    {
-      peer_id: memberPeerId,
-      role: "member",
-      is_local: !localIsOwner,
-      source: "signed_group_bootstrap_v1",
-    },
-  ];
+  const localId = localUserId(state);
+  return (group.members ?? [])
+    .filter((member) => {
+      const peerId = member.runtime_peer_id?.trim();
+      return Boolean(
+        peerId &&
+          member.status !== "pending" &&
+          member.status !== "revoked" &&
+          !member.revoked_at,
+      );
+    })
+    .map((member) => ({
+      peer_id: member.runtime_peer_id?.trim() ?? "",
+      role: member.role,
+      is_local: member.member_id === localId,
+      source:
+        member.route_evidence?.evidence_source ??
+        "admitted_group_member_runtime_peer_id_v1",
+      member_id: member.member_id,
+      device_id: member.device_id ?? null,
+      route_evidence: member.route_evidence ?? null,
+    }));
 }
 
 function selectedSignalingProfiles(
@@ -3112,12 +3112,12 @@ function retargetSignalingProfiles(
 ): SignalingProfileView[] {
   const retargeted = profiles
     .map((profile) => {
-      const endpoint = profile.endpoints.find((item) => item.trim());
-      if (!endpoint) return null;
-      return signalingProfileForEndpoint(
+      const endpoints = profile.endpoints.filter((item) => item.trim());
+      if (!endpoints.length) return null;
+      return signalingProfileForEndpoints(
         scope,
         profile.adapter_kind,
-        endpoint.trim(),
+        endpoints,
         `${profile.adapter_kind}-default`,
       );
     })
@@ -3206,37 +3206,53 @@ function normalizeConnectivityPolicyOverride(
 
 
 function productionInviteLink(metadata: ParsedInviteMetadata): string {
-  const query = new URLSearchParams({
-    endpoint: metadata.signalingEndpoint,
-    policy: metadata.endpointPolicy,
-    trust_fp: metadata.signalingTrustFingerprint,
-    trust: metadata.signalingTrustStatus,
-    commitment: metadata.roomSecretHash,
-    exp: metadata.expiresAt,
-    max: String(metadata.maxUses),
-    kind: metadata.connectivity.invite_kind,
-    scope: metadata.connectivity.scope_id_commitment,
-  });
-  if (metadata.groupId) query.set("gid", metadata.groupId);
+  const bootstrap: Record<string, unknown> = {
+    invite_kind: metadata.connectivity.invite_kind,
+    scope_id_commitment: metadata.connectivity.scope_id_commitment,
+    signaling_profiles: metadata.connectivity.signaling_profiles,
+  };
+  if (metadata.groupId) bootstrap.group_id = metadata.groupId;
+  if (metadata.groupName) bootstrap.group_name = metadata.groupName;
   const groupBootstrap = metadata.connectivity.group_bootstrap;
   if (groupBootstrap) {
-    query.set("group_identity", groupBootstrap.group_identity_commitment);
-    query.set("role_policy", groupBootstrap.role_admission_policy_commitment);
-    query.set("channel_policy", groupBootstrap.channel_policy_commitment);
+    bootstrap.group_identity_commitment =
+      groupBootstrap.group_identity_commitment;
+    bootstrap.role_admission_policy_commitment =
+      groupBootstrap.role_admission_policy_commitment;
+    bootstrap.channel_policy_commitment =
+      groupBootstrap.channel_policy_commitment;
   }
   const dmBootstrap = metadata.connectivity.dm_bootstrap;
   if (dmBootstrap) {
-    query.set("dm_inviter", dmBootstrap.inviter_identity_commitment);
-    query.set("dm_contact", dmBootstrap.contact_token_commitment);
-    query.set("dm_reply", dmBootstrap.reply_rendezvous_commitment);
+    bootstrap.dm_inviter_identity_commitment =
+      dmBootstrap.inviter_identity_commitment;
+    bootstrap.dm_contact_token_commitment = dmBootstrap.contact_token_commitment;
+    bootstrap.dm_reply_rendezvous_commitment =
+      dmBootstrap.reply_rendezvous_commitment;
   }
-  for (const endpoint of metadata.iceStunServers) {
-    query.append("stun", endpoint);
-  }
-  for (const server of metadata.iceTurnServers) {
-    query.append("turn", server.endpoint);
-  }
-  return `discrypt://join/v1/${metadata.inviteKey}?${query.toString()}`;
+  const descriptor = {
+    schema_version: "discrypt.signed_invite_descriptor.v1",
+    invite_key: metadata.inviteKey,
+    room_secret_commitment_hex: metadata.roomSecretHash,
+    signaling_metadata: {
+      signaling_endpoint: metadata.signalingEndpoint,
+      endpoint_policy: metadata.endpointPolicy,
+      trust: {
+        signaling_fingerprint: metadata.signalingTrustFingerprint,
+        trust_status: metadata.signalingTrustStatus,
+      },
+      ice_endpoint_policy: {
+        stun_servers: metadata.iceStunServers,
+        turn_servers: metadata.iceTurnServers,
+      },
+    },
+    bootstrap_metadata: bootstrap,
+    expires_at: metadata.expiresAt,
+    max_uses: metadata.maxUses,
+    consumed_uses: metadata.consumedUses,
+    revoked: metadata.revoked,
+  };
+  return `discrypt://join/v1/${metadata.inviteKey}?d=${encodeBase64UrlJson(descriptor)}`;
 }
 
 function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
@@ -3246,103 +3262,121 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
   const inviteKey = path.split("/").filter(Boolean).at(-1);
   if (!inviteKey) return null;
   const params = new URLSearchParams(query);
-  const descriptor = params.get("d") ? decodeBase64UrlJson(params.get("d") ?? "") : null;
+  const descriptorPayload = params.get("d");
+  if (!descriptorPayload) return null;
+  const descriptor = decodeBase64UrlJson(descriptorPayload);
+  if (!descriptor) return null;
+  if (
+    descriptor.schema_version !== "discrypt.signed_invite_descriptor.v1" ||
+    strictString(descriptor.invite_key) !== inviteKey
+  ) {
+    return null;
+  }
   const descriptorSignaling = descriptor?.signaling_metadata ?? {};
   const descriptorTrust = descriptorSignaling.trust ?? {};
   const descriptorIce = descriptorSignaling.ice_endpoint_policy ?? {};
   const descriptorBootstrap = descriptor?.bootstrap_metadata ?? {};
-  const signalingEndpoint =
-    params.get("endpoint") ?? descriptorSignaling.signaling_endpoint ?? "";
+  const signalingEndpoint = strictString(descriptorSignaling.signaling_endpoint);
   const endpointPolicy = endpointPolicyName(
-    params.get("policy") ?? descriptorSignaling.endpoint_policy ?? "",
+    descriptorSignaling.endpoint_policy,
   );
   const signalingTrustFingerprint =
-    params.get("trust_fp") ?? descriptorTrust.signaling_fingerprint ?? "";
-  const signalingTrustStatus =
-    params.get("trust") ?? descriptorTrust.trust_status ?? "";
+    strictString(descriptorTrust.signaling_fingerprint) ?? "";
+  const signalingTrustStatus = strictString(descriptorTrust.trust_status);
+  const scope = strictString(descriptorBootstrap.scope_id_commitment);
+  const roomSecretHash =
+    strictString(descriptor.room_secret_commitment_hex) ??
+    hexFromByteArray(descriptor?.room_secret_commitment);
+  const expiresAt = strictString(descriptor.expires_at);
+  const maxUses = Number(descriptor.max_uses);
   if (
     !signalingEndpoint ||
     !endpointPolicy ||
     !/^[a-fA-F0-9]{64}$/.test(signalingTrustFingerprint) ||
-    !signalingTrustStatus
+    !signalingTrustStatus ||
+    !scope ||
+    !roomSecretHash ||
+    !expiresAt ||
+    !Number.isFinite(maxUses) ||
+    maxUses < 1 ||
+    !Array.isArray(descriptorBootstrap.signaling_profiles) ||
+    descriptorBootstrap.signaling_profiles.length === 0
   ) {
     return null;
   }
-  const inviteKind =
-    params.get("kind") === "dm_contact" || descriptorBootstrap.invite_kind === "dm_contact"
-      ? "dm_contact"
-      : "group_join";
-  const scope =
-    params.get("scope") ??
-    descriptorBootstrap.scope_id_commitment ??
-    hashCommitment("discrypt-legacy-invite-scope-commitment-v1", [inviteKey]);
-  const iceStunServers =
-    params.getAll("stun").length > 0
-      ? params.getAll("stun")
-      : Array.isArray(descriptorIce.stun_servers)
-        ? descriptorIce.stun_servers
-        : [];
+  const inviteKind = strictString(descriptorBootstrap.invite_kind);
+  if (inviteKind !== "dm_contact" && inviteKind !== "group_join") return null;
+  const iceStunServers = Array.isArray(descriptorIce.stun_servers)
+    ? descriptorIce.stun_servers
+        .map((server: unknown) => strictString(server))
+        .filter(Boolean) as string[]
+    : [];
   const iceTurnServers =
-    params.getAll("turn").length > 0
-      ? params.getAll("turn").map((endpoint) => ({
-          endpoint,
-          credential_declared: true,
-          credential_expires_at: null,
-        }))
-      : Array.isArray(descriptorIce.turn_servers)
-        ? descriptorIce.turn_servers.map((server: any) => ({
-            endpoint: typeof server === "string" ? server : String(server?.endpoint ?? ""),
+    Array.isArray(descriptorIce.turn_servers)
+      ? descriptorIce.turn_servers
+          .map((server: any) => ({
+            endpoint:
+              typeof server === "string" ? server : String(server?.endpoint ?? ""),
             credential_declared: Boolean(
               server?.username ?? server?.credential ?? server?.credential_expires_at,
             ),
             credential_expires_at: server?.credential_expires_at ?? null,
           }))
-        : [];
+          .filter((server: IceTurnServerView) => server.endpoint.trim())
+      : [];
   const connectivity =
     inviteKind === "dm_contact"
       ? {
           ...dmConnectivityPolicy(`dm-${inviteKey}`, scope),
           scope_id_commitment: scope,
+          signaling_profiles: descriptorBootstrap.signaling_profiles,
           ice_stun_servers: iceStunServers,
           ice_turn_servers: iceTurnServers,
-          dm_bootstrap:
-            params.get("dm_inviter") && params.get("dm_contact") && params.get("dm_reply")
-              ? {
-                  inviter_identity_commitment: params.get("dm_inviter") ?? "",
-                  contact_token_commitment: params.get("dm_contact") ?? "",
-                  reply_rendezvous_commitment: params.get("dm_reply") ?? "",
-                }
-              : dmConnectivityPolicy(`dm-${inviteKey}`, scope).dm_bootstrap,
+          dm_bootstrap: {
+            inviter_identity_commitment:
+              strictString(descriptorBootstrap.dm_inviter_identity_commitment) ?? "",
+            contact_token_commitment:
+              strictString(descriptorBootstrap.dm_contact_token_commitment) ?? "",
+            reply_rendezvous_commitment:
+              strictString(descriptorBootstrap.dm_reply_rendezvous_commitment) ?? "",
+          },
         }
       : {
           ...groupConnectivityPolicy(`group-${inviteKey}`),
           scope_id_commitment: scope,
+          signaling_profiles: descriptorBootstrap.signaling_profiles,
           ice_stun_servers: iceStunServers,
           ice_turn_servers: iceTurnServers,
-          group_bootstrap:
-            params.get("group_identity") &&
-            params.get("role_policy") &&
-            params.get("channel_policy")
-              ? {
-                  group_identity_commitment: params.get("group_identity") ?? "",
-                  role_admission_policy_commitment: params.get("role_policy") ?? "",
-                  channel_policy_commitment: params.get("channel_policy") ?? "",
-                }
-              : groupConnectivityPolicy(`group-${inviteKey}`).group_bootstrap,
+          group_bootstrap: {
+            group_identity_commitment:
+              strictString(descriptorBootstrap.group_identity_commitment) ?? "",
+            role_admission_policy_commitment:
+              strictString(descriptorBootstrap.role_admission_policy_commitment) ?? "",
+            channel_policy_commitment:
+              strictString(descriptorBootstrap.channel_policy_commitment) ?? "",
+          },
         };
   if (
-    inviteKind === "group_join" &&
-    Array.isArray(descriptorBootstrap.signaling_profiles) &&
-    descriptorBootstrap.signaling_profiles.length > 0
+    inviteKind === "dm_contact" &&
+    (!connectivity.dm_bootstrap?.inviter_identity_commitment ||
+      !connectivity.dm_bootstrap.contact_token_commitment ||
+      !connectivity.dm_bootstrap.reply_rendezvous_commitment)
   ) {
-    connectivity.signaling_profiles = descriptorBootstrap.signaling_profiles;
+    return null;
+  }
+  if (
+    inviteKind === "group_join" &&
+    (!connectivity.group_bootstrap?.group_identity_commitment ||
+      !connectivity.group_bootstrap.role_admission_policy_commitment ||
+      !connectivity.group_bootstrap.channel_policy_commitment)
+  ) {
+    return null;
   }
   return {
     inviteKey,
-    groupId: params.get("gid"),
-    groupName: descriptor ? null : params.get("gname") ?? params.get("name"),
-    roomSecretHash:
-      params.get("commitment") ?? hexFromByteArray(descriptor?.room_secret_commitment),
+    groupId: strictString(descriptorBootstrap.group_id),
+    groupName: strictString(descriptorBootstrap.group_name),
+    roomSecretHash,
     signalingEndpoint,
     signalingTrustFingerprint,
     signalingTrustStatus,
@@ -3350,10 +3384,10 @@ function parseInviteMetadata(inviteCode: string): ParsedInviteMetadata | null {
     iceStunServers,
     iceTurnServers,
     connectivity,
-    expiresAt: params.get("exp") ?? descriptor?.expires_at ?? "",
-    maxUses: Number(params.get("max") ?? descriptor?.max_uses ?? 1) || 1,
+    expiresAt,
+    maxUses,
     consumedUses: Number(descriptor?.consumed_uses ?? 0) || 0,
-    revoked: Boolean(descriptor?.revocation_event_id),
+    revoked: Boolean(descriptor?.revoked ?? descriptor?.revocation_event_id),
   };
 }
 
@@ -3387,52 +3421,6 @@ function mutateFallback(update: (state: AppState) => void): AppState {
 
 export function commandErrorToAction(error: CommandErrorView | null): string {
   return error?.recovery_hint ?? "";
-}
-
-function localGroupMember(role: GroupRoleView): GroupMemberView {
-  const memberId = localUserId(fallbackState);
-  return {
-    member_id: memberId,
-    display_name: fallbackState.profile?.display_name ?? "Local member",
-    device_id: fallbackState.profile?.device_name ?? null,
-    role,
-    status: "offline",
-    signer_public_key_hex: null,
-    joined_at: new Date().toISOString(),
-    last_seen_at: null,
-    presence_expires_at: null,
-    revoked_at: null,
-    revoked_by: null,
-  };
-}
-
-function ensureFallbackGroupGovernanceDefaults(group: GroupView): void {
-  group.members ??= [localGroupMember((group.role as GroupRoleView) || "member")];
-  if (!group.members.some((member) => member.member_id === localUserId(fallbackState))) {
-    group.members.push(localGroupMember((group.role as GroupRoleView) || "member"));
-  }
-  group.governance_log ??= [
-    {
-      event_id: `fallback-governance-${group.group_id}`,
-      group_id: group.group_id,
-      event_kind: "governance.defaults_restored",
-      actor_member_id: localUserId(fallbackState),
-      target_member_id: null,
-      request_id: null,
-      role_before: null,
-      role_after: null,
-      created_at: new Date().toISOString(),
-      summary: "Restored fallback governance roster defaults",
-    },
-  ];
-}
-
-function fallbackLocalRoleForGroup(group: GroupView): GroupRoleView | null {
-  ensureFallbackGroupGovernanceDefaults(group);
-  const member = group.members?.find(
-    (item) => item.member_id === localUserId(fallbackState) && item.status !== "revoked",
-  );
-  return member?.role ?? null;
 }
 
 function governanceEntry(
@@ -3585,27 +3573,14 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
     );
     const createdAt = new Date().toISOString();
     const role: GroupRoleView = "member";
+    const member = initialGroupMember(fallbackState, role, createdAt);
     fallbackState.groups.push({
       group_id: groupId,
       name: room,
       role: "member",
-      channels: [
-        {
-          channel_id: `${groupId}-general`,
-          name: "#general",
-          kind: "Text",
-          retention_status: "7 days",
-          connectivity: null,
-        },
-        {
-          channel_id: `${groupId}-voice`,
-          name: "Voice Lobby",
-          kind: "Voice",
-          retention_status: "session",
-          connectivity: null,
-        },
-      ],
-      members: [initialGroupMember(fallbackState, role, createdAt)],
+      channels: [],
+      channel_schema_epoch: 0,
+      members: [member],
       role_policy: initialGroupRolePolicy(
         fallbackState,
         "automatic_when_authorized_online",
@@ -3618,7 +3593,7 @@ function applyFallbackAccountRecovery(request: RecoverUserRequest): void {
         role,
         createdAt,
       ),
-      runtime_peers: groupRuntimePeers(connectivity, "member"),
+      runtime_peers: groupRuntimePeers({ members: [member] }, fallbackState),
       connectivity,
     });
   }
@@ -3664,14 +3639,6 @@ export async function exportDiagnosticsLog(): Promise<string> {
       2,
     );
   });
-}
-
-export async function loadCompatibilityAppSnapshot(): Promise<AppSnapshot> {
-  return invokeOrFallback<AppSnapshot>(
-    "app_snapshot",
-    undefined,
-    () => cloneState(syncSnapshot(fallbackState)).snapshot,
-  );
 }
 
 export async function configureStorageSecurity(
@@ -3944,12 +3911,14 @@ export async function recoverUser(
           const connectivity = groupConnectivityPolicy(groupId);
           const createdAt = new Date().toISOString();
           const role: GroupRoleView = "member";
+          const member = initialGroupMember(state, role, createdAt);
           state.groups.push({
             group_id: groupId,
             name,
             role: "member",
-            channels: defaultGroupChannels(),
-            members: [initialGroupMember(state, role, createdAt)],
+            channels: [],
+            channel_schema_epoch: 0,
+            members: [member],
             role_policy: initialGroupRolePolicy(
               state,
               "automatic_when_authorized_online",
@@ -3962,7 +3931,7 @@ export async function recoverUser(
               role,
               createdAt,
             ),
-            runtime_peers: groupRuntimePeers(connectivity, "member"),
+            runtime_peers: groupRuntimePeers({ members: [member] }, state),
             connectivity,
           });
         }
@@ -4211,7 +4180,7 @@ export async function setConnectivityPolicy(
             dm.connectivity ?? dmConnectivityPolicy(dm.dm_id, dm.participant_id),
             request,
           );
-          dm.runtime_peers = dmRuntimePeers(policy, "inviter");
+          dm.runtime_peers = [];
           dm.connectivity = policy;
           pushEvent(state, "connectivity.policy_saved", `Updated connectivity for DM ${dm.display_name}`);
           return;
@@ -4241,8 +4210,8 @@ export async function setConnectivityPolicy(
           group.connectivity ?? groupConnectivityPolicy(group.group_id),
           request,
         );
-        group.runtime_peers = groupRuntimePeers(policy, group.role);
         group.connectivity = policy;
+        group.runtime_peers = groupRuntimePeers(group, state);
         pushEvent(state, "connectivity.policy_saved", `Updated connectivity for group ${group.name}`);
       } catch (error) {
         pushCommandError(
@@ -4277,7 +4246,7 @@ export async function startDm(request: StartDmRequest): Promise<AppState> {
           display_name: displayName,
           local_only_copy:
             "Local DM; remote delivery is not claimed until backend evidence is available",
-          runtime_peers: dmRuntimePeers(connectivity, "inviter"),
+          runtime_peers: [],
           connectivity,
         });
       }
@@ -4310,12 +4279,14 @@ export async function createGroup(
         }
         const createdAt = new Date().toISOString();
         const role: GroupRoleView = "owner";
+        const member = initialGroupMember(state, role, createdAt);
         state.groups.push({
           group_id: groupId,
           name,
           role: "owner",
           channels: defaultGroupChannels(),
-          members: [initialGroupMember(state, role, createdAt)],
+          channel_schema_epoch: 1,
+          members: [member],
           role_policy: initialGroupRolePolicy(
             state,
             request.admission_mode,
@@ -4328,7 +4299,7 @@ export async function createGroup(
             role,
             createdAt,
           ),
-          runtime_peers: groupRuntimePeers(connectivity, "owner"),
+          runtime_peers: groupRuntimePeers({ members: [member] }, state),
           connectivity,
         });
         ensureGroupGovernance(state, state.groups[state.groups.length - 1], "owner");
@@ -4372,31 +4343,55 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         return;
       }
       const parsedInvite = parseInviteMetadata(inviteCode);
-      if (parsedInvite) {
-        const failure = validateParsedInviteUsable(parsedInvite);
-        if (failure) {
-          pushInviteUseFailure(state, "join_group", failure);
-          return;
-        }
+      if (!parsedInvite) {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "join_group",
+          "invite_parse_failed",
+          "Group invite metadata could not be parsed",
+          "Paste a signed group invite descriptor before joining",
+        );
+        return;
+      }
+      if (parsedInvite.connectivity.invite_kind !== "group_join") {
+        pushCommandError(
+          state,
+          "invite.rejected",
+          "join_group",
+          "invite_kind_mismatch",
+          "Invite is not a group join invite",
+          "Use DM accept for DM contact invites or request a group invite",
+        );
+        return;
+      }
+      const failure = validateParsedInviteUsable(parsedInvite);
+      if (failure) {
+        pushInviteUseFailure(state, "join_group", failure);
+        return;
       }
       const name = inviteGroupNameFromMetadata(
         inviteCode,
         request.group_name,
         parsedInvite,
       );
-      const groupId = parsedInvite?.groupId || `group-${slugify(name)}`;
+      const groupId = parsedInvite.groupId || `group-${slugify(name)}`;
       if (!state.groups.some((group) => group.group_id === groupId)) {
-        const connectivity =
-          parsedInvite?.connectivity ?? groupConnectivityPolicy(groupId);
+        const connectivity = parsedInvite.connectivity;
         const createdAt = new Date().toISOString();
         const role: GroupRoleView = "member";
-        const localMember = initialGroupMember(state, role, createdAt);
-        localMember.status = "unknown";
+        const localMember = initialGroupMember(
+          state,
+          role,
+          createdAt,
+        );
+        localMember.status = "pending";
         state.groups.push({
           group_id: groupId,
           name,
-          role: "member",
-          channels: defaultGroupChannels(),
+          role: "pending",
+          channels: [],
+          channel_schema_epoch: 0,
           members: [localMember],
           role_policy: initialGroupRolePolicy(
             state,
@@ -4410,7 +4405,7 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
             role,
             createdAt,
           ),
-          runtime_peers: groupRuntimePeers(connectivity, "member"),
+          runtime_peers: [],
           connectivity,
         });
         ensureGroupGovernance(state, state.groups[state.groups.length - 1], "member");
@@ -4422,36 +4417,35 @@ export async function joinGroup(request: JoinGroupRequest): Promise<AppState> {
         channel_id: null,
         dm_id: null,
       };
-      if (parsedInvite) {
-        state.invites.push({
-          invite_id: `invite-${parsedInvite.inviteKey}`,
-          invite_key: parsedInvite.inviteKey,
-          group_id: groupId,
-          dm_id: null,
-          connectivity_schema_version: parsedInvite.connectivity.connectivity_schema_version,
-          invite_kind: parsedInvite.connectivity.invite_kind,
-          scope_id_commitment: parsedInvite.connectivity.scope_id_commitment,
-          signaling_profiles: parsedInvite.connectivity.signaling_profiles,
-          privacy_label: parsedInvite.connectivity.privacy_label,
-          dm_bootstrap: parsedInvite.connectivity.dm_bootstrap,
-          group_bootstrap: parsedInvite.connectivity.group_bootstrap,
-          code: inviteCode,
-          room_secret_hash: parsedInvite.roomSecretHash,
-          signaling_endpoint: parsedInvite.signalingEndpoint,
-          signaling_trust_fingerprint: parsedInvite.signalingTrustFingerprint,
-          signaling_trust_status: parsedInvite.signalingTrustStatus,
-          endpoint_policy: parsedInvite.endpointPolicy,
-          ice_stun_servers: parsedInvite.iceStunServers,
-          ice_turn_servers: parsedInvite.iceTurnServers,
-          expires: "Invite expiry from signed descriptor",
-          expires_at: parsedInvite.expiresAt,
-          max_use: String(parsedInvite.maxUses),
-          uses: 1,
-          revoked: false,
-          admission_copy:
-            "Parsed production invite metadata; final admission still requires authorized MLS Welcome/add",
-        });
-      }
+      state.invites.push({
+        invite_id: `invite-${parsedInvite.inviteKey}`,
+        invite_key: parsedInvite.inviteKey,
+        group_id: groupId,
+        dm_id: null,
+        connectivity_schema_version:
+          parsedInvite.connectivity.connectivity_schema_version,
+        invite_kind: parsedInvite.connectivity.invite_kind,
+        scope_id_commitment: parsedInvite.connectivity.scope_id_commitment,
+        signaling_profiles: parsedInvite.connectivity.signaling_profiles,
+        privacy_label: parsedInvite.connectivity.privacy_label,
+        dm_bootstrap: parsedInvite.connectivity.dm_bootstrap,
+        group_bootstrap: parsedInvite.connectivity.group_bootstrap,
+        code: inviteCode,
+        room_secret_hash: parsedInvite.roomSecretHash,
+        signaling_endpoint: parsedInvite.signalingEndpoint,
+        signaling_trust_fingerprint: parsedInvite.signalingTrustFingerprint,
+        signaling_trust_status: parsedInvite.signalingTrustStatus,
+        endpoint_policy: parsedInvite.endpointPolicy,
+        ice_stun_servers: parsedInvite.iceStunServers,
+        ice_turn_servers: parsedInvite.iceTurnServers,
+        expires: "Invite expiry from signed descriptor",
+        expires_at: parsedInvite.expiresAt,
+        max_use: String(parsedInvite.maxUses),
+        uses: 1,
+        revoked: false,
+        admission_copy:
+          "Parsed production invite metadata; final admission still requires authorized MLS Welcome/add",
+      });
       pushEvent(
         state,
         "group.admission_requested",
@@ -4662,6 +4656,16 @@ export async function publishGroupPresence(
   return invokeOrFallback<AppState>("publish_group_presence", { request }, () => {
     throw new Error(
       "publish_group_presence requires backend route evidence; browser fallback cannot claim online presence",
+    );
+  });
+}
+
+export async function publishDmPresence(
+  request: PublishDmPresenceRequest,
+): Promise<AppState> {
+  return invokeOrFallback<AppState>("publish_dm_presence", { request }, () => {
+    throw new Error(
+      "publish_dm_presence requires backend route evidence; browser fallback cannot claim DM presence",
     );
   });
 }
@@ -5012,7 +5016,7 @@ export async function acceptDmInvite(
           display_name: displayName,
           local_only_copy:
             "DM contact opened from signed invite metadata; remote delivery is not claimed until backend receipt evidence",
-          runtime_peers: dmRuntimePeers(parsedInvite.connectivity, "reply"),
+          runtime_peers: [],
           connectivity: parsedInvite.connectivity,
         });
       }
@@ -5115,7 +5119,7 @@ export async function publishVoiceSignalingMessage(
           "publish_voice_signaling_message",
           "voice_signal_queue_failed",
           "Local fallback web runtime cannot persist provider-signaled sealed voice envelopes; native Rust/Tauri command path is required",
-          "Run the native app with provider-derived runtime peers before queueing voice signaling",
+          "Run the native app and wait for current provider-advertised runtime peers before queueing voice signaling",
         );
       }),
   );
@@ -5331,7 +5335,7 @@ export async function joinVoice(request: JoinVoiceRequest): Promise<AppState> {
           ...inactiveVoiceSignalingState,
           session_id: `voice-${request.channel_id}`,
           status_copy: captureAllowed
-            ? "Voice signaling waits for provider-derived peer ids before SDP/ICE exchange"
+            ? "Voice signaling waits for provider-advertised peer ids before SDP/ICE exchange"
             : "Voice signaling did not start because capture permission/device gates failed",
         },
         participants: [

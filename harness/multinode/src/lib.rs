@@ -50,8 +50,8 @@ pub struct MediaSecuritySmoke {
 pub struct VoiceMediaE2eSmoke {
     /// Two local clients exchanged protected media over the direct/STUN WebRTC leg.
     pub direct_webrtc_audio_exchanged: bool,
-    /// Two local clients exchanged protected media over the peer-overlay relay leg.
-    pub overlay_audio_exchanged: bool,
+    /// Two local clients exchanged protected media when direct ICE required configured TURN.
+    pub turn_required_audio_exchanged: bool,
     /// Two local clients exchanged protected media over the TURN fallback leg.
     pub turn_audio_exchanged: bool,
     /// Local media mute suppressed outbound PCM before Opus/SFrame/transport.
@@ -109,8 +109,8 @@ pub struct TextHistoryDeliverySmoke {
     pub text_e2e_roundtrip: bool,
     /// Two client processes exchange protected text bytes over the direct/STUN route.
     pub direct_path_text_exchanged: bool,
-    /// Two client processes exchange protected text bytes over the peer-overlay route.
-    pub overlay_path_text_exchanged: bool,
+    /// Two client processes exchange protected text bytes when direct ICE requires configured TURN.
+    pub turn_required_path_text_exchanged: bool,
     /// Two client processes exchange protected text bytes over the TURN fallback route.
     pub turn_path_text_exchanged: bool,
     /// Offline recipient drains queued ciphertext from store-forward before TTL expiry.
@@ -165,7 +165,7 @@ pub struct StoragePersistenceSmoke {
     pub restart_loads_encrypted_state: bool,
     /// Plaintext app-state bytes are absent from DB, WAL, and temp sidecar paths.
     pub no_plaintext_in_db_wal_or_temp: bool,
-    /// Malformed legacy/corrupt store bytes fail closed instead of seeding silently.
+    /// Malformed or unsupported store bytes fail closed instead of seeding silently.
     pub corrupted_store_rejected: bool,
     /// Secure delete only passes after DB, WAL, and keychain material are all removed.
     pub secure_delete_requires_db_wal_and_keychain: bool,
@@ -212,7 +212,7 @@ pub struct AbuseE2eSmoke {
 pub struct ConnectivitySignalingPushSmoke {
     /// Signaling stores only opaque rendezvous data and no durable linkage.
     pub signaling_zero_linkage_at_rest: bool,
-    /// Simulated NAT activates STUN, overlay, and TURN in the approved order.
+    /// Simulated NAT activates STUN and configured TURN in the approved order.
     pub fallback_chain_covered: bool,
     /// Owner/group endpoint overrides are honored for STUN and TURN.
     pub owner_overrides_used: bool,
@@ -309,7 +309,7 @@ pub struct PerformanceSoakSmoke {
     pub one_to_three_relay_hops_covered: bool,
     /// Packet-loss simulation drives bounded redelivery without accepting replays.
     pub packet_loss_redelivery_bounded: bool,
-    /// NAT switching covers direct, overlay, and TURN fallback legs.
+    /// NAT switching covers direct and TURN fallback legs.
     pub nat_switching_fallbacks_covered: bool,
     /// Android doze posture is ranked away from preferred relay paths.
     pub android_doze_deprioritized: bool,
@@ -362,7 +362,7 @@ pub struct TwoProfileP2pDmVoiceUiSmoke {
     pub pairwise_safety_numbers_match: bool,
     /// The direct app-text route protects, delivers, and decrypts one DM payload.
     pub p2p_dm_message_e2e: bool,
-    /// The voice/media harness covers direct, overlay, and TURN attempts without plaintext exposure.
+    /// The voice/media harness covers direct and TURN attempts without plaintext exposure.
     pub voice_media_attempt_covered: bool,
     /// UI/command hardening gates are ready for browser-visible setup, DM, invite, text, and voice checks.
     pub frontend_ui_checks_ready: bool,
@@ -391,7 +391,7 @@ impl VoiceMediaE2eSmoke {
     #[must_use]
     pub fn ready(&self) -> bool {
         self.direct_webrtc_audio_exchanged
-            && self.overlay_audio_exchanged
+            && self.turn_required_audio_exchanged
             && self.turn_audio_exchanged
             && self.mute_blocks_outbound_audio
             && self.volume_affects_playback
@@ -442,7 +442,7 @@ impl TextHistoryDeliverySmoke {
     pub fn ready(&self) -> bool {
         self.text_e2e_roundtrip
             && self.direct_path_text_exchanged
-            && self.overlay_path_text_exchanged
+            && self.turn_required_path_text_exchanged
             && self.turn_path_text_exchanged
             && self.offline_store_forward_within_ttl
             && self.retention_locks_old_store_forward
@@ -1064,11 +1064,6 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
                 ContentExposure::None,
                 b"voice direct path stun binding; no app payload".to_vec(),
             ),
-            FallbackLeg::RelayOverlay => (
-                InfrastructureComponent::PeerRelay,
-                ContentExposure::CiphertextOnly,
-                payload.clone(),
-            ),
             FallbackLeg::Turn => (
                 InfrastructureComponent::Turn,
                 ContentExposure::CiphertextOnly,
@@ -1166,9 +1161,9 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
         &raw_pcm_bytes,
         &mut pcap,
     )?;
-    let overlay = verify_voice_route(
+    let turn_required = verify_voice_route(
         VoiceRouteCase {
-            route_label: "overlay",
+            route_label: "turn-required",
             nat: SimulatedNat::turn_only(),
             expected_leg: FallbackLeg::Turn,
             secret_seed: 72,
@@ -1224,10 +1219,10 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
     let forbidden_payloads = vec![
         raw_pcm_bytes,
         direct.opus_payload.clone(),
-        overlay.opus_payload.clone(),
+        turn_required.opus_payload.clone(),
         turn.opus_payload.clone(),
         direct.epoch_secret.clone(),
-        overlay.epoch_secret.clone(),
+        turn_required.epoch_secret.clone(),
         turn.epoch_secret.clone(),
         b"mls-epoch-secret".to_vec(),
         b"content-key".to_vec(),
@@ -1249,11 +1244,11 @@ pub fn voice_media_e2e_smoke() -> Result<VoiceMediaE2eSmoke, anyhow::Error> {
 
     Ok(VoiceMediaE2eSmoke {
         direct_webrtc_audio_exchanged: direct.audio_exchanged,
-        overlay_audio_exchanged: overlay.audio_exchanged,
+        turn_required_audio_exchanged: turn_required.audio_exchanged,
         turn_audio_exchanged: turn.audio_exchanged,
         mute_blocks_outbound_audio,
         volume_affects_playback: turn.volume_zeroed,
-        speaking_follows_actual_audio: direct.speaking && overlay.speaking && turn.speaking,
+        speaking_follows_actual_audio: direct.speaking && turn_required.speaking && turn.speaking,
         relay_pcap_protected_only,
     })
 }
@@ -2686,11 +2681,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
             TextSelectedRoute {
                 session_id: format!("text-{route_label}-session"),
                 route_label: route_label.to_owned(),
-                overlay_hops: if expected_leg == FallbackLeg::RelayOverlay {
-                    2
-                } else {
-                    0
-                },
+                overlay_hops: 0,
                 ciphertext_only: true,
             },
             &text_key,
@@ -2726,11 +2717,6 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
                 InfrastructureComponent::Stun,
                 ContentExposure::None,
                 b"text direct path stun binding; no app payload".to_vec(),
-            ),
-            FallbackLeg::RelayOverlay => (
-                InfrastructureComponent::PeerRelay,
-                ContentExposure::CiphertextOnly,
-                payload.clone(),
             ),
             FallbackLeg::Turn => (
                 InfrastructureComponent::Turn,
@@ -2777,11 +2763,11 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
         "alice-direct-3",
         3,
     )?;
-    let overlay_path_text_exchanged = verify_text_route(
-        "overlay",
+    let turn_required_text_exchanged = verify_text_route(
+        "turn-required",
         SimulatedNat::turn_only(),
         FallbackLeg::Turn,
-        "alice-overlay-4",
+        "alice-turn-required-4",
         4,
     )?;
     let turn_path_text_exchanged = verify_text_route(
@@ -3155,7 +3141,7 @@ pub fn text_history_delivery_smoke() -> Result<TextHistoryDeliverySmoke, anyhow:
     Ok(TextHistoryDeliverySmoke {
         text_e2e_roundtrip,
         direct_path_text_exchanged,
-        overlay_path_text_exchanged,
+        turn_required_path_text_exchanged: turn_required_text_exchanged,
         turn_path_text_exchanged,
         offline_store_forward_within_ttl,
         retention_locks_old_store_forward,
@@ -3335,7 +3321,10 @@ pub fn storage_persistence_smoke() -> Result<StoragePersistenceSmoke, anyhow::Er
             && !path_contains(&tmp_path, needle)
     });
 
-    fs::write(&path, br#"{"schema_version":0,"legacy":"plaintext-json"}"#)?;
+    fs::write(
+        &path,
+        br#"{"schema_version":0,"unsupported":"plaintext-json"}"#,
+    )?;
     let corrupted_store_rejected = restarted_db.load_app_state().is_err();
 
     let mut delete = SecureDeleteSimulator::default();
@@ -4147,17 +4136,17 @@ pub fn connectivity_signaling_push_smoke() -> Result<ConnectivitySignalingPushSm
         ..ConnectivityConfig::default()
     };
     let direct = ConnectivityPlanner::plan(&default_config, SimulatedNat::direct())?;
-    let overlay = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
+    let turn_required = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
     let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
     let fallback_chain_covered = direct.selected == FallbackLeg::Stun
-        && overlay.selected == FallbackLeg::Turn
+        && turn_required.selected == FallbackLeg::Turn
         && turn.selected == FallbackLeg::Turn
-        && direct.ordered_stun_overlay_turn()
-        && overlay.ordered_stun_overlay_turn()
-        && turn.ordered_stun_overlay_turn();
+        && direct.ordered_direct_turn()
+        && turn_required.ordered_direct_turn()
+        && turn.ordered_direct_turn();
     let relays_ciphertext_only =
-        overlay.relay_legs_ciphertext_only() && turn.relay_legs_ciphertext_only();
-    let route_report = overlay.route_report();
+        turn_required.relay_legs_ciphertext_only() && turn.relay_legs_ciphertext_only();
+    let route_report = turn_required.route_report();
 
     let override_config = ConnectivityConfig {
         overrides: EndpointOverrides::new(
@@ -4572,12 +4561,6 @@ pub fn two_profile_p2p_dm_voice_ui_smoke() -> Result<TwoProfileP2pDmVoiceUiSmoke
     })
 }
 
-/// Backward-compatible boolean smoke for scripts that only need passive relay status.
-pub fn media_passive_relay_roundtrip() -> Result<bool, discrypt_media::MediaError> {
-    let smoke = media_security_smoke()?;
-    Ok(smoke.passive_relay_cannot_read && smoke.plaintext == b"harness encoded voice frame")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4628,7 +4611,7 @@ mod tests {
             smoke,
             Ok(VoiceMediaE2eSmoke {
                 direct_webrtc_audio_exchanged: true,
-                overlay_audio_exchanged: true,
+                turn_required_audio_exchanged: true,
                 turn_audio_exchanged: true,
                 mute_blocks_outbound_audio: true,
                 volume_affects_playback: true,
@@ -4666,7 +4649,7 @@ mod tests {
             Ok(TextHistoryDeliverySmoke {
                 text_e2e_roundtrip: true,
                 direct_path_text_exchanged: true,
-                overlay_path_text_exchanged: true,
+                turn_required_path_text_exchanged: true,
                 turn_path_text_exchanged: true,
                 offline_store_forward_within_ttl: true,
                 retention_locks_old_store_forward: true,

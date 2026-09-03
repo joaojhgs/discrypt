@@ -8,7 +8,6 @@
 
 pub mod production_status;
 pub mod services;
-use admission::Invite;
 use content_keys::{RetentionPolicy, RetentionPolicySource, RetentionWindow};
 use mls_core::{verifying_key_from_hex, DeviceSet, GroupState, Identity, SafetyNumber};
 use serde::{Deserialize, Serialize};
@@ -1084,9 +1083,6 @@ fn apply_retention_policy_to_snapshot(snapshot: &mut AppSnapshot, policy: Retent
     snapshot.retention.selected_window_seconds = policy.seconds();
     snapshot.retention.policy_source = format!("{:?}", policy.source);
 }
-
-#[allow(dead_code)]
-fn _invite_boundary(_: &Invite) {}
 
 #[cfg(test)]
 mod tests {

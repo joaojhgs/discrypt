@@ -67,7 +67,7 @@ function writeManifest(status) {
     profile_model:
       "Playwright launches two isolated browser contexts against the production Vite build; media devices and RTCPeerConnection are shimmed only as a platform-credible local media loopback because CI has no physical microphone/speaker pair.",
     no_manual_pairing_or_debug_controls:
-      "The covered UX derives runtime peers from invite/group metadata and does not expose manual peer-id fields.",
+      "The covered UX reads current provider-advertised runtime peers from backend state and does not expose manual peer-id fields.",
     artifacts: {
       command_logs: commandLogDir,
       playwright_output: playwrightOutputDir,

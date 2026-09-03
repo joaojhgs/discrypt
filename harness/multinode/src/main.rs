@@ -70,7 +70,7 @@ fn main() {
                 std::process::exit(1);
             }
             println!(
-                "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} media_capture_opus_sframe={} media_receive_playback={} media_mute_suppresses={} media_speaker_volume={} media_speaking_vad={} media_android_native={} voice_direct_webrtc={} voice_overlay={} voice_turn={} voice_mute_blocks={} voice_volume={} voice_speaking={} voice_pcap_protected={} overlay_hops={} overlay_failover={} overlay_media_gap={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_e2e_roundtrip={} text_direct_path={} text_overlay_path={} text_turn_path={} text_offline_store_forward={} text_retention_locks_old={} text_pcap_no_plaintext={} text_no_plaintext={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} storage_fresh_install={} storage_restart={} storage_no_plaintext={} storage_corrupt_rejected={} storage_secure_delete={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={} signaling_zero_linkage={} connectivity_fallback={} connectivity_overrides={} android_wake_content_free={} metadata_matrix={} pcap_no_content={} relays_ciphertext_only={} socket_local_process={} route_reporting_honest={} phase_c_retired={} phase_c_rekeyed={} phase_c_old_send_blocked={} phase_c_replacement_send={} phase_c_stale_blocked={} phase_c_transparency={} phase_c_command_devices={} ux_commands={} ux_discord={} ux_verify_devices={} ux_invite_retention_delete={} ux_connectivity_copy={} ux_all_phases={}",
+                "discrypt multinode harness: room={} epoch={} members={} media_passive={} media_replay={} media_tamper={} media_capture_opus_sframe={} media_receive_playback={} media_mute_suppresses={} media_speaker_volume={} media_speaking_vad={} media_android_native={} voice_direct_webrtc={} voice_turn_required={} voice_turn={} voice_mute_blocks={} voice_volume={} voice_speaking={} voice_pcap_protected={} overlay_hops={} overlay_failover={} overlay_media_gap={} overlay_redelivery={} overlay_store_forward_plaintext={} overlay_store_forward_ttl={} overlay_store_forward_fanout={} overlay_ciphertext_only={} overlay_tamper={} text_e2e_roundtrip={} text_direct_path={} text_turn_required_path={} text_turn_path={} text_offline_store_forward={} text_retention_locks_old={} text_pcap_no_plaintext={} text_no_plaintext={} text_author_logs={} text_cache_bounded={} text_gossip16={} text_ordered_delivery={} text_welcome_catchup={} text_fork_detected={} text_repair_converged={} text_no_mls_replay={} retention_default_lock={} retention_transition={} shred_cross_device={} live_key_oracle={} secure_delete={} recovery_no_content_keys={} storage_fresh_install={} storage_restart={} storage_no_plaintext={} storage_corrupt_rejected={} storage_secure_delete={} gov_ordered={} gov_invalid_rejected={} gov_removed_admin={} admission_invites={} admission_password_welcome={} recovery_trust={} abuse_controls={} signaling_zero_linkage={} connectivity_fallback={} connectivity_overrides={} android_wake_content_free={} metadata_matrix={} pcap_no_content={} relays_ciphertext_only={} socket_local_process={} route_reporting_honest={} phase_c_retired={} phase_c_rekeyed={} phase_c_old_send_blocked={} phase_c_replacement_send={} phase_c_stale_blocked={} phase_c_transparency={} phase_c_command_devices={} ux_commands={} ux_discord={} ux_verify_devices={} ux_invite_retention_delete={} ux_connectivity_copy={} ux_all_phases={}",
             summary.room_id,
             summary.epoch,
             summary.members,
@@ -84,7 +84,7 @@ fn main() {
             media.speaking_indicator_from_vad,
             media.android_native_contingency_ready,
             voice_e2e.direct_webrtc_audio_exchanged,
-            voice_e2e.overlay_audio_exchanged,
+            voice_e2e.turn_required_audio_exchanged,
             voice_e2e.turn_audio_exchanged,
             voice_e2e.mute_blocks_outbound_audio,
             voice_e2e.volume_affects_playback,
@@ -101,7 +101,7 @@ fn main() {
             overlay.tamper_rejected,
             text.text_e2e_roundtrip,
             text.direct_path_text_exchanged,
-            text.overlay_path_text_exchanged,
+            text.turn_required_path_text_exchanged,
             text.turn_path_text_exchanged,
             text.offline_store_forward_within_ttl,
             text.retention_locks_old_store_forward,

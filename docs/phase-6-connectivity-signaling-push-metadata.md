@@ -1,7 +1,7 @@
 # Phase 6 connectivity, signaling, push, and metadata review
 
 G007 implements deterministic foundations for the approved Phase 6 scope: a
-content-blind signaling reference, strict STUN -> peer-overlay -> TURN fallback,
+content-blind signaling reference, strict STUN -> configured-TURN fallback,
 content-free Android FCM wake envelopes, and pcap-style metadata matrix fixtures.
 
 ## Implementation map
@@ -28,8 +28,7 @@ content-free Android FCM wake envelopes, and pcap-style metadata matrix fixtures
 
 ## Acceptance coverage
 
-- AC13: STUN succeeds first, overlay activates when STUN is blocked, and TURN
-  activates when both STUN and overlay are blocked; owner STUN/TURN overrides are
+- AC13: STUN succeeds first and configured TURN activates when direct ICE is blocked; owner STUN/TURN overrides are
   honored.
 - AC15: FCM Android wake is content-free and exposes no room/user/message token in
   the provider-visible audit bytes.

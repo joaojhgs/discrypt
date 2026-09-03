@@ -248,71 +248,13 @@ async function joinInvite(page: Page, invite: string) {
   await expect(page.getByText(/Two Profile Lab/i).first()).toBeVisible();
 }
 
-function stableUiHash(input: string): string {
-  let hash = 0x811c9dc5;
-  for (const char of input) {
-    hash ^= char.charCodeAt(0);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
-}
-
-function runtimePeerIdFromCommitment(
-  label: string,
-  commitment: string,
-): string {
-  return `peer-${stableUiHash(`${label}:${commitment}`)}`;
-}
-
-async function readLatestInviteParams(page: Page) {
-  const body = await page.locator("body").innerText();
-  const matches = [...body.matchAll(/discrypt:\/\/join\/v1\/\S+/g)].map(
-    (match) => match[0],
-  );
-  expect(matches.length).toBeGreaterThan(0);
-  return new URL(matches.at(-1) ?? "").searchParams;
-}
-
-function deriveOwnerAndMemberRuntimePeers(params: URLSearchParams) {
-  const kind = params.get("kind");
-  if (kind === "dm_contact") {
-    const owner = runtimePeerIdFromCommitment(
-      "dm-inviter-runtime-peer",
-      params.get("dm_inviter") ?? "",
-    );
-    const member = runtimePeerIdFromCommitment(
-      "dm-reply-runtime-peer",
-      params.get("dm_reply") ?? "",
-    );
-    return {
-      owner: { local: owner, remote: member },
-      member: { local: member, remote: owner },
-    };
-  }
-  const owner = runtimePeerIdFromCommitment(
-    "group-owner-runtime-peer",
-    params.get("group_identity") ?? "",
-  );
-  const member = runtimePeerIdFromCommitment(
-    "group-member-runtime-peer",
-    `${params.get("role_policy") ?? ""}:${params.get("channel_policy") ?? ""}`,
-  );
-  return {
-    owner: { local: owner, remote: member },
-    member: { local: member, remote: owner },
-  };
-}
-
-async function expectReciprocalRuntimePeers(owner: Page, member: Page) {
-  const ownerPeers = deriveOwnerAndMemberRuntimePeers(
-    await readLatestInviteParams(owner),
-  );
-  expect(ownerPeers.owner.local).toMatch(/^peer-[a-f0-9]{8,16}$/);
-  expect(ownerPeers.owner.remote).toMatch(/^peer-[a-f0-9]{8,16}$/);
-  expect(ownerPeers.member.local).toBe(ownerPeers.owner.remote);
-  expect(ownerPeers.member.remote).toBe(ownerPeers.owner.local);
-  await expect(member.locator("#runtime-local-peer")).toHaveCount(0);
-  await expect(member.locator("#runtime-remote-peer")).toHaveCount(0);
+async function expectPendingAuthoritySchema(page: Page) {
+  await expect(
+    page.getByRole("heading", { name: "No text channel selected" }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: /#general/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Voice Lobby/ })).toHaveCount(0);
+  await expect(page.getByRole("textbox", { name: "Message" })).toHaveCount(0);
 }
 
 async function createDmInviteForActiveContact(page: Page, contactName: string) {
@@ -405,6 +347,12 @@ async function reloadAndRepeatVoiceWithoutProfileLeakage(page: Page) {
   await attemptVoice(page);
 }
 
+async function reloadAndExpectPendingAuthoritySchema(page: Page) {
+  await page.reload();
+  await expectPendingAuthoritySchema(page);
+  await expect(page.getByText(/manual pairing|QR pairing/i)).toHaveCount(0);
+}
+
 test("two independent profiles exercise DM, invite join, and voice attempts honestly", async ({
   browser,
 }) => {
@@ -464,18 +412,14 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
     await expectNoManualRuntimeControls(alice.page, bob.page);
+    await expectPendingAuthoritySchema(bob.page);
     await sendGroupMessage(alice.page, "alice group channel command ping");
-    await sendGroupMessage(bob.page, "bob group channel command pong");
-    await expect(
-      alice.page.getByText("bob group channel command pong"),
-    ).toHaveCount(0);
     await expect(
       bob.page.getByText("alice group channel command ping"),
     ).toHaveCount(0);
     await attemptVoice(alice.page);
-    await attemptVoice(bob.page);
     await reloadAndRepeatVoiceWithoutProfileLeakage(alice.page);
-    await reloadAndRepeatVoiceWithoutProfileLeakage(bob.page);
+    await reloadAndExpectPendingAuthoritySchema(bob.page);
 
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);
@@ -485,7 +429,7 @@ test("two independent profiles exercise DM, invite join, and voice attempts hone
   }
 });
 
-test("two isolated profiles finish invite and channel text flows without claiming remote delivery", async ({
+test("an isolated invitee waits for authority schema without claiming remote delivery", async ({
   browser,
 }) => {
   test.setTimeout(180_000);
@@ -529,10 +473,12 @@ test("two isolated profiles finish invite and channel text flows without claimin
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
     await expectNoManualRuntimeControls(alice.page, bob.page);
+    await expectPendingAuthoritySchema(bob.page);
     await sendGroupMessage(alice.page, "alice group local text proof");
-    await sendGroupMessage(bob.page, "bob group local text proof");
     await expectMessageStaysLocal(alice.page, "alice group local text proof");
-    await expectMessageStaysLocal(bob.page, "bob group local text proof");
+    await expect(
+      bob.page.getByText("alice group local text proof"),
+    ).toHaveCount(0);
 
     expect(alice.errors).toEqual([]);
     expect(bob.errors).toEqual([]);

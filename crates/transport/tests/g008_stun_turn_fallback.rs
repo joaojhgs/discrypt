@@ -32,7 +32,6 @@ fn deterministic_direct_stun_turn_and_no_turn_fail_closed_matrix() -> Result<(),
 
     let no_turn_path = SimulatedNat {
         stun_available: false,
-        overlay_available: false,
         turn_available: false,
     };
     assert_eq!(

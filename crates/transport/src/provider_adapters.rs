@@ -12,6 +12,14 @@
     feature = "discrypt-quic-rendezvous-adapter"
 ))]
 use crate::SignalingProviderEndpoint;
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
+use crate::WebRtcDataTransportMetrics;
 use crate::WebRtcNegotiator;
 use crate::{
     AdapterFallbackBehavior, AdapterSession, AdapterTrustLabel, ControlBroadcast,
@@ -19,8 +27,8 @@ use crate::{
     RendezvousCapability, RendezvousRoom, SealedWebRtcNegotiationPayload, SignalingAdapter,
     SignalingAdapterCapabilities, SignalingAdapterKind, SignalingAdapterProfile,
     SignalingEndpointSecurity, SignalingHealth, SignalingHealthState, SignalingObservability,
-    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDataTransportMetrics,
-    WebRtcDiagnosticTimeline, WebRtcNegotiationConfig, WebRtcSdpType,
+    SignalingPeerId, TextControlDataTransport, TransportError, WebRtcDiagnosticTimeline,
+    WebRtcNegotiationConfig, WebRtcSdpType,
 };
 #[cfg(any(
     test,
@@ -32,6 +40,13 @@ use crate::{
 ))]
 use crate::{WebRtcNegotiationId, WebRtcNegotiationPayloadKind, WebRtcNegotiationSealer};
 use async_trait::async_trait;
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -521,9 +536,6 @@ pub struct ProviderWebRtcDataChannelProbe {
     pub receipt_frame_roundtrip: bool,
     /// SHA-256 of the opaque return receipt/control frame used for the proof.
     pub receipt_frame_sha256: String,
-    /// Versioned serialized runtime handoff material captured during the probe.
-    #[serde(default)]
-    pub runtime_spec: Option<ProviderTextControlRuntimeSpec>,
     /// Offerer-side redacted ICE/DTLS/DataChannel diagnostic timeline.
     #[serde(default)]
     pub offerer_diagnostic_timeline: Option<WebRtcDiagnosticTimeline>,
@@ -818,8 +830,6 @@ pub struct ProviderTextControlRuntimeEvidence {
     pub offerer_data_channel_open: bool,
     /// Answer-side DataChannel opened.
     pub answerer_data_channel_open: bool,
-    /// Versioned serialized runtime handoff material captured during attach.
-    pub runtime_spec: ProviderTextControlRuntimeSpec,
 }
 
 /// Live app-facing provider-backed text/control runtime pair.
@@ -911,8 +921,6 @@ pub struct ProviderTextControlRuntimePeerEvidence {
     pub direct_path_ready: bool,
     /// This peer's DataChannel opened.
     pub data_channel_open: bool,
-    /// Versioned serialized runtime handoff material captured during attach.
-    pub runtime_spec: ProviderTextControlRuntimeSpec,
 }
 
 /// One installed app's live provider-backed text/control runtime.
@@ -926,13 +934,26 @@ pub struct ProviderTextControlRuntime {
     evidence: ProviderTextControlRuntimePeerEvidence,
     transport: Arc<dyn TextControlDataTransport>,
     peer: Option<Arc<WebRtcNegotiator>>,
+    #[cfg(any(
+        test,
+        feature = "mqtt-adapter",
+        feature = "nostr-adapter",
+        feature = "ipfs-pubsub-adapter",
+        feature = "discrypt-quic-rendezvous-adapter"
+    ))]
     recovering_peer: Option<Arc<RecoveringProviderTextControlPeer>>,
     receiver_task: Option<tokio::task::JoinHandle<()>>,
     supervisor_task: Option<tokio::task::JoinHandle<()>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 type ProviderTextControlAnswerer =
     Arc<dyn Fn(Vec<u8>) -> Result<Vec<u8>, TransportError> + Send + Sync + 'static>;
 
@@ -958,6 +979,13 @@ impl ProviderTextControlRuntime {
             task.abort();
             let _ = task.await;
         }
+        #[cfg(any(
+            test,
+            feature = "mqtt-adapter",
+            feature = "nostr-adapter",
+            feature = "ipfs-pubsub-adapter",
+            feature = "discrypt-quic-rendezvous-adapter"
+        ))]
         let supervisor_closed_peer = self.supervisor_task.is_some();
         if let Some(task) = self.supervisor_task.take() {
             let _ = task.await;
@@ -965,6 +993,13 @@ impl ProviderTextControlRuntime {
         if let Some(peer) = self.peer.take() {
             peer.tear_down().await?;
         }
+        #[cfg(any(
+            test,
+            feature = "mqtt-adapter",
+            feature = "nostr-adapter",
+            feature = "ipfs-pubsub-adapter",
+            feature = "discrypt-quic-rendezvous-adapter"
+        ))]
         if !supervisor_closed_peer {
             if let Some(peer) = self.recovering_peer.take() {
                 peer.tear_down_current().await?;
@@ -986,19 +1021,38 @@ impl Drop for ProviderTextControlRuntime {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 struct RecoveringProviderTextControlPeer {
     current: Mutex<Arc<WebRtcNegotiator>>,
     inbound_tx: tokio::sync::mpsc::Sender<ProviderTextControlInboundFrame>,
     inbound_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ProviderTextControlInboundFrame>>,
 }
 
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 struct ProviderTextControlInboundFrame {
     peer: Arc<WebRtcNegotiator>,
     frame: Vec<u8>,
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 impl RecoveringProviderTextControlPeer {
     fn new(peer: Arc<WebRtcNegotiator>) -> Self {
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(128);
@@ -1041,6 +1095,13 @@ impl RecoveringProviderTextControlPeer {
     }
 }
 
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 #[async_trait]
 impl TextControlDataTransport for RecoveringProviderTextControlPeer {
     async fn send_text_control_frame(&self, frame: Vec<u8>) -> Result<(), TransportError> {
@@ -1060,7 +1121,13 @@ impl TextControlDataTransport for RecoveringProviderTextControlPeer {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn spawn_provider_text_control_answer_receiver(
     recovering_peer: Arc<RecoveringProviderTextControlPeer>,
     answerer: ProviderTextControlAnswerer,
@@ -1090,7 +1157,13 @@ fn spawn_provider_text_control_answer_receiver(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn spawn_provider_text_control_inbound_forwarder(
     peer: Arc<WebRtcNegotiator>,
     inbound_tx: tokio::sync::mpsc::Sender<ProviderTextControlInboundFrame>,
@@ -1109,234 +1182,6 @@ fn spawn_provider_text_control_inbound_forwarder(
             }
         }
     })
-}
-
-/// Inputs required to resume a provider-backed WebRTC text/control runtime from a
-/// previously proven peer rendezvous path.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProviderTextControlRuntimeAttachment {
-    /// Canonical adapter kind label (for example, `mqtt`, `nostr`, `ipfs_pubsub`).
-    pub adapter_kind: String,
-    /// Signaling profile identifier used by the proven peer contract.
-    pub profile_id: String,
-    /// Redacted profile endpoint label from probe evidence.
-    pub endpoint_label: String,
-    /// Rendezvous topic that the peer proof already established.
-    pub rendezvous_topic: String,
-    /// Scope commitment used to derive the rendezvous topic.
-    #[serde(default)]
-    pub scope_commitment: String,
-    /// Serialized runtime handoff material derived from the same proof.
-    #[serde(default)]
-    pub runtime_spec: Option<Box<ProviderTextControlRuntimeSpec>>,
-}
-
-/// Current schema version for persisted provider text/control runtime specs.
-pub const PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION: u16 = 1;
-
-/// Explicitly exposed transport-blocker message for provider-backed long-lived
-/// text/control runtime attachment.
-pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE: &str =
-    "provider-backed text/control runtime attachment is not implemented in this build";
-/// Recovery guidance for the missing long-lived runtime constructor path.
-pub const TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT: &str =
-    "Persisted provider offer/answer/ICE handoff and a long-lived receiver loop are still required before runtime attachment can be established";
-
-#[allow(dead_code)]
-const PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE: &str =
-    "provider application-payload relay is disabled; providers carry presence and sealed WebRTC negotiation only";
-
-#[allow(dead_code)]
-fn provider_app_payload_relay_disabled_error() -> TransportError {
-    TransportError::SignalingAdapter(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE.to_owned())
-}
-
-/// Typed boundary when a runtime spec is missing from a resume attachment.
-pub const TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE: &str =
-    "provider text/control runtime handoff spec is required for resume";
-
-/// Typed boundary when a runtime spec is stale beyond its validity window.
-pub const TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE: &str =
-    "provider text/control runtime handoff spec is stale";
-
-/// Typed boundary when a runtime spec does not match the resume attachment.
-pub const TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE: &str =
-    "provider text/control runtime handoff spec is incompatible with requested attachment";
-
-/// Persistable handoff from a provider WebRTC proof to a future long-lived text/control runtime.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProviderTextControlRuntimeSpec {
-    /// Version for compatibility checks before runtime attachment.
-    pub schema_version: u16,
-    /// Provider route metadata captured from a proofed rendezvous path.
-    pub attachment: ProviderTextControlRuntimeAttachment,
-    /// Unix timestamp when the handoff was created by the app-service.
-    pub created_at_unix_seconds: i64,
-    /// Unix timestamp after which the handoff must be considered stale.
-    pub expires_at_unix_seconds: i64,
-    /// Sealed WebRTC offer payload needed to resume/complete negotiation.
-    #[serde(default)]
-    pub sealed_offer: Option<SealedWebRtcNegotiationPayload>,
-    /// Sealed WebRTC answer payload needed to resume/complete negotiation.
-    #[serde(default)]
-    pub sealed_answer: Option<SealedWebRtcNegotiationPayload>,
-    /// Sealed ICE candidates cached for the runtime handoff.
-    #[serde(default)]
-    pub sealed_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
-    /// Missing production materials that still prevent live runtime attachment.
-    #[serde(default)]
-    pub missing_material: Vec<String>,
-}
-
-impl ProviderTextControlRuntimeSpec {
-    /// Build a fail-closed handoff from probe evidence when live negotiated material is unavailable.
-    #[must_use]
-    pub fn from_probe_without_negotiation_material(
-        probe: &ProviderWebRtcDataChannelProbe,
-        created_at_unix_seconds: i64,
-        ttl_seconds: i64,
-    ) -> Self {
-        Self {
-            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-            attachment: ProviderTextControlRuntimeAttachment {
-                adapter_kind: probe.kind.canonical_name().to_owned(),
-                profile_id: probe.profile_id.clone(),
-                endpoint_label: probe.endpoint_label.clone(),
-                rendezvous_topic: probe.rendezvous_topic.clone(),
-                scope_commitment: probe.scope_commitment.clone(),
-                runtime_spec: None,
-            },
-            created_at_unix_seconds,
-            expires_at_unix_seconds: created_at_unix_seconds.saturating_add(ttl_seconds.max(0)),
-            sealed_offer: None,
-            sealed_answer: None,
-            sealed_ice_candidates: Vec::new(),
-            missing_material: vec![
-                "sealed WebRTC offer payload was not retained by the probe API".to_owned(),
-                "sealed WebRTC answer payload was not retained by the probe API".to_owned(),
-                "ICE candidate cache was not retained for runtime resume".to_owned(),
-                "installed-app receiver loop is not yet bound to this handoff".to_owned(),
-            ],
-        }
-    }
-
-    /// Build a complete runtime spec from a successful offer/answer/ICE probe path.
-    #[must_use]
-    pub fn from_webrtc_probe(
-        probe: &ProviderWebRtcDataChannelProbe,
-        created_at_unix_seconds: i64,
-        ttl_seconds: i64,
-        sealed_offer: Option<SealedWebRtcNegotiationPayload>,
-        sealed_answer: Option<SealedWebRtcNegotiationPayload>,
-        sealed_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
-    ) -> Self {
-        Self {
-            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-            attachment: ProviderTextControlRuntimeAttachment {
-                adapter_kind: probe.kind.canonical_name().to_owned(),
-                profile_id: probe.profile_id.clone(),
-                endpoint_label: probe.endpoint_label.clone(),
-                rendezvous_topic: probe.rendezvous_topic.clone(),
-                scope_commitment: probe.scope_commitment.clone(),
-                runtime_spec: None,
-            },
-            created_at_unix_seconds,
-            expires_at_unix_seconds: created_at_unix_seconds.saturating_add(ttl_seconds.max(0)),
-            sealed_offer,
-            sealed_answer,
-            sealed_ice_candidates,
-            missing_material: Vec::new(),
-        }
-    }
-
-    /// Validate the spec before attempting a long-lived runtime attachment.
-    pub fn validate_for_runtime_attach(
-        &self,
-        now_unix_seconds: i64,
-        attachment: &ProviderTextControlRuntimeAttachment,
-    ) -> Result<(), TransportError> {
-        self.validate_for_runtime_attach_without_attachment(now_unix_seconds)?;
-        if self.attachment.adapter_kind != attachment.adapter_kind
-            || self.attachment.profile_id != attachment.profile_id
-            || self.attachment.endpoint_label != attachment.endpoint_label
-            || self.attachment.rendezvous_topic != attachment.rendezvous_topic
-            || (!self.attachment.scope_commitment.is_empty()
-                && self.attachment.scope_commitment != attachment.scope_commitment)
-        {
-            return Err(TransportError::Unavailable(
-                TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE.to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Validate this spec for runtime attachment before compatibility binding to the
-    /// active attachment metadata.
-    pub fn validate_for_runtime_attach_without_attachment(
-        &self,
-        now_unix_seconds: i64,
-    ) -> Result<(), TransportError> {
-        if self.schema_version != PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION {
-            return Err(TransportError::Unavailable(format!(
-                "unsupported provider text/control runtime spec version {}",
-                self.schema_version
-            )));
-        }
-        if self.attachment.adapter_kind.is_empty()
-            || self.attachment.profile_id.is_empty()
-            || self.attachment.rendezvous_topic.is_empty()
-        {
-            return Err(TransportError::Unavailable(
-                "provider text/control runtime spec is missing attachment metadata".to_owned(),
-            ));
-        }
-        if now_unix_seconds > self.expires_at_unix_seconds {
-            return Err(TransportError::Unavailable(
-                TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE.to_owned(),
-            ));
-        }
-        if !self.missing_material.is_empty() {
-            return Err(TransportError::Unavailable(format!(
-                "provider text/control runtime spec is missing negotiated material: {}",
-                self.missing_material.join("; ")
-            )));
-        }
-        if self.sealed_offer.is_none() || self.sealed_answer.is_none() {
-            return Err(TransportError::Unavailable(
-                "provider text/control runtime spec lacks sealed offer/answer handoff".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Build a live provider-backed text/control transport runtime from prior peer
-/// proof material.
-///
-/// This seam is intentionally currently unavailable while the transport backend
-/// grows the long-lived attachment contract. It is explicitly fail-closed to
-/// avoid silently pretending that short-lived test probes imply a production
-/// long-lived runtime.
-pub fn resume_text_control_runtime_from_probe(
-    attachment: ProviderTextControlRuntimeAttachment,
-) -> Result<std::sync::Arc<dyn TextControlDataTransport>, TransportError> {
-    let now_unix_seconds = Utc::now().timestamp();
-    let spec = attachment.runtime_spec.as_deref().ok_or_else(|| {
-        TransportError::Unavailable(TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE.to_owned())
-    })?;
-    resume_text_control_runtime_from_spec(spec, &attachment, now_unix_seconds)
-}
-
-/// Build a live provider-backed text/control transport runtime from a persisted handoff spec.
-pub fn resume_text_control_runtime_from_spec(
-    spec: &ProviderTextControlRuntimeSpec,
-    attachment: &ProviderTextControlRuntimeAttachment,
-    now_unix_seconds: i64,
-) -> Result<std::sync::Arc<dyn TextControlDataTransport>, TransportError> {
-    spec.validate_for_runtime_attach(now_unix_seconds, attachment)?;
-    Err(TransportError::Unavailable(
-        TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE.to_owned(),
-    ))
 }
 
 impl SignalingAdapterFallbackPlan {
@@ -2703,10 +2548,6 @@ where
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
     }
-    let captured_sealed_offer = Some(sealed_offer.clone());
-    let mut captured_sealed_answer = None;
-    let mut offerer_ice_candidates = Vec::new();
-    let mut answerer_ice_candidates = Vec::new();
     alice_room.send_signal(bob.clone(), sealed_offer).await?;
 
     let mut answer_applied = false;
@@ -2730,7 +2571,6 @@ where
                         signal.payload.negotiation_id,
                         signal.payload.expires_at_unix_seconds,
                     )?;
-                    captured_sealed_answer = Some(sealed_answer.clone());
                     bob_room.send_signal(alice.clone(), sealed_answer).await?;
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
@@ -2768,7 +2608,6 @@ where
                 Some(negotiation_id),
                 Some(negotiation_expires_at),
             )?;
-            offerer_ice_candidates.push(sealed_candidate.clone());
             alice_room
                 .send_signal(bob.clone(), sealed_candidate)
                 .await?;
@@ -2779,7 +2618,6 @@ where
                 Some(negotiation_id),
                 Some(negotiation_expires_at),
             )?;
-            answerer_ice_candidates.push(sealed_candidate.clone());
             bob_room
                 .send_signal(alice.clone(), sealed_candidate)
                 .await?;
@@ -2816,27 +2654,6 @@ where
 
     let alice_direct = alice_webrtc.direct_path_metrics().await;
     let bob_direct = bob_webrtc.direct_path_metrics().await;
-    let now_unix_seconds = Utc::now().timestamp();
-    let mut runtime_ice_candidates = Vec::new();
-    runtime_ice_candidates.extend(offerer_ice_candidates);
-    runtime_ice_candidates.extend(answerer_ice_candidates);
-    let runtime_spec = ProviderTextControlRuntimeSpec {
-        schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-        attachment: ProviderTextControlRuntimeAttachment {
-            adapter_kind: profile.kind.canonical_name().to_owned(),
-            profile_id: profile.profile_id.clone(),
-            endpoint_label: endpoint_label.clone(),
-            rendezvous_topic: rendezvous_topic.clone(),
-            scope_commitment: scope.scope_id_commitment.clone(),
-            runtime_spec: None,
-        },
-        created_at_unix_seconds: now_unix_seconds,
-        expires_at_unix_seconds: now_unix_seconds.saturating_add(60 * 60),
-        sealed_offer: captured_sealed_offer,
-        sealed_answer: captured_sealed_answer,
-        sealed_ice_candidates: runtime_ice_candidates,
-        missing_material: Vec::new(),
-    };
     let evidence = ProviderTextControlRuntimeEvidence {
         kind: profile.kind,
         profile_id: profile.profile_id,
@@ -2847,7 +2664,6 @@ where
         answerer_direct_path_ready: bob_direct.direct_path_ready,
         offerer_data_channel_open: offerer_data.open,
         answerer_data_channel_open: answerer_data.open,
-        runtime_spec,
     };
 
     alice_room.leave().await?;
@@ -2957,8 +2773,6 @@ where
     room.send_signal(remote_peer_id.clone(), sealed_offer.clone())
         .await?;
 
-    let mut captured_sealed_answer = None;
-    let mut sealed_ice_candidates = Vec::new();
     let mut sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut answer_applied = false;
     let mut pending_remote_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
@@ -2989,7 +2803,6 @@ where
                 Some(negotiation_id),
                 Some(negotiation_expires_at),
             )?;
-            sealed_ice_candidates.push(sealed_candidate.clone());
             sealed_local_ice_candidates.push(sealed_candidate.clone());
             if provider_runtime_debug_enabled() {
                 eprintln!(
@@ -3049,7 +2862,6 @@ where
             }
             match signal.payload.kind {
                 WebRtcNegotiationPayloadKind::Answer if !answer_applied => {
-                    captured_sealed_answer = Some(signal.payload.clone());
                     webrtc
                         .accept_answer(sealer.open_description(&signal.payload)?)
                         .await?;
@@ -3061,7 +2873,6 @@ where
                     }
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
-                    sealed_ice_candidates.push(signal.payload.clone());
                     if answer_applied {
                         webrtc
                             .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
@@ -3106,15 +2917,6 @@ where
         )));
     }
     let direct_metrics = webrtc.direct_path_metrics().await;
-    let runtime_spec = provider_runtime_spec_from_live_material(
-        &profile,
-        &scope,
-        endpoint_label.clone(),
-        rendezvous_topic.clone(),
-        Some(sealed_offer),
-        captured_sealed_answer,
-        sealed_ice_candidates,
-    );
     let evidence = ProviderTextControlRuntimePeerEvidence {
         kind: profile.kind,
         profile_id: profile.profile_id,
@@ -3126,7 +2928,6 @@ where
         role: ProviderTextControlRuntimePeerRole::Offerer,
         direct_path_ready: direct_metrics.direct_path_ready,
         data_channel_open: data_metrics.open,
-        runtime_spec,
     };
 
     room.leave().await?;
@@ -3189,9 +2990,7 @@ where
 
     let mut webrtc = Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?);
     let sealer = WebRtcNegotiationSealer::new([0x9d; 32]);
-    let mut captured_sealed_offer = None;
     let mut captured_sealed_answer: Option<SealedWebRtcNegotiationPayload> = None;
-    let mut sealed_ice_candidates = Vec::new();
     let mut sealed_local_ice_candidates: Vec<SealedWebRtcNegotiationPayload> = Vec::new();
     let mut answer_sent = false;
     let mut active_negotiation_id = None;
@@ -3257,7 +3056,7 @@ where
             if signal_negotiation_id.is_none() {
                 if provider_runtime_debug_enabled() {
                     eprintln!(
-                        "discrypt-provider-runtime role=answerer event=ignore_legacy_signal kind={} from={} to={}",
+                        "discrypt-provider-runtime role=answerer event=ignore_unscoped_signal kind={} from={} to={}",
                         negotiation_payload_kind_label(&signal.payload.kind),
                         redacted_peer_label(&signal.from_peer),
                         redacted_peer_label(&signal.to_peer)
@@ -3308,7 +3107,6 @@ where
                             Arc::new(WebRtcNegotiator::new(negotiation_config.clone()).await?),
                         );
                         old_webrtc.tear_down().await?;
-                        sealed_ice_candidates.clear();
                         sealed_local_ice_candidates.clear();
                         pending_remote_candidates.clear();
                     }
@@ -3317,7 +3115,6 @@ where
                         seen_negotiation_ids.insert(negotiation_id);
                     }
                     active_negotiation_expires_at = signal.payload.expires_at_unix_seconds;
-                    captured_sealed_offer = Some(signal.payload.clone());
                     let offer = sealer.open_description(&signal.payload)?;
                     let answer = webrtc
                         .create_candidate_bundled_answer(
@@ -3355,7 +3152,6 @@ where
                     last_answer_resend = Instant::now();
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
-                    sealed_ice_candidates.push(signal.payload.clone());
                     if answer_sent {
                         webrtc
                             .add_remote_candidate(sealer.open_candidate(&signal.payload)?)
@@ -3374,7 +3170,6 @@ where
                 active_negotiation_id,
                 active_negotiation_expires_at,
             )?;
-            sealed_ice_candidates.push(sealed_candidate.clone());
             sealed_local_ice_candidates.push(sealed_candidate.clone());
             if provider_runtime_debug_enabled() {
                 eprintln!(
@@ -3420,15 +3215,6 @@ where
         )));
     }
     let direct_metrics = webrtc.direct_path_metrics().await;
-    let runtime_spec = provider_runtime_spec_from_live_material(
-        &profile,
-        &scope,
-        endpoint_label.clone(),
-        rendezvous_topic.clone(),
-        captured_sealed_offer,
-        captured_sealed_answer.clone(),
-        sealed_ice_candidates,
-    );
     let evidence = ProviderTextControlRuntimePeerEvidence {
         kind: profile.kind,
         profile_id: profile.profile_id,
@@ -3440,7 +3226,6 @@ where
         role: ProviderTextControlRuntimePeerRole::Answerer,
         direct_path_ready: direct_metrics.direct_path_ready,
         data_channel_open: data_metrics.open,
-        runtime_spec,
     };
 
     let recovering_peer = Arc::new(RecoveringProviderTextControlPeer::new(webrtc.clone()));
@@ -3730,42 +3515,6 @@ where
 }
 
 #[cfg(any(
-    test,
-    feature = "mqtt-adapter",
-    feature = "nostr-adapter",
-    feature = "ipfs-pubsub-adapter",
-    feature = "discrypt-quic-rendezvous-adapter"
-))]
-fn provider_runtime_spec_from_live_material(
-    profile: &SignalingAdapterProfile,
-    scope: &ConversationScope,
-    endpoint_label: String,
-    rendezvous_topic: String,
-    sealed_offer: Option<SealedWebRtcNegotiationPayload>,
-    sealed_answer: Option<SealedWebRtcNegotiationPayload>,
-    sealed_ice_candidates: Vec<SealedWebRtcNegotiationPayload>,
-) -> ProviderTextControlRuntimeSpec {
-    let now_unix_seconds = Utc::now().timestamp();
-    ProviderTextControlRuntimeSpec {
-        schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-        attachment: ProviderTextControlRuntimeAttachment {
-            adapter_kind: profile.kind.canonical_name().to_owned(),
-            profile_id: profile.profile_id.clone(),
-            endpoint_label,
-            rendezvous_topic,
-            scope_commitment: scope.scope_id_commitment.clone(),
-            runtime_spec: None,
-        },
-        created_at_unix_seconds: now_unix_seconds,
-        expires_at_unix_seconds: now_unix_seconds.saturating_add(60 * 60),
-        sealed_offer,
-        sealed_answer,
-        sealed_ice_candidates,
-        missing_material: Vec::new(),
-    }
-}
-
-#[cfg(any(
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -3838,10 +3587,6 @@ where
     if opaque_offer.windows(3).any(|window| window == b"v=0") {
         return Err(TransportError::PlaintextLeak);
     }
-    let captured_sealed_offer = Some(sealed_offer.clone());
-    let mut captured_sealed_answer = None;
-    let mut offerer_ice_candidates = Vec::new();
-    let mut answerer_ice_candidates = Vec::new();
     alice_room.send_signal(bob.clone(), sealed_offer).await?;
 
     let mut answer_applied = false;
@@ -3865,7 +3610,6 @@ where
                         signal.payload.negotiation_id,
                         signal.payload.expires_at_unix_seconds,
                     )?;
-                    captured_sealed_answer = Some(sealed_answer.clone());
                     bob_room.send_signal(alice.clone(), sealed_answer).await?;
                 }
                 WebRtcNegotiationPayloadKind::Candidate => {
@@ -3903,7 +3647,6 @@ where
                 Some(negotiation_id),
                 Some(negotiation_expires_at),
             )?;
-            offerer_ice_candidates.push(sealed_candidate.clone());
             alice_room
                 .send_signal(bob.clone(), sealed_candidate)
                 .await?;
@@ -3914,7 +3657,6 @@ where
                 Some(negotiation_id),
                 Some(negotiation_expires_at),
             )?;
-            answerer_ice_candidates.push(sealed_candidate.clone());
             bob_room
                 .send_signal(alice.clone(), sealed_candidate)
                 .await?;
@@ -4005,28 +3747,6 @@ where
     let offerer_diagnostic_timeline = alice_webrtc.diagnostic_timeline().await;
     let answerer_diagnostic_timeline = bob_webrtc.diagnostic_timeline().await;
 
-    let now_unix_seconds = Utc::now().timestamp();
-    let mut runtime_ice_candidates = Vec::new();
-    runtime_ice_candidates.extend(offerer_ice_candidates);
-    runtime_ice_candidates.extend(answerer_ice_candidates);
-    let runtime_spec = ProviderTextControlRuntimeSpec {
-        schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-        attachment: ProviderTextControlRuntimeAttachment {
-            adapter_kind: profile.kind.canonical_name().to_owned(),
-            profile_id: profile.profile_id.clone(),
-            endpoint_label: endpoint_label.clone(),
-            rendezvous_topic: rendezvous_topic.clone(),
-            scope_commitment: scope.scope_id_commitment.clone(),
-            runtime_spec: None,
-        },
-        created_at_unix_seconds: now_unix_seconds,
-        expires_at_unix_seconds: now_unix_seconds.saturating_add(60 * 60),
-        sealed_offer: captured_sealed_offer,
-        sealed_answer: captured_sealed_answer,
-        sealed_ice_candidates: runtime_ice_candidates,
-        missing_material: Vec::new(),
-    };
-
     alice_webrtc.tear_down().await?;
     bob_webrtc.tear_down().await?;
     alice_room.leave().await?;
@@ -4056,7 +3776,6 @@ where
         text_control_frame_sha256: frame_sha256,
         receipt_frame_roundtrip,
         receipt_frame_sha256,
-        runtime_spec: Some(runtime_spec),
         offerer_diagnostic_timeline: Some(offerer_diagnostic_timeline),
         answerer_diagnostic_timeline: Some(answerer_diagnostic_timeline),
     })
@@ -4100,7 +3819,13 @@ where
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn redacted_endpoint_label(endpoint: &str) -> String {
     let digest = redacted_observable_digest(endpoint);
     let scheme = endpoint
@@ -4115,7 +3840,6 @@ fn redacted_observable_label(kind: &str, value: &str) -> String {
     format!("{kind}#{}", redacted_observable_digest(value))
 }
 
-#[allow(dead_code)]
 fn redacted_observable_digest(value: &str) -> String {
     use sha2::Digest as _;
 
@@ -4128,14 +3852,26 @@ fn redacted_observable_digest(value: &str) -> String {
         .collect::<String>()
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn provider_runtime_debug_enabled() -> bool {
     std::env::var_os("DISCRYPT_WEBRTC_DEBUG").is_some()
         || std::env::var_os("DISCRYPT_WEBRTC_DEBUG_CANDIDATES").is_some()
         || std::env::var("DISCRYPT_SIGNALING_TRACE").as_deref() == Ok("1")
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    test,
+    feature = "mqtt-adapter",
+    feature = "nostr-adapter",
+    feature = "ipfs-pubsub-adapter",
+    feature = "discrypt-quic-rendezvous-adapter"
+))]
 fn redacted_peer_label(peer: &SignalingPeerId) -> String {
     format!("peer#{}", redacted_observable_digest(&peer.0))
 }
@@ -5930,8 +5666,21 @@ fn discrypt_rendezvous_validate_wire_envelope(
             }
             reject_forbidden_plaintext(&payload.ciphertext)
         }
-        DiscryptRendezvousWireEnvelope::Control { .. } => {
-            Err(provider_app_payload_relay_disabled_error())
+        DiscryptRendezvousWireEnvelope::Control {
+            schema, payload, ..
+        } => {
+            if expected_kind != DiscryptRendezvousSignalKind::Rendezvous {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous control envelope arrived on non-rendezvous signal kind"
+                        .to_owned(),
+                ));
+            }
+            if *schema != DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION {
+                return Err(TransportError::SignalingAdapter(
+                    "discrypt rendezvous control envelope schema_version is unsupported".to_owned(),
+                ));
+            }
+            reject_forbidden_plaintext(&payload.bytes)
         }
     }
 }
@@ -6534,12 +6283,20 @@ impl RendezvousRoom for IpfsPubsubProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        let _ = sealed_payload;
-        Err(provider_app_payload_relay_disabled_error())
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        let payload = ipfs_encode_envelope(&IpfsPubsubWireEnvelope::Control {
+            schema: IPFS_PUBSUB_EVENT_SCHEMA,
+            from_peer: self.local_peer_id.clone(),
+            payload: sealed_payload,
+        })?;
+        ipfs_command(&self.commands, payload).await
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        Err(provider_app_payload_relay_disabled_error())
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        self.take_health_fault().await?;
+        let mut inbox = self.inbox.lock().await;
+        Ok(std::mem::take(&mut inbox.controls))
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -7453,12 +7210,40 @@ impl RendezvousRoom for DiscryptQuicRendezvousProviderRoom {
         &self,
         sealed_payload: OpaqueSignalingPayload,
     ) -> Result<(), TransportError> {
-        let _ = sealed_payload;
-        Err(provider_app_payload_relay_disabled_error())
+        reject_forbidden_plaintext(&sealed_payload.bytes)?;
+        self.publish_envelope(
+            DiscryptRendezvousSignalKind::Rendezvous,
+            discrypt_rendezvous_key(&self.topic, "control", None),
+            DiscryptRendezvousWireEnvelope::Control {
+                schema: 1,
+                from_peer: self.local_peer_id.clone(),
+                payload: sealed_payload,
+            },
+            120,
+        )
+        .await
     }
 
     async fn take_control_payloads(&self) -> Result<Vec<ControlBroadcast>, TransportError> {
-        Err(provider_app_payload_relay_disabled_error())
+        let envelopes = self
+            .take_envelopes(
+                DiscryptRendezvousSignalKind::Rendezvous,
+                discrypt_rendezvous_key(&self.topic, "control", None),
+            )
+            .await?;
+        Ok(envelopes
+            .into_iter()
+            .filter_map(|envelope| match envelope {
+                DiscryptRendezvousWireEnvelope::Control {
+                    schema: 1,
+                    from_peer,
+                    payload,
+                } if from_peer != self.local_peer_id => {
+                    Some(ControlBroadcast { from_peer, payload })
+                }
+                _ => None,
+            })
+            .collect())
     }
 
     async fn leave(&self) -> Result<(), TransportError> {
@@ -8415,24 +8200,8 @@ mod tests {
             text_control_frame_sha256: "a".repeat(64),
             receipt_frame_roundtrip: true,
             receipt_frame_sha256: "b".repeat(64),
-            runtime_spec: None,
             offerer_diagnostic_timeline: Some(timeline),
             answerer_diagnostic_timeline: None,
-        }
-    }
-
-    fn assert_provider_app_payload_relay_disabled<T>(result: Result<T, TransportError>) {
-        assert!(
-            result.is_err(),
-            "provider application-payload relay path unexpectedly succeeded"
-        );
-        if let Err(error) = result {
-            assert!(
-                error
-                    .to_string()
-                    .contains(PROVIDER_APP_PAYLOAD_RELAY_DISABLED_MESSAGE),
-                "unexpected provider relay error: {error}"
-            );
         }
     }
 
@@ -8713,9 +8482,6 @@ mod tests {
         assert_eq!(reconnect_policy.delay_for_attempt(1), 125);
         assert_eq!(reconnect_policy.delay_for_attempt(4), 1_000);
 
-        assert_provider_app_payload_relay_disabled::<()>(Err(
-            provider_app_payload_relay_disabled_error(),
-        ));
         assert!(report.metrics.content_free_and_safe_to_export());
         Ok(())
     }
@@ -9442,14 +9208,22 @@ mod tests {
         let bob_signals = bob_room.take_signals().await?;
         assert!(bob_signals.iter().any(|signal| signal.payload == offer));
 
-        assert_provider_app_payload_relay_disabled(
-            bob_room
-                .broadcast_control(OpaqueSignalingPayload::new(
-                    b"sealed-provider-relay-attempt-bob".to_vec(),
-                )?)
-                .await,
+        let control_payload_bytes = b"sealed-ipfs-control-from-bob".to_vec();
+        bob_room
+            .broadcast_control(OpaqueSignalingPayload::new(control_payload_bytes.clone())?)
+            .await?;
+        let alice_controls = alice_room.take_control_payloads().await?;
+        assert_eq!(
+            alice_controls.len(),
+            1,
+            "ipfs pubsub control envelope must be delivered"
         );
-        assert_provider_app_payload_relay_disabled(alice_room.take_control_payloads().await);
+        assert_eq!(alice_controls[0].from_peer, bob);
+        assert_eq!(alice_controls[0].payload.bytes, control_payload_bytes);
+        assert!(
+            bob_room.take_control_payloads().await?.is_empty(),
+            "sender must not receive its own control broadcast"
+        );
 
         alice_room.leave().await?;
         bob_room.leave().await?;
@@ -9872,6 +9646,8 @@ mod tests {
             to_peer: local_peer_id.clone(),
             payload: SealedWebRtcNegotiationPayload {
                 version: 1,
+                negotiation_id: None,
+                expires_at_unix_seconds: None,
                 kind: WebRtcNegotiationPayloadKind::Offer,
                 nonce: [9; 12],
                 ciphertext: b"sealed-ipfs-duplicate-storm-offer".to_vec(),
@@ -10461,15 +10237,38 @@ mod tests {
 
         let control = DiscryptRendezvousWireEnvelope::Control {
             schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION,
-            from_peer: alice,
+            from_peer: alice.clone(),
             payload: OpaqueSignalingPayload::new(b"ciphertext:application-control".to_vec())?,
         };
-        let control_error =
-            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Rendezvous, &control)
-                .expect_err("application/control relay must remain disabled");
-        assert!(control_error
-            .to_string()
-            .contains("application-payload relay is disabled"));
+        let encoded_control = discrypt_rendezvous_encode_envelope(
+            DiscryptRendezvousSignalKind::Rendezvous,
+            &control,
+        )?;
+        let decoded_control = discrypt_rendezvous_decode_envelope(
+            DiscryptRendezvousSignalKind::Rendezvous,
+            &encoded_control,
+        )?;
+        assert!(matches!(
+            decoded_control,
+            DiscryptRendezvousWireEnvelope::Control { .. }
+        ));
+        let wrong_control_kind =
+            discrypt_rendezvous_encode_envelope(DiscryptRendezvousSignalKind::Offer, &control)
+                .expect_err("control envelope must stay on rendezvous signal kind");
+        assert!(wrong_control_kind.to_string().contains("non-rendezvous"));
+
+        let plaintext_control = DiscryptRendezvousWireEnvelope::Control {
+            schema: DISCRYPT_RENDEZVOUS_WIRE_SCHEMA_VERSION,
+            from_peer: alice,
+            payload: OpaqueSignalingPayload::new(b"channel name plaintext".to_vec())?,
+        };
+        assert!(matches!(
+            discrypt_rendezvous_encode_envelope(
+                DiscryptRendezvousSignalKind::Rendezvous,
+                &plaintext_control,
+            ),
+            Err(TransportError::PlaintextLeak)
+        ));
 
         Ok(())
     }
@@ -10547,6 +10346,40 @@ mod tests {
                 "local sibling service binary",
             )?,
         };
+        let capability = RendezvousCapability::derive(
+            scope.clone(),
+            SignalingAdapterKind::DiscryptQuicRendezvous,
+            b"bootstrap secret with more than thirty two bytes",
+            b"random entropy bytes",
+            120,
+            ProviderMetadataPosture::HashedTopic,
+            AdapterTrustLabel::new("discrypt_quic_rendezvous", "local sibling service control")?,
+        )?;
+        let alice = SignalingPeerId::new("quic-sibling-control-alice")?;
+        let bob = SignalingPeerId::new("quic-sibling-control-bob")?;
+        let alice_session = DiscryptQuicRendezvousProviderAdapter
+            .connect(profile.clone())
+            .await?;
+        let bob_session = DiscryptQuicRendezvousProviderAdapter
+            .connect(profile.clone())
+            .await?;
+        let alice_room = alice_session
+            .join(scope.clone(), capability.clone(), alice.clone())
+            .await?;
+        let bob_room = bob_session.join(scope.clone(), capability, bob).await?;
+        let control_payload = b"ciphertext:quic-sibling-control".to_vec();
+        alice_room
+            .broadcast_control(OpaqueSignalingPayload::new(control_payload.clone())?)
+            .await?;
+        let bob_controls = bob_room.take_control_payloads().await?;
+        assert_eq!(bob_controls.len(), 1);
+        assert_eq!(bob_controls[0].from_peer, alice);
+        assert_eq!(bob_controls[0].payload.bytes, control_payload);
+        alice_room.leave().await?;
+        bob_room.leave().await?;
+        alice_session.close().await?;
+        bob_session.close().await?;
+
         let probe = probe_provider_adapter_roundtrip(
             profile,
             scope,
@@ -10761,228 +10594,6 @@ mod tests {
             room.leave().await,
             Err(TransportError::SignalingAdapter(_))
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn text_control_runtime_attachment_seam_reports_missing_implementation(
-    ) -> Result<(), TransportError> {
-        let attach_request = ProviderTextControlRuntimeAttachment {
-            adapter_kind: "mqtt".to_owned(),
-            profile_id: "unit-test-profile".to_owned(),
-            endpoint_label: "unit-test-endpoint".to_owned(),
-            rendezvous_topic: "unit-test-topic".to_owned(),
-            scope_commitment: "unit-test-scope".to_owned(),
-            runtime_spec: None,
-        };
-        let Err(error) = resume_text_control_runtime_from_probe(attach_request) else {
-            return Err(TransportError::Unavailable(
-                "runtime attachment path must remain unimplemented".to_owned(),
-            ));
-        };
-        assert!(error
-            .to_string()
-            .contains(TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE));
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_spec_from_probe_serializes_and_stays_fail_closed_without_handoff_material(
-    ) -> Result<(), TransportError> {
-        let probe = ProviderWebRtcDataChannelProbe {
-            kind: SignalingAdapterKind::Mqtt,
-            profile_id: "unit-test-profile".to_owned(),
-            endpoint_label: "mqtt://redacted".to_owned(),
-            scope_commitment: "scope".to_owned(),
-            rendezvous_topic: "topic".to_owned(),
-            offerer_direct_path_ready: true,
-            answerer_direct_path_ready: true,
-            offerer_turn_fallback_ready: false,
-            answerer_turn_fallback_ready: false,
-            offerer_configured_turn_servers: 0,
-            answerer_configured_turn_servers: 0,
-            offerer_local_relay_candidates_gathered: 0,
-            answerer_local_relay_candidates_gathered: 0,
-            offerer_remote_relay_candidates_applied: 0,
-            answerer_remote_relay_candidates_applied: 0,
-            offerer_data_channel_open: true,
-            answerer_data_channel_open: true,
-            text_control_frame_roundtrip: true,
-            text_control_frame_sha256: "text-sha".to_owned(),
-            receipt_frame_roundtrip: true,
-            receipt_frame_sha256: "receipt-sha".to_owned(),
-            runtime_spec: None,
-            offerer_diagnostic_timeline: None,
-            answerer_diagnostic_timeline: None,
-        };
-        let spec = ProviderTextControlRuntimeSpec::from_probe_without_negotiation_material(
-            &probe, 100, 60,
-        );
-        let encoded = serde_json::to_string(&spec).map_err(|error| {
-            TransportError::Unavailable(format!("serialize runtime spec: {error}"))
-        })?;
-        assert!(encoded.contains("unit-test-profile"));
-        assert!(!encoded.contains("text-sha"));
-        let decoded: ProviderTextControlRuntimeSpec =
-            serde_json::from_str(&encoded).map_err(|error| {
-                TransportError::Unavailable(format!("decode runtime spec: {error}"))
-            })?;
-        assert_eq!(
-            decoded.schema_version,
-            PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION
-        );
-        assert_eq!(decoded.attachment.adapter_kind, "mqtt");
-        assert_eq!(decoded.expires_at_unix_seconds, 160);
-        let Err(error) = decoded.validate_for_runtime_attach(120, &decoded.attachment) else {
-            return Err(TransportError::Unavailable(
-                "missing offer/answer/ICE must fail closed".to_owned(),
-            ));
-        };
-        assert!(error.to_string().contains("missing negotiated material"));
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_spec_rejects_stale_handoff_before_runtime_attach() -> Result<(), TransportError> {
-        let spec = ProviderTextControlRuntimeSpec {
-            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-            attachment: ProviderTextControlRuntimeAttachment {
-                adapter_kind: "mqtt".to_owned(),
-                profile_id: "unit-test-profile".to_owned(),
-                endpoint_label: "endpoint".to_owned(),
-                rendezvous_topic: "topic".to_owned(),
-                scope_commitment: "unit-scope".to_owned(),
-                runtime_spec: None,
-            },
-            created_at_unix_seconds: 10,
-            expires_at_unix_seconds: 20,
-            sealed_offer: None,
-            sealed_answer: None,
-            sealed_ice_candidates: Vec::new(),
-            missing_material: Vec::new(),
-        };
-        let Err(error) = spec.validate_for_runtime_attach(21, &spec.attachment) else {
-            return Err(TransportError::Unavailable(
-                "expired spec must fail before runtime attach".to_owned(),
-            ));
-        };
-        assert!(error.to_string().contains("stale"));
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_spec_rejects_incompatible_attachment() -> Result<(), TransportError> {
-        let mut attachment = ProviderTextControlRuntimeAttachment {
-            adapter_kind: "mqtt".to_owned(),
-            profile_id: "unit-test-profile".to_owned(),
-            endpoint_label: "endpoint".to_owned(),
-            rendezvous_topic: "topic".to_owned(),
-            scope_commitment: "unit-scope".to_owned(),
-            runtime_spec: None,
-        };
-        let now_unix_seconds = Utc::now().timestamp();
-        let spec = ProviderTextControlRuntimeSpec {
-            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-            attachment: attachment.clone(),
-            created_at_unix_seconds: now_unix_seconds,
-            expires_at_unix_seconds: now_unix_seconds.saturating_add(3600),
-            sealed_offer: Some(SealedWebRtcNegotiationPayload {
-                version: 1,
-                negotiation_id: None,
-                expires_at_unix_seconds: None,
-                kind: WebRtcNegotiationPayloadKind::Offer,
-                nonce: [7; 12],
-                ciphertext: b"offer".to_vec(),
-            }),
-            sealed_answer: Some(SealedWebRtcNegotiationPayload {
-                version: 1,
-                negotiation_id: None,
-                expires_at_unix_seconds: None,
-                kind: WebRtcNegotiationPayloadKind::Answer,
-                nonce: [8; 12],
-                ciphertext: b"answer".to_vec(),
-            }),
-            sealed_ice_candidates: Vec::new(),
-            missing_material: Vec::new(),
-        };
-        attachment.adapter_kind = "nostr".to_owned();
-        let Err(error) = spec.validate_for_runtime_attach(150, &attachment) else {
-            return Err(TransportError::Unavailable(
-                "incompatible adapter must fail before runtime attach".to_owned(),
-            ));
-        };
-        assert!(error
-            .to_string()
-            .contains(TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE));
-        Ok(())
-    }
-
-    #[test]
-    fn valid_runtime_spec_still_fails_closed_until_runtime_factory_exists(
-    ) -> Result<(), TransportError> {
-        let attachment = ProviderTextControlRuntimeAttachment {
-            adapter_kind: "mqtt".to_owned(),
-            profile_id: "unit-test-profile".to_owned(),
-            endpoint_label: "endpoint".to_owned(),
-            rendezvous_topic: "topic".to_owned(),
-            scope_commitment: "unit-scope".to_owned(),
-            runtime_spec: None,
-        };
-        let now_unix_seconds = Utc::now().timestamp();
-        let spec = ProviderTextControlRuntimeSpec {
-            schema_version: PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-            attachment: attachment.clone(),
-            created_at_unix_seconds: now_unix_seconds,
-            expires_at_unix_seconds: now_unix_seconds.saturating_add(3600),
-            sealed_offer: Some(SealedWebRtcNegotiationPayload {
-                version: 1,
-                negotiation_id: None,
-                expires_at_unix_seconds: None,
-                kind: WebRtcNegotiationPayloadKind::Offer,
-                nonce: [7; 12],
-                ciphertext: b"offer".to_vec(),
-            }),
-            sealed_answer: Some(SealedWebRtcNegotiationPayload {
-                version: 1,
-                negotiation_id: None,
-                expires_at_unix_seconds: None,
-                kind: WebRtcNegotiationPayloadKind::Answer,
-                nonce: [8; 12],
-                ciphertext: b"answer".to_vec(),
-            }),
-            sealed_ice_candidates: vec![SealedWebRtcNegotiationPayload {
-                version: 1,
-                negotiation_id: None,
-                expires_at_unix_seconds: None,
-                kind: WebRtcNegotiationPayloadKind::Candidate,
-                nonce: [9; 12],
-                ciphertext: b"candidate".to_vec(),
-            }],
-            missing_material: Vec::new(),
-        };
-        let Err(error) =
-            resume_text_control_runtime_from_spec(&spec, &attachment, now_unix_seconds + 1)
-        else {
-            return Err(TransportError::Unavailable(
-                "validated handoff must not fake a live runtime".to_owned(),
-            ));
-        };
-        assert!(error
-            .to_string()
-            .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));
-
-        let attachment_with_spec = ProviderTextControlRuntimeAttachment {
-            runtime_spec: Some(Box::new(spec)),
-            ..attachment
-        };
-        let Err(error) = resume_text_control_runtime_from_probe(attachment_with_spec) else {
-            return Err(TransportError::Unavailable(
-                "attachment seam must still fail closed without factory".to_owned(),
-            ));
-        };
-        assert!(error
-            .to_string()
-            .contains(TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE));
         Ok(())
     }
 
@@ -11371,13 +10982,6 @@ mod tests {
         assert!(runtime.evidence().answerer_direct_path_ready);
         assert!(runtime.evidence().offerer_data_channel_open);
         assert!(runtime.evidence().answerer_data_channel_open);
-        runtime
-            .evidence()
-            .runtime_spec
-            .validate_for_runtime_attach(
-                Utc::now().timestamp(),
-                &runtime.evidence().runtime_spec.attachment,
-            )?;
 
         let transport = runtime.transport();
         let mut expected_receipts = Vec::new();
@@ -11529,20 +11133,6 @@ mod tests {
         assert!(answerer.evidence().direct_path_ready);
         assert!(offerer.evidence().data_channel_open);
         assert!(answerer.evidence().data_channel_open);
-        offerer
-            .evidence()
-            .runtime_spec
-            .validate_for_runtime_attach(
-                Utc::now().timestamp(),
-                &offerer.evidence().runtime_spec.attachment,
-            )?;
-        answerer
-            .evidence()
-            .runtime_spec
-            .validate_for_runtime_attach(
-                Utc::now().timestamp(),
-                &answerer.evidence().runtime_spec.attachment,
-            )?;
 
         let transport = offerer.transport();
         let notice = b"ciphertext:role-split-presence-notice:0".to_vec();

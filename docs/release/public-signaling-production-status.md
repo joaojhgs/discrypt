@@ -185,7 +185,7 @@ File:
 MQTT command:
 
 ```bash
-DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
+DISCRYPT_PUBLIC_MQTT_E2E=1 \
   cargo test -q -p discrypt-transport --features mqtt-adapter \
   public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 ```
@@ -378,9 +378,7 @@ npm --prefix apps/ui run test:command-coverage
 - [x] Establish data channel for opaque text/control delivery across two independent Rust transport peers over public MQTT and Nostr rendezvous.
 - [x] Expose a UI/Tauri opt-in message-send transport proof that sends an opaque message-derived frame through the provider-signaled WebRTC DataChannel diagnostic.
 - [x] Add a same-process Tauri service harness that can load and persist two isolated app profiles from distinct state files, removing the prior global-state-only blocker for two-profile command E2E tests.
-- [ ] Expose a production-safe long-lived text/control runtime attachment path (not a test shim).
-  - `attach_text_control_transport_runtime` now starts role-split offerer/answerer runtimes when role/local/remote peer ids are supplied; legacy no-role probe-resume remains fail-closed with `transport_runtime_not_supported`.
-  - Current probe-only helpers (`run_provider_webrtc_data_channel_probe` / `..._request_response_probe`) terminate their transport sessions after verification and do not leave a reusable `WebRtcNegotiator` or equivalent runtime object in app-service state.
+- [x] Expose a production-safe long-lived text/control runtime attachment path. Runtime attachment requires current provider-advertised peer identities and starts role-split offerer/answerer runtimes; probe-resume and session-only attachment shims were removed.
 - [ ] Establish persistent send/receive over the same data-channel path across two real Tauri app profiles/devices from UI-driven DM/group state, with signed peer receipts. The signed receipt verification/apply boundary, receiver-side envelope acceptance/receipt-generation command, text-control-frame handler, durable outbound text-control outbox, and reusable backend `TextControlDataTransport` pump are implemented and tested; the pump lists pending frames, sends over the transport trait, records frame-hash-guarded send handoff, receives response frames, applies signed receipts, emits metrics, persists `receipted` state, and now rejects missing-runtime, missing-session, and session-id-mismatch cases with typed command errors. Env-gated same-process two-profile MQTT and Nostr proofs now consume the persisted outbox frame, send that serialized frame through a real provider-signaled DataChannel, invoke Bob's receiver handler after answerer DataChannel delivery, return a signed receipt frame over the same DataChannel, mark the outbox handoff `sent`, and then transition to `receipted`; `start_text_session(..., data_channel_probe=true)` marks the backend text session route as direct only after the provider-signaled DataChannel proof succeeds. A local `TextControlDataTransport` pump proof now covers send/recv trait invocation, receiver handler invocation, DataChannel-style metrics, frame-hash-guarded send handoff, durable receipt persistence, and fail-closed ownership preconditions. Native builds now keep text/control pumping on the Tauri backend rather than a React foreground timer, and the pump remains fail-closed/status-visible until a matching live runtime exists; role-split provider WebRTC runtime attachment and background pending status are implemented; installed-device/two-process app proof remains open.
 - [ ] Establish audio media path and prove speaking/mute/volume UI state reflects real media state. Partial local-only progress: the UI now measures a real local microphone buffer, the backend app service updates the local participant speaking flag from RMS/peak evidence while respecting self-mute, and a core reload regression now persists that speaking state across restart; remote transported audio, per-peer playback volume, and encrypted media-frame E2E remain open.
 - [x] Prove public STUN participates in provider-signaled WebRTC data-channel setup in the live same-host Rust transport harness with real network UDP bind.
@@ -399,13 +397,13 @@ npm --prefix apps/ui run test:command-coverage
 
 #### G132 status
 
-- Added local deterministic proof for STUN→overlay→TURN behavior and provider-privacy hygiene in:
+- Added local deterministic proof for STUN→configured-TURN behavior and provider-privacy hygiene in:
   - `harness/multinode/src/lib.rs`
   - `crates/transport/tests/connectivity_flows.rs`
 - Added release gate script:
   - `npm --prefix apps/ui run test:stun-turn-provider-privacy-g132`
 - Public-provider smoke remains optional to keep default CI deterministic:
-  - set `DISCRYPT_PUBLIC_SIGNALING_E2E=1` for MQTT reruns and `DISCRYPT_PUBLIC_NOSTR_E2E=1` for Nostr reruns; latest MQTT and Nostr public adapter-boundary proofs are green against their configured default public providers.
+  - set `DISCRYPT_PUBLIC_MQTT_E2E=1` for MQTT reruns and `DISCRYPT_PUBLIC_NOSTR_E2E=1` for Nostr reruns; latest MQTT and Nostr public adapter-boundary proofs are green against their configured default public providers.
 
 ### G132 production evidence matrix
 
@@ -413,9 +411,9 @@ npm --prefix apps/ui run test:command-coverage
 
 | Gate slice | Command | Evidence target |
 | --- | --- | --- |
-| STUN overlay ordering and TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
-| Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
-| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_SIGNALING_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture` | Latest reruns passed against `mqtts://broker.emqx.io:8883` after broker `SUBACK` readiness was enforced; `test.mosquitto.org` certificate incompatibility and `broker.hivemq.com` network timeout remain provider-specific caveats. |
+| STUN and configured-TURN fallback determinism | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | `ConnectivitySignalingPushSmoke` flags: `fallback_chain_covered`, `owner_overrides_used`, `metadata_matrix_validated`, `relays_ciphertext_only`, `ac_metadata_matrix_validated` |
+| Transport policy/ciphertext-only routing | `cargo test -p discrypt-transport valid_direct_and_configured_turn_flows_select_expected_leg --quiet` | Test-asserted route ordering and relay leg ciphertext-only constraints |
+| Optional public MQTT proof (provider-visible real smoke) | `DISCRYPT_PUBLIC_MQTT_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...> cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture` | Latest reruns passed against `mqtts://broker.emqx.io:8883` after broker `SUBACK` readiness was enforced; `test.mosquitto.org` certificate incompatibility and `broker.hivemq.com` network timeout remain provider-specific caveats. |
 | Nostr public-provider proof | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://relay.damus.io cargo test -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_and_signal_roundtrip -- --nocapture`; `DISCRYPT_PUBLIC_NOSTR_MULTI_RELAY_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_multi_relay_degraded_fallback_soak -- --nocapture`; `DISCRYPT_PUBLIC_NOSTR_REJECTION_E2E=1 cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_blocked_relay_maps_to_auth_required -- --nocapture` | Latest single-relay rerun passed against `wss://relay.damus.io`; degraded multi-relay fallback passed on 2026-05-30 with `wss://nos.lol,wss://relay.damus.io,wss://discrypt-degraded-relay.invalid`; blocked relay rejection passed against `wss://nostr.oxtr.dev` with typed `provider_auth_required` and no payload leakage |
 | Optional public provider-signaled WebRTC data-channel proof | `DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E=1 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_signals_real_webrtc_datachannel_roundtrip -- --nocapture` and `DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol cargo test -q -p discrypt-transport --features nostr-adapter --test public_webrtc_datachannel_e2e public_nostr_signals_real_webrtc_datachannel_roundtrip -- --nocapture` | Latest MQTT and Nostr runs passed. They use `stun:stun.l.google.com:19302`, bind WebRTC UDP to `0.0.0.0:0`, exchange sealed offer/answer through the provider, open a WebRTC DataChannel, and deliver an opaque text/control frame. Damus was rate-limited in one rerun, so `nos.lol` is the latest green public Nostr relay evidence. |
 | Optional public TURN relay-only WebRTC proof | `DISCRYPT_PUBLIC_TURN_E2E=1 DISCRYPT_PUBLIC_TURN_ENDPOINT=<turns://...> DISCRYPT_PUBLIC_TURN_USERNAME=<user> DISCRYPT_PUBLIC_TURN_CREDENTIAL=<secret> cargo test -q -p discrypt-transport --features mqtt-adapter --test public_webrtc_datachannel_e2e public_mqtt_relay_only_turn_fallback_roundtrip_when_configured -- --nocapture` | Executable opt-in release gate. Local deterministic coverage rejects relay-only WebRTC without configured TURN. A real credentialed TURN run is still missing before hard-NAT/TURN production closure. |
@@ -431,7 +429,7 @@ npm --prefix apps/ui run test:command-coverage
 Default public broker:
 
 ```bash
-DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
+DISCRYPT_PUBLIC_MQTT_E2E=1 \
   cargo test -q -p discrypt-transport --features mqtt-adapter \
   public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
 ```
@@ -439,7 +437,7 @@ DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
 Custom public broker:
 
 ```bash
-DISCRYPT_PUBLIC_SIGNALING_E2E=1 \
+DISCRYPT_PUBLIC_MQTT_E2E=1 \
 DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtts://broker.emqx.io:8883 \
   cargo test -q -p discrypt-transport --features mqtt-adapter \
   public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture
@@ -468,8 +466,7 @@ DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=
   - `ProviderTextControlRuntime`, `ProviderTextControlRuntimePeerEvidence`, and `ProviderTextControlRuntimePeerRole`
 - [x] Proved the new runtime shape with two separately started local provider peers over the signaling adapter boundary. The answerer starts first, waits in the rendezvous scope, receives the sealed offer, answers, opens a real WebRTC DataChannel, receives an opaque frame, and returns an opaque receipt to the offerer.
 - [x] Kept provider-visible material opaque in the role-split test by scanning the local conformance bus for forbidden plaintext/SDP markers.
-- [x] Wire the role-split runtime APIs into `attach_text_control_transport_runtime` and app state. The Tauri command now accepts role/local-peer/remote-peer configuration and stores an owned `ProviderTextControlRuntime` handle for the active scope. Legacy no-role clients still use the fail-closed persisted probe resume path.
-- [x] Expose a UI role-split attach control surface that derives default peer ids from active DM/group/invite state and can call backend answerer/offerer runtime attach. This is an explicit manual runtime attach bridge, not final automatic invite/member orchestration.
+- [x] Wire role-split runtime attachment into app state using current provider-advertised runtime peer identities. No invite-derived or manual compatibility identity path remains.
 
 Verification added/run:
 
@@ -484,17 +481,15 @@ cargo test -q -p discrypt-transport live_provider_text_control_runtime_pair_carr
 
 ### 2026-05-30 Tauri role-split attach surface progress
 
-- [x] Extended the Tauri/backend `attach_text_control_transport_runtime` command with optional role-split fields:
-  - `runtime_role`: `offerer` or `answerer`
-  - `local_peer_id`
-  - `remote_peer_id`
-- [x] Preserved backward compatibility: if no role is supplied, the command still uses the legacy fail-closed persisted-probe resume path and does not pretend stale probe SDP is a live runtime.
-- [x] When role and peer ids are supplied, the backend now builds active-scope signaling profile/scope/ICE material, starts the corresponding one-peer provider runtime, stores the owned runtime handle plus executor in app-service state, and exposes role/peer evidence in the text/control runtime status row.
-- [x] Updated the frontend command type and command-coverage gate to include the new attach fields.
-- [x] UI now derives default runtime peer ids from active DM/group/invite state and lets the operator set reciprocal local/remote peer ids before starting answerer or offerer.
+- [x] The Tauri/backend `attach_text_control_transport_runtime` command accepts
+  only an optional session ID. It derives the role and both runtime peer IDs
+  internally from current signed provider advertisements.
+- [x] The backend builds active-scope signaling profile/scope/ICE material, starts the corresponding one-peer provider runtime, stores the owned runtime handle plus executor in app-service state, and exposes role/peer evidence in the text/control runtime status row.
+- [x] Updated the frontend command type and command-coverage gate to expose only
+  the optional session ID.
+- [x] UI consumes provider-advertised runtime peer identities and never derives them from invite/bootstrap commitments.
 - [x] Backend role-split attach now starts on a background thread and surfaces an `attaching` text/control runtime status row, so answerer/offerer startup no longer blocks the command/UI while it waits for the reciprocal peer.
-- [x] DM runtime peer defaults now use signed DM invite bootstrap commitments: the inviter side defaults to the inviter identity commitment and the accepted side defaults to the reply rendezvous commitment.
-- [ ] Group/member runtime peer identity exchange still needs signed member-device metadata; manual reciprocal peer id entry remains the operator bridge outside DM bootstrap flows.
+- [x] DM and group runtime peer identities are carried only by signed provider-control presence advertisements with bounded leases.
 - [ ] Two installed app instances have not yet been run through the role-split attach command over public providers.
 
 Verification added/run:
@@ -508,14 +503,11 @@ npm --prefix apps/ui run test:command-coverage
 npm --prefix apps/ui run typecheck
 ```
 
-### 2026-05-30 UI role-split runtime attach bridge
+### Text/control runtime attachment
 
-- [x] Added manual UI controls to the transport status strip for `Local runtime peer`, `Remote runtime peer`, `Listen as answerer`, and `Connect as offerer`.
-- [x] Defaults are deterministically derived from active profile plus active DM/group/channel/invite state so the control is scoped to the current conversation context instead of global hard-coded peer ids.
-- [x] The UI calls the native `attach_text_control_transport_runtime` command with `runtime_role`, `local_peer_id`, and `remote_peer_id`; browser fallback remains honest through the existing command layer.
-- [x] Backend attach returns an honest `attaching` state immediately and completes/fails asynchronously through app events, avoiding a blocked UI while a peer is offline.
-- [x] DM defaults use signed invite bootstrap commitments for reciprocal inviter/reply peer roles where the app can infer the accepted-invite side.
-- [ ] This is not yet the final production UX. Group runtime attach still needs signed member-device metadata and a two-installed-app UI E2E over public providers.
+- [x] Runtime attachment derives role and runtime peer identities from current signed provider advertisements.
+- [x] Manual peer-id controls, invite-derived runtime identities, and probe-resume attachment paths are removed.
+- [x] Backend attach returns an honest `attaching` state immediately and completes or fails asynchronously through app events, avoiding a blocked UI while a peer is offline.
 
 Verification added/run:
 
@@ -552,37 +544,22 @@ cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter --test public
 cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter --test public_webrtc_datachannel_e2e public_quic_rendezvous_role_split_text_runtime_roundtrip -- --nocapture
 ```
 
-## 2026-05-30 update: invite-shared role-split runtime material
+## 2026-05-30 update: provider-advertised runtime material
 
-Role-split text/control runtime attach now derives its WebRTC rendezvous bootstrap
-and entropy from signed connectivity metadata (`connectivity_schema_version`,
-invite kind, scope commitment, selected profile id, and DM/group bootstrap
-commitments) instead of the local profile identity seed. This is required for two
-separately installed app profiles to compute the same provider rendezvous topic
-after one user creates a DM invite and the other accepts it.
-
-The active-DM connectivity resolver also prefers the matching signed DM invite
-snapshot for that DM before falling back to the local-only DM default, so the
-inviter and invitee attach against the same DM scope when a contact invite is
-present.
+Role-split text/control runtime attach uses the invite only for admission and
+shared connectivity policy. Runtime peer IDs are not encoded in the invite and
+are not accepted from UI/manual attach inputs. Each peer advertises its current
+runtime route over the signed, expiring provider control plane; attach and
+fanout fail closed until a current remote route advertisement exists.
 
 Verification added:
 
-- `live_role_split_runtime_material_is_invite_shared_not_profile_local` proves
-  Alice and Bob have distinct local profile identities but resolve identical
-  role-split runtime profile, scope, ICE config, bootstrap secret, and entropy
-  after create/accept DM invite.
-
-Verification run:
-
-- `cargo fmt --all --check`
-- `cargo check -q -p discrypt-desktop`
-- `cargo test -q -p discrypt-desktop attach_text_control_transport_runtime -- --nocapture`
-- `cargo test -q -p discrypt-desktop live_role_split_runtime_material_is_invite_shared_not_profile_local -- --nocapture`
-
-Remaining gap: this removes a real two-profile attach precondition, but does not
-by itself prove two installed GUI processes completed a public-provider attach
-and sent/received text from the UI.
+- `attach_text_control_transport_runtime_requires_provider_advertisement` proves
+  a text session cannot attach only from local/invite state.
+- `route_proof_does_not_replace_provider_peer_advertisement` proves a prior
+  route proof does not synthesize runtime peers.
+- `group_text_runtime_rejects_remote_route_without_current_presence_lease`
+  proves expired group presence is rejected for attach and text fanout.
 
 ## 2026-05-30 update: desktop runtime-pair proof now uses role-split constructors
 
@@ -601,160 +578,34 @@ Public evidence rerun:
 Remaining gap: this is now a stronger two-role persisted-state backend proof, but
 still not a two-window installed GUI Playwright/Tauri UI flow.
 
-## 2026-05-30 update: group invite-derived runtime peer defaults
+## 2026-05-30 update: runtime peers come from signed provider presence
 
-The React runtime attach controls now derive group owner/member peer defaults
-from signed group bootstrap commitments instead of falling through to local UI
-hash seeds. For an owner/admin profile, the default local peer is derived from
-`group_identity_commitment` and the remote member peer is derived from the signed
-role-admission/channel-policy commitments. For a joined member profile, the
-mapping is reversed. Users can still override the fields manually, but the normal
-group path no longer starts from ad-hoc profile-local defaults when signed group
-metadata is present.
+Invites carry admission and connectivity policy, but never runtime peer IDs.
+`publish_dm_presence` and `publish_group_presence` queue signed provider-control
+heartbeats containing the local runtime route, signer key, device identity, and
+TTL. The backend validates those leases before exposing remote DM/group
+`runtime_peers`, selecting text route fanout, or opening a voice media runtime.
 
-Verification run:
-
-- `npm --prefix apps/ui run typecheck`
-- `npm --prefix apps/ui run test:command-coverage`
-- `npm --prefix apps/ui run build`
-
-Remaining gap: this improves UI/runtime attach defaults for group flows, but does
-not yet provide a full signed member-device directory or two-window group text
-and voice E2E proof.
-
-## 2026-05-30 update: backend group runtime peers are persisted and returned
-
-Group creation, invite join, and account-recovery room hydration now persist a
-backend-owned `runtime_peers` list on each `GroupView`. The peer ids are derived
-from signed group bootstrap commitments with the same domain separation used by
-the UI/runtime attach path:
-
-- owner peer: signed `group_identity_commitment`
-- member peer: signed `role_admission_policy_commitment` + `channel_policy_commitment`
-- `is_local` marks owner-local on created groups and member-local on joined or
-  recovered groups
-- `source=signed_group_bootstrap_v1` documents that these are not ad-hoc UI-only
-  hashes
-
-The React runtime attach controls now prefer backend-returned group runtime peers
-before falling back to local bootstrap derivation, so the normal group attach path
-is driven by persisted Tauri state.
+The React runtime controls no longer expose manual peer or role fields. They ask
+the backend to attach the active text/control runtime, and the backend derives
+the offerer/answerer role from current provider-advertised routes.
 
 Verification added:
 
-- `group_invite_join_persists_signed_runtime_peers` proves Alice-created owner
-  peers and Bob-joined member peers are reciprocal, derived from the signed group
-  invite bootstrap, and survive reload.
+- `dm_runtime_routes_require_reciprocal_signed_provider_advertisements`
+  exercises DM route publication and reciprocal receipt.
+- `group_text_runtime_rejects_remote_route_without_current_presence_lease`
+  exercises group attach and text fanout rejection for expired presence.
+- `text_control_runtime_status_remains_not_attached_without_provider_advertisement`
+  keeps the UI-visible status fail-closed when no remote advertisement exists.
 
 Verification run:
 
 - `cargo fmt --all --check`
 - `cargo check -q -p discrypt-desktop`
-- `cargo test -q -p discrypt-desktop group_invite_join_persists_signed_runtime_peers -- --nocapture`
-- `npm --prefix apps/ui run typecheck`
-- `npm --prefix apps/ui run test:command-coverage`
-- `npm --prefix apps/ui run build`
-
-Remaining gap: this closes the UI-only group peer defaulting gap for two-sided
-owner/member invite bootstrap, but it is not a full multi-member signed device
-directory, not dynamic peer selection for large groups, and not yet a two-window
-installed GUI proof of group text or voice over public providers.
-
-## 2026-05-30 update: UI fallback invites carry bootstrap commitments and E2E asserts reciprocal peers
-
-The browser/local-dev fallback invite format now carries the same bootstrap
-commitments needed by two independent UI profiles to derive reciprocal runtime
-peers from an invite:
-
-- group invites include `group_identity`, `role_policy`, and `channel_policy`
-  commitment query fields
-- DM invites include `dm_inviter`, `dm_contact`, and `dm_reply` commitment query
-  fields
-- parsing preserves these commitments instead of rebuilding bootstrap metadata
-  from invite-key-local fallbacks
-
-The two-profile Playwright flow now asserts that after Alice creates a group
-invite and Bob joins it, the displayed local/remote runtime peer ids are
-reciprocal (`Alice.local == Bob.remote` and `Alice.remote == Bob.local`) before
-sending group messages. This does not claim remote delivery; it verifies the UI
-state needed before role-split attach is no longer divergent.
-
-Verification run:
-
-- `npm --prefix apps/ui run typecheck`
-- `VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npm --prefix apps/ui run build`
-- `cd apps/ui && CI=1 VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npx playwright test tests/e2e/two-profile-flow.spec.ts --workers=1`
-- `npm --prefix apps/ui run test:command-coverage`
-
-Remaining gap: this is browser fallback E2E for invite/bootstrap state and UI
-reciprocal runtime peer fields, not an installed Tauri two-process public-provider
-DataChannel receipt proof.
-
-## 2026-05-30 update: backend DM runtime peers are persisted and E2E-asserted
-
-Direct-message state now mirrors the group runtime-peer contract. `DirectConversationView`
-returns a backend-owned `runtime_peers` list derived from signed DM bootstrap
-commitments:
-
-- inviter peer: signed `inviter_identity_commitment`
-- reply peer: signed `reply_rendezvous_commitment`
-- `is_local` marks inviter-local on locally started/seeded DMs and reply-local
-  on accepted DM contact invites
-- `source=signed_dm_bootstrap_v1` records the evidence boundary
-
-The React runtime attach controls now prefer backend-returned DM runtime peers
-before falling back to bootstrap derivation. The two-profile Playwright flow now
-checks reciprocal DM runtime peer ids after Alice creates a DM invite and Bob
-accepts it, then checks reciprocal group runtime peer ids after group invite
-join.
-
-Verification added:
-
-- `dm_invite_accept_persists_signed_runtime_peers` proves Alice inviter and Bob
-  reply DM peers are reciprocal, derived from signed DM invite bootstrap, and
-  survive reload.
-
-Verification run:
-
-- `cargo fmt --all --check`
-- `cargo check -q -p discrypt-desktop`
-- `cargo test -q -p discrypt-desktop dm_invite_accept_persists_signed_runtime_peers -- --nocapture`
-- `npm --prefix apps/ui run typecheck`
-- `VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npm --prefix apps/ui run build`
-- `cd apps/ui && CI=1 VITE_DISCRYPT_LOCAL_DEV_FALLBACK=1 npx playwright test tests/e2e/two-profile-flow.spec.ts --workers=1`
-- `npm --prefix apps/ui run test:command-coverage`
-
-Remaining gap: this closes backend/UI reciprocal peer derivation for basic DM
-invite attach setup, but it is still not an installed Tauri two-process public
-provider receipt proof and not real media/voice E2E.
-
-## 2026-05-30 update: live runtime-pair proofs now use signed invite peer rows
-
-The backend live runtime-pair pump no longer synthesizes offerer/answerer peer ids
-from local profile ids for the public MQTT/Nostr receipt proof path. It now:
-
-- derives the shared runtime bootstrap/entropy from the signed invite connectivity
-  metadata through the same role-split material path used by runtime attach
-- reads local/remote peer ids from persisted DM/group `runtime_peers`
-- fails closed when sender and receiver states do not contain reciprocal signed
-  bootstrap peer rows
-- updates the public MQTT/Nostr runtime-pair tests so Bob accepts Alice's real DM
-  invite before the pump attempts a peer receipt
-
-Verification added:
-
-- `live_runtime_peer_ids_are_signed_invite_reciprocals` proves Alice/Bob DM invite
-  states produce reciprocal signed runtime peer ids.
-- Public MQTT/Nostr runtime-pair tests compile and skip cleanly unless their
-  public-provider E2E env flags are explicitly enabled; their setup now uses the
-  real DM invite/accept flow.
-
-Verification run:
-
-- `cargo fmt --all --check`
-- `cargo check -q -p discrypt-desktop`
-- `cargo test -q -p discrypt-desktop live_runtime_peer_ids_are_signed_invite_reciprocals -- --nocapture`
-- `cargo test -q -p discrypt-desktop live_role_split_runtime_material_is_invite_shared_not_profile_local -- --nocapture`
+- `cargo test -q -p discrypt-desktop dm_runtime_routes_require_reciprocal_signed_provider_advertisements -- --nocapture`
+- `cargo test -q -p discrypt-desktop group_text_runtime_rejects_remote_route_without_current_presence_lease -- --nocapture`
+- `cargo test -q -p discrypt-desktop native_rust_voice_media_start_rejects_non_backend_runtime_peers -- --nocapture`
 - `cargo test -q -p discrypt-desktop --features mqtt-adapter public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` (skipped because public E2E env flag was not set)
 - `cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` (skipped because public E2E env flag was not set)
 
@@ -770,8 +621,8 @@ open.
 After the runtime-pair hardening, the env-enabled public-provider receipt proofs
 were run against public endpoints with the real DM invite/accept setup:
 
-- MQTT: Alice creates a DM invite, Bob accepts it, both sides use reciprocal
-  signed `runtime_peers`, and the text/control envelope plus signed receipt cross
+- MQTT: Alice creates a DM invite, Bob accepts it, both sides exchange signed
+  provider-presence leases, and the text/control envelope plus signed receipt cross
   a provider-negotiated WebRTC DataChannel via `mqtts://broker.emqx.io:8883`.
 - Nostr: the same two-profile DM invite/accept receipt flow passes through
   `wss://nos.lol`.
@@ -782,7 +633,7 @@ Verification run:
 - `DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=wss://nos.lol timeout 240s cargo test -q -p discrypt-desktop --features nostr-adapter public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled -- --nocapture` — passed
 
 Remaining gap: MQTT and Nostr DM text/control receipt proof now has public-provider
-evidence through signed invite state, but IPFS direct topic-peer, deployed QUIC
+evidence through provider-advertised runtime routes, but IPFS direct topic-peer, deployed QUIC
 rendezvous, credentialed TURN relay-only, group public-provider receipt, installed
 GUI two-window E2E, and real voice/audio capture/playback E2E remain open.
 
@@ -792,7 +643,7 @@ The backend now has opt-in public-provider group-channel receipt gates mirroring
 the DM receipt proof. Each test creates a group, issues a signed group invite,
 has Bob join through that invite, sends a channel message from Alice, and pumps
 the persisted text/control outbox through the provider-signaled WebRTC runtime
-using reciprocal group `runtime_peers` from signed bootstrap metadata.
+using reciprocal group runtime peers from signed provider-presence leases.
 
 Verification run:
 

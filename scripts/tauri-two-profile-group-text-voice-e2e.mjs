@@ -462,48 +462,6 @@ function sealVoiceSignalPayloadNode({ session_id, group_id, channel_id, from_pee
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
   return `voice-signal-sealed:v1:${base64Url(nonce)}.${base64Url(encrypted)}`;
 }
-function backendHashCommitment(domain, parts) {
-  const hash = createHash("sha256");
-  hash.update(domain);
-  for (const part of parts) {
-    hash.update(Buffer.from([0]));
-    hash.update(String(part));
-  }
-  return hash.digest("hex");
-}
-function backendRuntimePeerIdFromCommitment(label, commitment) {
-  return `peer-${backendHashCommitment("discrypt-runtime-peer-id-v1", [label, commitment]).slice(0, 16)}`;
-}
-function backendGroupRuntimePeers(group, localRole) {
-  const bootstrap = group?.connectivity?.group_bootstrap;
-  if (!bootstrap) return null;
-  const owner = backendRuntimePeerIdFromCommitment("group-owner-runtime-peer", bootstrap.group_identity_commitment);
-  const memberCommitment = `${bootstrap.role_admission_policy_commitment}:${bootstrap.channel_policy_commitment}`;
-  const member = backendRuntimePeerIdFromCommitment("group-member-runtime-peer", memberCommitment);
-  const localIsOwner = /^(owner|staff)$/i.test(localRole || "");
-  return {
-    local: localIsOwner ? owner : member,
-    remote: localIsOwner ? member : owner,
-    local_role: localRole,
-    source: "backend-derived-signed-group-bootstrap",
-  };
-}
-function localGovernedGroupRole(state, group) {
-  const localUserId = state?.profile?.user_id;
-  const member = group?.members?.find((item) =>
-    item?.member_id === localUserId &&
-    item?.status !== "revoked" &&
-    item?.status !== "migration_default"
-  );
-  if (!member?.role) return null;
-  const hasRoleEvidence = group?.governance_log?.some((entry) =>
-    entry?.target_member_id === localUserId &&
-    entry?.role_after === member.role &&
-    entry?.event_kind !== "group_governance_initialized" &&
-    entry?.event_kind !== "governance.defaults_restored"
-  );
-  return hasRoleEvidence ? member.role : null;
-}
 function runtimePeersFromAppState(state) {
   const session = state?.voice_session ?? {};
   if (session.signaling?.local_peer_id && session.signaling?.remote_peer_id) {
@@ -518,9 +476,6 @@ function runtimePeersFromAppState(state) {
   const group = groupId
     ? state.groups?.find((item) => item.group_id === groupId)
     : state.groups?.[0];
-  const governedRole = localGovernedGroupRole(state, group);
-  const backendPeers = backendGroupRuntimePeers(group, governedRole);
-  if (backendPeers?.local && backendPeers?.remote) return backendPeers;
   const peers = group?.runtime_peers ?? [];
   const local = peers.find((peer) => peer.is_local);
   const remote = peers.find((peer) => !peer.is_local);
@@ -724,8 +679,8 @@ async function startProviderTextControlRuntimePair(profiles, label) {
     invokeTauriCommand(profiles.bob, "start_text_session", { request }),
   ]);
   const attaches = await Promise.all([
-    invokeTauriCommand(profiles.alice, "attach_text_control_transport_runtime", { request: { derive_from_state: true } }),
-    invokeTauriCommand(profiles.bob, "attach_text_control_transport_runtime", { request: { derive_from_state: true } }),
+    invokeTauriCommand(profiles.alice, "attach_text_control_transport_runtime", { request: {} }),
+    invokeTauriCommand(profiles.bob, "attach_text_control_transport_runtime", { request: {} }),
   ]);
   const ready = await Promise.all([
     waitForProviderRuntime(profiles.alice, `${label}-alice`),

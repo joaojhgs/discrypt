@@ -22,8 +22,6 @@ pub enum TransportSessionState {
     Checking,
     /// A direct ICE/STUN route is active.
     Direct,
-    /// Legacy unsupported peer overlay route. Retained only for decoding old snapshots.
-    OverlayRelay,
     /// The encrypted TURN route is active.
     TurnRelay,
     /// A previously active route was lost.
@@ -38,13 +36,12 @@ pub enum TransportSessionState {
 
 impl TransportSessionState {
     /// The exact state set promised by the G041 transport-session contract.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::Idle,
         Self::Signaling,
         Self::IceGathering,
         Self::Checking,
         Self::Direct,
-        Self::OverlayRelay,
         Self::TurnRelay,
         Self::Disconnected,
         Self::Reconnecting,
@@ -64,8 +61,6 @@ impl TransportSessionState {
 pub enum TransportRoute {
     /// Direct ICE/STUN connectivity.
     Direct,
-    /// Legacy unsupported peer overlay fallback. The current policy never selects it.
-    OverlayRelay,
     /// Encrypted TURN fallback.
     TurnRelay,
 }
@@ -76,7 +71,6 @@ impl TransportRoute {
     pub const fn from_fallback_leg(leg: FallbackLeg) -> Self {
         match leg {
             FallbackLeg::Stun => Self::Direct,
-            FallbackLeg::RelayOverlay => Self::OverlayRelay,
             FallbackLeg::Turn => Self::TurnRelay,
         }
     }
@@ -84,7 +78,6 @@ impl TransportRoute {
     const fn state(self) -> TransportSessionState {
         match self {
             Self::Direct => TransportSessionState::Direct,
-            Self::OverlayRelay => TransportSessionState::OverlayRelay,
             Self::TurnRelay => TransportSessionState::TurnRelay,
         }
     }
@@ -101,8 +94,6 @@ pub enum TransportSessionEvent {
     StartConnectivityChecks,
     /// Select direct ICE/STUN connectivity.
     SelectDirect,
-    /// Legacy unsupported peer overlay relay selection.
-    SelectOverlayRelay,
     /// Select encrypted TURN connectivity.
     SelectTurnRelay,
     /// Mark an active route disconnected.
@@ -245,12 +236,6 @@ pub enum TransportSessionError {
         /// Requested event.
         event: TransportSessionEvent,
     },
-    /// The route is not supported by the current fail-closed transport policy.
-    #[error("unsupported transport route under current policy: {route:?}")]
-    UnsupportedRoute {
-        /// Rejected route.
-        route: TransportRoute,
-    },
     /// Reconnect backoff policy is malformed.
     #[error("invalid reconnect backoff policy")]
     InvalidReconnectPolicy,
@@ -352,16 +337,6 @@ impl TransportSession {
         self.select_route(TransportRoute::Direct, endpoint, None)
     }
 
-    /// Reject the legacy overlay relay route; only direct WebRTC or configured TURN is allowed.
-    pub fn select_overlay_relay(
-        &mut self,
-        _endpoint: Endpoint,
-    ) -> Result<TransportSessionSnapshot, TransportSessionError> {
-        Err(TransportSessionError::UnsupportedRoute {
-            route: TransportRoute::OverlayRelay,
-        })
-    }
-
     /// Select an encrypted TURN relay route from the checking state.
     pub fn select_turn_relay(
         &mut self,
@@ -439,7 +414,6 @@ impl TransportSession {
             TransportSessionEvent::MarkDisconnected,
             &[
                 TransportSessionState::Direct,
-                TransportSessionState::OverlayRelay,
                 TransportSessionState::TurnRelay,
             ],
         )?;
@@ -557,13 +531,9 @@ impl TransportSession {
         endpoint: Endpoint,
         route_report: Option<RouteReport>,
     ) -> Result<TransportSessionSnapshot, TransportSessionError> {
-        if route == TransportRoute::OverlayRelay {
-            return Err(TransportSessionError::UnsupportedRoute { route });
-        }
         self.require_state(
             match route {
                 TransportRoute::Direct => TransportSessionEvent::SelectDirect,
-                TransportRoute::OverlayRelay => TransportSessionEvent::SelectOverlayRelay,
                 TransportRoute::TurnRelay => TransportSessionEvent::SelectTurnRelay,
             },
             &[TransportSessionState::Checking],
@@ -627,7 +597,6 @@ mod tests {
                 TransportSessionState::IceGathering,
                 TransportSessionState::Checking,
                 TransportSessionState::Direct,
-                TransportSessionState::OverlayRelay,
                 TransportSessionState::TurnRelay,
                 TransportSessionState::Disconnected,
                 TransportSessionState::Reconnecting,

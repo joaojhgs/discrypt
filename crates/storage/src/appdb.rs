@@ -63,8 +63,7 @@ impl StorageKeychainDecision {
                 .app_store_runtime
                 .contains("not persist plaintext SQLite pages")
             && self.sqlite_schema_policy.contains("AppDbSchema")
-            && self.sqlite_schema_policy.contains("VERSION_1_DDL")
-            && self.sqlite_schema_policy.contains("VERSION_2_DDL")
+            && self.sqlite_schema_policy.contains("CURRENT_SCHEMA_DDL")
             && self.sqlite_schema_policy.contains("openmls_sqlite_storage")
             && self.encrypted_store_crates.contains(&"aes-gcm")
             && self.encrypted_store_crates.contains(&"serde_json")
@@ -95,12 +94,12 @@ impl StorageKeychainDecision {
 pub const fn storage_keychain_decision() -> StorageKeychainDecision {
     StorageKeychainDecision {
         app_store_runtime: "EncryptedAppDb persists a serde_json envelope encrypted with AES-256-GCM; app DB does not persist plaintext SQLite pages.",
-        sqlite_schema_policy: "AppDbSchema, VERSION_1_DDL, and VERSION_2_DDL define the SQLite-compatible durable schema contract; OpenMLS protocol state uses openmls_sqlite_storage separately.",
+        sqlite_schema_policy: "AppDbSchema and CURRENT_SCHEMA_DDL define the SQLite-compatible durable schema contract; OpenMLS protocol state uses openmls_sqlite_storage separately.",
         encrypted_store_crates: &["aes-gcm", "serde_json", "zeroize", "sha2", "hex"],
         keychain_crate: "keyring 3.6.3 is optional behind production-storage; LinuxOsKeychain uses the default Secret Service sync provider; ProductionAppDbKeychain may use an Argon2id/AES-GCM PassphraseVaultKeychain when the user chooses password-vault storage or an explicit operator passphrase is configured; MemoryAppDbKeychain is restricted to tests/local/non-production builds.",
         wal_journal_policy: "Encrypted envelope writes use temp-file plus rename; sqlite_wal_path, -shm, and -journal sidecars are leakage-checked or moved by quarantine_corrupt_store; no plaintext WAL is expected for EncryptedAppDb.",
         key_wrapping: "A random data key encrypts payload bytes; the AppDbKeychain wrapping key wraps that data key into wrapped_data_key with nonces in the envelope; the data key zeroized after wrapping/decryption.",
-        schema_migrations: "AppDbMigrationPlan supports 0<->2 and 1<->2 forward/backward/noop transitions, rejects future versions, and validate_observed_schema checks tables and columns before opening state.",
+        schema_migrations: "AppDbMigrationPlan supports empty-store creation and current-version noop only; pre-current and future existing versions are rejected, and validate_observed_schema checks tables and columns before opening state.",
         secure_delete_limits: "Secure delete is best-effort enumeration plus verification for local files/keychain entries and cannot promise erasure from SSD wear-leveling, backups, or cloud snapshot copies.",
         platform_differences: &[
             "Linux production-storage uses keyring default Secret Service through LinuxOsKeychain when keyring mode is selected, or a user-unlocked PassphraseVaultKeychain when password-vault mode is selected.",
@@ -242,7 +241,6 @@ impl AppDbKeychain for MemoryAppDbKeychain {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinuxOsKeychain {
     service: String,
-    legacy_target: String,
 }
 
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -252,7 +250,6 @@ impl LinuxOsKeychain {
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             service: service.into(),
-            legacy_target: "discrypt".to_owned(),
         }
     }
 
@@ -268,27 +265,14 @@ impl LinuxOsKeychain {
         &self.service
     }
 
-    /// Production Linux now uses the desktop default Secret Service collection.
-    /// A separate legacy target is retained only to read/delete keys from an
-    /// earlier GNOME-specific Discrypt collection build.
+    /// Production Linux uses the desktop default Secret Service collection.
     #[must_use]
     pub fn target(&self) -> &str {
         "default"
     }
 
-    /// Legacy custom Secret Service collection target used by earlier Linux builds.
-    #[must_use]
-    pub fn legacy_target(&self) -> &str {
-        &self.legacy_target
-    }
-
     fn entry(&self, key_id: &str) -> Result<keyring::Entry, AppStoreError> {
         keyring::Entry::new(&self.service, key_id).map_err(keyring_error)
-    }
-
-    fn legacy_target_entry(&self, key_id: &str) -> Result<keyring::Entry, AppStoreError> {
-        keyring::Entry::new_with_target(&self.legacy_target, &self.service, key_id)
-            .map_err(keyring_error)
     }
 }
 
@@ -304,21 +288,9 @@ impl AppDbKeychain for LinuxOsKeychain {
     fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
         let entry = self.entry(key_id)?;
         match entry.get_secret() {
-            Ok(secret) => return secret_to_wrapping_key(secret),
-            Err(keyring::Error::NoEntry) => {}
-            Err(error) => return Err(keyring_error(error)),
-        }
-
-        // Backward-compatible read for the temporary build that wrote to a
-        // GNOME-specific custom collection. KDE/KWallet implementations may not
-        // support that path, so production writes now use the default collection.
-        let legacy_entry = match self.legacy_target_entry(key_id) {
-            Ok(entry) => entry,
-            Err(_) => return Ok(None),
-        };
-        match legacy_entry.get_secret() {
             Ok(secret) => secret_to_wrapping_key(secret),
-            Err(_) => Ok(None),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(keyring_error(error)),
         }
     }
 
@@ -339,10 +311,7 @@ impl AppDbKeychain for LinuxOsKeychain {
             Err(error) => return Err(keyring_error(error)),
         }
 
-        let Ok(legacy_entry) = self.legacy_target_entry(key_id) else {
-            return Ok(());
-        };
-        legacy_delete_result(legacy_entry.delete_credential())
+        Ok(())
     }
 }
 
@@ -376,14 +345,6 @@ fn secret_to_wrapping_key(mut secret: Vec<u8>) -> Result<Option<[u8; 32]>, AppSt
 #[cfg(all(target_os = "linux", feature = "production-storage"))]
 fn keyring_error(error: keyring::Error) -> AppStoreError {
     AppStoreError::Keychain(error.to_string())
-}
-
-#[cfg(all(target_os = "linux", feature = "production-storage"))]
-fn legacy_delete_result(result: Result<(), keyring::Error>) -> Result<(), AppStoreError> {
-    match result {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(keyring_error(error)),
-    }
 }
 
 /// Production-only encrypted vault fallback for app DB wrapping keys.
@@ -964,10 +925,7 @@ fn decrypt_bytes(
 /// Current application database schema version.
 pub const APP_DB_SCHEMA_VERSION: u32 = 2;
 
-/// The first schema version supported by this crate.
-pub const MIN_SUPPORTED_APP_DB_SCHEMA_VERSION: u32 = 0;
-
-/// Durable database tables required by schema version 1.
+/// Durable database tables required by the current schema.
 pub const REQUIRED_TABLES: &[&str] = &[
     "profiles",
     "devices",
@@ -1016,11 +974,16 @@ const CREATE_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_group_presence_expiry ON group_member_presence(group_id, presence_expires_at_ms)",
 ];
 
-const VERSION_1_DDL: &[&str] = &[
+const CURRENT_SCHEMA_DDL: &[&str] = &[
     "PRAGMA foreign_keys = ON",
     CREATE_PROFILES,
     CREATE_DEVICES,
     CREATE_GROUPS,
+    CREATE_GROUP_ROLE_POLICY,
+    CREATE_GROUP_MEMBERS,
+    CREATE_GROUP_ADMISSION_REQUESTS,
+    CREATE_GROUP_GOVERNANCE_LOG,
+    CREATE_GROUP_MEMBER_PRESENCE,
     CREATE_CHANNELS,
     CREATE_INVITES,
     CREATE_GOVERNANCE_EVENTS,
@@ -1035,43 +998,10 @@ const VERSION_1_DDL: &[&str] = &[
     CREATE_INDEXES[3],
     CREATE_INDEXES[4],
     CREATE_INDEXES[5],
-    "PRAGMA user_version = 1",
-];
-
-const VERSION_2_DDL: &[&str] = &[
-    CREATE_GROUP_ROLE_POLICY,
-    CREATE_GROUP_MEMBERS,
-    CREATE_GROUP_ADMISSION_REQUESTS,
-    CREATE_GROUP_GOVERNANCE_LOG,
-    CREATE_GROUP_MEMBER_PRESENCE,
     CREATE_INDEXES[6],
     CREATE_INDEXES[7],
     CREATE_INDEXES[8],
     "PRAGMA user_version = 2",
-];
-
-const VERSION_2_ROLLBACK: &[&str] = &[
-    "DROP TABLE IF EXISTS group_member_presence",
-    "DROP TABLE IF EXISTS group_governance_log",
-    "DROP TABLE IF EXISTS group_admission_requests",
-    "DROP TABLE IF EXISTS group_members",
-    "DROP TABLE IF EXISTS group_role_policy",
-    "PRAGMA user_version = 1",
-];
-
-const VERSION_1_ROLLBACK: &[&str] = &[
-    "DROP TABLE IF EXISTS event_cursors",
-    "DROP TABLE IF EXISTS voice_preferences",
-    "DROP TABLE IF EXISTS delivery_queue",
-    "DROP TABLE IF EXISTS retention_state",
-    "DROP TABLE IF EXISTS message_envelopes",
-    "DROP TABLE IF EXISTS governance_events",
-    "DROP TABLE IF EXISTS invites",
-    "DROP TABLE IF EXISTS channels",
-    "DROP TABLE IF EXISTS groups",
-    "DROP TABLE IF EXISTS devices",
-    "DROP TABLE IF EXISTS profiles",
-    "PRAGMA user_version = 0",
 ];
 
 /// A required column in a schema table.
@@ -1106,10 +1036,8 @@ pub struct AppDbSchema {
 /// Direction for a schema migration plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationDirection {
-    /// Upgrade from an older supported schema.
-    Forward,
-    /// Roll back to an older supported schema for tests/recovery validation.
-    Backward,
+    /// Create the current schema in an empty store.
+    CreateCurrent,
     /// No schema changes are required.
     Noop,
 }
@@ -1144,9 +1072,9 @@ pub enum AppDbError {
     /// A requested migration version is newer than this crate understands.
     #[error("unsupported future app DB schema version {version}; current is {current}")]
     UnsupportedFutureVersion { version: u32, current: u32 },
-    /// A requested migration version is older than the supported floor.
-    #[error("unsupported legacy app DB schema version {version}; minimum is {minimum}")]
-    UnsupportedLegacyVersion { version: u32, minimum: u32 },
+    /// An existing store uses a pre-current schema; clean-v1 builds do not migrate old formats.
+    #[error("unsupported pre-current app DB schema version {version}; current is {current}")]
+    UnsupportedPreCurrentVersion { version: u32, current: u32 },
     /// The observed store is missing a required table.
     #[error("corrupt app DB: missing required table {table}")]
     MissingRequiredTable { table: &'static str },
@@ -1977,10 +1905,10 @@ impl AppDbSchema {
 impl AppDbMigrationPlan {
     /// Build a supported migration plan between schema versions.
     pub fn plan(from_version: u32, to_version: u32) -> Result<Self, AppDbError> {
-        validate_version(from_version)?;
-        validate_version(to_version)?;
+        validate_target_version(to_version)?;
 
         if from_version == to_version {
+            validate_existing_version(from_version)?;
             return Ok(Self {
                 from_version,
                 to_version,
@@ -1989,67 +1917,18 @@ impl AppDbMigrationPlan {
             });
         }
 
-        if from_version == 0 && to_version == 1 {
+        if from_version == 0 && to_version == APP_DB_SCHEMA_VERSION {
             return Ok(Self {
                 from_version,
                 to_version,
-                direction: MigrationDirection::Forward,
-                statements: VERSION_1_DDL.to_vec(),
+                direction: MigrationDirection::CreateCurrent,
+                statements: CURRENT_SCHEMA_DDL.to_vec(),
             });
         }
 
-        if from_version == 0 && to_version == 2 {
-            let mut statements = VERSION_1_DDL.to_vec();
-            statements.extend_from_slice(VERSION_2_DDL);
-            return Ok(Self {
-                from_version,
-                to_version,
-                direction: MigrationDirection::Forward,
-                statements,
-            });
-        }
+        validate_existing_version(from_version)?;
 
-        if from_version == 1 && to_version == 2 {
-            return Ok(Self {
-                from_version,
-                to_version,
-                direction: MigrationDirection::Forward,
-                statements: VERSION_2_DDL.to_vec(),
-            });
-        }
-
-        if from_version == 2 && to_version == 1 {
-            return Ok(Self {
-                from_version,
-                to_version,
-                direction: MigrationDirection::Backward,
-                statements: VERSION_2_ROLLBACK.to_vec(),
-            });
-        }
-
-        if from_version == 1 && to_version == 0 {
-            return Ok(Self {
-                from_version,
-                to_version,
-                direction: MigrationDirection::Backward,
-                statements: VERSION_1_ROLLBACK.to_vec(),
-            });
-        }
-
-        if from_version == 2 && to_version == 0 {
-            let mut statements = VERSION_2_ROLLBACK.to_vec();
-            statements.extend_from_slice(VERSION_1_ROLLBACK);
-            return Ok(Self {
-                from_version,
-                to_version,
-                direction: MigrationDirection::Backward,
-                statements,
-            });
-        }
-
-        // The version validator keeps this arm unreachable for the current version graph,
-        // but keeping the explicit future error makes added versions fail safely.
-        Err(AppDbError::UnsupportedFutureVersion {
+        Err(AppDbError::UnsupportedPreCurrentVersion {
             version: to_version,
             current: APP_DB_SCHEMA_VERSION,
         })
@@ -2114,10 +1993,25 @@ pub fn quarantine_corrupt_store(path: impl AsRef<Path>) -> Result<QuarantinedApp
     })
 }
 
-#[allow(clippy::absurd_extreme_comparisons)]
-fn validate_version(version: u32) -> Result<(), AppDbError> {
+fn validate_target_version(version: u32) -> Result<(), AppDbError> {
     if version > APP_DB_SCHEMA_VERSION {
         return Err(AppDbError::UnsupportedFutureVersion {
+            version,
+            current: APP_DB_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+fn validate_existing_version(version: u32) -> Result<(), AppDbError> {
+    if version > APP_DB_SCHEMA_VERSION {
+        return Err(AppDbError::UnsupportedFutureVersion {
+            version,
+            current: APP_DB_SCHEMA_VERSION,
+        });
+    }
+    if version != APP_DB_SCHEMA_VERSION {
+        return Err(AppDbError::UnsupportedPreCurrentVersion {
             version,
             current: APP_DB_SCHEMA_VERSION,
         });
@@ -2161,7 +2055,7 @@ mod tests {
     #[test]
     fn encrypted_app_db_exports_versioned_schema_contract() -> Result<(), AppDbError> {
         let plan = AppDbMigrationPlan::plan(0, APP_DB_SCHEMA_VERSION)?;
-        assert_eq!(plan.direction, MigrationDirection::Forward);
+        assert_eq!(plan.direction, MigrationDirection::CreateCurrent);
         for required in REQUIRED_TABLES {
             assert!(AppDbSchema::current().table(required).is_some());
         }
@@ -2548,20 +2442,23 @@ mod tests {
         let keychain = LinuxOsKeychain::discrypt_app_db();
         assert_eq!(keychain.service(), "discrypt.appdb");
         assert_eq!(keychain.target(), "default");
-        assert_eq!(keychain.legacy_target(), "discrypt");
         assert_keychain(keychain);
     }
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
     #[test]
-    fn invalid_os_keychain_wrapping_key_length_is_rejected() {
-        let error = secret_to_wrapping_key(vec![0x11; 31])
-            .expect_err("short keyring material must fail closed");
+    fn invalid_os_keychain_wrapping_key_length_is_rejected() -> Result<(), AppStoreError> {
+        let Err(error) = secret_to_wrapping_key(vec![0x11; 31]) else {
+            return Err(AppStoreError::Crypto(
+                "short keyring material must fail closed",
+            ));
+        };
 
         assert!(matches!(
             error,
             AppStoreError::Crypto("invalid OS keychain wrapping key length")
         ));
+        Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -2667,9 +2564,12 @@ mod tests {
                 "correct horse battery staple",
             )),
         );
-        let error = missing_vault
-            .save_app_state(br#"{"profile_id":"replacement-profile"}"#)
-            .expect_err("existing encrypted state must not seed a replacement vault key");
+        let Err(error) = missing_vault.save_app_state(br#"{"profile_id":"replacement-profile"}"#)
+        else {
+            return Err(AppStoreError::Crypto(
+                "existing encrypted state must not seed a replacement vault key",
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -2685,16 +2585,19 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
     #[test]
-    fn production_passphrase_vault_rejects_short_passphrase() {
+    fn production_passphrase_vault_rejects_short_passphrase() -> Result<(), AppStoreError> {
         let path = temp_db_path("discrypt-short-vault").with_extension("vault");
         let _ = fs::remove_file(&path);
         let mut vault = PassphraseVaultKeychain::new(&path, "too-short");
 
-        let error = vault
-            .store_wrapping_key("vault-key", [7; 32])
-            .expect_err("short vault passphrase must be rejected");
+        let Err(error) = vault.store_wrapping_key("vault-key", [7; 32]) else {
+            return Err(AppStoreError::Crypto(
+                "short vault passphrase must be rejected",
+            ));
+        };
         assert!(error.to_string().contains("at least 12 characters"));
         assert!(!path.exists());
+        Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -2743,31 +2646,22 @@ mod tests {
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
     #[test]
-    fn production_delete_preserves_os_keychain_failure_when_vault_delete_succeeds() {
-        let error = production_keychain_delete_result(
+    fn production_delete_preserves_os_keychain_failure_when_vault_delete_succeeds(
+    ) -> Result<(), AppStoreError> {
+        let Err(error) = production_keychain_delete_result(
             Err(AppStoreError::Keychain(
                 "native delete permission denied".to_owned(),
             )),
             Ok(()),
-        )
-        .expect_err("OS keychain delete failure must not be masked by vault cleanup success");
+        ) else {
+            return Err(AppStoreError::Crypto(
+                "OS keychain delete failure must not be masked by vault cleanup success",
+            ));
+        };
 
         let rendered = error.to_string();
         assert!(rendered.contains("native delete permission denied"));
-    }
-
-    #[cfg(all(target_os = "linux", feature = "production-storage"))]
-    #[test]
-    fn linux_legacy_delete_only_ignores_no_entry() {
-        assert!(legacy_delete_result(Ok(())).is_ok());
-        assert!(legacy_delete_result(Err(keyring::Error::NoEntry)).is_ok());
-
-        let error = legacy_delete_result(Err(keyring::Error::Invalid(
-            "legacy-target".to_owned(),
-            "delete denied".to_owned(),
-        )))
-        .expect_err("legacy delete errors other than NoEntry must be reported");
-        assert!(error.to_string().contains("delete denied"));
+        Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "production-storage"))]
@@ -2813,7 +2707,7 @@ mod tests {
     #[test]
     fn migration_from_empty_store_creates_required_schema() -> Result<(), AppDbError> {
         let plan = AppDbMigrationPlan::plan(0, APP_DB_SCHEMA_VERSION)?;
-        assert_eq!(plan.direction, MigrationDirection::Forward);
+        assert_eq!(plan.direction, MigrationDirection::CreateCurrent);
         assert!(!plan.is_empty());
         for required in REQUIRED_TABLES {
             let needle = format!("CREATE TABLE IF NOT EXISTS {required}");
@@ -2829,16 +2723,21 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v1_store_adds_canonical_governance_state() -> Result<(), AppDbError> {
-        let plan = AppDbMigrationPlan::plan(1, APP_DB_SCHEMA_VERSION)?;
-        assert_eq!(plan.direction, MigrationDirection::Forward);
-        assert!(plan.statements.contains(&CREATE_GROUP_ROLE_POLICY));
-        assert!(plan.statements.contains(&CREATE_GROUP_MEMBERS));
-        assert!(plan.statements.contains(&CREATE_GROUP_ADMISSION_REQUESTS));
-        assert!(plan.statements.contains(&CREATE_GROUP_GOVERNANCE_LOG));
-        assert!(plan.statements.contains(&CREATE_GROUP_MEMBER_PRESENCE));
-        assert!(plan.statements.contains(&"PRAGMA user_version = 2"));
-        Ok(())
+    fn migration_planner_rejects_pre_current_existing_schema() {
+        assert!(matches!(
+            AppDbMigrationPlan::plan(1, APP_DB_SCHEMA_VERSION),
+            Err(AppDbError::UnsupportedPreCurrentVersion {
+                version: 1,
+                current: APP_DB_SCHEMA_VERSION,
+            })
+        ));
+        assert!(matches!(
+            AppDbMigrationPlan::plan(APP_DB_SCHEMA_VERSION, 1),
+            Err(AppDbError::UnsupportedPreCurrentVersion {
+                version: 1,
+                current: APP_DB_SCHEMA_VERSION,
+            })
+        ));
     }
 
     #[test]
@@ -2941,22 +2840,6 @@ mod tests {
                 "evidence_source",
             ],
         );
-        Ok(())
-    }
-
-    #[test]
-    fn backward_migration_drops_required_schema_for_recovery_tests() -> Result<(), AppDbError> {
-        let plan = AppDbMigrationPlan::plan(APP_DB_SCHEMA_VERSION, 0)?;
-        assert_eq!(plan.direction, MigrationDirection::Backward);
-        for required in REQUIRED_TABLES {
-            let needle = format!("DROP TABLE IF EXISTS {required}");
-            assert!(
-                plan.statements
-                    .iter()
-                    .any(|statement| statement.contains(&needle)),
-                "missing rollback statement for {required}"
-            );
-        }
         Ok(())
     }
 

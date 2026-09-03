@@ -29,8 +29,8 @@ than claiming a plaintext SQLite runtime:
   `wrapped_data_key`, `data_nonce`, and encrypted `ciphertext` bytes.
 - The encrypted envelope is implemented with `aes-gcm`, `serde_json`, `zeroize`,
   `sha2`, and `hex`.
-- `AppDbSchema` and `VERSION_1_DDL` define the SQLite-compatible durable schema
-  contract for migration/recovery tests and future SQL-backed app storage.
+- `AppDbSchema` and `CURRENT_SCHEMA_DDL` define the SQLite-compatible durable
+  schema contract for empty-store creation and future SQL-backed app storage.
 - OpenMLS state remains separate and uses `openmls_sqlite_storage` under the
   provider/storage policy in ADR-002.
 - `storage_keychain_decision()` is the code-level launch decision and
@@ -75,13 +75,12 @@ as sensitive because future SQL-backed stores and OpenMLS stores may have them:
 
 ## Schema migrations
 
-`APP_DB_SCHEMA_VERSION` is `1`; `MIN_SUPPORTED_APP_DB_SCHEMA_VERSION` is `0`.
-`AppDbMigrationPlan` supports:
+`APP_DB_SCHEMA_VERSION` is `2`. `AppDbMigrationPlan` supports:
 
-- `0 -> 1` forward creation of all required tables and indexes in `VERSION_1_DDL`.
-- `1 -> 0` rollback for recovery tests with `VERSION_1_ROLLBACK`.
-- `1 -> 1` no-op.
-- rejection of future versions before opening state.
+- `0 -> 2` creation of all required tables and indexes in `CURRENT_SCHEMA_DDL`
+  for an empty store.
+- `2 -> 2` no-op.
+- rejection of pre-current or future existing versions before opening state.
 
 `validate_observed_schema` checks required tables and columns from `AppDbSchema`
 so corrupt or partial stores fail closed. Sensitive columns are explicit key
@@ -120,13 +119,13 @@ Required gates for this decision:
    proves the persisted envelope contains only a wrapped data key and requires
    the keychain wrapping key.
 4. `cargo test -p discrypt-storage migration_from_empty_store_creates_required_schema --quiet`
-   proves the forward schema contract.
-5. `cargo test -p discrypt-storage backward_migration_drops_required_schema_for_recovery_tests --quiet`
-   proves rollback coverage for recovery tests.
+   proves empty-store current-schema creation.
+5. `cargo test -p discrypt-storage migration_planner_rejects_pre_current_existing_schema --quiet`
+   proves pre-current existing schemas are rejected instead of migrated.
 6. `cargo test -p discrypt-storage corrupt_store_quarantine_moves_db_and_sidecars --quiet`
    proves corrupt DB/WAL/SHM quarantine.
 7. `cargo test -p discrypt-storage secure_delete_removes_material_and_snapshot_restores_on_failed_verify --quiet`
-   proves best-effort secure-delete enumeration and rollback behavior.
+   proves best-effort secure-delete enumeration and failed-verification restore behavior.
 
 ## Consequences
 
@@ -135,5 +134,5 @@ Required gates for this decision:
 - Linux production storage has a concrete OS keychain implementation.
 - Other desktop/mobile platforms remain gated until their OS keychain adapters are
   implemented and tested.
-- Future SQL-backed app storage can reuse the schema/migration manifest, but must
+- Future SQL-backed app storage can reuse the schema manifest, but must
   add its own WAL encryption/leakage proof before replacing `EncryptedAppDb`.

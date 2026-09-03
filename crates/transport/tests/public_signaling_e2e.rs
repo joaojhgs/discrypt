@@ -380,10 +380,8 @@ where
 #[cfg(feature = "mqtt-adapter")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_mqtt_two_peer_presence_and_signal_roundtrip() -> Result<(), TransportError> {
-    if std::env::var("DISCRYPT_PUBLIC_MQTT_E2E").as_deref() != Ok("1")
-        && std::env::var("DISCRYPT_PUBLIC_SIGNALING_E2E").as_deref() != Ok("1")
-    {
-        eprintln!("skipping public MQTT E2E; set DISCRYPT_PUBLIC_MQTT_E2E=1 or legacy DISCRYPT_PUBLIC_SIGNALING_E2E=1 to run");
+    if std::env::var("DISCRYPT_PUBLIC_MQTT_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping public MQTT E2E; set DISCRYPT_PUBLIC_MQTT_E2E=1 to run");
         return Ok(());
     }
 

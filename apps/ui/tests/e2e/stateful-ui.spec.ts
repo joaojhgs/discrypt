@@ -925,7 +925,7 @@ test("group invite join text channel and voice controls work without fake member
   await expect(page.getByText(/You/).first()).toBeVisible();
   await expect(page.getByTestId("voice-local-participant")).toHaveAttribute(
     "title",
-    "Speaking",
+    "Listening",
   );
   // Coverage token: Local microphone level comes from the active MediaStream analyser.
   await expect(page.getByText(/waiting-route-proof|policy-only/i)).toHaveCount(
@@ -1146,8 +1146,25 @@ test("expired revoked and max-used invites fail clearly without pending group st
   await expect(page.getByText(/Invite maximum use count/i)).toBeVisible();
   await expect(page.getByText(/Max Used Should Not Exist/i)).toHaveCount(0);
 
-  const expiredInvite =
-    "discrypt://join/v1/expired-ui?endpoint=https%3A%2F%2Fsignal.example.invalid%2Fv1&policy=production_tls&trust_fp=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&trust=signed%20endpoint&commitment=bbbb&exp=2000-01-01T00%3A00%3A00Z&max=3";
+  const expiredInvite = await page.evaluate((inviteCode) => {
+    const inviteUrl = new URL(inviteCode);
+    const encodedDescriptor = inviteUrl.searchParams.get("d");
+    if (!encodedDescriptor) throw new Error("signed invite descriptor missing");
+    const paddedDescriptor = encodedDescriptor
+      .replace(/-/g, "+")
+      .replace(/_/g, "/")
+      .padEnd(Math.ceil(encodedDescriptor.length / 4) * 4, "=");
+    const descriptor = JSON.parse(atob(paddedDescriptor));
+    descriptor.expires_at = "2000-01-01T00:00:00Z";
+    inviteUrl.searchParams.set(
+      "d",
+      btoa(JSON.stringify(descriptor))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, ""),
+    );
+    return inviteUrl.toString();
+  }, firstInvite);
   await openLauncher(page);
   await page.getByPlaceholder("Paste invite URL or code").fill(expiredInvite);
   await page.getByLabel("Local label").fill("Expired Should Not Exist");

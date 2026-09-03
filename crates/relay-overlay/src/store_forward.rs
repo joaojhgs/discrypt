@@ -116,25 +116,8 @@ impl StoreForwardPolicy {
         }
     }
 
-    /// Harness-compatible policy that allows any recipient but keeps bounded defaults.
-    #[must_use]
-    pub fn permissive_harness(local_peer_id: impl Into<String>) -> Self {
-        Self::new(
-            std::iter::empty::<String>(),
-            u64::MAX / 4,
-            u64::MAX / 4,
-            VolunteerRelaySettings::enabled(local_peer_id),
-        )
-    }
-
     fn permits_recipient(&self, recipient_id: &str) -> bool {
         self.authorized_recipients.is_empty() || self.authorized_recipients.contains(recipient_id)
-    }
-}
-
-impl Default for StoreForwardPolicy {
-    fn default() -> Self {
-        Self::permissive_harness("local")
     }
 }
 
@@ -204,19 +187,13 @@ impl StoreForwardEnvelope {
 }
 
 /// Deterministic in-memory opportunistic store-forward queue.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoreForwardQueue {
     envelopes: BTreeMap<String, StoreForwardEnvelope>,
     policy: StoreForwardPolicy,
 }
 
 impl StoreForwardQueue {
-    /// Create an empty harness-compatible queue.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Create an empty queue with explicit production admission policy.
     #[must_use]
     pub fn with_policy(policy: StoreForwardPolicy) -> Self {
@@ -410,7 +387,7 @@ mod tests {
 
     #[test]
     fn queues_ciphertext_until_ttl_and_recipient_match() -> Result<(), Box<dyn std::error::Error>> {
-        let mut queue = StoreForwardQueue::new();
+        let mut queue = StoreForwardQueue::with_policy(production_policy());
         queue.enqueue(StoreForwardEnvelope::new(
             "m1",
             "bob",
@@ -430,7 +407,7 @@ mod tests {
 
     #[test]
     fn expired_messages_are_not_delivered() -> Result<(), Box<dyn std::error::Error>> {
-        let mut queue = StoreForwardQueue::new();
+        let mut queue = StoreForwardQueue::with_policy(production_policy());
         queue.enqueue(StoreForwardEnvelope::new(
             "m1",
             "bob",

@@ -57,7 +57,7 @@ environment gates are set. Missing credentials/endpoints are honest skips.
 
 | Adapter/proof | Required gate | Additional required env |
 | --- | --- | --- |
-| MQTT public signaling | `DISCRYPT_PUBLIC_MQTT_E2E=1` | Optional `DISCRYPT_PUBLIC_MQTT_ENDPOINT`; defaults to `mqtts://broker.emqx.io:8883`. Legacy `DISCRYPT_PUBLIC_SIGNALING_E2E=1` remains accepted for compatibility. |
+| MQTT public signaling | `DISCRYPT_PUBLIC_MQTT_E2E=1` | Optional `DISCRYPT_PUBLIC_MQTT_ENDPOINT`; defaults to `mqtts://broker.emqx.io:8883`. |
 | Nostr public signaling | `DISCRYPT_PUBLIC_NOSTR_E2E=1` | Optional `DISCRYPT_PUBLIC_NOSTR_ENDPOINT`; defaults to the test's public relay setting. |
 | IPFS public topic peer | `DISCRYPT_PUBLIC_IPFS_E2E=1` | `DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct topic-peer multiaddr,...>`. |
 | QUIC rendezvous | `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1` | `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=<https/wss endpoint>` and optional trust fingerprint. |

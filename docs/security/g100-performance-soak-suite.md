@@ -8,7 +8,7 @@ This gate adds a deterministic Phase N soak harness for the high-load routing an
 - **8+ voice senders**: eight concurrent voice sender bindings protect and verify media frames through SFrame receiver state.
 - **1-3 relay hops**: voice routes are constructed for one, two, and three overlay hops and remain inside the hop cap.
 - **Packet loss**: deterministic packet loss drives bounded redelivery and rejects stale replay.
-- **NAT switching**: direct STUN, relay-overlay, and TURN fallback planner legs are covered.
+- **NAT switching**: direct STUN and configured-TURN fallback planner legs are covered; peer-overlay routing is tested separately.
 - **Android doze**: dozing relay posture is accepted as a metric but ranked behind powered relay capacity.
 - **Restart/reconnect**: encrypted session route state restores after restart and reconnect recovers around a failed relay with media gap target met.
 

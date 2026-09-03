@@ -82,8 +82,6 @@ impl ControlLaneSessionDriver for GlobalControlLaneSessionDriver {
             super::attach_text_control_transport_runtime(
                 super::AttachTextControlTransportRuntimeRequest {
                     session_id: Some(session_id),
-                    derive_from_state: true,
-                    ..Default::default()
                 },
             );
         }

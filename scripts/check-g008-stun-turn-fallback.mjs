@@ -82,7 +82,7 @@ run("Existing transport fallback ordering gate", "cargo", [
   "-q",
   "-p",
   "discrypt-transport",
-  "valid_direct_overlay_and_turn_flows_select_expected_leg",
+  "valid_direct_and_configured_turn_flows_select_expected_leg",
 ]);
 
 run("Existing TURN relay-only fail-closed gate", "cargo", [

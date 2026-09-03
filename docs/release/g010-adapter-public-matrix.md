@@ -6,15 +6,15 @@ G010 wires release-harness automation for local deterministic adapter gates and 
 
 | Slice | Command | CI status |
 | --- | --- | --- |
-| STUN direct + relay-overlay + TURN fallback policy | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | Required by `npm --prefix apps/ui run test:signaling-e2e-matrix-g132` and wrapped by `npm --prefix apps/ui run test:g010-adapter-public-matrix` |
-| Transport adapter fallback route selection | `cargo test -p discrypt-transport valid_direct_overlay_and_turn_flows_select_expected_leg --quiet` | Required by `npm --prefix apps/ui run test:signaling-e2e-matrix-g132` and wrapped by `npm --prefix apps/ui run test:g010-adapter-public-matrix` |
+| STUN direct + configured TURN fallback policy | `cargo test -p discrypt-multinode-harness connectivity_signaling_push_smoke_covers_phase6_gates --quiet` | Required by `npm --prefix apps/ui run test:signaling-e2e-matrix-g132` and wrapped by `npm --prefix apps/ui run test:g010-adapter-public-matrix` |
+| Transport adapter fallback route selection | `cargo test -p discrypt-transport valid_direct_and_configured_turn_flows_select_expected_leg --quiet` | Required by `npm --prefix apps/ui run test:signaling-e2e-matrix-g132` and wrapped by `npm --prefix apps/ui run test:g010-adapter-public-matrix` |
 | Static adapter/public contract | `npm --prefix apps/ui run test:g010-adapter-public-matrix` | Required in CI; verifies package/docs/CI wiring plus explicit skip reporting |
 
 ## Public adapter matrix
 
 | Adapter/public proof | Environment gate | Command | Default local behavior |
 | --- | --- | --- | --- |
-| MQTT public signaling | `DISCRYPT_PUBLIC_MQTT_E2E=1` or legacy `DISCRYPT_PUBLIC_SIGNALING_E2E=1`; optional `DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...>` | `cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture` | Skipped with an explicit message |
+| MQTT public signaling | `DISCRYPT_PUBLIC_MQTT_E2E=1`; optional `DISCRYPT_PUBLIC_MQTT_ENDPOINT=<mqtts://...>` | `cargo test -q -p discrypt-transport --features mqtt-adapter public_mqtt_two_peer_presence_and_signal_roundtrip -- --nocapture` | Skipped with an explicit message |
 | Nostr public signaling | `DISCRYPT_PUBLIC_NOSTR_E2E=1 DISCRYPT_PUBLIC_NOSTR_ENDPOINT=<wss://...>` | `cargo test -q -p discrypt-transport --features nostr-adapter public_nostr_two_peer_presence_and_signal_roundtrip -- --nocapture` | Skipped with an explicit message |
 | IPFS direct topic-peer signaling | `DISCRYPT_PUBLIC_IPFS_E2E=1 DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS=<direct-topic-peer-multiaddr,...>` | `cargo test -q -p discrypt-transport --features ipfs-pubsub-adapter public_ipfs_two_peer_signaling_smoke -- --nocapture` | Skipped with an explicit message; generic public bootstrap is not accepted as production proof |
 | Discrypt QUIC rendezvous service | `DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E=1 DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_ENDPOINT=<https://...>` | `cargo test -q -p discrypt-transport --features discrypt-quic-rendezvous-adapter public_quic_two_peer_signaling_smoke -- --nocapture` | Skipped with an explicit message until a deployed service endpoint is supplied |

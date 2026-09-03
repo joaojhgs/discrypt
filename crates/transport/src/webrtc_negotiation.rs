@@ -1471,38 +1471,21 @@ impl WebRtcNegotiationConfig {
     }
 
     fn apply_env_ice_mode(&mut self) {
-        let legacy_host_only = std::env::var("DISCRYPT_WEBRTC_HOST_ONLY")
-            .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
         let mode = std::env::var("DISCRYPT_WEBRTC_ICE_MODE")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty());
-        if legacy_host_only
-            || matches!(
-                mode.as_deref(),
-                Some(
-                    "host_only"
-                        | "host-only"
-                        | "direct_only"
-                        | "direct-only"
-                        | "private_overlay"
-                        | "private-overlay"
-                        | "no_stun"
-                        | "no-stun"
-                )
-            )
-        {
+        if mode.as_deref() == Some("host_only") {
             self.ice_servers = IceServerConfig::host_only();
             self.ice_transport_policy = WebRtcIceTransportPolicy::All;
             return;
         }
         match mode.as_deref() {
-            Some("stun" | "stun_only" | "stun-only") => {
+            Some("stun_only") => {
                 self.ice_servers.turn_servers.clear();
                 self.ice_transport_policy = WebRtcIceTransportPolicy::All;
             }
-            Some("turn_relay" | "turn-relay" | "relay_only" | "relay-only") => {
+            Some("turn_relay") => {
                 self.ice_transport_policy = WebRtcIceTransportPolicy::RelayOnly;
             }
             Some("all" | "default") | None => {}

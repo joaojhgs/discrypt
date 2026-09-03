@@ -1129,7 +1129,11 @@ mod tests {
             let snapshot = match leg.label.as_str() {
                 "direct-ice" | "stun" => session.select_direct(endpoint),
                 "turn" | "turn-relay" => session.select_turn_relay(endpoint),
-                _ => session.select_overlay_relay(endpoint),
+                _ => {
+                    return Err(ServiceBoundaryError::InvalidRequest(
+                        "transport leg must be direct ICE/STUN or configured TURN".to_owned(),
+                    ));
+                }
             }
             .map_err(transport_error)?;
             self.transport_snapshots

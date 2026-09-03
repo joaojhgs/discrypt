@@ -30,13 +30,6 @@ const expectedCommands = [
     returns: "string",
   },
   {
-    command: "app_snapshot",
-    exportName: "loadCompatibilityAppSnapshot",
-    args: [],
-    returns: "AppSnapshot",
-    compatibility: true,
-  },
-  {
     command: "configure_storage_security",
     exportName: "configureStorageSecurity",
     args: ["mode", "passphrase"],
@@ -185,6 +178,12 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
+    command: "publish_dm_presence",
+    exportName: "publishDmPresence",
+    args: ["dm_id", "ttl_seconds"],
+    returns: "AppState",
+  },
+  {
     command: "create_invite",
     exportName: "createInvite",
     args: ["group_id", "expires", "max_use", "password_gate"],
@@ -240,7 +239,7 @@ const expectedCommands = [
   {
     command: "attach_text_control_transport_runtime",
     exportName: "attachTextControlTransportRuntime",
-    args: ["session_id", "runtime_role", "local_peer_id", "remote_peer_id", "derive_from_state"],
+    args: ["session_id"],
     returns: "AppState",
   },
   {
@@ -583,6 +582,7 @@ const requestTypes = [
   ["DemoteGroupStaffRequest", ["group_id", "member_id"]],
   ["RevokeGroupMemberAccessRequest", ["group_id", "member_id", "reason"]],
   ["PublishGroupPresenceRequest", ["group_id", "member_id", "ttl_seconds"]],
+  ["PublishDmPresenceRequest", ["dm_id", "ttl_seconds"]],
   ["SetActiveGroupRequest", ["group_id"]],
   ["SetActiveChannelRequest", ["group_id", "channel_id"]],
   ["SetActiveDmRequest", ["dm_id"]],
@@ -602,7 +602,7 @@ const requestTypes = [
   ["StopTextSessionRequest", ["session_id"]],
   [
     "AttachTextControlTransportRuntimeRequest",
-    ["session_id", "runtime_role", "local_peer_id", "remote_peer_id", "derive_from_state"],
+    ["session_id"],
   ],
   ["SendMessageRequest", ["target", "body"]],
   [
@@ -715,9 +715,7 @@ for (const [typeName, fields] of requestTypes) {
 }
 
 const mutationExportNames = expectedCommands
-  .filter(
-    (entry) => entry.returns === "AppState" && entry.command !== "app_snapshot",
-  )
+  .filter((entry) => entry.returns === "AppState")
   .map((entry) => entry.exportName);
 for (const name of mutationExportNames) {
   const block = functionBlock(name);
@@ -754,7 +752,7 @@ if (
   );
 }
 
-const forbiddenLegacyDtoTokens = [
+const forbiddenObsoleteDtoTokens = [
   "server_name: string",
   "channel: string;\n  body: string",
   "export async function joinVoice(): Promise<AppSnapshot>",
@@ -762,10 +760,10 @@ const forbiddenLegacyDtoTokens = [
   "export type SelfMuteRequest = {\n  muted: boolean",
   "export type SpeakerVolumeRequest = {\n  participant_id: string;\n  volume: number",
 ];
-for (const token of forbiddenLegacyDtoTokens) {
+for (const token of forbiddenObsoleteDtoTokens) {
   if (commands.includes(token)) {
     failures.push(
-      `legacy drift token still present in commands.ts: ${token.replace(/\n/g, " ")}`,
+      `removed drift token is present in commands.ts: ${token.replace(/\n/g, " ")}`,
     );
   }
 }
@@ -993,7 +991,7 @@ if (
   !main.includes("ensureTextRuntimeForActiveScope")
 ) {
   failures.push(
-    "text runtime attachment must derive peers from invite/connectivity state and start automatically",
+    "text runtime attachment must derive peers from provider-advertised rows and start automatically",
   );
 }
 if (main.includes("messageTransportProof || Boolean(window.__TAURI__?.core?.invoke)")) {
@@ -1130,7 +1128,7 @@ if (main.includes("id=\"runtime-local-peer\"") || main.includes("id=\"runtime-re
   failures.push("production UI must not expose manual text runtime peer pairing inputs");
 }
 if (!main.includes("not user-entered pairing fields") || !main.includes("ensureTextRuntimeForActiveScope")) {
-  failures.push("text runtime attachment must derive peers from invite/connectivity state and start automatically");
+  failures.push("text runtime attachment must derive peers from provider-advertised rows and start automatically");
 }
 for (const inviteUiToken of [
   "Invite ready",

@@ -13,7 +13,7 @@ It is not full production readiness for the app, invite admission, OpenMLS membe
 
 - Nostr profile relay extraction now deduplicates configured relay URLs while preserving order before connecting.
 - Nostr publish validates serialized provider envelopes against the profile's bounded provider message cap and fails closed with `provider_message_too_large` diagnostics.
-- Desktop default Nostr profile generation now supports `DISCRYPT_DEFAULT_NOSTR_ENDPOINTS` as a comma-separated public/custom relay list, keeps legacy `DISCRYPT_DEFAULT_NOSTR_ENDPOINT`, and defaults to `wss://relay.damus.io` plus `wss://nos.lol` when no override is present.
+- Desktop default Nostr profile generation reads `DISCRYPT_DEFAULT_NOSTR_ENDPOINTS` as a comma-separated public/custom relay list, the UI reads `VITE_DISCRYPT_DEFAULT_NOSTR_ENDPOINTS`, and both default to `wss://relay.damus.io` plus `wss://nos.lol` when no override is present.
 - Generated profile allowlist commitments now cover every endpoint in a relay list.
 - `crates/transport/tests/public_signaling_e2e.rs` now includes a test-local loopback Nostr relay that accepts real WebSocket Nostr `REQ`/`EVENT` traffic and exercises a two-peer presence plus sealed WebRTC signaling roundtrip through `NostrProviderAdapter`.
 

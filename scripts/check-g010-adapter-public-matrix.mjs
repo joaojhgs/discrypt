@@ -21,7 +21,7 @@ for (const token of [
   "# G010 adapter/public matrix",
   "Local deterministic gates",
   "Public adapter matrix",
-  "DISCRYPT_PUBLIC_SIGNALING_E2E",
+  "DISCRYPT_PUBLIC_MQTT_E2E",
   "DISCRYPT_PUBLIC_NOSTR_E2E",
   "DISCRYPT_PUBLIC_IPFS_E2E",
   "DISCRYPT_PUBLIC_QUIC_RENDEZVOUS_E2E",
@@ -57,7 +57,6 @@ for (const token of [
 if (failures.length === 0) {
   const env = { ...process.env };
   for (const key of [
-    "DISCRYPT_PUBLIC_SIGNALING_E2E",
     "DISCRYPT_PUBLIC_MQTT_E2E",
     "DISCRYPT_PUBLIC_NOSTR_E2E",
     "DISCRYPT_PUBLIC_IPFS_E2E",

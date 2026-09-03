@@ -53,15 +53,15 @@ if (!packageJson.scripts?.["test:stun-turn-provider-privacy-g132"]) {
 const matrixCommands = [
   {
     required: true,
-    label: "STUN direct + overlay + TURN fallback (two-profile deterministic)",
+    label: "STUN direct + configured TURN fallback (two-profile deterministic)",
     command: "cargo",
     args: ["test", "-p", "discrypt-multinode-harness", "connectivity_signaling_push_smoke_covers_phase6_gates", "--quiet"],
   },
   {
     required: true,
-    label: "Transport adapter fallback policy for STUN/overlay/TURN",
+    label: "Transport adapter fallback policy for STUN/TURN",
     command: "cargo",
-    args: ["test", "-p", "discrypt-transport", "valid_direct_overlay_and_turn_flows_select_expected_leg", "--quiet"],
+    args: ["test", "-p", "discrypt-transport", "valid_direct_and_configured_turn_flows_select_expected_leg", "--quiet"],
   },
   {
     required: false,
@@ -191,12 +191,12 @@ const matrixCommands = [
       "--nocapture",
     ],
     env: {
-      DISCRYPT_PUBLIC_SIGNALING_E2E: "1",
+      DISCRYPT_PUBLIC_MQTT_E2E: "1",
       DISCRYPT_PUBLIC_MQTT_ENDPOINT: "mqtts://broker.emqx.io:8883",
     },
-    enabledByEnv: "DISCRYPT_PUBLIC_SIGNALING_E2E",
+    enabledByEnv: "DISCRYPT_PUBLIC_MQTT_E2E",
     skipReason:
-      "Set DISCRYPT_PUBLIC_SIGNALING_E2E=1 to run this real-provider verification.",
+      "Set DISCRYPT_PUBLIC_MQTT_E2E=1 to run this real-provider verification.",
   },
 ];
 

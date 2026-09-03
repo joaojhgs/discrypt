@@ -77,6 +77,7 @@ import {
   drainTextControlInboundFrames,
   startControlLaneSessionManager,
   pumpTextControlTransportOnce,
+  publishDmPresence,
   publishGroupPresence,
   startDm,
   approveGroupAdmissionRequest,
@@ -418,51 +419,50 @@ function asThemeId(value: string): ThemeId {
     : discryptUiConfig.activeTheme;
 }
 
-function stableUiHash(input: string): string {
-  let hash = 0x811c9dc5;
-  for (const char of input) {
-    hash ^= char.charCodeAt(0);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
+function runtimePeerLeaseIsCurrent(peer: { presence_expires_at?: string | null }): boolean {
+  const expiresAt = peer.presence_expires_at;
+  if (!expiresAt) return false;
+  const expiresMs = Date.parse(expiresAt);
+  return Number.isFinite(expiresMs) && expiresMs > Date.now();
+}
+
+function hasCurrentAdvertisedRemoteGroupRuntimePeer(
+  group: AppState["groups"][number] | null | undefined,
+  peer: NonNullable<AppState["groups"][number]["runtime_peers"]>[number],
+): boolean {
+  if (peer.is_local || peer.source !== "sealed_provider_peer_advertisement_v1") {
+    return false;
   }
-  return hash.toString(16).padStart(8, "0");
-}
-
-function runtimePeerIdFromCommitment(
-  label: string,
-  commitment: string,
-): string {
-  return `peer-${stableUiHash(`${label}:${commitment}`)}`;
-}
-
-function localGovernedGroupRole(state: AppState, group: AppState["groups"][number] | undefined): string | null {
-  const localUserId = state.profile?.user_id;
   const member = group?.members?.find(
-    (item) =>
-      item.member_id === localUserId &&
-      item.status !== "revoked" &&
-      item.status !== "migration_default",
+    (candidate) =>
+      candidate.member_id === peer.member_id &&
+      candidate.runtime_peer_id === peer.peer_id,
   );
-  if (!member?.role) return null;
-  const hasRoleEvidence = group?.governance_log?.some(
-    (entry) =>
-      entry.target_member_id === localUserId &&
-      entry.role_after === member.role &&
-      entry.event_kind !== "group_governance_initialized" &&
-      entry.event_kind !== "governance.defaults_restored",
+  return Boolean(
+    member &&
+      member.status === "online" &&
+      runtimePeerLeaseIsCurrent(member),
   );
-  return hasRoleEvidence ? member.role : null;
+}
+
+function hasCurrentAdvertisedRemoteDmRuntimePeer(
+  dm: AppState["dms"][number] | null | undefined,
+): boolean {
+  return Boolean(
+    dm?.runtime_peers?.some(
+      (peer) =>
+        !peer.is_local &&
+        peer.source === "sealed_provider_peer_advertisement_v1" &&
+        Boolean(peer.peer_id) &&
+        runtimePeerLeaseIsCurrent(peer),
+    ),
+  );
 }
 
 function textRuntimePeerDefaults(state: AppState): {
   local: string;
   remote: string;
-} {
-  const scope =
-    state.active_context?.dm_id ??
-    state.active_context?.group_id ??
-    state.active_context?.channel_id ??
-    state.invites.at(-1)?.invite_key ??
-    "active-scope";
+} | null {
   const activeDm = state.active_context?.dm_id
     ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
     : state.dms[0];
@@ -478,20 +478,14 @@ function textRuntimePeerDefaults(state: AppState): {
       remote: voiceSignaling.remote_peer_id,
     };
   }
-  const activeInvite = state.active_context?.dm_id
-    ? state.invites
-        .slice()
-        .reverse()
-        .find((invite) => invite.dm_id === state.active_context?.dm_id)
-    : state.active_context?.group_id
-      ? state.invites
-          .slice()
-          .reverse()
-          .find((invite) => invite.group_id === state.active_context?.group_id)
-      : state.invites.at(-1);
   const dmRuntimePeers = activeDm?.runtime_peers ?? [];
   const backendLocalDmPeer = dmRuntimePeers.find((peer) => peer.is_local);
-  const backendRemoteDmPeer = dmRuntimePeers.find((peer) => !peer.is_local);
+  const backendRemoteDmPeer = dmRuntimePeers.find(
+    (peer) =>
+      !peer.is_local &&
+      peer.source === "sealed_provider_peer_advertisement_v1" &&
+      runtimePeerLeaseIsCurrent(peer),
+  );
   if (backendLocalDmPeer && backendRemoteDmPeer) {
     return {
       local: backendLocalDmPeer.peer_id,
@@ -500,29 +494,9 @@ function textRuntimePeerDefaults(state: AppState): {
   }
 
   const groupRuntimePeers = activeGroup?.runtime_peers ?? [];
-  const localGroupRole = localGovernedGroupRole(state, activeGroup);
-  const localGroupPeerRole = localGroupRole === "owner" || localGroupRole === "staff"
-    ? "owner"
-    : localGroupRole === "member"
-      ? "member"
-      : null;
-  if (localGroupPeerRole) {
-    const backendLocalGroupPeer = groupRuntimePeers.find(
-      (peer) => peer.role === localGroupPeerRole,
-    );
-    const backendRemoteGroupPeer = groupRuntimePeers.find(
-      (peer) => peer.role !== localGroupPeerRole,
-    );
-    if (backendLocalGroupPeer && backendRemoteGroupPeer) {
-      return {
-        local: backendLocalGroupPeer.peer_id,
-        remote: backendRemoteGroupPeer.peer_id,
-      };
-    }
-  }
   const backendLocalGroupPeer = groupRuntimePeers.find((peer) => peer.is_local);
   const backendRemoteGroupPeer = groupRuntimePeers.find(
-    (peer) => !peer.is_local,
+    (peer) => hasCurrentAdvertisedRemoteGroupRuntimePeer(activeGroup, peer),
   );
   if (backendLocalGroupPeer && backendRemoteGroupPeer) {
     return {
@@ -531,54 +505,7 @@ function textRuntimePeerDefaults(state: AppState): {
     };
   }
 
-  const dmBootstrap =
-    activeDm?.connectivity?.dm_bootstrap ?? activeInvite?.dm_bootstrap ?? null;
-  if (dmBootstrap) {
-    const inviterPeer = runtimePeerIdFromCommitment(
-      "dm-inviter-runtime-peer",
-      dmBootstrap.inviter_identity_commitment,
-    );
-    const replyPeer = runtimePeerIdFromCommitment(
-      "dm-reply-runtime-peer",
-      dmBootstrap.reply_rendezvous_commitment,
-    );
-    const openedFromInvite = state.events.some(
-      (event) => event.kind === "dm.invite_accepted",
-    );
-    return openedFromInvite
-      ? { local: replyPeer, remote: inviterPeer }
-      : { local: inviterPeer, remote: replyPeer };
-  }
-  const groupBootstrap =
-    activeGroup?.connectivity?.group_bootstrap ??
-    activeInvite?.group_bootstrap ??
-    null;
-  if (groupBootstrap) {
-    const ownerPeer = runtimePeerIdFromCommitment(
-      "group-owner-runtime-peer",
-      groupBootstrap.group_identity_commitment,
-    );
-    const memberPeer = runtimePeerIdFromCommitment(
-      "group-member-runtime-peer",
-      `${groupBootstrap.role_admission_policy_commitment}:${groupBootstrap.channel_policy_commitment}`,
-    );
-    const joinedFromInvite =
-      localGroupRole === "member" ||
-      activeGroup?.role !== "owner" ||
-      state.events.some((event) => event.kind === "group.joined");
-    return joinedFromInvite
-      ? { local: memberPeer, remote: ownerPeer }
-      : { local: ownerPeer, remote: memberPeer };
-  }
-  const remoteSeed =
-    activeDm?.participant_id ??
-    activeInvite?.invite_key ??
-    state.active_context?.group_id ??
-    "remote-peer";
-  return {
-    local: `peer-${stableUiHash(`local:${state.profile?.user_id ?? "local-profile-pending"}:${scope}`)}`,
-    remote: `peer-${stableUiHash(`remote:${remoteSeed}:${scope}`)}`,
-  };
+  return null;
 }
 
 function activeScopeLabelForState(state: AppState): string {
@@ -601,7 +528,12 @@ function voiceConnectivityForState(state: AppState) {
   );
 }
 
-function textRuntimeRole(state: AppState): "offerer" | "answerer" {
+function textRuntimeRole(state: AppState): "offerer" | "answerer" | null {
+  const voiceRole = state.voice_session?.signaling.role;
+  if (voiceRole === "offerer" || voiceRole === "answerer") {
+    return voiceRole;
+  }
+
   const activeDm = state.active_context?.dm_id
     ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
     : state.dms[0];
@@ -622,16 +554,7 @@ function textRuntimeRole(state: AppState): "offerer" | "answerer" {
     return localGroupPeer.role === "member" ? "answerer" : "offerer";
   }
 
-  if (state.events.some((event) => event.kind === "dm.invite_accepted")) {
-    return "answerer";
-  }
-  if (activeGroup?.role && activeGroup.role !== "owner") {
-    return "answerer";
-  }
-  if (state.events.some((event) => event.kind === "group.joined")) {
-    return "answerer";
-  }
-  return "offerer";
+  return null;
 }
 
 function emptyVoiceDeviceAccess(
@@ -1265,6 +1188,7 @@ function App() {
   const messageSendInFlightRef = useRef(false);
   const textRuntimeSyncInFlightRef = useRef(false);
   const groupPresenceInFlightRef = useRef(false);
+  const dmPresenceInFlightRef = useRef(false);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
   const voiceMediaSessionRef = useRef<VoiceMediaSessionHandle | null>(null);
 
@@ -1711,14 +1635,41 @@ function App() {
   ): Promise<AppState | null> {
     const runtimeState = stateOverride ?? commandState;
     if (!runtimeState) return null;
-    // Runtime role and peer ids are derived inside the Rust app-service from
-    // signed invite/connectivity state; the UI never supplies manual pairing ids.
+    // Runtime role and peer ids are resolved inside the Rust app-service from
+    // provider-advertised rows; the UI never supplies pairing ids.
     return applyCommand(
       attachTextControlTransportRuntime({
         session_id: null,
-        derive_from_state: true,
       }),
     );
+  }
+
+  async function waitForCurrentRemoteDmRuntimePeer(
+    dmId: string,
+    seedState: AppState,
+  ): Promise<AppState> {
+    let latest = seedState;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const refreshed = await loadAppState().catch(() => null);
+      if (refreshed) {
+        latest = refreshed;
+        commitCommandState(refreshed);
+      }
+      const dm = latest.dms.find((item) => item.dm_id === dmId);
+      if (hasCurrentAdvertisedRemoteDmRuntimePeer(dm)) {
+        return latest;
+      }
+      await pumpTextControlTransportOnce({
+        target: null,
+        limit: 8,
+        operation_timeout_ms: 5_000,
+      });
+      await drainTextControlInboundFrames({
+        drain_ms: 1_000,
+        operation_timeout_ms: 1_000,
+      });
+    }
+    return latest;
   }
 
   async function refreshVoiceInputDevices(requestPermission = true) {
@@ -1767,7 +1718,7 @@ function App() {
     stateForScope: AppState,
     reportFailures = true,
   ): Promise<AppState | null> {
-    // Backend-derived runtime peers come from invite/connectivity state, not user-entered pairing fields.
+    // Runtime peers come from backend-verified provider advertisements, not user-entered pairing fields.
     if (!window.__TAURI__?.core?.invoke) return stateForScope;
     const scopeLabel = activeScopeLabelForState(stateForScope);
     let started: AppState;
@@ -1802,39 +1753,46 @@ function App() {
     const activeGroup = activeGroupId
       ? started.groups.find((group) => group.group_id === activeGroupId) ?? null
       : null;
-    const localMember = activeGroup?.members?.find(
-      (member) => member.member_id === started.profile?.user_id,
-    );
-    const hasAdmittedRemoteMember = activeGroup?.members?.some(
-      (member) =>
-        member.member_id !== started.profile?.user_id &&
-        member.status !== "pending" &&
-        member.status !== "revoked",
-    ) ?? false;
-    const requiresAdmissionControlLane = Boolean(
-      activeGroup &&
-        (activeGroup.role === "pending" ||
-          localMember?.status === "pending" ||
-          !hasAdmittedRemoteMember),
-    );
-    if (requiresAdmissionControlLane) {
-      const attached = await attachBrokerControlLaneRuntime({
+    const activeDmId = started.active_context?.dm_id ?? null;
+    const activeDm = activeDmId
+      ? started.dms.find((dm) => dm.dm_id === activeDmId) ?? null
+      : null;
+    let stateAfterControl = started;
+    if (activeDm && activeDmId) {
+      const controlAttached = await attachBrokerControlLaneRuntime({
         adapter_kind: null,
       });
-      commitCommandState(attached);
-      if (attached.last_command_error) {
+      commitCommandState(controlAttached);
+      if (controlAttached.last_command_error) {
         if (reportFailures) {
-          const action = commandErrorToAction(attached.last_command_error);
+          const action = commandErrorToAction(controlAttached.last_command_error);
           reportCommandError(
             action
-              ? `${attached.last_command_error.message} — ${action}`
-              : attached.last_command_error.message,
-            attached.last_command_error.command,
+              ? `${controlAttached.last_command_error.message} — ${action}`
+              : controlAttached.last_command_error.message,
+            controlAttached.last_command_error.command,
           );
         }
-        return attached;
+        return controlAttached;
       }
-      const sent = await pumpTextControlTransportOnce({
+      const presenceState = await publishDmPresence({
+        dm_id: activeDmId,
+        ttl_seconds: 120,
+      });
+      commitCommandState(presenceState);
+      if (presenceState.last_command_error) {
+        if (reportFailures) {
+          const action = commandErrorToAction(presenceState.last_command_error);
+          reportCommandError(
+            action
+              ? `${presenceState.last_command_error.message} — ${action}`
+              : presenceState.last_command_error.message,
+            presenceState.last_command_error.command,
+          );
+        }
+        return presenceState;
+      }
+      await pumpTextControlTransportOnce({
         target: null,
         limit: 8,
         operation_timeout_ms: 5_000,
@@ -1843,12 +1801,50 @@ function App() {
         drain_ms: 1_500,
         operation_timeout_ms: 1_000,
       });
-      if (reportFailures && (sent.failures.length > 0 || drained.failures.length > 0)) {
+      if (reportFailures && drained.failures.length > 0) {
         reportCommandError(
-          sent.failures[0] ?? drained.failures[0],
-          sent.failures.length > 0
-            ? "pump_text_control_transport_once"
-            : "drain_text_control_inbound_frames",
+          drained.failures[0],
+          "drain_text_control_inbound_frames",
+        );
+      }
+      stateAfterControl = await waitForCurrentRemoteDmRuntimePeer(
+        activeDmId,
+        presenceState,
+      );
+      const refreshedDm = stateAfterControl.dms.find((dm) => dm.dm_id === activeDmId);
+      if (!hasCurrentAdvertisedRemoteDmRuntimePeer(refreshedDm)) {
+        return stateAfterControl;
+      }
+    } else if (activeGroup) {
+      const controlAttached = await attachBrokerControlLaneRuntime({
+        adapter_kind: null,
+      });
+      commitCommandState(controlAttached);
+      if (controlAttached.last_command_error) {
+        if (reportFailures) {
+          const action = commandErrorToAction(controlAttached.last_command_error);
+          reportCommandError(
+            action
+              ? `${controlAttached.last_command_error.message} — ${action}`
+              : controlAttached.last_command_error.message,
+            controlAttached.last_command_error.command,
+          );
+        }
+        return controlAttached;
+      }
+      await pumpTextControlTransportOnce({
+        target: null,
+        limit: 8,
+        operation_timeout_ms: 5_000,
+      });
+      const drained = await drainTextControlInboundFrames({
+        drain_ms: 1_500,
+        operation_timeout_ms: 1_000,
+      });
+      if (reportFailures && drained.failures.length > 0) {
+        reportCommandError(
+          drained.failures[0],
+          "drain_text_control_inbound_frames",
         );
       }
       const managed = await startControlLaneSessionManager({
@@ -1856,7 +1852,7 @@ function App() {
         drain_ms: 300,
         backoff_initial_ms: 100,
         backoff_max_ms: 2_000,
-        backoff_max_attempts: 5,
+        backoff_max_attempts: 4_294_967_295,
       });
       commitCommandState(managed);
       if (managed.last_command_error) {
@@ -1871,14 +1867,22 @@ function App() {
         }
         return managed;
       }
-      const refreshed = await loadAppState().catch(() => null);
-      if (refreshed) {
-        commitCommandState(refreshed);
-        return refreshed;
-      }
-      return managed;
+      stateAfterControl = (await loadAppState().catch(() => null)) ?? managed;
+      commitCommandState(stateAfterControl);
+      const refreshedGroup = activeGroupId
+        ? stateAfterControl.groups.find((group) => group.group_id === activeGroupId)
+        : null;
+      const hasAdvertisedRemotePeer =
+        refreshedGroup?.members?.some(
+          (member) =>
+            member.member_id !== stateAfterControl.profile?.user_id &&
+            member.status !== "pending" &&
+            member.status !== "revoked" &&
+            Boolean(member.runtime_peer_id),
+        ) ?? false;
+      if (!hasAdvertisedRemotePeer) return stateAfterControl;
     }
-    const attached = await attachTextRuntime(started).catch((error: unknown) => {
+    const attached = await attachTextRuntime(stateAfterControl).catch((error: unknown) => {
       const message =
         error instanceof Error ? error.message : String(error ?? "");
       if (reportFailures) {
@@ -1919,7 +1923,7 @@ function App() {
       commitCommandState(refreshed);
       return refreshed;
     }
-    return attached ?? started;
+    return attached ?? stateAfterControl;
   }
 
   async function syncTextRuntimeForState(
@@ -2001,6 +2005,67 @@ function App() {
     commandState?.runtime_mode.mode,
     commandState?.storage_security.status,
     commandState?.profile?.user_id,
+    hasTauriCommandRuntime,
+  ]);
+
+  useEffect(() => {
+    const activeDmId = commandState?.active_context?.dm_id ?? null;
+    if (
+      !commandState ||
+      !activeDmId ||
+      commandState.lifecycle === "first_run" ||
+      commandState.storage_security.status !== "ready" ||
+      !hasTauriCommandRuntime
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const publishAndPump = async () => {
+      const latestState = commandStateRef.current ?? commandState;
+      const latestDmId = latestState.active_context?.dm_id ?? activeDmId;
+      if (cancelled || dmPresenceInFlightRef.current || !latestDmId) return;
+      dmPresenceInFlightRef.current = true;
+      try {
+        const activeDm = latestState.dms.find((dm) => dm.dm_id === latestDmId);
+        if (!activeDm) return;
+        await attachBrokerControlLaneRuntime({ adapter_kind: null });
+        const presenceState = await publishDmPresence({
+          dm_id: latestDmId,
+          ttl_seconds: 120,
+        });
+        if (cancelled) return;
+        commitCommandState(presenceState);
+        await pumpTextControlTransportOnce({
+          target: null,
+          limit: 8,
+          operation_timeout_ms: 5_000,
+        });
+        await drainTextControlInboundFrames({
+          drain_ms: 1_500,
+          operation_timeout_ms: 1_000,
+        });
+        const refreshed = await loadAppState().catch(() => null);
+        if (!cancelled && refreshed) {
+          commitCommandState(refreshed);
+        }
+      } catch (_error) {
+      } finally {
+        dmPresenceInFlightRef.current = false;
+      }
+    };
+
+    void publishAndPump();
+    const intervalId = window.setInterval(publishAndPump, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    commandState?.active_context?.dm_id,
+    commandState?.lifecycle,
+    commandState?.runtime_mode.mode,
+    commandState?.storage_security.status,
     hasTauriCommandRuntime,
   ]);
 
@@ -2819,6 +2884,10 @@ function App() {
           ? mediaState.voice_session
           : joinedState.voice_session;
         const voicePeers = textRuntimePeerDefaults(mediaState);
+        const voiceRole = textRuntimeRole(mediaState);
+        if (!voicePeers || !voiceRole) {
+          return;
+        }
         if (voiceSession) {
           const canUseWebViewRtc = Boolean(
             !forceNativeRustVoice &&
@@ -2833,7 +2902,7 @@ function App() {
               inputGain: localMicGain,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
-              role: textRuntimeRole(mediaState),
+              role: voiceRole,
               connectivity: voiceConnectivityForState(mediaState),
               onLocalActivity: handleVoiceActivitySample,
               onRemoteTrack: (track) => {
@@ -2882,7 +2951,7 @@ function App() {
               localStream: voiceAccess.stream,
               localPeerId: voicePeers.local,
               remotePeerId: voicePeers.remote,
-              role: textRuntimeRole(mediaState),
+              role: voiceRole,
               connectivity: voiceConnectivityForState(mediaState),
               outputDeviceId: selectedVoiceOutputId,
               outputVolume: appOutputVolume,
@@ -3797,7 +3866,7 @@ function StorageSecurityPanel({
               <p className="rounded-xl border border-amber-300/25 bg-amber-300/10 p-3 text-amber-100">
                 No storage restore flow exists yet for a lost password, broken
                 keyring, or moved vault. Discrypt preserves existing unreadable
-                state and leaves recovery/migration on the roadmap.
+                state and requires an explicit reset before starting over.
               </p>
             </div>
             {locked || storage.mode === "passphrase_vault" ? (
@@ -5839,8 +5908,8 @@ function TransportStatusStrip({
 }: {
   statuses: TransportStatusView[];
   diagnostics?: TransportDiagnosticsView;
-  runtimePeers: { local: string; remote: string };
-  runtimeRole: "offerer" | "answerer";
+  runtimePeers: { local: string; remote: string } | null;
+  runtimeRole: "offerer" | "answerer" | null;
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
   onStartTextTransport: () => void;
@@ -5894,21 +5963,25 @@ function TransportStatusStrip({
               Backend-derived text runtime
             </p>
             <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              Peer ids and role are derived from signed invite/group metadata.
+              Peer ids and role come from backend/provider-advertised runtime rows.
             </p>
           </div>
           <div className="grid gap-2 text-xs md:grid-cols-3">
             <code className="rounded-lg bg-black/25 px-2 py-1 font-mono">
-              local {runtimePeers.local}
+              local {runtimePeers?.local ?? "pending"}
             </code>
             <code className="rounded-lg bg-black/25 px-2 py-1 font-mono">
-              remote {runtimePeers.remote}
+              remote {runtimePeers?.remote ?? "pending"}
             </code>
-            <Badge variant="outline">{runtimeRole}</Badge>
+            <Badge variant="outline">{runtimeRole ?? "pending"}</Badge>
           </div>
         </div>
         <div className="flex flex-wrap items-end gap-2">
-          <Button size="sm" onClick={onAttachRuntime}>
+          <Button
+            size="sm"
+            onClick={onAttachRuntime}
+            disabled={!runtimePeers || !runtimeRole}
+          >
             Attach text runtime
           </Button>
         </div>
@@ -8593,8 +8666,8 @@ function InspectorRail({
   resetPhrase: string;
   setResetPhrase: (value: string) => void;
   onResetState: () => void;
-  runtimePeers: { local: string; remote: string };
-  runtimeRole: "offerer" | "answerer";
+  runtimePeers: { local: string; remote: string } | null;
+  runtimeRole: "offerer" | "answerer" | null;
   onProbeAdapter: () => void;
   onProbeDataChannel: () => void;
   onStartTextTransport: () => void;

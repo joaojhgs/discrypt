@@ -23,7 +23,7 @@ for (const token of [
   "# G132",
   "connectivity_signaling_push_smoke_covers_phase6_gates",
   "AC13",
-  "STUN → relay-overlay → TURN",
+  "STUN → configured TURN",
   "provider-visible",
   "ciphertext-only",
   "public-provider proof",
@@ -46,9 +46,9 @@ for (const token of [
 
 for (const token of [
   "ConnectivityConfig",
-  "valid_direct_overlay_and_turn_flows_select_expected_leg",
+  "valid_direct_and_configured_turn_flows_select_expected_leg",
   "FallbackLeg",
-  "ordered_stun_overlay_turn",
+  "ordered_direct_turn",
   "ciphertext_only",
 ]) {
   requireText("transport-tests", transportTests, token);
@@ -102,12 +102,12 @@ run(
     "test",
     "-p",
     "discrypt-transport",
-    "valid_direct_overlay_and_turn_flows_select_expected_leg",
+    "valid_direct_and_configured_turn_flows_select_expected_leg",
     "--quiet",
   ]
 );
 
-if (process.env.DISCRYPT_PUBLIC_SIGNALING_E2E === "1") {
+if (process.env.DISCRYPT_PUBLIC_MQTT_E2E === "1") {
   const endpoint = process.env.DISCRYPT_PUBLIC_MQTT_ENDPOINT || "mqtts://broker.emqx.io:8883";
   run(
     "Public MQTT signaling smoke (opt-in)",
@@ -126,7 +126,7 @@ if (process.env.DISCRYPT_PUBLIC_SIGNALING_E2E === "1") {
     {
       env: {
         ...process.env,
-        DISCRYPT_PUBLIC_SIGNALING_E2E: "1",
+        DISCRYPT_PUBLIC_MQTT_E2E: "1",
         DISCRYPT_PUBLIC_MQTT_ENDPOINT: endpoint,
       },
     }

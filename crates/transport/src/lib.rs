@@ -83,7 +83,6 @@ pub use provider_adapters::{
     probe_provider_webrtc_datachannel_roundtrip,
     probe_provider_webrtc_datachannel_text_frame_roundtrip, required_provider_adapter_boundaries,
     required_provider_adapter_registry, required_provider_adapter_registry_entry,
-    resume_text_control_runtime_from_probe, resume_text_control_runtime_from_spec,
     start_provider_webrtc_text_control_answer_runtime_with_answerer,
     start_provider_webrtc_text_control_offer_runtime,
     start_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer,
@@ -91,16 +90,10 @@ pub use provider_adapters::{
     FeatureGatedProviderAdapter, IceDtlsProviderFailureKind, IceDtlsProviderReport,
     LocalConformanceProviderAdapter, LocalConformanceProviderBus, ProviderAdapterBoundary,
     ProviderAdapterReadiness, ProviderAdapterRoundtripProbe, ProviderTextControlRuntime,
-    ProviderTextControlRuntimeAttachment, ProviderTextControlRuntimeEvidence,
-    ProviderTextControlRuntimePair, ProviderTextControlRuntimePeerEvidence,
-    ProviderTextControlRuntimePeerRole, ProviderTextControlRuntimeSpec,
+    ProviderTextControlRuntimeEvidence, ProviderTextControlRuntimePair,
+    ProviderTextControlRuntimePeerEvidence, ProviderTextControlRuntimePeerRole,
     ProviderWebRtcDataChannelProbe, SignalingAdapterFactory, SignalingAdapterFallbackAttempt,
     SignalingAdapterFallbackPlan, SignalingAdapterRegistryEntry,
-    PROVIDER_TEXT_CONTROL_RUNTIME_SPEC_SCHEMA_VERSION,
-    TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_MESSAGE,
-    TEXT_CONTROL_RUNTIME_NOT_IMPLEMENTED_RECOVERY_HINT,
-    TEXT_CONTROL_RUNTIME_SPEC_INCOMPATIBLE_MESSAGE, TEXT_CONTROL_RUNTIME_SPEC_MISSING_MESSAGE,
-    TEXT_CONTROL_RUNTIME_SPEC_STALE_MESSAGE,
 };
 pub use route_graph::{
     GroupRouteGraph, RouteGraphEdge, RouteGraphScope, RouteIntent, ROUTE_GRAPH_SCHEMA_VERSION,
@@ -194,8 +187,6 @@ impl Transport for LoopbackTransport {
 pub enum FallbackLeg {
     /// Direct NAT traversal through STUN/ICE.
     Stun,
-    /// Legacy peer overlay route. Kept for old diagnostics only; the planner no longer selects it.
-    RelayOverlay,
     /// Provider TURN relay carrying end-to-end ciphertext.
     Turn,
 }
@@ -205,8 +196,6 @@ pub enum FallbackLeg {
 pub struct SimulatedNat {
     /// Whether STUN/ICE direct traversal succeeds.
     pub stun_available: bool,
-    /// Legacy overlay flag retained for old fixtures; ignored by the current planner.
-    pub overlay_available: bool,
     /// Whether TURN is reachable as the final fallback.
     pub turn_available: bool,
 }
@@ -217,18 +206,7 @@ impl SimulatedNat {
     pub const fn direct() -> Self {
         Self {
             stun_available: true,
-            overlay_available: true,
             turn_available: true,
-        }
-    }
-
-    /// Legacy overlay-only scenario. Current policy must fail unless TURN is configured.
-    #[must_use]
-    pub const fn overlay_only() -> Self {
-        Self {
-            stun_available: false,
-            overlay_available: true,
-            turn_available: false,
         }
     }
 
@@ -237,7 +215,6 @@ impl SimulatedNat {
     pub const fn turn_only() -> Self {
         Self {
             stun_available: false,
-            overlay_available: false,
             turn_available: true,
         }
     }
@@ -347,19 +324,12 @@ impl ConnectivityPlan {
             .all(|(index, attempt)| order.get(index) == Some(&attempt.leg))
     }
 
-    /// Compatibility alias for older call sites; overlay is no longer part of the valid order.
-    #[must_use]
-    pub fn ordered_stun_overlay_turn(&self) -> bool {
-        self.ordered_direct_turn()
-    }
-
-    /// Return true when TURN attempts do not carry plaintext content and no overlay route is selected.
+    /// Return true when TURN attempts do not carry plaintext content.
     #[must_use]
     pub fn relay_legs_ciphertext_only(&self) -> bool {
         self.attempts.iter().all(|attempt| match attempt.leg {
             FallbackLeg::Stun => !attempt.carries_content,
             FallbackLeg::Turn => attempt.ciphertext_only && !attempt.carries_content,
-            FallbackLeg::RelayOverlay => false,
         })
     }
 
@@ -387,7 +357,7 @@ pub struct RouteReport {
     pub endpoint: Endpoint,
     /// Attempted legs in order.
     pub attempted_legs: Vec<FallbackLeg>,
-    /// Whether TURN legs are marked ciphertext-only and no overlay relay was selected.
+    /// Whether TURN legs are marked ciphertext-only.
     pub ciphertext_only_relay_legs: bool,
     /// Honest limitation copy for deterministic local tests.
     pub limitation: String,
@@ -597,7 +567,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_uses_direct_then_configured_turn_order() -> Result<(), TransportError> {
+    fn valid_direct_and_configured_turn_flows_select_expected_leg() -> Result<(), TransportError> {
         let config = ConnectivityConfig::default();
         let turn_config = ConnectivityConfig {
             overrides: EndpointOverrides::new(
@@ -607,11 +577,9 @@ mod tests {
             ..ConnectivityConfig::default()
         };
         let direct = ConnectivityPlanner::plan(&config, SimulatedNat::direct())?;
-        let overlay = ConnectivityPlanner::plan(&config, SimulatedNat::overlay_only());
         let turn = ConnectivityPlanner::plan(&turn_config, SimulatedNat::turn_only())?;
 
         assert_eq!(direct.selected, FallbackLeg::Stun);
-        assert_eq!(overlay, Err(TransportError::NoViablePath));
         assert_eq!(turn.selected, FallbackLeg::Turn);
         assert_eq!(turn.attempts.len(), 2);
         assert!(direct.ordered_direct_turn());

@@ -21,8 +21,7 @@ text/control frames, receipts, media, or plaintext.
 - MQTT publish configures the provider packet cap from the selected endpoint and
   rejects oversized serialized sealed envelopes before broker publish with
   `failure_class=provider_message_too_large`.
-- The public MQTT test gate now accepts `DISCRYPT_PUBLIC_MQTT_E2E=1` and the
-  legacy `DISCRYPT_PUBLIC_SIGNALING_E2E=1`.
+- The public MQTT test gate uses `DISCRYPT_PUBLIC_MQTT_E2E=1`.
 
 ## Verification Run
 
@@ -39,7 +38,7 @@ text/control frames, receipts, media, or plaintext.
 - Local Mosquitto run was not available in this runner: `mosquitto` is not
   installed, and Docker access to `/var/run/docker.sock` is denied, so a
   short-lived `eclipse-mosquitto:2` broker could not be started. The harness is
-  now wired for `DISCRYPT_PUBLIC_SIGNALING_E2E=1
+  now wired for `DISCRYPT_PUBLIC_MQTT_E2E=1
   DISCRYPT_PUBLIC_MQTT_ENDPOINT=mqtt://127.0.0.1:1883` once Mosquitto is
   available.
 
@@ -50,4 +49,3 @@ public MQTT profile validation, explicit payload/backoff metadata, fail-closed
 payload cap behavior, and a live public broker opaque signaling roundtrip. It is
 not installed-app two-profile message/voice evidence and does not claim MQTT is
 an application relay.
-
