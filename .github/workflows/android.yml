@@ -101,7 +101,7 @@ jobs:
           npm run tauri -- android init
           --ci
           --skip-targets-install
-      - name: Build Android APK for emulator
+      - name: Build Android APK for virtual-device validation
         working-directory: apps/desktop
         run: >
           npm run tauri -- android build
@@ -109,26 +109,26 @@ jobs:
           --apk
           --target x86_64
           --features tauri-runtime,production-network,production-media
-      - name: Sign APK for emulator installation
+      - name: Sign APK for test installation
         shell: bash
         run: |
           set -euo pipefail
           unsigned_apk=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*-unsigned.apk' -print -quit)
           test -n "$unsigned_apk"
-          emulator_keystore="$RUNNER_TEMP/discrypt-emulator.p12"
-          signed_apk="${unsigned_apk%-unsigned.apk}-emulator-signed.apk"
+          signing_keystore="$RUNNER_TEMP/discrypt-ci-signing.p12"
+          signed_apk="${unsigned_apk%-unsigned.apk}-ci-signed.apk"
           keytool -genkeypair -noprompt \
             -storetype PKCS12 \
-            -keystore "$emulator_keystore" \
+            -keystore "$signing_keystore" \
             -storepass android \
             -keypass android \
-            -alias discrypt-emulator \
-            -dname "CN=Discrypt Emulator,O=Discrypt,C=US" \
+            -alias discrypt-ci \
+            -dname "CN=Discrypt CI,O=Discrypt,C=US" \
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
-            --ks "$emulator_keystore" \
+            --ks "$signing_keystore" \
             --ks-pass pass:android \
             --key-pass pass:android \
             --out "$signed_apk" \
@@ -141,7 +141,7 @@ jobs:
           profile: pixel_6
           script: |
             set -euo pipefail
-            APK_PATH=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*-emulator-signed.apk' -print -quit)
+            APK_PATH=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*-ci-signed.apk' -print -quit)
             test -n "$APK_PATH"
             adb install -r "$APK_PATH"
             adb shell pm grant "$DISCRYPT_ANDROID_PACKAGE" android.permission.BLUETOOTH_CONNECT
