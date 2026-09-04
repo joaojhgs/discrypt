@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(resolve(repoRoot, ".github/workflows/android.yml"), "utf8");
 const mainCi = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
+const desktopCargo = readFileSync(
+  resolve(repoRoot, "apps/desktop/src-tauri/Cargo.toml"),
+  "utf8",
+);
 const mediaTransport = readFileSync(resolve(repoRoot, "crates/media/src/transport.rs"), "utf8");
 const docs = readFileSync(resolve(repoRoot, "docs/release/android-build-emulator-gate.md"), "utf8");
 
@@ -51,6 +55,39 @@ for (const token of [
   "cargo check --workspace --target aarch64-linux-android",
 ]) {
   if (!mainCi.includes(token)) failures.push(`Main CI Android target check missing token: ${token}`);
+}
+
+const desktopLibSection = desktopCargo.match(
+  /(?:^|\n)\[lib\]\s*\n(?<body>[\s\S]*?)(?=\n\[|$)/,
+);
+if (!desktopLibSection) {
+  failures.push(
+    "Desktop Tauri Cargo manifest missing [lib] section for Android native library build",
+  );
+} else {
+  const libNameMatch = desktopLibSection.groups.body.match(
+    /^\s*name\s*=\s*"(?<name>[^"]+)"/m,
+  );
+  if (libNameMatch && libNameMatch.groups.name !== "discrypt_desktop") {
+    failures.push(
+      "Desktop Tauri Cargo manifest [lib] name must produce libdiscrypt_desktop.so",
+    );
+  }
+  const crateTypeMatch = desktopLibSection.groups.body.match(
+    /^\s*crate-type\s*=\s*\[(?<types>[^\]]*)\]/m,
+  );
+  if (!crateTypeMatch) {
+    failures.push("Desktop Tauri Cargo manifest [lib] section missing crate-type");
+  } else {
+    const crateTypes = [...crateTypeMatch.groups.types.matchAll(/"([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    for (const crateType of ["staticlib", "cdylib", "rlib"]) {
+      if (!crateTypes.includes(crateType)) {
+        failures.push(`Desktop Tauri Cargo manifest crate-type missing ${crateType}`);
+      }
+    }
+  }
 }
 
 const mediaTokens = [

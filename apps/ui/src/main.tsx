@@ -84,9 +84,10 @@ import {
   unlockStorageSecurity,
 } from "./commands";
 import {
-  startNativeRustVoiceMediaSession,
+  startNativeRustVoiceMediaMeshSession,
   startWebViewVoiceMediaSession,
   VoiceMediaSessionHandle,
+  VoiceMediaPeerEdge,
 } from "./voice-media";
 import { shouldMountRemoteAudioElement } from "./voice-playback";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -115,7 +116,11 @@ import { Select, SelectItem } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { logSanitizedCommandError } from "./command-error-log";
 import "./styles.css";
@@ -215,14 +220,16 @@ function tauriTwoProfileE2EVoiceHarnessEnabled(): boolean {
     __discryptTauriTwoProfileE2EVoiceEvidence?: unknown;
   };
   if (
-    automationWindow.__discryptTauriTwoProfileE2EForceNativeRustVoice !== undefined ||
+    automationWindow.__discryptTauriTwoProfileE2EForceNativeRustVoice !==
+      undefined ||
     automationWindow.__discryptTauriTwoProfileE2EVoiceEvidence !== undefined
   ) {
     return true;
   }
   try {
     return (
-      window.localStorage?.getItem(TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY) === "1"
+      window.localStorage?.getItem(TAURI_TWO_PROFILE_E2E_VOICE_HARNESS_KEY) ===
+      "1"
     );
   } catch {
     return false;
@@ -247,14 +254,14 @@ function generatedAutomationVoiceDeviceAccess(
 ): VoiceDeviceAccess {
   const selectedGeneratedDeviceId = selectedInputDeviceId?.trim()
     ? selectedInputDeviceId
-      : "tauri-two-profile-e2e-generated-audio-input";
+    : "tauri-two-profile-e2e-generated-audio-input";
   const selectedGeneratedOutputId = selectedOutputDeviceId?.trim()
     ? selectedOutputDeviceId
     : "default";
-  const selectedGeneratedOutput =
-    availableOutputDevices.find(
-      (device) => device.device_id === selectedGeneratedOutputId,
-    ) ?? availableOutputDevices[0] ?? {
+  const selectedGeneratedOutput = availableOutputDevices.find(
+    (device) => device.device_id === selectedGeneratedOutputId,
+  ) ??
+    availableOutputDevices[0] ?? {
       device_id: "default",
       label: "System default speaker",
     };
@@ -263,7 +270,8 @@ function generatedAutomationVoiceDeviceAccess(
       device_id: selectedGeneratedDeviceId,
       label: "Generated audio input",
     },
-    ...(selectedGeneratedDeviceId === "tauri-two-profile-e2e-generated-audio-input"
+    ...(selectedGeneratedDeviceId ===
+    "tauri-two-profile-e2e-generated-audio-input"
       ? []
       : [
           {
@@ -419,30 +427,13 @@ function asThemeId(value: string): ThemeId {
     : discryptUiConfig.activeTheme;
 }
 
-function runtimePeerLeaseIsCurrent(peer: { presence_expires_at?: string | null }): boolean {
+function runtimePeerLeaseIsCurrent(peer: {
+  presence_expires_at?: string | null;
+}): boolean {
   const expiresAt = peer.presence_expires_at;
   if (!expiresAt) return false;
   const expiresMs = Date.parse(expiresAt);
   return Number.isFinite(expiresMs) && expiresMs > Date.now();
-}
-
-function hasCurrentAdvertisedRemoteGroupRuntimePeer(
-  group: AppState["groups"][number] | null | undefined,
-  peer: NonNullable<AppState["groups"][number]["runtime_peers"]>[number],
-): boolean {
-  if (peer.is_local || peer.source !== "sealed_provider_peer_advertisement_v1") {
-    return false;
-  }
-  const member = group?.members?.find(
-    (candidate) =>
-      candidate.member_id === peer.member_id &&
-      candidate.runtime_peer_id === peer.peer_id,
-  );
-  return Boolean(
-    member &&
-      member.status === "online" &&
-      runtimePeerLeaseIsCurrent(member),
-  );
 }
 
 function hasCurrentAdvertisedRemoteDmRuntimePeer(
@@ -459,24 +450,77 @@ function hasCurrentAdvertisedRemoteDmRuntimePeer(
   );
 }
 
-function textRuntimePeerDefaults(state: AppState): {
+type RuntimePeerEdge = {
   local: string;
   remote: string;
-} | null {
-  const activeDm = state.active_context?.dm_id
-    ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
-    : state.dms[0];
-  const activeGroup = state.active_context?.group_id
+  role: "offerer" | "answerer";
+};
+
+function runtimePeerEdgeKey(edge: RuntimePeerEdge): string {
+  return `${edge.local}->${edge.remote}`;
+}
+
+function groupRoleCanManageMembers(role: string | null | undefined): boolean {
+  return role === "owner" || role === "staff";
+}
+
+function runtimeRoleForGroupEdge({
+  localPeerId,
+  localRole,
+  remotePeerId,
+  remoteRole,
+}: {
+  localPeerId: string;
+  localRole: string | null | undefined;
+  remotePeerId: string;
+  remoteRole: string | null | undefined;
+}): "offerer" | "answerer" {
+  if (
+    groupRoleCanManageMembers(localRole) &&
+    !groupRoleCanManageMembers(remoteRole)
+  ) {
+    return "offerer";
+  }
+  if (
+    !groupRoleCanManageMembers(localRole) &&
+    groupRoleCanManageMembers(remoteRole)
+  ) {
+    return "answerer";
+  }
+  return localPeerId < remotePeerId ? "offerer" : "answerer";
+}
+
+function textRuntimePeerEdges(state: AppState): RuntimePeerEdge[] {
+  const joinedVoiceSession = state.voice_session?.joined
+    ? state.voice_session
+    : null;
+  const activeDm = joinedVoiceSession
+    ? undefined
+    : state.active_context?.dm_id
+      ? state.dms.find((dm) => dm.dm_id === state.active_context?.dm_id)
+      : state.dms[0];
+  const activeGroup = joinedVoiceSession
     ? state.groups.find(
-        (group) => group.group_id === state.active_context?.group_id,
+        (group) => group.group_id === joinedVoiceSession.group_id,
       )
-    : state.groups[0];
+    : state.active_context?.group_id
+      ? state.groups.find(
+          (group) => group.group_id === state.active_context?.group_id,
+        )
+      : state.groups[0];
   const voiceSignaling = state.voice_session?.signaling;
-  if (voiceSignaling?.local_peer_id && voiceSignaling.remote_peer_id) {
-    return {
-      local: voiceSignaling.local_peer_id,
-      remote: voiceSignaling.remote_peer_id,
-    };
+  if (
+    activeDm &&
+    voiceSignaling?.local_peer_id &&
+    voiceSignaling.remote_peer_id
+  ) {
+    return [
+      {
+        local: voiceSignaling.local_peer_id,
+        remote: voiceSignaling.remote_peer_id,
+        role: voiceSignaling.role === "answerer" ? "answerer" : "offerer",
+      },
+    ];
   }
   const dmRuntimePeers = activeDm?.runtime_peers ?? [];
   const backendLocalDmPeer = dmRuntimePeers.find((peer) => peer.is_local);
@@ -487,25 +531,88 @@ function textRuntimePeerDefaults(state: AppState): {
       runtimePeerLeaseIsCurrent(peer),
   );
   if (backendLocalDmPeer && backendRemoteDmPeer) {
-    return {
-      local: backendLocalDmPeer.peer_id,
-      remote: backendRemoteDmPeer.peer_id,
-    };
+    return [
+      {
+        local: backendLocalDmPeer.peer_id,
+        remote: backendRemoteDmPeer.peer_id,
+        role: backendLocalDmPeer.role === "reply" ? "answerer" : "offerer",
+      },
+    ];
   }
 
   const groupRuntimePeers = activeGroup?.runtime_peers ?? [];
   const backendLocalGroupPeer = groupRuntimePeers.find((peer) => peer.is_local);
-  const backendRemoteGroupPeer = groupRuntimePeers.find(
-    (peer) => hasCurrentAdvertisedRemoteGroupRuntimePeer(activeGroup, peer),
+  const localMember = activeGroup?.members?.find(
+    (member) => member.member_id === state.profile?.user_id,
   );
-  if (backendLocalGroupPeer && backendRemoteGroupPeer) {
-    return {
-      local: backendLocalGroupPeer.peer_id,
-      remote: backendRemoteGroupPeer.peer_id,
-    };
-  }
+  const localPeerId =
+    localMember?.runtime_peer_id || backendLocalGroupPeer?.peer_id || "";
+  if (!activeGroup || !localPeerId) return [];
+  const localRole = localMember?.role ?? activeGroup.role;
+  const seenRemotePeers = new Set<string>();
+  return (activeGroup.members ?? [])
+    .filter(
+      (member) =>
+        member.member_id !== state.profile?.user_id &&
+        member.status === "online" &&
+        runtimePeerLeaseIsCurrent(member) &&
+        Boolean(member.runtime_peer_id),
+    )
+    .flatMap((member) => {
+      const remotePeerId = member.runtime_peer_id ?? "";
+      if (
+        !remotePeerId ||
+        remotePeerId === localPeerId ||
+        seenRemotePeers.has(remotePeerId)
+      ) {
+        return [];
+      }
+      seenRemotePeers.add(remotePeerId);
+      return [
+        {
+          local: localPeerId,
+          remote: remotePeerId,
+          role: runtimeRoleForGroupEdge({
+            localPeerId,
+            localRole,
+            remotePeerId,
+            remoteRole: member.role,
+          }),
+        },
+      ];
+    });
+}
 
-  return null;
+function compositeVoiceMediaHandle(
+  handles: VoiceMediaSessionHandle[],
+): VoiceMediaSessionHandle | null {
+  if (handles.length === 0) return null;
+  if (handles.length === 1) return handles[0];
+  return {
+    close: () => {
+      for (const handle of handles) handle.close();
+    },
+    setMuted: (muted) => {
+      for (const handle of handles) handle.setMuted(muted);
+    },
+    setInputGain: (gainPercent) => {
+      for (const handle of handles) handle.setInputGain?.(gainPercent);
+    },
+    setOutputDevice: (deviceId) => {
+      for (const handle of handles) handle.setOutputDevice?.(deviceId);
+    },
+    setOutputVolume: (volumePercent) => {
+      for (const handle of handles) handle.setOutputVolume?.(volumePercent);
+    },
+  };
+}
+
+function textRuntimePeerDefaults(state: AppState): {
+  local: string;
+  remote: string;
+} | null {
+  const edge = textRuntimePeerEdges(state)[0];
+  return edge ? { local: edge.local, remote: edge.remote } : null;
 }
 
 function activeScopeLabelForState(state: AppState): string {
@@ -529,6 +636,8 @@ function voiceConnectivityForState(state: AppState) {
 }
 
 function textRuntimeRole(state: AppState): "offerer" | "answerer" | null {
+  const edgeRole = textRuntimePeerEdges(state)[0]?.role;
+  if (edgeRole) return edgeRole;
   const voiceRole = state.voice_session?.signaling.role;
   if (voiceRole === "offerer" || voiceRole === "answerer") {
     return voiceRole;
@@ -597,15 +706,19 @@ function voiceDeviceFailure(error: unknown): VoiceDeviceFailure {
         "Microphone could not be opened — Close other audio apps and verify the device is available, then try again",
     };
   }
-  if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+  if (
+    name === "OverconstrainedError" ||
+    name === "ConstraintNotSatisfiedError"
+  ) {
     return {
       message:
         "The selected microphone is unavailable — Choose the system default or another input device",
     };
   }
-  const detail = error instanceof Error && error.message.trim()
-    ? `: ${error.message.trim()}`
-    : "";
+  const detail =
+    error instanceof Error && error.message.trim()
+      ? `: ${error.message.trim()}`
+      : "";
   return {
     message: `Microphone capture failed${detail}`,
   };
@@ -642,11 +755,28 @@ function nativeRustVoiceAvailable(): boolean {
   return Boolean(window.__TAURI__?.core?.invoke);
 }
 
-function voiceInputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
+function forceNativeRustVoiceForE2E(): boolean {
+  return Boolean(
+    (
+      window as typeof window & {
+        __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
+      }
+    ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
+    window.localStorage?.getItem(
+      "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+    ) === "1",
+  );
+}
+
+function voiceInputDeviceOptions(
+  devices: MediaDeviceInfo[],
+): VoiceDeviceOption[] {
   return voiceDeviceOptions(devices, "audioinput", "Microphone");
 }
 
-function voiceOutputDeviceOptions(devices: MediaDeviceInfo[]): VoiceDeviceOption[] {
+function voiceOutputDeviceOptions(
+  devices: MediaDeviceInfo[],
+): VoiceDeviceOption[] {
   return voiceDeviceOptions(devices, "audiooutput", "Speaker");
 }
 
@@ -731,11 +861,10 @@ async function requestVoiceDeviceAccess(
   selectedOutputDeviceId?: string,
   preferNativeCapture = false,
 ): Promise<VoiceDeviceAccess> {
-  const generatedAutomationAccess =
-    await requestGeneratedAutomationVoiceAccess(
-      selectedInputDeviceId,
-      selectedOutputDeviceId,
-    );
+  const generatedAutomationAccess = await requestGeneratedAutomationVoiceAccess(
+    selectedInputDeviceId,
+    selectedOutputDeviceId,
+  );
   if (generatedAutomationAccess) return generatedAutomationAccess;
 
   const nativeSystemAccess = async (): Promise<VoiceDeviceAccess> => {
@@ -811,11 +940,11 @@ async function requestVoiceDeviceAccess(
         (device) => device.kind === "audioinput" && device.deviceId,
       ) ??
       devices.find((device) => device.kind === "audioinput");
-    const selectedOutput = normalizeVoiceDevicePreference(selectedOutputDeviceId);
+    const selectedOutput = normalizeVoiceDevicePreference(
+      selectedOutputDeviceId,
+    );
     const requestedOutput =
-      selectedOutput !== "default"
-        ? selectedOutput
-        : null;
+      selectedOutput !== "default" ? selectedOutput : null;
     const output =
       (requestedOutput
         ? devices.find(
@@ -985,20 +1114,30 @@ function normalizedPeerRouteKind(
   ]
     .filter((value): value is string => Boolean(value))
     .map((value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "_"));
-  if (tokens.some((token) => /(^|_)(failed|failure|blocked|unavailable)($|_)/.test(token))) {
+  if (
+    tokens.some((token) =>
+      /(^|_)(failed|failure|blocked|unavailable)($|_)/.test(token),
+    )
+  ) {
     return "failed";
   }
   if (tokens.some((token) => /(^|_)turn(_|$)/.test(token))) return "turn";
-  if (tokens.some((token) => /(^|_)(relay|overlay|peer_relay)($|_)/.test(token))) {
+  if (
+    tokens.some((token) => /(^|_)(relay|overlay|peer_relay)($|_)/.test(token))
+  ) {
     return "relay";
   }
-  if (tokens.some((token) => /(^|_)(direct|stun|webrtc_direct)($|_)/.test(token))) {
+  if (
+    tokens.some((token) => /(^|_)(direct|stun|webrtc_direct)($|_)/.test(token))
+  ) {
     return "direct";
   }
   return null;
 }
 
-function peerRouteCopy(evidence: PeerRouteEvidenceView | null | undefined): string {
+function peerRouteCopy(
+  evidence: PeerRouteEvidenceView | null | undefined,
+): string {
   const route = normalizedPeerRouteKind(evidence);
   return route ? `route: ${peerRouteLabels[route]}` : "route: no route proof";
 }
@@ -1009,7 +1148,11 @@ function routeEvidenceFromRuntimePeer(
 ): PeerRouteEvidenceView | null {
   const matchedPeer = peers.find((peer) => {
     if (peer.member_id && peer.member_id === member.member_id) return true;
-    if (peer.device_id && member.device_id && peer.device_id === member.device_id) {
+    if (
+      peer.device_id &&
+      member.device_id &&
+      peer.device_id === member.device_id
+    ) {
       return true;
     }
     return false;
@@ -1048,7 +1191,9 @@ function Icon({
   );
 }
 
-function isKeyboardContextMenu(event: React.KeyboardEvent<HTMLElement>): boolean {
+function isKeyboardContextMenu(
+  event: React.KeyboardEvent<HTMLElement>,
+): boolean {
   return event.key === "ContextMenu" || (event.shiftKey && event.key === "F10");
 }
 
@@ -1056,7 +1201,10 @@ function contextMenuPointFromElement(element: HTMLElement): ContextMenuPoint {
   const rect = element.getBoundingClientRect();
   return {
     x: Math.min(rect.left + 16, Math.max(12, window.innerWidth - 240)),
-    y: Math.min(rect.top + Math.min(rect.height, 36), Math.max(12, window.innerHeight - 160)),
+    y: Math.min(
+      rect.top + Math.min(rect.height, 36),
+      Math.max(12, window.innerHeight - 160),
+    ),
   };
 }
 
@@ -1118,7 +1266,9 @@ function App() {
   const [draftConfigAdmissionMode, setDraftConfigAdmissionMode] =
     useState<GroupAdmissionModeView>("manual_approval");
   const [membersPanelOpen, setMembersPanelOpen] = useState(true);
-  const [memberActionInFlight, setMemberActionInFlight] = useState<string | null>(null);
+  const [memberActionInFlight, setMemberActionInFlight] = useState<
+    string | null
+  >(null);
   const [draftSignalingAdapter, setDraftSignalingAdapter] =
     useState<SignalingAdapterKind>("mqtt");
   const [draftSignalingEndpoint, setDraftSignalingEndpoint] = useState(
@@ -1187,20 +1337,31 @@ function App() {
   const commandStateRef = useRef<AppState | null>(null);
   const messageSendInFlightRef = useRef(false);
   const textRuntimeSyncInFlightRef = useRef(false);
-  const groupPresenceInFlightRef = useRef(false);
-  const dmPresenceInFlightRef = useRef(false);
   const voiceCaptureRef = useRef<MediaStream | null>(null);
   const voiceMediaSessionRef = useRef<VoiceMediaSessionHandle | null>(null);
+  const voiceMediaHandlesRef = useRef<Map<string, VoiceMediaSessionHandle>>(
+    new Map(),
+  );
+  const voiceWebViewActivityEdgeKeyRef = useRef<string | null>(null);
+
+  function updateCompositeVoiceMediaHandle() {
+    voiceMediaSessionRef.current = compositeVoiceMediaHandle([
+      ...voiceMediaHandlesRef.current.values(),
+    ]);
+  }
 
   function cleanupVoiceMediaSession() {
-    voiceMediaSessionRef.current?.close();
+    for (const handle of voiceMediaHandlesRef.current.values()) {
+      handle.close();
+    }
+    voiceMediaHandlesRef.current.clear();
     voiceMediaSessionRef.current = null;
+    voiceWebViewActivityEdgeKeyRef.current = null;
     setVoiceRemoteStreams({});
   }
 
   function stopLocalVoiceCapture() {
-    voiceMediaSessionRef.current?.close();
-    voiceMediaSessionRef.current = null;
+    cleanupVoiceMediaSession();
     setVoiceRemoteStreams({});
     stopMediaStream(voiceCaptureRef.current);
     voiceCaptureRef.current = null;
@@ -1269,7 +1430,21 @@ function App() {
       logSanitizedCommandError();
     }
     setCommandError(message);
-    setCommandNotifications((current) => [notification, ...current].slice(0, 6));
+    setCommandNotifications((current) =>
+      [notification, ...current].slice(0, 6),
+    );
+  }
+
+  function reportReturnedCommandError(state: AppState): boolean {
+    if (!state.last_command_error) return false;
+    const action = commandErrorToAction(state.last_command_error);
+    reportCommandError(
+      action
+        ? `${state.last_command_error.message} — ${action}`
+        : state.last_command_error.message,
+      state.last_command_error.command,
+    );
+    return true;
   }
 
   function dismissCommandNotification(id: string) {
@@ -1335,11 +1510,17 @@ function App() {
   }
 
   function openGroupConfigOverlay(groupId: string) {
-    const group = commandState?.groups.find((candidate) => candidate.group_id === groupId);
+    const group = commandState?.groups.find(
+      (candidate) => candidate.group_id === groupId,
+    );
     setOverlayClosing(false);
     setOverlayGroupId(groupId);
-    hydrateConnectivityDrafts(group?.connectivity ?? commandState?.connectivity_defaults ?? null);
-    setDraftConfigAdmissionMode(group?.role_policy?.admission_mode ?? "manual_approval");
+    hydrateConnectivityDrafts(
+      group?.connectivity ?? commandState?.connectivity_defaults ?? null,
+    );
+    setDraftConfigAdmissionMode(
+      group?.role_policy?.admission_mode ?? "manual_approval",
+    );
     setActiveOverlay("group-config");
   }
 
@@ -1448,6 +1629,190 @@ function App() {
     voiceMediaSessionRef.current?.setMuted(!enabled);
     if (!enabled) setLocalVoiceSpeaking(false);
   }, [commandState?.voice_session?.self_muted]);
+
+  useEffect(() => {
+    const voiceSession = commandState?.voice_session?.joined
+      ? commandState.voice_session
+      : null;
+    const closeHandle = (key: string) => {
+      const handle = voiceMediaHandlesRef.current.get(key);
+      if (!handle) return;
+      handle.close();
+      voiceMediaHandlesRef.current.delete(key);
+    };
+    if (!commandState || !voiceSession) {
+      cleanupVoiceMediaSession();
+      return;
+    }
+
+    const edges = textRuntimePeerEdges(commandState);
+    const forceNativeRustVoice = forceNativeRustVoiceForE2E();
+    const canUseNativeRustVoice =
+      forceNativeRustVoice || nativeRustVoiceAvailable();
+    const canUseWebViewRtc = Boolean(
+      !forceNativeRustVoice &&
+      voiceCaptureRef.current &&
+      typeof RTCPeerConnection !== "undefined" &&
+      localAudioTracks(voiceCaptureRef.current).length > 0,
+    );
+    const mode = canUseWebViewRtc
+      ? "webview"
+      : canUseNativeRustVoice
+        ? "native"
+        : "none";
+    const wantedKeys = new Set<string>();
+    const handleVoiceActivitySample = (sample: VoiceActivityReading) => {
+      const stream = voiceCaptureRef.current;
+      if (!stream) return;
+      const trackEnabled = localAudioTracks(stream).some(
+        (track) => track.enabled,
+      );
+      setLocalVoiceSpeaking(
+        trackEnabled &&
+          voiceActivityIsSpeaking(
+            sample.activity_rms_i16,
+            sample.activity_peak_i16,
+          ),
+      );
+      void applyCommand(
+        updateVoiceActivity({
+          session_id: voiceSession.session_id,
+          rms_i16: sample.activity_rms_i16,
+          peak_i16: sample.activity_peak_i16,
+          captured_at_ms: sample.activity_captured_at_ms,
+        }),
+      );
+    };
+
+    if (mode === "webview") {
+      closeHandle(`native:${voiceSession.session_id}`);
+      const nextWebViewKeys = edges.map(
+        (edge) =>
+          `webview:${voiceSession.session_id}:${runtimePeerEdgeKey(edge)}`,
+      );
+      if (
+        voiceWebViewActivityEdgeKeyRef.current &&
+        !nextWebViewKeys.includes(voiceWebViewActivityEdgeKeyRef.current)
+      ) {
+        closeHandle(voiceWebViewActivityEdgeKeyRef.current);
+        voiceWebViewActivityEdgeKeyRef.current = null;
+      }
+      const activityEdgeKey =
+        voiceWebViewActivityEdgeKeyRef.current ?? nextWebViewKeys[0] ?? null;
+      voiceWebViewActivityEdgeKeyRef.current = activityEdgeKey;
+      edges.forEach((edge) => {
+        const key = `webview:${voiceSession.session_id}:${runtimePeerEdgeKey(edge)}`;
+        wantedKeys.add(key);
+        if (voiceMediaHandlesRef.current.has(key)) return;
+        const stream = voiceCaptureRef.current;
+        if (!stream) return;
+        const handle = startWebViewVoiceMediaSession({
+          session: voiceSession,
+          localStream: stream,
+          inputGain: localMicGain,
+          localPeerId: edge.local,
+          remotePeerId: edge.remote,
+          role: edge.role,
+          connectivity: voiceConnectivityForState(commandState),
+          onLocalActivity:
+            key === activityEdgeKey ? handleVoiceActivitySample : undefined,
+          onRemoteTrack: (track) => {
+            if (isUsableMediaStream(track.stream)) {
+              setVoiceRemoteStreams((current) => ({
+                ...current,
+                [track.participant_id]: track.stream,
+              }));
+            }
+          },
+          onRemoteMedia: (evidence) => {
+            if (isUsableMediaStream(evidence.stream)) {
+              setVoiceRemoteStreams((current) => ({
+                ...current,
+                [evidence.participant_id]: evidence.stream,
+              }));
+            }
+            void applyCommand(
+              attachVoiceRemoteMedia({
+                session_id: voiceSession.session_id,
+                participant_id: evidence.participant_id,
+                participant_name: evidence.participant_name,
+                remote_peer_id: evidence.remote_peer_id,
+                stream_id: evidence.stream_id,
+                audio_track_id: evidence.audio_track_id,
+                playback_element_id: evidence.playback_element_id,
+                local_audio_tracks_sent: evidence.local_audio_tracks_sent,
+                received_audio_frames: evidence.received_audio_frames,
+                speaking: evidence.speaking,
+                attached_at_ms: evidence.attached_at_ms,
+              }),
+            );
+          },
+          onStatus: (status) => reportCommandError(status, "Voice media"),
+        });
+        if (handle) {
+          voiceMediaHandlesRef.current.set(key, handle);
+        }
+      });
+    } else if (mode === "native" && edges.length > 0) {
+      voiceWebViewActivityEdgeKeyRef.current = null;
+      for (const key of [...voiceMediaHandlesRef.current.keys()]) {
+        if (key.startsWith("webview:")) closeHandle(key);
+      }
+      const edgeSignature = edges
+        .map((edge) => `${edge.local}:${edge.remote}:${edge.role}`)
+        .sort()
+        .join("|");
+      const key = `native:${voiceSession.session_id}:${edgeSignature}`;
+      wantedKeys.add(key);
+      for (const existingKey of [...voiceMediaHandlesRef.current.keys()]) {
+        if (existingKey.startsWith("native:") && existingKey !== key) {
+          closeHandle(existingKey);
+        }
+      }
+      const currentNativeHandle = voiceMediaHandlesRef.current.get(key);
+      if (currentNativeHandle) {
+        currentNativeHandle.setMuted(voiceSession.self_muted);
+      } else {
+        const nativeEdges: VoiceMediaPeerEdge[] = edges.map((edge) => ({
+          localPeerId: edge.local,
+          remotePeerId: edge.remote,
+          role: edge.role,
+        }));
+        const handle = startNativeRustVoiceMediaMeshSession({
+          session: voiceSession,
+          localStream: voiceCaptureRef.current,
+          edges: nativeEdges,
+          connectivity: voiceConnectivityForState(commandState),
+          outputDeviceId: selectedVoiceOutputId,
+          outputVolume: appOutputVolume,
+          onLocalActivity: handleVoiceActivitySample,
+          onState: (state) => commitCommandState(state as AppState),
+          onStatus: (status) => {
+            if (!/Local DataChannel (is attaching|connected)/i.test(status)) {
+              reportCommandError(status, "Voice media");
+            }
+          },
+        });
+        if (handle) {
+          voiceMediaHandlesRef.current.set(key, handle);
+        }
+      }
+    }
+
+    for (const key of [...voiceMediaHandlesRef.current.keys()]) {
+      const staleForMode =
+        (mode === "webview" && key.startsWith("native:")) ||
+        (mode === "native" && key.startsWith("webview:")) ||
+        mode === "none";
+      if (staleForMode || !wantedKeys.has(key)) {
+        if (voiceWebViewActivityEdgeKeyRef.current === key) {
+          voiceWebViewActivityEdgeKeyRef.current = null;
+        }
+        closeHandle(key);
+      }
+    }
+    updateCompositeVoiceMediaHandle();
+  }, [appOutputVolume, commandState, localMicGain, selectedVoiceOutputId]);
 
   useEffect(() => {
     if (!commandState || !hasTauriCommandRuntime) {
@@ -1732,7 +2097,10 @@ function App() {
       const message =
         error instanceof Error ? error.message : String(error ?? "");
       if (reportFailures) {
-        reportCommandError(message || "Text runtime did not start.", "start_text_session");
+        reportCommandError(
+          message || "Text runtime did not start.",
+          "start_text_session",
+        );
       }
       return stateForScope;
     }
@@ -1751,11 +2119,12 @@ function App() {
     }
     const activeGroupId = started.active_context?.group_id ?? null;
     const activeGroup = activeGroupId
-      ? started.groups.find((group) => group.group_id === activeGroupId) ?? null
+      ? (started.groups.find((group) => group.group_id === activeGroupId) ??
+        null)
       : null;
     const activeDmId = started.active_context?.dm_id ?? null;
     const activeDm = activeDmId
-      ? started.dms.find((dm) => dm.dm_id === activeDmId) ?? null
+      ? (started.dms.find((dm) => dm.dm_id === activeDmId) ?? null)
       : null;
     let stateAfterControl = started;
     if (activeDm && activeDmId) {
@@ -1765,7 +2134,9 @@ function App() {
       commitCommandState(controlAttached);
       if (controlAttached.last_command_error) {
         if (reportFailures) {
-          const action = commandErrorToAction(controlAttached.last_command_error);
+          const action = commandErrorToAction(
+            controlAttached.last_command_error,
+          );
           reportCommandError(
             action
               ? `${controlAttached.last_command_error.message} — ${action}`
@@ -1811,7 +2182,9 @@ function App() {
         activeDmId,
         presenceState,
       );
-      const refreshedDm = stateAfterControl.dms.find((dm) => dm.dm_id === activeDmId);
+      const refreshedDm = stateAfterControl.dms.find(
+        (dm) => dm.dm_id === activeDmId,
+      );
       if (!hasCurrentAdvertisedRemoteDmRuntimePeer(refreshedDm)) {
         return stateAfterControl;
       }
@@ -1822,7 +2195,9 @@ function App() {
       commitCommandState(controlAttached);
       if (controlAttached.last_command_error) {
         if (reportFailures) {
-          const action = commandErrorToAction(controlAttached.last_command_error);
+          const action = commandErrorToAction(
+            controlAttached.last_command_error,
+          );
           reportCommandError(
             action
               ? `${controlAttached.last_command_error.message} — ${action}`
@@ -1870,7 +2245,9 @@ function App() {
       stateAfterControl = (await loadAppState().catch(() => null)) ?? managed;
       commitCommandState(stateAfterControl);
       const refreshedGroup = activeGroupId
-        ? stateAfterControl.groups.find((group) => group.group_id === activeGroupId)
+        ? stateAfterControl.groups.find(
+            (group) => group.group_id === activeGroupId,
+          )
         : null;
       const hasAdvertisedRemotePeer =
         refreshedGroup?.members?.some(
@@ -1882,17 +2259,19 @@ function App() {
         ) ?? false;
       if (!hasAdvertisedRemotePeer) return stateAfterControl;
     }
-    const attached = await attachTextRuntime(stateAfterControl).catch((error: unknown) => {
-      const message =
-        error instanceof Error ? error.message : String(error ?? "");
-      if (reportFailures) {
-        reportCommandError(
-          message || "Text runtime did not attach.",
-          "attach_text_control_transport_runtime",
-        );
-      }
-      return null;
-    });
+    const attached = await attachTextRuntime(stateAfterControl).catch(
+      (error: unknown) => {
+        const message =
+          error instanceof Error ? error.message : String(error ?? "");
+        if (reportFailures) {
+          reportCommandError(
+            message || "Text runtime did not attach.",
+            "attach_text_control_transport_runtime",
+          );
+        }
+        return null;
+      },
+    );
     const report = await pumpTextControlTransportOnce({
       target: null,
       limit: 8,
@@ -1935,12 +2314,17 @@ function App() {
     }
     textRuntimeSyncInFlightRef.current = true;
     try {
-      const synced = await ensureTextRuntimeForActiveScope(stateForScope, reportFailures);
+      const synced = await ensureTextRuntimeForActiveScope(
+        stateForScope,
+        reportFailures,
+      );
       return synced;
     } catch (error) {
       if (reportFailures) {
         reportCommandError(
-          error instanceof Error ? error.message : String(error ?? "Text runtime sync failed."),
+          error instanceof Error
+            ? error.message
+            : String(error ?? "Text runtime sync failed."),
           "text_runtime_sync",
         );
       }
@@ -1963,33 +2347,99 @@ function App() {
     }
 
     let cancelled = false;
+    let inFlight = false;
     const publishAndPump = async () => {
       const latestState = commandStateRef.current ?? commandState;
-      const latestGroupId = latestState.active_context?.group_id ?? activeGroupId;
-      if (cancelled || groupPresenceInFlightRef.current || !latestGroupId) return;
-      groupPresenceInFlightRef.current = true;
+      const latestGroupId =
+        latestState.active_context?.group_id ?? activeGroupId;
+      if (cancelled || inFlight || !latestGroupId) return;
+      inFlight = true;
       try {
         const localStatus = latestState.groups
           .find((group) => group.group_id === latestGroupId)
-          ?.members?.find((member) => member.member_id === latestState.profile?.user_id)
-          ?.status;
+          ?.members?.find(
+            (member) => member.member_id === latestState.profile?.user_id,
+          )?.status;
         if (localStatus === "pending") {
           await syncTextRuntimeForState(latestState, false);
           return;
         }
-        const routedState = await syncTextRuntimeForState(latestState, false);
+        const started = await startTextSession({
+          scope_label: activeScopeLabelForState(latestState),
+          data_channel_probe: false,
+          adapter_kind: null,
+        });
+        if (reportReturnedCommandError(started)) {
+          if (!cancelled) commitCommandState(started);
+          return;
+        }
+        if (cancelled) return;
+        commitCommandState(started);
+        const controlAttached = await attachBrokerControlLaneRuntime({
+          adapter_kind: null,
+        });
+        if (reportReturnedCommandError(controlAttached)) {
+          if (!cancelled) commitCommandState(controlAttached);
+          return;
+        }
+        if (cancelled) return;
+        commitCommandState(controlAttached);
+        const managed = await startControlLaneSessionManager({
+          pump_interval_ms: 250,
+          drain_ms: 300,
+          backoff_initial_ms: 100,
+          backoff_max_ms: 2_000,
+          backoff_max_attempts: 4_294_967_295,
+        });
+        if (reportReturnedCommandError(managed)) {
+          if (!cancelled) commitCommandState(managed);
+          return;
+        }
+        if (cancelled) return;
+        commitCommandState(managed);
         if (cancelled) return;
         const presenceState = await publishGroupPresence({
-          group_id: routedState?.active_context?.group_id ?? latestGroupId,
+          group_id: managed.active_context?.group_id ?? latestGroupId,
           member_id: null,
           status: "online",
           ttl_seconds: 120,
         });
+        if (reportReturnedCommandError(presenceState)) {
+          if (!cancelled) commitCommandState(presenceState);
+          return;
+        }
         if (cancelled) return;
         commitCommandState(presenceState);
-      } catch (_error) {
+        const pumpReport = await pumpTextControlTransportOnce({
+          target: null,
+          limit: 8,
+          operation_timeout_ms: 5_000,
+        });
+        if (pumpReport.failures.length > 0) {
+          reportCommandError(
+            pumpReport.failures[0],
+            "pump_text_control_transport_once",
+          );
+        }
+        const drainReport = await drainTextControlInboundFrames({
+          drain_ms: 1_500,
+          operation_timeout_ms: 1_000,
+        });
+        if (drainReport.failures.length > 0) {
+          reportCommandError(
+            drainReport.failures[0],
+            "drain_text_control_inbound_frames",
+          );
+        }
+      } catch (error) {
+        reportCommandError(
+          error instanceof Error
+            ? error.message
+            : String(error ?? "Group presence synchronization failed."),
+          "group_presence_sync",
+        );
       } finally {
-        groupPresenceInFlightRef.current = false;
+        inFlight = false;
       }
     };
 
@@ -2021,37 +2471,70 @@ function App() {
     }
 
     let cancelled = false;
+    let inFlight = false;
     const publishAndPump = async () => {
       const latestState = commandStateRef.current ?? commandState;
       const latestDmId = latestState.active_context?.dm_id ?? activeDmId;
-      if (cancelled || dmPresenceInFlightRef.current || !latestDmId) return;
-      dmPresenceInFlightRef.current = true;
+      if (cancelled || inFlight || !latestDmId) return;
+      inFlight = true;
       try {
         const activeDm = latestState.dms.find((dm) => dm.dm_id === latestDmId);
         if (!activeDm) return;
-        await attachBrokerControlLaneRuntime({ adapter_kind: null });
+        const controlAttached = await attachBrokerControlLaneRuntime({
+          adapter_kind: null,
+        });
+        if (reportReturnedCommandError(controlAttached)) {
+          if (!cancelled) commitCommandState(controlAttached);
+          return;
+        }
+        if (cancelled) return;
+        commitCommandState(controlAttached);
         const presenceState = await publishDmPresence({
           dm_id: latestDmId,
           ttl_seconds: 120,
         });
+        if (reportReturnedCommandError(presenceState)) {
+          if (!cancelled) commitCommandState(presenceState);
+          return;
+        }
         if (cancelled) return;
         commitCommandState(presenceState);
-        await pumpTextControlTransportOnce({
+        const pumpReport = await pumpTextControlTransportOnce({
           target: null,
           limit: 8,
           operation_timeout_ms: 5_000,
         });
-        await drainTextControlInboundFrames({
+        if (pumpReport.failures.length > 0) {
+          reportCommandError(
+            pumpReport.failures[0],
+            "pump_text_control_transport_once",
+          );
+        }
+        const drainReport = await drainTextControlInboundFrames({
           drain_ms: 1_500,
           operation_timeout_ms: 1_000,
         });
-        const refreshed = await loadAppState().catch(() => null);
-        if (!cancelled && refreshed) {
+        if (drainReport.failures.length > 0) {
+          reportCommandError(
+            drainReport.failures[0],
+            "drain_text_control_inbound_frames",
+          );
+        }
+        const refreshed = await loadAppState();
+        if (!cancelled) {
           commitCommandState(refreshed);
         }
-      } catch (_error) {
+      } catch (error) {
+        reportCommandError(
+          error instanceof Error
+            ? error.message
+            : String(
+                error ?? "Direct-message presence synchronization failed.",
+              ),
+          "dm_presence_sync",
+        );
       } finally {
-        dmPresenceInFlightRef.current = false;
+        inFlight = false;
       }
     };
 
@@ -2124,9 +2607,9 @@ function App() {
   )?.status;
   const localAdmissionPending = localMemberStatus === "pending";
   const canReviewAdmissions = ["owner", "staff"].includes(localGroupRole);
-  const pendingAdmissionRequests = (activeGroup?.admission_requests ?? []).filter(
-    (request) => request.status === "pending",
-  );
+  const pendingAdmissionRequests = (
+    activeGroup?.admission_requests ?? []
+  ).filter((request) => request.status === "pending");
   const backendVoiceParticipants = appState.voice_session?.participants ?? [];
   const voiceJoined = appState.voice_session?.joined ?? false;
   const joinedVoiceChannelId = voiceJoined
@@ -2160,7 +2643,6 @@ function App() {
     ...(localVoiceParticipant ? [localVoiceParticipant] : []),
     ...backendVoiceParticipants,
   ];
-
 
   const activeTheme = getThemeDefinition(appState.preferences.theme_id);
   const themeStyle = createThemeStyle(activeTheme, {
@@ -2287,7 +2769,9 @@ function App() {
       (state) => {
         const group = getActiveGroup(state);
         setDraftGroup(group?.name ?? draftGroup);
-        setDraftConfigAdmissionMode(group?.role_policy?.admission_mode ?? draftAdmissionMode);
+        setDraftConfigAdmissionMode(
+          group?.role_policy?.admission_mode ?? draftAdmissionMode,
+        );
         setWorkflow("channel");
         setActiveOverlay(null);
         void syncTextRuntimeForState(state, true);
@@ -2352,8 +2836,8 @@ function App() {
 
   function runMemberAction(actionId: string, command: Promise<AppState>) {
     setMemberActionInFlight(actionId);
-    void applyCommand(command, () => setMemberActionInFlight(null)).finally(() =>
-      setMemberActionInFlight(null),
+    void applyCommand(command, () => setMemberActionInFlight(null)).finally(
+      () => setMemberActionInFlight(null),
     );
   }
 
@@ -2404,7 +2888,12 @@ function App() {
 
   function revokeMember(member: GroupMemberView) {
     if (!activeGroup) return;
-    if (!window.confirm(`Revoke ${member.display_name} access to ${activeGroup.name}?`)) return;
+    if (
+      !window.confirm(
+        `Revoke ${member.display_name} access to ${activeGroup.name}?`,
+      )
+    )
+      return;
     runMemberAction(
       `revoke:${member.member_id}`,
       revokeGroupMemberAccess({
@@ -2502,7 +2991,9 @@ function App() {
           const nextText = getActiveTextChannel(nextState, nextGroup, null);
           setLastTextChannelId(nextText?.channel_id ?? null);
         }
-        setWorkflow(kind === "Voice" && !showDesktopSidebar ? "voice" : "channel");
+        setWorkflow(
+          kind === "Voice" && !showDesktopSidebar ? "voice" : "channel",
+        );
         setActiveOverlay(null);
       },
     );
@@ -2586,7 +3077,9 @@ function App() {
     const body = draftMessage.trim();
     if (!body) return;
     if (!activeGroup || !activeTextChannel) {
-      reportCommandError("Create a group text channel before sending a message.");
+      reportCommandError(
+        "Create a group text channel before sending a message.",
+      );
       return;
     }
     sendCommandText(
@@ -2647,7 +3140,9 @@ function App() {
 
   function createCommandDmInvite() {
     if (!activeDm) {
-      reportCommandError("Start or select a DM before creating a contact invite.");
+      reportCommandError(
+        "Start or select a DM before creating a contact invite.",
+      );
       return;
     }
     void applyCommand(
@@ -2682,7 +3177,6 @@ function App() {
     );
   }
 
-
   function toggleSelfMute(checked: boolean) {
     const sessionId = appState.voice_session?.session_id;
     if (!sessionId) {
@@ -2715,7 +3209,8 @@ function App() {
         return;
       }
       let voiceChannel =
-        voiceChannelOverride ?? getActiveVoiceChannel(runtimeState, runtimeGroup);
+        voiceChannelOverride ??
+        getActiveVoiceChannel(runtimeState, runtimeGroup);
       if (!voiceChannel) {
         const withVoice = await createChannelCommand({
           group_id: runtimeGroup.group_id,
@@ -2741,9 +3236,9 @@ function App() {
             __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
           }
         ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
-          window.localStorage?.getItem(
-            "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
-          ) === "1",
+        window.localStorage?.getItem(
+          "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+        ) === "1",
       );
       const canUseNativeRustVoice =
         forceNativeRustVoice || nativeRustVoiceAvailable();
@@ -2780,10 +3275,7 @@ function App() {
         stopLocalVoiceCapture();
         return;
       }
-      if (
-        !canUseNativeRustVoice &&
-        typeof RTCPeerConnection === "undefined"
-      ) {
+      if (!canUseNativeRustVoice && typeof RTCPeerConnection === "undefined") {
         reportCommandError(
           "Local WebRTC audio runtime is unavailable — Install the required desktop media runtime and restart discrypt",
           "join_voice",
@@ -2793,7 +3285,8 @@ function App() {
       }
       if (
         !canUseNativeRustVoice &&
-        (!voiceAccess.stream || localAudioTracks(voiceAccess.stream).length === 0)
+        (!voiceAccess.stream ||
+          localAudioTracks(voiceAccess.stream).length === 0)
       ) {
         reportCommandError(
           "Microphone capture did not provide a live audio track — Select another input device and try again",
@@ -2832,27 +3325,6 @@ function App() {
       }
       const sessionId = joinedState.voice_session?.session_id;
       if (sessionId) {
-        const handleVoiceActivitySample = (sample: VoiceActivityReading) => {
-          if (!voiceAccess.stream) return;
-          const trackEnabled = localAudioTracks(voiceAccess.stream).some(
-            (track) => track.enabled,
-          );
-          setLocalVoiceSpeaking(
-            trackEnabled &&
-              voiceActivityIsSpeaking(
-                sample.activity_rms_i16,
-                sample.activity_peak_i16,
-              ),
-          );
-          void applyCommand(
-            updateVoiceActivity({
-              session_id: sessionId,
-              rms_i16: sample.activity_rms_i16,
-              peak_i16: sample.activity_peak_i16,
-              captured_at_ms: sample.activity_captured_at_ms,
-            }),
-          );
-        };
         if (voiceAccess.stream) {
           if (
             voiceAccess.activity_rms_i16 !== null &&
@@ -2879,107 +3351,6 @@ function App() {
             );
           }
         }
-        const mediaState = joinedState;
-        const voiceSession = mediaState.voice_session?.joined
-          ? mediaState.voice_session
-          : joinedState.voice_session;
-        const voicePeers = textRuntimePeerDefaults(mediaState);
-        const voiceRole = textRuntimeRole(mediaState);
-        if (!voicePeers || !voiceRole) {
-          return;
-        }
-        if (voiceSession) {
-          const canUseWebViewRtc = Boolean(
-            !forceNativeRustVoice &&
-            voiceAccess.stream &&
-            typeof RTCPeerConnection !== "undefined" &&
-            localAudioTracks(voiceAccess.stream).length > 0,
-          );
-          if (canUseWebViewRtc && voiceAccess.stream) {
-            const mediaHandle = startWebViewVoiceMediaSession({
-              session: voiceSession,
-              localStream: voiceAccess.stream,
-              inputGain: localMicGain,
-              localPeerId: voicePeers.local,
-              remotePeerId: voicePeers.remote,
-              role: voiceRole,
-              connectivity: voiceConnectivityForState(mediaState),
-              onLocalActivity: handleVoiceActivitySample,
-              onRemoteTrack: (track) => {
-                if (isUsableMediaStream(track.stream)) {
-                  setVoiceRemoteStreams((current) => ({
-                    ...current,
-                    [track.participant_id]: track.stream,
-                  }));
-                }
-              },
-              onRemoteMedia: (evidence) => {
-                if (isUsableMediaStream(evidence.stream)) {
-                  setVoiceRemoteStreams((current) => ({
-                    ...current,
-                    [evidence.participant_id]: evidence.stream,
-                  }));
-                }
-                void applyCommand(
-                  attachVoiceRemoteMedia({
-                    session_id: voiceSession.session_id,
-                    participant_id: evidence.participant_id,
-                    participant_name: evidence.participant_name,
-                    remote_peer_id: evidence.remote_peer_id,
-                    stream_id: evidence.stream_id,
-                    audio_track_id: evidence.audio_track_id,
-                    playback_element_id: evidence.playback_element_id,
-                    local_audio_tracks_sent: evidence.local_audio_tracks_sent,
-                    received_audio_frames: evidence.received_audio_frames,
-                    speaking: evidence.speaking,
-                    attached_at_ms: evidence.attached_at_ms,
-                  }),
-                );
-              },
-              onStatus: (status) => reportCommandError(status, "Voice media"),
-            });
-            voiceMediaSessionRef.current = mediaHandle;
-            if (!mediaHandle) {
-              const leftState = await leaveVoice({ session_id: sessionId });
-              commitCommandState(leftState);
-              stopLocalVoiceCapture();
-              return;
-            }
-          } else if (canUseNativeRustVoice) {
-            voiceMediaSessionRef.current = startNativeRustVoiceMediaSession({
-              session: voiceSession,
-              localStream: voiceAccess.stream,
-              localPeerId: voicePeers.local,
-              remotePeerId: voicePeers.remote,
-              role: voiceRole,
-              connectivity: voiceConnectivityForState(mediaState),
-              outputDeviceId: selectedVoiceOutputId,
-              outputVolume: appOutputVolume,
-              onLocalActivity: handleVoiceActivitySample,
-              onState: (state) => commitCommandState(state as AppState),
-              onStatus: (status) => {
-                if (!/Local DataChannel (is attaching|connected)/i.test(status)) {
-                  reportCommandError(status, "Voice media");
-                }
-              },
-            });
-            if (!voiceMediaSessionRef.current) {
-              const leftState = await leaveVoice({ session_id: sessionId });
-              commitCommandState(leftState);
-              stopLocalVoiceCapture();
-              return;
-            }
-          } else {
-            reportCommandError(
-              "Local WebRTC audio session could not start with the selected microphone",
-              "join_voice",
-            );
-            const leftState = await leaveVoice({ session_id: sessionId });
-            commitCommandState(leftState);
-            stopLocalVoiceCapture();
-            return;
-          }
-        }
       }
       return;
     }
@@ -3000,7 +3371,10 @@ function App() {
     );
   }
 
-  function persistVoiceDevicePreferences(inputDeviceId: string, outputDeviceId: string) {
+  function persistVoiceDevicePreferences(
+    inputDeviceId: string,
+    outputDeviceId: string,
+  ) {
     void applyCommand(
       savePreferences({
         theme_id: appState.preferences.theme_id,
@@ -3008,7 +3382,8 @@ function App() {
         voice_input_device_id: inputDeviceId,
         voice_output_device_id: outputDeviceId,
         mic_gain_percent: appState.preferences.mic_gain_percent,
-        app_output_volume_percent: appState.preferences.app_output_volume_percent,
+        app_output_volume_percent:
+          appState.preferences.app_output_volume_percent,
       }),
     );
   }
@@ -3062,12 +3437,18 @@ function App() {
   }
 
   function chooseKeyringStorage() {
-    void applyCommand(configureStorageSecurity({ mode: "keyring" }), (state) => {
-      if (!state.last_command_error && state.storage_security.status === "ready") {
-        setStoragePassword("");
-        setStoragePasswordConfirm("");
-      }
-    });
+    void applyCommand(
+      configureStorageSecurity({ mode: "keyring" }),
+      (state) => {
+        if (
+          !state.last_command_error &&
+          state.storage_security.status === "ready"
+        ) {
+          setStoragePassword("");
+          setStoragePasswordConfirm("");
+        }
+      },
+    );
   }
 
   function setupPasswordStorage() {
@@ -3084,7 +3465,10 @@ function App() {
         passphrase: storagePassword,
       }),
       (state) => {
-        if (!state.last_command_error && state.storage_security.status === "ready") {
+        if (
+          !state.last_command_error &&
+          state.storage_security.status === "ready"
+        ) {
           setStoragePassword("");
           setStoragePasswordConfirm("");
         }
@@ -3096,7 +3480,10 @@ function App() {
     void applyCommand(
       unlockStorageSecurity({ passphrase: storagePassword }),
       (state) => {
-        if (!state.last_command_error && state.storage_security.status === "ready") {
+        if (
+          !state.last_command_error &&
+          state.storage_security.status === "ready"
+        ) {
           setStoragePassword("");
           setStoragePasswordConfirm("");
         }
@@ -3198,11 +3585,16 @@ function App() {
           setGroupContextMenu({ groupId, x, y })
         }
       />
-      {showDesktopSidebar && workflow !== "dm" && workflow !== "setup" && hasActiveGroup ? (
+      {showDesktopSidebar &&
+      workflow !== "dm" &&
+      workflow !== "setup" &&
+      hasActiveGroup ? (
         <ChannelSidebar
           groupLabel={groupLabel}
           role={localGroupRole || activeGroup?.role || "local profile"}
-          pendingAdmissionCount={canReviewAdmissions ? pendingAdmissionRequests.length : 0}
+          pendingAdmissionCount={
+            canReviewAdmissions ? pendingAdmissionRequests.length : 0
+          }
           pendingAdmissionEnabled={
             canReviewAdmissions &&
             activeGroup?.role_policy?.admission_mode === "manual_approval"
@@ -3275,9 +3667,9 @@ function App() {
                 onJoinInvite={openLauncherOverlay}
                 verifyMessage={verifyMessage}
                 onVerifySafetyNumber={confirmSafetyNumber}
-                authorizedDeviceCount={appState.devices.filter(
-                  (device) => device.authorized,
-                ).length}
+                authorizedDeviceCount={
+                  appState.devices.filter((device) => device.authorized).length
+                }
               />
             ) : workflow === "dm" ? (
               <DmPanel
@@ -3334,10 +3726,7 @@ function App() {
                 actionInFlight={memberActionInFlight}
               />
             ) : workflow === "audit_log" ? (
-              <AuditLogPanel
-                group={activeGroup}
-                localRole={localGroupRole}
-              />
+              <AuditLogPanel group={activeGroup} localRole={localGroupRole} />
             ) : (
               <ChannelPanel
                 group={activeGroup}
@@ -3358,7 +3747,10 @@ function App() {
           </div>
         </div>
       </section>
-      {workflow !== "dm" && workflow !== "setup" && membersPanelOpen && hasActiveGroup ? (
+      {workflow !== "dm" &&
+      workflow !== "setup" &&
+      membersPanelOpen &&
+      hasActiveGroup ? (
         <MemberPanel
           group={activeGroup}
           members={groupMembers}
@@ -3484,7 +3876,8 @@ function App() {
             password={invitePassword}
             setPassword={setInvitePassword}
             onCreateInvite={() => {
-              if (overlayGroup) createCommandInviteForGroup(overlayGroup.group_id);
+              if (overlayGroup)
+                createCommandInviteForGroup(overlayGroup.group_id);
             }}
           />
         ) : null}
@@ -3502,7 +3895,8 @@ function App() {
             admissionMode={draftConfigAdmissionMode}
             setAdmissionMode={setDraftConfigAdmissionMode}
             onSave={() => {
-              if (overlayGroup) void saveGroupConfiguration(overlayGroup.group_id);
+              if (overlayGroup)
+                void saveGroupConfiguration(overlayGroup.group_id);
             }}
           />
         ) : null}
@@ -3657,10 +4051,7 @@ function normalizedGroupMembers(
   return [];
 }
 
-function localGroupRoleForUi(
-  group: GroupView | null,
-  state: AppState,
-): string {
+function localGroupRoleForUi(group: GroupView | null, state: AppState): string {
   if (!group) return "local profile";
   const localMember = (group.members ?? []).find(
     (member) => member.member_id === state.profile?.user_id,
@@ -3675,11 +4066,19 @@ function roleRank(role: string): number {
 }
 
 function canPromoteFromUi(localRole: string, member: GroupMemberView): boolean {
-  return localRole === "owner" && member.role === "member" && member.status !== "revoked";
+  return (
+    localRole === "owner" &&
+    member.role === "member" &&
+    member.status !== "revoked"
+  );
 }
 
 function canDemoteFromUi(localRole: string, member: GroupMemberView): boolean {
-  return localRole === "owner" && member.role === "staff" && member.status !== "revoked";
+  return (
+    localRole === "owner" &&
+    member.role === "staff" &&
+    member.status !== "revoked"
+  );
 }
 
 function canRevokeFromUi(localRole: string, member: GroupMemberView): boolean {
@@ -3688,7 +4087,9 @@ function canRevokeFromUi(localRole: string, member: GroupMemberView): boolean {
   return localRole === "staff" && member.role === "member";
 }
 
-function memberDisplayStatus(member: GroupMemberView): "online" | "offline" | "revoked" {
+function memberDisplayStatus(
+  member: GroupMemberView,
+): "online" | "offline" | "revoked" {
   if (member.status === "revoked") return "revoked";
   return isPresenceOnline(member) ? "online" : "offline";
 }
@@ -4060,9 +4461,7 @@ function FirstRunPanel({
   const recoveryReadyForSubmit =
     storageReadyForSubmit &&
     (allowEmptyRecovery ||
-      Boolean(
-        displayName.trim() && deviceName.trim() && recoveryCode.trim(),
-      ));
+      Boolean(displayName.trim() && deviceName.trim() && recoveryCode.trim()));
   const passwordMessage = !vaultSelected
     ? null
     : !passwordLongEnough
@@ -4113,7 +4512,9 @@ function FirstRunPanel({
                     </p>
                   </div>
                   <Badge
-                    variant={storage.keyring_available ? "secondary" : "warning"}
+                    variant={
+                      storage.keyring_available ? "secondary" : "warning"
+                    }
                     className="w-fit"
                   >
                     {storage.keyring_available
@@ -4127,58 +4528,58 @@ function FirstRunPanel({
                     data-testid="first-run-storage-mode-options"
                     className="grid gap-3 lg:grid-cols-2"
                   >
-                  <Button
-                    type="button"
-                    variant="outline"
-                    aria-pressed={selectedStorageMode === "keyring"}
-                    className={cn(
-                      "h-auto min-h-40 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
-                      selectedStorageMode === "keyring"
-                        ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
-                        : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
-                    )}
-                    onClick={() => setSelectedStorageMode("keyring")}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <h3 className="font-semibold">Use OS keyring</h3>
-                      <Badge variant="secondary">best UX</Badge>
-                    </div>
-                    <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                      The desktop keyring protects Discrypt's storage key and may
-                      unlock with your login session. It trusts your OS keyring
-                      boundary.
-                    </p>
-                    <p className="mt-3 rounded-xl border border-[hsl(var(--border))] bg-black/10 p-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                      {storage.keyring_detail}
-                    </p>
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className={cn(
-                      "h-auto min-h-36 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
-                      selectedStorageMode === "passphrase_vault"
-                        ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
-                        : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
-                    )}
-                    onClick={() => setSelectedStorageMode("passphrase_vault")}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <h3 className="font-semibold">
-                        Use Discrypt password vault
-                      </h3>
-                      <Badge variant="secondary">stronger separation</Badge>
-                    </div>
-                    <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
-                      A password-derived vault protects local storage without
-                      relying on the OS keyring. You must enter it every time the
-                      app starts.
-                    </p>
-                    <p className="mt-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs leading-5 text-amber-100">
-                      No storage restore exists yet for a lost password;
-                      existing unreadable state is preserved.
-                    </p>
-                  </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      aria-pressed={selectedStorageMode === "keyring"}
+                      className={cn(
+                        "h-auto min-h-40 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
+                        selectedStorageMode === "keyring"
+                          ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
+                          : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
+                      )}
+                      onClick={() => setSelectedStorageMode("keyring")}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <h3 className="font-semibold">Use OS keyring</h3>
+                        <Badge variant="secondary">best UX</Badge>
+                      </div>
+                      <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                        The desktop keyring protects Discrypt's storage key and
+                        may unlock with your login session. It trusts your OS
+                        keyring boundary.
+                      </p>
+                      <p className="mt-3 rounded-xl border border-[hsl(var(--border))] bg-black/10 p-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
+                        {storage.keyring_detail}
+                      </p>
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className={cn(
+                        "h-auto min-h-36 w-full flex-col items-stretch justify-start whitespace-normal rounded-2xl border p-4 text-left transition hover:border-[hsl(var(--primary))] hover:bg-[hsl(var(--secondary)/0.42)]",
+                        selectedStorageMode === "passphrase_vault"
+                          ? "border-[hsl(var(--primary))] bg-[hsl(var(--primary)/0.12)]"
+                          : "border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.28)]",
+                      )}
+                      onClick={() => setSelectedStorageMode("passphrase_vault")}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <h3 className="font-semibold">
+                          Use Discrypt password vault
+                        </h3>
+                        <Badge variant="secondary">stronger separation</Badge>
+                      </div>
+                      <p className="mt-2 text-sm leading-6 text-[hsl(var(--muted-foreground))]">
+                        A password-derived vault protects local storage without
+                        relying on the OS keyring. You must enter it every time
+                        the app starts.
+                      </p>
+                      <p className="mt-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs leading-5 text-amber-100">
+                        No storage restore exists yet for a lost password;
+                        existing unreadable state is preserved.
+                      </p>
+                    </Button>
                   </div>
                 </fieldset>
                 {vaultSelected ? (
@@ -4407,7 +4808,9 @@ function ServerRail({
             </Button>
           );
         })}
-        {dms.length ? <div className="h-px w-9 rounded-full bg-[hsl(var(--border))]" /> : null}
+        {dms.length ? (
+          <div className="h-px w-9 rounded-full bg-[hsl(var(--border))]" />
+        ) : null}
         {dms.map((dm) => {
           const active = workflow === "dm" && dm.dm_id === activeDm?.dm_id;
           return (
@@ -4499,7 +4902,9 @@ function MobileVoicePanel({
   onLeaveVoice: () => void;
 }) {
   const activeVoiceChannel =
-    voiceChannels.find((channel) => channel.channel_id === activeVoiceChannelId) ??
+    voiceChannels.find(
+      (channel) => channel.channel_id === activeVoiceChannelId,
+    ) ??
     voiceChannels[0] ??
     null;
   const speaking = participants.filter(
@@ -4537,7 +4942,8 @@ function MobileVoicePanel({
             </div>
           ) : null}
           {voiceChannels.map((channel) => {
-            const active = activeVoiceChannel?.channel_id === channel.channel_id;
+            const active =
+              activeVoiceChannel?.channel_id === channel.channel_id;
             return (
               <Button
                 key={channel.channel_id}
@@ -4749,7 +5155,7 @@ function ChannelSidebar({
             >
               {pendingAdmissionCount > 0
                 ? `Pending requests · ${pendingAdmissionCount}`
-              : "Pending requests"}
+                : "Pending requests"}
             </SidebarButton>
           ) : null}
           <SidebarButton
@@ -5050,7 +5456,11 @@ function VoiceParticipantList({
             {!local && mountRemoteAudio ? (
               <RemoteAudioAttachment
                 participant={participant}
-                src={remoteTrack?.playback_element_id ? null : participant.remote_audio_src}
+                src={
+                  remoteTrack?.playback_element_id
+                    ? null
+                    : participant.remote_audio_src
+                }
                 stream={remoteStream}
                 volumePercent={outputVolume}
                 outputDeviceId={outputDeviceId}
@@ -5088,7 +5498,8 @@ function SidebarVoiceStatus({
   onToggleSelfMute: (muted: boolean) => void;
   onLeaveVoice: () => void;
 }) {
-  const adapter = connectivity?.signaling_profiles[0]?.adapter_kind ?? "provider";
+  const adapter =
+    connectivity?.signaling_profiles[0]?.adapter_kind ?? "provider";
   return (
     <div
       data-testid="voice-sidebar-status"
@@ -5159,7 +5570,10 @@ function SidebarVoiceStatus({
           >
             {selfMuted ? "Unmute" : "Mute"}
           </Button>
-          <Badge variant={joined ? "success" : "secondary"} className="justify-center">
+          <Badge
+            variant={joined ? "success" : "secondary"}
+            className="justify-center"
+          >
             {joined ? "joined" : "idle"}
           </Badge>
         </div>
@@ -5353,7 +5767,9 @@ function TopBar({
               type="button"
               variant="outline"
               size="icon"
-              aria-label={membersPanelOpen ? "Close member panel" : "Open member panel"}
+              aria-label={
+                membersPanelOpen ? "Close member panel" : "Open member panel"
+              }
               title="Members"
               onClick={onToggleMembers}
               className="h-9 w-9"
@@ -5396,22 +5812,19 @@ function overlayCopy(overlay: OverlayKind | null): {
     case "launcher":
       return {
         title: "Add group or direct message",
-        description:
-          "Paste an invite for a group or DM, or start a new group.",
+        description: "Paste an invite for a group or DM, or start a new group.",
         align: "center",
       };
     case "group-invite":
       return {
         title: "Create group invite",
-        description:
-          "Generate a signed invite descriptor for this group.",
+        description: "Generate a signed invite descriptor for this group.",
         align: "side",
       };
     case "group-config":
       return {
         title: "Group configuration",
-        description:
-          "Configure this group's signaling profile and ICE policy.",
+        description: "Configure this group's signaling profile and ICE policy.",
         align: "side",
       };
     case "settings":
@@ -5532,13 +5945,18 @@ function AppearanceSettings({
       <CardHeader>
         <CardTitle>Appearance</CardTitle>
         <CardDescription>
-          Choose the app theme. Theme tokens drive the shadcn component system so future themes can extend the interface without changing screens.
+          Choose the app theme. Theme tokens drive the shadcn component system
+          so future themes can extend the interface without changing screens.
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-3">
         <Label className="grid gap-2">
           Theme
-          <Select aria-label="Theme" value={themeId} onValueChange={(value) => onThemeChange(value as ThemeId)}>
+          <Select
+            aria-label="Theme"
+            value={themeId}
+            onValueChange={(value) => onThemeChange(value as ThemeId)}
+          >
             {discryptUiConfig.themes.map((theme) => (
               <SelectItem key={theme.id} value={theme.id}>
                 {theme.label}
@@ -5583,14 +6001,20 @@ function AudioSettingsPanel({
       <CardHeader>
         <CardTitle>Audio</CardTitle>
         <CardDescription>
-          Select capture and playback devices, then tune app-wide microphone and output levels used by voice and future app sounds.
+          Select capture and playback devices, then tune app-wide microphone and
+          output levels used by voice and future app sounds.
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-5">
         <div className="grid gap-4 md:grid-cols-2">
           <Label className="grid gap-2">
             Microphone input
-            <Select aria-label="Microphone input" data-testid="voice-mic-selector" value={selectedInputDeviceId} onValueChange={onSelectInputDevice}>
+            <Select
+              aria-label="Microphone input"
+              data-testid="voice-mic-selector"
+              value={selectedInputDeviceId}
+              onValueChange={onSelectInputDevice}
+            >
               <SelectItem value="default">System default microphone</SelectItem>
               {inputDevices.map((device) => (
                 <SelectItem key={device.device_id} value={device.device_id}>
@@ -5601,7 +6025,12 @@ function AudioSettingsPanel({
           </Label>
           <Label className="grid gap-2">
             App output device
-            <Select aria-label="App output device" data-testid="voice-output-selector" value={selectedOutputDeviceId} onValueChange={onSelectOutputDevice}>
+            <Select
+              aria-label="App output device"
+              data-testid="voice-output-selector"
+              value={selectedOutputDeviceId}
+              onValueChange={onSelectOutputDevice}
+            >
               <SelectItem value="default">System default output</SelectItem>
               {outputDevices.map((device) => (
                 <SelectItem key={device.device_id} value={device.device_id}>
@@ -5611,26 +6040,53 @@ function AudioSettingsPanel({
             </Select>
           </Label>
         </div>
-        <Button type="button" variant="outline" aria-label="Refresh audio devices" onClick={onRefreshDevices} className="w-fit">
+        <Button
+          type="button"
+          variant="outline"
+          aria-label="Refresh audio devices"
+          onClick={onRefreshDevices}
+          className="w-fit"
+        >
           Refresh audio devices
         </Button>
         <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-          {voiceDeviceStatus ?? "Refresh may request microphone access so Linux and browser backends can reveal device names."}
+          {voiceDeviceStatus ??
+            "Refresh may request microphone access so Linux and browser backends can reveal device names."}
         </p>
         <div className="grid gap-4 md:grid-cols-2">
           <label className="grid gap-2 text-sm">
             <span className="flex items-center justify-between gap-2">
               <span>Microphone input volume</span>
-              <span className="text-xs text-[hsl(var(--muted-foreground))]">{localMicGain}%</span>
+              <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                {localMicGain}%
+              </span>
             </span>
-            <Slider aria-label="Microphone input volume" value={[localMicGain]} min={0} max={200} step={1} onValueChange={(value) => onLocalMicGainChange(value[0] ?? 100)} />
+            <Slider
+              aria-label="Microphone input volume"
+              value={[localMicGain]}
+              min={0}
+              max={200}
+              step={1}
+              onValueChange={(value) => onLocalMicGainChange(value[0] ?? 100)}
+            />
           </label>
           <label className="grid gap-2 text-sm">
             <span className="flex items-center justify-between gap-2">
               <span>App output volume</span>
-              <span className="text-xs text-[hsl(var(--muted-foreground))]">{appOutputVolume}%</span>
+              <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                {appOutputVolume}%
+              </span>
             </span>
-            <Slider aria-label="App output volume" value={[appOutputVolume]} min={0} max={100} step={1} onValueChange={(value) => onAppOutputVolumeChange(value[0] ?? 100)} />
+            <Slider
+              aria-label="App output volume"
+              value={[appOutputVolume]}
+              min={0}
+              max={100}
+              step={1}
+              onValueChange={(value) =>
+                onAppOutputVolumeChange(value[0] ?? 100)
+              }
+            />
           </label>
         </div>
       </CardContent>
@@ -5652,15 +6108,11 @@ function supportBundlePreview(bundle: string): SupportBundlePreview | null {
   try {
     const parsed = JSON.parse(bundle) as Record<string, unknown>;
     const structuredLogs = parsed.structured_logs as
-      | Record<string, unknown>
-      | undefined;
-    const lastCommandError = (
-      structuredLogs?.last_command_error ??
-      parsed.last_command_error
-    ) as Record<string, unknown> | null | undefined;
+      Record<string, unknown> | undefined;
+    const lastCommandError = (structuredLogs?.last_command_error ??
+      parsed.last_command_error) as Record<string, unknown> | null | undefined;
     const transportDiagnostics = parsed.transport_diagnostics as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const events = Array.isArray(parsed.events) ? parsed.events : [];
     return {
       schemaVersion: String(parsed.schema_version ?? "unknown"),
@@ -5668,7 +6120,9 @@ function supportBundlePreview(bundle: string): SupportBundlePreview | null {
       appVersion: String(parsed.app_version ?? "unknown"),
       groupCount: String(parsed.group_count ?? "unknown"),
       eventCount: String(events.length),
-      routeProof: String(transportDiagnostics?.route_proof_status ?? "not provided"),
+      routeProof: String(
+        transportDiagnostics?.route_proof_status ?? "not provided",
+      ),
       lastErrorCode: String(lastCommandError?.code ?? "none"),
     };
   } catch {
@@ -5781,7 +6235,8 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
           <div>
             <CardTitle>Logs and export</CardTitle>
             <CardDescription>
-              Review and export the backend redacted support bundle for support and release checks.
+              Review and export the backend redacted support bundle for support
+              and release checks.
             </CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -5790,7 +6245,9 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
               variant="secondary"
               onClick={loadDiagnostics}
               disabled={loading}
-              aria-label={loading ? "Loading support bundle" : "Load support bundle"}
+              aria-label={
+                loading ? "Loading support bundle" : "Load support bundle"
+              }
             >
               {loading ? "Loading" : "Load bundle"}
             </Button>
@@ -5825,10 +6282,14 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
       </CardHeader>
       <CardContent className="grid gap-4">
         <div className="flex items-center justify-between gap-4 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted)/0.28)] px-3 py-2">
-          <Label htmlFor="support-bundle-consent" className="grid gap-1 text-sm">
+          <Label
+            htmlFor="support-bundle-consent"
+            className="grid gap-1 text-sm"
+          >
             <span>Include support bundle data</span>
             <span className="text-xs text-[hsl(var(--muted-foreground))]">
-              Requires user consent before reading backend diagnostics into the UI.
+              Requires user consent before reading backend diagnostics into the
+              UI.
             </span>
           </Label>
           <Switch
@@ -5838,9 +6299,13 @@ function ConfigLogsExportPanel({ appState }: { appState: AppState }) {
               setConsentGranted(checked);
               if (!checked) {
                 setBundle("");
-                setExportStatus("Consent required before loading support bundle.");
+                setExportStatus(
+                  "Consent required before loading support bundle.",
+                );
               } else {
-                setExportStatus("Consent enabled. Load the support bundle to preview or export.");
+                setExportStatus(
+                  "Consent enabled. Load the support bundle to preview or export.",
+                );
               }
             }}
             aria-label="Include support bundle data"
@@ -5963,7 +6428,8 @@ function TransportStatusStrip({
               Backend-derived text runtime
             </p>
             <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              Peer ids and role come from backend/provider-advertised runtime rows.
+              Peer ids and role come from backend/provider-advertised runtime
+              rows.
             </p>
           </div>
           <div className="grid gap-2 text-xs md:grid-cols-3">
@@ -5986,7 +6452,8 @@ function TransportStatusStrip({
           </Button>
         </div>
         <p className="text-xs leading-5 text-[hsl(var(--muted-foreground))] md:col-span-2">
-          Attachments and route probes are available for diagnostics and release checks.
+          Attachments and route probes are available for diagnostics and release
+          checks.
         </p>
       </div>
       <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
@@ -6588,14 +7055,17 @@ function MemberPanel({
   const sections = memberPanelSections(members);
   const manualAdmissionEnabled =
     group?.role_policy?.admission_mode === "manual_approval";
-  const canReviewPending = manualAdmissionEnabled && ["owner", "staff"].includes(localRole);
+  const canReviewPending =
+    manualAdmissionEnabled && ["owner", "staff"].includes(localRole);
 
   return (
     <aside
       aria-label="Member panel"
       className={cn(
         "hidden h-dvh border-l border-[hsl(var(--border))] bg-[hsl(var(--card)/0.68)] backdrop-blur-xl transition-[opacity,transform] duration-200 lg:block",
-        open ? "translate-x-0 opacity-100" : "pointer-events-none translate-x-full opacity-0",
+        open
+          ? "translate-x-0 opacity-100"
+          : "pointer-events-none translate-x-full opacity-0",
       )}
     >
       <ScrollArea className="h-full">
@@ -6604,9 +7074,12 @@ function MemberPanel({
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
               Members
             </p>
-            <h2 className="mt-1 text-lg font-semibold">{group?.name ?? "No group"}</h2>
+            <h2 className="mt-1 text-lg font-semibold">
+              {group?.name ?? "No group"}
+            </h2>
             <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              Role and presence are read from backend governance state with TTL-backed online status.
+              Role and presence are read from backend governance state with
+              TTL-backed online status.
             </p>
           </div>
           {manualAdmissionEnabled ? (
@@ -6618,7 +7091,8 @@ function MemberPanel({
                 <div className="min-w-0">
                   <p className="text-sm font-medium">Manual admission</p>
                   <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                    Pending requests stay in backend governance state until owner/staff review.
+                    Pending requests stay in backend governance state until
+                    owner/staff review.
                   </p>
                 </div>
                 <Badge variant={pendingCount > 0 ? "warning" : "secondary"}>
@@ -6741,7 +7215,9 @@ function MemberRow({
       title="Right-click for member actions"
     >
       <Avatar className="h-8 w-8">
-        <AvatarFallback>{member.display_name.slice(0, 2).toUpperCase()}</AvatarFallback>
+        <AvatarFallback>
+          {member.display_name.slice(0, 2).toUpperCase()}
+        </AvatarFallback>
       </Avatar>
       <div className="min-w-0 flex-1">
         <p className="truncate font-medium">{member.display_name}</p>
@@ -6756,7 +7232,8 @@ function MemberRow({
         aria-label={status}
         className={cn(
           "h-2.5 w-2.5 rounded-full",
-          status === "online" && "bg-emerald-300 shadow-[0_0_0_3px_hsl(142_76%_36%/0.20)]",
+          status === "online" &&
+            "bg-emerald-300 shadow-[0_0_0_3px_hsl(142_76%_36%/0.20)]",
           status === "offline" && "bg-[hsl(var(--muted-foreground)/0.45)]",
           status === "revoked" && "bg-red-300",
         )}
@@ -6888,12 +7365,17 @@ function auditCategoryForEntry(
   return null;
 }
 
-function auditableGovernanceLog(group: GroupView | null): GroupGovernanceLogEntryView[] {
+function auditableGovernanceLog(
+  group: GroupView | null,
+): GroupGovernanceLogEntryView[] {
   const log = group?.governance_log;
   if (!Array.isArray(log)) return [];
   return log
     .filter((entry) => auditCategoryForEntry(entry) !== null)
-    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at));
+    .sort(
+      (left, right) =>
+        Date.parse(right.created_at) - Date.parse(left.created_at),
+    );
 }
 
 function AuditLogPanel({
@@ -6933,7 +7415,8 @@ function AuditLogPanel({
           <div>
             <CardTitle>Governance audit log</CardTitle>
             <CardDescription>
-              {group?.name ?? "No group"} · read-only history from backend governance events.
+              {group?.name ?? "No group"} · read-only history from backend
+              governance events.
             </CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -7068,7 +7551,13 @@ function AuditLogEntryRow({
         </Badge>
       </div>
       <div className="mt-3 grid gap-2 text-xs text-[hsl(var(--muted-foreground))] md:grid-cols-2">
-        <AuditMeta label="Actor" value={memberNameForAudit(group, entry.actor_member_id) ?? entry.actor_member_id} />
+        <AuditMeta
+          label="Actor"
+          value={
+            memberNameForAudit(group, entry.actor_member_id) ??
+            entry.actor_member_id
+          }
+        />
         <AuditMeta label="Target" value={target} />
         <AuditMeta label="Request" value={entry.request_id ?? "not linked"} />
         <AuditMeta
@@ -7095,13 +7584,21 @@ function AuditMeta({ label, value }: { label: string; value: string }) {
   );
 }
 
-function memberNameForAudit(group: GroupView, memberId?: string | null): string | null {
+function memberNameForAudit(
+  group: GroupView,
+  memberId?: string | null,
+): string | null {
   if (!memberId) return null;
-  const member = group.members?.find((candidate) => candidate.member_id === memberId);
+  const member = group.members?.find(
+    (candidate) => candidate.member_id === memberId,
+  );
   return member ? `${member.display_name} (${member.role})` : memberId;
 }
 
-function requestNameForAudit(group: GroupView, requestId?: string | null): string | null {
+function requestNameForAudit(
+  group: GroupView,
+  requestId?: string | null,
+): string | null {
   if (!requestId) return null;
   const request = group.admission_requests?.find(
     (candidate) => candidate.request_id === requestId,
@@ -7134,7 +7631,8 @@ function AdmissionRequestsPanel({
           <div>
             <CardTitle>Pending admission requests</CardTitle>
             <CardDescription>
-              {group?.name ?? "Group"} · valid approvals create an OpenMLS Welcome before a request is marked approved.
+              {group?.name ?? "Group"} · valid approvals create an OpenMLS
+              Welcome before a request is marked approved.
             </CardDescription>
           </div>
           <Badge variant={pending.length ? "warning" : "secondary"}>
@@ -7177,12 +7675,17 @@ function AdmissionRequestsPanel({
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="font-medium">{request.display_name}</span>
-                    <Badge variant={request.status === "approved" ? "success" : "secondary"}>
+                    <Badge
+                      variant={
+                        request.status === "approved" ? "success" : "secondary"
+                      }
+                    >
                       {request.status}
                     </Badge>
                   </div>
                   <p className="mt-1 text-xs text-[hsl(var(--muted-foreground))]">
-                    decided {request.decided_at ?? "not recorded"} by {request.decided_by ?? "unknown"}
+                    decided {request.decided_at ?? "not recorded"} by{" "}
+                    {request.decided_by ?? "unknown"}
                   </p>
                 </div>
               ))}
@@ -7214,16 +7717,29 @@ function AdmissionRequestCard({
         <div>
           <p className="text-base font-semibold">{request.display_name}</p>
           <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
-            {request.device_name ?? "Unknown device"} · requested {request.requested_at}
+            {request.device_name ?? "Unknown device"} · requested{" "}
+            {request.requested_at}
           </p>
         </div>
         <Badge variant="warning">{request.status}</Badge>
       </div>
       <div className="mt-3 grid gap-2 text-xs text-[hsl(var(--muted-foreground))] md:grid-cols-2">
-        <InfoRow title="Invite" copy={request.invite_id ?? "invite fingerprint unavailable"} />
-        <InfoRow title="Policy epoch" copy={String(request.policy_epoch_at_request)} />
-        <InfoRow title="Admission mode at request" copy={request.admission_mode_at_request ?? "not recorded"} />
-        <InfoRow title="Key package bytes" copy={`${request.key_package.length} byte(s) stored`} />
+        <InfoRow
+          title="Invite"
+          copy={request.invite_id ?? "invite fingerprint unavailable"}
+        />
+        <InfoRow
+          title="Policy epoch"
+          copy={String(request.policy_epoch_at_request)}
+        />
+        <InfoRow
+          title="Admission mode at request"
+          copy={request.admission_mode_at_request ?? "not recorded"}
+        />
+        <InfoRow
+          title="Key package bytes"
+          copy={`${request.key_package.length} byte(s) stored`}
+        />
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
         <Button
@@ -7351,9 +7867,7 @@ function LauncherPanel({
           >
             Create DM invite for current direct message
           </Button>
-          {latestInvite ? (
-            <InviteDetailCard invite={latestInvite} />
-          ) : null}
+          {latestInvite ? <InviteDetailCard invite={latestInvite} /> : null}
         </CardContent>
       </Card>
       <Card className="border-[hsl(var(--primary)/0.28)] bg-[hsl(var(--primary)/0.08)]">
@@ -7413,7 +7927,9 @@ function GroupInvitePanel({
       <div className="rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--secondary)/0.22)] p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className="text-sm font-semibold">{group?.name ?? "No group selected"}</p>
+            <p className="text-sm font-semibold">
+              {group?.name ?? "No group selected"}
+            </p>
             <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
               {selectedProfile
                 ? `${selectedProfile.adapter_kind} · ${selectedProfile.endpoints[0] ?? "endpoint missing"}`
@@ -7430,14 +7946,19 @@ function GroupInvitePanel({
         <CardHeader>
           <CardTitle>Create invite</CardTitle>
           <CardDescription>
-            Configure expiry, max uses, and admission options before generating the share link.
+            Configure expiry, max uses, and admission options before generating
+            the share link.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
           <div className="grid gap-4 md:grid-cols-2">
             <Label className="grid gap-2">
               Expires after
-              <Select value={expiryDays} onValueChange={setExpiryDays} aria-label="Invite expiry">
+              <Select
+                value={expiryDays}
+                onValueChange={setExpiryDays}
+                aria-label="Invite expiry"
+              >
                 <SelectItem value="1">1 day</SelectItem>
                 <SelectItem value="7">7 days</SelectItem>
                 <SelectItem value="30">30 days</SelectItem>
@@ -7451,7 +7972,9 @@ function GroupInvitePanel({
                 min={1}
                 max={100}
                 value={maxUses}
-                onChange={(event) => setMaxUses(event.target.value.replace(/[^0-9]/g, ""))}
+                onChange={(event) =>
+                  setMaxUses(event.target.value.replace(/[^0-9]/g, ""))
+                }
                 placeholder="5"
               />
             </Label>
@@ -7479,7 +8002,8 @@ function GroupInvitePanel({
                 {adapterSnapshot}
               </p>
               <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                This signed snapshot is copied from the selected group policy when the invite is issued.
+                This signed snapshot is copied from the selected group policy
+                when the invite is issued.
               </p>
             </div>
           </div>
@@ -7489,7 +8013,8 @@ function GroupInvitePanel({
               <div>
                 <p className="text-sm font-medium">Password admission</p>
                 <p className="mt-1 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-                  Optional admission password. The raw password is never embedded in the pasted invite.
+                  Optional admission password. The raw password is never
+                  embedded in the pasted invite.
                 </p>
               </div>
               <Switch
@@ -7511,7 +8036,10 @@ function GroupInvitePanel({
             ) : null}
           </div>
 
-          <Button onClick={onCreateInvite} disabled={!group || !passwordReady || !maxUses.trim()}>
+          <Button
+            onClick={onCreateInvite}
+            disabled={!group || !passwordReady || !maxUses.trim()}
+          >
             Create invite for {group?.name ?? "selected group"}
           </Button>
           {latestInvite ? (
@@ -7611,7 +8139,9 @@ function GroupConfigPanel({
               <Select
                 aria-label="Group admission mode"
                 value={admissionMode}
-                onValueChange={(value) => setAdmissionMode(value as GroupAdmissionModeView)}
+                onValueChange={(value) =>
+                  setAdmissionMode(value as GroupAdmissionModeView)
+                }
               >
                 <SelectItem value="manual_approval">Manual approval</SelectItem>
                 <SelectItem value="automatic_when_authorized_online">
@@ -7620,7 +8150,8 @@ function GroupConfigPanel({
               </Select>
             </Label>
             <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              Existing manual pending requests stay pending after switching to automatic mode.
+              Existing manual pending requests stay pending after switching to
+              automatic mode.
             </p>
           </div>
           <Button onClick={onSave} disabled={!group}>
@@ -7640,7 +8171,8 @@ function JoinProgressCard({ steps }: { steps: JoinProgressStepView[] }) {
           key: "invite_parsed",
           label: "Invite parsed",
           status: "waiting-for-invite",
-          detail: "Paste an invite before receiver-side join progress can start",
+          detail:
+            "Paste an invite before receiver-side join progress can start",
         },
         {
           key: "rendezvous",
@@ -7768,7 +8300,12 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             <span className="truncate text-xs text-emerald-50/70">
               Click the field to select the full invite.
             </span>
-            <Button type="button" size="sm" variant="secondary" onClick={copyInvite}>
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={copyInvite}
+            >
               {copied ? "Copied" : "Copy invite"}
             </Button>
           </div>
@@ -7780,13 +8317,14 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             label="Adapter"
             value={selectedProfile?.adapter_kind ?? invite.invite_kind}
           />
-          <InviteFact
-            label="Adapter snapshot"
-            value={adapterSnapshot}
-          />
+          <InviteFact label="Adapter snapshot" value={adapterSnapshot} />
           <InviteFact
             label="Signaling endpoint"
-            value={invite.signaling_endpoint || selectedProfile?.endpoints[0] || "not provided"}
+            value={
+              invite.signaling_endpoint ||
+              selectedProfile?.endpoints[0] ||
+              "not provided"
+            }
           />
           <InviteFact
             label="Endpoint policy"
@@ -7809,7 +8347,9 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
           <InviteFact label="Max uses" value={invite.max_use} />
           <InviteFact
             label="Remaining local uses"
-            value={remainingUses === null ? "not parsed" : String(remainingUses)}
+            value={
+              remainingUses === null ? "not parsed" : String(remainingUses)
+            }
           />
           <InviteFact label="Revocation state" value={revocationState} />
           <InviteFact label="Password gate" value={passwordGate} />
@@ -7817,10 +8357,7 @@ function InviteDetailCard({ invite }: { invite: InviteView }) {
             label="Admission"
             value={invite.admission_copy || "Authorized MLS welcome required"}
           />
-          <InviteFact
-            label="Admission snapshot"
-            value={admissionSnapshot}
-          />
+          <InviteFact label="Admission snapshot" value={admissionSnapshot} />
           <InviteFact
             label="STUN/TURN"
             value={`${invite.ice_stun_servers.length} STUN · ${invite.ice_turn_servers.length} TURN`}
@@ -7920,7 +8457,9 @@ function CreateGroupPanel({
               <Select
                 aria-label="Invite admission mode"
                 value={admissionMode}
-                onValueChange={(value) => setAdmissionMode(value as GroupAdmissionModeView)}
+                onValueChange={(value) =>
+                  setAdmissionMode(value as GroupAdmissionModeView)
+                }
               >
                 <SelectItem value="manual_approval">Manual approval</SelectItem>
                 <SelectItem value="automatic_when_authorized_online">
@@ -7929,7 +8468,8 @@ function CreateGroupPanel({
               </Select>
             </Label>
             <p className="mt-2 text-xs leading-5 text-[hsl(var(--muted-foreground))]">
-              Manual is safest for private groups. Switching modes later will not retroactively approve pending manual requests.
+              Manual is safest for private groups. Switching modes later will
+              not retroactively approve pending manual requests.
             </p>
           </div>
           <div className="mt-4 grid gap-3">
@@ -8191,7 +8731,9 @@ function ChannelPanel({
     return (
       <Card className="flex h-full min-h-0 flex-col">
         <CardHeader className="border-b border-[hsl(var(--border))]">
-          <CardTitle>{group ? "No text channel selected" : "Choose a group"}</CardTitle>
+          <CardTitle>
+            {group ? "No text channel selected" : "Choose a group"}
+          </CardTitle>
           <CardDescription>
             {group
               ? "Use the + next to Text channels in the sidebar, or pick an existing channel."
@@ -8227,7 +8769,11 @@ function ChannelPanel({
         sendLabel="Send message"
         onSend={onSendMessage}
         disabled={admissionPending || messageSendInFlight}
-        composerNotice={admissionPending ? "Waiting for owner/staff approval before protected messages can be sent." : null}
+        composerNotice={
+          admissionPending
+            ? "Waiting for owner/staff approval before protected messages can be sent."
+            : null
+        }
         transportProof={transportProof}
         setTransportProof={setTransportProof}
         diagnosticsEnabled={diagnosticsEnabled}
@@ -8272,18 +8818,27 @@ function Timeline({
     >
       <CardHeader className="border-b border-[hsl(var(--border))] px-4 py-3">
         <CardTitle className="text-lg">{title}</CardTitle>
-        <CardDescription className="line-clamp-1">{description}</CardDescription>
+        <CardDescription className="line-clamp-1">
+          {description}
+        </CardDescription>
       </CardHeader>
       {diagnosticsEnabled ? <TextStateLegend states={textStateLegend} /> : null}
       <ScrollArea data-testid="message-scroll" className="min-h-0 flex-1">
         <div className="py-3">
           {messages.length === 0 ? (
             <div className="px-4">
-              <EmptyState title="No messages yet" copy="Send the first local message. It will persist through reloads." />
+              <EmptyState
+                title="No messages yet"
+                copy="Send the first local message. It will persist through reloads."
+              />
             </div>
           ) : (
             messages.map((message) => (
-              <MessageRow key={message.message_id} message={message} diagnosticsEnabled={diagnosticsEnabled} />
+              <MessageRow
+                key={message.message_id}
+                message={message}
+                diagnosticsEnabled={diagnosticsEnabled}
+              />
             ))
           )}
         </div>
@@ -8296,7 +8851,11 @@ function Timeline({
             value={draftMessage}
             onChange={(event) => setDraftMessage(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && draftMessage.trim()) {
+              if (
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                draftMessage.trim()
+              ) {
                 event.preventDefault();
                 onSend();
               }
@@ -8305,18 +8864,33 @@ function Timeline({
             disabled={disabled}
             className="border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
           />
-          <Button type="button" size="icon" aria-label={sendLabel} title={sendLabel} onClick={onSend} disabled={disabled || !draftMessage.trim()} className="h-9 w-9 rounded-xl">
+          <Button
+            type="button"
+            size="icon"
+            aria-label={sendLabel}
+            title={sendLabel}
+            onClick={onSend}
+            disabled={disabled || !draftMessage.trim()}
+            className="h-9 w-9 rounded-xl"
+          >
             <Icon>➤</Icon>
           </Button>
         </div>
         {composerNotice ? (
-          <p className="mt-2 text-xs text-[hsl(var(--muted-foreground))]">{composerNotice}</p>
+          <p className="mt-2 text-xs text-[hsl(var(--muted-foreground))]">
+            {composerNotice}
+          </p>
         ) : null}
         {diagnosticsEnabled ? (
           <div className="mt-2 flex justify-end">
             <Label className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
-              <Switch checked={transportProof} onCheckedChange={setTransportProof} disabled={disabled} />
-              Verify backend-state provider-signaled WebRTC transport for this send
+              <Switch
+                checked={transportProof}
+                onCheckedChange={setTransportProof}
+                disabled={disabled}
+              />
+              Verify backend-state provider-signaled WebRTC transport for this
+              send
             </Label>
           </div>
         ) : null}
@@ -8358,14 +8932,15 @@ function messageStateBadgeVariant(
   stateKey: string,
 ): React.ComponentProps<typeof Badge>["variant"] {
   if (
-    ["sent_local", "received", "peer_receipt", "transport_probe_verified"].includes(
-      stateKey,
-    )
+    [
+      "sent_local",
+      "received",
+      "peer_receipt",
+      "transport_probe_verified",
+    ].includes(stateKey)
   )
     return "success";
-  if (
-    ["pending", "locked", "transport_probe_unavailable"].includes(stateKey)
-  )
+  if (["pending", "locked", "transport_probe_unavailable"].includes(stateKey))
     return "warning";
   if (["failed", "shredded", "transport_probe_failed"].includes(stateKey))
     return "secondary";
@@ -8373,8 +8948,10 @@ function messageStateBadgeVariant(
 }
 
 function messageStateIcon(stateKey: string): string {
-  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey)) return "!";
-  if (["pending", "locked", "transport_probe_unavailable"].includes(stateKey)) return "…";
+  if (["failed", "shredded", "transport_probe_failed"].includes(stateKey))
+    return "!";
+  if (["pending", "locked", "transport_probe_unavailable"].includes(stateKey))
+    return "…";
   return "✓";
 }
 
@@ -8403,16 +8980,26 @@ function MessageRow({
       className="group grid grid-cols-[2.25rem_minmax(0,1fr)_auto] gap-3 px-4 py-2.5 transition-colors hover:bg-[hsl(var(--secondary)/0.32)]"
     >
       <Avatar className="mt-0.5 h-9 w-9">
-        <AvatarFallback>{message.author.slice(0, 2).toUpperCase()}</AvatarFallback>
+        <AvatarFallback>
+          {message.author.slice(0, 2).toUpperCase()}
+        </AvatarFallback>
       </Avatar>
       <div className="min-w-0">
         <div className="flex flex-wrap items-baseline gap-2">
-          <span className="font-medium text-[hsl(var(--foreground))]">{message.author}</span>
-          <time className="text-[11px] text-[hsl(var(--muted-foreground))]">{message.sent_at}</time>
+          <span className="font-medium text-[hsl(var(--foreground))]">
+            {message.author}
+          </span>
+          <time className="text-[11px] text-[hsl(var(--muted-foreground))]">
+            {message.sent_at}
+          </time>
         </div>
-        <p className="whitespace-pre-wrap break-words text-sm leading-6 text-[hsl(var(--foreground)/0.92)]">{message.body}</p>
+        <p className="whitespace-pre-wrap break-words text-sm leading-6 text-[hsl(var(--foreground)/0.92)]">
+          {message.body}
+        </p>
         {diagnosticsEnabled ? (
-          <p className="mt-1 text-[11px] leading-5 text-[hsl(var(--muted-foreground))]">{message.state_detail}</p>
+          <p className="mt-1 text-[11px] leading-5 text-[hsl(var(--muted-foreground))]">
+            {message.state_detail}
+          </p>
         ) : null}
       </div>
       <Tooltip>
@@ -8542,7 +9129,12 @@ function DiagnosticsSheet({
                 <CardTitle>Workspace diagnostics</CardTitle>
                 <CardDescription>{themeLabel}</CardDescription>
               </div>
-              <Button type="button" size="sm" variant="secondary" onClick={copyDiagnostics}>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={copyDiagnostics}
+              >
                 Copy logs
               </Button>
             </div>
@@ -8571,7 +9163,9 @@ function DiagnosticsSheet({
               />
             </div>
             {exportStatus ? (
-              <p className="text-xs text-[hsl(var(--muted-foreground))]">{exportStatus}</p>
+              <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                {exportStatus}
+              </p>
             ) : null}
           </CardHeader>
           <CardContent className="grid gap-3">
@@ -8695,9 +9289,7 @@ function InspectorRail({
           <Card>
             <CardHeader>
               <CardTitle>Workspace state</CardTitle>
-              <CardDescription>
-                {themeLabel}
-              </CardDescription>
+              <CardDescription>{themeLabel}</CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3">
               <InfoRow
@@ -8733,8 +9325,7 @@ function InspectorRail({
               <CardTitle>Danger zone</CardTitle>
               <CardDescription>
                 Resetting local state erases this device&apos;s profile, groups,
-                messages, invites, and voice preferences from the
-                local shell.
+                messages, invites, and voice preferences from the local shell.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3">

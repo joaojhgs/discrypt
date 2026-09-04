@@ -8,8 +8,6 @@
 
 pub mod connection;
 pub mod production_status;
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
@@ -32,7 +30,7 @@ use discrypt_core::{
 use discrypt_media::{
     apply_microphone_gain_percent, AudioCaptureFormat, BridgeProtectedFrame, CapturedAudioFrame,
     DecodedAudioFrame, MediaKeyRegistry, MicrophonePermissionState, OpusAudioDecoder,
-    OpusAudioEncoder, PlaybackAudioSink, ProtectedFrame, ProtectedMediaFrameSink, ReplayWindow,
+    OpusAudioEncoder, PlaybackAudioSink, ProtectedMediaFrameSink, ReplayWindow,
     RustTransformBridge, SFrameReceiver, SFrameSender, SenderBinding, VoiceCaptureSFramePipeline,
     VoiceCaptureSendOutcome, VoiceDeviceDescriptor, VoiceDeviceKind, VoiceDeviceSelection,
     VoiceJitterBuffer, VoiceReceiveSFramePipeline, APP_OUTPUT_VOLUME_MAX_PERCENT,
@@ -137,6 +135,7 @@ const ABUSE_WINDOW_SECONDS: i64 = 60;
 const APP_EVENT_TAURI_TOPIC: &str = "app_event";
 const GROUP_PRESENCE_DEFAULT_TTL_SECONDS: i64 = 90;
 const GROUP_PRESENCE_MAX_TTL_SECONDS: i64 = 300;
+const GROUP_PRESENCE_MAX_FUTURE_SKEW_SECONDS: i64 = 30;
 
 /// Lifecycle route for the desktop app shell.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1596,8 +1595,6 @@ pub struct ApplyTextDeliveryReceiptRequest {
     pub message_id: String,
     /// Signed delivery receipt received from a peer device over text/control transport.
     pub receipt: TextDeliveryReceipt,
-    /// Hex-encoded recipient Ed25519 verifying key expected to validate the receipt.
-    pub recipient_verifying_key_hex: String,
 }
 
 /// Request to accept a signed encrypted text envelope from a peer and produce a receipt.
@@ -1778,8 +1775,6 @@ pub enum TextControlFrameView {
         message_id: String,
         /// Signed receipt payload.
         receipt: TextDeliveryReceipt,
-        /// Hex-encoded recipient verifying key.
-        recipient_verifying_key_hex: String,
     },
 }
 
@@ -1803,6 +1798,8 @@ pub struct TextControlOutboxFrameView {
     /// Expected admitted remote runtime peer ids for group fanout.
     #[serde(default)]
     pub route_peer_ids: Vec<String>,
+    /// Immutable route peer ids that were expected when this frame was queued.
+    pub expected_route_peer_ids: Vec<String>,
     /// Runtime peer ids this frame has been handed to.
     #[serde(default)]
     pub sent_route_peer_ids: Vec<String>,
@@ -1919,6 +1916,8 @@ pub struct VoiceSignalingMessageView {
 pub struct PublishVoiceSignalingMessageRequest {
     /// Active voice session id.
     pub session_id: String,
+    /// Provider/runtime peer id expected to receive this voice signal.
+    pub recipient_peer_id: String,
     /// `offer`, `answer`, or `candidate`.
     pub signal_kind: String,
     /// WebView-sealed voice signal payload. Raw SDP/ICE never crosses IPC or persisted state.
@@ -1931,11 +1930,15 @@ pub struct PublishVoiceSignalingMessageRequest {
 }
 
 /// Request to drain pending inbound WebRTC voice signaling messages from backend state.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TakePendingVoiceSignalingMessagesRequest {
     /// Optional voice session id filter. Defaults to the active voice session.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Provider/runtime peer id for the local browser/native edge draining messages.
+    pub recipient_peer_id: String,
+    /// Provider/runtime peer id of the remote edge whose signals should be drained.
+    pub sender_peer_id: String,
     /// Optional result cap. Defaults to 50 and is clamped to 200.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -1950,14 +1953,14 @@ pub struct TakePendingVoiceSignalingMessagesResponse {
     pub messages: Vec<VoiceSignalingMessageView>,
 }
 
-/// Request to build one Rust-owned native voice media proof frame for the active Tauri voice session.
+/// Request to attach one Rust-owned native voice stream for the active Tauri voice session.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StartNativeVoiceMediaSessionRequest {
+pub struct StartNativeVoiceStreamRequest {
     /// Active voice session id.
     pub session_id: String,
     /// Local runtime peer id advertised over the provider control plane.
     pub local_peer_id: String,
-    /// Provider/runtime peer id expected to receive the native media proof frame.
+    /// Provider/runtime peer id expected to receive the native media stream.
     pub remote_peer_id: String,
     /// Whether local mute should suppress the generated capture frame before Opus/SFrame.
     #[serde(default)]
@@ -1980,7 +1983,7 @@ pub struct NativeVoiceProtectedFrameView {
     pub bytes: Vec<u8>,
 }
 
-/// Sealed-payload body for the Tauri native Rust media proof path.
+/// Protected payload body carried over the backend-owned direct peer DataChannel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeVoiceMediaSignalPayload {
     /// Proof schema marker for harness/UI routing.
@@ -2138,16 +2141,6 @@ fn decode_native_voice_data_channel_frame(
     })
 }
 
-/// Response returned after Rust creates a native media proof frame.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StartNativeVoiceMediaSessionResponse {
-    /// Updated state after command validation.
-    pub state: AppStateView,
-    /// Native proof payload for the UI to seal and publish through the existing voice signaling route.
-    #[serde(default)]
-    pub native_media: Option<NativeVoiceMediaSignalPayload>,
-}
-
 /// Live native Rust voice-stream lifecycle and transport evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeVoiceStreamStatusView {
@@ -2172,6 +2165,40 @@ pub struct NativeVoiceStreamStatusView {
     /// Protected audio frames authenticated and decoded from the remote peer.
     pub frames_received: u64,
     /// Decoded PCM frames waiting for WebAudio playback.
+    pub playback_queue_depth: usize,
+    /// Latest attach/send/receive failure, if any.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Per-peer native runtime statuses. UI must use these rows for edge-specific readiness.
+    pub peer_statuses: Vec<NativeVoiceStreamPeerStatusView>,
+}
+
+/// Per-peer native Rust voice-stream lifecycle and transport evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NativeVoiceStreamPeerStatusView {
+    /// Active voice session id.
+    pub session_id: String,
+    /// Provider-advertised local runtime peer id for this edge.
+    pub local_peer_id: String,
+    /// Provider-advertised remote runtime peer id for this edge.
+    pub remote_peer_id: String,
+    /// Provider runtime role for this edge.
+    pub role: String,
+    /// `attaching`, `backend-verified-connected`, or `failed`.
+    pub state: String,
+    /// Whether backend-verified Rust WebRTC completed its direct ICE path for this edge.
+    pub direct_path_ready: bool,
+    /// Whether the backend-verified Rust WebRTC DataChannel is open for this edge.
+    pub data_channel_open: bool,
+    /// STUN servers configured for this edge.
+    pub configured_stun_servers: usize,
+    /// TURN servers configured for this edge. This is always zero.
+    pub configured_turn_servers: usize,
+    /// Protected audio frames accepted by this edge's DataChannel sender.
+    pub frames_sent: u64,
+    /// Protected audio frames authenticated and decoded from this edge's remote peer.
+    pub frames_received: u64,
+    /// Decoded PCM frames waiting for WebAudio playback from this edge.
     pub playback_queue_depth: usize,
     /// Latest attach/send/receive failure, if any.
     #[serde(default)]
@@ -2215,7 +2242,7 @@ pub struct SendNativeVoiceAudioFrameResponse {
 pub struct TakeNativeVoicePlaybackFramesRequest {
     /// Active voice session id.
     pub session_id: String,
-    /// Optional result cap, clamped to 1..=100.
+    /// Optional result cap, clamped to 0..=100. Zero reads status without draining playback.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -2251,26 +2278,6 @@ pub struct TakeNativeVoicePlaybackFramesResponse {
 pub struct StopNativeVoiceStreamRequest {
     /// Voice session id being stopped.
     pub session_id: String,
-}
-
-/// Request to accept one remote native Rust media proof delivered through backend voice signaling.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AcceptNativeVoiceMediaFrameRequest {
-    /// Active voice session id.
-    pub session_id: String,
-    /// Remote native media proof opened from sealed backend voice signaling.
-    pub native_media: NativeVoiceMediaSignalPayload,
-    /// Evidence timestamp in milliseconds.
-    pub attached_at_ms: u64,
-}
-
-/// Request to accept one remote native Rust media proof directly from a sealed backend voice signal.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AcceptNativeVoiceMediaSignalRequest {
-    /// Remote backend signaling message carrying the sealed native media proof.
-    pub signal: VoiceSignalingMessageView,
-    /// Evidence timestamp in milliseconds.
-    pub attached_at_ms: u64,
 }
 
 /// One-shot text/control transport pump report for a session-loop iteration.
@@ -3042,6 +3049,51 @@ struct PendingNativeVoiceTransportRuntime {
     local_peer_id: String,
     remote_peer_id: String,
     configured_stun_servers: usize,
+    failed: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct NativeVoiceRuntimeMapKey {
+    session_id: String,
+    local_peer_id: String,
+    remote_peer_id: String,
+}
+
+impl NativeVoiceRuntimeMapKey {
+    fn new(session_id: String, local_peer_id: String, remote_peer_id: String) -> Self {
+        Self {
+            session_id,
+            local_peer_id,
+            remote_peer_id,
+        }
+    }
+
+    fn from_request(request: &StartNativeVoiceStreamRequest) -> Self {
+        Self::new(
+            request.session_id.clone(),
+            request.local_peer_id.clone(),
+            request.remote_peer_id.clone(),
+        )
+    }
+}
+
+fn native_voice_runtime_requires_attach(
+    existing_last_error: Option<Option<&str>>,
+    pending_failed: Option<bool>,
+) -> bool {
+    match existing_last_error {
+        Some(None) => false,
+        Some(Some(_)) => true,
+        None => pending_failed.is_none_or(|failed| failed),
+    }
+}
+
+fn native_voice_start_request_is_current(
+    active_session: Option<(&str, bool)>,
+    requested_session_id: &str,
+) -> bool {
+    active_session.is_some_and(|(session_id, joined)| joined && session_id == requested_session_id)
 }
 
 struct NativeVoiceTransportRuntime {
@@ -3058,11 +3110,12 @@ struct NativeVoiceTransportRuntime {
     data_channel_open: bool,
     frames_sent: Arc<AtomicU64>,
     muted: Arc<AtomicBool>,
+    last_error: Option<String>,
     use_webview_capture: bool,
-    native_capture: Option<NativeVoiceCaptureRuntime>,
     receiver_abort: Option<tokio::task::AbortHandle>,
 }
 
+#[derive(Debug)]
 struct NativeVoiceCaptureRuntime {
     device_label: String,
     stop: std::sync::mpsc::SyncSender<()>,
@@ -3102,14 +3155,8 @@ impl fmt::Debug for NativeVoiceTransportRuntime {
             .field("data_channel_open", &self.data_channel_open)
             .field("frames_sent", &self.frames_sent.load(Ordering::Relaxed))
             .field("muted", &self.muted.load(Ordering::Relaxed))
+            .field("last_error", &self.last_error)
             .field("use_webview_capture", &self.use_webview_capture)
-            .field(
-                "native_capture",
-                &self
-                    .native_capture
-                    .as_ref()
-                    .map(|capture| &capture.device_label),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -3123,7 +3170,7 @@ impl Drop for NativeVoiceTransportRuntime {
 }
 
 struct NativeVoiceRuntimeAttachJob {
-    request: StartNativeVoiceMediaSessionRequest,
+    request: StartNativeVoiceStreamRequest,
     inputs: TextControlRuntimeAttachInputs,
     role: ProviderTextControlRuntimePeerRole,
     codec: Arc<Mutex<NativeVoiceCodecState>>,
@@ -3227,6 +3274,7 @@ struct TextControlOutboxRecord {
     last_transport_session_id: Option<String>,
     #[serde(default)]
     route_peer_ids: Vec<String>,
+    expected_route_peer_ids: Vec<String>,
     #[serde(default)]
     sent_route_peer_ids: Vec<String>,
     #[serde(default)]
@@ -3369,10 +3417,14 @@ struct TauriAppService {
         BTreeMap<TextControlRuntimeMapKey, TextControlTransportRuntime>,
     pending_text_control_transport_runtimes:
         BTreeMap<TextControlRuntimeMapKey, PendingTextControlTransportRuntime>,
-    native_voice_transport_runtime: Option<NativeVoiceTransportRuntime>,
-    pending_native_voice_transport_runtime: Option<PendingNativeVoiceTransportRuntime>,
+    native_voice_transport_runtimes:
+        BTreeMap<NativeVoiceRuntimeMapKey, NativeVoiceTransportRuntime>,
+    pending_native_voice_transport_runtimes:
+        BTreeMap<NativeVoiceRuntimeMapKey, PendingNativeVoiceTransportRuntime>,
+    native_voice_capture_runtime: Option<NativeVoiceCaptureRuntime>,
+    native_voice_capture_session_id: Option<String>,
     native_voice_transport_error: Option<String>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "harness"))]
     state_path_override: Option<PathBuf>,
 }
 
@@ -3407,10 +3459,12 @@ impl TauriAppService {
             state: load_state(),
             text_control_transport_runtimes: BTreeMap::new(),
             pending_text_control_transport_runtimes: BTreeMap::new(),
-            native_voice_transport_runtime: None,
-            pending_native_voice_transport_runtime: None,
+            native_voice_transport_runtimes: BTreeMap::new(),
+            pending_native_voice_transport_runtimes: BTreeMap::new(),
+            native_voice_capture_runtime: None,
+            native_voice_capture_session_id: None,
             native_voice_transport_error: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "harness"))]
             state_path_override: None,
         }
     }
@@ -3421,8 +3475,10 @@ impl TauriAppService {
             state: load_state_from_path(&path),
             text_control_transport_runtimes: BTreeMap::new(),
             pending_text_control_transport_runtimes: BTreeMap::new(),
-            native_voice_transport_runtime: None,
-            pending_native_voice_transport_runtime: None,
+            native_voice_transport_runtimes: BTreeMap::new(),
+            pending_native_voice_transport_runtimes: BTreeMap::new(),
+            native_voice_capture_runtime: None,
+            native_voice_capture_session_id: None,
             native_voice_transport_error: None,
             state_path_override: Some(path),
         }
@@ -3730,9 +3786,10 @@ impl TauriAppService {
     }
 
     fn native_voice_stream_status(&self, session_id: &str) -> NativeVoiceStreamStatusView {
-        if let Some(runtime) = self
-            .native_voice_transport_runtime
-            .as_ref()
+        let mut peer_statuses = Vec::new();
+        for runtime in self
+            .native_voice_transport_runtimes
+            .values()
             .filter(|runtime| runtime.session_id == session_id)
         {
             let (frames_received, playback_queue_depth) = runtime
@@ -3740,9 +3797,10 @@ impl TauriAppService {
                 .lock()
                 .map(|codec| (codec.frames_received, codec.playback_queue_depth()))
                 .unwrap_or_default();
-            return NativeVoiceStreamStatusView {
-                schema_version: 1,
+            peer_statuses.push(NativeVoiceStreamPeerStatusView {
                 session_id: session_id.to_owned(),
+                local_peer_id: runtime.local_peer_id.clone(),
+                remote_peer_id: runtime.remote_peer_id.clone(),
                 state: "backend-verified-connected".to_owned(),
                 role: runtime_role_label(Some(runtime.role)).to_owned(),
                 direct_path_ready: runtime.direct_path_ready,
@@ -3752,18 +3810,24 @@ impl TauriAppService {
                 frames_sent: runtime.frames_sent.load(Ordering::Relaxed),
                 frames_received,
                 playback_queue_depth,
-                last_error: self.native_voice_transport_error.clone(),
-            };
+                last_error: runtime.last_error.clone(),
+            });
         }
-        if let Some(pending) = self
-            .pending_native_voice_transport_runtime
-            .as_ref()
+        for pending in self
+            .pending_native_voice_transport_runtimes
+            .values()
             .filter(|pending| pending.session_id == session_id)
         {
-            return NativeVoiceStreamStatusView {
-                schema_version: 1,
+            peer_statuses.push(NativeVoiceStreamPeerStatusView {
                 session_id: session_id.to_owned(),
-                state: "attaching".to_owned(),
+                local_peer_id: pending.local_peer_id.clone(),
+                remote_peer_id: pending.remote_peer_id.clone(),
+                state: if pending.failed {
+                    "failed"
+                } else {
+                    "attaching"
+                }
+                .to_owned(),
                 role: runtime_role_label(Some(pending.role)).to_owned(),
                 direct_path_ready: false,
                 data_channel_open: false,
@@ -3772,26 +3836,63 @@ impl TauriAppService {
                 frames_sent: 0,
                 frames_received: 0,
                 playback_queue_depth: 0,
-                last_error: self.native_voice_transport_error.clone(),
-            };
+                last_error: pending.last_error.clone(),
+            });
         }
+        let aggregate_last_error = peer_statuses
+            .iter()
+            .find_map(|status| status.last_error.clone())
+            .or_else(|| self.native_voice_transport_error.clone());
+        let frames_sent = peer_statuses.iter().map(|status| status.frames_sent).sum();
+        let frames_received = peer_statuses
+            .iter()
+            .map(|status| status.frames_received)
+            .sum();
+        let playback_queue_depth = peer_statuses
+            .iter()
+            .map(|status| status.playback_queue_depth)
+            .sum();
+        let configured_stun_servers = peer_statuses
+            .iter()
+            .map(|status| status.configured_stun_servers)
+            .max()
+            .unwrap_or_default();
+        let direct_path_ready = !peer_statuses.is_empty()
+            && peer_statuses.iter().all(|status| status.direct_path_ready);
+        let data_channel_open = !peer_statuses.is_empty()
+            && peer_statuses.iter().all(|status| status.data_channel_open);
+        let state = if peer_statuses
+            .iter()
+            .any(|status| status.state == "attaching")
+        {
+            "attaching"
+        } else if !peer_statuses.is_empty() && direct_path_ready && data_channel_open {
+            "backend-verified-connected"
+        } else if aggregate_last_error.is_some() {
+            "failed"
+        } else {
+            "idle"
+        };
         NativeVoiceStreamStatusView {
             schema_version: 1,
             session_id: session_id.to_owned(),
-            state: if self.native_voice_transport_error.is_some() {
-                "failed".to_owned()
+            state: state.to_owned(),
+            role: if peer_statuses.len() == 1 {
+                peer_statuses[0].role.clone()
+            } else if peer_statuses.is_empty() {
+                "none".to_owned()
             } else {
-                "idle".to_owned()
+                "mesh".to_owned()
             },
-            role: "none".to_owned(),
-            direct_path_ready: false,
-            data_channel_open: false,
-            configured_stun_servers: 0,
+            direct_path_ready,
+            data_channel_open,
+            configured_stun_servers,
             configured_turn_servers: 0,
-            frames_sent: 0,
-            frames_received: 0,
-            playback_queue_depth: 0,
-            last_error: self.native_voice_transport_error.clone(),
+            frames_sent,
+            frames_received,
+            playback_queue_depth,
+            last_error: aggregate_last_error,
+            peer_statuses,
         }
     }
 
@@ -4359,7 +4460,7 @@ impl TauriAppService {
     }
 
     fn persist_candidate(&self, state: &PersistedAppState) -> Result<(), Box<CommandErrorView>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "harness"))]
         if let Some(path) = &self.state_path_override {
             return persist_state_to_path(path, state);
         }
@@ -4414,6 +4515,7 @@ impl TauriAppService {
                 transport.clone(),
                 executor.clone(),
                 session_id.clone(),
+                remote_peer_id.clone(),
             );
         }
         let runtime = TextControlTransportRuntime {
@@ -4432,16 +4534,16 @@ impl TauriAppService {
         self.text_control_transport_runtimes.insert(key, runtime);
     }
 
-    fn local_signaling_peer_id_for_active_context(&self) -> Result<SignalingPeerId, String> {
-        let state = &self.state;
-        let context = state.active_context.as_ref().ok_or_else(|| {
+    fn local_signaling_peer_id_for_active_context(&mut self) -> Result<SignalingPeerId, String> {
+        let context = self.state.active_context.clone().ok_or_else(|| {
             "No active DM/group context is available for the broker control lane".to_owned()
         })?;
-        if let Some(dm_id) = &context.dm_id {
-            let dm = state
+        if let Some(dm_id) = context.dm_id {
+            let dm = self
+                .state
                 .dms
                 .iter()
-                .find(|dm| &dm.dm_id == dm_id)
+                .find(|dm| dm.dm_id == dm_id)
                 .ok_or_else(|| {
                     format!("Active DM {dm_id} is missing for the broker control lane")
                 })?;
@@ -4454,33 +4556,49 @@ impl TauriAppService {
                 })?;
             return SignalingPeerId::new(local.peer_id.clone()).map_err(|error| error.to_string());
         }
-        if let Some(group_id) = &context.group_id {
-            let group = state
+        if let Some(group_id) = context.group_id {
+            let local_member_id = self.state.local_user_id();
+            let (status, advertised_peer_id) = self
+                .state
                 .groups
                 .iter()
-                .find(|group| &group.group_id == group_id)
+                .find(|group| group.group_id == group_id)
                 .ok_or_else(|| {
                     format!("Active group {group_id} is missing for the broker control lane")
-                })?;
-            let local_member_id = state.local_user_id();
-            let local = group
+                })?
                 .members
                 .iter()
                 .find(|member| member.member_id == local_member_id)
+                .map(|member| (member.status.clone(), member.runtime_peer_id.clone()))
                 .ok_or_else(|| {
                     format!(
                         "Active group {group_id} has no local member for the broker control lane"
                     )
                 })?;
-            return SignalingPeerId::new(group_member_runtime_peer_id(group_id, local)?)
-                .map_err(|error| error.to_string());
+            if status == "revoked" {
+                return Err(format!(
+                    "Active group {group_id} local member is revoked from the broker control lane"
+                ));
+            }
+            let peer_id = match advertised_peer_id.filter(|peer_id| !peer_id.trim().is_empty()) {
+                Some(peer_id) => peer_id,
+                None if status == "pending" => {
+                    local_group_runtime_peer_id(&mut self.state, &group_id)
+                }
+                None => {
+                    return Err(format!(
+                        "Active group {group_id} local member has not advertised a runtime peer id"
+                    ));
+                }
+            };
+            return SignalingPeerId::new(peer_id).map_err(|error| error.to_string());
         }
         Err("Active context is not a DM or group for the broker control lane".to_owned())
     }
 
     #[allow(clippy::type_complexity)]
     fn broker_control_lane_attach_inputs(
-        &self,
+        &mut self,
         requested_kind: Option<&str>,
     ) -> Result<
         (
@@ -5453,8 +5571,10 @@ pub fn reload_app_state_for_harness(path: impl AsRef<std::path::Path>) -> AppSta
     guard.state = load_state_from_path(path);
     guard.text_control_transport_runtimes.clear();
     guard.pending_text_control_transport_runtimes.clear();
-    guard.native_voice_transport_runtime = None;
-    guard.pending_native_voice_transport_runtime = None;
+    guard.native_voice_transport_runtimes.clear();
+    guard.pending_native_voice_transport_runtimes.clear();
+    guard.native_voice_capture_runtime = None;
+    guard.native_voice_capture_session_id = None;
     guard.native_voice_transport_error = None;
     guard.state_path_override = Some(path.to_path_buf());
     guard.to_view()
@@ -6161,6 +6281,7 @@ fn start_text_control_offer_receiver_loop(
     transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
     executor: Arc<tokio::runtime::Runtime>,
     session_id: String,
+    remote_peer_id: String,
 ) {
     executor.spawn(async move {
         loop {
@@ -6203,7 +6324,9 @@ fn start_text_control_offer_receiver_loop(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let previous_cursor = guard.state.latest_event_cursor();
-                let response_frame = guard.state.handle_text_control_frame(inbound_frame);
+                let response_frame = guard
+                    .state
+                    .handle_text_control_frame_for_route(inbound_frame, Some(&remote_peer_id));
                 guard.persist();
                 let state = guard.to_view();
                 (response_frame, state, previous_cursor)
@@ -7234,6 +7357,7 @@ pub fn refuse_group_admission_request(request: RefuseGroupAdmissionRequest) -> A
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
+                expected_route_peer_ids: Vec::new(),
                 sent_route_peer_ids: Vec::new(),
                 receipted_route_peer_ids: Vec::new(),
             }),
@@ -9094,10 +9218,43 @@ pub fn send_message(request: SendMessageRequest) -> AppStateView {
     })
 }
 
-/// Tauri command: apply a signed peer delivery receipt to a persisted message.
-pub fn apply_text_delivery_receipt(request: ApplyTextDeliveryReceiptRequest) -> AppStateView {
+#[cfg(test)]
+fn apply_text_delivery_receipt_after_test_handoff(
+    request: ApplyTextDeliveryReceiptRequest,
+) -> AppStateView {
     mutate_app_service(|state| {
-        if let Err(error) = state.apply_text_delivery_receipt(request) {
+        let route_handoff = state
+            .text_delivery_envelopes
+            .iter()
+            .find(|record| record.message_id == request.message_id)
+            .and_then(|record| {
+                state
+                    .receipt_recipient_authority(
+                        &record.group_id,
+                        &request.receipt.recipient_device_id,
+                    )
+                    .ok()
+                    .and_then(|(_, route_peer_id)| route_peer_id)
+            })
+            .and_then(|route_peer_id| {
+                state
+                    .text_control_outbox
+                    .iter()
+                    .find(|record| record.message_id == request.message_id)
+                    .map(|record| (route_peer_id, record.frame_sha256.clone()))
+            });
+        if let Some((route_peer_id, frame_sha256)) = route_handoff.as_ref() {
+            let _ = state.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+                message_id: request.message_id.clone(),
+                frame_sha256: frame_sha256.clone(),
+                transport_session_id: Some("test-direct-peer-handoff".to_owned()),
+                route_peer_id: Some(route_peer_id.clone()),
+            });
+        }
+        let observed_route_peer_id = route_handoff.map(|(route_peer_id, _)| route_peer_id);
+        if let Err(error) =
+            state.apply_text_delivery_receipt_for_route(request, observed_route_peer_id.as_deref())
+        {
             state.push_command_error(
                 "message.receipt_rejected",
                 "apply_text_delivery_receipt",
@@ -9260,26 +9417,42 @@ pub fn take_pending_voice_signaling_messages(
 
 /// Tauri command: attach a dedicated backend-verified Rust WebRTC DataChannel for real audio.
 pub fn start_native_voice_stream(
-    request: StartNativeVoiceMediaSessionRequest,
+    request: StartNativeVoiceStreamRequest,
 ) -> StartNativeVoiceStreamResponse {
     let service = app_service();
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard
-        .native_voice_transport_runtime
+    let active_session = guard
+        .state
+        .voice_session
         .as_ref()
-        .is_some_and(|runtime| runtime.session_id == request.session_id)
-        || guard
-            .pending_native_voice_transport_runtime
-            .as_ref()
-            .is_some_and(|pending| pending.session_id == request.session_id)
-    {
+        .map(|session| (session.session_id.as_str(), session.joined));
+    if !native_voice_start_request_is_current(active_session, &request.session_id) {
         return StartNativeVoiceStreamResponse {
             state: guard.to_view(),
             status: guard.native_voice_stream_status(&request.session_id),
         };
     }
+    let runtime_key = NativeVoiceRuntimeMapKey::from_request(&request);
+    let existing_last_error = guard
+        .native_voice_transport_runtimes
+        .get(&runtime_key)
+        .map(|runtime| runtime.last_error.as_deref());
+    let pending_failed = guard
+        .pending_native_voice_transport_runtimes
+        .get(&runtime_key)
+        .map(|pending| pending.failed);
+    if !native_voice_runtime_requires_attach(existing_last_error, pending_failed) {
+        return StartNativeVoiceStreamResponse {
+            state: guard.to_view(),
+            status: guard.native_voice_stream_status(&request.session_id),
+        };
+    }
+    guard.native_voice_transport_runtimes.remove(&runtime_key);
+    guard
+        .pending_native_voice_transport_runtimes
+        .remove(&runtime_key);
 
     let prepared = (|| {
         let session = guard
@@ -9287,15 +9460,18 @@ pub fn start_native_voice_stream(
             .voice_session
             .as_ref()
             .ok_or_else(|| "No active voice session for native Rust voice stream".to_owned())?;
-        let attachment = guard.state.native_voice_runtime_peer_attachment(session)?;
-        if attachment.local_peer_id.0 != request.local_peer_id
-            || attachment.remote_peer_id.0 != request.remote_peer_id
-        {
-            return Err(
+        let attachment = guard
+            .state
+            .native_voice_runtime_peer_attachments(session)?
+            .into_iter()
+            .find(|attachment| {
+                attachment.local_peer_id.0 == request.local_peer_id
+                    && attachment.remote_peer_id.0 == request.remote_peer_id
+            })
+            .ok_or_else(|| {
                 "Native Rust voice stream peer ids must match current provider-advertised runtime peers"
-                    .to_owned(),
-            );
-        }
+                    .to_owned()
+            })?;
         let base_inputs = guard
             .state
             .text_control_runtime_inputs_for_active_scope(None)?;
@@ -9325,15 +9501,20 @@ pub fn start_native_voice_stream(
             };
         }
     };
-    guard.native_voice_transport_runtime = None;
+    guard.native_voice_transport_runtimes.remove(&runtime_key);
     guard.native_voice_transport_error = None;
-    guard.pending_native_voice_transport_runtime = Some(PendingNativeVoiceTransportRuntime {
-        session_id: request.session_id.clone(),
-        role: attachment.role,
-        local_peer_id: request.local_peer_id.clone(),
-        remote_peer_id: request.remote_peer_id.clone(),
-        configured_stun_servers: inputs.ice_config.stun_servers.len(),
-    });
+    guard.pending_native_voice_transport_runtimes.insert(
+        runtime_key,
+        PendingNativeVoiceTransportRuntime {
+            session_id: request.session_id.clone(),
+            role: attachment.role,
+            local_peer_id: request.local_peer_id.clone(),
+            remote_peer_id: request.remote_peer_id.clone(),
+            configured_stun_servers: inputs.ice_config.stun_servers.len(),
+            failed: false,
+            last_error: None,
+        },
+    );
     if let Some(session) = &mut guard.state.voice_session {
         session.media_runtime.boundary = "native-rust-webrtc-datachannel-attaching".to_owned();
         session.media_runtime.local_capture_active = true;
@@ -9416,49 +9597,67 @@ pub fn send_native_voice_audio_frame(
     request: SendNativeVoiceAudioFrameRequest,
 ) -> SendNativeVoiceAudioFrameResponse {
     let service = app_service();
-    let (transport, executor, codec, frames_sent, runtime_muted) = {
+    let runtimes = {
         let guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(runtime) = guard
-            .native_voice_transport_runtime
-            .as_ref()
-            .filter(|runtime| runtime.session_id == request.session_id)
-        else {
+        let runtimes = guard
+            .native_voice_transport_runtimes
+            .iter()
+            .filter(|(_, runtime)| runtime.session_id == request.session_id)
+            .map(|(key, runtime)| {
+                (
+                    key.clone(),
+                    runtime.transport.clone(),
+                    runtime.executor.clone(),
+                    runtime.codec.clone(),
+                    runtime.frames_sent.clone(),
+                    runtime.muted.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if runtimes.is_empty() {
             return SendNativeVoiceAudioFrameResponse {
                 accepted: false,
                 status: guard.native_voice_stream_status(&request.session_id),
             };
-        };
-        (
-            runtime.transport.clone(),
-            runtime.executor.clone(),
-            runtime.codec.clone(),
-            runtime.frames_sent.clone(),
-            runtime.muted.clone(),
-        )
+        }
+        runtimes
     };
 
-    let send_result = send_native_voice_pcm_frame_over_transport(
-        &transport,
-        &executor,
-        &codec,
-        &frames_sent,
-        NativeVoiceOutgoingPcmFrame {
-            pcm_i16: request.pcm_i16,
-            muted: request.muted || runtime_muted.load(Ordering::Relaxed),
-            captured_at_ms: request.captured_at_ms,
-            capture_source: "webview-getusermedia-pcm",
-        },
-    );
+    let mut accepted = false;
+    let mut edge_errors = Vec::new();
+    for (key, transport, executor, codec, frames_sent, runtime_muted) in runtimes {
+        let result = send_native_voice_pcm_frame_over_transport(
+            &transport,
+            &executor,
+            &codec,
+            &frames_sent,
+            NativeVoiceOutgoingPcmFrame {
+                pcm_i16: request.pcm_i16.clone(),
+                muted: request.muted || runtime_muted.load(Ordering::Relaxed),
+                captured_at_ms: request.captured_at_ms,
+                capture_source: "webview-getusermedia-pcm",
+            },
+        );
+        match result {
+            Ok(true) => accepted = true,
+            Ok(false) => {}
+            Err(error) => edge_errors.push((key, error)),
+        }
+    }
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Err(error) = &send_result {
-        guard.native_voice_transport_error = Some(error.clone());
+    for (key, error) in edge_errors {
+        if let Some(runtime) = guard.native_voice_transport_runtimes.get_mut(&key) {
+            runtime.last_error = Some(error);
+        } else {
+            guard.native_voice_transport_error = Some(error);
+        }
     }
     SendNativeVoiceAudioFrameResponse {
-        accepted: send_result.as_ref().is_ok_and(|accepted| *accepted),
+        accepted,
         status: guard.native_voice_stream_status(&request.session_id),
     }
 }
@@ -9471,18 +9670,21 @@ pub fn take_native_voice_playback_frames(
     let guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let codec = guard
-        .native_voice_transport_runtime
-        .as_ref()
+    let limit = request.limit.unwrap_or(25).min(100);
+    let mut frames = Vec::new();
+    for codec in guard
+        .native_voice_transport_runtimes
+        .values()
         .filter(|runtime| runtime.session_id == request.session_id)
-        .map(|runtime| runtime.codec.clone());
-    let frames = codec
-        .and_then(|codec| {
-            codec.lock().ok().map(|mut codec| {
-                codec.take_playback_frames(request.limit.unwrap_or(25).clamp(1, 100))
-            })
-        })
-        .unwrap_or_default();
+        .map(|runtime| runtime.codec.clone())
+    {
+        if frames.len() >= limit {
+            break;
+        }
+        if let Ok(mut codec) = codec.lock() {
+            frames.extend(codec.take_playback_frames(limit - frames.len()));
+        }
+    }
     TakeNativeVoicePlaybackFramesResponse {
         frames,
         status: guard.native_voice_stream_status(&request.session_id),
@@ -9495,19 +9697,15 @@ pub fn stop_native_voice_stream(request: StopNativeVoiceStreamRequest) -> AppSta
     let mut guard = service
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard
-        .native_voice_transport_runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.session_id == request.session_id)
-    {
-        guard.native_voice_transport_runtime = None;
-    }
-    if guard
-        .pending_native_voice_transport_runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.session_id == request.session_id)
-    {
-        guard.pending_native_voice_transport_runtime = None;
+    guard
+        .native_voice_transport_runtimes
+        .retain(|_, runtime| runtime.session_id != request.session_id);
+    guard
+        .pending_native_voice_transport_runtimes
+        .retain(|_, runtime| runtime.session_id != request.session_id);
+    if guard.native_voice_capture_session_id.as_deref() == Some(&request.session_id) {
+        guard.native_voice_capture_runtime = None;
+        guard.native_voice_capture_session_id = None;
     }
     guard.native_voice_transport_error = None;
     if let Some(session) = &mut guard.state.voice_session {
@@ -9521,102 +9719,6 @@ pub fn stop_native_voice_stream(request: StopNativeVoiceStreamRequest) -> AppSta
     );
     guard.persist();
     guard.to_view()
-}
-
-/// Tauri command: produce a Rust-owned native voice media proof frame for signaling.
-pub fn start_native_voice_media_session(
-    request: StartNativeVoiceMediaSessionRequest,
-) -> StartNativeVoiceMediaSessionResponse {
-    let (state, native_media) = mutate_app_service_with_result(|state| {
-        match build_native_voice_media_signal(state, &request) {
-            Ok(native_media) => {
-                if let Some(session) = &mut state.voice_session {
-                    session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
-                    session.media_runtime.local_capture_active = true;
-                    session.media_runtime.fail_closed_reason = "Remote native Rust media proof has not been received yet; playback claims remain gated until a non-local protected frame arrives over backend signaling".to_owned();
-                    session.media_runtime.status_copy = format!(
-                        "Native Rust voice media generated {} Opus/SFrame frame(s) for provider-advertised peer {}; waiting for remote proof",
-                        native_media.protected_frames_count, request.remote_peer_id
-                    );
-                    session.signaling.local_peer_id = request.local_peer_id.clone();
-                    session.signaling.remote_peer_id = request.remote_peer_id.clone();
-                    session.signaling.status_copy =
-                        "Native Rust voice media proof is ready to be sealed and sent through backend text/control signaling".to_owned();
-                }
-                state.push_event(
-                    "voice.native_media_started",
-                    "Generated native Rust Opus/SFrame voice proof frame for backend signaling",
-                );
-                Some(native_media)
-            }
-            Err(error) => {
-                state.push_command_error(
-                    "voice.native_media_rejected",
-                    "start_native_voice_media_session",
-                    "native_voice_media_start_failed",
-                    error,
-                    "Join voice after current provider-advertised runtime peers are available",
-                );
-                None
-            }
-        }
-    });
-    StartNativeVoiceMediaSessionResponse {
-        state,
-        native_media,
-    }
-}
-
-/// Tauri command: accept one remote native Rust media proof delivered through backend signaling.
-pub fn accept_native_voice_media_frame(
-    request: AcceptNativeVoiceMediaFrameRequest,
-) -> AppStateView {
-    mutate_app_service(|state| {
-        if let Err(error) = accept_native_voice_media_signal_frame(state, request) {
-            state.push_command_error(
-                "voice.native_media_rejected",
-                "accept_native_voice_media_frame",
-                "native_voice_media_invalid",
-                error,
-                "Accept only non-local native Rust media proof frames delivered through backend voice signaling",
-            );
-        }
-    })
-}
-
-/// Tauri command: open and accept one remote native Rust media proof from a sealed backend voice signal.
-pub fn accept_native_voice_media_signal(
-    request: AcceptNativeVoiceMediaSignalRequest,
-) -> AppStateView {
-    mutate_app_service(
-        |state| match native_voice_media_from_sealed_signal(&request.signal) {
-            Ok(native_media) => {
-                let frame_request = AcceptNativeVoiceMediaFrameRequest {
-                    session_id: request.signal.session_id.clone(),
-                    native_media,
-                    attached_at_ms: request.attached_at_ms,
-                };
-                if let Err(error) = accept_native_voice_media_signal_frame(state, frame_request) {
-                    state.push_command_error(
-                    "voice.native_media_rejected",
-                    "accept_native_voice_media_signal",
-                    "native_voice_media_invalid",
-                    error,
-                    "Accept only non-local native Rust media proof frames delivered through sealed backend voice signaling",
-                );
-                }
-            }
-            Err(error) => {
-                state.push_command_error(
-                "voice.native_media_rejected",
-                "accept_native_voice_media_signal",
-                "native_voice_media_sealed_payload_invalid",
-                error,
-                "Accept only sealed candidate voice signaling messages containing native Rust media proof frames",
-            );
-            }
-        },
-    )
 }
 
 /// Tauri command: join a voice channel.
@@ -9691,10 +9793,12 @@ pub fn join_voice(request: JoinVoiceRequest) -> AppStateView {
             dm_id: None,
         });
         if capture_allowed {
-            let voice_runtime_attachment = state
-                .voice_session
-                .clone()
-                .and_then(|session| state.native_voice_runtime_peer_attachment(&session).ok());
+            let voice_runtime_attachment = state.voice_session.clone().and_then(|session| {
+                state
+                    .native_voice_runtime_peer_attachments(&session)
+                    .ok()
+                    .and_then(|attachments| attachments.into_iter().next())
+            });
             if let (Some(session), Some(attachment)) =
                 (&mut state.voice_session, voice_runtime_attachment)
             {
@@ -9843,9 +9947,9 @@ pub fn set_self_mute(request: SetSelfMuteRequest) -> AppStateView {
     });
     let service = app_service();
     if let Ok(guard) = service.lock() {
-        if let Some(runtime) = guard
-            .native_voice_transport_runtime
-            .as_ref()
+        for runtime in guard
+            .native_voice_transport_runtimes
+            .values()
             .filter(|runtime| runtime.session_id == session_id)
         {
             runtime.muted.store(muted, Ordering::Relaxed);
@@ -9921,30 +10025,38 @@ pub fn update_voice_activity(request: UpdateVoiceActivityRequest) -> AppStateVie
                     volume: 82,
                 });
             }
+            let media_transport_status = if session.media_runtime.remote_transport_active
+                && session.media_runtime.boundary == "native-rust-webrtc-datachannel"
+            {
+                "Backend-verified authenticated remote media is active over the direct WebRTC transport"
+            } else if session.media_runtime.remote_transport_active {
+                "Backend media-route evidence confirms remote audio is attached for playback"
+            } else if session.media_runtime.boundary == "native-rust-webrtc-datachannel" {
+                "Backend-verified direct WebRTC DataChannel is open while playback waits for authenticated remote media"
+            } else {
+                "Media playback remains gated until backend-verified authenticated frames arrive"
+            };
             session.status_copy = if self_muted {
                 format!(
-                    "Local microphone level observed at {} ms (rms {}, peak {}) but self-mute suppresses speaking state",
-                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                    "Local microphone level observed at {} ms (rms {}, peak {}) but self-mute suppresses speaking state; {media_transport_status}",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16,
                 )
             } else if evidence_speaking {
                 format!(
-                    "Local speaking indicator is driven by real microphone level evidence at {} ms (rms {}, peak {}); encrypted media transport remains gated by media-frame E2E",
-                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                    "Local speaking indicator is driven by real microphone level evidence at {} ms (rms {}, peak {}); {media_transport_status}",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16,
                 )
             } else if speaking {
                 format!(
-                    "Local speaking indicator is held briefly after verified microphone activity to avoid capture-window flicker at {} ms (rms {}, peak {})",
-                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                    "Local speaking indicator is held briefly after verified microphone activity to avoid capture-window flicker at {} ms (rms {}, peak {}); {media_transport_status}",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16,
                 )
             } else {
                 format!(
-                    "Local microphone level observed below speaking threshold at {} ms (rms {}, peak {}); encrypted media transport remains gated by media-frame E2E",
-                    request.captured_at_ms, request.rms_i16, request.peak_i16
+                    "Local microphone level observed below speaking threshold at {} ms (rms {}, peak {}); {media_transport_status}",
+                    request.captured_at_ms, request.rms_i16, request.peak_i16,
                 )
             };
-            session.route_copy =
-                "Local capture permission, device selection, and microphone level evidence are active; encrypted remote media transport remains gated by media-frame E2E"
-                    .to_owned();
             state.push_event(
                 "voice.activity",
                 format!(
@@ -10264,8 +10376,10 @@ pub fn reset_app_state_confirmed(request: ResetAppStateRequest) -> AppStateView 
         return guard.state.to_view();
     }
     guard.state = PersistedAppState::initial();
-    guard.native_voice_transport_runtime = None;
-    guard.pending_native_voice_transport_runtime = None;
+    guard.native_voice_transport_runtimes.clear();
+    guard.pending_native_voice_transport_runtimes.clear();
+    guard.native_voice_capture_runtime = None;
+    guard.native_voice_capture_session_id = None;
     guard.native_voice_transport_error = None;
     guard.state.push_event(
         "state.reset",
@@ -10282,8 +10396,10 @@ pub fn reset_app_state() -> AppStateView {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.state = PersistedAppState::initial();
-    guard.native_voice_transport_runtime = None;
-    guard.pending_native_voice_transport_runtime = None;
+    guard.native_voice_transport_runtimes.clear();
+    guard.pending_native_voice_transport_runtimes.clear();
+    guard.native_voice_capture_runtime = None;
+    guard.native_voice_capture_session_id = None;
     guard.native_voice_transport_error = None;
     guard.persist();
     guard.state.to_view()
@@ -10613,16 +10729,6 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn apply_text_delivery_receipt(
-        app_handle: tauri::AppHandle,
-        request: ApplyTextDeliveryReceiptRequest,
-    ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || {
-            super::apply_text_delivery_receipt(request)
-        })
-    }
-
-    #[tauri::command]
     pub(super) fn receive_text_delivery_envelope(
         app_handle: tauri::AppHandle,
         request: ReceiveTextDeliveryEnvelopeRequest,
@@ -10740,19 +10846,9 @@ mod ipc_commands {
     }
 
     #[tauri::command]
-    pub(super) fn start_native_voice_media_session(
-        app_handle: tauri::AppHandle,
-        request: StartNativeVoiceMediaSessionRequest,
-    ) -> StartNativeVoiceMediaSessionResponse {
-        super::run_command_with_event_emit(&app_handle, || {
-            super::start_native_voice_media_session(request)
-        })
-    }
-
-    #[tauri::command]
     pub(super) fn start_native_voice_stream(
         app_handle: tauri::AppHandle,
-        request: StartNativeVoiceMediaSessionRequest,
+        request: StartNativeVoiceStreamRequest,
     ) -> StartNativeVoiceStreamResponse {
         super::run_command_with_event_emit(&app_handle, || {
             super::start_native_voice_stream(request)
@@ -10786,26 +10882,6 @@ mod ipc_commands {
     ) -> AppStateView {
         super::run_app_state_command_with_event_emit(&app_handle, || {
             super::stop_native_voice_stream(request)
-        })
-    }
-
-    #[tauri::command]
-    pub(super) fn accept_native_voice_media_frame(
-        app_handle: tauri::AppHandle,
-        request: AcceptNativeVoiceMediaFrameRequest,
-    ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || {
-            super::accept_native_voice_media_frame(request)
-        })
-    }
-
-    #[tauri::command]
-    pub(super) fn accept_native_voice_media_signal(
-        app_handle: tauri::AppHandle,
-        request: AcceptNativeVoiceMediaSignalRequest,
-    ) -> AppStateView {
-        super::run_app_state_command_with_event_emit(&app_handle, || {
-            super::accept_native_voice_media_signal(request)
         })
     }
 
@@ -10945,7 +11021,6 @@ pub fn run() {
             ipc_commands::accept_dm_invite,
             ipc_commands::create_channel,
             ipc_commands::send_message,
-            ipc_commands::apply_text_delivery_receipt,
             ipc_commands::receive_text_delivery_envelope,
             ipc_commands::list_pending_text_control_frames,
             ipc_commands::pump_text_control_transport_once,
@@ -10958,13 +11033,10 @@ pub fn run() {
             ipc_commands::handle_text_control_frame,
             ipc_commands::publish_voice_signaling_message,
             ipc_commands::take_pending_voice_signaling_messages,
-            ipc_commands::start_native_voice_media_session,
             ipc_commands::start_native_voice_stream,
             ipc_commands::send_native_voice_audio_frame,
             ipc_commands::take_native_voice_playback_frames,
             ipc_commands::stop_native_voice_stream,
-            ipc_commands::accept_native_voice_media_frame,
-            ipc_commands::accept_native_voice_media_signal,
             ipc_commands::join_voice,
             ipc_commands::leave_voice,
             ipc_commands::set_self_mute,
@@ -11750,6 +11822,7 @@ impl PersistedAppState {
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
+                expected_route_peer_ids: Vec::new(),
                 sent_route_peer_ids: Vec::new(),
                 receipted_route_peer_ids: Vec::new(),
             });
@@ -13207,13 +13280,14 @@ impl PersistedAppState {
             existing.attempts = 0;
             existing.last_attempted_at_ms = None;
             existing.state_key = "pending".to_owned();
-            existing.route_peer_ids = route_peer_ids;
+            existing.route_peer_ids = route_peer_ids.clone();
+            existing.expected_route_peer_ids = route_peer_ids;
             existing
                 .sent_route_peer_ids
                 .retain(|peer_id| existing.route_peer_ids.contains(peer_id));
             existing
                 .receipted_route_peer_ids
-                .retain(|peer_id| existing.route_peer_ids.contains(peer_id));
+                .retain(|peer_id| existing.expected_route_peer_ids.contains(peer_id));
             return Ok(());
         }
         self.text_control_outbox.push(TextControlOutboxRecord {
@@ -13225,7 +13299,8 @@ impl PersistedAppState {
             last_attempted_at_ms: None,
             state_key: "pending".to_owned(),
             last_transport_session_id: None,
-            route_peer_ids,
+            route_peer_ids: route_peer_ids.clone(),
+            expected_route_peer_ids: route_peer_ids,
             sent_route_peer_ids: Vec::new(),
             receipted_route_peer_ids: Vec::new(),
         });
@@ -13332,16 +13407,30 @@ impl PersistedAppState {
             text_control_frame_plane(&record.frame) == TextControlFramePlane::DirectPeer
                 && record.target.group_id.as_deref() == Some(group_id)
         }) {
-            record.route_peer_ids = route_peer_ids.clone();
+            if record.expected_route_peer_ids.is_empty() && !route_peer_ids.is_empty() {
+                record.expected_route_peer_ids = route_peer_ids.clone();
+            }
+            let expected_route_peer_ids = record
+                .expected_route_peer_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            record.route_peer_ids = route_peer_ids
+                .iter()
+                .filter(|peer_id| expected_route_peer_ids.contains(peer_id.as_str()))
+                .cloned()
+                .collect();
             record
                 .sent_route_peer_ids
                 .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            let expected_route_peer_ids = record.expected_route_peer_ids.clone();
             record
                 .receipted_route_peer_ids
-                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
-            record.state_key = if !record.route_peer_ids.is_empty()
+                .retain(|peer_id| expected_route_peer_ids.contains(peer_id));
+            let expected_route_peer_ids = record.expected_route_peer_ids.clone();
+            record.state_key = if !expected_route_peer_ids.is_empty()
                 && record
-                    .route_peer_ids
+                    .expected_route_peer_ids
                     .iter()
                     .all(|peer_id| record.receipted_route_peer_ids.contains(peer_id))
             {
@@ -13367,13 +13456,26 @@ impl PersistedAppState {
                 && record.target.dm_id.as_deref() == Some(dm_id)
                 && matches!(record.frame, TextControlFrameView::Envelope { .. })
         }) {
-            record.route_peer_ids = route_peer_ids.clone();
+            if record.expected_route_peer_ids.is_empty() && !route_peer_ids.is_empty() {
+                record.expected_route_peer_ids = route_peer_ids.clone();
+            }
+            let expected_route_peer_ids = record
+                .expected_route_peer_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            record.route_peer_ids = route_peer_ids
+                .iter()
+                .filter(|peer_id| expected_route_peer_ids.contains(peer_id.as_str()))
+                .cloned()
+                .collect();
             record
                 .sent_route_peer_ids
-                .retain(|peer_id| route_peer_ids.contains(peer_id));
+                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            let expected_route_peer_ids = record.expected_route_peer_ids.clone();
             record
                 .receipted_route_peer_ids
-                .retain(|peer_id| route_peer_ids.contains(peer_id));
+                .retain(|peer_id| expected_route_peer_ids.contains(peer_id));
         }
         Ok(())
     }
@@ -13397,13 +13499,14 @@ impl PersistedAppState {
             record
                 .sent_route_peer_ids
                 .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+            let expected_route_peer_ids = record.expected_route_peer_ids.clone();
             record
                 .receipted_route_peer_ids
-                .retain(|peer_id| record.route_peer_ids.contains(peer_id));
+                .retain(|peer_id| expected_route_peer_ids.contains(peer_id));
             if record.route_peer_ids.is_empty() {
                 record.state_key = "closed_route".to_owned();
             } else if record
-                .route_peer_ids
+                .expected_route_peer_ids
                 .iter()
                 .all(|peer_id| record.receipted_route_peer_ids.contains(peer_id))
             {
@@ -13447,27 +13550,6 @@ impl PersistedAppState {
         ))
     }
 
-    fn validate_group_route_member_id(
-        &self,
-        group_id: &str,
-        member_id: &str,
-    ) -> Result<String, String> {
-        let group = self
-            .groups
-            .iter()
-            .find(|group| group.group_id == group_id)
-            .ok_or_else(|| format!("Group {group_id} is missing for route membership check"))?;
-        let member = group
-            .members
-            .iter()
-            .find(|member| member.member_id == member_id)
-            .ok_or_else(|| {
-                format!("Group {group_id} has no current member {member_id} for route receipt")
-            })?;
-        self.validate_admitted_group_route_member(group_id, group, member)?;
-        group_member_runtime_peer_id(group_id, member)
-    }
-
     fn validate_current_remote_group_route_sender(
         &self,
         group_id: &str,
@@ -13483,45 +13565,6 @@ impl PersistedAppState {
             return Err(format!(
                 "Group {group_id} route sender {} is not currently admitted/online for text route authority (status={})",
                 member.member_id, member.status
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_admitted_group_route_member(
-        &self,
-        group_id: &str,
-        group: &GroupView,
-        member: &GroupMemberView,
-    ) -> Result<(), String> {
-        if member.member_id == self.local_user_id() {
-            return Err(format!(
-                "Group {group_id} route member {} is local, not a remote route peer",
-                member.member_id
-            ));
-        }
-        if matches!(member.status.as_str(), "pending" | "revoked" | "offline") {
-            return Err(format!(
-                "Group {group_id} route member {} is not currently admitted/online for text route cleanup (status={})",
-                member.member_id, member.status
-            ));
-        }
-        let local_member = group
-            .members
-            .iter()
-            .find(|candidate| {
-                candidate.member_id == self.local_user_id()
-                    && !matches!(candidate.status.as_str(), "pending" | "revoked" | "offline")
-            })
-            .ok_or_else(|| {
-                format!("Group {group_id} has no current admitted local member for route cleanup")
-            })?;
-        let local_peer_id = group_member_runtime_peer_id(group_id, local_member)?;
-        let remote_peer_id = group_member_runtime_peer_id(group_id, member)?;
-        if remote_peer_id == local_peer_id {
-            return Err(format!(
-                "Group {group_id} route member {} resolves to the local runtime peer",
-                member.member_id
             ));
         }
         Ok(())
@@ -13545,7 +13588,14 @@ impl PersistedAppState {
         }
         let signal_kind = normalize_voice_signal_kind(&request.signal_kind)?;
         validate_voice_signal_payload(&signal_kind, &request.sealed_payload)?;
-        let attachment = self.native_voice_runtime_peer_attachment(&session)?;
+        let attachment = self
+            .native_voice_runtime_peer_attachments(&session)?
+            .into_iter()
+            .find(|attachment| attachment.remote_peer_id.0 == request.recipient_peer_id)
+            .ok_or_else(|| {
+                "Voice signaling recipient peer id does not match a current provider-advertised runtime peer"
+                    .to_owned()
+            })?;
         let local_user_id = self.local_user_id();
         let signal_id = request
             .signal_id
@@ -13563,7 +13613,7 @@ impl PersistedAppState {
             channel_id: session.channel_id.clone(),
             sender_participant_id: local_user_id,
             sender_peer_id: attachment.local_peer_id.0.clone(),
-            recipient_peer_id: attachment.remote_peer_id.0.clone(),
+            recipient_peer_id: request.recipient_peer_id,
             signal_kind: signal_kind.clone(),
             sealed_payload: request.sealed_payload,
             created_at_ms: request.created_at_ms,
@@ -13592,6 +13642,7 @@ impl PersistedAppState {
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
+                expected_route_peer_ids: Vec::new(),
                 sent_route_peer_ids: Vec::new(),
                 receipted_route_peer_ids: Vec::new(),
             });
@@ -13707,6 +13758,7 @@ impl PersistedAppState {
         if signal.sender_participant_id == local_user_id || signal.sender_peer_id.is_empty() {
             return Err("Inbound voice signal must come from a non-local provider peer".to_owned());
         }
+        self.validate_voice_signal_group_route(signal, "Inbound voice signal")?;
         Ok(())
     }
 
@@ -13728,18 +13780,26 @@ impl PersistedAppState {
                 "Pre-join voice signal must come from a non-local provider peer".to_owned(),
             );
         }
+        self.validate_voice_signal_group_route(signal, "Pre-join voice signal")
+    }
+
+    fn validate_voice_signal_group_route(
+        &self,
+        signal: &VoiceSignalingMessageView,
+        error_prefix: &str,
+    ) -> Result<(), String> {
         let group = self
             .groups
             .iter()
             .find(|group| group.group_id == signal.group_id)
-            .ok_or_else(|| "Pre-join voice signal group is not installed".to_owned())?;
+            .ok_or_else(|| format!("{error_prefix} group is not installed"))?;
         let channel = group
             .channels
             .iter()
             .find(|channel| channel.channel_id == signal.channel_id)
-            .ok_or_else(|| "Pre-join voice signal channel is not installed".to_owned())?;
+            .ok_or_else(|| format!("{error_prefix} channel is not installed"))?;
         if channel.kind != ChannelKind::Voice {
-            return Err("Pre-join voice signal channel is not a voice channel".to_owned());
+            return Err(format!("{error_prefix} channel is not a voice channel"));
         }
         let local_member_id = self.local_user_id();
         let now = Utc::now();
@@ -13751,8 +13811,7 @@ impl PersistedAppState {
                     && group_member_runtime_route_is_current(member, &local_member_id, now)
             })
             .ok_or_else(|| {
-                "Pre-join voice signal has no admitted local group member for runtime peers"
-                    .to_owned()
+                format!("{error_prefix} has no admitted local group member for runtime peers")
             })?;
         let remote_member = group
             .members
@@ -13761,15 +13820,12 @@ impl PersistedAppState {
                 member.member_id == signal.sender_participant_id
                     && group_member_runtime_route_is_current(member, &local_member_id, now)
             })
-            .ok_or_else(|| {
-                "Pre-join voice signal sender is not an admitted group member".to_owned()
-            })?;
+            .ok_or_else(|| format!("{error_prefix} sender is not an admitted group member"))?;
         let local_peer_id = group_member_runtime_peer_id(&signal.group_id, local_member)?;
         let remote_peer_id = group_member_runtime_peer_id(&signal.group_id, remote_member)?;
         if signal.recipient_peer_id != local_peer_id || signal.sender_peer_id != remote_peer_id {
             return Err(
-                "Pre-join voice signal peer ids did not match provider-advertised group member runtime peers"
-                    .to_owned(),
+                format!("{error_prefix} peer ids did not match provider-advertised group member runtime peers"),
             );
         }
         Ok(())
@@ -13791,7 +13847,9 @@ impl PersistedAppState {
             let matches_session = session_id
                 .as_ref()
                 .is_none_or(|expected| &record.signal.session_id == expected);
-            if matches_session && taken.len() < limit {
+            let matches_recipient = record.signal.recipient_peer_id == request.recipient_peer_id;
+            let matches_sender = record.signal.sender_peer_id == request.sender_peer_id;
+            if matches_session && matches_recipient && matches_sender && taken.len() < limit {
                 taken.push(record.signal);
             } else {
                 retained.push(record);
@@ -13963,31 +14021,73 @@ impl PersistedAppState {
         })
     }
 
-    fn route_peer_id_for_receipt(
+    fn receipt_recipient_authority(
         &self,
         delivery_group_id: &str,
         recipient_device_id: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<(VerifyingKey, Option<String>), String> {
+        if let Some(dm_id) = delivery_group_id.strip_prefix("dm:") {
+            let dm = self
+                .dms
+                .iter()
+                .find(|dm| dm.dm_id == dm_id)
+                .ok_or_else(|| format!("DM {dm_id} is missing for receipt verification"))?;
+            let remote = dm
+                .runtime_peers
+                .iter()
+                .find(|peer| {
+                    !peer.is_local
+                        && (peer.profile_id == recipient_device_id
+                            || peer.device_id == recipient_device_id)
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "DM {dm_id} has no established remote route identity for receipt recipient {recipient_device_id}"
+                    )
+                })?;
+            let key = verifying_key_from_hex(&remote.signer_public_key_hex)
+                .ok_or_else(|| "DM remote receipt signer key is invalid".to_owned())?;
+            return Ok((key, Some(remote.peer_id.clone())));
+        }
+
         let group_id = delivery_group_id
             .strip_prefix("group:")
             .and_then(|value| value.split_once(":channel:").map(|(group_id, _)| group_id))
             .unwrap_or(delivery_group_id);
-        let Some(group) = self.groups.iter().find(|group| group.group_id == group_id) else {
-            return Ok(None);
-        };
-        let Some(member) = group
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| format!("Group {group_id} is missing for receipt verification"))?;
+        let member = group
             .members
             .iter()
-            .find(|member| member.member_id == recipient_device_id)
-        else {
-            return Ok(None);
-        };
-        if delivery_group_id.starts_with("group:") {
-            return self
-                .validate_group_route_member_id(group_id, recipient_device_id)
-                .map(Some);
+            .find(|member| {
+                member.member_id == recipient_device_id
+                    || member.device_id.as_deref() == Some(recipient_device_id)
+            })
+            .ok_or_else(|| {
+                format!("Group {group_id} has no admitted member {recipient_device_id} for receipt verification")
+            })?;
+        if member.member_id == self.local_user_id()
+            || matches!(member.status.as_str(), "pending" | "revoked")
+        {
+            return Err(format!(
+                "Group {group_id} receipt recipient {recipient_device_id} is not an admitted remote member"
+            ));
         }
-        Ok(Some(group_member_runtime_peer_id(group_id, member)?))
+        let signer_public_key_hex = member
+            .signer_public_key_hex
+            .as_deref()
+            .ok_or_else(|| {
+                format!(
+                    "Group {group_id} receipt recipient {recipient_device_id} has no admitted signer key"
+                )
+            })?;
+        let key = verifying_key_from_hex(signer_public_key_hex)
+            .ok_or_else(|| "group member receipt signer key is invalid".to_owned())?;
+        let route_peer_id = member.runtime_peer_id.clone();
+        Ok((key, route_peer_id))
     }
 
     pub(crate) async fn pump_text_control_transport_once_for_route<T>(
@@ -14255,7 +14355,9 @@ impl PersistedAppState {
                 // setup/invite/admission command error; a stale error must not make a later peer
                 // receipt look invalid.
                 self.last_command_error = None;
-                if let Some(response_frame) = self.handle_text_control_frame(inbound_frame) {
+                if let Some(response_frame) = self
+                    .handle_text_control_frame_for_route(inbound_frame, route_peer_id.as_deref())
+                {
                     let response = match serde_json::to_vec(&response_frame) {
                         Ok(response) => response,
                         Err(error) => {
@@ -14321,17 +14423,20 @@ impl PersistedAppState {
         }
     }
 
-    fn apply_text_delivery_receipt(
+    fn apply_text_delivery_receipt_for_route(
         &mut self,
         request: ApplyTextDeliveryReceiptRequest,
+        observed_route_peer_id: Option<&str>,
     ) -> Result<(), String> {
-        let recipient_key = verifying_key_from_hex(&request.recipient_verifying_key_hex)
-            .ok_or_else(|| "recipient verifying key is invalid".to_owned())?;
         let envelope_record = self
             .text_delivery_envelopes
             .iter()
             .find(|record| record.message_id == request.message_id)
             .ok_or_else(|| "no persisted text envelope for receipt message id".to_owned())?;
+        let (recipient_key, route_peer_id) = self.receipt_recipient_authority(
+            &envelope_record.group_id,
+            &request.receipt.recipient_device_id,
+        )?;
         request
             .receipt
             .verify(
@@ -14346,10 +14451,40 @@ impl PersistedAppState {
             envelope_ciphertext_hash: hex::encode(request.receipt.envelope_ciphertext_hash),
             recipient_key_fingerprint: key_fingerprint(&recipient_key),
         };
-        let route_peer_id = self.route_peer_id_for_receipt(
-            &envelope_record.group_id,
-            &request.receipt.recipient_device_id,
-        )?;
+        let expected_route_peer_ids = self
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == request.message_id)
+            .map(|record| record.expected_route_peer_ids.clone())
+            .ok_or_else(|| "no text control outbox row for receipt message id".to_owned())?;
+        if expected_route_peer_ids.is_empty() {
+            return Err(
+                "receipt cannot be accepted without an immutable expected route set".to_owned(),
+            );
+        }
+        let route_peer_id = route_peer_id.as_ref().ok_or_else(|| {
+            "receipt recipient is not bound to an advertised runtime route".to_owned()
+        })?;
+        if !expected_route_peer_ids.contains(route_peer_id) {
+            return Err(format!(
+                "receipt recipient route {route_peer_id} was not an expected route for this message"
+            ));
+        }
+        if observed_route_peer_id != Some(route_peer_id.as_str()) {
+            return Err(format!(
+                    "receipt recipient route {route_peer_id} did not match the observed transport route"
+            ));
+        }
+        let route_was_sent = self
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == request.message_id)
+            .is_some_and(|record| record.sent_route_peer_ids.contains(route_peer_id));
+        if !route_was_sent {
+            return Err(format!(
+                "receipt recipient route {route_peer_id} has no recorded transport handoff for this message"
+            ));
+        }
         let duplicate_receipt = self.text_delivery_receipts.iter().any(|record| {
             record.message_id == request.message_id
                 && record.receipt.recipient_device_id == request.receipt.recipient_device_id
@@ -14359,33 +14494,27 @@ impl PersistedAppState {
             .iter_mut()
             .find(|record| record.message_id == request.message_id)
         {
-            if let Some(route_peer_id) = route_peer_id.as_ref() {
-                if outbox.route_peer_ids.contains(route_peer_id)
-                    && !outbox.receipted_route_peer_ids.contains(route_peer_id)
-                {
-                    outbox.receipted_route_peer_ids.push(route_peer_id.clone());
-                }
-                if outbox
-                    .route_peer_ids
-                    .iter()
-                    .all(|peer_id| outbox.receipted_route_peer_ids.contains(peer_id))
-                {
-                    outbox.state_key = "receipted".to_owned();
-                } else {
-                    outbox.state_key = "pending".to_owned();
-                }
-            } else {
+            if !outbox.receipted_route_peer_ids.contains(route_peer_id) {
+                outbox.receipted_route_peer_ids.push(route_peer_id.clone());
+            }
+            if outbox
+                .expected_route_peer_ids
+                .iter()
+                .all(|peer_id| outbox.receipted_route_peer_ids.contains(peer_id))
+            {
                 outbox.state_key = "receipted".to_owned();
+            } else {
+                outbox.state_key = "pending".to_owned();
             }
         }
         let all_routes_receipted = self
             .text_control_outbox
             .iter()
             .find(|record| record.message_id == request.message_id)
-            .is_none_or(|record| {
-                record.route_peer_ids.is_empty()
-                    || record
-                        .route_peer_ids
+            .is_some_and(|record| {
+                !record.expected_route_peer_ids.is_empty()
+                    && record
+                        .expected_route_peer_ids
                         .iter()
                         .all(|peer_id| record.receipted_route_peer_ids.contains(peer_id))
             });
@@ -14417,7 +14546,7 @@ impl PersistedAppState {
         if !duplicate_receipt {
             self.text_delivery_receipts.push(TextDeliveryReceiptRecord {
                 message_id: request.message_id.clone(),
-                recipient_verifying_key_hex: request.recipient_verifying_key_hex,
+                recipient_verifying_key_hex: hex::encode(recipient_key.as_bytes()),
                 receipt: request.receipt,
             });
         }
@@ -14844,6 +14973,7 @@ impl PersistedAppState {
                     state_key: "pending".to_owned(),
                     last_transport_session_id: None,
                     route_peer_ids: Vec::new(),
+                    expected_route_peer_ids: Vec::new(),
                     sent_route_peer_ids: Vec::new(),
                     receipted_route_peer_ids: Vec::new(),
                 }),
@@ -14868,6 +14998,14 @@ impl PersistedAppState {
     fn handle_text_control_frame(
         &mut self,
         frame: TextControlFrameView,
+    ) -> Option<TextControlFrameView> {
+        self.handle_text_control_frame_for_route(frame, None)
+    }
+
+    fn handle_text_control_frame_for_route(
+        &mut self,
+        frame: TextControlFrameView,
+        observed_route_peer_id: Option<&str>,
     ) -> Option<TextControlFrameView> {
         match frame {
             TextControlFrameView::OpenMlsAdmissionKeyPackage {
@@ -15067,11 +15205,10 @@ impl PersistedAppState {
                     sender_verifying_key_hex,
                     recipient_leaf,
                 }) {
-                    Ok((receipt, recipient_verifying_key_hex)) => {
+                    Ok((receipt, _recipient_verifying_key_hex)) => {
                         Some(TextControlFrameView::Receipt {
                             message_id,
                             receipt,
-                            recipient_verifying_key_hex,
                         })
                     }
                     Err(_) => None,
@@ -15404,15 +15541,14 @@ impl PersistedAppState {
             TextControlFrameView::Receipt {
                 message_id,
                 receipt,
-                recipient_verifying_key_hex,
             } => {
-                if let Err(error) =
-                    self.apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
+                if let Err(error) = self.apply_text_delivery_receipt_for_route(
+                    ApplyTextDeliveryReceiptRequest {
                         message_id,
                         receipt,
-                        recipient_verifying_key_hex,
-                    })
-                {
+                    },
+                    observed_route_peer_id,
+                ) {
                     self.push_command_error(
                         "message.receipt_frame_rejected",
                         "handle_text_control_frame",
@@ -15635,10 +15771,10 @@ impl PersistedAppState {
         Ok(attachments)
     }
 
-    fn native_voice_runtime_peer_attachment(
+    fn native_voice_runtime_peer_attachments(
         &self,
         session: &VoiceSessionView,
-    ) -> Result<TextControlRuntimePeerAttachment, String> {
+    ) -> Result<Vec<TextControlRuntimePeerAttachment>, String> {
         let group = self
             .groups
             .iter()
@@ -15669,34 +15805,39 @@ impl PersistedAppState {
                     .to_owned()
             })?;
         let local_peer_id = group_member_runtime_peer_id(&session.group_id, local_member)?;
-        let remote_members = group
-            .members
-            .iter()
-            .filter(|member| {
-                member.member_id != local_member_id
-                    && group_member_runtime_route_is_current(member, &local_member_id, now)
-            })
-            .collect::<Vec<_>>();
-        if let [remote_member] = remote_members.as_slice() {
+        let local_peer =
+            SignalingPeerId::new(local_peer_id.clone()).map_err(|error| error.to_string())?;
+        let mut seen_remote_peers = BTreeSet::new();
+        let mut attachments = Vec::new();
+        for remote_member in group.members.iter().filter(|member| {
+            member.member_id != local_member_id
+                && group_member_runtime_route_is_current(member, &local_member_id, now)
+        }) {
             let remote_peer_id = group_member_runtime_peer_id(&session.group_id, remote_member)?;
-            return Ok(TextControlRuntimePeerAttachment {
+            if remote_peer_id == local_peer_id {
+                return Err(
+                    "Active voice session remote runtime peer id matches the local peer".to_owned(),
+                );
+            }
+            if !seen_remote_peers.insert(remote_peer_id.clone()) {
+                return Err(
+                    "Active voice session has duplicate admitted runtime peer ids".to_owned(),
+                );
+            }
+            attachments.push(TextControlRuntimePeerAttachment {
                 role: group_text_control_runtime_role_for_edge(
                     &local_member.role,
                     &local_peer_id,
                     &remote_member.role,
                     &remote_peer_id,
                 )?,
-                local_peer_id: SignalingPeerId::new(local_peer_id)
-                    .map_err(|error| error.to_string())?,
+                local_peer_id: local_peer.clone(),
                 remote_peer_id: SignalingPeerId::new(remote_peer_id)
                     .map_err(|error| error.to_string())?,
             });
         }
-        if remote_members.len() > 1 {
-            return Err(
-                "Active voice session has multiple admitted remote group members; select one remote voice peer before opening a single native Rust media runtime"
-                    .to_owned(),
-            );
+        if !attachments.is_empty() {
+            return Ok(attachments);
         }
         Err(format!(
             "Active group {} has no admitted remote member with a provider-advertised runtime peer id",
@@ -16669,6 +16810,7 @@ impl From<&TextControlOutboxRecord> for TextControlOutboxFrameView {
             last_transport_session_id: record.last_transport_session_id.clone(),
             frame_sha256: record.frame_sha256.clone(),
             route_peer_ids: record.route_peer_ids.clone(),
+            expected_route_peer_ids: record.expected_route_peer_ids.clone(),
             sent_route_peer_ids: record.sent_route_peer_ids.clone(),
             receipted_route_peer_ids: record.receipted_route_peer_ids.clone(),
         }
@@ -18498,17 +18640,29 @@ fn device_view_from_leaf(leaf: &DeviceLeaf, local: bool, authorized: bool) -> De
     }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TestAppDbKeychain;
 
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
 fn test_app_db_keys() -> &'static Mutex<BTreeMap<String, [u8; 32]>> {
     static KEYS: OnceLock<Mutex<BTreeMap<String, [u8; 32]>>> = OnceLock::new();
     KEYS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
 impl AppDbKeychain for TestAppDbKeychain {
     fn load_wrapping_key(&mut self, key_id: &str) -> Result<Option<[u8; 32]>, AppStoreError> {
         test_app_db_keys()
@@ -18593,7 +18747,11 @@ fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
     load_state_from_store(&mut store)
 }
 
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
@@ -18611,7 +18769,10 @@ fn load_state_from_path(path: &std::path::Path) -> PersistedAppState {
     load_state_from_store(&mut store)
 }
 
-#[cfg(all(test, not(all(target_os = "linux", feature = "production-storage"))))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    not(all(target_os = "linux", feature = "production-storage"))
+))]
 fn persist_state_to_path(
     path: &std::path::Path,
     state: &PersistedAppState,
@@ -18853,81 +19014,6 @@ fn validate_voice_signal_payload(signal_kind: &str, sealed_payload: &str) -> Res
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct SealedVoiceSignalPayload {
-    #[serde(default)]
-    native_media: Option<NativeVoiceMediaSignalPayload>,
-}
-
-fn native_voice_media_from_sealed_signal(
-    signal: &VoiceSignalingMessageView,
-) -> Result<NativeVoiceMediaSignalPayload, String> {
-    if signal.signal_kind != "candidate" {
-        return Err(
-            "Native Rust media proof is carried in a candidate signaling envelope".to_owned(),
-        );
-    }
-    let payload = signal.sealed_payload.trim();
-    const PREFIX: &str = "voice-signal-sealed:v1:";
-    let sealed = payload.strip_prefix(PREFIX).ok_or_else(|| {
-        "native voice signaling payload is missing the sealed v1 prefix".to_owned()
-    })?;
-    let (nonce_text, ciphertext_text) = sealed.split_once('.').ok_or_else(|| {
-        "native voice signaling payload is missing nonce/ciphertext parts".to_owned()
-    })?;
-    let nonce_bytes = URL_SAFE_NO_PAD
-        .decode(nonce_text.as_bytes())
-        .map_err(|error| format!("native voice signaling nonce is not base64url: {error}"))?;
-    let ciphertext = URL_SAFE_NO_PAD
-        .decode(ciphertext_text.as_bytes())
-        .map_err(|error| format!("native voice signaling ciphertext is not base64url: {error}"))?;
-    if nonce_bytes.len() != 12 {
-        return Err("native voice signaling nonce must be 12 bytes".to_owned());
-    }
-    let mut peers = [
-        signal.sender_peer_id.as_str(),
-        signal.recipient_peer_id.as_str(),
-    ];
-    peers.sort_unstable();
-    let mut digest = Sha256::new();
-    digest.update(b"discrypt-voice-signal-seal-v1:");
-    digest.update(signal.session_id.as_bytes());
-    digest.update(b":");
-    digest.update(signal.group_id.as_bytes());
-    digest.update(b":");
-    digest.update(signal.channel_id.as_bytes());
-    digest.update(b":");
-    digest.update(peers[0].as_bytes());
-    digest.update(b":");
-    digest.update(peers[1].as_bytes());
-    let key = digest.finalize();
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|error| format!("native voice signaling key rejected: {error}"))?;
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
-        .map_err(|error| format!("native voice signaling decrypt failed: {error}"))?;
-    let decoded: SealedVoiceSignalPayload = serde_json::from_slice(&plaintext)
-        .map_err(|error| format!("native voice signaling payload JSON failed: {error}"))?;
-    decoded
-        .native_media
-        .ok_or_else(|| "native voice signaling payload did not contain native_media".to_owned())
-}
-
-#[derive(Default)]
-struct NativeVoiceProofSink {
-    frames: Vec<BridgeProtectedFrame>,
-}
-
-impl ProtectedMediaFrameSink for NativeVoiceProofSink {
-    fn send_protected_media_frame(
-        &mut self,
-        frame: BridgeProtectedFrame,
-    ) -> Result<(), discrypt_media::MediaError> {
-        self.frames.push(frame);
-        Ok(())
-    }
-}
-
 #[derive(Clone, Default)]
 struct NativeVoiceProtectedQueueSink {
     frames: Arc<Mutex<VecDeque<BridgeProtectedFrame>>>,
@@ -19096,7 +19182,7 @@ impl NativeVoiceCodecState {
 
     fn from_state(
         state: &PersistedAppState,
-        request: &StartNativeVoiceMediaSessionRequest,
+        request: &StartNativeVoiceStreamRequest,
     ) -> Result<Self, String> {
         let session = state
             .voice_session
@@ -19105,15 +19191,17 @@ impl NativeVoiceCodecState {
         if session.session_id != request.session_id || !session.joined {
             return Err("Native Rust voice stream requires the active joined session".to_owned());
         }
-        let attachment = state.native_voice_runtime_peer_attachment(session)?;
-        if attachment.local_peer_id.0 != request.local_peer_id
-            || attachment.remote_peer_id.0 != request.remote_peer_id
-        {
-            return Err(
+        let _attachment = state
+            .native_voice_runtime_peer_attachments(session)?
+            .into_iter()
+            .find(|attachment| {
+                attachment.local_peer_id.0 == request.local_peer_id
+                    && attachment.remote_peer_id.0 == request.remote_peer_id
+            })
+            .ok_or_else(|| {
                 "Native Rust voice stream peer ids must match current provider-advertised runtime peers"
-                    .to_owned(),
-            );
-        }
+                    .to_owned()
+            })?;
         let (epoch_secret, current_epoch) = state.openmls_media_exporter_secret(
             &session.group_id,
             &session.channel_id,
@@ -19247,359 +19335,12 @@ impl NativeVoiceCodecState {
     }
 }
 
-fn build_native_voice_media_signal(
-    state: &PersistedAppState,
-    request: &StartNativeVoiceMediaSessionRequest,
-) -> Result<NativeVoiceMediaSignalPayload, String> {
-    build_native_voice_media_signal_with_peer_boundary(state, request, true)
-}
-
-fn build_native_voice_media_signal_with_peer_boundary(
-    state: &PersistedAppState,
-    request: &StartNativeVoiceMediaSessionRequest,
-    enforce_backend_peer_boundary: bool,
-) -> Result<NativeVoiceMediaSignalPayload, String> {
-    let session = state
-        .voice_session
-        .as_ref()
-        .ok_or_else(|| "No active voice session for native Rust media".to_owned())?;
-    if session.session_id != request.session_id {
-        return Err("Native voice media request did not match the active voice session".to_owned());
-    }
-    if !session.joined {
-        return Err("Native Rust voice media requires a joined voice session".to_owned());
-    }
-    if request.local_peer_id.trim().is_empty()
-        || request.remote_peer_id.trim().is_empty()
-        || request.local_peer_id == request.remote_peer_id
-    {
-        return Err(
-            "Native Rust voice media requires distinct provider-advertised peer ids".to_owned(),
-        );
-    }
-    if enforce_backend_peer_boundary {
-        let runtime_attachment = state.native_voice_runtime_peer_attachment(session)?;
-        if runtime_attachment.local_peer_id.0 != request.local_peer_id
-            || runtime_attachment.remote_peer_id.0 != request.remote_peer_id
-        {
-            return Err(
-                "Native Rust voice media peer ids must match current provider-advertised voice runtime peers"
-                    .to_owned(),
-            );
-        }
-    }
-
-    let (epoch_secret, current_epoch) = state.openmls_media_exporter_secret(
-        &session.group_id,
-        &session.channel_id,
-        &session.session_id,
-    )?;
-    let binding = SenderBinding::derive_for_epoch(
-        &epoch_secret,
-        &session.group_id,
-        current_epoch,
-        native_voice_peer_leaf_index(&request.local_peer_id),
-        &request.local_peer_id,
-    )
-    .map_err(|error| error.to_string())?;
-    let sender =
-        SFrameSender::new(&epoch_secret, binding.clone()).map_err(|error| error.to_string())?;
-    let mut registry = MediaKeyRegistry::new();
-    registry
-        .register_sender(&epoch_secret, binding)
-        .map_err(|error| error.to_string())?;
-    let bridge = RustTransformBridge::new(
-        sender,
-        SFrameReceiver::new(registry, ReplayWindow::default()),
-    );
-    let format = AudioCaptureFormat::mono_20ms_48khz();
-    let mut pipeline = VoiceCaptureSFramePipeline::new(
-        OpusAudioEncoder::new(format).map_err(|error| error.to_string())?,
-        bridge,
-        NativeVoiceProofSink::default(),
-    );
-    pipeline.set_muted(request.muted);
-    let mut pcm = generated_native_voice_pcm(format, &request.local_peer_id);
-    apply_microphone_gain_percent(&mut pcm, state.preferences.mic_gain_percent)
-        .map_err(|error| error.to_string())?;
-    let frame = CapturedAudioFrame::new(pcm, format, request.created_at_ms)
-        .map_err(|error| error.to_string())?;
-    let outcome = pipeline
-        .capture_encode_protect_or_mute(frame)
-        .map_err(|error| error.to_string())?;
-    let report = match outcome {
-        VoiceCaptureSendOutcome::Sent(report) => report,
-        VoiceCaptureSendOutcome::Muted { .. } => {
-            return Err("Native Rust voice media proof was muted before Opus/SFrame".to_owned());
-        }
-    };
-    let sink = pipeline.into_sink();
-    if sink.frames.is_empty() {
-        return Err("Native Rust media pipeline produced no protected frames".to_owned());
-    }
-    let protected_payload_bytes = sink.frames.iter().map(|frame| frame.bytes.len()).sum();
-    let protected_frames = sink
-        .frames
-        .into_iter()
-        .map(|frame| NativeVoiceProtectedFrameView {
-            kid: frame.kid,
-            counter: frame.counter,
-            bytes: frame.bytes,
-        })
-        .collect::<Vec<_>>();
-    Ok(NativeVoiceMediaSignalPayload {
-        schema_version: "discrypt.native_voice_media.v1".to_owned(),
-        session_id: session.session_id.clone(),
-        group_id: session.group_id.clone(),
-        channel_id: session.channel_id.clone(),
-        from_peer_id: request.local_peer_id.clone(),
-        to_peer_id: request.remote_peer_id.clone(),
-        media_path: "native_rust_webrtc_datachannel".to_owned(),
-        boundary: "rust-opus-sframe-over-provider-webrtc-datachannel".to_owned(),
-        capture_source: "native-rust-generated-audio-frame".to_owned(),
-        rms_i16: report.audio_level.rms_i16,
-        peak_i16: report.audio_level.peak_i16,
-        speaking: report.audio_level.speaking,
-        opus_frames: 1,
-        protected_frames_count: protected_frames.len() as u16,
-        opus_payload_bytes: report.opus_payload_len,
-        protected_payload_bytes,
-        mic_gain_percent: state.preferences.mic_gain_percent,
-        app_output_volume_percent: state.preferences.app_output_volume_percent,
-        protected_frames,
-        created_at_ms: request.created_at_ms,
-    })
-}
-
 fn native_voice_peer_leaf_index(peer_id: &str) -> u32 {
     let mut digest = Sha256::new();
     digest.update(b"discrypt-native-voice-peer-leaf-index-v1");
     digest.update(peer_id.as_bytes());
     let hash = digest.finalize();
     u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
-}
-
-fn verify_native_voice_media_frames(
-    state: &PersistedAppState,
-    media: &NativeVoiceMediaSignalPayload,
-) -> Result<(u16, usize), String> {
-    let (epoch_secret, current_epoch) = state.openmls_media_exporter_secret(
-        &media.group_id,
-        &media.channel_id,
-        &media.session_id,
-    )?;
-    let binding = SenderBinding::derive_for_epoch(
-        &epoch_secret,
-        &media.group_id,
-        current_epoch,
-        native_voice_peer_leaf_index(&media.from_peer_id),
-        &media.from_peer_id,
-    )
-    .map_err(|error| format!("Native Rust media sender binding rejected: {error}"))?;
-    let mut registry = MediaKeyRegistry::new();
-    registry
-        .register_sender(&epoch_secret, binding.clone())
-        .map_err(|error| format!("Native Rust media key registration failed: {error}"))?;
-    let mut receiver = SFrameReceiver::new(registry, ReplayWindow::default());
-    let mut verified_frames = 0_u16;
-    let mut verified_payload_bytes = 0_usize;
-    for frame in &media.protected_frames {
-        if frame.kid != binding.kid {
-            return Err(
-                "Native Rust media frame KID is not bound to the claimed provider peer".to_owned(),
-            );
-        }
-        let verified = receiver
-            .open(&ProtectedFrame {
-                kid: frame.kid.clone(),
-                counter: frame.counter,
-                ciphertext: frame.bytes.clone(),
-            })
-            .map_err(|error| format!("Native Rust media frame authentication failed: {error}"))?;
-        if verified.binding != binding {
-            return Err(
-                "Native Rust media frame authenticated with the wrong sender binding".to_owned(),
-            );
-        }
-        if verified.plaintext.is_empty() {
-            return Err(
-                "Native Rust media frame authenticated to an empty Opus payload".to_owned(),
-            );
-        }
-        verified_frames = verified_frames.saturating_add(1);
-        verified_payload_bytes = verified_payload_bytes.saturating_add(verified.plaintext.len());
-    }
-    if verified_frames == 0 || usize::from(verified_frames) != media.protected_frames.len() {
-        return Err(
-            "Native Rust media proof did not authenticate every protected frame".to_owned(),
-        );
-    }
-    if verified_frames != media.protected_frames_count {
-        return Err(
-            "Native Rust media protected frame count does not match authenticated frames"
-                .to_owned(),
-        );
-    }
-    if verified_payload_bytes != media.opus_payload_bytes {
-        return Err(
-            "Native Rust media authenticated Opus bytes do not match the payload evidence"
-                .to_owned(),
-        );
-    }
-    Ok((verified_frames, verified_payload_bytes))
-}
-
-fn generated_native_voice_pcm(format: AudioCaptureFormat, seed: &str) -> Vec<i16> {
-    let samples = format.interleaved_samples_per_frame();
-    let seed_offset = seed
-        .bytes()
-        .fold(0_u32, |acc, byte| acc.wrapping_add(u32::from(byte)))
-        % 17;
-    (0..samples)
-        .map(|index| {
-            let phase = ((index as u32 + seed_offset) % 48) as i32;
-            let triangle = if phase < 24 { phase } else { 48 - phase };
-            ((triangle - 12) * 360) as i16
-        })
-        .collect()
-}
-
-fn accept_native_voice_media_signal_frame(
-    state: &mut PersistedAppState,
-    request: AcceptNativeVoiceMediaFrameRequest,
-) -> Result<(), String> {
-    let local_user_id = state.local_user_id();
-    let media = request.native_media;
-    {
-        let session = state
-            .voice_session
-            .as_ref()
-            .ok_or_else(|| "No active voice session for native Rust media proof".to_owned())?;
-        if session.session_id != request.session_id || session.session_id != media.session_id {
-            return Err(
-                "Native Rust media proof did not match the active voice session".to_owned(),
-            );
-        }
-        if !session.joined {
-            return Err("Native Rust media proof requires a joined voice session".to_owned());
-        }
-        if media.schema_version != "discrypt.native_voice_media.v1"
-            || media.media_path != "native_rust_webrtc_datachannel"
-            || media.group_id != session.group_id
-            || media.channel_id != session.channel_id
-            || media.from_peer_id.trim().is_empty()
-            || media.to_peer_id.trim().is_empty()
-            || media.from_peer_id == media.to_peer_id
-            || media.protected_frames.is_empty()
-            || media.protected_frames_count == 0
-            || media.opus_frames == 0
-            || media.opus_payload_bytes == 0
-            || media.protected_payload_bytes == 0
-        {
-            return Err(
-                "Native Rust media proof is missing non-local protected Opus/SFrame evidence"
-                    .to_owned(),
-            );
-        }
-        if !session.signaling.local_peer_id.is_empty()
-            && media.to_peer_id != session.signaling.local_peer_id
-        {
-            return Err(
-                "Native Rust media proof was addressed to a different provider peer".to_owned(),
-            );
-        }
-        if !session.signaling.remote_peer_id.is_empty()
-            && media.from_peer_id != session.signaling.remote_peer_id
-        {
-            return Err(
-                "Native Rust media proof did not come from the expected provider peer".to_owned(),
-            );
-        }
-    }
-    let (verified_frames, verified_opus_bytes) = verify_native_voice_media_frames(state, &media)?;
-    let session = state
-        .voice_session
-        .as_mut()
-        .ok_or_else(|| "No active voice session for native Rust media proof".to_owned())?;
-    let participant_id = media.from_peer_id.clone();
-    let existing_volume = session
-        .participants
-        .iter()
-        .find(|participant| participant.id == participant_id)
-        .map(|participant| participant.volume)
-        .unwrap_or(82);
-    if participant_id == local_user_id {
-        return Err(
-            "Native Rust remote media proof must not identify the local participant".to_owned(),
-        );
-    }
-    if let Some(participant) = session
-        .participants
-        .iter_mut()
-        .find(|participant| participant.id == participant_id)
-    {
-        participant.name = "Native Rust peer".to_owned();
-        participant.role = "remote".to_owned();
-        participant.speaking = media.speaking;
-        participant.muted = false;
-        participant.volume = existing_volume;
-    } else {
-        session.participants.push(VoiceParticipantView {
-            id: participant_id.clone(),
-            name: "Native Rust peer".to_owned(),
-            role: "remote".to_owned(),
-            speaking: media.speaking,
-            muted: false,
-            volume: existing_volume,
-        });
-    }
-
-    let remote_audio = VoiceRemoteAudioView {
-        participant_id: participant_id.clone(),
-        remote_peer_id: media.from_peer_id.clone(),
-        stream_id: format!("native-rust-stream-{}", media.from_peer_id),
-        audio_track_id: format!(
-            "native-rust-opus-sframe-{}-{}",
-            media.from_peer_id, media.protected_frames_count
-        ),
-        playback_element_id: format!("voice-native-rust-audio-{}", media.from_peer_id),
-        local_audio_tracks_sent: media.opus_frames,
-        received_audio_frames: u64::from(verified_frames),
-        attached_at_ms: request.attached_at_ms,
-    };
-    session
-        .media_runtime
-        .remote_audio
-        .retain(|audio| audio.participant_id != participant_id);
-    session.media_runtime.remote_audio.push(remote_audio);
-    session.media_runtime.boundary = "native-rust-webrtc-datachannel".to_owned();
-    session.media_runtime.local_capture_active = true;
-    session.media_runtime.remote_transport_active = true;
-    session.media_runtime.fail_closed_reason = String::new();
-    session.media_runtime.status_copy = format!(
-        "Native Rust voice media authenticated {} protected Opus/SFrame frame(s) ({} Opus bytes) from provider peer {} over backend-verified WebRTC datachannel signaling",
-        verified_frames, verified_opus_bytes, media.from_peer_id
-    );
-    session.route_copy =
-        "Native Rust Opus/SFrame media proof arrived from a non-local provider peer over backend signaling; remote voice activity is active without WebView RTCPeerConnection".to_owned();
-    session.status_copy = format!(
-        "Native Rust remote voice frame accepted at {} ms (rms {}, peak {})",
-        request.attached_at_ms, media.rms_i16, media.peak_i16
-    );
-    session.signaling.received_remote_signals =
-        session.signaling.received_remote_signals.saturating_add(1);
-    session.signaling.last_signal_kind = Some("native_media_frame".to_owned());
-    session.signaling.status_copy =
-        "Received native Rust media proof through provider-signaled backend text/control transport"
-            .to_owned();
-    state.push_event(
-        "voice.native_media_received",
-        format!(
-            "Accepted authenticated native Rust voice media proof from {} protected frame(s)",
-            verified_frames
-        ),
-    );
-    Ok(())
 }
 
 fn voice_media_runtime_for_join(
@@ -20893,9 +20634,83 @@ fn record_native_voice_capture_error(session_id: &str, error: String) {
         .as_ref()
         .is_some_and(|session| session.session_id == session_id && session.joined)
     {
-        guard.native_voice_transport_error = Some(error);
+        let mut applied = false;
+        for runtime in guard
+            .native_voice_transport_runtimes
+            .values_mut()
+            .filter(|runtime| runtime.session_id == session_id)
+        {
+            runtime.last_error = Some(error.clone());
+            applied = true;
+        }
+        if !applied {
+            guard.native_voice_transport_error = Some(error);
+        }
         guard.persist();
     }
+}
+
+fn send_native_voice_pcm_frame_to_session(
+    session_id: &str,
+    frame: NativeVoiceOutgoingPcmFrame,
+) -> Result<bool, String> {
+    let service = app_service();
+    let runtimes = {
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .native_voice_transport_runtimes
+            .iter()
+            .filter(|(_, runtime)| runtime.session_id == session_id)
+            .map(|(key, runtime)| {
+                (
+                    key.clone(),
+                    runtime.transport.clone(),
+                    runtime.executor.clone(),
+                    runtime.codec.clone(),
+                    runtime.frames_sent.clone(),
+                    runtime.muted.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if runtimes.is_empty() {
+        return Ok(false);
+    }
+    let mut accepted = false;
+    let mut errors = Vec::new();
+    for (key, transport, executor, codec, frames_sent, muted) in runtimes {
+        match send_native_voice_pcm_frame_over_transport(
+            &transport,
+            &executor,
+            &codec,
+            &frames_sent,
+            NativeVoiceOutgoingPcmFrame {
+                pcm_i16: frame.pcm_i16.clone(),
+                muted: frame.muted || muted.load(Ordering::Relaxed),
+                captured_at_ms: frame.captured_at_ms,
+                capture_source: frame.capture_source,
+            },
+        ) {
+            Ok(true) => accepted = true,
+            Ok(false) => {}
+            Err(error) => errors.push((key, error)),
+        }
+    }
+    if !errors.is_empty() {
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, error) in errors {
+            if let Some(runtime) = guard.native_voice_transport_runtimes.get_mut(&key) {
+                runtime.last_error = Some(error);
+            } else {
+                guard.native_voice_transport_error = Some(error);
+            }
+        }
+    }
+    Ok(accepted)
 }
 
 fn select_native_voice_input_device(
@@ -20939,11 +20754,6 @@ fn select_native_voice_input_device(
 
 fn start_native_voice_capture_runtime(
     session_id: String,
-    transport: Arc<dyn discrypt_transport::TextControlDataTransport>,
-    executor: Arc<tokio::runtime::Runtime>,
-    codec: Arc<Mutex<NativeVoiceCodecState>>,
-    frames_sent: Arc<AtomicU64>,
-    muted: Arc<AtomicBool>,
 ) -> Result<NativeVoiceCaptureRuntime, String> {
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel::<Result<String, String>>(1);
     let (stop_sender, stop_receiver) = std::sync::mpsc::sync_channel::<()>(1);
@@ -20974,15 +20784,11 @@ fn start_native_voice_capture_runtime(
                         captured_at_ms: frame.captured_at_ms,
                     });
                 }
-                let muted_now = muted.load(Ordering::Relaxed);
-                match send_native_voice_pcm_frame_over_transport(
-                    &transport,
-                    &executor,
-                    &codec,
-                    &frames_sent,
+                match send_native_voice_pcm_frame_to_session(
+                    &worker_session_id,
                     NativeVoiceOutgoingPcmFrame {
                         pcm_i16: frame.pcm_i16,
-                        muted: muted_now,
+                        muted: false,
                         captured_at_ms: frame.captured_at_ms,
                         capture_source: "native-system-cpal-pcm",
                     },
@@ -21124,6 +20930,7 @@ fn start_role_split_native_voice_runtime(
     local_peer_id: SignalingPeerId,
     remote_peer_id: SignalingPeerId,
     codec: Arc<Mutex<NativeVoiceCodecState>>,
+    runtime_key: NativeVoiceRuntimeMapKey,
 ) -> Result<discrypt_transport::ProviderTextControlRuntime, String> {
     executor
         .block_on(async move {
@@ -21163,7 +20970,18 @@ fn start_role_split_native_voice_runtime(
                                 }
                                 let service = app_service();
                                 if let Ok(mut guard) = service.lock() {
-                                    guard.native_voice_transport_error = Some(error.to_string());
+                                    if let Some(runtime) = guard
+                                        .native_voice_transport_runtimes
+                                        .get_mut(&runtime_key)
+                                    {
+                                        runtime.last_error = Some(error.to_string());
+                                    } else if let Some(pending) = guard
+                                        .pending_native_voice_transport_runtimes
+                                        .get_mut(&runtime_key)
+                                    {
+                                        pending.failed = true;
+                                        pending.last_error = Some(error.to_string());
+                                    }
                                 }
                                 Err(error)
                             }
@@ -21176,8 +20994,25 @@ fn start_role_split_native_voice_runtime(
         .map_err(|error| error.to_string())
 }
 
+fn record_native_voice_runtime_attach_failure(
+    guard: &mut TauriAppService,
+    runtime_key: &NativeVoiceRuntimeMapKey,
+    error: String,
+) {
+    if let Some(pending) = guard
+        .pending_native_voice_transport_runtimes
+        .get_mut(runtime_key)
+    {
+        pending.failed = true;
+        pending.last_error = Some(error);
+    } else {
+        guard.native_voice_transport_error = Some(error);
+    }
+}
+
 fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
     std::thread::spawn(move || {
+        let runtime_key = NativeVoiceRuntimeMapKey::from_request(&job.request);
         let executor = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -21189,8 +21024,11 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 let mut guard = service
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.pending_native_voice_transport_runtime = None;
-                guard.native_voice_transport_error = Some(error.to_string());
+                record_native_voice_runtime_attach_failure(
+                    &mut guard,
+                    &runtime_key,
+                    error.to_string(),
+                );
                 guard.state.push_command_error(
                     "voice.native_stream_attach_failed",
                     "start_native_voice_stream",
@@ -21209,8 +21047,11 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 let mut guard = service
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.pending_native_voice_transport_runtime = None;
-                guard.native_voice_transport_error = Some(error.to_string());
+                record_native_voice_runtime_attach_failure(
+                    &mut guard,
+                    &runtime_key,
+                    error.to_string(),
+                );
                 guard.persist();
                 return;
             }
@@ -21222,8 +21063,11 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 let mut guard = service
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.pending_native_voice_transport_runtime = None;
-                guard.native_voice_transport_error = Some(error.to_string());
+                record_native_voice_runtime_attach_failure(
+                    &mut guard,
+                    &runtime_key,
+                    error.to_string(),
+                );
                 guard.persist();
                 return;
             }
@@ -21236,6 +21080,7 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
             local_peer_id,
             remote_peer_id,
             job.codec.clone(),
+            runtime_key.clone(),
         );
         let service = app_service();
         let mut guard = service
@@ -21246,8 +21091,8 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
         match runtime_result {
             Ok(runtime) => {
                 let pending_matches = guard
-                    .pending_native_voice_transport_runtime
-                    .as_ref()
+                    .pending_native_voice_transport_runtimes
+                    .get(&runtime_key)
                     .is_some_and(|pending| {
                         pending.session_id == job.request.session_id
                             && pending.role == job.role
@@ -21258,17 +21103,20 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                     session.joined && session.session_id == job.request.session_id
                 });
                 if !pending_matches || !session_matches {
-                    guard.pending_native_voice_transport_runtime = None;
-                    guard.native_voice_transport_error = Some(
-                        "Native voice runtime attach completed after the session changed"
-                            .to_owned(),
-                    );
+                    guard
+                        .pending_native_voice_transport_runtimes
+                        .remove(&runtime_key);
                     guard.persist();
                     return;
                 }
+                let pending_last_error = guard
+                    .pending_native_voice_transport_runtimes
+                    .get(&runtime_key)
+                    .and_then(|pending| pending.last_error.clone());
                 let evidence = runtime.evidence().clone();
                 let owned_runtime = Arc::new(runtime);
                 let transport = owned_runtime.transport();
+                let receiver_runtime_key = runtime_key.clone();
                 let receiver_abort = if job.role == ProviderTextControlRuntimePeerRole::Offerer {
                     let receiver_transport = transport.clone();
                     let receiver_codec = job.codec.clone();
@@ -21280,7 +21128,15 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                             {
                                 let service = app_service();
                                 if let Ok(mut guard) = service.lock() {
-                                    guard.native_voice_transport_error = Some(error.to_string());
+                                    if let Some(runtime) = guard
+                                        .native_voice_transport_runtimes
+                                        .get_mut(&receiver_runtime_key)
+                                    {
+                                        runtime.last_error = Some(error.to_string());
+                                    } else {
+                                        guard.native_voice_transport_error =
+                                            Some(error.to_string());
+                                    }
                                 }
                                 break;
                             }
@@ -21293,18 +21149,20 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 let frames_sent = Arc::new(AtomicU64::new(0));
                 let muted = Arc::new(AtomicBool::new(job.request.muted));
                 let use_webview_capture = job.request.use_webview_capture;
-                let native_capture = if use_webview_capture {
-                    None
-                } else {
-                    match start_native_voice_capture_runtime(
-                        job.request.session_id.clone(),
-                        transport.clone(),
-                        executor.clone(),
-                        job.codec.clone(),
-                        frames_sent.clone(),
-                        muted.clone(),
-                    ) {
-                        Ok(capture) => Some(capture),
+                if !use_webview_capture
+                    && guard.native_voice_capture_session_id.as_deref()
+                        != Some(job.request.session_id.as_str())
+                {
+                    guard.native_voice_capture_runtime = None;
+                    guard.native_voice_capture_session_id = None;
+                }
+                if !use_webview_capture && guard.native_voice_capture_runtime.is_none() {
+                    match start_native_voice_capture_runtime(job.request.session_id.clone()) {
+                        Ok(capture) => {
+                            guard.native_voice_capture_session_id =
+                                Some(job.request.session_id.clone());
+                            guard.native_voice_capture_runtime = Some(capture);
+                        }
                         Err(error) => {
                             guard.native_voice_transport_error = Some(error.clone());
                             guard.state.push_command_error(
@@ -21314,35 +21172,44 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                                 error,
                                 "Verify the OS default input device is available to the installed app or select a WebView microphone",
                             );
-                            None
                         }
                     }
-                };
-                let native_capture_label = native_capture
+                }
+                let native_capture_label = guard
+                    .native_voice_capture_runtime
                     .as_ref()
+                    .filter(|_| {
+                        guard.native_voice_capture_session_id.as_deref()
+                            == Some(job.request.session_id.as_str())
+                    })
                     .map(|capture| capture.device_label.clone());
-                guard.pending_native_voice_transport_runtime = None;
-                if native_capture.is_some() || use_webview_capture {
+                guard
+                    .pending_native_voice_transport_runtimes
+                    .remove(&runtime_key);
+                if native_capture_label.is_some() || use_webview_capture {
                     guard.native_voice_transport_error = None;
                 }
-                guard.native_voice_transport_runtime = Some(NativeVoiceTransportRuntime {
-                    transport,
-                    _owned_runtime: owned_runtime,
-                    executor,
-                    codec: job.codec,
-                    session_id: job.request.session_id.clone(),
-                    role: job.role,
-                    local_peer_id: job.request.local_peer_id,
-                    remote_peer_id: job.request.remote_peer_id,
-                    configured_stun_servers,
-                    direct_path_ready: evidence.direct_path_ready,
-                    data_channel_open: evidence.data_channel_open,
-                    frames_sent,
-                    muted,
-                    use_webview_capture,
-                    native_capture,
-                    receiver_abort,
-                });
+                guard.native_voice_transport_runtimes.insert(
+                    runtime_key,
+                    NativeVoiceTransportRuntime {
+                        transport,
+                        _owned_runtime: owned_runtime,
+                        executor,
+                        codec: job.codec,
+                        session_id: job.request.session_id.clone(),
+                        role: job.role,
+                        local_peer_id: job.request.local_peer_id,
+                        remote_peer_id: job.request.remote_peer_id,
+                        configured_stun_servers,
+                        direct_path_ready: evidence.direct_path_ready,
+                        data_channel_open: evidence.data_channel_open,
+                        frames_sent,
+                        muted,
+                        last_error: pending_last_error,
+                        use_webview_capture,
+                        receiver_abort,
+                    },
+                );
                 if let Some(session) = &mut guard.state.voice_session {
                     if let Some(label) = native_capture_label.as_ref() {
                         session.input_device = Some(VoiceDeviceDescriptor::new(
@@ -21392,8 +21259,7 @@ fn spawn_native_voice_runtime_attach(job: NativeVoiceRuntimeAttachJob) {
                 );
             }
             Err(error) => {
-                guard.pending_native_voice_transport_runtime = None;
-                guard.native_voice_transport_error = Some(error.clone());
+                record_native_voice_runtime_attach_failure(&mut guard, &runtime_key, error.clone());
                 guard.state.push_command_error(
                     "voice.native_stream_attach_failed",
                     "start_native_voice_stream",
@@ -21570,6 +21436,7 @@ fn start_role_split_text_control_runtime(
     local_peer_id: SignalingPeerId,
     remote_peer_id: SignalingPeerId,
 ) -> Result<discrypt_transport::ProviderTextControlRuntime, String> {
+    let remote_peer_id_for_answerer = remote_peer_id.0.clone();
     executor
         .block_on(async move {
             match role {
@@ -21608,7 +21475,11 @@ fn start_role_split_text_control_runtime(
                                     )
                                 })?;
                                 let previous_cursor = guard.state.latest_event_cursor();
-                                let response_frame = guard.state.handle_text_control_frame(frame);
+                                let response_frame =
+                                    guard.state.handle_text_control_frame_for_route(
+                                        frame,
+                                        Some(&remote_peer_id_for_answerer),
+                                    );
                                 guard.persist();
                                 let state = guard.to_view();
                                 (response_frame, state, previous_cursor)
@@ -22151,6 +22022,7 @@ fn queue_provider_control_frame(
         state_key: "pending".to_owned(),
         last_transport_session_id: None,
         route_peer_ids: Vec::new(),
+        expected_route_peer_ids: Vec::new(),
         sent_route_peer_ids: Vec::new(),
         receipted_route_peer_ids: Vec::new(),
     });
@@ -22864,10 +22736,18 @@ fn apply_dm_presence_heartbeat(
             )
         })?
         .with_timezone(&Utc);
+    let now = Utc::now();
+    if last_seen_at > now + chrono::Duration::seconds(GROUP_PRESENCE_MAX_FUTURE_SKEW_SECONDS) {
+        return Err((
+            "presence_timestamp_future",
+            "DM presence timestamp is too far in the future".to_owned(),
+            "Reject the route and wait for a current signed presence heartbeat",
+        ));
+    }
     let ttl = presence_expires_at.signed_duration_since(last_seen_at);
     if ttl <= chrono::Duration::zero()
         || ttl > chrono::Duration::seconds(GROUP_PRESENCE_MAX_TTL_SECONDS)
-        || presence_expires_at <= Utc::now()
+        || presence_expires_at <= now
     {
         return Err((
             "presence_ttl_invalid",
@@ -22898,6 +22778,18 @@ fn apply_dm_presence_heartbeat(
             "Accept only DM route advertisements signed by the advertised identity",
         )
     })?;
+    if let Some(existing) = state.dms[dm_index]
+        .runtime_peers
+        .iter()
+        .find(|peer| !peer.is_local)
+    {
+        if DateTime::parse_from_rfc3339(&existing.last_seen_at)
+            .map(|existing_last_seen_at| existing_last_seen_at.with_timezone(&Utc) >= last_seen_at)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+    }
     if state.dms[dm_index]
         .runtime_peers
         .iter()
@@ -23054,14 +22946,23 @@ fn apply_group_presence_heartbeat(
             )
         })?
         .with_timezone(&Utc);
+    let now = Utc::now();
+    if last_seen_at > now + chrono::Duration::seconds(GROUP_PRESENCE_MAX_FUTURE_SKEW_SECONDS) {
+        return Err((
+            "presence_timestamp_future",
+            "Presence last-seen timestamp is too far in the future".to_owned(),
+            "Reject the route and wait for a current signed presence heartbeat",
+        ));
+    }
     let ttl = presence_expires_at.signed_duration_since(last_seen_at);
     if ttl <= chrono::Duration::zero()
         || ttl > chrono::Duration::seconds(GROUP_PRESENCE_MAX_TTL_SECONDS)
+        || presence_expires_at <= now
     {
         return Err((
             "presence_ttl_invalid",
-            "Presence heartbeat TTL is outside the allowed range".to_owned(),
-            "Accept only bounded positive presence leases",
+            "Presence heartbeat lease is expired or outside the allowed range".to_owned(),
+            "Accept only current bounded positive presence leases",
         ));
     }
     verify_group_presence_signature(
@@ -23088,6 +22989,16 @@ fn apply_group_presence_heartbeat(
             "Accept only presence advertisements signed by the admitted roster key",
         )
     })?;
+    if member
+        .last_seen_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|existing_last_seen_at| {
+            existing_last_seen_at.with_timezone(&Utc) >= last_seen_at
+        })
+    {
+        return Ok(false);
+    }
     let member = &mut group.members[member_index];
     if let Some(display_name) = event.display_name.filter(|value| !value.trim().is_empty()) {
         member.display_name = display_name.to_owned();
@@ -23095,7 +23006,7 @@ fn apply_group_presence_heartbeat(
     if let Some(device_id) = event.device_id.filter(|value| !value.trim().is_empty()) {
         member.device_id = Some(device_id.to_owned());
     }
-    member.status = if presence_expires_at > Utc::now() {
+    member.status = if presence_expires_at > now {
         "online"
     } else {
         "offline"
@@ -24176,8 +24087,10 @@ mod tests {
         guard.state = load_state_from_path(path);
         guard.text_control_transport_runtimes.clear();
         guard.pending_text_control_transport_runtimes.clear();
-        guard.native_voice_transport_runtime = None;
-        guard.pending_native_voice_transport_runtime = None;
+        guard.native_voice_transport_runtimes.clear();
+        guard.pending_native_voice_transport_runtimes.clear();
+        guard.native_voice_capture_runtime = None;
+        guard.native_voice_capture_session_id = None;
         guard.native_voice_transport_error = None;
     }
 
@@ -24236,6 +24149,24 @@ mod tests {
         dm_id: &str,
         peer_id: &str,
     ) -> Result<(), String> {
+        seed_remote_dm_runtime_peer_identity_for_test(
+            state,
+            dm_id,
+            peer_id,
+            "test-remote-profile",
+            "test-remote-device",
+            &"00".repeat(32),
+        )
+    }
+
+    fn seed_remote_dm_runtime_peer_identity_for_test(
+        state: &mut PersistedAppState,
+        dm_id: &str,
+        peer_id: &str,
+        profile_id: &str,
+        device_id: &str,
+        signer_public_key_hex: &str,
+    ) -> Result<(), String> {
         let dm = state
             .dms
             .iter_mut()
@@ -24258,18 +24189,35 @@ mod tests {
             role: remote_role.to_owned(),
             is_local: false,
             source: "sealed_provider_peer_advertisement_v1".to_owned(),
-            profile_id: "test-remote-profile".to_owned(),
-            signer_public_key_hex: "00".repeat(32),
-            device_id: "test-remote-device".to_owned(),
+            profile_id: profile_id.to_owned(),
+            signer_public_key_hex: signer_public_key_hex.to_owned(),
+            device_id: device_id.to_owned(),
             last_seen_at: Utc::now().to_rfc3339(),
             presence_expires_at: (Utc::now() + Duration::minutes(2)).to_rfc3339(),
         });
-        Ok(())
+        state.refresh_text_control_outbox_routes_for_dm(dm_id)
     }
 
     fn signed_dm_presence_frame_for_test(
         state: &mut PersistedAppState,
         dm_id: &str,
+    ) -> Result<TextControlFrameView, String> {
+        let now = Utc::now();
+        signed_dm_presence_frame_at_for_test(
+            state,
+            dm_id,
+            None,
+            now,
+            now + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS),
+        )
+    }
+
+    fn signed_dm_presence_frame_at_for_test(
+        state: &mut PersistedAppState,
+        dm_id: &str,
+        event_id: Option<&str>,
+        last_seen_at: DateTime<Utc>,
+        presence_expires_at: DateTime<Utc>,
     ) -> Result<TextControlFrameView, String> {
         let signing_key = SigningKey::from_bytes(&state.identity_seed_bytes());
         let signer_public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
@@ -24293,15 +24241,15 @@ mod tests {
             .find(|peer| peer.is_local)
             .cloned()
             .ok_or_else(|| "test DM local runtime peer is missing".to_owned())?;
-        let now = Utc::now();
-        let last_seen_at = now.to_rfc3339();
-        let presence_expires_at =
-            (now + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339();
-        let event_id = stable_id(
-            "dm-presence-test",
-            &format!("{scope_id_commitment}:{}", profile.user_id),
-            state.next_sequence,
-        );
+        let last_seen_at = last_seen_at.to_rfc3339();
+        let presence_expires_at = presence_expires_at.to_rfc3339();
+        let event_id = event_id.map(ToOwned::to_owned).unwrap_or_else(|| {
+            stable_id(
+                "dm-presence-test",
+                &format!("{scope_id_commitment}:{}", profile.user_id),
+                state.next_sequence,
+            )
+        });
         let signature_hex = sign_dm_presence(
             &signing_key,
             DmPresenceSignaturePayload {
@@ -24511,39 +24459,6 @@ mod tests {
         guard.clear_text_control_transport_runtime();
     }
 
-    #[cfg(feature = "harness")]
-    fn seal_native_voice_media_for_test(
-        media: &NativeVoiceMediaSignalPayload,
-    ) -> Result<String, String> {
-        let mut peers = [media.from_peer_id.as_str(), media.to_peer_id.as_str()];
-        peers.sort_unstable();
-        let mut digest = Sha256::new();
-        digest.update(b"discrypt-voice-signal-seal-v1:");
-        digest.update(media.session_id.as_bytes());
-        digest.update(b":");
-        digest.update(media.group_id.as_bytes());
-        digest.update(b":");
-        digest.update(media.channel_id.as_bytes());
-        digest.update(b":");
-        digest.update(peers[0].as_bytes());
-        digest.update(b":");
-        digest.update(peers[1].as_bytes());
-        let key = digest.finalize();
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|error| format!("test voice seal key rejected: {error}"))?;
-        let nonce = [0x56; 12];
-        let plaintext = serde_json::to_vec(&serde_json::json!({ "native_media": media }))
-            .map_err(|error| format!("test voice seal JSON failed: {error}"))?;
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
-            .map_err(|error| format!("test voice seal failed: {error}"))?;
-        Ok(format!(
-            "voice-signal-sealed:v1:{}.{}",
-            URL_SAFE_NO_PAD.encode(nonce),
-            URL_SAFE_NO_PAD.encode(ciphertext)
-        ))
-    }
-
     fn add_test_member(group_id: &str, member_id: &str, role: GroupRoleView) {
         let service = app_service();
         let mut guard = service
@@ -24600,6 +24515,16 @@ mod tests {
         member.presence_expires_at =
             Some((now + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339());
         group.runtime_peers = advertised_group_runtime_peers(&group.members, &local_member_id);
+        let has_group_outbox = guard
+            .state
+            .text_control_outbox
+            .iter()
+            .any(|record| record.target.group_id.as_deref() == Some(group_id));
+        if has_group_outbox {
+            guard
+                .state
+                .refresh_text_control_outbox_routes_for_group(group_id)?;
+        }
         guard.persist();
         Ok(())
     }
@@ -26415,6 +26340,154 @@ mod tests {
             .all(|member| member.member_id != "member-charlie"));
     }
 
+    #[test]
+    fn group_presence_rejects_older_last_seen_without_route_rollback() -> Result<(), String> {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("presence-monotonic-last-seen");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Presence Monotonic Lab".to_owned(),
+            retention: "7 days".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        let member_id = "member-bob-presence";
+        let signer = SigningKey::generate(&mut OsRng);
+        let signer_public_key_hex = hex::encode(signer.verifying_key().as_bytes());
+        let runtime_peer_id = "peer-bob-presence-monotonic";
+        add_test_member(&group_id, member_id, GroupRoleView::Member);
+        set_group_member_signer_for_test(&group_id, member_id, &signer_public_key_hex)?;
+        advertise_test_member_runtime_peer(&group_id, member_id, runtime_peer_id)?;
+
+        let before = load_state_from_path(&path);
+        let group = before
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing".to_owned())?;
+        let existing_last_seen = group
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .and_then(|member| member.last_seen_at.clone())
+            .ok_or_else(|| "member last_seen missing".to_owned())?;
+        let channel_schema_sha256 = group_channel_schema_sha256(&group.channels)?;
+        let stale_seen_at = DateTime::parse_from_rfc3339(&existing_last_seen)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Utc)
+            - Duration::seconds(30);
+        let stale_seen_at_string = stale_seen_at.to_rfc3339();
+        let stale_expires_at_string =
+            (Utc::now() + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339();
+        let event_id = "group-presence-stale-older-last-seen";
+        let signature_hex = sign_group_presence(
+            &signer,
+            GroupPresenceSignaturePayload {
+                group_id: &group_id,
+                event_id,
+                member_id,
+                display_name: Some("Bob Presence"),
+                device_id: Some("bob-presence-device"),
+                signer_public_key_hex: &signer_public_key_hex,
+                runtime_peer_id,
+                channel_schema_epoch: group.channel_schema_epoch,
+                channel_schema_sha256: &channel_schema_sha256,
+                last_seen_at: &stale_seen_at_string,
+                presence_expires_at: &stale_expires_at_string,
+            },
+        );
+        let mut service = TauriAppService::load_for_test_path(path);
+        let applied = apply_group_presence_heartbeat(
+            &mut service.state,
+            GroupPresenceHeartbeatEvent {
+                group_id: &group_id,
+                event_id,
+                member_id,
+                display_name: Some("Bob Presence"),
+                device_id: Some("bob-presence-device"),
+                signer_public_key_hex: &signer_public_key_hex,
+                runtime_peer_id,
+                channel_schema_epoch: group.channel_schema_epoch,
+                channel_schema_sha256: &channel_schema_sha256,
+                last_seen_at: &stale_seen_at_string,
+                presence_expires_at: &stale_expires_at_string,
+                signature_hex: &signature_hex,
+            },
+        )
+        .map_err(|(_, message, _)| message)?;
+        assert!(!applied);
+        let member = service.state.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| "member missing after stale presence".to_owned())?;
+        assert_eq!(
+            member.last_seen_at.as_deref(),
+            Some(existing_last_seen.as_str())
+        );
+        assert_eq!(member.runtime_peer_id.as_deref(), Some(runtime_peer_id));
+
+        let future_seen_at =
+            Utc::now() + Duration::seconds(GROUP_PRESENCE_MAX_FUTURE_SKEW_SECONDS + 60);
+        let future_seen_at_string = future_seen_at.to_rfc3339();
+        let future_expires_at_string =
+            (future_seen_at + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS)).to_rfc3339();
+        let future_event_id = "group-presence-future-last-seen";
+        let future_signature_hex = sign_group_presence(
+            &signer,
+            GroupPresenceSignaturePayload {
+                group_id: &group_id,
+                event_id: future_event_id,
+                member_id,
+                display_name: Some("Bob Presence"),
+                device_id: Some("bob-presence-device"),
+                signer_public_key_hex: &signer_public_key_hex,
+                runtime_peer_id,
+                channel_schema_epoch: group.channel_schema_epoch,
+                channel_schema_sha256: &channel_schema_sha256,
+                last_seen_at: &future_seen_at_string,
+                presence_expires_at: &future_expires_at_string,
+            },
+        );
+        assert!(matches!(
+            apply_group_presence_heartbeat(
+                &mut service.state,
+                GroupPresenceHeartbeatEvent {
+                    group_id: &group_id,
+                    event_id: future_event_id,
+                    member_id,
+                    display_name: Some("Bob Presence"),
+                    device_id: Some("bob-presence-device"),
+                    signer_public_key_hex: &signer_public_key_hex,
+                    runtime_peer_id,
+                    channel_schema_epoch: group.channel_schema_epoch,
+                    channel_schema_sha256: &channel_schema_sha256,
+                    last_seen_at: &future_seen_at_string,
+                    presence_expires_at: &future_expires_at_string,
+                    signature_hex: &future_signature_hex,
+                },
+            ),
+            Err(("presence_timestamp_future", _, _))
+        ));
+        let member = service.state.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == member_id)
+            .ok_or_else(|| "member missing after future presence".to_owned())?;
+        assert_eq!(
+            member.last_seen_at.as_deref(),
+            Some(existing_last_seen.as_str())
+        );
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct ReceiverBackedTextControlTransport {
         receiver: Mutex<TauriAppService>,
@@ -27018,6 +27091,7 @@ mod tests {
                 && invite.max_use == group_invite.max_use
         }));
 
+        let _ = backend_group_runtime_peer_ids(&group)?;
         let target = MessageTargetView {
             kind: "channel".to_owned(),
             dm_id: None,
@@ -27055,12 +27129,28 @@ mod tests {
         assert!(bob.state.messages.iter().any(|message| {
             message.message_id == message_id && message.state_key == "received_envelope"
         }));
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            let group = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .ok_or_else(|| "alice group missing before receipt".to_owned())?;
+            let remote = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id != alice_user_id)
+                .ok_or_else(|| "alice receipt remote missing".to_owned())?;
+            remote.device_id = Some(receipt.recipient_device_id.clone());
+            remote.signer_public_key_hex = Some(recipient_key_hex.clone());
+            Ok(())
+        })
+        .1?;
 
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: recipient_key_hex.clone(),
-        });
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
         let message = receipted
             .messages
             .iter()
@@ -27276,6 +27366,7 @@ mod tests {
             alice_connectivity.ice_turn_servers
         );
 
+        let _ = backend_group_runtime_peer_ids(&alice_group)?;
         let alice_target = MessageTargetView {
             kind: "channel".to_owned(),
             dm_id: None,
@@ -27305,7 +27396,6 @@ mod tests {
             .find(|record| record.message_id == alice_message.message_id)
             .ok_or_else(|| "alice native text envelope missing".to_owned())?;
 
-        let _ = backend_group_runtime_peer_ids(&alice_group)?;
         let alice_voice_joined = join_voice(JoinVoiceRequest {
             group_id: alice_group_id.clone(),
             channel_id: alice_voice_channel_id.clone(),
@@ -27485,14 +27575,15 @@ mod tests {
                 .find(|member| member.member_id != alice_profile_id)
                 .ok_or_else(|| "alice voice test remote missing before receipt".to_owned())?;
             remote.device_id = Some(receipt_device_id.clone());
+            remote.signer_public_key_hex = Some(receipt_key.clone());
             Ok(())
         })
         .1?;
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: alice_message.message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: receipt_key.clone(),
-        });
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: alice_message.message_id.clone(),
+                receipt,
+            });
         assert!(receipted.last_command_error.is_none(), "{receipted:?}");
         let alice_reloaded = load_state_from_path(&alice_path).to_view();
         assert!(alice_reloaded.messages.iter().any(|message| {
@@ -27682,6 +27773,7 @@ mod tests {
                 .map_or_else(Vec::new, |policy| { policy.ice_turn_servers.clone() })
         );
 
+        let _ = backend_group_runtime_peer_ids(&group)?;
         let target = MessageTargetView {
             kind: "channel".to_owned(),
             dm_id: None,
@@ -27948,11 +28040,27 @@ mod tests {
         }));
 
         reload_global_app_service_from_path(&alice_path);
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: recipient_verifying_key_hex.clone(),
-        });
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            let group = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .ok_or_else(|| "alice group missing before receipt".to_owned())?;
+            let remote = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id != alice_profile_id)
+                .ok_or_else(|| "alice receipt remote missing".to_owned())?;
+            remote.device_id = Some(receipt.recipient_device_id.clone());
+            remote.signer_public_key_hex = Some(recipient_verifying_key_hex.clone());
+            Ok(())
+        })
+        .1?;
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
         assert!(receipted.last_command_error.is_none(), "{receipted:?}");
         let alice_reloaded_after_receipt = load_state_from_path(&alice_path).to_view();
         let reloaded_message = alice_reloaded_after_receipt
@@ -28936,6 +29044,74 @@ mod tests {
     }
 
     #[test]
+    fn pending_invitee_can_attach_control_lane_without_direct_payload_access() {
+        let _guard = test_lock();
+        let owner_path = reset_with_temp_state("control-lane-pending-owner");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: None,
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Pending Lane Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: Some(GroupAdmissionModeView::ManualApproval),
+            adapter_kind: Some("mqtt".to_owned()),
+            signaling_endpoint: Some("mqtts://broker.emqx.io:8883".to_owned()),
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group_id = created.groups[0].group_id.clone();
+        let invite_code = create_invite(CreateInviteRequest {
+            group_id: Some(group_id.clone()),
+            expires: "1 day".to_owned(),
+            max_use: "1".to_owned(),
+            password_gate: None,
+        })
+        .invites[0]
+            .code
+            .clone();
+
+        let joiner_path = reset_with_temp_state("control-lane-pending-joiner");
+        create_user(CreateUserRequest {
+            display_name: "Bob".to_owned(),
+            device_name: None,
+        });
+        let joined = join_group(JoinGroupRequest {
+            invite_code,
+            group_name: None,
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        assert_eq!(joined.groups[0].role, "pending");
+
+        let mut joiner_service = TauriAppService::load_for_test_path(joiner_path.clone());
+        let (_, _, _, _, _, signaling_peer_id) = joiner_service
+            .broker_control_lane_attach_inputs(Some("mqtt"))
+            .expect("a signed pending invite must bootstrap the provider control lane");
+        let expected_peer_id = local_group_runtime_peer_id(&mut joiner_service.state, &group_id);
+        assert_eq!(signaling_peer_id.0, expected_peer_id);
+        let local_member = joiner_service.state.groups[0]
+            .members
+            .iter()
+            .find(|member| member.member_id == joiner_service.state.local_user_id())
+            .expect("pending local member");
+        assert_eq!(local_member.status, "pending");
+        assert!(
+            local_member.runtime_peer_id.is_none(),
+            "control-lane bootstrap must not persist an admitted payload route"
+        );
+        assert!(
+            joiner_service
+                .state
+                .active_runtime_peer_attachment_for_text_control()
+                .is_err(),
+            "pending membership must remain denied from direct text/control payload routes"
+        );
+
+        std::fs::remove_file(owner_path).ok();
+        std::fs::remove_file(joiner_path).ok();
+    }
+
+    #[test]
     fn broker_control_lane_completes_manual_admission_without_data_channel() {
         use discrypt_transport::{
             AdapterSession, LocalConformanceProviderAdapter, LocalConformanceProviderBus,
@@ -29557,6 +29733,62 @@ mod tests {
             1,
             "replaying a signed provider advertisement must be idempotent"
         );
+        let stale_last_seen = Utc::now() - Duration::seconds(30);
+        let stale_alice_presence = signed_dm_presence_frame_at_for_test(
+            &mut alice_service.state,
+            &inviter_dm_id,
+            Some("dm-presence-stale-older-last-seen"),
+            stale_last_seen,
+            stale_last_seen + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS),
+        )?;
+        assert!(bob_service
+            .state
+            .handle_text_control_frame(stale_alice_presence)
+            .is_none());
+        assert_eq!(
+            bob_service
+                .state
+                .dms
+                .iter()
+                .find(|dm| dm.dm_id == reply_dm_id)
+                .ok_or_else(|| "reply DM missing after stale presence".to_owned())?
+                .runtime_peers,
+            reply_runtime_peers,
+            "older signed DM presence heartbeat must not roll back the runtime route"
+        );
+        let future_last_seen =
+            Utc::now() + Duration::seconds(GROUP_PRESENCE_MAX_FUTURE_SKEW_SECONDS + 60);
+        let future_alice_presence = signed_dm_presence_frame_at_for_test(
+            &mut alice_service.state,
+            &inviter_dm_id,
+            Some("dm-presence-future-last-seen"),
+            future_last_seen,
+            future_last_seen + Duration::seconds(GROUP_PRESENCE_DEFAULT_TTL_SECONDS),
+        )?;
+        assert!(bob_service
+            .state
+            .handle_text_control_frame(future_alice_presence)
+            .is_none());
+        assert_eq!(
+            bob_service
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("presence_timestamp_future")
+        );
+        assert_eq!(
+            bob_service
+                .state
+                .dms
+                .iter()
+                .find(|dm| dm.dm_id == reply_dm_id)
+                .ok_or_else(|| "reply DM missing after future presence".to_owned())?
+                .runtime_peers,
+            reply_runtime_peers,
+            "future-dated signed DM presence must not poison the monotonic route lease"
+        );
+        bob_service.state.last_command_error = None;
 
         alice_service.persist();
         bob_service.persist();
@@ -31983,6 +32215,159 @@ mod tests {
     }
 
     #[test]
+    fn native_voice_runtime_peer_attachments_cover_three_remote_members() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("native-voice-three-member-attachments");
+        create_user(CreateUserRequest {
+            display_name: "Alice Owner".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Native Voice Mesh Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let voice_channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        for (member_id, peer_id) in [
+            ("bob-member", "peer-bob-native"),
+            ("carol-member", "peer-carol-native"),
+            ("dave-member", "peer-dave-native"),
+        ] {
+            add_test_member(&group.group_id, member_id, GroupRoleView::Member);
+            advertise_test_member_runtime_peer(&group.group_id, member_id, peer_id)?;
+        }
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group.group_id.clone(),
+            channel_id: voice_channel_id,
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("alice-mic".to_owned()),
+            input_device_label: Some("Alice microphone".to_owned()),
+            output_device_id: Some("alice-speaker".to_owned()),
+            output_device_label: Some("Alice speaker".to_owned()),
+        });
+        assert!(joined.last_command_error.is_none(), "{joined:?}");
+        let session = joined
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "joined voice session missing".to_owned())?;
+        let state = load_state();
+        let attachments = state.native_voice_runtime_peer_attachments(session)?;
+        let remote_peers = attachments
+            .iter()
+            .map(|attachment| attachment.remote_peer_id.0.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(remote_peers.len(), 3);
+        assert!(remote_peers.contains("peer-bob-native"));
+        assert!(remote_peers.contains("peer-carol-native"));
+        assert!(remote_peers.contains("peer-dave-native"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_voice_attach_failure_is_scoped_to_its_peer_edge() {
+        let _guard = test_lock();
+        let path = reset_with_temp_state("native-voice-peer-edge-failure");
+        let mut service = TauriAppService::load_for_test_path(path);
+        let failed_key = NativeVoiceRuntimeMapKey::new(
+            "voice-session-a".to_owned(),
+            "peer-local".to_owned(),
+            "peer-failed".to_owned(),
+        );
+        service.pending_native_voice_transport_runtimes.insert(
+            failed_key.clone(),
+            PendingNativeVoiceTransportRuntime {
+                session_id: "voice-session-a".to_owned(),
+                role: ProviderTextControlRuntimePeerRole::Offerer,
+                local_peer_id: "peer-local".to_owned(),
+                remote_peer_id: "peer-failed".to_owned(),
+                configured_stun_servers: 1,
+                failed: false,
+                last_error: None,
+            },
+        );
+        service.pending_native_voice_transport_runtimes.insert(
+            NativeVoiceRuntimeMapKey::new(
+                "voice-session-a".to_owned(),
+                "peer-local".to_owned(),
+                "peer-attaching".to_owned(),
+            ),
+            PendingNativeVoiceTransportRuntime {
+                session_id: "voice-session-a".to_owned(),
+                role: ProviderTextControlRuntimePeerRole::Answerer,
+                local_peer_id: "peer-local".to_owned(),
+                remote_peer_id: "peer-attaching".to_owned(),
+                configured_stun_servers: 1,
+                failed: false,
+                last_error: None,
+            },
+        );
+
+        record_native_voice_runtime_attach_failure(
+            &mut service,
+            &failed_key,
+            "direct path failed".to_owned(),
+        );
+        let status = service.native_voice_stream_status("voice-session-a");
+        let failed = status
+            .peer_statuses
+            .iter()
+            .find(|peer| peer.remote_peer_id == "peer-failed")
+            .expect("failed peer status");
+        let attaching = status
+            .peer_statuses
+            .iter()
+            .find(|peer| peer.remote_peer_id == "peer-attaching")
+            .expect("attaching peer status");
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.last_error.as_deref(), Some("direct path failed"));
+        assert_eq!(attaching.state, "attaching");
+        assert_eq!(attaching.last_error, None);
+    }
+
+    #[test]
+    fn native_voice_failed_runtime_is_eligible_for_fresh_attach() {
+        assert!(!native_voice_runtime_requires_attach(Some(None), None));
+        assert!(!native_voice_runtime_requires_attach(None, Some(false)));
+        assert!(native_voice_runtime_requires_attach(
+            Some(Some("data channel send failed")),
+            None,
+        ));
+        assert!(native_voice_runtime_requires_attach(None, Some(true)));
+        assert!(native_voice_runtime_requires_attach(None, None));
+    }
+
+    #[test]
+    fn stale_native_voice_start_after_leave_is_ignored() {
+        assert!(!native_voice_start_request_is_current(None, "voice-a"));
+        assert!(!native_voice_start_request_is_current(
+            Some(("voice-a", false)),
+            "voice-a",
+        ));
+        assert!(!native_voice_start_request_is_current(
+            Some(("voice-b", true)),
+            "voice-a",
+        ));
+        assert!(native_voice_start_request_is_current(
+            Some(("voice-a", true)),
+            "voice-a",
+        ));
+    }
+
+    #[test]
     fn group_runtime_peer_member_mapping_uses_explicit_advertised_ids() -> Result<(), String> {
         let _guard = test_lock();
         reset_with_temp_state("group-runtime-peer-ambiguous-role-view");
@@ -32485,6 +32870,7 @@ mod tests {
             .ok_or_else(|| "voice session missing".to_owned())?;
         let queued = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
             session_id: session_id.clone(),
+            recipient_peer_id: remote_peer.clone(),
             signal_kind: "offer".to_owned(),
             sealed_payload: "voice-signal-sealed:v2:test-offer-ciphertext-ref".to_owned(),
             signal_id: Some("voice-signal-offer-1".to_owned()),
@@ -32542,6 +32928,8 @@ mod tests {
         let taken =
             take_pending_voice_signaling_messages(TakePendingVoiceSignalingMessagesRequest {
                 session_id: Some(session_id.clone()),
+                recipient_peer_id: local_peer.clone(),
+                sender_peer_id: remote_peer.clone(),
                 limit: Some(10),
             });
         assert_eq!(taken.messages.len(), 1);
@@ -32549,6 +32937,8 @@ mod tests {
         let drained =
             take_pending_voice_signaling_messages(TakePendingVoiceSignalingMessagesRequest {
                 session_id: Some(session_id.clone()),
+                recipient_peer_id: local_peer,
+                sender_peer_id: remote_peer,
                 limit: Some(10),
             });
         assert!(drained.messages.is_empty());
@@ -32557,6 +32947,106 @@ mod tests {
             .voice_session
             .as_ref()
             .is_some_and(|session| session.signaling.role == "stopped"));
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_voice_signal_rejects_forged_sender_or_recipient_peer() -> Result<(), String> {
+        let _guard = test_lock();
+        reset_with_temp_state("voice-signaling-route-forgery");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Voice Route Forgery Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "group missing".to_owned())?;
+        let local_peer = group
+            .runtime_peers
+            .iter()
+            .find(|peer| peer.is_local)
+            .ok_or_else(|| "local runtime peer missing".to_owned())?
+            .peer_id
+            .clone();
+        let remote_peer = "peer-remote-voice-member".to_owned();
+        add_test_member(&group.group_id, "remote-member", GroupRoleView::Member);
+        advertise_test_member_runtime_peer(&group.group_id, "remote-member", &remote_peer)?;
+        let voice_channel = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Voice)
+            .ok_or_else(|| "voice channel missing".to_owned())?;
+        let joined = join_voice(JoinVoiceRequest {
+            group_id: group.group_id.clone(),
+            channel_id: voice_channel.channel_id.clone(),
+            microphone_permission: "granted".to_owned(),
+            input_device_id: Some("mic".to_owned()),
+            input_device_label: Some("Mic".to_owned()),
+            output_device_id: Some("speaker".to_owned()),
+            output_device_label: Some("Speaker".to_owned()),
+        });
+        let session_id = joined
+            .voice_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "voice session missing".to_owned())?;
+        for (signal_id, sender_peer_id, recipient_peer_id) in [
+            (
+                "voice-signal-forged-sender-peer",
+                "peer-forged-remote",
+                local_peer.as_str(),
+            ),
+            (
+                "voice-signal-forged-recipient-peer",
+                remote_peer.as_str(),
+                "peer-forged-local",
+            ),
+        ] {
+            let handled = handle_text_control_frame(HandleTextControlFrameRequest {
+                frame: TextControlFrameView::VoiceSignal {
+                    signal: VoiceSignalingMessageView {
+                        signal_id: signal_id.to_owned(),
+                        session_id: session_id.clone(),
+                        group_id: group.group_id.clone(),
+                        channel_id: voice_channel.channel_id.clone(),
+                        sender_participant_id: "remote-member".to_owned(),
+                        sender_peer_id: sender_peer_id.to_owned(),
+                        recipient_peer_id: recipient_peer_id.to_owned(),
+                        signal_kind: "answer".to_owned(),
+                        sealed_payload: "voice-signal-sealed:v2:test-forged-route".to_owned(),
+                        created_at_ms: 43,
+                    },
+                },
+            });
+            assert!(handled.response_frame.is_none());
+            assert_eq!(
+                handled
+                    .state
+                    .last_command_error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some("voice_signal_invalid")
+            );
+            assert_eq!(
+                handled
+                    .state
+                    .voice_session
+                    .as_ref()
+                    .map(|session| session.signaling.received_remote_signals),
+                Some(0)
+            );
+        }
         Ok(())
     }
 
@@ -32642,6 +33132,8 @@ mod tests {
         let taken =
             take_pending_voice_signaling_messages(TakePendingVoiceSignalingMessagesRequest {
                 session_id: Some(joined_session_id),
+                recipient_peer_id: local_peer,
+                sender_peer_id: remote_peer,
                 limit: Some(10),
             });
         assert_eq!(taken.messages.len(), 1);
@@ -32691,6 +33183,7 @@ mod tests {
             .ok_or_else(|| "voice session missing".to_owned())?;
         let rejected = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
             session_id,
+            recipient_peer_id: "peer-remote-member".to_owned(),
             signal_kind: "offer".to_owned(),
             sealed_payload: "voice-signal-sealed:v1:v=0\r\na=ice-pwd:g009\r\ncandidate:g009"
                 .to_owned(),
@@ -32918,6 +33411,25 @@ mod tests {
                     })
             })
             .unwrap_or(false));
+        let remote_route_copy = remote_attached
+            .voice_session
+            .as_ref()
+            .map(|session| session.route_copy.clone())
+            .ok_or_else(|| "remote voice route copy missing".to_owned())?;
+        let activity_after_remote_attach = update_voice_activity(UpdateVoiceActivityRequest {
+            session_id: session_id.clone(),
+            rms_i16: 2_100,
+            peak_i16: 9_200,
+            captured_at_ms: 1_280,
+        });
+        let activity_session = activity_after_remote_attach
+            .voice_session
+            .as_ref()
+            .ok_or_else(|| "voice activity session missing after remote attach".to_owned())?;
+        assert_eq!(activity_session.route_copy, remote_route_copy);
+        assert!(activity_session.status_copy.contains(
+            "Backend media-route evidence confirms remote audio is attached for playback"
+        ));
         let volume = set_speaker_volume(SetSpeakerVolumeRequest {
             session_id: session_id.clone(),
             participant_id: remote_participant_id.clone(),
@@ -33190,734 +33702,6 @@ mod tests {
                 .find(|participant| participant.role == "you"))
             .map(|participant| !participant.muted && participant.speaking)
             .unwrap_or(false));
-        Ok(())
-    }
-
-    #[test]
-    fn native_rust_voice_media_start_rejects_missing_or_unjoined_backend_session(
-    ) -> Result<(), String> {
-        let _guard = test_lock();
-        let _path = reset_with_temp_state("native-rust-voice-media-requires-session");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: None,
-        });
-        let missing = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
-            session_id: "voice-missing".to_owned(),
-            local_peer_id: "peer-local".to_owned(),
-            remote_peer_id: "peer-remote".to_owned(),
-            muted: false,
-            use_webview_capture: false,
-            created_at_ms: 40,
-        });
-        assert!(missing.native_media.is_none());
-        assert_eq!(
-            missing
-                .state
-                .last_command_error
-                .as_ref()
-                .map(|error| error.code.as_str()),
-            Some("native_voice_media_start_failed")
-        );
-        assert!(missing.state.voice_session.is_none());
-
-        let group_state = create_group(CreateGroupRequest {
-            name: "Native Voice Boundary".to_owned(),
-            retention: "7 days".to_owned(),
-            admission_mode: None,
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
-        });
-        let (local_peer_id, remote_peer_id) =
-            backend_group_runtime_peer_ids(&group_state.groups[0])?;
-        let group_id = group_state.groups[0].group_id.clone();
-        let channel_state = create_channel(CreateChannelRequest {
-            group_id: group_id.clone(),
-            name: "Ops Voice".to_owned(),
-            kind: ChannelKind::Voice,
-            retention_status: "session".to_owned(),
-        });
-        let channel_id = channel_state.groups[0]
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Voice)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "voice channel missing".to_owned())?;
-        let denied = join_voice(JoinVoiceRequest {
-            group_id,
-            channel_id,
-            microphone_permission: "denied".to_owned(),
-            input_device_id: Some("native-rust-default-capture".to_owned()),
-            input_device_label: Some("Native Rust capture source".to_owned()),
-            output_device_id: Some("native-rust-default-playback".to_owned()),
-            output_device_label: Some("Native Rust playback sink".to_owned()),
-        });
-        let session_id = denied
-            .voice_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "unjoined voice session missing".to_owned())?;
-        assert!(!denied
-            .voice_session
-            .as_ref()
-            .map(|session| session.joined)
-            .unwrap_or(true));
-        let unjoined = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
-            session_id,
-            local_peer_id,
-            remote_peer_id,
-            muted: false,
-            use_webview_capture: false,
-            created_at_ms: 41,
-        });
-        assert!(unjoined.native_media.is_none());
-        assert!(unjoined
-            .state
-            .last_command_error
-            .as_ref()
-            .map(|error| error.message.contains("requires a joined voice session"))
-            .unwrap_or(false));
-        assert!(!unjoined
-            .state
-            .events
-            .iter()
-            .any(|event| event.kind == "voice.native_media_started"));
-        Ok(())
-    }
-
-    #[test]
-    fn native_rust_voice_media_start_rejects_non_backend_runtime_peers() -> Result<(), String> {
-        let _guard = test_lock();
-        let _path = reset_with_temp_state("native-rust-voice-media-backend-peers");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: None,
-        });
-        let group_state = create_group(CreateGroupRequest {
-            name: "Native Voice Peer Boundary".to_owned(),
-            retention: "7 days".to_owned(),
-            admission_mode: None,
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
-        });
-        let _ = backend_group_runtime_peer_ids(&group_state.groups[0])?;
-        let group_id = group_state.groups[0].group_id.clone();
-        let channel_state = create_channel(CreateChannelRequest {
-            group_id: group_id.clone(),
-            name: "Ops Voice".to_owned(),
-            kind: ChannelKind::Voice,
-            retention_status: "session".to_owned(),
-        });
-        let channel_id = channel_state.groups[0]
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Voice)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "voice channel missing".to_owned())?;
-        let joined = join_voice(JoinVoiceRequest {
-            group_id,
-            channel_id,
-            microphone_permission: "granted".to_owned(),
-            input_device_id: Some("native-rust-default-capture".to_owned()),
-            input_device_label: Some("Native Rust capture source".to_owned()),
-            output_device_id: Some("native-rust-default-playback".to_owned()),
-            output_device_label: Some("Native Rust playback sink".to_owned()),
-        });
-        let session_id = joined
-            .voice_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "voice session missing".to_owned())?;
-        let rejected = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
-            session_id,
-            local_peer_id: "peer-ui-supplied-local".to_owned(),
-            remote_peer_id: "peer-ui-supplied-remote".to_owned(),
-            muted: false,
-            use_webview_capture: false,
-            created_at_ms: 42,
-        });
-        assert!(rejected.native_media.is_none());
-        assert!(rejected
-            .state
-            .last_command_error
-            .as_ref()
-            .map(|error| error
-                .message
-                .contains("must match current provider-advertised voice runtime peers"))
-            .unwrap_or(false));
-        assert!(!rejected
-            .state
-            .events
-            .iter()
-            .any(|event| event.kind == "voice.native_media_started"));
-        Ok(())
-    }
-
-    #[test]
-    fn native_rust_voice_media_proof_attaches_remote_without_webview_rtc() -> Result<(), String> {
-        let _guard = test_lock();
-        let _path = reset_with_temp_state("native-rust-voice-media");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: None,
-        });
-        let group_state = create_group(CreateGroupRequest {
-            name: "Native Voice Lab".to_owned(),
-            retention: "7 days".to_owned(),
-            admission_mode: None,
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
-        });
-        let (local_peer_id, remote_peer_id) =
-            backend_group_runtime_peer_ids(&group_state.groups[0])?;
-        let group_id = group_state.groups[0].group_id.clone();
-        let channel_state = create_channel(CreateChannelRequest {
-            group_id: group_id.clone(),
-            name: "Ops Voice".to_owned(),
-            kind: ChannelKind::Voice,
-            retention_status: "session".to_owned(),
-        });
-        let channel_id = channel_state.groups[0]
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Voice)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "voice channel missing".to_owned())?;
-        let joined = join_voice(JoinVoiceRequest {
-            group_id,
-            channel_id,
-            microphone_permission: "granted".to_owned(),
-            input_device_id: Some("native-rust-default-capture".to_owned()),
-            input_device_label: Some("Native Rust capture source".to_owned()),
-            output_device_id: Some("native-rust-default-playback".to_owned()),
-            output_device_label: Some("Native Rust playback sink".to_owned()),
-        });
-        let session_id = joined
-            .voice_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "voice session missing".to_owned())?;
-        let joined_session = joined
-            .voice_session
-            .as_ref()
-            .ok_or_else(|| "voice session missing".to_owned())?;
-        assert_eq!(joined_session.signaling.local_peer_id, local_peer_id);
-        assert_eq!(joined_session.signaling.remote_peer_id, remote_peer_id);
-        let started = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
-            session_id: session_id.clone(),
-            local_peer_id: local_peer_id.clone(),
-            remote_peer_id: remote_peer_id.clone(),
-            muted: false,
-            use_webview_capture: false,
-            created_at_ms: 42,
-        });
-        let local_media = started
-            .native_media
-            .ok_or_else(|| "native media proof missing".to_owned())?;
-        assert_eq!(local_media.media_path, "native_rust_webrtc_datachannel");
-        assert_eq!(local_media.from_peer_id, local_peer_id);
-        assert_eq!(local_media.to_peer_id, remote_peer_id);
-        assert_eq!(local_media.protected_frames_count, 1);
-        assert!(local_media.opus_payload_bytes > 0);
-        assert!(local_media.protected_payload_bytes > 0);
-        assert_eq!(local_media.mic_gain_percent, default_app_audio_percent());
-        assert_eq!(
-            local_media.app_output_volume_percent,
-            default_app_audio_percent()
-        );
-        assert!(started
-            .state
-            .events
-            .iter()
-            .any(|event| event.kind == "voice.native_media_started"));
-
-        let mut forged_relabel = local_media.clone();
-        forged_relabel.from_peer_id = "peer-bob".to_owned();
-        forged_relabel.to_peer_id = "peer-alice".to_owned();
-        let rejected = accept_native_voice_media_frame(AcceptNativeVoiceMediaFrameRequest {
-            session_id: session_id.clone(),
-            native_media: forged_relabel,
-            attached_at_ms: 83,
-        });
-        assert!(
-            rejected
-                .last_command_error
-                .as_ref()
-                .map(|error| error.message.contains("KID")
-                    || error.message.contains("authentication")
-                    || error.message.contains("sender binding")
-                    || error
-                        .message
-                        .contains("addressed to a different provider peer"))
-                .unwrap_or(false),
-            "relabeled protected frame must fail peer boundary or authentication/binding"
-        );
-
-        let remote_media = with_state(|state| {
-            build_native_voice_media_signal_with_peer_boundary(
-                state,
-                &StartNativeVoiceMediaSessionRequest {
-                    session_id: session_id.clone(),
-                    local_peer_id: remote_peer_id,
-                    remote_peer_id: local_peer_id,
-                    muted: false,
-                    use_webview_capture: false,
-                    created_at_ms: 43,
-                },
-                false,
-            )
-        })?;
-        let accepted = accept_native_voice_media_frame(AcceptNativeVoiceMediaFrameRequest {
-            session_id,
-            native_media: remote_media,
-            attached_at_ms: 84,
-        });
-        assert!(
-            accepted.last_command_error.is_none(),
-            "accept failed: {:?}",
-            accepted.last_command_error
-        );
-        let runtime = accepted
-            .voice_session
-            .as_ref()
-            .map(|session| session.media_runtime.clone())
-            .ok_or_else(|| "accepted voice session missing".to_owned())?;
-        assert_eq!(runtime.boundary, "native-rust-webrtc-datachannel");
-        assert!(runtime.remote_transport_active);
-        assert_eq!(runtime.remote_audio.len(), 1);
-        assert!(accepted
-            .events
-            .iter()
-            .any(|event| event.kind == "voice.native_media_received"));
-        Ok(())
-    }
-
-    #[test]
-    fn native_voice_media_uses_persisted_microphone_gain() -> Result<(), String> {
-        let _guard = test_lock();
-        let _path = reset_with_temp_state("native-rust-voice-media-gain");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: None,
-        });
-        let preferences = save_preferences(SavePreferencesRequest {
-            theme_id: DEFAULT_THEME_ID.to_owned(),
-            template_id: DEFAULT_TEMPLATE_ID.to_owned(),
-            voice_input_device_id: None,
-            voice_output_device_id: None,
-            mic_gain_percent: Some(0),
-            app_output_volume_percent: Some(44),
-        });
-        assert_eq!(preferences.preferences.mic_gain_percent, 0);
-        assert_eq!(preferences.preferences.app_output_volume_percent, 44);
-        let group_state = create_group(CreateGroupRequest {
-            name: "Native Gain Lab".to_owned(),
-            retention: "7 days".to_owned(),
-            admission_mode: None,
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
-        });
-        let (local_peer_id, remote_peer_id) =
-            backend_group_runtime_peer_ids(&group_state.groups[0])?;
-        let group_id = group_state.groups[0].group_id.clone();
-        let channel_state = create_channel(CreateChannelRequest {
-            group_id: group_id.clone(),
-            name: "Ops Voice".to_owned(),
-            kind: ChannelKind::Voice,
-            retention_status: "session".to_owned(),
-        });
-        let channel_id = channel_state.groups[0]
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Voice)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "voice channel missing".to_owned())?;
-        let joined = join_voice(JoinVoiceRequest {
-            group_id,
-            channel_id,
-            microphone_permission: "granted".to_owned(),
-            input_device_id: Some("gain-mic".to_owned()),
-            input_device_label: Some("Gain microphone".to_owned()),
-            output_device_id: Some("gain-speaker".to_owned()),
-            output_device_label: Some("Gain speaker".to_owned()),
-        });
-        let session_id = joined
-            .voice_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "voice session missing".to_owned())?;
-        let started = start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
-            session_id,
-            local_peer_id,
-            remote_peer_id,
-            muted: false,
-            use_webview_capture: false,
-            created_at_ms: 4_200,
-        });
-        let media = started
-            .native_media
-            .ok_or_else(|| "native media proof missing".to_owned())?;
-        assert_eq!(media.mic_gain_percent, 0);
-        assert_eq!(media.app_output_volume_percent, 44);
-        assert_eq!(media.rms_i16, 0);
-        assert_eq!(media.peak_i16, 0);
-        assert!(!media.speaking);
-        assert!(media.opus_payload_bytes > 0);
-        assert!(media.protected_payload_bytes > 0);
-        let reloaded = load_state().to_view();
-        assert_eq!(reloaded.preferences.mic_gain_percent, 0);
-        assert_eq!(reloaded.preferences.app_output_volume_percent, 44);
-        Ok(())
-    }
-
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "provider-signaled WebRTC loopback media proof is runner-dependent outside Linux CI"
-    )]
-    #[cfg(feature = "harness")]
-    #[test]
-    fn native_voice_signal_traverses_provider_signaled_text_control_runtime() -> Result<(), String>
-    {
-        let _guard = test_lock();
-        let alice_path = reset_with_temp_state("per56-provider-voice-alice");
-        create_user(CreateUserRequest {
-            display_name: "Alice PER56".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let created = create_group(CreateGroupRequest {
-            name: "PER56 Voice Lab".to_owned(),
-            retention: "24 hours".to_owned(),
-            admission_mode: None,
-            adapter_kind: Some("mqtt".to_owned()),
-            signaling_endpoint: Some("mqtt://127.0.0.1:1883".to_owned()),
-            ice_stun_servers: Some(vec!["stun:127.0.0.1:3478".to_owned()]),
-            ice_turn_servers: None,
-        });
-        assert!(created.last_command_error.is_none(), "{created:?}");
-        let alice_group = created
-            .groups
-            .first()
-            .cloned()
-            .ok_or_else(|| "alice group missing".to_owned())?;
-        let (alice_peer_id, bob_peer_id) = backend_group_runtime_peer_ids(&alice_group)?;
-        let group_id = alice_group.group_id.clone();
-        let channel_id = alice_group
-            .channels
-            .iter()
-            .find(|channel| channel.kind == ChannelKind::Voice)
-            .map(|channel| channel.channel_id.clone())
-            .ok_or_else(|| "voice channel missing".to_owned())?;
-        let invited = create_invite(CreateInviteRequest {
-            group_id: Some(group_id.clone()),
-            expires: "1 day".to_owned(),
-            max_use: "2".to_owned(),
-            password_gate: None,
-        });
-        assert!(invited.last_command_error.is_none(), "{invited:?}");
-        let invite_code = invited
-            .invites
-            .iter()
-            .find(|invite| invite.group_id == group_id)
-            .map(|invite| invite.code.clone())
-            .ok_or_else(|| "group invite missing".to_owned())?;
-
-        let (bob_path, mut bob_service) = join_group_invite_as_test_profile(
-            "per56-provider-voice-bob",
-            "Bob PER56",
-            "Bob laptop",
-            invite_code,
-            "PER56 Voice Lab",
-        )?;
-        let bob_package = bob_service.request_openmls_admission_key_package(&group_id)?;
-        let mut alice_admission_service = TauriAppService::load_for_test_path(alice_path.clone());
-        let bob_welcome = alice_admission_service.issue_openmls_admission_welcome(&bob_package)?;
-        bob_service.join_openmls_group_from_welcome(&bob_welcome)?;
-        bob_service.state.upsert_admitted_group_member(
-            &group_id,
-            &bob_package.member_identity,
-            &bob_package.signer_public_key_hex,
-        );
-        bob_service.persist();
-        reload_global_app_service_from_path(&bob_path);
-        let bob_joined = join_voice(JoinVoiceRequest {
-            group_id: group_id.clone(),
-            channel_id: channel_id.clone(),
-            microphone_permission: "granted".to_owned(),
-            input_device_id: Some("native-rust-default-capture".to_owned()),
-            input_device_label: Some("Native Rust capture source".to_owned()),
-            output_device_id: Some("native-rust-default-playback".to_owned()),
-            output_device_label: Some("Native Rust playback sink".to_owned()),
-        });
-        assert!(bob_joined.last_command_error.is_none(), "{bob_joined:?}");
-        let bob_session_id = bob_joined
-            .voice_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "bob voice session missing".to_owned())?;
-        let bob_live_service = {
-            let service = app_service();
-            let guard = service
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            TauriAppService {
-                state: guard.state.clone(),
-                text_control_transport_runtimes: BTreeMap::new(),
-                pending_text_control_transport_runtimes: BTreeMap::new(),
-                native_voice_transport_runtime: None,
-                pending_native_voice_transport_runtime: None,
-                native_voice_transport_error: None,
-                state_path_override: Some(bob_path.clone()),
-            }
-        };
-
-        reload_global_app_service_from_path(&alice_path);
-        let alice_joined = join_voice(JoinVoiceRequest {
-            group_id: group_id.clone(),
-            channel_id: channel_id.clone(),
-            microphone_permission: "granted".to_owned(),
-            input_device_id: Some("native-rust-default-capture".to_owned()),
-            input_device_label: Some("Native Rust capture source".to_owned()),
-            output_device_id: Some("native-rust-default-playback".to_owned()),
-            output_device_label: Some("Native Rust playback sink".to_owned()),
-        });
-        assert!(
-            alice_joined.last_command_error.is_none(),
-            "{alice_joined:?}"
-        );
-        let session_id = alice_joined
-            .voice_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "alice voice session missing".to_owned())?;
-        assert_eq!(session_id, bob_session_id);
-        let started_native =
-            start_native_voice_media_session(StartNativeVoiceMediaSessionRequest {
-                session_id: session_id.clone(),
-                local_peer_id: alice_peer_id.clone(),
-                remote_peer_id: bob_peer_id.clone(),
-                muted: false,
-                use_webview_capture: false,
-                created_at_ms: 1_700_000_000_056,
-            });
-        assert!(
-            started_native.state.last_command_error.is_none(),
-            "{started_native:?}"
-        );
-        let native_media = started_native
-            .native_media
-            .ok_or_else(|| "native media proof missing".to_owned())?;
-        let sealed_payload = seal_native_voice_media_for_test(&native_media)?;
-        let queued = publish_voice_signaling_message(PublishVoiceSignalingMessageRequest {
-            session_id: session_id.clone(),
-            signal_kind: "candidate".to_owned(),
-            sealed_payload,
-            signal_id: Some("per56-native-voice-signal".to_owned()),
-            created_at_ms: 1_700_000_000_057,
-        });
-        assert!(queued.last_command_error.is_none(), "{queued:?}");
-        assert_eq!(
-            queued
-                .voice_session
-                .as_ref()
-                .map(|session| session.signaling.pending_local_signals),
-            Some(1)
-        );
-
-        let text_started = start_text_session(StartTextSessionRequest {
-            scope_label: Some("per56-provider-voice-route".to_owned()),
-            data_channel_probe: false,
-            adapter_kind: Some("mqtt".to_owned()),
-        });
-        assert!(
-            text_started.last_command_error.is_none(),
-            "{text_started:?}"
-        );
-        let text_session_id = load_state()
-            .text_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "alice text session missing".to_owned())?;
-        let mut alice_sender = load_state();
-        let (scope_level, connectivity) =
-            alice_sender.active_connectivity_policy().ok_or_else(|| {
-                "alice active connectivity policy missing for provider runtime".to_owned()
-            })?;
-        let profile_view = alice_sender
-            .select_signaling_profile(&connectivity, Some(SignalingAdapterKind::Mqtt))
-            .ok_or_else(|| "alice mqtt signaling profile missing".to_owned())?;
-        let profile = transport_profile_from_view(&profile_view)?;
-        let scope = ConversationScope::new(scope_level, connectivity.scope_id_commitment.clone())
-            .map_err(|error| error.to_string())?;
-        let ice_config =
-            ice_config_from_connectivity(&connectivity).map_err(|error| error.to_string())?;
-        let mut negotiation_config =
-            discrypt_transport::WebRtcNegotiationConfig::new(ice_config).host_only();
-        negotiation_config.udp_addrs = vec!["127.0.0.1:0".to_owned()];
-        let bootstrap_secret = shared_runtime_material(
-            "discrypt-per56-local-provider-runtime-bootstrap-v1",
-            &connectivity,
-            &profile.profile_id,
-            32,
-        );
-        let random_entropy = shared_runtime_material(
-            "discrypt-per56-local-provider-runtime-entropy-v1",
-            &connectivity,
-            &profile.profile_id,
-            16,
-        );
-        let alice_peer =
-            SignalingPeerId::new(alice_peer_id.clone()).map_err(|error| error.to_string())?;
-        let bob_peer =
-            SignalingPeerId::new(bob_peer_id.clone()).map_err(|error| error.to_string())?;
-        let bob_answerer = Arc::new(Mutex::new(bob_live_service));
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|error| format!("per56 provider runtime failed to start: {error}"))?;
-        let (report, evidence, provider_visible_material) = runtime.block_on(async {
-            let answerer_service = bob_answerer.clone();
-            let (provider_runtime, bus) =
-                discrypt_transport::start_local_conformance_provider_webrtc_text_control_runtime_pair_between_peers_with_answerer(
-                    SignalingAdapterKind::Mqtt,
-                    profile,
-                    scope,
-                    &bootstrap_secret,
-                    &random_entropy,
-                    negotiation_config,
-                    alice_peer,
-                    bob_peer,
-                    move |received| {
-                        let frame: TextControlFrameView = serde_json::from_slice(&received)
-                            .map_err(|error| {
-                                TransportError::Unavailable(format!(
-                                    "bob could not decode PER56 provider text/control frame: {error}"
-                                ))
-                            })?;
-                        let mut response_frame = None;
-                        answerer_service
-                            .lock()
-                            .map_err(|_| {
-                                TransportError::Unavailable(
-                                    "bob provider answerer service lock poisoned".to_owned(),
-                                )
-                            })?
-                            .mutate(|state| {
-                                response_frame = state.handle_text_control_frame(frame);
-                            });
-                        let Some(response_frame) = response_frame else {
-                            return Ok(Vec::new());
-                        };
-                        serde_json::to_vec(&response_frame).map_err(|error| {
-                            TransportError::Unavailable(format!(
-                                "bob could not encode PER56 provider response frame: {error}"
-                            ))
-                        })
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let evidence = provider_runtime.evidence().clone();
-            let report = alice_sender
-                .pump_text_control_transport_once(
-                    provider_runtime.transport().as_ref(),
-                    ListPendingTextControlFramesRequest {
-                        target: Some(MessageTargetView {
-                            kind: "channel".to_owned(),
-                            dm_id: None,
-                            group_id: Some(group_id.clone()),
-                            channel_id: Some(channel_id.clone()),
-                        }),
-                        limit: Some(1),
-                        operation_timeout_ms: Some(10_000),
-                    },
-                    text_session_id.clone(),
-                )
-                .await;
-            let provider_visible_material = bus.relay_visible_material_for_tests();
-            provider_runtime
-                .close()
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((report, evidence, provider_visible_material))
-        })?;
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.pending_before, 1);
-        assert_eq!(report.frames_sent, 1);
-        assert_eq!(report.response_frames_received, 0);
-        assert!(report.metrics.open, "{report:?}");
-        assert!(evidence.offerer_direct_path_ready);
-        assert!(evidence.answerer_direct_path_ready);
-        assert!(evidence.offerer_data_channel_open);
-        assert!(evidence.answerer_data_channel_open);
-        for material in provider_visible_material {
-            for forbidden in [
-                b"per56-native-voice-signal".as_slice(),
-                b"voice-signal-sealed".as_slice(),
-                b"native_rust_webrtc_datachannel".as_slice(),
-                b"rust-opus-sframe".as_slice(),
-                b"candidate".as_slice(),
-                b"v=0".as_slice(),
-            ] {
-                assert!(
-                    !material
-                        .windows(forbidden.len())
-                        .any(|window| window == forbidden),
-                    "provider-visible material leaked voice/media marker"
-                );
-            }
-        }
-
-        let accepted = {
-            let mut bob = bob_answerer
-                .lock()
-                .map_err(|_| "bob provider answerer service lock poisoned".to_owned())?;
-            let backend_proof_signals = bob.state.take_pending_voice_signaling_messages(
-                TakePendingVoiceSignalingMessagesRequest {
-                    session_id: Some(session_id.clone()),
-                    limit: Some(10),
-                },
-            );
-            assert_eq!(backend_proof_signals.len(), 1, "{backend_proof_signals:?}");
-            assert_eq!(
-                backend_proof_signals[0].signal_id,
-                "per56-native-voice-signal"
-            );
-            assert_eq!(backend_proof_signals[0].signal_kind, "candidate");
-            assert_eq!(backend_proof_signals[0].sender_peer_id, alice_peer_id);
-            assert_eq!(backend_proof_signals[0].recipient_peer_id, bob_peer_id);
-            let remote_media = native_voice_media_from_sealed_signal(&backend_proof_signals[0])?;
-            accept_native_voice_media_signal_frame(
-                &mut bob.state,
-                AcceptNativeVoiceMediaFrameRequest {
-                    session_id: backend_proof_signals[0].session_id.clone(),
-                    native_media: remote_media,
-                    attached_at_ms: 1_700_000_000_058,
-                },
-            )?;
-            bob.persist();
-            bob.state.to_view()
-        };
-        let media_runtime = accepted
-            .voice_session
-            .as_ref()
-            .map(|session| session.media_runtime.clone())
-            .ok_or_else(|| "bob accepted voice session missing".to_owned())?;
-        assert_eq!(media_runtime.boundary, "native-rust-webrtc-datachannel");
-        assert!(media_runtime.remote_transport_active);
-        assert_eq!(media_runtime.remote_audio.len(), 1);
-        assert!(accepted
-            .events
-            .iter()
-            .any(|event| event.kind == "voice.native_media_received"));
         Ok(())
     }
 
@@ -34649,7 +34433,7 @@ mod tests {
         let sent = send_message(SendMessageRequest {
             target: MessageTargetView {
                 kind: "dm".to_owned(),
-                dm_id: Some(dm_id),
+                dm_id: Some(dm_id.clone()),
                 group_id: None,
                 channel_id: None,
             },
@@ -34677,12 +34461,23 @@ mod tests {
             &recipient_signer,
         )
         .map_err(|error| error.to_string())?;
+        mutate_app_service_with_result(|state| {
+            seed_remote_dm_runtime_peer_identity_for_test(
+                state,
+                &dm_id,
+                "bob-runtime-peer",
+                "bob-desktop",
+                "bob-desktop",
+                &hex::encode(recipient_signer.verifying_key().as_bytes()),
+            )
+        })
+        .1?;
 
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: hex::encode(recipient_signer.verifying_key().as_bytes()),
-        });
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
 
         assert!(receipted.last_command_error.is_none());
         let message = receipted
@@ -34712,7 +34507,7 @@ mod tests {
         let sent = send_message(SendMessageRequest {
             target: MessageTargetView {
                 kind: "dm".to_owned(),
-                dm_id: Some(dm_id),
+                dm_id: Some(dm_id.clone()),
                 group_id: None,
                 channel_id: None,
             },
@@ -34753,12 +34548,24 @@ mod tests {
             &bob_signer,
         )
         .map_err(|error| error.to_string())?;
+        let bob_user_id = bob.state.local_user_id();
+        mutate_app_service_with_result(|state| {
+            seed_remote_dm_runtime_peer_identity_for_test(
+                state,
+                &dm_id,
+                "bob-runtime-peer",
+                &bob_user_id,
+                &bob_user_id,
+                &hex::encode(bob_signer.verifying_key().as_bytes()),
+            )
+        })
+        .1?;
 
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: hex::encode(bob_signer.verifying_key().as_bytes()),
-        });
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
 
         assert!(receipted.last_command_error.is_none());
         let message = receipted
@@ -34792,7 +34599,7 @@ mod tests {
         let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_id),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
@@ -34841,6 +34648,7 @@ mod tests {
                 && message.state_key == "received_envelope"));
         let recipient_key = verifying_key_from_hex(&recipient_key_hex)
             .ok_or_else(|| "recipient key should decode".to_owned())?;
+        let bob_user_id = bob.state.local_user_id();
         receipt
             .verify(
                 &envelope_record.group_id,
@@ -34848,12 +34656,23 @@ mod tests {
                 &recipient_key,
             )
             .map_err(|error| error.to_string())?;
+        mutate_app_service_with_result(|state| {
+            seed_remote_dm_runtime_peer_identity_for_test(
+                state,
+                &dm_id,
+                "bob-runtime-peer",
+                &bob_user_id,
+                &bob_user_id,
+                &recipient_key_hex,
+            )
+        })
+        .1?;
 
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: recipient_key_hex,
-        });
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
         let message = receipted
             .messages
             .iter()
@@ -35265,7 +35084,7 @@ mod tests {
         let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_id),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
@@ -35333,7 +35152,7 @@ mod tests {
         let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_id),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
@@ -35378,24 +35197,52 @@ mod tests {
         let TextControlFrameView::Receipt {
             message_id: receipt_message_id,
             receipt,
-            recipient_verifying_key_hex,
         } = response
         else {
             return Err("expected receipt response frame".to_owned());
         };
         assert_eq!(receipt_message_id, message_id);
+        let bob_signer_hex = hex::encode(
+            SigningKey::from_bytes(&bob.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        let bob_user_id = bob.state.local_user_id();
 
         let service = app_service();
         let mut guard = service
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let response = guard
+        seed_remote_dm_runtime_peer_identity_for_test(
+            &mut guard.state,
+            &dm_id,
+            "bob-runtime-peer",
+            &bob_user_id,
+            &bob_user_id,
+            &bob_signer_hex,
+        )?;
+        let frame_sha256 = guard
             .state
-            .handle_text_control_frame(TextControlFrameView::Receipt {
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .map(|record| record.frame_sha256.clone())
+            .ok_or_else(|| "outbox frame missing before receipt handoff".to_owned())?;
+        guard
+            .state
+            .mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+                message_id: message_id.clone(),
+                frame_sha256,
+                transport_session_id: Some("text-session-test:bob-runtime-peer".to_owned()),
+                route_peer_id: Some("bob-runtime-peer".to_owned()),
+            })?;
+        let response = guard.state.handle_text_control_frame_for_route(
+            TextControlFrameView::Receipt {
                 message_id: receipt_message_id,
                 receipt,
-                recipient_verifying_key_hex,
-            });
+            },
+            Some("bob-runtime-peer"),
+        );
         assert!(response.is_none());
         let alice_view = guard.state.to_view();
         let message = alice_view
@@ -35422,7 +35269,7 @@ mod tests {
         let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_id),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
@@ -35463,7 +35310,7 @@ mod tests {
         let receipt_frame =
             receipt_frame.ok_or_else(|| "receiver should return receipt frame".to_owned())?;
 
-        let bob_reloaded = TauriAppService::load_for_test_path(bob_path);
+        let mut bob_reloaded = TauriAppService::load_for_test_path(bob_path);
         let bob_view = bob_reloaded.state.to_view();
         assert!(bob_view.messages.iter().any(|message| {
             message.message_id == message_id && message.state_key == "received_envelope"
@@ -35473,9 +35320,40 @@ mod tests {
             .text_delivery_receipts
             .iter()
             .any(|receipt| receipt.message_id == message_id));
+        let bob_signer_hex = hex::encode(
+            SigningKey::from_bytes(&bob_reloaded.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        let bob_user_id = bob_reloaded.state.local_user_id();
 
-        let (_alice_view, response) =
-            mutate_app_service_with_result(|state| state.handle_text_control_frame(receipt_frame));
+        let (_alice_view, response) = mutate_app_service_with_result(
+            |state| -> Result<Option<TextControlFrameView>, String> {
+                seed_remote_dm_runtime_peer_identity_for_test(
+                    state,
+                    &dm_id,
+                    "bob-runtime-peer",
+                    &bob_user_id,
+                    &bob_user_id,
+                    &bob_signer_hex,
+                )?;
+                let frame_sha256 = state
+                    .text_control_outbox
+                    .iter()
+                    .find(|record| record.message_id == message_id)
+                    .map(|record| record.frame_sha256.clone())
+                    .ok_or_else(|| "outbox frame missing before receipt handoff".to_owned())?;
+                state.mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+                    message_id: message_id.clone(),
+                    frame_sha256,
+                    transport_session_id: Some("text-session-test:bob-runtime-peer".to_owned()),
+                    route_peer_id: Some("bob-runtime-peer".to_owned()),
+                })?;
+                Ok(state
+                    .handle_text_control_frame_for_route(receipt_frame, Some("bob-runtime-peer")))
+            },
+        );
+        let response = response?;
         assert!(response.is_none());
 
         let alice_reloaded = load_state_from_path(&alice_path);
@@ -35500,9 +35378,10 @@ mod tests {
         let dm_state = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
         });
+        let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
@@ -35551,12 +35430,42 @@ mod tests {
         let dm_state = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
         });
+        let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
+
+        let bob_path = fresh_state_path("text-control-outbox-receipted-bob");
+        let _ = fs::remove_file(&bob_path);
+        let mut bob = TauriAppService::load_for_test_path(bob_path);
+        bob.mutate(|state| {
+            state.create_user(
+                CreateUserRequest {
+                    display_name: "Bob".to_owned(),
+                    device_name: Some("Bob laptop".to_owned()),
+                },
+                false,
+            );
+        });
+        mutate_app_service_with_result(|state| {
+            seed_remote_dm_runtime_peer_identity_for_test(
+                state,
+                &dm_id,
+                "bob-runtime-peer",
+                &bob.state.local_user_id(),
+                &bob.state.local_user_id(),
+                &hex::encode(
+                    SigningKey::from_bytes(&bob.state.identity_seed_bytes())
+                        .verifying_key()
+                        .as_bytes(),
+                ),
+            )
+        })
+        .1?;
+
         let sent = send_message(SendMessageRequest {
             target,
             body: "outbox sent then receipt".to_owned(),
@@ -35579,7 +35488,7 @@ mod tests {
             message_id: message_id.clone(),
             frame_sha256: outbox_frame.frame_sha256.clone(),
             transport_session_id: Some("text-session-test".to_owned()),
-            route_peer_id: None,
+            route_peer_id: Some("bob-runtime-peer".to_owned()),
         });
         assert!(marked.last_command_error.is_none());
         let marked_message = marked
@@ -35588,38 +35497,32 @@ mod tests {
             .find(|message| message.message_id == message_id)
             .ok_or_else(|| "marked message row missing".to_owned())?;
         assert_eq!(marked_message.state_key, "transport_frame_sent");
-        assert!(
+        let awaiting_receipt =
             list_pending_text_control_frames(ListPendingTextControlFramesRequest {
                 target: None,
                 limit: None,
                 operation_timeout_ms: None,
-            })
-            .frames
-            .is_empty()
+            });
+        assert_eq!(
+            awaiting_receipt
+                .frames
+                .iter()
+                .find(|frame| frame.message_id == message_id)
+                .map(|frame| frame.state_key.as_str()),
+            Some("sent")
         );
 
-        let bob_path = fresh_state_path("text-control-outbox-receipted-bob");
-        let _ = fs::remove_file(&bob_path);
-        let mut bob = TauriAppService::load_for_test_path(bob_path);
-        bob.mutate(|state| {
-            state.create_user(
-                CreateUserRequest {
-                    display_name: "Bob".to_owned(),
-                    device_name: Some("Bob laptop".to_owned()),
-                },
-                false,
-            );
-        });
         let receipt_frame = bob
             .state
             .handle_text_control_frame(outbox_frame.frame)
             .ok_or_else(|| "receiver should return receipt frame".to_owned())?;
-        let handled = handle_text_control_frame(HandleTextControlFrameRequest {
-            frame: receipt_frame,
-        });
-        assert!(handled.state.last_command_error.is_none());
+        let handled = mutate_app_service_with_result(|state| {
+            state.handle_text_control_frame_for_route(receipt_frame, Some("bob-runtime-peer"));
+            state.to_view()
+        })
+        .0;
+        assert!(handled.last_command_error.is_none());
         let receipted_message = handled
-            .state
             .messages
             .iter()
             .find(|message| message.message_id == message_id)
@@ -35648,9 +35551,10 @@ mod tests {
         let dm_state = start_dm(StartDmRequest {
             display_name: "Bob".to_owned(),
         });
+        let dm_id = dm_state.dms[0].dm_id.clone();
         let target = MessageTargetView {
             kind: "dm".to_owned(),
-            dm_id: Some(dm_state.dms[0].dm_id.clone()),
+            dm_id: Some(dm_id.clone()),
             group_id: None,
             channel_id: None,
         };
@@ -35674,7 +35578,24 @@ mod tests {
                 false,
             );
         });
+        let bob_user_id = bob.state.local_user_id();
+        let bob_signer_hex = hex::encode(
+            SigningKey::from_bytes(&bob.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
         let transport = Arc::new(ReceiverBackedTextControlTransport::new(bob));
+        mutate_app_service_with_result(|state| {
+            seed_remote_dm_runtime_peer_identity_for_test(
+                state,
+                &dm_id,
+                "bob-runtime-peer",
+                &bob_user_id,
+                &bob_user_id,
+                &bob_signer_hex,
+            )
+        })
+        .1?;
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("text-control-transport-trait-test".to_owned()),
             data_channel_probe: false,
@@ -35686,7 +35607,19 @@ mod tests {
             .as_ref()
             .map(|session| session.session_id.clone())
             .expect("text session should be active after start_text_session");
-        attach_text_control_transport_runtime_for_test(transport.clone(), active_session_id);
+        let local_peer_id = load_state()
+            .dms
+            .iter()
+            .find(|dm| dm.dm_id == dm_id)
+            .and_then(|dm| dm.runtime_peers.iter().find(|peer| peer.is_local))
+            .map(|peer| peer.peer_id.clone())
+            .ok_or_else(|| "local DM runtime peer id missing".to_owned())?;
+        attach_peer_text_control_transport_runtime_for_test(
+            transport.clone(),
+            active_session_id,
+            local_peer_id,
+            "bob-runtime-peer",
+        );
 
         let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
             target: Some(target),
@@ -36164,6 +36097,7 @@ mod tests {
                     state_key: state_key.to_owned(),
                     last_transport_session_id: Some("stale-session".to_owned()),
                     route_peer_ids: Vec::new(),
+                    expected_route_peer_ids: Vec::new(),
                     sent_route_peer_ids: Vec::new(),
                     receipted_route_peer_ids: Vec::new(),
                 });
@@ -36896,6 +36830,12 @@ mod tests {
             &[(&carol_id, "Carol Stale")],
             "p7-t06 stale receipt",
         )?;
+        let carol_signer_hex = hex::encode(
+            SigningKey::from_bytes(&carol_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer_hex)?;
         let receipt_frame = carol_service
             .state
             .handle_text_control_frame(frame)
@@ -36916,6 +36856,328 @@ mod tests {
             .ok_or_else(|| "outbox missing after stale receipt".to_owned())?;
         assert_ne!(outbox.state_key, "receipted");
         assert!(outbox.receipted_route_peer_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_group_receipt_from_wrong_transport_route_is_rejected() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("receipt-wrong-route-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Wrong Route".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Wrong Route Receipt Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (_bob_path, _bob_service, bob_id) =
+            create_text_receiver_profile("receipt-wrong-route-bob", "Bob Route")?;
+        let (_carol_path, mut carol_service, carol_id) =
+            create_text_receiver_profile("receipt-wrong-route-carol", "Carol Route")?;
+        reload_global_app_service_from_path(&alice_path);
+        let (_target, message_id, _routes, frame) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(&bob_id, "Bob Route"), (&carol_id, "Carol Route")],
+            "valid receipt must match observed route",
+        )?;
+        let carol_signer_hex = hex::encode(
+            SigningKey::from_bytes(&carol_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer_hex)?;
+        let loaded = load_state();
+        let bob_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, &bob_id)?;
+        let receipt_frame = carol_service
+            .state
+            .handle_text_control_frame(frame)
+            .ok_or_else(|| "carol should return a valid receipt".to_owned())?;
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let response = guard
+            .state
+            .handle_text_control_frame_for_route(receipt_frame, Some(&bob_route));
+        assert!(response.is_none());
+        let error = guard
+            .state
+            .last_command_error
+            .as_ref()
+            .ok_or_else(|| "wrong-route receipt should be rejected".to_owned())?;
+        assert_eq!(error.code, "receipt_frame_verification_failed");
+        let outbox = guard
+            .state
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing".to_owned())?;
+        assert_ne!(outbox.state_key, "receipted");
+        assert!(outbox.receipted_route_peer_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_group_receipt_survives_live_route_churn_when_expected_route_is_frozen(
+    ) -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("receipt-live-route-churn-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Route Churn".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Route Churn Receipt Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (_carol_path, mut carol_service, carol_id) =
+            create_text_receiver_profile("receipt-live-route-churn-carol", "Carol Route Churn")?;
+        reload_global_app_service_from_path(&alice_path);
+        let (_target, message_id, _routes, frame) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(&carol_id, "Carol Route Churn")],
+            "valid receipt must use immutable expected route",
+        )?;
+        let carol_signer_hex = hex::encode(
+            SigningKey::from_bytes(&carol_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer_hex)?;
+        let loaded = load_state();
+        let carol_route = route_peer_id_for_member_in_state(&loaded, &group.group_id, &carol_id)?;
+        let receipt_frame = carol_service
+            .state
+            .handle_text_control_frame(frame)
+            .ok_or_else(|| "carol should return a valid receipt".to_owned())?;
+
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let frame_sha256 = guard
+            .state
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .map(|outbox| {
+                assert_eq!(outbox.expected_route_peer_ids, vec![carol_route.clone()]);
+                outbox.frame_sha256.clone()
+            })
+            .ok_or_else(|| "outbox missing before route churn".to_owned())?;
+
+        let response = guard
+            .state
+            .handle_text_control_frame_for_route(receipt_frame.clone(), Some(&carol_route));
+        assert!(response.is_none());
+        assert_eq!(
+            guard
+                .state
+                .last_command_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("receipt_frame_verification_failed")
+        );
+        guard.state.last_command_error = None;
+
+        guard
+            .state
+            .mark_text_control_frame_sent(MarkTextControlFrameSentRequest {
+                message_id: message_id.clone(),
+                frame_sha256,
+                transport_session_id: Some("route-churn-session".to_owned()),
+                route_peer_id: Some(carol_route.clone()),
+            })?;
+        guard
+            .state
+            .text_control_outbox
+            .iter_mut()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing before live route churn".to_owned())?
+            .route_peer_ids
+            .clear();
+        let response = guard
+            .state
+            .handle_text_control_frame_for_route(receipt_frame, Some(&carol_route));
+        assert!(response.is_none());
+        assert!(
+            guard.state.last_command_error.is_none(),
+            "{:?}",
+            guard.state.last_command_error
+        );
+        let outbox = guard
+            .state
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing after receipt".to_owned())?;
+        assert_eq!(outbox.receipted_route_peer_ids, vec![carol_route]);
+        assert_eq!(outbox.state_key, "receipted");
+        let message = guard
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| "message missing after receipt".to_owned())?;
+        assert_eq!(message.state_key, "peer_receipt");
+        Ok(())
+    }
+
+    #[test]
+    fn group_text_outbox_does_not_expand_to_peer_admitted_after_enqueue() -> Result<(), String> {
+        let _guard = test_lock();
+        let alice_path = reset_with_temp_state("group-outbox-frozen-routes-alice");
+        create_user(CreateUserRequest {
+            display_name: "Alice Frozen Routes".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let created = create_group(CreateGroupRequest {
+            name: "Frozen Route Lab".to_owned(),
+            retention: "24 hours".to_owned(),
+            admission_mode: None,
+            adapter_kind: None,
+            signaling_endpoint: None,
+            ice_stun_servers: None,
+            ice_turn_servers: None,
+        });
+        let group = created
+            .groups
+            .first()
+            .cloned()
+            .ok_or_else(|| "created group missing".to_owned())?;
+        let channel_id = group
+            .channels
+            .iter()
+            .find(|channel| channel.kind == ChannelKind::Text)
+            .map(|channel| channel.channel_id.clone())
+            .ok_or_else(|| "text channel missing".to_owned())?;
+        let (bob_path, mut bob_service, bob_id) =
+            create_text_receiver_profile("group-outbox-frozen-routes-bob", "Bob Original")?;
+        let (carol_path, mut carol_service, carol_id) =
+            create_text_receiver_profile("group-outbox-frozen-routes-carol", "Carol Later")?;
+        let bob_signer_hex = hex::encode(
+            SigningKey::from_bytes(&bob_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        let carol_signer_hex = hex::encode(
+            SigningKey::from_bytes(&carol_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+
+        reload_global_app_service_from_path(&alice_path);
+        let (target, message_id, initial_routes, _) = seed_group_text_outbox_for_routes(
+            &group.group_id,
+            &channel_id,
+            &[(&bob_id, "Bob Original")],
+            "queued before Carol was admitted",
+        )?;
+        assert_eq!(initial_routes.len(), 1);
+        let bob_route = initial_routes[0].clone();
+        set_group_member_signer_for_test(&group.group_id, &bob_id, &bob_signer_hex)?;
+
+        add_admitted_test_route_member(&group.group_id, &carol_id, "Carol Later")?;
+        let carol_route =
+            runtime_peer_id_from_commitment("test-provider-advertised-peer", &carol_id);
+        advertise_test_member_runtime_peer(&group.group_id, &carol_id, &carol_route)?;
+        set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer_hex)?;
+
+        let refreshed = load_state();
+        let outbox = refreshed
+            .text_control_outbox
+            .iter()
+            .find(|record| record.message_id == message_id)
+            .ok_or_else(|| "outbox missing after later peer advertisement".to_owned())?;
+        assert_eq!(outbox.expected_route_peer_ids, vec![bob_route.clone()]);
+        assert_eq!(outbox.route_peer_ids, vec![bob_route.clone()]);
+        assert!(!outbox.route_peer_ids.contains(&carol_route));
+
+        let local_member_id = refreshed.local_user_id();
+        let local_peer_id =
+            route_peer_id_for_member_in_state(&refreshed, &group.group_id, &local_member_id)?;
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("group-outbox-frozen-routes".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "active text session missing".to_owned())?;
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(ReceiverBackedTextControlTransport::new(bob_service)),
+            active_session_id.clone(),
+            local_peer_id.clone(),
+            bob_route,
+        );
+        attach_peer_text_control_transport_runtime_for_test(
+            Arc::new(ReceiverBackedTextControlTransport::new(carol_service)),
+            active_session_id,
+            local_peer_id,
+            carol_route,
+        );
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: Some(target),
+            limit: Some(8),
+            operation_timeout_ms: Some(5_000),
+        });
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.frames_sent, 1);
+        assert_eq!(report.response_frames_received, 1);
+        assert_eq!(report.receipts_applied, 1);
+
+        let bob_after = load_state_from_path(&bob_path);
+        assert!(bob_after
+            .messages
+            .iter()
+            .any(|message| message.message_id == message_id));
+        let carol_after = load_state_from_path(&carol_path);
+        assert!(!carol_after
+            .messages
+            .iter()
+            .any(|message| message.message_id == message_id));
+        clear_text_control_transport_runtime_for_test();
         Ok(())
     }
 
@@ -37025,9 +37287,9 @@ mod tests {
             .find(|channel| channel.kind == ChannelKind::Text)
             .map(|channel| channel.channel_id.clone())
             .ok_or_else(|| "text channel missing".to_owned())?;
-        let (bob_path, bob_service, bob_id) =
+        let (bob_path, mut bob_service, bob_id) =
             create_text_receiver_profile("p7-t04-fanout-bob", "Bob Fanout")?;
-        let (carol_path, carol_service, carol_id) =
+        let (carol_path, mut carol_service, carol_id) =
             create_text_receiver_profile("p7-t04-fanout-carol", "Carol Fanout")?;
         reload_global_app_service_from_path(&alice_path);
         let (target, message_id, route_peer_ids, _) = seed_group_text_outbox_for_routes(
@@ -37037,6 +37299,18 @@ mod tests {
             "p7-t04 protected fanout",
         )?;
         assert_eq!(route_peer_ids.len(), 2);
+        let bob_signer_hex = hex::encode(
+            SigningKey::from_bytes(&bob_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        let carol_signer_hex = hex::encode(
+            SigningKey::from_bytes(&carol_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        set_group_member_signer_for_test(&group.group_id, &bob_id, &bob_signer_hex)?;
+        set_group_member_signer_for_test(&group.group_id, &carol_id, &carol_signer_hex)?;
 
         let started = start_text_session(StartTextSessionRequest {
             scope_label: Some("p7-t04-fanout".to_owned()),
@@ -37249,7 +37523,7 @@ mod tests {
             .find(|channel| channel.kind == ChannelKind::Text)
             .map(|channel| channel.channel_id.clone())
             .ok_or_else(|| "text channel missing".to_owned())?;
-        let (bob_path, bob_service, bob_id) =
+        let (bob_path, mut bob_service, bob_id) =
             create_text_receiver_profile("p7-t04-pending-route-bob", "Bob Pending")?;
         let (_carol_path, _carol_service, carol_id) =
             create_text_receiver_profile("p7-t04-pending-route-carol", "Carol Pending")?;
@@ -37260,6 +37534,12 @@ mod tests {
             &[(&bob_id, "Bob Pending"), (&carol_id, "Carol Pending")],
             "p7-t04 pending route partial fanout",
         )?;
+        let bob_signer_hex = hex::encode(
+            SigningKey::from_bytes(&bob_service.state.identity_seed_bytes())
+                .verifying_key()
+                .as_bytes(),
+        );
+        set_group_member_signer_for_test(&group.group_id, &bob_id, &bob_signer_hex)?;
         let loaded = load_state();
         let local_peer_id = loaded
             .groups
@@ -39670,6 +39950,12 @@ mod tests {
         assert!(!group_invite_row.revoked);
         let group_invite_code = group_invite_row.code.clone();
 
+        let current_group = load_state()
+            .groups
+            .into_iter()
+            .find(|group| group.group_id == group_id)
+            .ok_or_else(|| "group missing before text send".to_owned())?;
+        let _ = backend_group_runtime_peer_ids(&current_group)?;
         let sent = send_message(SendMessageRequest {
             target: MessageTargetView {
                 kind: "channel".to_owned(),
@@ -39706,11 +39992,29 @@ mod tests {
             &recipient_signer,
         )
         .map_err(|error| error.to_string())?;
-        let receipted = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: hex::encode(recipient_signer.verifying_key().as_bytes()),
-        });
+        mutate_app_service_with_result(|state| -> Result<(), String> {
+            let local_user_id = state.local_user_id();
+            let group = state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id == group_id)
+                .ok_or_else(|| "group missing before receipt".to_owned())?;
+            let remote = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id != local_user_id)
+                .ok_or_else(|| "remote member missing before receipt".to_owned())?;
+            remote.device_id = Some("bob-laptop".to_owned());
+            remote.signer_public_key_hex =
+                Some(hex::encode(recipient_signer.verifying_key().as_bytes()));
+            Ok(())
+        })
+        .1?;
+        let receipted =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
         assert!(receipted.last_command_error.is_none(), "{receipted:?}");
         assert_eq!(
             receipted
@@ -39721,12 +40025,6 @@ mod tests {
             Some("peer_receipt")
         );
 
-        let current_group = load_state()
-            .groups
-            .into_iter()
-            .find(|group| group.group_id == group_id)
-            .ok_or_else(|| "group missing before voice join".to_owned())?;
-        let _ = backend_group_runtime_peer_ids(&current_group)?;
         let voice_joined = join_voice(JoinVoiceRequest {
             group_id: group_id.clone(),
             channel_id: voice_channel_id.clone(),
@@ -40046,153 +40344,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mqtt-adapter")]
-    fn public_mqtt_two_profile_receipt_crosses_provider_webrtc_when_enabled() -> Result<(), String>
-    {
-        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E").as_deref() != Ok("1") {
-            eprintln!(
-                "skipping desktop public MQTT two-profile receipt proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E=1 to run"
-            );
-            return Ok(());
-        }
-        let _guard = test_lock();
-        let _alice_path = reset_with_temp_state("public-mqtt-two-profile-receipt-alice");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
-                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
-        );
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let dm_state = start_dm(StartDmRequest {
-            display_name: "Bob".to_owned(),
-        });
-        let dm_id = dm_state.dms[0].dm_id.clone();
-        let sent = send_message(SendMessageRequest {
-            target: MessageTargetView {
-                kind: "dm".to_owned(),
-                dm_id: Some(dm_id),
-                group_id: None,
-                channel_id: None,
-            },
-            body: "provider receipt proof".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let message_id = sent.messages[0].message_id.clone();
-
-        let bob_path = fresh_state_path("public-mqtt-two-profile-receipt-bob");
-        let _ = fs::remove_file(&bob_path);
-        let mut bob = TauriAppService::load_for_test_path(bob_path);
-        bob.mutate(|state| {
-            state.create_user(
-                CreateUserRequest {
-                    display_name: "Bob".to_owned(),
-                    device_name: Some("Bob laptop".to_owned()),
-                },
-                false,
-            );
-        });
-
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let proof = guard
-            .state
-            .prove_text_delivery_receipt_over_data_channel_with_receiver(
-                &bob.state,
-                &message_id,
-                Some("mqtt"),
-            )?;
-        assert_eq!(proof.kind, "mqtt");
-        assert!(proof.text_control_frame_roundtrip);
-        assert!(proof.receipt_frame_roundtrip);
-        let view = guard.mutate(|_| {});
-        let message = view
-            .messages
-            .iter()
-            .find(|message| message.message_id == message_id)
-            .ok_or_else(|| "message row missing".to_owned())?;
-        assert_eq!(message.state_key, "peer_receipt");
-        assert!(message.peer_receipt.is_some());
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "nostr-adapter")]
-    fn public_nostr_two_profile_receipt_crosses_provider_webrtc_when_enabled() -> Result<(), String>
-    {
-        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_RECEIPT_E2E").as_deref() != Ok("1") {
-            eprintln!(
-                "skipping desktop public Nostr two-profile receipt proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_RECEIPT_E2E=1 to run"
-            );
-            return Ok(());
-        }
-        let _guard = test_lock();
-        let _alice_path = reset_with_temp_state("public-nostr-two-profile-receipt-alice");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let dm_state = start_dm(StartDmRequest {
-            display_name: "Bob".to_owned(),
-        });
-        let dm_id = dm_state.dms[0].dm_id.clone();
-        let sent = send_message(SendMessageRequest {
-            target: MessageTargetView {
-                kind: "dm".to_owned(),
-                dm_id: Some(dm_id),
-                group_id: None,
-                channel_id: None,
-            },
-            body: "provider nostr receipt proof".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let message_id = sent.messages[0].message_id.clone();
-
-        let bob_path = fresh_state_path("public-nostr-two-profile-receipt-bob");
-        let _ = fs::remove_file(&bob_path);
-        let mut bob = TauriAppService::load_for_test_path(bob_path);
-        bob.mutate(|state| {
-            state.create_user(
-                CreateUserRequest {
-                    display_name: "Bob".to_owned(),
-                    device_name: Some("Bob laptop".to_owned()),
-                },
-                false,
-            );
-        });
-
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let proof = guard
-            .state
-            .prove_text_delivery_receipt_over_data_channel_with_receiver(
-                &bob.state,
-                &message_id,
-                Some("nostr"),
-            )?;
-        assert_eq!(proof.kind, "nostr");
-        assert!(proof.text_control_frame_roundtrip);
-        assert!(proof.receipt_frame_roundtrip);
-        let view = guard.mutate(|_| {});
-        let message = view
-            .messages
-            .iter()
-            .find(|message| message.message_id == message_id)
-            .ok_or_else(|| "message row missing".to_owned())?;
-        assert_eq!(message.state_key, "peer_receipt");
-        assert!(message.peer_receipt.is_some());
-        Ok(())
-    }
-
-    #[test]
     fn tampered_text_delivery_receipt_is_rejected() -> Result<(), String> {
         let _guard = test_lock();
         let _path = reset_with_temp_state("tampered-text-receipt");
@@ -40207,7 +40358,7 @@ mod tests {
         let sent = send_message(SendMessageRequest {
             target: MessageTargetView {
                 kind: "dm".to_owned(),
-                dm_id: Some(dm_id),
+                dm_id: Some(dm_id.clone()),
                 group_id: None,
                 channel_id: None,
             },
@@ -40236,19 +40387,30 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         receipt.message_id = "different-message".to_owned();
+        mutate_app_service_with_result(|state| {
+            seed_remote_dm_runtime_peer_identity_for_test(
+                state,
+                &dm_id,
+                "bob-runtime-peer",
+                "bob-desktop",
+                "bob-desktop",
+                &hex::encode(recipient_signer.verifying_key().as_bytes()),
+            )
+        })
+        .1?;
 
-        let rejected = apply_text_delivery_receipt(ApplyTextDeliveryReceiptRequest {
-            message_id: message_id.clone(),
-            receipt,
-            recipient_verifying_key_hex: hex::encode(recipient_signer.verifying_key().as_bytes()),
-        });
+        let rejected =
+            apply_text_delivery_receipt_after_test_handoff(ApplyTextDeliveryReceiptRequest {
+                message_id: message_id.clone(),
+                receipt,
+            });
 
         let error = rejected
             .last_command_error
             .as_ref()
             .ok_or_else(|| "tampered receipt should be rejected".to_owned())?;
         assert_eq!(error.code, "receipt_verification_failed");
-        assert_eq!(rejected.messages[0].state_key, "sent_local");
+        assert_eq!(rejected.messages[0].state_key, "transport_frame_sent");
         Ok(())
     }
 
@@ -40948,498 +41110,6 @@ mod tests {
         assert!(proof.text_control_frame_roundtrip);
         assert!(proof.receipt_frame_roundtrip);
         assert!(state.voice_session.is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "mqtt-adapter")]
-    fn public_mqtt_live_runtime_pair_pump_persists_peer_receipt_when_enabled() -> Result<(), String>
-    {
-        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E").as_deref() != Ok("1") {
-            eprintln!(
-                "skipping desktop public MQTT live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_RUNTIME_PAIR_E2E=1 to run"
-            );
-            return Ok(());
-        }
-        let _guard = test_lock();
-        let alice_path = reset_with_temp_state("desktop-public-mqtt-live-runtime-pair-alice");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
-                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
-        );
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let dm = start_dm(StartDmRequest {
-            display_name: "Bob".to_owned(),
-        });
-        let active_dm_id = dm
-            .active_context
-            .as_ref()
-            .and_then(|context| context.dm_id.clone())
-            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
-        let invite = create_dm_invite(CreateDmInviteRequest {
-            dm_id: Some(active_dm_id.clone()),
-            expires: "24 hours".to_owned(),
-            max_use: "1 use".to_owned(),
-        });
-        assert!(invite.last_command_error.is_none(), "{invite:?}");
-        let invite_code = invite
-            .invites
-            .last()
-            .map(|invite| invite.code.clone())
-            .ok_or_else(|| "DM invite code missing".to_owned())?;
-        let target = MessageTargetView {
-            kind: "dm".to_owned(),
-            dm_id: Some(active_dm_id),
-            group_id: None,
-            channel_id: None,
-        };
-        let sent = send_message(SendMessageRequest {
-            target: target.clone(),
-            body: "mqtt live runtime pair receipt".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let message_id = sent.messages[0].message_id.clone();
-
-        let (_bob_path, bob) = accept_dm_invite_as_test_profile(
-            "desktop-public-mqtt-live-runtime-pair-bob",
-            "Bob",
-            "Bob laptop",
-            invite_code,
-            "Alice",
-        )?;
-        reload_global_app_service_from_path(&alice_path);
-
-        let started = start_text_session(StartTextSessionRequest {
-            scope_label: Some("dm:bob".to_owned()),
-            data_channel_probe: false,
-            adapter_kind: Some("mqtt".to_owned()),
-        });
-        assert!(started.last_command_error.is_none(), "{started:?}");
-        assert_eq!(
-            started.transport_diagnostics.route_proof_status,
-            "route-proof-not-available"
-        );
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session_id = guard
-            .state
-            .text_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "active text session missing".to_owned())?;
-        let (evidence, report, bob_state) = guard
-            .state
-            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
-                bob,
-                &message_id,
-                Some("mqtt"),
-                session_id,
-            )?;
-        guard.persist();
-
-        assert_eq!(evidence.kind.canonical_name(), "mqtt");
-        assert!(evidence.offerer_direct_path_ready);
-        assert!(evidence.answerer_direct_path_ready);
-        assert!(evidence.offerer_data_channel_open);
-        assert!(evidence.answerer_data_channel_open);
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.frames_sent, 1);
-        assert_eq!(report.response_frames_received, 1);
-        assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_path(&alice_path);
-        assert!(
-            alice_reloaded
-                .messages
-                .iter()
-                .any(|message| message.message_id == message_id
-                    && message.state_key == "peer_receipt")
-        );
-        assert!(bob_state.messages.iter().any(|message| {
-            message.message_id == message_id && message.state_key == "received_envelope"
-        }));
-        assert!(bob_state
-            .text_delivery_receipts
-            .iter()
-            .any(|receipt| receipt.message_id == message_id));
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "mqtt-adapter")]
-    fn public_mqtt_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled(
-    ) -> Result<(), String> {
-        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_MQTT_GROUP_RUNTIME_PAIR_E2E").as_deref()
-            != Ok("1")
-        {
-            eprintln!(
-                "skipping desktop public MQTT group live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_MQTT_GROUP_RUNTIME_PAIR_E2E=1 to run"
-            );
-            return Ok(());
-        }
-        let _guard = test_lock();
-        let alice_path = reset_with_temp_state("desktop-public-mqtt-group-runtime-pair-alice");
-        std::env::set_var(
-            "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
-            std::env::var("DISCRYPT_PUBLIC_MQTT_ENDPOINT")
-                .unwrap_or_else(|_| "mqtts://broker.emqx.io:8883".to_owned()),
-        );
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let group = create_group(CreateGroupRequest {
-            name: "Private Lab".to_owned(),
-            retention: "7 days".to_owned(),
-            admission_mode: None,
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
-        });
-        let group_id = group
-            .active_context
-            .as_ref()
-            .and_then(|context| context.group_id.clone())
-            .ok_or_else(|| "active group id missing after create_group".to_owned())?;
-        let channel_id = group
-            .groups
-            .iter()
-            .find(|group| group.group_id == group_id)
-            .and_then(|group| {
-                group
-                    .channels
-                    .iter()
-                    .find(|channel| channel.kind == ChannelKind::Text)
-                    .map(|channel| channel.channel_id.clone())
-            })
-            .ok_or_else(|| "group text channel missing after create_group".to_owned())?;
-        let invite = create_invite(CreateInviteRequest {
-            group_id: Some(group_id.clone()),
-            expires: "24 hours".to_owned(),
-            max_use: "1 use".to_owned(),
-            password_gate: None,
-        });
-        assert!(invite.last_command_error.is_none(), "{invite:?}");
-        let invite_code = invite
-            .invites
-            .last()
-            .map(|invite| invite.code.clone())
-            .ok_or_else(|| "group invite code missing".to_owned())?;
-        let target = MessageTargetView {
-            kind: "channel".to_owned(),
-            dm_id: None,
-            group_id: Some(group_id.clone()),
-            channel_id: Some(channel_id),
-        };
-        let sent = send_message(SendMessageRequest {
-            target: target.clone(),
-            body: "mqtt group live runtime pair receipt".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let message_id = sent.messages[0].message_id.clone();
-
-        let (_bob_path, bob) = join_group_invite_as_test_profile(
-            "desktop-public-mqtt-group-runtime-pair-bob",
-            "Bob",
-            "Bob laptop",
-            invite_code,
-            "Private Lab",
-        )?;
-        reload_global_app_service_from_path(&alice_path);
-
-        let started = start_text_session(StartTextSessionRequest {
-            scope_label: Some("group:private-lab".to_owned()),
-            data_channel_probe: false,
-            adapter_kind: Some("mqtt".to_owned()),
-        });
-        assert!(started.last_command_error.is_none(), "{started:?}");
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session_id = guard
-            .state
-            .text_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "active group text session missing".to_owned())?;
-        let (evidence, report, bob_state) = guard
-            .state
-            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
-                bob,
-                &message_id,
-                Some("mqtt"),
-                session_id,
-            )?;
-        guard.persist();
-
-        assert_eq!(evidence.kind.canonical_name(), "mqtt");
-        assert!(evidence.offerer_direct_path_ready);
-        assert!(evidence.answerer_direct_path_ready);
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.frames_sent, 1);
-        assert_eq!(report.response_frames_received, 1);
-        assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_path(&alice_path);
-        assert!(
-            alice_reloaded
-                .messages
-                .iter()
-                .any(|message| message.message_id == message_id
-                    && message.state_key == "peer_receipt")
-        );
-        assert!(bob_state.messages.iter().any(|message| {
-            message.message_id == message_id && message.state_key == "received_envelope"
-        }));
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "nostr-adapter")]
-    fn public_nostr_live_runtime_pair_pump_persists_peer_receipt_when_enabled() -> Result<(), String>
-    {
-        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E").as_deref() != Ok("1") {
-            eprintln!(
-                "skipping desktop public Nostr live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_RUNTIME_PAIR_E2E=1 to run"
-            );
-            return Ok(());
-        }
-        let _guard = test_lock();
-        let alice_path = reset_with_temp_state("desktop-public-nostr-live-runtime-pair-alice");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let dm = start_dm(StartDmRequest {
-            display_name: "Bob".to_owned(),
-        });
-        let active_dm_id = dm
-            .active_context
-            .as_ref()
-            .and_then(|context| context.dm_id.clone())
-            .ok_or_else(|| "active DM id missing after start_dm".to_owned())?;
-        let invite = create_dm_invite(CreateDmInviteRequest {
-            dm_id: Some(active_dm_id.clone()),
-            expires: "24 hours".to_owned(),
-            max_use: "1 use".to_owned(),
-        });
-        assert!(invite.last_command_error.is_none(), "{invite:?}");
-        let invite_code = invite
-            .invites
-            .last()
-            .map(|invite| invite.code.clone())
-            .ok_or_else(|| "DM invite code missing".to_owned())?;
-        let target = MessageTargetView {
-            kind: "dm".to_owned(),
-            dm_id: Some(active_dm_id),
-            group_id: None,
-            channel_id: None,
-        };
-        let sent = send_message(SendMessageRequest {
-            target: target.clone(),
-            body: "nostr live runtime pair receipt".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let message_id = sent.messages[0].message_id.clone();
-
-        let (_bob_path, bob) = accept_dm_invite_as_test_profile(
-            "desktop-public-nostr-live-runtime-pair-bob",
-            "Bob",
-            "Bob laptop",
-            invite_code,
-            "Alice",
-        )?;
-        reload_global_app_service_from_path(&alice_path);
-
-        let started = start_text_session(StartTextSessionRequest {
-            scope_label: Some("dm:bob".to_owned()),
-            data_channel_probe: false,
-            adapter_kind: Some("nostr".to_owned()),
-        });
-        assert!(started.last_command_error.is_none(), "{started:?}");
-        assert_eq!(
-            started.transport_diagnostics.route_proof_status,
-            "route-proof-not-available"
-        );
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session_id = guard
-            .state
-            .text_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "active text session missing".to_owned())?;
-        let (evidence, report, bob_state) = guard
-            .state
-            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
-                bob,
-                &message_id,
-                Some("nostr"),
-                session_id,
-            )?;
-        guard.persist();
-
-        assert_eq!(evidence.kind.canonical_name(), "nostr");
-        assert!(evidence.offerer_direct_path_ready);
-        assert!(evidence.answerer_direct_path_ready);
-        assert!(evidence.offerer_data_channel_open);
-        assert!(evidence.answerer_data_channel_open);
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.frames_sent, 1);
-        assert_eq!(report.response_frames_received, 1);
-        assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_path(&alice_path);
-        assert!(
-            alice_reloaded
-                .messages
-                .iter()
-                .any(|message| message.message_id == message_id
-                    && message.state_key == "peer_receipt")
-        );
-        assert!(bob_state.messages.iter().any(|message| {
-            message.message_id == message_id && message.state_key == "received_envelope"
-        }));
-        assert!(bob_state
-            .text_delivery_receipts
-            .iter()
-            .any(|receipt| receipt.message_id == message_id));
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "nostr-adapter")]
-    fn public_nostr_group_live_runtime_pair_pump_persists_peer_receipt_when_enabled(
-    ) -> Result<(), String> {
-        if std::env::var("DISCRYPT_DESKTOP_PUBLIC_NOSTR_GROUP_RUNTIME_PAIR_E2E").as_deref()
-            != Ok("1")
-        {
-            eprintln!(
-                "skipping desktop public Nostr group live runtime-pair pump proof; set DISCRYPT_DESKTOP_PUBLIC_NOSTR_GROUP_RUNTIME_PAIR_E2E=1 to run"
-            );
-            return Ok(());
-        }
-        let _guard = test_lock();
-        let alice_path = reset_with_temp_state("desktop-public-nostr-group-runtime-pair-alice");
-        create_user(CreateUserRequest {
-            display_name: "Alice".to_owned(),
-            device_name: Some("Alice laptop".to_owned()),
-        });
-        let group = create_group(CreateGroupRequest {
-            name: "Private Lab".to_owned(),
-            retention: "7 days".to_owned(),
-            admission_mode: None,
-            adapter_kind: None,
-            signaling_endpoint: None,
-            ice_stun_servers: None,
-            ice_turn_servers: None,
-        });
-        let group_id = group
-            .active_context
-            .as_ref()
-            .and_then(|context| context.group_id.clone())
-            .ok_or_else(|| "active group id missing after create_group".to_owned())?;
-        let channel_id = group
-            .groups
-            .iter()
-            .find(|group| group.group_id == group_id)
-            .and_then(|group| {
-                group
-                    .channels
-                    .iter()
-                    .find(|channel| channel.kind == ChannelKind::Text)
-                    .map(|channel| channel.channel_id.clone())
-            })
-            .ok_or_else(|| "group text channel missing after create_group".to_owned())?;
-        let invite = create_invite(CreateInviteRequest {
-            group_id: Some(group_id.clone()),
-            expires: "24 hours".to_owned(),
-            max_use: "1 use".to_owned(),
-            password_gate: None,
-        });
-        assert!(invite.last_command_error.is_none(), "{invite:?}");
-        let invite_code = invite
-            .invites
-            .last()
-            .map(|invite| invite.code.clone())
-            .ok_or_else(|| "group invite code missing".to_owned())?;
-        let target = MessageTargetView {
-            kind: "channel".to_owned(),
-            dm_id: None,
-            group_id: Some(group_id.clone()),
-            channel_id: Some(channel_id),
-        };
-        let sent = send_message(SendMessageRequest {
-            target: target.clone(),
-            body: "nostr group live runtime pair receipt".to_owned(),
-            transport_proof: false,
-            adapter_kind: None,
-        });
-        let message_id = sent.messages[0].message_id.clone();
-
-        let (_bob_path, bob) = join_group_invite_as_test_profile(
-            "desktop-public-nostr-group-runtime-pair-bob",
-            "Bob",
-            "Bob laptop",
-            invite_code,
-            "Private Lab",
-        )?;
-        reload_global_app_service_from_path(&alice_path);
-
-        let started = start_text_session(StartTextSessionRequest {
-            scope_label: Some("group:private-lab".to_owned()),
-            data_channel_probe: false,
-            adapter_kind: Some("nostr".to_owned()),
-        });
-        assert!(started.last_command_error.is_none(), "{started:?}");
-        let service = app_service();
-        let mut guard = service
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session_id = guard
-            .state
-            .text_session
-            .as_ref()
-            .map(|session| session.session_id.clone())
-            .ok_or_else(|| "active group text session missing".to_owned())?;
-        let (evidence, report, bob_state) = guard
-            .state
-            .pump_text_delivery_receipt_over_live_runtime_pair_with_receiver(
-                bob,
-                &message_id,
-                Some("nostr"),
-                session_id,
-            )?;
-        guard.persist();
-
-        assert_eq!(evidence.kind.canonical_name(), "nostr");
-        assert!(evidence.offerer_direct_path_ready);
-        assert!(evidence.answerer_direct_path_ready);
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.frames_sent, 1);
-        assert_eq!(report.response_frames_received, 1);
-        assert_eq!(report.receipts_applied, 1);
-        let alice_reloaded = load_state_from_path(&alice_path);
-        assert!(
-            alice_reloaded
-                .messages
-                .iter()
-                .any(|message| message.message_id == message_id
-                    && message.state_key == "peer_receipt")
-        );
-        assert!(bob_state.messages.iter().any(|message| {
-            message.message_id == message_id && message.state_key == "received_envelope"
-        }));
-        Ok(())
     }
 
     #[test]
@@ -43511,7 +43181,6 @@ mod tests {
             "accept_dm_invite",
             "create_channel",
             "send_message",
-            "apply_text_delivery_receipt",
             "mark_text_control_frame_sent",
             "join_voice",
             "leave_voice",
@@ -43841,6 +43510,7 @@ mod tests {
                 state_key: "pending".to_owned(),
                 last_transport_session_id: None,
                 route_peer_ids: Vec::new(),
+                expected_route_peer_ids: Vec::new(),
                 sent_route_peer_ids: Vec::new(),
                 receipted_route_peer_ids: Vec::new(),
             });
@@ -44442,11 +44112,44 @@ mod tests {
             .expect("joiner voice session")
             .session_id
             .clone();
+        let joiner_local_voice_peer = joiner_service
+            .state
+            .voice_session
+            .as_ref()
+            .expect("joiner voice session")
+            .signaling
+            .local_peer_id
+            .clone();
+        let joiner_remote_voice_peer = joiner_service
+            .state
+            .voice_session
+            .as_ref()
+            .expect("joiner voice session")
+            .signaling
+            .remote_peer_id
+            .clone();
+        let owner_local_voice_peer = owner_service
+            .state
+            .voice_session
+            .as_ref()
+            .expect("owner voice session")
+            .signaling
+            .local_peer_id
+            .clone();
+        let owner_remote_voice_peer = owner_service
+            .state
+            .voice_session
+            .as_ref()
+            .expect("owner voice session")
+            .signaling
+            .remote_peer_id
+            .clone();
 
         joiner_service
             .state
             .enqueue_voice_signaling_outbox(PublishVoiceSignalingMessageRequest {
                 session_id: voice_session_id.clone(),
+                recipient_peer_id: joiner_remote_voice_peer.clone(),
                 signal_kind: "offer".to_owned(),
                 sealed_payload: format!(
                     "voice-signal-sealed:v1:{}",
@@ -44468,6 +44171,8 @@ mod tests {
             let taken = owner_service.state.take_pending_voice_signaling_messages(
                 TakePendingVoiceSignalingMessagesRequest {
                     session_id: Some(voice_session_id.clone()),
+                    recipient_peer_id: owner_local_voice_peer.clone(),
+                    sender_peer_id: owner_remote_voice_peer.clone(),
                     limit: None,
                 },
             );
@@ -44488,6 +44193,7 @@ mod tests {
             .state
             .enqueue_voice_signaling_outbox(PublishVoiceSignalingMessageRequest {
                 session_id: voice_session_id.clone(),
+                recipient_peer_id: owner_remote_voice_peer.clone(),
                 signal_kind: "candidate".to_owned(),
                 sealed_payload: format!(
                     "voice-signal-sealed:v1:{}",
@@ -44519,6 +44225,8 @@ mod tests {
             let taken = joiner_service.state.take_pending_voice_signaling_messages(
                 TakePendingVoiceSignalingMessagesRequest {
                     session_id: Some(voice_session_id.clone()),
+                    recipient_peer_id: joiner_local_voice_peer.clone(),
+                    sender_peer_id: joiner_remote_voice_peer.clone(),
                     limit: None,
                 },
             );

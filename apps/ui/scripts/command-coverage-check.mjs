@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 
-const rust = readFileSync(
+function readText(path) {
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
+const rust = readText(
   new URL("../../desktop/src-tauri/src/lib.rs", import.meta.url),
-  "utf8",
 );
-const commands = readFileSync(
-  new URL("../src/commands.ts", import.meta.url),
-  "utf8",
-);
-const main = readFileSync(new URL("../src/main.tsx", import.meta.url), "utf8");
-const statefulE2e = readFileSync(
+const commands = readText(new URL("../src/commands.ts", import.meta.url));
+const main = readText(new URL("../src/main.tsx", import.meta.url));
+const statefulE2e = readText(
   new URL("../tests/e2e/stateful-ui.spec.ts", import.meta.url),
-  "utf8",
 );
 const failures = [];
 
@@ -285,12 +284,6 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
-    command: "apply_text_delivery_receipt",
-    exportName: "applyTextDeliveryReceipt",
-    args: ["message_id", "receipt", "recipient_verifying_key_hex"],
-    returns: "AppState",
-  },
-  {
     command: "receive_text_delivery_envelope",
     exportName: "receiveTextDeliveryEnvelope",
     args: ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"],
@@ -325,11 +318,9 @@ const expectedCommands = [
     exportName: "publishVoiceSignalingMessage",
     args: [
       "session_id",
+      "recipient_peer_id",
       "signal_kind",
-      "sdp",
-      "candidate",
-      "sdp_mid",
-      "sdp_m_line_index",
+      "sealed_payload",
       "signal_id",
       "created_at_ms",
     ],
@@ -338,7 +329,7 @@ const expectedCommands = [
   {
     command: "take_pending_voice_signaling_messages",
     exportName: "takePendingVoiceSignalingMessages",
-    args: ["session_id", "limit"],
+    args: ["session_id", "recipient_peer_id", "sender_peer_id", "limit"],
     returns: "TakePendingVoiceSignalingMessagesResponse",
   },
   {
@@ -390,12 +381,6 @@ const expectedCommands = [
     returns: "AppState",
   },
   {
-    command: "start_native_voice_media_session",
-    exportName: "startNativeVoiceMediaSession",
-    args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
-    returns: "StartNativeVoiceMediaSessionResponse",
-  },
-  {
     command: "start_native_voice_stream",
     exportName: "startNativeVoiceStream",
     args: ["session_id", "local_peer_id", "remote_peer_id", "muted", "use_webview_capture", "created_at_ms"],
@@ -417,18 +402,6 @@ const expectedCommands = [
     command: "stop_native_voice_stream",
     exportName: "stopNativeVoiceStream",
     args: ["session_id"],
-    returns: "AppState",
-  },
-  {
-    command: "accept_native_voice_media_frame",
-    exportName: "acceptNativeVoiceMediaFrame",
-    args: ["session_id", "native_media", "attached_at_ms"],
-    returns: "AppState",
-  },
-  {
-    command: "accept_native_voice_media_signal",
-    exportName: "acceptNativeVoiceMediaSignal",
-    args: ["signal", "attached_at_ms"],
     returns: "AppState",
   },
   {
@@ -606,10 +579,6 @@ const requestTypes = [
   ],
   ["SendMessageRequest", ["target", "body"]],
   [
-    "ApplyTextDeliveryReceiptRequest",
-    ["message_id", "receipt", "recipient_verifying_key_hex"],
-  ],
-  [
     "ReceiveTextDeliveryEnvelopeRequest",
     ["target", "envelope", "sender_verifying_key_hex", "recipient_leaf"],
   ],
@@ -690,14 +659,9 @@ const requestTypes = [
   ["SelfMuteRequest", ["session_id", "muted"]],
   ["SpeakerVolumeRequest", ["session_id", "participant_id", "volume"]],
   [
-    "StartNativeVoiceMediaSessionRequest",
-    ["session_id", "local_peer_id", "remote_peer_id", "muted", "created_at_ms"],
+    "StartNativeVoiceStreamRequest",
+    ["session_id", "local_peer_id", "remote_peer_id", "muted", "use_webview_capture", "created_at_ms"],
   ],
-  [
-    "AcceptNativeVoiceMediaFrameRequest",
-    ["session_id", "native_media", "attached_at_ms"],
-  ],
-  ["AcceptNativeVoiceMediaSignalRequest", ["signal", "attached_at_ms"]],
 ];
 for (const [typeName, fields] of requestTypes) {
   const match = commands.match(
@@ -1054,7 +1018,7 @@ if (
 }
 if (
   !main.includes(".catch(() => {") ||
-  !main.includes("pollAppEventFallback();\n          startFallbackPolling();")
+  !/pollAppEventFallback\(\);\r?\n\s*startFallbackPolling\(\);/.test(main)
 ) {
   failures.push(
     "native app-event listener rejection must trigger an immediate polling resync",

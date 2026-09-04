@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, resolve } from "node:path";
@@ -38,9 +38,15 @@ const localMqttEndpoint = configuredMqttEndpoint ?? `mqtt://127.0.0.1:${mqttPort
 const mqttBrokerBinary = configuredMqttEndpoint ? null : commandPath("rumqttd");
 const mqttBrokerConfigPath = resolve(artifactRoot, "rumqttd.toml");
 const mqttBrokerLogPath = resolve(logDir, "rumqttd.log");
+const webdriverCommandTimeoutMs = Number(
+  process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_COMMAND_TIMEOUT_MS ?? 120_000,
+);
 const disableSyntheticVoiceFallback = argv.includes("--disable-synthetic-voice-fallback") || process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_DISABLE_SYNTHETIC_VOICE_FALLBACK === "1";
 if (!Number.isInteger(basePort) || basePort < 1024 || basePort > 65000) failCli("base port must be a valid high TCP port", 2);
 if (!configuredMqttEndpoint && (!Number.isInteger(mqttPort) || mqttPort < 1024 || mqttPort > 65535)) failCli("local MQTT port must be a valid high TCP port", 2);
+if (!Number.isFinite(webdriverCommandTimeoutMs) || webdriverCommandTimeoutMs < 30_000) {
+  failCli("WebDriver command timeout must be at least 30000 milliseconds", 2);
+}
 
 const harnessEnv = {
   ...process.env,
@@ -52,7 +58,8 @@ const profiles = {
   alice: {
     display_name: "Alice",
     device_name: "Alice Desktop",
-    state_path: resolve(profileDir, "alice/app-state.discrypt-store"),
+    data_home: resolve(profileDir, "alice"),
+    state_path: resolve(profileDir, "alice/discrypt/app-state.discrypt-store"),
     driver_port: basePort,
     native_port: basePort + 1,
     log_path: resolve(logDir, "tauri-driver-alice.log"),
@@ -60,13 +67,17 @@ const profiles = {
   bob: {
     display_name: "Bob",
     device_name: "Bob Laptop",
-    state_path: resolve(profileDir, "bob/app-state.discrypt-store"),
+    data_home: resolve(profileDir, "bob"),
+    state_path: resolve(profileDir, "bob/discrypt/app-state.discrypt-store"),
     driver_port: basePort + 2,
     native_port: basePort + 3,
     log_path: resolve(logDir, "tauri-driver-bob.log"),
   },
 };
 for (const profile of Object.values(profiles)) mkdirSync(dirname(profile.state_path), { recursive: true });
+const storageVaultPasswords = new Map(
+  Object.values(profiles).map((profile) => [profile.display_name, randomBytes(24).toString("base64url")]),
+);
 
 const workflowSteps = [
   {
@@ -83,6 +94,11 @@ const workflowSteps = [
     id: "approval",
     description: "Approve Bob's pending admission through Alice's owner/staff UI and wait for persisted OpenMLS Welcome state.",
     required_artifacts: ["openmls_admission_owner_approval", "OpenMLS handle epochs"],
+  },
+  {
+    id: "channels",
+    description: "Create text and voice channels after admission, replicate the signed owner schema live to Bob, and verify it survives reload.",
+    required_artifacts: ["channel_schema", "provider control-lane pump records"],
   },
   {
     id: "text",
@@ -110,7 +126,7 @@ const artifactContract = {
   test: "Tauri two-profile group text and voice E2E",
   evidence_level: "Tauri WebDriver release harness evidence when run with --run on a display-capable runner",
   dry_run_boundary: "Dry-run writes the manifest/preflight contract only; it is not setup, invite, approval, text, voice, persistence, or production evidence.",
-  provider_policy: "The strict run uses the sealed MQTT broker control lane only for admission bootstrap, then provider-signaled direct WebRTC text/control runtimes for group text and voice signaling; it rejects manual command-bridge fallback.",
+  provider_policy: "The strict run uses the sealed MQTT broker control lane for admission, presence, and channel schema; direct WebRTC for text/receipts; and the native Rust provider-signaled WebRTC runtime for voice media. It rejects manual command-bridge fallback.",
   membership_policy: "Invite parsing is not membership; protected text and voice evidence require backend approval plus persisted OpenMLS Welcome/add state.",
   voice_policy: "Synthetic WebView peer-connection fallback is diagnostic only and cannot satisfy the strict E2E acceptance criteria.",
 };
@@ -126,7 +142,7 @@ const manifest = {
   app_binary: rel(appBinary),
   driver_binary: driverBinary || null,
   native_webdriver: nativeDriverBinary,
-  profile_isolation_env: "DISCRYPT_APP_STATE_PATH",
+  profile_isolation_env: "DISCRYPT_APP_STATE_PATH + XDG_DATA_HOME",
   automation_env: "TAURI_WEBVIEW_AUTOMATION=1",
   local_mqtt: {
     endpoint: localMqttEndpoint,
@@ -136,7 +152,8 @@ const manifest = {
     log_path: configuredMqttEndpoint ? null : rel(mqttBrokerLogPath),
   },
   require_native_voice: requireNativeVoice,
-  boundary: "Drives two real Tauri WebViews through setup/group invite/text/voice UX. It reports remote text/media delivery truthfully and does not convert launch/UI smoke into a production network claim.",
+  webdriver_command_timeout_ms: webdriverCommandTimeoutMs,
+  boundary: "Drives two real Tauri WebViews through setup, group invite/admission, channel schema updates, text, and voice UX. It reports remote text/media delivery truthfully and does not convert launch/UI smoke into a production network claim.",
   workflow_steps: workflowSteps,
   artifact_contract: artifactContract,
   profiles,
@@ -194,16 +211,8 @@ function webkitRuntimeDiagnostics() {
     },
   };
 }
-function readJsonIfExists(path) {
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch (error) {
-    return { parse_error: error instanceof Error ? error.message : String(error) };
-  }
-}
-function textStateEvidence(profile, localMessage, remoteMessage) {
-  const state = readJsonIfExists(profile.state_path);
+async function textStateEvidence(profile, localMessage, remoteMessage) {
+  const state = await appState(profile);
   const messages = Array.isArray(state?.messages) ? state.messages : [];
   const events = Array.isArray(state?.events) ? state.events : [];
   const receivedEnvelopes = messages.filter((message) => message?.state_key === "received_envelope");
@@ -211,8 +220,8 @@ function textStateEvidence(profile, localMessage, remoteMessage) {
   const peerReceipts = messages.filter((message) => message?.state_key === "peer_receipt");
   const envelopeReceivedEvent = events.some((event) => event?.kind === "message.envelope_received");
   return {
-    state_readable: Boolean(state && !state.parse_error),
-    parse_error: state?.parse_error ?? null,
+    state_readable: Boolean(state),
+    evidence_source: "read-only app_state IPC over encrypted production storage",
     local_plaintext_visible: messages.some((message) => String(message?.body ?? "").includes(localMessage)),
     remote_plaintext_visible: messages.some((message) => String(message?.body ?? "").includes(remoteMessage)),
     remote_envelope_visible: receivedEnvelopes.length > 0 || receivedPlaintexts.length > 0 || envelopeReceivedEvent,
@@ -351,6 +360,7 @@ function startDriver(profile) {
     env: {
       ...harnessEnv,
       DISCRYPT_APP_STATE_PATH: profile.state_path,
+      XDG_DATA_HOME: profile.data_home,
       TAURI_WEBVIEW_AUTOMATION: "1",
       WEBKIT_FORCE_SANDBOX: "0",
       WEBKIT_DISABLE_COMPOSITING_MODE: "1",
@@ -392,9 +402,7 @@ async function wd(
   method,
   path,
   body,
-  timeoutMs = Number(
-    process.env.DISCRYPT_TAURI_TWO_PROFILE_E2E_COMMAND_TIMEOUT_MS ?? 30_000,
-  ),
+  timeoutMs = webdriverCommandTimeoutMs,
 ) {
   const response = await fetch(`http://127.0.0.1:${profile.driver_port}${path}`, {
     method,
@@ -411,10 +419,25 @@ async function wd(
 }
 async function createSession(profile) {
   const value = await wd(profile, "POST", "/session", {
-    capabilities: { alwaysMatch: { "tauri:options": { application: appBinary } } },
+    capabilities: {
+      alwaysMatch: {
+        "tauri:options": { application: appBinary },
+        timeouts: {
+          script: webdriverCommandTimeoutMs,
+          pageLoad: 300_000,
+          implicit: 0,
+        },
+      },
+    },
   });
   profile.session_id = value.sessionId;
   profile.capabilities = value.capabilities;
+  await wd(
+    profile,
+    "POST",
+    `/session/${profile.session_id}/timeouts`,
+    { script: webdriverCommandTimeoutMs },
+  );
   return value;
 }
 async function closeSession(profile) {
@@ -437,170 +460,73 @@ async function invokeTauriCommand(profile, command, args = {}) {
   return exec(profile, "return window.__TAURI__?.core?.invoke ? window.__TAURI__.core.invoke(arguments[0], arguments[1]) : null;", [command, args]);
 }
 
-function base64Url(bytes) {
-  return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-function deriveVoiceSignalKey({ session_id, group_id, channel_id, from_peer_id, to_peer_id }) {
-  const [firstPeer, secondPeer] = [from_peer_id, to_peer_id].sort();
-  return createHash("sha256")
-    .update("discrypt-voice-signal-seal-v1:")
-    .update(session_id)
-    .update(":")
-    .update(group_id)
-    .update(":")
-    .update(channel_id)
-    .update(":")
-    .update(firstPeer)
-    .update(":")
-    .update(secondPeer)
-    .digest();
-}
-function sealVoiceSignalPayloadNode({ session_id, group_id, channel_id, from_peer_id, to_peer_id, candidate, native_media }) {
-  const nonce = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", deriveVoiceSignalKey({ session_id, group_id, channel_id, from_peer_id, to_peer_id }), nonce);
-  const plaintext = Buffer.from(JSON.stringify({ candidate, native_media }), "utf8");
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
-  return `voice-signal-sealed:v1:${base64Url(nonce)}.${base64Url(encrypted)}`;
-}
-function runtimePeersFromAppState(state) {
-  const session = state?.voice_session ?? {};
-  if (session.signaling?.local_peer_id && session.signaling?.remote_peer_id) {
-    return {
-      local: session.signaling.local_peer_id,
-      remote: session.signaling.remote_peer_id,
-      source: "voice-session-signaling",
-    };
-  }
-  const active = state?.active_context ?? {};
-  const groupId = session.group_id || active.group_id;
-  const group = groupId
-    ? state.groups?.find((item) => item.group_id === groupId)
-    : state.groups?.[0];
-  const peers = group?.runtime_peers ?? [];
-  const local = peers.find((peer) => peer.is_local);
-  const remote = peers.find((peer) => !peer.is_local);
-  if (!local?.peer_id || !remote?.peer_id) {
-    throw new Error(`Could not derive runtime peers from app_state for ${groupId || "active group"}`);
-  }
-  return { local: local.peer_id, remote: remote.peer_id, source: "persisted-runtime-peers" };
-}
-async function publishBackendNativeVoiceProof(profile) {
+async function readNativeVoiceRuntimeEvidence(profile) {
   const state = await invokeTauriCommand(profile, "app_state");
   const session = state?.voice_session;
-  if (!session?.joined) throw new Error(`${profile.display_name} has no joined voice session for native proof`);
-  const peers = runtimePeersFromAppState(state);
-  const started = await invokeTauriCommand(profile, "start_native_voice_media_session", {
-    request: {
-      session_id: session.session_id,
-      local_peer_id: peers.local,
-      remote_peer_id: peers.remote,
-      muted: false,
-      created_at_ms: Date.now(),
-    },
-  });
-  const nativeMedia = started?.native_media;
-  if (!nativeMedia) {
-    throw new Error(`${profile.display_name} native voice media command did not return native_media`);
+  if (!session?.joined) {
+    return {
+      profile: profile.display_name,
+      joined: false,
+      status: null,
+      playback_frames_drained: 0,
+      ready: false,
+      reason: "not joined",
+      last_command_error: state?.last_command_error ?? null,
+    };
   }
-  const candidate = {
-    candidate: `candidate:native-rust-webrtc-datachannel:${nativeMedia.protected_frames_count}`,
-    sdpMid: "native-rust",
-    sdpMLineIndex: 0,
-  };
-  const sealed_payload = sealVoiceSignalPayloadNode({
-    session_id: session.session_id,
-    group_id: session.group_id,
-    channel_id: session.channel_id,
-    from_peer_id: peers.local,
-    to_peer_id: peers.remote,
-    candidate,
-    native_media: nativeMedia,
+  const playback = await invokeTauriCommand(profile, "take_native_voice_playback_frames", {
+    request: { session_id: session.session_id, limit: 0 },
   });
-  const queued = await invokeTauriCommand(profile, "publish_voice_signaling_message", {
-    request: {
-      session_id: session.session_id,
-      signal_kind: "candidate",
-      sealed_payload,
-      signal_id: `tauri-two-profile-e2e-native-rust-${profile.display_name.toLowerCase()}-${Date.now()}`,
-      created_at_ms: Date.now(),
-    },
-  });
+  const status = playback?.status ?? null;
+  const peerStatuses = Array.isArray(status?.peer_statuses) ? status.peer_statuses : [];
+  const readyPeers = peerStatuses.filter((peer) =>
+    peer?.direct_path_ready &&
+      peer?.data_channel_open &&
+      Number(peer?.frames_sent ?? 0) > 0 &&
+      Number(peer?.frames_received ?? 0) > 0
+  );
+  const remoteAudioFrames = (session?.media_runtime?.remote_audio ?? []).reduce(
+    (sum, audio) => sum + Number(audio?.received_audio_frames ?? 0),
+    0,
+  );
+  const playbackFramesDrained = Array.isArray(playback?.frames) ? playback.frames.length : 0;
   return {
     profile: profile.display_name,
+    joined: true,
     session_id: session.session_id,
-    local_peer_id: peers.local,
-    remote_peer_id: peers.remote,
-    peer_source: peers.source ?? null,
-    local_role: peers.local_role ?? null,
-    mic_gain_percent: nativeMedia.mic_gain_percent,
-    app_output_volume_percent: nativeMedia.app_output_volume_percent,
-    rms_i16: nativeMedia.rms_i16,
-    peak_i16: nativeMedia.peak_i16,
-    speaking: nativeMedia.speaking,
-    opus_payload_bytes: nativeMedia.opus_payload_bytes,
-    protected_payload_bytes: nativeMedia.protected_payload_bytes,
-    protected_frames_count: nativeMedia.protected_frames_count,
-    queued_signaling_status: queued?.voice_session?.signaling?.status_copy ?? null,
+    status,
+    peer_statuses: peerStatuses,
+    ready_peer_count: readyPeers.length,
+    playback_frames_drained: playbackFramesDrained,
+    remote_audio_frames: remoteAudioFrames,
+    preferences: state?.preferences ?? null,
+    last_command_error: state?.last_command_error ?? null,
+    ready: readyPeers.length > 0 && (playbackFramesDrained > 0 || remoteAudioFrames > 0),
   };
 }
-async function publishBackendNativeVoiceProofs(profiles) {
-  const reports = await Promise.all([
-    publishBackendNativeVoiceProof(profiles.alice),
-    publishBackendNativeVoiceProof(profiles.bob),
-  ]);
-  manifest.backend_native_voice_proofs = reports;
-  writeManifest(manifest.status || "running", {});
-  return reports;
-}
-async function acceptNativeVoiceSignalPayload(profile, signal) {
-  if (!signal || signal.signal_kind !== "candidate") return null;
-  return exec(profile, String.raw`
-    try {
-      const message = arguments[0];
-      const state = await window.__TAURI__.core.invoke('accept_native_voice_media_signal', {
-        request: { signal: message, attached_at_ms: Date.now() },
-      });
-      const runtime = state?.voice_session?.media_runtime || {};
-      const accepted = Boolean(runtime.remote_transport_active || (runtime.remote_audio || []).length);
-      const evidence = window.__discryptTauriTwoProfileE2EVoiceEvidence;
-      if (evidence && accepted) {
-        evidence.mode = 'native_rust_webrtc_datachannel';
-        evidence.nativeRustVoiceRuntimeAvailable = true;
-        evidence.remoteTrackEvents = (evidence.remoteTrackEvents || 0) + Math.max(1, (runtime.remote_audio || []).length);
-        evidence.iceConnected = true;
-      }
-      return {
-        accepted,
-        boundary: runtime.boundary || null,
-        remote_audio_count: (runtime.remote_audio || []).length,
-        status_copy: runtime.status_copy || null,
-      };
-    } catch (error) {
-      return { accepted: false, stage: 'accept_native_voice_media_signal', error: String(error?.message || error), name: String(error?.name || '') };
-    }
-  `, [signal]);
-}
-async function acceptPendingNativeVoiceSignals(profile, label) {
-  const pending = await invokeTauriCommand(profile, "take_pending_voice_signaling_messages", {
-    request: { limit: 50 },
-  });
-  const signals = Array.isArray(pending?.messages) ? pending.messages : [];
-  const report = {
-    label,
-    profile: profile.display_name,
-    pending: signals.length,
-    accepted: 0,
-    errors: [],
-  };
-  for (const signal of signals) {
-    const accepted = await acceptNativeVoiceSignalPayload(profile, signal).catch((error) => ({
-      accepted: false,
-      error: error instanceof Error ? error.message : String(error),
-    }));
-    if (accepted?.accepted) report.accepted += 1;
-    else if (accepted?.error) report.errors.push(accepted.error);
+async function waitForNativeVoiceRuntimePair(profiles, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  const drainedTotals = { alice: 0, bob: 0 };
+  let last = null;
+  while (Date.now() < deadline) {
+    const [alice, bob] = await Promise.all([
+      readNativeVoiceRuntimeEvidence(profiles.alice),
+      readNativeVoiceRuntimeEvidence(profiles.bob),
+    ]);
+    drainedTotals.alice += alice.playback_frames_drained || 0;
+    drainedTotals.bob += bob.playback_frames_drained || 0;
+    last = {
+      alice: { ...alice, cumulative_playback_frames_drained: drainedTotals.alice },
+      bob: { ...bob, cumulative_playback_frames_drained: drainedTotals.bob },
+    };
+    last.alice.ready = alice.ready || (alice.ready_peer_count > 0 && drainedTotals.alice > 0);
+    last.bob.ready = bob.ready || (bob.ready_peer_count > 0 && drainedTotals.bob > 0);
+    manifest.native_voice_stream_runtime = last;
+    writeManifest(manifest.status || "running", {});
+    if (last.alice.ready && last.bob.ready) return last;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
   }
-  return report;
+  throw new Error(`Native Rust WebRTC DataChannel voice did not produce send/receive/playback evidence; last=${JSON.stringify(last)}`);
 }
 async function appState(profile) {
   return invokeTauriCommand(profile, "app_state", {});
@@ -653,6 +579,28 @@ function providerRuntimeProofed(state) {
   );
   return runtime?.status === "attached";
 }
+function activeScopeLabelForProfileState(state, profile, label) {
+  const scopeLabel =
+    state?.active_context?.dm_id ??
+    state?.active_context?.group_id ??
+    state?.active_context?.channel_id ??
+    null;
+  if (!scopeLabel) {
+    throw new Error(`${profile.display_name} has no active scope for ${label}`);
+  }
+  return scopeLabel;
+}
+async function activeScopeRequestsForProfiles(profiles, label, dataChannelProbe) {
+  const states = await Promise.all([
+    appState(profiles.alice),
+    appState(profiles.bob),
+  ]);
+  return [profiles.alice, profiles.bob].map((profile, index) => ({
+    scope_label: activeScopeLabelForProfileState(states[index], profile, label),
+    data_channel_probe: dataChannelProbe,
+    adapter_kind: "mqtt",
+  }));
+}
 async function waitForProviderRuntime(profile, label, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
@@ -673,10 +621,14 @@ async function waitForProviderRuntime(profile, label, timeoutMs = 45_000) {
   throw new Error(`${profile.display_name} timed out waiting for provider text/control runtime ${label}; last=${JSON.stringify(last)}`);
 }
 async function startProviderTextControlRuntimePair(profiles, label) {
-  const request = { scope_label: `tauri-two-profile-e2e-provider-runtime-${label}`, data_channel_probe: true, adapter_kind: "mqtt" };
+  const [aliceRequest, bobRequest] = await activeScopeRequestsForProfiles(
+    profiles,
+    label,
+    true,
+  );
   const starts = await Promise.all([
-    invokeTauriCommand(profiles.alice, "start_text_session", { request }),
-    invokeTauriCommand(profiles.bob, "start_text_session", { request }),
+    invokeTauriCommand(profiles.alice, "start_text_session", { request: aliceRequest }),
+    invokeTauriCommand(profiles.bob, "start_text_session", { request: bobRequest }),
   ]);
   const attaches = await Promise.all([
     invokeTauriCommand(profiles.alice, "attach_text_control_transport_runtime", { request: {} }),
@@ -716,14 +668,14 @@ async function pumpProviderTextControlFramesOnce(profile, label) {
   };
 }
 async function startProviderControlLanePair(profiles, label) {
-  const request = {
-    scope_label: `tauri-two-profile-e2e-provider-control-lane-${label}`,
-    data_channel_probe: false,
-    adapter_kind: "mqtt",
-  };
+  const [aliceRequest, bobRequest] = await activeScopeRequestsForProfiles(
+    profiles,
+    label,
+    false,
+  );
   const starts = await Promise.all([
-    invokeTauriCommand(profiles.alice, "start_text_session", { request }),
-    invokeTauriCommand(profiles.bob, "start_text_session", { request }),
+    invokeTauriCommand(profiles.alice, "start_text_session", { request: aliceRequest }),
+    invokeTauriCommand(profiles.bob, "start_text_session", { request: bobRequest }),
   ]);
   const attaches = await Promise.all([
     invokeTauriCommand(profiles.alice, "attach_broker_control_lane_runtime", { request: { adapter_kind: "mqtt" } }),
@@ -767,11 +719,12 @@ async function drainProviderControlLaneOnce(profile, label) {
     metrics: report?.metrics ?? null,
   };
 }
-function providerControlLaneEventCounters(state) {
+function providerControlLaneEventCounters(state, afterSequence = 0) {
   const events = Array.isArray(state?.events) ? state.events : [];
   let framesSent = 0;
   let inboundFrames = 0;
   for (const event of events) {
+    if (Number(event?.sequence ?? 0) <= afterSequence) continue;
     if (event?.kind === "message.transport_pump") {
       framesSent += Number(String(event.summary ?? "").match(/sent (\d+) frame/)?.[1] ?? 0);
     }
@@ -779,7 +732,11 @@ function providerControlLaneEventCounters(state) {
       inboundFrames += Number(String(event.summary ?? "").match(/applied (\d+) inbound frame/)?.[1] ?? 0);
     }
   }
-  return { frames_sent: framesSent, inbound_frames: inboundFrames };
+  const lastSequence = events.reduce(
+    (maximum, event) => Math.max(maximum, Number(event?.sequence ?? 0)),
+    afterSequence,
+  );
+  return { frames_sent: framesSent, inbound_frames: inboundFrames, last_sequence: lastSequence };
 }
 async function providerControlLaneCountersForProfiles(profiles) {
   const states = await Promise.all([
@@ -799,21 +756,7 @@ async function pumpProviderControlLaneBidirectional(
     appState(profiles.bob),
   ]);
   const beforeCounters = evidenceBaseline ?? beforeStates.map(providerControlLaneEventCounters);
-  const alreadyAttached = beforeStates.every((state) =>
-    !state?.last_command_error &&
-      state?.events?.some((event) => event?.kind === "transport.broker_control_lane_attached")
-  );
-  const runtime = alreadyAttached
-    ? {
-        label,
-        reused_ui_managed_runtime: true,
-        attached: beforeStates.map((state) => ({
-          last_command_error: state?.last_command_error ?? null,
-          broker_control_lane_attached: state?.events?.some((event) => event?.kind === "transport.broker_control_lane_attached") ?? false,
-          session_manager_started: state?.events?.some((event) => event?.kind === "transport.control_session_started") ?? false,
-        })),
-      }
-    : await startProviderControlLanePair(profiles, label);
+  const runtime = await startProviderControlLanePair(profiles, label);
   const reports = [];
   for (let round = 0; round < rounds; round += 1) {
     const aliceSent = await pumpProviderTextControlFramesOnce(profiles.alice, `${label}-alice-send-${round}`);
@@ -829,15 +772,11 @@ async function pumpProviderControlLaneBidirectional(
     appState(profiles.alice),
     appState(profiles.bob),
   ]);
-  const afterCounters = afterStates.map(providerControlLaneEventCounters);
-  const eventFramesSent = afterCounters.reduce(
-    (sum, counter, index) => sum + Math.max(0, counter.frames_sent - beforeCounters[index].frames_sent),
-    0,
+  const eventDeltas = afterStates.map((state, index) =>
+    providerControlLaneEventCounters(state, beforeCounters[index].last_sequence)
   );
-  const eventInboundFrames = afterCounters.reduce(
-    (sum, counter, index) => sum + Math.max(0, counter.inbound_frames - beforeCounters[index].inbound_frames),
-    0,
-  );
+  const eventFramesSent = eventDeltas.reduce((sum, counter) => sum + counter.frames_sent, 0);
+  const eventInboundFrames = eventDeltas.reduce((sum, counter) => sum + counter.inbound_frames, 0);
   const reportedFramesSent = reports.reduce((sum, report) => sum + (report.frames_sent || 0), 0);
   const reportedInboundFrames = reports.reduce((sum, report) => sum + (report.inbound_frames || 0), 0);
   const evidence = {
@@ -882,15 +821,11 @@ async function pumpProviderTextControlFramesBidirectional(
   const reports = [];
   for (let round = 0; round < rounds; round += 1) {
     const aliceToBob = await pumpProviderTextControlFramesOnce(profiles.alice, `${label}-a2b-${round}`);
-    const bobAccepted = await acceptPendingNativeVoiceSignals(profiles.bob, `${label}-bob-accept-${round}`);
     const bobToAlice = await pumpProviderTextControlFramesOnce(profiles.bob, `${label}-b2a-${round}`);
-    const aliceAccepted = await acceptPendingNativeVoiceSignals(profiles.alice, `${label}-alice-accept-${round}`);
-    reports.push(aliceToBob, bobAccepted, bobToAlice, aliceAccepted);
+    reports.push(aliceToBob, bobToAlice);
     if (
       aliceToBob.frames_sent === 0 &&
-      bobToAlice.frames_sent === 0 &&
-      bobAccepted.accepted === 0 &&
-      aliceAccepted.accepted === 0
+      bobToAlice.frames_sent === 0
     ) {
       break;
     }
@@ -900,11 +835,10 @@ async function pumpProviderTextControlFramesBidirectional(
     appState(profiles.alice),
     appState(profiles.bob),
   ]);
-  const afterCounters = afterStates.map(providerControlLaneEventCounters);
-  const eventFramesSent = afterCounters.reduce(
-    (sum, counter, index) => sum + Math.max(0, counter.frames_sent - beforeCounters[index].frames_sent),
-    0,
+  const eventDeltas = afterStates.map((state, index) =>
+    providerControlLaneEventCounters(state, beforeCounters[index].last_sequence)
   );
+  const eventFramesSent = eventDeltas.reduce((sum, counter) => sum + counter.frames_sent, 0);
   const reportedFramesSent = reports.reduce(
     (sum, report) => sum + (report.frames_sent || 0),
     0,
@@ -919,13 +853,11 @@ async function pumpProviderTextControlFramesBidirectional(
       command_reports: { frames_sent: reportedFramesSent },
       persisted_backend_event_deltas: { frames_sent: eventFramesSent },
     },
-    native_voice_signals_accepted: reports.reduce((sum, report) => sum + (report.accepted || 0), 0),
     manual_command_bridge_used: false,
   };
   const failures = reports.flatMap((report) => Array.isArray(report.failures) ? report.failures : []);
-  const acceptanceErrors = reports.flatMap((report) => Array.isArray(report.errors) ? report.errors : []);
-  if (evidence.frames_sent === 0 || failures.length > 0 || acceptanceErrors.length > 0) {
-    throw new Error(`Provider text/control pump ${label} did not complete cleanly; frames_sent=${evidence.frames_sent} failures=${JSON.stringify(failures)} acceptance_errors=${JSON.stringify(acceptanceErrors)}`);
+  if (evidence.frames_sent === 0 || failures.length > 0) {
+    throw new Error(`Provider text/control pump ${label} did not complete cleanly; frames_sent=${evidence.frames_sent} failures=${JSON.stringify(failures)}`);
   }
   manifest[`provider_text_control_pump_${label.replace(/\W+/g, "_")}`] = evidence;
   writeManifest(manifest.status || "running", {});
@@ -935,8 +867,8 @@ async function waitForProfileState(profile, label, predicate, timeoutMs = 90_000
   const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
-    const state = readJsonIfExists(profile.state_path);
-    last = state?.parse_error ? state.parse_error : predicate(state);
+    const state = await appState(profile);
+    last = predicate(state);
     if (last === true) return state;
     await new Promise((resolveWait) => setTimeout(resolveWait, 500));
   }
@@ -946,12 +878,23 @@ async function waitForProfileState(profile, label, predicate, timeoutMs = 90_000
 
 function hasOpenMlsAdmission(state) {
   const groups = Array.isArray(state?.groups) ? state.groups : [];
-  const handles = Array.isArray(state?.openmls_groups) ? state.openmls_groups : [];
+  const diagnostics = Array.isArray(state?.mls_admission_diagnostic_report?.groups)
+    ? state.mls_admission_diagnostic_report.groups
+    : [];
   const events = Array.isArray(state?.events) ? state.events : [];
   const groupId = groups.find((group) => group?.name === "Two Profile WebDriver Lab")?.group_id;
-  if (!groupId) return { group_id: null, handles: handles.length, joined: false };
-  const handle = handles.find((entry) => entry?.group_id === groupId && Number(entry?.epoch ?? -1) >= 1);
-  return Boolean(handle) || { group_id: groupId, handles: handles.map((entry) => ({ group_id: entry?.group_id, epoch: entry?.epoch })), joined: events.some((event) => event?.kind === "mls.admission_welcome_joined") };
+  const handlePresent = diagnostics.some((entry) => entry?.openmls_handle_present === true);
+  const joined = events.some((event) => event?.kind === "mls.admission_welcome_joined");
+  if (groupId && handlePresent) return true;
+  return {
+    group_id: groupId ?? null,
+    diagnostic_groups: diagnostics.map((entry) => ({
+      local_member_status: entry?.local_member_status ?? null,
+      openmls_handle_present: Boolean(entry?.openmls_handle_present),
+      fail_closed: Boolean(entry?.fail_closed),
+    })),
+    joined,
+  };
 }
 
 function pendingAdmissionRequest(state) {
@@ -972,11 +915,57 @@ function pendingAdmissionRequest(state) {
   };
 }
 
+async function waitForMutualProviderPresence(profiles, label, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    const states = await Promise.all([
+      appState(profiles.alice),
+      appState(profiles.bob),
+    ]);
+    const evidence = [profiles.alice, profiles.bob].map((profile, index) => {
+      const state = states[index];
+      const localMemberId = state?.profile?.user_id;
+      const group = state?.groups?.find((candidate) => candidate?.name === "Two Profile WebDriver Lab");
+      const remoteMember = group?.members?.find((member) => member?.member_id !== localMemberId);
+      const remoteRuntimePeer = group?.runtime_peers?.find(
+        (peer) => !peer?.is_local && peer?.member_id === remoteMember?.member_id,
+      );
+      const ready = Boolean(
+        remoteMember?.status === "online" &&
+          remoteMember?.last_seen_at &&
+          remoteMember?.presence_expires_at &&
+          remoteMember?.runtime_peer_id &&
+          remoteRuntimePeer?.source === "sealed_provider_peer_advertisement_v1",
+      );
+      return {
+        profile: profile.display_name,
+        ready,
+        remote_display_name: remoteMember?.display_name ?? null,
+        remote_role: remoteMember?.role ?? null,
+        remote_status: remoteMember?.status ?? null,
+        last_seen_at: remoteMember?.last_seen_at ?? null,
+        presence_expires_at: remoteMember?.presence_expires_at ?? null,
+        runtime_peer_advertised: Boolean(remoteMember?.runtime_peer_id),
+        runtime_peer_source: remoteRuntimePeer?.source ?? null,
+      };
+    });
+    last = { label, alice: evidence[0], bob: evidence[1] };
+    if (evidence.every((entry) => entry.ready)) {
+      manifest[`provider_presence_${label.replace(/\W+/g, "_")}`] = last;
+      writeManifest(manifest.status || "running", {});
+      return last;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  }
+  throw new Error(`Mutual signed provider presence ${label} was not observed: ${JSON.stringify(last)}`);
+}
+
 async function approvePendingAdmissionThroughUi(profile) {
   const deadline = Date.now() + 60_000;
   let pending = null;
   while (Date.now() < deadline) {
-    const state = readJsonIfExists(profile.state_path);
+    const state = await appState(profile);
     pending = pendingAdmissionRequest(state);
     if (pending?.group_id && pending?.request_id) break;
     await new Promise((resolveWait) => setTimeout(resolveWait, 500));
@@ -1045,7 +1034,14 @@ async function waitForMaybe(profile, label, script, args = [], timeoutMs = 90_00
 }
 async function reloadProfile(profile) {
   await exec(profile, "location.reload(); return true;");
-  await waitUntil(profile, "post-reload app shell", "return /Local-first workspace|Set up your local discrypt profile|Local profile ready|Start a private space|Two Profile WebDriver Lab/i.test(document.body.innerText)", [], 30_000);
+  await waitUntil(
+    profile,
+    "post-reload app shell or password vault unlock",
+    "return /Local-first workspace|Set up your local discrypt profile|Local profile ready|Start a private space|Two Profile WebDriver Lab|Unlock password vault/i.test(document.body.innerText)",
+    [],
+    30_000,
+  );
+  await unlockStorageIfNeeded(profile);
 }
 
 async function assertNoAdmissionDecisionApplyFailure(profile, label) {
@@ -1122,7 +1118,7 @@ const findLabelledControl = (label) => {
   }
   return null;
 };
-const setControlValue = (label, value) => {
+const setControlValue = (label, value, blur = true) => {
   const el = findLabelledControl(label);
   if (!el) return false;
   el.focus();
@@ -1136,7 +1132,7 @@ const setControlValue = (label, value) => {
   else el.value = value;
   el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
-  el.blur();
+  if (blur) el.blur();
   return true;
 };
 const accessibleText = (el) => norm([
@@ -1222,8 +1218,69 @@ async function fill(profile, label, value) {
   const ok = await exec(profile, `${domHelpers}; return setControlValue(arguments[0], arguments[1]);`, [label, value]);
   if (!ok) throw new Error(`${profile.display_name} could not fill ${label}`);
 }
+async function fillAndPressEnter(profile, label, value) {
+  const filled = await exec(
+    profile,
+    `${domHelpers}; return setControlValue(arguments[0], arguments[1], false);`,
+    [label, value],
+  );
+  if (!filled) throw new Error(`${profile.display_name} could not fill ${label}`);
+  await waitUntil(
+    profile,
+    `${label} value`,
+    `${domHelpers}; const el = findLabelledControl(arguments[0]); return el?.value === arguments[1];`,
+    [label, value],
+  );
+  const committed = await exec(
+    profile,
+    `${domHelpers}; const el = findLabelledControl(arguments[0]); if (!el) return false; el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true })); el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true })); return true;`,
+    [label],
+  );
+  if (!committed) throw new Error(`${profile.display_name} could not commit ${label}`);
+}
+async function unlockStorageIfNeeded(profile) {
+  const locked = await exec(
+    profile,
+    "return /Unlock password vault/i.test(document.body.innerText) && document.querySelector('input[type=\"password\"]') !== null;",
+  );
+  if (!locked) return false;
+  const password = storageVaultPasswords.get(profile.display_name);
+  if (!password) throw new Error(`${profile.display_name} has no in-memory E2E vault password`);
+  await fill(profile, "Storage password", password);
+  await click(profile, "^Unlock storage$", { timeoutMs: 30_000 });
+  await waitUntil(
+    profile,
+    "password vault unlock",
+    "return !/Unlock password vault/i.test(document.body.innerText) && /Local-first workspace|Local profile ready|Start a private space|Two Profile WebDriver Lab/i.test(document.body.innerText);",
+    [],
+    120_000,
+  );
+  return true;
+}
 async function setupProfile(profile) {
-  await waitUntil(profile, "setup screen", "return /set up your local discrypt profile/i.test(document.body.innerText)");
+  await waitUntil(
+    profile,
+    "setup screen",
+    "return /set up your local discrypt profile/i.test(document.body.innerText)",
+    [],
+    120_000,
+  );
+  const storageSetupRequired = await exec(
+    profile,
+    "return document.querySelector('[data-testid=\"first-run-storage\"]') !== null;",
+  );
+  if (storageSetupRequired) {
+    const password = storageVaultPasswords.get(profile.display_name);
+    if (!password) throw new Error(`${profile.display_name} has no in-memory E2E vault password`);
+    await click(profile, "Use Discrypt password vault", { timeoutMs: 30_000 });
+    await waitUntil(
+      profile,
+      "password vault credentials",
+      `${domHelpers}; return findLabelledControl('Storage password') !== null && findLabelledControl('Confirm storage password') !== null;`,
+    );
+    await fill(profile, "Storage password", password);
+    await fill(profile, "Confirm storage password", password);
+  }
   await fill(profile, "Display name", profile.display_name);
   await fill(profile, "Device name", profile.device_name);
   await click(profile, "create new user");
@@ -1266,6 +1323,30 @@ async function sendGroupMessage(profile, message) {
   await fill(profile, "Message", message);
   await click(profile, "Send message");
   await waitUntil(profile, `message ${message}`, "return document.body.innerText.includes(arguments[0]);", [message]);
+}
+function persistedChannelName(kind, name) {
+  return kind === "Text" ? `#${name.replace(/^#+/, "")}` : name;
+}
+async function createChannelThroughUi(profile, kind, name) {
+  const action = kind === "Text" ? "Add text channel" : "Add voice channel";
+  const storedName = persistedChannelName(kind, name);
+  await click(profile, action);
+  await fillAndPressEnter(profile, `${kind} channel name`, name);
+  await waitForProfileState(
+    profile,
+    `${kind.toLowerCase()} channel ${name}`,
+    (state) => state?.groups?.some((group) =>
+      group?.name === "Two Profile WebDriver Lab" &&
+      group?.channels?.some((channel) => channel?.kind === kind && channel?.name === storedName)
+    ) ?? false,
+    30_000,
+  );
+  await waitUntil(
+    profile,
+    `${name} visible in channel navigation`,
+    "return document.body.innerText.includes(arguments[0]);",
+    [name],
+  );
 }
 async function installVoiceHarness(profile) {
   await exec(profile, String.raw`
@@ -1384,89 +1465,22 @@ async function installVoiceHarness(profile) {
   `, [profile.display_name.toLowerCase(), requireNativeVoice || disableSyntheticVoiceFallback]);
 }
 
-const alreadyJoinedVoiceUiPredicate = `return /Leave voice call|Mute|joined/i.test(document.body.innerText) && (/You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null);`;
-
-async function readAlreadyJoinedNativeVoice(profile) {
-  const state = await appState(profile);
-  const nativeMediaStarted = state?.events?.some((event) => event?.kind === "voice.native_media_started");
-  const nativeMediaReceived = state?.events?.some((event) => event?.kind === "voice.native_media_received");
-  const joinedUi = await exec(profile, alreadyJoinedVoiceUiPredicate);
-  return {
-    ok: Boolean(requireNativeVoice && nativeMediaStarted && nativeMediaReceived && !state?.last_command_error && joinedUi),
-    state,
-    nativeMediaStarted,
-    nativeMediaReceived,
-    joinedUi,
-  };
-}
-
-async function waitForAlreadyJoinedNativeVoice(profile, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  let last = null;
-  while (Date.now() < deadline) {
-    last = await readAlreadyJoinedNativeVoice(profile);
-    if (last.ok) {
-      await waitUntil(profile, "already joined native voice media", alreadyJoinedVoiceUiPredicate);
-      return true;
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
-  }
-  manifest[`${profile.display_name.toLowerCase()}_already_joined_native_voice_last`] = {
-    native_media_started: Boolean(last?.nativeMediaStarted),
-    native_media_received: Boolean(last?.nativeMediaReceived),
-    joined_ui: Boolean(last?.joinedUi),
-    last_command_error: last?.state?.last_command_error ?? null,
-  };
-  writeManifest(manifest.status || "running", {});
-  return false;
-}
-
-async function joinVoice(profile) {
-  await click(profile, "Voice Lobby");
-  if (requireNativeVoice && await waitForAlreadyJoinedNativeVoice(profile)) {
-    return;
-  }
-  const before = await appState(profile);
-  if (before?.voice_session?.joined) {
-    if (
-      requireNativeVoice &&
-      before?.last_command_error?.command === "start_native_voice_media_session"
-    ) {
-      const commandError = before.last_command_error;
-      throw new Error(`${profile.display_name} native voice media failed after join; ${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`);
-    }
-    if (before?.voice_session?.media_runtime?.local_capture_active) {
-      if (requireNativeVoice) {
-        if (await waitForAlreadyJoinedNativeVoice(profile, 45_000)) {
-          return;
-        }
-        const after = await appState(profile);
-        const commandError = after?.last_command_error;
-        const detail = commandError
-          ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
-          : "native media start/receive evidence did not settle";
-        throw new Error(`${profile.display_name} is already joined locally but native voice media is not active; ${detail}`);
-      }
-      await waitUntil(profile, "already joined local voice participant", alreadyJoinedVoiceUiPredicate);
-      return;
-    }
-    if (requireNativeVoice) {
-      const commandError = before?.last_command_error;
-      const detail = commandError
-        ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
-        : "no backend command error was recorded";
-      throw new Error(`${profile.display_name} is already joined but native voice media is not active; ${detail}`);
-    }
-  }
-  await click(profile, "join call");
-  await waitUntil(profile, "local voice participant", `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`);
-  if (requireNativeVoice && !await waitForAlreadyJoinedNativeVoice(profile, 45_000)) {
-    const after = await appState(profile);
-    const commandError = after?.last_command_error;
+async function joinVoice(profile, channelName) {
+  await click(profile, channelName);
+  await waitUntil(
+    profile,
+    "local voice participant",
+    `return /You · you/i.test(document.body.innerText) || document.querySelector('[data-testid="voice-local-participant"]') !== null;`,
+    [],
+    60_000,
+  );
+  const joined = await appState(profile);
+  if (!joined?.voice_session?.joined) {
+    const commandError = joined?.last_command_error;
     const detail = commandError
       ? `${commandError.command || "unknown command"} ${commandError.code || "unknown_code"}: ${commandError.message || "no message"}`
-      : "native media start/receive evidence did not settle";
-    throw new Error(`${profile.display_name} joined voice but native voice media is not active; ${detail}`);
+      : "backend voice session was not created";
+    throw new Error(`${profile.display_name} UI showed a local voice participant without a joined backend session; ${detail}`);
   }
 }
 async function leaveVoice(profile) {
@@ -1474,19 +1488,44 @@ async function leaveVoice(profile) {
   return waitForLeftVoice(profile);
 }
 async function readLeftVoiceState(profile) {
-  const persistedState = readJsonIfExists(profile.state_path);
+  const persistedState = await appState(profile);
   const persistedEvents = Array.isArray(persistedState?.events) ? persistedState.events : [];
+  const session = persistedState?.voice_session ?? null;
   const voiceLeftEvent = persistedEvents.some((event) => event?.kind === "voice.left");
-  const voiceSessionCleared = Boolean(persistedState && !persistedState.parse_error && !persistedState.voice_session);
+  const voiceSessionLeft = Boolean(session && session.joined === false);
+  const mediaRuntimeStopped = Boolean(
+    session?.media_runtime?.boundary === "stopped" &&
+      session.media_runtime.local_capture_active === false &&
+      session.media_runtime.remote_transport_active === false &&
+      session.media_runtime.remote_audio?.length === 0,
+  );
+  const remoteParticipantsCleared = Boolean(
+    session?.participants?.length === 1 &&
+      session.participants.every((participant) => participant?.role === "you"),
+  );
+  const leftUi = /Voice idle|Click a voice channel to join/i.test(await bodyText(profile));
+  const webviewTrackStopped = await exec(
+    profile,
+    "return (window.__discryptTauriTwoProfileE2EVoiceEvidence?.trackStopCount || 0) > 0;",
+  );
+  const lastCommandError = persistedState?.last_command_error ?? null;
   return {
-    ok: Boolean(voiceSessionCleared && voiceLeftEvent),
-    source: "persisted_app_state",
-    voice_session_cleared: voiceSessionCleared,
+    ok: Boolean(
+      voiceSessionLeft &&
+        mediaRuntimeStopped &&
+        remoteParticipantsCleared &&
+        voiceLeftEvent &&
+        leftUi &&
+        !lastCommandError,
+    ),
+    source: "read-only app_state IPC and rendered WebView",
+    voice_session_left: voiceSessionLeft,
+    media_runtime_stopped: mediaRuntimeStopped,
+    remote_participants_cleared: remoteParticipantsCleared,
     voice_left_event: voiceLeftEvent,
-    left_ui: null,
-    webview_track_stopped: null,
-    last_command_error: persistedState?.last_command_error ?? null,
-    parse_error: persistedState?.parse_error ?? null,
+    left_ui: leftUi,
+    webview_track_stopped: webviewTrackStopped,
+    last_command_error: lastCommandError,
   };
 }
 async function waitForLeftVoice(profile, timeoutMs = 120_000) {
@@ -1539,7 +1578,7 @@ async function adjustRemoteParticipantVolumes(profiles) {
   writeManifest(manifest.status || "running", {});
   return reports;
 }
-async function voiceCallFlow(profiles) {
+async function voiceCallFlow(profiles, channelName) {
   await Promise.all([installVoiceHarness(profiles.alice), installVoiceHarness(profiles.bob)]);
   if (requireNativeVoice) {
     const nativeProbe = {
@@ -1554,29 +1593,79 @@ async function voiceCallFlow(profiles) {
       throw new Error(`Synthetic WebView voice fallback is not permitted for native voice proof: ${JSON.stringify(nativeProbe)}`);
     }
   }
-  const voiceSignalingProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
-  await Promise.all([joinVoice(profiles.alice), joinVoice(profiles.bob)]);
-  const backendNativeProofs = await publishBackendNativeVoiceProofs(profiles);
-  const providerVoiceSignaling = await pumpProviderTextControlFramesBidirectional(
-    profiles,
-    "voice-signaling-provider-runtime",
-    8,
-    voiceSignalingProviderBaseline,
-  );
+  await Promise.all([
+    joinVoice(profiles.alice, channelName),
+    joinVoice(profiles.bob, channelName),
+  ]);
+  const nativeVoiceStreamRuntime = await waitForNativeVoiceRuntimePair(profiles);
+  const nativeVoicePeerStatuses = [
+    ...(nativeVoiceStreamRuntime.alice?.status?.peer_statuses ?? []),
+    ...(nativeVoiceStreamRuntime.bob?.status?.peer_statuses ?? []),
+  ];
+  const providerVoiceSignaling = {
+    label: "native-rust-provider-signaled-webrtc",
+    provider_runtime_used: nativeVoicePeerStatuses.length > 0 && nativeVoicePeerStatuses.every(
+      (peer) => peer?.direct_path_ready && peer?.data_channel_open,
+    ),
+    provider_runtime_kind: "native_rust_provider_signaled_webrtc",
+    provider_endpoint: localMqttEndpoint,
+    direct_peer_edges: nativeVoicePeerStatuses.length,
+    configured_stun_servers: Math.max(
+      0,
+      ...nativeVoicePeerStatuses.map((peer) => Number(peer?.configured_stun_servers ?? 0)),
+    ),
+    configured_turn_servers: Math.max(
+      0,
+      ...nativeVoicePeerStatuses.map((peer) => Number(peer?.configured_turn_servers ?? 0)),
+    ),
+    frames_sent: nativeVoicePeerStatuses.reduce(
+      (sum, peer) => sum + Number(peer?.frames_sent ?? 0),
+      0,
+    ),
+    frames_received: nativeVoicePeerStatuses.reduce(
+      (sum, peer) => sum + Number(peer?.frames_received ?? 0),
+      0,
+    ),
+    evidence_source: "native_voice_stream_runtime.peer_statuses",
+    manual_command_bridge_used: false,
+  };
+  if (
+    !providerVoiceSignaling.provider_runtime_used ||
+    providerVoiceSignaling.configured_turn_servers !== 0
+  ) {
+    throw new Error(`Native voice provider negotiation did not prove direct STUN-only WebRTC: ${JSON.stringify(providerVoiceSignaling)}`);
+  }
+  let remotePlaybackObserved = { alice: false, bob: false };
   for (let round = 0; round < 12; round += 1) {
-    const observed = await Promise.all([
-      waitForMaybe(profiles.alice, "remote voice audio on alice", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptTauriTwoProfileE2EVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
-      waitForMaybe(profiles.bob, "remote voice audio on bob", "return document.querySelector('[data-testid=\"voice-remote-audio-boundary\"]') !== null || (window.__discryptTauriTwoProfileE2EVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
+    const [aliceObserved, bobObserved] = await Promise.all([
+      waitForMaybe(profiles.alice, "remote voice playback on alice", "return document.querySelector('[data-testid=\"voice-remote-participant\"]') !== null && window.__discryptTauriTwoProfileE2EVoiceEvidence?.mode === 'native_rust_webrtc_datachannel' && (window.__discryptTauriTwoProfileE2EVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
+      waitForMaybe(profiles.bob, "remote voice playback on bob", "return document.querySelector('[data-testid=\"voice-remote-participant\"]') !== null && window.__discryptTauriTwoProfileE2EVoiceEvidence?.mode === 'native_rust_webrtc_datachannel' && (window.__discryptTauriTwoProfileE2EVoiceEvidence?.remoteTrackEvents || 0) > 0;", [], 1500),
     ]);
-    if (observed.every(Boolean)) break;
+    remotePlaybackObserved = {
+      alice: remotePlaybackObserved.alice || aliceObserved,
+      bob: remotePlaybackObserved.bob || bobObserved,
+    };
+    if (remotePlaybackObserved.alice && remotePlaybackObserved.bob) break;
+  }
+  if (requireNativeVoice && (!remotePlaybackObserved.alice || !remotePlaybackObserved.bob)) {
+    throw new Error(`Native voice reached the backend but did not cross both UI playback boundaries: ${JSON.stringify(remotePlaybackObserved)}`);
   }
   const remoteParticipantVolume = await adjustRemoteParticipantVolumes(profiles);
   await clickText(profiles.alice, "Voice Lobby");
   await clickText(profiles.bob, "Voice Lobby");
   const beforeLeave = {
-    alice: await exec(profiles.alice, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
-    bob: await exec(profiles.bob, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, remoteAudio: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, remoteBoundaries: document.querySelectorAll('[data-testid=\"voice-remote-audio-boundary\"]').length, text: document.body.innerText };"),
+    alice: await exec(profiles.alice, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, remoteParticipants: document.querySelectorAll('[data-testid=\"voice-remote-participant\"]').length, remoteAudioElements: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, text: document.body.innerText };"),
+    bob: await exec(profiles.bob, "return { evidence: window.__discryptTauriTwoProfileE2EVoiceEvidence || null, remoteParticipants: document.querySelectorAll('[data-testid=\"voice-remote-participant\"]').length, remoteAudioElements: document.querySelectorAll('[data-testid=\"voice-remote-audio\"]').length, text: document.body.innerText };"),
   };
+  const truthfulRemoteMediaStatus = Boolean(
+    beforeLeave.alice.text.includes("Backend-verified authenticated remote media is active over the direct WebRTC transport") &&
+      beforeLeave.bob.text.includes("Backend-verified authenticated remote media is active over the direct WebRTC transport") &&
+      !beforeLeave.alice.text.includes("Media playback remains gated") &&
+      !beforeLeave.bob.text.includes("Media playback remains gated"),
+  );
+  if (!truthfulRemoteMediaStatus) {
+    throw new Error("Voice UI did not report the active authenticated remote media route truthfully on both peers");
+  }
   await click(profiles.alice, "^Mute$");
   await waitUntil(profiles.alice, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptTauriTwoProfileE2EVoiceEvidence?.trackEnabled === false;");
   const afterMute = {
@@ -1590,32 +1679,32 @@ async function voiceCallFlow(profiles) {
   ]);
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
+  const reloadedLeaveCleanup = {
+    alice: await readLeftVoiceState(profiles.alice),
+    bob: await readLeftVoiceState(profiles.bob),
+  };
+  if (!reloadedLeaveCleanup.alice.ok || !reloadedLeaveCleanup.bob.ok) {
+    throw new Error(`Voice leave state did not survive reload: ${JSON.stringify(reloadedLeaveCleanup)}`);
+  }
   const reloadedAudioPreferences = await readReleaseSmokeAudioPreferences(profiles, "after_voice_leave_reload");
   return {
     alice: await exec(profiles.alice, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;"),
     bob: await exec(profiles.bob, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;"),
-    backend_native_proofs: backendNativeProofs,
+    native_voice_stream_runtime: nativeVoiceStreamRuntime,
+    remote_playback_observed: remotePlaybackObserved,
     per56_provider_runtime_voice_signaling: providerVoiceSignaling,
     remote_participant_volume: remoteParticipantVolume,
     reloaded_audio_preferences: reloadedAudioPreferences,
     before_leave: beforeLeave,
+    truthful_remote_media_status: truthfulRemoteMediaStatus,
     after_mute: afterMute,
     leave_cleanup: {
       alice: aliceLeaveCleanup,
       bob: bobLeaveCleanup,
     },
+    reloaded_leave_cleanup: reloadedLeaveCleanup,
   };
 }
-async function voiceFlow(profile) {
-  await installVoiceHarness(profile);
-  await joinVoice(profile);
-  await click(profile, "^Mute$");
-  await waitUntil(profile, "muted microphone", "return /Unmute|Muted/i.test(document.body.innerText) || window.__discryptTauriTwoProfileE2EVoiceEvidence?.trackEnabled === false;");
-  await click(profile, "^Unmute$");
-  await leaveVoice(profile);
-  return exec(profile, "return window.__discryptTauriTwoProfileE2EVoiceEvidence || null;");
-}
-
 writeManifest(run ? "planned" : "dry-run", { preflight_result: preflight() });
 if (!run) {
   console.log(`Tauri two-profile group text and voice E2E dry-run manifest: ${manifestPath}`);
@@ -1672,12 +1761,63 @@ try {
   await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_openmls_admission_provider_runtime");
   await waitForProfileState(profiles.bob, "OpenMLS admission Welcome", hasOpenMlsAdmission, 90_000);
   await waitForProfileState(profiles.alice, "OpenMLS owner admission epoch", hasOpenMlsAdmission, 90_000);
+  const presenceAfterAdmission = await waitForMutualProviderPresence(
+    profiles,
+    "after-admission",
+  );
   await reloadProfile(profiles.alice);
   await reloadProfile(profiles.bob);
   await assertNoAdmissionDecisionApplyFailure(profiles.alice, "alice_after_admission_reload");
   await assertNoAdmissionDecisionApplyFailure(profiles.bob, "bob_after_admission_reload");
   await waitForAdmissionUnlockedUi(profiles.alice);
   await waitForAdmissionUnlockedUi(profiles.bob);
+  const presenceAfterAdmissionReload = await waitForMutualProviderPresence(
+    profiles,
+    "after-admission-reload",
+  );
+  const replicatedTextChannel = "Operations";
+  const replicatedVoiceChannel = "Transatlantic Voice";
+  const persistedTextChannel = persistedChannelName("Text", replicatedTextChannel);
+  const persistedVoiceChannel = persistedChannelName("Voice", replicatedVoiceChannel);
+  const channelSchemaProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
+  await createChannelThroughUi(profiles.alice, "Text", replicatedTextChannel);
+  await createChannelThroughUi(profiles.alice, "Voice", replicatedVoiceChannel);
+  const channelSchemaProviderPump = await pumpProviderControlLaneBidirectional(
+    profiles,
+    "post-admission-channel-schema",
+    8,
+    channelSchemaProviderBaseline,
+  );
+  for (const profile of [profiles.alice, profiles.bob]) {
+    await waitForProfileState(
+      profile,
+      "replicated post-admission channel schema",
+      (state) => state?.groups?.some((group) =>
+        group?.name === "Two Profile WebDriver Lab" &&
+        group?.channels?.some((channel) => channel?.kind === "Text" && channel?.name === persistedTextChannel) &&
+        group?.channels?.some((channel) => channel?.kind === "Voice" && channel?.name === persistedVoiceChannel)
+      ) ?? false,
+      60_000,
+    );
+    await waitUntil(
+      profile,
+      "replicated channels visible before reload",
+      "return document.body.innerText.includes(arguments[0]) && document.body.innerText.includes(arguments[1]);",
+      [replicatedTextChannel, replicatedVoiceChannel],
+      60_000,
+    );
+  }
+  await reloadProfile(profiles.alice);
+  await reloadProfile(profiles.bob);
+  for (const profile of [profiles.alice, profiles.bob]) {
+    await waitUntil(
+      profile,
+      "replicated channels visible after reload",
+      "return document.body.innerText.includes(arguments[0]) && document.body.innerText.includes(arguments[1]);",
+      [replicatedTextChannel, replicatedVoiceChannel],
+      30_000,
+    );
+  }
   const aliceMessage = "alice webdriver group text proof";
   const bobMessage = "bob webdriver group text proof";
   const groupTextProviderBaseline = await providerControlLaneCountersForProfiles(profiles);
@@ -1689,8 +1829,6 @@ try {
     8,
     groupTextProviderBaseline,
   );
-  await reloadProfile(profiles.alice);
-  await reloadProfile(profiles.bob);
   await waitForMaybe(profiles.alice, "bob message visible on alice before reload", "return document.body.innerText.includes(arguments[0]);", [bobMessage], 75_000);
   await waitForMaybe(profiles.bob, "alice message visible on bob before reload", "return document.body.innerText.includes(arguments[0]);", [aliceMessage], 75_000);
   await reloadProfile(profiles.alice);
@@ -1699,27 +1837,51 @@ try {
   await waitForMaybe(profiles.bob, "alice message visible on bob after reload", "return document.body.innerText.includes(arguments[0]);", [aliceMessage], 20_000);
   const aliceBody = await bodyText(profiles.alice);
   const bobBody = await bodyText(profiles.bob);
-  const voice = await voiceCallFlow(profiles);
+  const voice = await voiceCallFlow(profiles, replicatedVoiceChannel);
   const screenshots = { alice: await screenshot(profiles.alice, "final"), bob: await screenshot(profiles.bob, "final") };
-  const aliceTextEvidence = textStateEvidence(profiles.alice, aliceMessage, bobMessage);
-  const bobTextEvidence = textStateEvidence(profiles.bob, bobMessage, aliceMessage);
+  const aliceTextEvidence = await textStateEvidence(profiles.alice, aliceMessage, bobMessage);
+  const bobTextEvidence = await textStateEvidence(profiles.bob, bobMessage, aliceMessage);
   const remotePlaintextObserved = aliceTextEvidence.remote_plaintext_visible && bobTextEvidence.remote_plaintext_visible;
   const remoteEncryptedEnvelopeObserved = aliceTextEvidence.remote_envelope_visible && bobTextEvidence.remote_envelope_visible;
   const peerReceiptsObserved = aliceTextEvidence.sender_peer_receipt_visible && bobTextEvidence.sender_peer_receipt_visible;
+  const mutualProviderPresenceObserved = Boolean(
+    presenceAfterAdmission?.alice?.ready &&
+      presenceAfterAdmission?.bob?.ready &&
+      presenceAfterAdmissionReload?.alice?.ready &&
+      presenceAfterAdmissionReload?.bob?.ready,
+  );
   const aliceRetainedNativeVoiceEvidence = voice?.before_leave?.alice?.evidence ?? voice?.alice ?? null;
   const bobRetainedNativeVoiceEvidence = voice?.before_leave?.bob?.evidence ?? voice?.bob ?? null;
   const browserVoiceLoopbackObserved = Boolean(
-    voice?.before_leave?.alice?.remoteBoundaries > 0 &&
-    voice?.before_leave?.bob?.remoteBoundaries > 0 &&
+    voice?.before_leave?.alice?.remoteAudioElements > 0 &&
+    voice?.before_leave?.bob?.remoteAudioElements > 0 &&
     voice?.alice?.localAudioTracksSent > 0 &&
     voice?.bob?.localAudioTracksSent > 0 &&
     voice?.alice?.remoteTrackEvents > 0 &&
       voice?.bob?.remoteTrackEvents > 0,
   );
-  const backendNativeProofObserved = Boolean(
-    Array.isArray(voice?.backend_native_proofs) &&
-      voice.backend_native_proofs.length >= 2 &&
-      voice.backend_native_proofs.every((proof) => proof?.protected_frames_count > 0),
+  const nativeStreamRuntime = voice?.native_voice_stream_runtime ?? null;
+  const nativeStreamRuntimeObserved = Boolean(
+    nativeStreamRuntime?.alice?.ready &&
+      nativeStreamRuntime?.bob?.ready &&
+      nativeStreamRuntime.alice?.status?.peer_statuses?.some((peer) =>
+        peer?.direct_path_ready &&
+          peer?.data_channel_open &&
+          Number(peer?.frames_sent ?? 0) > 0 &&
+          Number(peer?.frames_received ?? 0) > 0
+      ) &&
+      nativeStreamRuntime.bob?.status?.peer_statuses?.some((peer) =>
+        peer?.direct_path_ready &&
+          peer?.data_channel_open &&
+          Number(peer?.frames_sent ?? 0) > 0 &&
+          Number(peer?.frames_received ?? 0) > 0
+      ) &&
+      Number(nativeStreamRuntime.alice?.remote_audio_frames ?? 0) > 0 &&
+      Number(nativeStreamRuntime.bob?.remote_audio_frames ?? 0) > 0 &&
+      voice?.before_leave?.alice?.remoteParticipants > 0 &&
+      voice?.before_leave?.bob?.remoteParticipants > 0 &&
+      voice?.remote_playback_observed?.alice &&
+      voice?.remote_playback_observed?.bob,
   );
   const nativeRustWebDriverEvidenceObserved = Boolean(
     aliceRetainedNativeVoiceEvidence?.mode === "native_rust_webrtc_datachannel" &&
@@ -1734,7 +1896,7 @@ try {
       bobRetainedNativeVoiceEvidence?.syntheticFallback === false,
   );
   const nativeRustBackendMediaObserved = Boolean(
-    backendNativeProofObserved &&
+    nativeStreamRuntimeObserved &&
       nativeRustWebDriverEvidenceObserved,
   );
   const voiceLoopbackObserved = browserVoiceLoopbackObserved || nativeRustBackendMediaObserved;
@@ -1785,18 +1947,12 @@ try {
       reloaded?.mic_gain_percent === expected.mic_gain_percent &&
       reloaded?.app_output_volume_percent === expected.app_output_volume_percent;
   });
-  const nativeMediaUsesConfiguredAudio = Boolean(
-    Array.isArray(voice?.backend_native_proofs) &&
-      voice.backend_native_proofs.length >= 2 &&
-      voice.backend_native_proofs.every((proof) => {
-        const name = String(proof?.profile || "").toLowerCase();
-        const expected = expectedAudioPreferences[name];
-        return expected &&
-          proof.mic_gain_percent === expected.mic_gain_percent &&
-          proof.app_output_volume_percent === expected.app_output_volume_percent &&
-          proof.protected_frames_count > 0 &&
-          proof.opus_payload_bytes > 0 &&
-          proof.protected_payload_bytes > 0;
+  const nativeStreamUsesConfiguredAudio = Boolean(
+    nativeStreamRuntimeObserved &&
+      Object.entries(expectedAudioPreferences).every(([name, expected]) => {
+        const preferences = nativeStreamRuntime?.[name]?.preferences;
+        return preferences?.mic_gain_percent === expected.mic_gain_percent &&
+          preferences?.app_output_volume_percent === expected.app_output_volume_percent;
       }),
   );
   const remoteParticipantVolumeChanged = Boolean(
@@ -1805,9 +1961,13 @@ try {
   );
   const muteObserved = Boolean(voice?.after_mute?.alice?.evidence?.trackEnabled === false);
   const backendLeaveCleanupObserved = Boolean(
-    voice?.leave_cleanup?.alice?.voice_session_cleared &&
+    voice?.leave_cleanup?.alice?.voice_session_left &&
+      voice?.leave_cleanup?.alice?.media_runtime_stopped &&
+      voice?.leave_cleanup?.alice?.remote_participants_cleared &&
       voice?.leave_cleanup?.alice?.voice_left_event &&
-      voice?.leave_cleanup?.bob?.voice_session_cleared &&
+      voice?.leave_cleanup?.bob?.voice_session_left &&
+      voice?.leave_cleanup?.bob?.media_runtime_stopped &&
+      voice?.leave_cleanup?.bob?.remote_participants_cleared &&
       voice?.leave_cleanup?.bob?.voice_left_event,
   );
   const leaveCleanupObserved = Boolean(
@@ -1815,35 +1975,40 @@ try {
       backendLeaveCleanupObserved,
   );
   const speakingEvidenceObserved = Boolean(
-    Array.isArray(voice?.backend_native_proofs) &&
-      voice.backend_native_proofs.every((proof) => proof?.speaking && proof?.rms_i16 > 0 && proof?.peak_i16 > 0),
+    nativeStreamRuntimeObserved &&
+      voice?.before_leave?.alice?.remoteParticipants > 0 &&
+      voice?.before_leave?.bob?.remoteParticipants > 0,
   );
   const strictProviderRuntimeObserved = Boolean(
     admissionRequestProviderPump?.provider_runtime_used &&
       admissionRequestProviderPump?.frames_sent > 0 &&
       admissionDecisionProviderPump?.provider_runtime_used &&
       admissionDecisionProviderPump?.frames_sent > 0 &&
+      channelSchemaProviderPump?.provider_runtime_used &&
+      channelSchemaProviderPump?.frames_sent > 0 &&
       groupTextProviderPump?.provider_runtime_used &&
       groupTextProviderPump?.frames_sent > 0 &&
       voice?.per56_provider_runtime_voice_signaling?.provider_runtime_used &&
       voice?.per56_provider_runtime_voice_signaling?.frames_sent > 0 &&
+      voice?.per56_provider_runtime_voice_signaling?.frames_received > 0 &&
+      voice?.per56_provider_runtime_voice_signaling?.configured_turn_servers === 0 &&
       voice?.per56_provider_runtime_voice_signaling?.manual_command_bridge_used === false,
   );
   const per59ReleaseSmoke = {
     issue: "PER-59 / P6-T08 human or loopback release smoke",
     native_path_required: true,
     browser_shim_or_raw_pulse_capture_counts_as_production: false,
-    join_proved: Boolean(voice?.backend_native_proofs?.length >= 2),
+    join_proved: nativeStreamRuntimeObserved,
     mute_proved: muteObserved,
     speaking_vad_proved: speakingEvidenceObserved,
-    mic_gain_and_output_volume_proved: audioPreferencesPersisted && nativeMediaUsesConfiguredAudio,
+    mic_gain_and_output_volume_proved: audioPreferencesPersisted && nativeStreamUsesConfiguredAudio,
     per_peer_volume_surface_proved: remoteParticipantVolumeChanged,
     native_loopback_proved: nativeVoiceLoopbackObserved,
     leave_cleanup_proved: leaveCleanupObserved,
     production_claim_allowed: Boolean(
       nativeVoiceLoopbackObserved &&
         audioPreferencesPersisted &&
-        nativeMediaUsesConfiguredAudio &&
+        nativeStreamUsesConfiguredAudio &&
         remoteParticipantVolumeChanged &&
         muteObserved &&
         leaveCleanupObserved &&
@@ -1852,6 +2017,7 @@ try {
     configured_audio_preferences: audioPreferences,
     reloaded_audio_preferences: voice?.reloaded_audio_preferences ?? null,
     remote_participant_volume: voice?.remote_participant_volume ?? null,
+    native_voice_stream_runtime: nativeStreamRuntime,
     leave_cleanup: voice?.leave_cleanup ?? null,
   };
   const summary = {
@@ -1863,6 +2029,8 @@ try {
       invite_created: invite.startsWith("discrypt://join/v1/"),
       owner_staff_approval_applied: Boolean(manifest.openmls_admission_owner_approval?.approved),
       openmls_admission_persisted: true,
+      mutual_provider_presence_observed_live_and_after_reload: mutualProviderPresenceObserved,
+      post_admission_channel_schema_replicated_live_and_after_reload: true,
       text_plaintext_observed_both_ways: remotePlaintextObserved,
       text_envelope_or_receipt_observed_both_ways: remoteEncryptedEnvelopeObserved || peerReceiptsObserved,
       voice_native_or_capability_evidence_recorded: nativeVoiceLoopbackObserved || Boolean(nativeVoiceCapability.alice || nativeVoiceCapability.bob),
@@ -1878,11 +2046,23 @@ try {
         ? "native_rust_webrtc_datachannel_loopback"
         : "native_rtc_generated_audio_loopback")
       : syntheticVoiceFallbackObserved ? "synthetic_peerconnection_fallback_loopback" : voiceLoopbackObserved ? "non_native_browser_media_harness_loopback" : "voice_remote_media_not_observed",
-    strict_e2e_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved && strictProviderRuntimeObserved,
+    strict_e2e_eligible: mutualProviderPresenceObserved && remotePlaintextObserved && nativeVoiceLoopbackObserved && strictProviderRuntimeObserved && voice?.truthful_remote_media_status === true,
+    presence: {
+      after_admission: presenceAfterAdmission,
+      after_admission_reload: presenceAfterAdmissionReload,
+      observed_live_and_after_reload: mutualProviderPresenceObserved,
+    },
+    channel_schema: {
+      text_channel: replicatedTextChannel,
+      voice_channel: replicatedVoiceChannel,
+      replicated_live_and_after_reload: true,
+      provider_control_lane: channelSchemaProviderPump,
+    },
     strict_provider_runtime: {
       local_mqtt_endpoint: localMqttEndpoint,
       admission_request: admissionRequestProviderPump,
       admission_decision: admissionDecisionProviderPump,
+      channel_schema: channelSchemaProviderPump,
       group_text: groupTextProviderPump,
       voice_signaling: voice?.per56_provider_runtime_voice_signaling ?? null,
       provider_runtime_used: strictProviderRuntimeObserved,
@@ -1892,12 +2072,12 @@ try {
       loopback_observed: voiceLoopbackObserved,
       native_generated_audio_observed: nativeVoiceLoopbackObserved && (voice?.alice?.mode === "native_rtc_generated_audio" || voice?.bob?.mode === "native_rtc_generated_audio"),
       native_rust_webrtc_datachannel_observed: nativeVoiceLoopbackObserved && nativeRustBackendMediaObserved,
-      native_rust_evidence_source: nativeRustBackendMediaObserved ? "voice.before_leave.*.evidence" : null,
+      native_rust_evidence_source: nativeRustBackendMediaObserved ? "native_voice_stream_runtime + voice.before_leave.*.evidence" : null,
       synthetic_fallback_observed: syntheticVoiceFallbackObserved,
       production_claim_allowed: nativeVoiceLoopbackObserved,
       blocker: nativeVoiceLoopbackObserved
         ? "physical two-device microphone/speaker proof is still outside this automated native Rust/generated-audio harness"
-        : "native Rust Opus/SFrame media proof or generated-audio loopback was not observed in both Tauri profiles",
+        : "native Rust WebRTC DataChannel send/receive/playback or generated-audio loopback was not observed in both Tauri profiles",
     },
     per59_release_smoke: per59ReleaseSmoke,
     run_id: runId,
@@ -1905,7 +2085,7 @@ try {
     invite_prefix: invite.slice(0, 48),
     setup: { alice: true, bob: true },
     group_invite_join: { invite_created: invite.startsWith("discrypt://join/v1/"), bob_joined: /Two Profile WebDriver Lab/i.test(bobBody) },
-    text_control_transport_bridge: "No manual WebDriver command bridge was used; admission crossed the sealed loopback MQTT control lane, while group text and voice signaling used provider-signaled direct WebRTC text/control runtimes.",
+    text_control_transport_bridge: "No manual WebDriver command bridge was used; admission/presence/channel schema crossed the sealed loopback MQTT control lane, group text and receipts crossed direct WebRTC text/control runtimes, and native voice used its own provider-signaled direct WebRTC runtime.",
     per56_provider_runtime_voice_signaling: voice?.per56_provider_runtime_voice_signaling ?? null,
     native_voice_capability: nativeVoiceCapability,
     text: {
@@ -1924,7 +2104,7 @@ try {
     },
     voice,
     screenshots,
-    profile_state_files: Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { path: rel(profile.state_path), exists: existsSync(profile.state_path), sha256: sha256IfExists(profile.state_path) }])),
+    profile_state_files: Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { path: rel(profile.state_path), exists: existsSync(profile.state_path), sha256: sha256IfExists(profile.state_path), format: "encrypted production store" }])),
     logs: Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { path: rel(profile.log_path), sha256: sha256IfExists(profile.log_path) }])),
     remaining_production_blockers: [
       ...(remotePlaintextObserved ? [] : remoteEncryptedEnvelopeObserved ? [

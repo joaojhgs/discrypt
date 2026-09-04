@@ -119,7 +119,7 @@ for (const roomName of [
       providerAdapters,
       roomName,
       methodName,
-      /TextMessageEnvelope|TextDeliveryReceipt|receive_text_delivery_envelope|apply_text_delivery_receipt|handle_text_control_frame|ProviderApplicationRelay/,
+      /TextMessageEnvelope|TextDeliveryReceipt|receive_text_delivery_envelope|handle_text_control_frame|ProviderApplicationRelay/,
       "must not relay text envelopes/receipts or application payloads through the provider"
     );
   }

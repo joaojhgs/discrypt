@@ -48,7 +48,10 @@ test("command failures log console errors and render dismissible notifications",
     name: "Command notifications",
   });
   await expect(notificationRegion).toBeVisible();
-  const alert = notificationRegion.getByRole("alert").first();
+  const alert = notificationRegion
+    .getByRole("alert")
+    .filter({ hasText: "create_channel backend unavailable" })
+    .first();
   await expect(alert).toContainText("Command failed");
   await expect(alert).toContainText("create_channel backend unavailable");
   await expect(alert).toContainText("Logged to console");

@@ -33,8 +33,8 @@ for (const token of [
   "text_control_frame_roundtrip_persists_across_two_profile_state_files",
   "text_control_session_pump_uses_data_transport_trait_and_persists_receipt",
   "g004_two_profile_restart_matrix_persists_invites_connectivity_receipts_voice_and_preferences",
-  "public-mqtt-two-profile-receipt",
-  "public-nostr-two-profile-receipt",
+  "public-mqtt-provider-signaled-datachannel",
+  "public-nostr-provider-signaled-datachannel",
   "skipped_missing_external_credentials",
   "DISCRYPT_PUBLIC_TURN_ENDPOINT",
   "DISCRYPT_PUBLIC_IPFS_BOOTSTRAP_ENDPOINTS",
@@ -75,7 +75,7 @@ if (dryRun.status !== 0) {
     if (!localIds.includes(id)) failures.push(`dry-run missing local matrix row ${id}`);
   }
   const publicStatuses = (plan.publicAdapterMatrix ?? []).map((entry) => `${entry.id}:${(entry.missingEnv ?? []).join(",")}`).join("\n");
-  for (const id of ["public-mqtt-two-profile-receipt", "public-nostr-two-profile-receipt", "public-turn-relay-only", "public-ipfs-topic-peer", "public-quic-rendezvous"]) {
+  for (const id of ["public-mqtt-provider-signaled-datachannel", "public-nostr-provider-signaled-datachannel", "public-turn-relay-only", "public-ipfs-topic-peer", "public-quic-rendezvous"]) {
     if (!publicStatuses.includes(id)) failures.push(`dry-run missing public matrix row ${id}`);
   }
 }

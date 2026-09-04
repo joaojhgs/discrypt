@@ -964,12 +964,6 @@ export type SendMessageRequest = {
   adapter_kind?: string | null;
 };
 
-export type ApplyTextDeliveryReceiptRequest = {
-  message_id: string;
-  receipt: TextDeliveryReceipt;
-  recipient_verifying_key_hex: string;
-};
-
 export type ReceiveTextDeliveryEnvelopeRequest = {
   target: MessageTargetView;
   envelope: TextMessageEnvelope;
@@ -998,6 +992,7 @@ export type VoiceSignalingMessageView = {
 
 export type PublishVoiceSignalingMessageRequest = {
   session_id: string;
+  recipient_peer_id: string;
   signal_kind: "offer" | "answer" | "candidate" | string;
   sealed_payload: string;
   signal_id?: string | null;
@@ -1006,6 +1001,8 @@ export type PublishVoiceSignalingMessageRequest = {
 
 export type TakePendingVoiceSignalingMessagesRequest = {
   session_id?: string | null;
+  recipient_peer_id: string;
+  sender_peer_id: string;
   limit?: number | null;
 };
 
@@ -1014,36 +1011,7 @@ export type TakePendingVoiceSignalingMessagesResponse = {
   messages: VoiceSignalingMessageView[];
 };
 
-export type NativeVoiceProtectedFrameView = {
-  kid: number[];
-  counter: number;
-  bytes: number[];
-};
-
-export type NativeVoiceMediaSignalPayload = {
-  schema_version: "discrypt.native_voice_media.v1" | string;
-  session_id: string;
-  group_id: string;
-  channel_id: string;
-  from_peer_id: string;
-  to_peer_id: string;
-  media_path: string;
-  boundary: string;
-  capture_source: string;
-  rms_i16: number;
-  peak_i16: number;
-  speaking: boolean;
-  opus_frames: number;
-  protected_frames_count: number;
-  opus_payload_bytes: number;
-  protected_payload_bytes: number;
-  mic_gain_percent: number;
-  app_output_volume_percent: number;
-  protected_frames: NativeVoiceProtectedFrameView[];
-  created_at_ms: number;
-};
-
-export type StartNativeVoiceMediaSessionRequest = {
+export type StartNativeVoiceStreamRequest = {
   session_id: string;
   local_peer_id: string;
   remote_peer_id: string;
@@ -1052,14 +1020,26 @@ export type StartNativeVoiceMediaSessionRequest = {
   created_at_ms: number;
 };
 
-export type StartNativeVoiceMediaSessionResponse = {
-  state: AppState;
-  native_media?: NativeVoiceMediaSignalPayload | null;
-};
-
 export type NativeVoiceStreamStatusView = {
   schema_version: number;
   session_id: string;
+  state: string;
+  role: string;
+  direct_path_ready: boolean;
+  data_channel_open: boolean;
+  configured_stun_servers: number;
+  configured_turn_servers: number;
+  frames_sent: number;
+  frames_received: number;
+  playback_queue_depth: number;
+  last_error?: string | null;
+  peer_statuses: NativeVoiceStreamPeerStatusView[];
+};
+
+export type NativeVoiceStreamPeerStatusView = {
+  session_id: string;
+  local_peer_id: string;
+  remote_peer_id: string;
   state: string;
   role: string;
   direct_path_ready: boolean;
@@ -1091,6 +1071,7 @@ export type SendNativeVoiceAudioFrameResponse = {
 
 export type TakeNativeVoicePlaybackFramesRequest = {
   session_id: string;
+  /** Zero reads runtime status without draining frames queued for speaker playback. */
   limit?: number | null;
 };
 
@@ -1110,17 +1091,6 @@ export type TakeNativeVoicePlaybackFramesResponse = {
 
 export type StopNativeVoiceStreamRequest = {
   session_id: string;
-};
-
-export type AcceptNativeVoiceMediaFrameRequest = {
-  session_id: string;
-  native_media: NativeVoiceMediaSignalPayload;
-  attached_at_ms: number;
-};
-
-export type AcceptNativeVoiceMediaSignalRequest = {
-  signal: VoiceSignalingMessageView;
-  attached_at_ms: number;
 };
 
 export type TextControlFrameView =
@@ -1206,7 +1176,6 @@ export type TextControlFrameView =
       kind: "receipt";
       message_id: string;
       receipt: TextDeliveryReceipt;
-      recipient_verifying_key_hex: string;
     };
 
 export type HandleTextControlFrameRequest = {
@@ -5126,7 +5095,7 @@ export async function publishVoiceSignalingMessage(
 }
 
 export async function takePendingVoiceSignalingMessages(
-  request: TakePendingVoiceSignalingMessagesRequest = {},
+  request: TakePendingVoiceSignalingMessagesRequest,
 ): Promise<TakePendingVoiceSignalingMessagesResponse> {
   return invokeOrFallback<TakePendingVoiceSignalingMessagesResponse>(
     "take_pending_voice_signaling_messages",
@@ -5147,28 +5116,6 @@ export async function takePendingVoiceSignalingMessages(
   );
 }
 
-export async function startNativeVoiceMediaSession(
-  request: StartNativeVoiceMediaSessionRequest,
-): Promise<StartNativeVoiceMediaSessionResponse> {
-  return invokeOrFallback<StartNativeVoiceMediaSessionResponse>(
-    "start_native_voice_media_session",
-    { request },
-    () => {
-      const state = mutateFallback((draft) => {
-        pushCommandError(
-          draft,
-          "voice.native_media_rejected",
-          "start_native_voice_media_session",
-          "native_voice_media_unavailable",
-          "Local fallback web runtime cannot start native Rust voice media; Tauri backend is required",
-          "Run the native Tauri app before claiming native Rust voice media proof",
-        );
-      });
-      return { state, native_media: null };
-    },
-  );
-}
-
 function unavailableNativeVoiceStreamStatus(
   sessionId: string,
 ): NativeVoiceStreamStatusView {
@@ -5185,11 +5132,12 @@ function unavailableNativeVoiceStreamStatus(
     frames_received: 0,
     playback_queue_depth: 0,
     last_error: "Native Rust/Tauri voice runtime is unavailable",
+    peer_statuses: [],
   };
 }
 
 export async function startNativeVoiceStream(
-  request: StartNativeVoiceMediaSessionRequest,
+  request: StartNativeVoiceStreamRequest,
 ): Promise<StartNativeVoiceStreamResponse> {
   return invokeOrFallback<StartNativeVoiceStreamResponse>(
     "start_native_voice_stream",
@@ -5241,40 +5189,6 @@ export async function stopNativeVoiceStream(
 ): Promise<AppState> {
   return invokeOrFallback<AppState>("stop_native_voice_stream", { request }, () =>
     mutateFallback(() => undefined),
-  );
-}
-
-export async function acceptNativeVoiceMediaFrame(
-  request: AcceptNativeVoiceMediaFrameRequest,
-): Promise<AppState> {
-  return invokeOrFallback<AppState>("accept_native_voice_media_frame", { request }, () =>
-    mutateFallback((state) => {
-      pushCommandError(
-        state,
-        "voice.native_media_rejected",
-        "accept_native_voice_media_frame",
-        "native_voice_media_unavailable",
-        "Local fallback web runtime cannot accept native Rust voice media; Tauri backend is required",
-        "Run the native Tauri app before claiming native Rust voice media proof",
-      );
-    }),
-  );
-}
-
-export async function acceptNativeVoiceMediaSignal(
-  request: AcceptNativeVoiceMediaSignalRequest,
-): Promise<AppState> {
-  return invokeOrFallback<AppState>("accept_native_voice_media_signal", { request }, () =>
-    mutateFallback((state) => {
-      pushCommandError(
-        state,
-        "voice.native_media_rejected",
-        "accept_native_voice_media_signal",
-        "native_voice_media_unavailable",
-        "Local fallback web runtime cannot accept native Rust voice media signals; Tauri backend is required",
-        "Run the native Tauri app before claiming native Rust voice media proof",
-      );
-    }),
   );
 }
 
@@ -5776,26 +5690,6 @@ export async function sendMessage(
   );
 }
 
-
-export async function applyTextDeliveryReceipt(
-  request: ApplyTextDeliveryReceiptRequest,
-): Promise<AppState> {
-  return invokeOrFallback<AppState>(
-    "apply_text_delivery_receipt",
-    { request },
-    () =>
-      mutateFallback((state) => {
-        pushCommandError(
-          state,
-          "message.receipt_rejected",
-          "apply_text_delivery_receipt",
-          "receipt_verification_unavailable",
-          "Fallback web runtime cannot verify signed peer receipts; native Rust/Tauri command path is required",
-          "Run the native app to verify peer receipt signatures",
-        );
-      }),
-  );
-}
 
 export async function receiveTextDeliveryEnvelope(
   request: ReceiveTextDeliveryEnvelopeRequest,

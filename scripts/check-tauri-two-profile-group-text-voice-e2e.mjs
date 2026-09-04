@@ -10,6 +10,7 @@ const packageJson = JSON.parse(read("apps/ui/package.json"));
 const harness = read("scripts/tauri-two-profile-group-text-voice-e2e.mjs");
 const uiMain = read("apps/ui/src/main.tsx");
 const uiCommands = read("apps/ui/src/commands.ts");
+const ciWorkflow = read(".github/workflows/ci.yml");
 const releaseMatrix = read("docs/release/release-verification-matrix.md");
 const evidenceDoc = read("docs/release/tauri-two-profile-group-text-voice-e2e.md");
 const failures = [];
@@ -32,6 +33,7 @@ for (const token of [
   "setup",
   "invite",
   "approval",
+  "channels",
   "text",
   "voice",
   "persistence",
@@ -42,6 +44,8 @@ for (const token of [
   "acceptance_criteria",
   "owner_staff_approval_applied",
   "openmls_admission_persisted",
+  "mutual_provider_presence_observed_live_and_after_reload",
+  "post_admission_channel_schema_replicated_live_and_after_reload",
   "text_plaintext_observed_both_ways",
   "voice_native_or_capability_evidence_recorded",
   "persistence_reloaded_after_admission_text_and_voice",
@@ -53,11 +57,18 @@ for (const token of [
   "openmls_admission_owner_approval",
   "hasOpenMlsAdmission",
   "waitForAdmissionUnlockedUi",
+  "waitForMutualProviderPresence",
+  "sealed_provider_peer_advertisement_v1",
+  "storageVaultPasswords",
+  "Use Discrypt password vault",
+  "unlockStorageIfNeeded(profile)",
+  "^Unlock storage$",
   "voice_proof",
   "native_voice_capability",
   "startLocalMqttBroker",
   "DISCRYPT_DEFAULT_MQTT_ENDPOINT",
   "VITE_DISCRYPT_DEFAULT_MQTT_ENDPOINT",
+  "XDG_DATA_HOME",
   "approvePendingAdmissionThroughUi",
   "admission-approve-${pending.request_id}",
   "startProviderControlLanePair",
@@ -65,20 +76,34 @@ for (const token of [
   "drain_text_control_inbound_frames",
   "admissionRequestProviderPump = await pumpProviderControlLaneBidirectional",
   "admissionDecisionProviderPump = await pumpProviderControlLaneBidirectional",
+  "await approvePendingAdmissionThroughUi(profiles.alice)",
+  "await waitForAdmissionUnlockedUi(profiles.alice)",
+  "await waitForAdmissionUnlockedUi(profiles.bob)",
+  "await createChannelThroughUi(profiles.alice, \"Text\", replicatedTextChannel)",
+  "await createChannelThroughUi(profiles.alice, \"Voice\", replicatedVoiceChannel)",
+  '"post-admission-channel-schema"',
+  "const groupTextProviderPump = await pumpProviderTextControlFramesBidirectional",
   '"group-text",\n    8,\n    groupTextProviderBaseline',
-  '"voice-signaling-provider-runtime"',
+  '"native-rust-provider-signaled-webrtc"',
+  'provider_runtime_kind: "native_rust_provider_signaled_webrtc"',
+  'evidence_source: "native_voice_stream_runtime.peer_statuses"',
+  "truthful_remote_media_status",
+  "Backend-verified authenticated remote media is active over the direct WebRTC transport",
+  "const peerReceiptsObserved = aliceTextEvidence.sender_peer_receipt_visible && bobTextEvidence.sender_peer_receipt_visible",
+  "text_envelope_or_receipt_observed_both_ways: remoteEncryptedEnvelopeObserved || peerReceiptsObserved",
   "manual_command_bridge_used: false",
-  "strict_e2e_eligible: remotePlaintextObserved && nativeVoiceLoopbackObserved && strictProviderRuntimeObserved",
+  "strict_e2e_eligible: mutualProviderPresenceObserved && remotePlaintextObserved && nativeVoiceLoopbackObserved && strictProviderRuntimeObserved",
 ]) {
   requireText("Tauri two-profile group text and voice E2E harness", harness, token);
 }
 
 for (const token of [
-  "requiresAdmissionControlLane",
+  "localAdmissionPending",
+  'localStatus === "pending"',
+  "syncTextRuntimeForState(latestState, false)",
   "attachBrokerControlLaneRuntime",
   "drainTextControlInboundFrames",
   "startControlLaneSessionManager",
-  'activeGroup.role === "pending"',
   'member.status !== "pending"',
 ]) {
   requireText("native UI admission control-lane selection", uiMain, token);
@@ -97,7 +122,7 @@ for (const token of [
   "npm --prefix apps/ui run test:tauri-two-profile-group-text-voice-e2e-contract",
   "node scripts/tauri-two-profile-group-text-voice-e2e.mjs --run --require-native-voice",
   "target/tauri-two-profile-group-text-voice-e2e/<run-id>/tauri-two-profile-group-text-voice-e2e-summary.json",
-  "setup, invite, owner/staff approval, text, voice, persistence, and degraded/unavailable-state evidence",
+  "setup, invite, owner/staff approval, live and persisted channel-schema replication, text, voice, persistence, and degraded/unavailable-state evidence",
   "Dry-run is contract/preflight evidence only",
 ]) {
   requireText("two-profile E2E evidence doc", evidenceDoc, token);
@@ -109,6 +134,12 @@ for (const token of [
   "target/tauri-two-profile-group-text-voice-e2e/<run-id>/tauri-two-profile-group-text-voice-e2e-summary.json",
 ]) {
   requireText("release verification matrix", releaseMatrix, token);
+}
+
+for (const token of [
+  "npm run test:tauri-two-profile-group-text-voice-e2e-contract",
+]) {
+  requireText("GitHub UI CI", ciWorkflow, token);
 }
 
 for (const token of [

@@ -164,6 +164,8 @@ jobs:
         working-directory: apps/ui
       - run: npm run test:final-e2e-g131
         working-directory: apps/ui
+      - run: npm run test:tauri-two-profile-group-text-voice-e2e-contract
+        working-directory: apps/ui
 
   per27-public-mqtt-namespace:
     name: PER-27 public MQTT namespace proof

@@ -42,6 +42,7 @@ use crate::{WebRtcNegotiationId, WebRtcNegotiationPayloadKind, WebRtcNegotiation
 use async_trait::async_trait;
 #[cfg(any(
     test,
+    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -102,7 +103,6 @@ use tokio::time::Instant;
 const PROVIDER_ICE_CANDIDATE_BUNDLE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(
     test,
-    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -120,7 +120,6 @@ const PROVIDER_RUNTIME_DATA_CHANNEL_FINAL_GRACE: Duration = Duration::from_secs(
 const PROVIDER_NEGOTIATION_SIGNAL_TTL_SECONDS: i64 = 75;
 #[cfg(any(
     test,
-    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",
@@ -3821,6 +3820,7 @@ where
 
 #[cfg(any(
     test,
+    feature = "harness",
     feature = "mqtt-adapter",
     feature = "nostr-adapter",
     feature = "ipfs-pubsub-adapter",

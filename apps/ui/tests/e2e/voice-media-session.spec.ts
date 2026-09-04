@@ -37,6 +37,7 @@ type VoiceMediaEvidence = {
   sinkIds: string[];
   gainValues: number[];
   nativePlaybackFrames: number;
+  nativePlaybackStartTimes: number[];
   stoppedPlaybackTracks: number;
   remoteDescriptionSdps: string[];
   iceCandidateValues: string[];
@@ -159,6 +160,7 @@ async function installVoiceMediaHarness(
         sinkIds: [],
         gainValues: [],
         nativePlaybackFrames: 0,
+        nativePlaybackStartTimes: [],
         stoppedPlaybackTracks: 0,
         remoteDescriptionSdps: [],
         iceCandidateValues: [],
@@ -367,7 +369,9 @@ async function installVoiceMediaHarness(
             connect: () => {
               evidence.nativePlaybackFrames += 1;
             },
-            start: () => undefined,
+            start: (when = 0) => {
+              evidence.nativePlaybackStartTimes.push(when);
+            },
           };
         }
         resume() {
@@ -708,7 +712,7 @@ async function joinInvite(page: Page, invite: string) {
   await expect(page.getByText(/G007 Voice Media Lab/i).first()).toBeVisible();
 }
 
-type AdvertisedVoicePeer = {
+type BrowserFixtureVoicePeer = {
   memberId: string;
   displayName: string;
   deviceId: string;
@@ -716,14 +720,19 @@ type AdvertisedVoicePeer = {
   role: "owner" | "member";
 };
 
-type AuthorityGroupSchema = {
+type BrowserFixtureGroupSchema = {
   groupId: string;
   channels: Array<Record<string, unknown>>;
   channelSchemaEpoch: number;
-  owner: AdvertisedVoicePeer;
+  owner: BrowserFixtureVoicePeer;
 };
 
-async function readAuthorityGroupSchema(page: Page): Promise<AuthorityGroupSchema> {
+type BrowserFixtureGroupVoiceTopologyOptions = {
+  memberPages?: Page[];
+  fixturePeers?: BrowserFixtureVoicePeer[];
+};
+
+async function readBrowserFixtureGroupSchema(page: Page): Promise<BrowserFixtureGroupSchema> {
   return page.evaluate(() => {
     const storageKey = "discrypt.local-dev.app-state.v1";
     const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
@@ -732,7 +741,7 @@ async function readAuthorityGroupSchema(page: Page): Promise<AuthorityGroupSchem
       (candidate: { group_id?: string }) => candidate.group_id === groupId,
     );
     if (!state?.profile || !group || !Array.isArray(group.channels)) {
-      throw new Error("authority group state is unavailable");
+      throw new Error("browser fixture group state is unavailable");
     }
     return {
       groupId: group.group_id,
@@ -749,7 +758,7 @@ async function readAuthorityGroupSchema(page: Page): Promise<AuthorityGroupSchem
   });
 }
 
-async function readMemberVoicePeer(page: Page): Promise<AdvertisedVoicePeer> {
+async function readBrowserFixtureVoicePeer(page: Page): Promise<BrowserFixtureVoicePeer> {
   return page.evaluate(() => {
     const storageKey = "discrypt.local-dev.app-state.v1";
     const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
@@ -764,14 +773,14 @@ async function readMemberVoicePeer(page: Page): Promise<AdvertisedVoicePeer> {
   });
 }
 
-async function installAdvertisedGroupState(
+async function installBrowserFixtureGroupState(
   page: Page,
-  schema: AuthorityGroupSchema,
-  localPeer: AdvertisedVoicePeer,
-  remotePeer: AdvertisedVoicePeer,
+  schema: BrowserFixtureGroupSchema,
+  localPeer: BrowserFixtureVoicePeer,
+  remotePeers: BrowserFixtureVoicePeer[],
 ) {
   await page.evaluate(
-    ({ authoritySchema, local, remote }) => {
+    ({ authoritySchema, local, remotes }) => {
       const storageKey = "discrypt.local-dev.app-state.v1";
       const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
       const group = state?.groups?.find(
@@ -779,11 +788,11 @@ async function installAdvertisedGroupState(
           candidate.group_id === authoritySchema.groupId,
       );
       if (!state?.profile || !group) {
-        throw new Error("group state is unavailable for provider advertisement");
+        throw new Error("group state is unavailable for browser voice fixture");
       }
       const now = new Date().toISOString();
       const presenceExpiresAt = new Date(Date.now() + 10 * 60 * 1_000).toISOString();
-      const members = [local, remote].map((peer) => ({
+      const members = [local, ...remotes].map((peer) => ({
         member_id: peer.memberId,
         display_name: peer.displayName,
         device_id: peer.deviceId,
@@ -838,30 +847,57 @@ async function installAdvertisedGroupState(
     {
       authoritySchema: schema,
       local: localPeer,
-      remote: remotePeer,
+      remotes: remotePeers,
     },
   );
 }
 
-async function synchronizeAuthoritySchemaAndPeerAdvertisements(
+async function installBrowserFixtureGroupVoiceTopology(
   ownerPage: Page,
-  memberPage?: Page,
+  options: BrowserFixtureGroupVoiceTopologyOptions = {},
 ) {
-  const schema = await readAuthorityGroupSchema(ownerPage);
-  const member = memberPage
-    ? await readMemberVoicePeer(memberPage)
-    : {
-        memberId: "remote-member-voice-e2e",
-        displayName: "Remote peer",
-        deviceId: "remote-device-voice-e2e",
-        peerId: "remote-peer",
-        role: "member" as const,
-      };
-  await installAdvertisedGroupState(ownerPage, schema, schema.owner, member);
-  if (memberPage) {
-    await installAdvertisedGroupState(memberPage, schema, member, schema.owner);
-    await Promise.all([ownerPage.reload(), memberPage.reload()]);
-    await expect(memberPage.getByRole("button", { name: /Voice Lobby/ })).toBeVisible();
+  const schema = await readBrowserFixtureGroupSchema(ownerPage);
+  const memberPages = options.memberPages ?? [];
+  const fixturePeers = options.fixturePeers ?? [];
+  const pagePeers = await Promise.all(
+    memberPages.map((page) => readBrowserFixtureVoicePeer(page)),
+  );
+  const members =
+    pagePeers.length > 0 || fixturePeers.length > 0
+      ? [...pagePeers, ...fixturePeers]
+      : [
+          {
+            memberId: "remote-member-voice-e2e",
+            displayName: "Remote peer",
+            deviceId: "remote-device-voice-e2e",
+            peerId: "remote-peer",
+            role: "member",
+          },
+        ];
+  await installBrowserFixtureGroupState(ownerPage, schema, schema.owner, members);
+  if (memberPages.length > 0) {
+    await Promise.all(
+      memberPages.map((page, index) =>
+        installBrowserFixtureGroupState(
+          page,
+          schema,
+          pagePeers[index],
+          [
+            schema.owner,
+            ...members.filter((peer) => peer.peerId !== pagePeers[index].peerId),
+          ],
+        ),
+      ),
+    );
+    await Promise.all([
+      ownerPage.reload(),
+      ...memberPages.map((page) => page.reload()),
+    ]);
+    await Promise.all(
+      memberPages.map((page) =>
+        expect(page.getByRole("button", { name: /Voice Lobby/ })).toBeVisible(),
+      ),
+    );
   } else {
     await ownerPage.reload();
   }
@@ -1119,13 +1155,13 @@ test("sealed WebView voice signaling binds backend envelope metadata", async ({
   }
 });
 
-test("native Rust voice bridges WebAudio microphone PCM over the backend DataChannel and retries stale transport errors", async ({
+test("browser fixture voice bridges WebAudio microphone PCM over the backend DataChannel and retries stale transport errors", async ({
   browser,
 }) => {
   const profile = await openProfile(browser, "Native Speaker", "Linux Desktop");
   try {
     await createInvite(profile.page);
-    await synchronizeAuthoritySchemaAndPeerAdvertisements(profile.page);
+    await installBrowserFixtureGroupVoiceTopology(profile.page);
     await profile.page.evaluate(() => {
       const voiceEvidence = (
         window as Window & {
@@ -1133,24 +1169,55 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
         }
       ).__discryptVoiceMediaEvidence;
       if (!voiceEvidence) throw new Error("voice media evidence missing");
-      const status = {
-        schema_version: 1,
-        session_id: "native-session",
-        state: "connected",
-        role: "offerer",
-        direct_path_ready: true,
-        data_channel_open: true,
-        configured_stun_servers: 1,
-        configured_turn_servers: 0,
-        frames_sent: 0,
-        frames_received: 1,
-        playback_queue_depth: 0,
-        last_error: null,
-      };
       const retryEvidence = {
         startCalls: 0,
         stopCalls: 0,
         playbackPolls: 0,
+        latestLocalPeerId: "",
+        latestRemotePeerId: "",
+      };
+      const statusForPeer = (
+        overrides: Partial<{
+          state: string;
+          role: string;
+          direct_path_ready: boolean;
+          data_channel_open: boolean;
+          frames_sent: number;
+          frames_received: number;
+          playback_queue_depth: number;
+          last_error: string | null;
+        }> = {},
+      ) => {
+        const peerStatus = {
+          session_id: "native-session",
+          local_peer_id: retryEvidence.latestLocalPeerId,
+          remote_peer_id: retryEvidence.latestRemotePeerId,
+          state: overrides.state ?? "connected",
+          role: overrides.role ?? "offerer",
+          direct_path_ready: overrides.direct_path_ready ?? true,
+          data_channel_open: overrides.data_channel_open ?? true,
+          configured_stun_servers: 1,
+          configured_turn_servers: 0,
+          frames_sent: overrides.frames_sent ?? 0,
+          frames_received: overrides.frames_received ?? 1,
+          playback_queue_depth: overrides.playback_queue_depth ?? 0,
+          last_error: overrides.last_error ?? null,
+        };
+        return {
+          schema_version: 1,
+          session_id: "native-session",
+          state: peerStatus.state,
+          role: peerStatus.role,
+          direct_path_ready: peerStatus.direct_path_ready,
+          data_channel_open: peerStatus.data_channel_open,
+          configured_stun_servers: peerStatus.configured_stun_servers,
+          configured_turn_servers: peerStatus.configured_turn_servers,
+          frames_sent: peerStatus.frames_sent,
+          frames_received: peerStatus.frames_received,
+          playback_queue_depth: peerStatus.playback_queue_depth,
+          last_error: peerStatus.last_error,
+          peer_statuses: [peerStatus],
+        };
       };
       Object.defineProperty(window, "__discryptNativeVoiceRetryEvidence", {
         configurable: true,
@@ -1259,18 +1326,24 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
               }
               if (command === "start_native_voice_stream") {
                 retryEvidence.startCalls += 1;
-                voiceEvidence.nativeVoiceStartRequests.push(args?.request ?? {});
+                const request = args?.request ?? {};
+                retryEvidence.latestLocalPeerId = String(
+                  request.local_peer_id ?? "",
+                );
+                retryEvidence.latestRemotePeerId = String(
+                  request.remote_peer_id ?? "",
+                );
+                voiceEvidence.nativeVoiceStartRequests.push(request);
                 return {
                   state: readState(),
                   status:
                     retryEvidence.startCalls === 1
-                      ? {
-                          ...status,
+                      ? statusForPeer({
                           state: "attaching",
                           direct_path_ready: false,
                           data_channel_open: false,
-                        }
-                      : status,
+                        })
+                      : statusForPeer(),
                 };
               }
               if (command === "take_native_voice_playback_frames") {
@@ -1278,10 +1351,12 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
                 if (retryEvidence.startCalls === 1) {
                   return {
                     frames: [],
-                    status: {
-                      ...status,
+                    status: statusForPeer({
+                      state: "failed",
+                      direct_path_ready: false,
+                      data_channel_open: false,
                       last_error: "simulated initial attach timeout",
-                    },
+                    }),
                   };
                 }
                 const frames = playbackDrained
@@ -1295,13 +1370,21 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
                         frame_duration_ms: 20,
                         pcm_i16: [0, 1200, -1200, 0],
                       },
+                      {
+                        from_peer_id: "second-remote-peer",
+                        counter: 1,
+                        sample_rate_hz: 48_000,
+                        channels: 1,
+                        frame_duration_ms: 20,
+                        pcm_i16: [0, 1000, -1000, 0],
+                      },
                     ];
                 playbackDrained = true;
-                return { frames, status };
+                return { frames, status: statusForPeer() };
               }
               if (command === "send_native_voice_audio_frame") {
                 voiceEvidence.nativeAudioFramesSent += 1;
-                return { accepted: true, status };
+                return { accepted: true, status: statusForPeer() };
               }
               if (command === "save_preferences") {
                 const state = withCursor(readState());
@@ -1348,18 +1431,26 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
                   startCalls: number;
                   stopCalls: number;
                   playbackPolls: number;
+                  latestLocalPeerId: string;
+                  latestRemotePeerId: string;
                 };
               }
             ).__discryptNativeVoiceRetryEvidence ?? null,
         ),
       )
-      .toMatchObject({ startCalls: 2, stopCalls: 1 });
+      .toMatchObject({ startCalls: 2, stopCalls: 0 });
     expect((await readEvidence(profile.page)).sinkIds).toEqual([]);
     expect((await readEvidence(profile.page)).playbackAttachments).toBe(0);
     expect((await readEvidence(profile.page)).stoppedPlaybackTracks).toBe(0);
     await expect
       .poll(async () => (await readEvidence(profile.page)).nativePlaybackFrames)
-      .toBeGreaterThan(0);
+      .toBeGreaterThan(1);
+    await expect
+      .poll(async () => {
+        const starts = (await readEvidence(profile.page)).nativePlaybackStartTimes;
+        return starts.length >= 2 ? starts.slice(0, 2) : starts;
+      })
+      .toEqual([0.02, 0.02]);
     await expect
       .poll(async () => {
         const evidence = await readEvidence(profile.page);
@@ -1427,7 +1518,53 @@ test("native Rust voice bridges WebAudio microphone PCM over the backend DataCha
   }
 });
 
-test("two profiles attach local microphone tracks and surface remote audio playback", async ({
+test("browser fixture starts one WebView voice edge per advertised remote peer", async ({
+  browser,
+}) => {
+  const profile = await openProfile(browser, "Mesh Owner", "Owner Desktop");
+  try {
+    await createInvite(profile.page);
+    await installBrowserFixtureGroupVoiceTopology(profile.page, {
+      fixturePeers: [
+        {
+          memberId: "remote-member-one",
+          displayName: "Remote One",
+          deviceId: "remote-device-one",
+          peerId: "remote-peer-one",
+          role: "member",
+        },
+        {
+          memberId: "remote-member-two",
+          displayName: "Remote Two",
+          deviceId: "remote-device-two",
+          peerId: "remote-peer-two",
+          role: "member",
+        },
+      ],
+    });
+
+    await joinVoice(profile.page);
+
+    await expect
+      .poll(async () => (await readEvidence(profile.page)).localAudioTracksSent)
+      .toBe(2);
+    await expect
+      .poll(async () => {
+        const evidence = await readEvidence(profile.page);
+        return evidence.sentVoiceSignals
+          .filter((signal) => signal.kind === "offer")
+          .map((signal) => signal.to_peer_id)
+          .sort();
+      })
+      .toEqual(["remote-peer-one", "remote-peer-two"]);
+    await expect(profile.page.getByTestId("voice-local-participant").first()).toBeVisible();
+    expect(profile.errors).toEqual([]);
+  } finally {
+    await profile.context.close();
+  }
+});
+
+test("browser fixture profiles attach local microphone tracks and surface remote audio playback", async ({
   browser,
 }) => {
   test.setTimeout(180_000);
@@ -1436,7 +1573,9 @@ test("two profiles attach local microphone tracks and surface remote audio playb
   try {
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await synchronizeAuthoritySchemaAndPeerAdvertisements(alice.page, bob.page);
+    await installBrowserFixtureGroupVoiceTopology(alice.page, {
+      memberPages: [bob.page],
+    });
 
     await joinVoice(alice.page);
     await joinVoice(bob.page);
@@ -1523,7 +1662,9 @@ test("WebView voice ignores stale signaling from a previous media attempt", asyn
   try {
     const invite = await createInvite(alice.page);
     await joinInvite(bob.page, invite);
-    await synchronizeAuthoritySchemaAndPeerAdvertisements(alice.page, bob.page);
+    await installBrowserFixtureGroupVoiceTopology(alice.page, {
+      memberPages: [bob.page],
+    });
 
     await joinVoice(bob.page);
     await joinVoice(alice.page);

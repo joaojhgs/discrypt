@@ -7,6 +7,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 const harness = read("scripts/tauri-two-profile-group-text-voice-e2e.mjs");
 const ui = read("apps/ui/src/main.tsx");
+const voiceMedia = read("apps/ui/src/voice-media.ts");
 const desktop = read("apps/desktop/src-tauri/src/lib.rs");
 const releaseNote = read("docs/release/per59-human-loopback-release-smoke-2026-06-20.md");
 const plan = read(".omx/plans/P6-T08-human-loopback-release-smoke-2026-06-20.md");
@@ -24,13 +25,17 @@ for (const token of [
   "per_peer_volume_surface_proved",
   "production_claim_allowed",
   "browser_shim_or_raw_pulse_capture_counts_as_production: false",
-  "nativeMedia.mic_gain_percent",
-  "nativeMedia.app_output_volume_percent",
+  "readNativeVoiceRuntimeEvidence",
+  "waitForNativeVoiceRuntimePair",
+  "native_voice_stream_runtime",
+  "cumulative_playback_frames_drained",
+  "data_channel_open",
+  "frames_received",
+  "take_native_voice_playback_frames",
   "adjustRemoteParticipantVolumes",
-  "runtimePeersFromAppState",
-  "persisted-runtime-peers",
-  "voice-session-signaling",
-  "media_runtime?.local_capture_active",
+  "native_voice_stream_runtime",
+  "ready_peer_count",
+  "joined?.voice_session?.joined",
   "profile ready or trust setup screen",
   "local profile ready|start a private space",
   "contextClickText",
@@ -52,21 +57,23 @@ for (const token of [
   "assertNoAdmissionDecisionApplyFailure",
   "admission_decision_apply_failed",
   "await click(profile, \"Send message\");",
-  "native voice media failed after join",
-  "already joined native voice media",
-  "alreadyJoinedVoiceUiPredicate",
-  "waitForAlreadyJoinedNativeVoice",
-  "already_joined_native_voice_last",
+  "UI showed a local voice participant without a joined backend session",
+  "native_rust_provider_signaled_webrtc",
+  "native_voice_stream_runtime.peer_statuses",
+  "configured_turn_servers !== 0",
+  "voice-remote-participant",
   "after_voice_leave_reload",
   "await click(profiles.alice, \"^Mute$\");",
   "await click(profiles.alice, \"^Unmute$\");",
   "await click(profile, \"Leave voice call\");",
   "waitForLeftVoice",
-  "readJsonIfExists(profile.state_path)",
-  "source: \"persisted_app_state\"",
+  "source: \"read-only app_state IPC and rendered WebView\"",
   "timeoutMs = 120_000",
-  "voice_session_cleared",
+  "voice_session_left",
+  "media_runtime_stopped",
+  "remote_participants_cleared",
   "voice_left_event",
+  "reloaded_leave_cleanup",
   "backendLeaveCleanupObserved",
   "leave_cleanup",
   "aliceRetainedNativeVoiceEvidence",
@@ -79,28 +86,66 @@ for (const token of [
   "nativeRustVoiceRuntimeAvailable",
   "syntheticFallback === false",
   "native_rust_evidence_source",
-  "voice.before_leave.*.evidence",
-  "native Rust Opus/SFrame media proof or generated-audio loopback",
-  "voice.native_media_started",
-  "voice.native_media_received",
+  "native_voice_stream_runtime + voice.before_leave.*.evidence",
+  "native Rust WebRTC DataChannel send/receive/playback or generated-audio loopback",
 ]) {
   requireText("two-profile E2E harness", harness, token);
 }
 
 for (const token of [
-  "hasCurrentAdvertisedRemoteGroupRuntimePeer",
-  "voiceSignaling?.local_peer_id",
-  "groupRuntimePeers.find",
-  "peer.source !== \"sealed_provider_peer_advertisement_v1\"",
-  "startNativeRustVoiceMediaSession",
+  "start_native_voice_media_session",
+  "accept_native_voice_media_frame",
+  "accept_native_voice_media_signal",
+  "native_media",
+  "voice.native_media_started",
+  "voice.native_media_received",
+  "runtimePeersFromAppState",
+  "persisted-runtime-peers",
+  "voice-session-signaling",
 ]) {
-  requireText("Discrypt UI native voice peer selection", ui, token);
+  if (harness.includes(token) || ui.includes(token) || voiceMedia.includes(token)) {
+    failures.push(`obsolete native voice proof token is still present: ${token}`);
+  }
 }
 
 for (const token of [
-  "native_voice_runtime_peer_attachment",
+  "textRuntimePeerEdges",
+  "runtimeRoleForGroupEdge",
+  "runtimePeerEdgeKey",
+  "voiceMediaHandlesRef",
+  "startNativeRustVoiceMediaMeshSession",
+  "VoiceMediaPeerEdge",
+]) {
+  requireText("Discrypt UI native voice mesh reconciliation", ui, token);
+}
+
+for (const token of [
+  "startNativeRustVoiceMediaMeshSession",
+  "edges: VoiceMediaPeerEdge[]",
+  "signal.from_peer_id !== remotePeerId",
+  "recipient_peer_id: signal.to_peer_id",
+  "sender_peer_id: remotePeerId",
+]) {
+  requireText("Discrypt UI native/WebView voice media mesh", voiceMedia, token);
+}
+
+for (const token of [
+  "hasCurrentAdvertisedRemoteGroupRuntimePeer",
+  "startNativeRustVoiceMediaSession",
+]) {
+  if (ui.includes(token) || voiceMedia.includes(token)) {
+    failures.push(`Discrypt UI retains obsolete single-peer voice token: ${token}`);
+  }
+}
+
+for (const token of [
+  "native_voice_runtime_peer_attachments",
+  "recipient_peer_id",
+  "sender_peer_id",
+  "matches_recipient",
+  "matches_sender",
   "Voice signaling is ready with provider-advertised runtime peer ids before SDP/ICE exchange",
-  "joined_session.signaling.local_peer_id",
+  "session.signaling = VoiceSignalingStateView",
   "voice_join_without_remote_peer_waits_without_error",
 ]) {
   requireText("Discrypt backend native voice peer seeding", desktop, token);

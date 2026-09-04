@@ -92,29 +92,29 @@ const localAdapterMatrix = [
 ];
 const publicAdapterMatrix = [
   {
-    id: "public-mqtt-two-profile-receipt",
+    id: "public-mqtt-provider-signaled-datachannel",
     adapter: "mqtt",
     command: "cargo",
-    args: ["test", "-q", "-p", "discrypt-desktop", "--features", "mqtt-adapter", "public_mqtt_two_profile_receipt_crosses_provider_webrtc_when_enabled", "--", "--nocapture"],
+    args: ["test", "-q", "-p", "discrypt-transport", "--features", "mqtt-adapter", "--test", "public_webrtc_datachannel_e2e", "public_mqtt_signals_real_webrtc_datachannel_roundtrip", "--", "--nocapture"],
     env: {
-      DISCRYPT_DESKTOP_PUBLIC_MQTT_RECEIPT_E2E: "1",
+      DISCRYPT_PUBLIC_MQTT_WEBRTC_E2E: "1",
       DISCRYPT_PUBLIC_MQTT_ENDPOINT: process.env.DISCRYPT_PUBLIC_MQTT_ENDPOINT || "mqtts://broker.emqx.io:8883",
     },
-    stdout: "public-mqtt-two-profile-receipt.stdout.log",
-    stderr: "public-mqtt-two-profile-receipt.stderr.log",
+    stdout: "public-mqtt-provider-signaled-datachannel.stdout.log",
+    stderr: "public-mqtt-provider-signaled-datachannel.stderr.log",
     requiredEnv: [],
   },
   {
-    id: "public-nostr-two-profile-receipt",
+    id: "public-nostr-provider-signaled-datachannel",
     adapter: "nostr",
     command: "cargo",
-    args: ["test", "-q", "-p", "discrypt-desktop", "--features", "nostr-adapter", "public_nostr_two_profile_receipt_crosses_provider_webrtc_when_enabled", "--", "--nocapture"],
+    args: ["test", "-q", "-p", "discrypt-transport", "--features", "nostr-adapter", "--test", "public_webrtc_datachannel_e2e", "public_nostr_signals_real_webrtc_datachannel_roundtrip", "--", "--nocapture"],
     env: {
-      DISCRYPT_DESKTOP_PUBLIC_NOSTR_RECEIPT_E2E: "1",
+      DISCRYPT_PUBLIC_NOSTR_WEBRTC_E2E: "1",
       DISCRYPT_PUBLIC_NOSTR_ENDPOINT: process.env.DISCRYPT_PUBLIC_NOSTR_ENDPOINT || "wss://nos.lol",
     },
-    stdout: "public-nostr-two-profile-receipt.stdout.log",
-    stderr: "public-nostr-two-profile-receipt.stderr.log",
+    stdout: "public-nostr-provider-signaled-datachannel.stdout.log",
+    stderr: "public-nostr-provider-signaled-datachannel.stderr.log",
     requiredEnv: [],
   },
   {

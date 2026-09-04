@@ -6,7 +6,8 @@ import {
   takePendingVoiceSignalingMessages,
   takeNativeVoicePlaybackFrames,
   type ConnectivityPolicyView,
-  type NativeVoiceMediaSignalPayload,
+  type NativeVoiceStreamPeerStatusView,
+  type NativeVoiceStreamStatusView,
   type VoiceSessionView,
   type VoiceSignalingMessageView,
 } from "./commands";
@@ -36,6 +37,41 @@ export type VoiceMediaSessionHandle = {
   setOutputVolume?: (volumePercent: number) => void;
 };
 
+export type VoiceMediaPeerEdge = {
+  localPeerId: string;
+  remotePeerId: string;
+  role: "offerer" | "answerer";
+};
+
+type NativeVoiceMeshEdgeState = {
+  edge: VoiceMediaPeerEdge;
+  retryTimer: number | null;
+  retryAttempt: number;
+  startInFlight: boolean;
+  transportReady: boolean;
+  lastFailureStatus: string | null;
+};
+
+function nativeVoicePeerStatusForEdge(
+  status: NativeVoiceStreamStatusView,
+  edge: VoiceMediaPeerEdge,
+): NativeVoiceStreamPeerStatusView | null {
+  return (
+    status.peer_statuses.find(
+      (peerStatus) =>
+        peerStatus.session_id === status.session_id &&
+        peerStatus.local_peer_id === edge.localPeerId &&
+        peerStatus.remote_peer_id === edge.remotePeerId,
+    ) ?? null
+  );
+}
+
+function nativeVoicePeerReady(
+  status: NativeVoiceStreamPeerStatusView | null,
+): boolean {
+  return Boolean(status?.data_channel_open && status.direct_path_ready);
+}
+
 type VoiceSignalKind = "offer" | "answer" | "candidate";
 
 type VoiceSignal = {
@@ -51,7 +87,6 @@ type VoiceSignal = {
   kind: VoiceSignalKind;
   description?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
-  native_media?: NativeVoiceMediaSignalPayload;
 };
 
 type VoiceSignalTransport = {
@@ -99,35 +134,54 @@ const MAX_PENDING_CANDIDATES_PER_NEGOTIATION = 64;
 const NATIVE_VOICE_RETRY_INITIAL_MS = 500;
 const NATIVE_VOICE_RETRY_MAX_MS = 8_000;
 
-export function startNativeRustVoiceMediaSession(
-  options: Omit<StartVoiceMediaSessionOptions, "onRemoteMedia"> & {
+export function startNativeRustVoiceMediaMeshSession(
+  options: Omit<
+    StartVoiceMediaSessionOptions,
+    "localPeerId" | "remotePeerId" | "role" | "onRemoteMedia"
+  > & {
+    edges: VoiceMediaPeerEdge[];
     onState?: (state: unknown) => void;
   },
 ): VoiceMediaSessionHandle | null {
   const AudioContextCtor = window.AudioContext;
+  const edges = options.edges.filter(
+    (edge) => edge.localPeerId && edge.remotePeerId,
+  );
   if (
+    edges.length === 0 ||
     !options.session.joined ||
     !tauriVoiceSignalingAvailable() ||
     !AudioContextCtor
   ) {
     options.onStatus?.(
-      "Native Rust voice media did not start: joined Tauri backend and WebAudio playback are required",
+      "Native Rust voice media did not start: joined Tauri backend, provider-advertised peers, and WebAudio playback are required",
     );
     return null;
   }
+
   let closed = false;
   let muted = false;
   let playbackTimer: number | null = null;
-  let retryTimer: number | null = null;
-  let retryAttempt = 0;
-  let startInFlight = false;
-  let nextPlaybackTime = 0;
+  const nextPlaybackTimeByPeerId = new Map<string, number>();
   let queuedSends = 0;
-  let transportReady = false;
   let pendingCaptureSamples: number[] = [];
   let lastActivityReportAtMs = 0;
-  let lastFailureStatus: string | null = null;
   let startEvidenceRecorded = false;
+  const edgeState = new Map<string, NativeVoiceMeshEdgeState>();
+  const edgeKey = (edge: VoiceMediaPeerEdge) =>
+    `${edge.localPeerId}->${edge.remotePeerId}`;
+
+  for (const edge of edges) {
+    edgeState.set(edgeKey(edge), {
+      edge,
+      retryTimer: null,
+      retryAttempt: 0,
+      startInFlight: false,
+      transportReady: false,
+      lastFailureStatus: null,
+    });
+  }
+
   const audioContext = new AudioContextCtor({ sampleRate: 48_000 });
   const playbackOutput = createNativePlaybackOutput(
     audioContext,
@@ -150,88 +204,88 @@ export function startNativeRustVoiceMediaSession(
     silentOutput.connect(playbackOutput.destination);
   }
 
-  const clearRetryTimer = () => {
-    if (retryTimer === null) return;
-    window.clearTimeout(retryTimer);
-    retryTimer = null;
+  const clearRetryTimer = (state: { retryTimer: number | null }) => {
+    if (state.retryTimer === null) return;
+    window.clearTimeout(state.retryTimer);
+    state.retryTimer = null;
   };
-  const markTransportReady = () => {
-    transportReady = true;
-    retryAttempt = 0;
-    lastFailureStatus = null;
-    clearRetryTimer();
+  const markTransportReady = (state: NativeVoiceMeshEdgeState) => {
+    state.transportReady = true;
+    state.retryAttempt = 0;
+    state.lastFailureStatus = null;
+    clearRetryTimer(state);
   };
-  const reportFailureOnce = (message: string) => {
-    if (message === lastFailureStatus) return;
-    lastFailureStatus = message;
+  const reportFailureOnce = (
+    state: NativeVoiceMeshEdgeState,
+    message: string,
+  ) => {
+    if (message === state.lastFailureStatus) return;
+    state.lastFailureStatus = message;
     options.onStatus?.(message);
   };
-  const scheduleRetry = (message: string) => {
-    if (closed || retryTimer !== null) return;
-    transportReady = false;
-    reportFailureOnce(`${message} — retrying automatically`);
+  const scheduleRetry = (
+    state: NativeVoiceMeshEdgeState,
+    message: string,
+  ) => {
+    if (closed || state.retryTimer !== null) return;
+    state.transportReady = false;
+    reportFailureOnce(
+      state,
+      `${message} for peer ${state.edge.remotePeerId} — retrying automatically`,
+    );
     const delay = Math.min(
-      NATIVE_VOICE_RETRY_INITIAL_MS * 2 ** Math.min(retryAttempt, 4),
+      NATIVE_VOICE_RETRY_INITIAL_MS * 2 ** Math.min(state.retryAttempt, 4),
       NATIVE_VOICE_RETRY_MAX_MS,
     );
-    retryAttempt += 1;
-    retryTimer = window.setTimeout(async () => {
-      retryTimer = null;
-      try {
-        await stopNativeVoiceStream({
-          session_id: options.session.session_id,
-        });
-      } catch (error) {
-        if (!closed) {
-          scheduleRetry(
-            `Native Rust voice reset failed: ${
-              error instanceof Error ? error.message : "unknown error"
-            }`,
-          );
-        }
-        return;
-      }
-      if (!closed) void startTransport();
+    state.retryAttempt += 1;
+    state.retryTimer = window.setTimeout(() => {
+      state.retryTimer = null;
+      if (!closed) void startEdgeTransport(state);
     }, delay);
   };
-  const startTransport = async () => {
-    if (closed || startInFlight) return;
-    startInFlight = true;
+  const startEdgeTransport = async (
+    state: NativeVoiceMeshEdgeState,
+  ) => {
+    if (closed || state.startInFlight) return;
+    state.startInFlight = true;
     try {
       const response = await startNativeVoiceStream({
         session_id: options.session.session_id,
-        local_peer_id: options.localPeerId,
-        remote_peer_id: options.remotePeerId,
+        local_peer_id: state.edge.localPeerId,
+        remote_peer_id: state.edge.remotePeerId,
         muted,
         use_webview_capture: webAudioCaptureActive,
         created_at_ms: Date.now(),
       });
       if (closed) return;
       options.onState?.(response.state);
-      if (response.status.last_error) {
+      const peerStatus = nativeVoicePeerStatusForEdge(
+        response.status,
+        state.edge,
+      );
+      if (peerStatus?.last_error) {
         scheduleRetry(
-          `Native Rust voice media did not start: ${response.status.last_error}`,
+          state,
+          `Native Rust voice media did not start: ${peerStatus.last_error}`,
         );
-      } else if (
-        response.status.data_channel_open &&
-        response.status.direct_path_ready
-      ) {
-        markTransportReady();
-      } else if (response.status.state === "failed") {
+      } else if (nativeVoicePeerReady(peerStatus)) {
+        markTransportReady(state);
+      } else if (peerStatus?.state === "failed") {
         scheduleRetry(
+          state,
           `Native Rust voice media did not start: ${
-            response.status.last_error ?? "backend transport failed"
+            peerStatus.last_error ?? "backend transport failed"
           }`,
         );
       } else {
-        transportReady = false;
+        state.transportReady = false;
         options.onStatus?.(
-          "Backend-verified native Rust WebRTC voice Local DataChannel is attaching",
+          `Backend-verified native Rust WebRTC voice Local DataChannel is attaching for peer ${state.edge.remotePeerId}`,
         );
       }
-      if (response.status.data_channel_open) {
+      if (peerStatus?.data_channel_open) {
         options.onStatus?.(
-          "Backend-verified native Rust WebRTC voice Local DataChannel connected with STUN and zero TURN servers",
+          `Backend-verified native Rust WebRTC voice Local DataChannel connected for peer ${state.edge.remotePeerId} with STUN and zero TURN servers`,
         );
       }
       if (!startEvidenceRecorded) {
@@ -243,16 +297,20 @@ export function startNativeRustVoiceMediaSession(
     } catch (error) {
       if (!closed) {
         scheduleRetry(
+          state,
           `Native Rust voice media did not start: ${
             error instanceof Error ? error.message : "unknown error"
           }`,
         );
       }
     } finally {
-      startInFlight = false;
+      state.startInFlight = false;
     }
   };
-  void startTransport();
+
+  for (const state of edgeState.values()) {
+    void startEdgeTransport(state);
+  }
 
   if (captureProcessor) {
     captureProcessor.onaudioprocess = (event) => {
@@ -276,7 +334,10 @@ export function startNativeRustVoiceMediaSession(
             activity_captured_at_ms: capturedAtMs,
           });
         }
-        if (!transportReady) continue;
+        const anyTransportReady = Array.from(edgeState.values()).some(
+          (state) => state.transportReady,
+        );
+        if (!anyTransportReady) continue;
         if (queuedSends >= 8) continue;
         queuedSends += 1;
         void sendNativeVoiceAudioFrame({
@@ -286,26 +347,47 @@ export function startNativeRustVoiceMediaSession(
           captured_at_ms: capturedAtMs,
         })
           .then((response) => {
+            const readyPeerStatuses = response.status.peer_statuses.filter(
+              (peerStatus) => nativeVoicePeerReady(peerStatus),
+            );
+            for (const readyPeerStatus of readyPeerStatuses) {
+              const readyState = edgeState.get(
+                `${readyPeerStatus.local_peer_id}->${readyPeerStatus.remote_peer_id}`,
+              );
+              if (readyState) markTransportReady(readyState);
+            }
+            for (const peerStatus of response.status.peer_statuses) {
+              if (!peerStatus.last_error) continue;
+              const failedState = edgeState.get(
+                `${peerStatus.local_peer_id}->${peerStatus.remote_peer_id}`,
+              );
+              if (failedState) {
+                scheduleRetry(
+                  failedState,
+                  `Native Rust voice send failed: ${peerStatus.last_error}`,
+                );
+              }
+            }
             if (response.accepted) {
               recordTauriTwoProfileE2ENativeVoiceEvidence({
                 mode: "native_rust_webrtc_datachannel",
                 localAudioTracksSentDelta: 1,
                 iceConnected:
-                  response.status.direct_path_ready &&
-                  response.status.data_channel_open,
+                  readyPeerStatuses.length > 0,
               });
-            } else if (response.status.last_error) {
-              scheduleRetry(
-                `Native Rust voice send failed: ${response.status.last_error}`,
-              );
             }
           })
           .catch((error) => {
-            scheduleRetry(
-              `Native Rust voice send failed: ${
-                error instanceof Error ? error.message : "unknown error"
-              }`,
-            );
+            for (const state of edgeState.values()) {
+              if (!state.transportReady) {
+                scheduleRetry(
+                  state,
+                  `Native Rust voice send failed: ${
+                    error instanceof Error ? error.message : "unknown error"
+                  }`,
+                );
+              }
+            }
           })
           .finally(() => {
             queuedSends = Math.max(0, queuedSends - 1);
@@ -322,27 +404,29 @@ export function startNativeRustVoiceMediaSession(
     })
       .then((response) => {
         if (closed) return;
-        if (response.status.last_error) {
-          transportReady = false;
-          scheduleRetry(
-            `Native Rust voice receive failed: ${response.status.last_error}`,
+        for (const peerStatus of response.status.peer_statuses) {
+          const state = edgeState.get(
+            `${peerStatus.local_peer_id}->${peerStatus.remote_peer_id}`,
           );
-        } else {
-          transportReady =
-            response.status.data_channel_open &&
-            response.status.direct_path_ready;
-          if (transportReady) {
-            markTransportReady();
+          if (!state) continue;
+          if (peerStatus.last_error) {
+            scheduleRetry(
+              state,
+              `Native Rust voice receive failed: ${peerStatus.last_error}`,
+            );
+          } else if (nativeVoicePeerReady(peerStatus)) {
+            markTransportReady(state);
           }
         }
         for (const frame of response.frames) {
+          const fromPeerId = frame.from_peer_id || "unknown-peer";
           scheduleNativeVoicePlaybackFrame(
             audioContext,
             playbackOutput.destination,
             frame,
-            () => nextPlaybackTime,
+            () => nextPlaybackTimeByPeerId.get(fromPeerId) ?? 0,
             (time) => {
-              nextPlaybackTime = time;
+              nextPlaybackTimeByPeerId.set(fromPeerId, time);
             },
           );
         }
@@ -350,19 +434,24 @@ export function startNativeRustVoiceMediaSession(
           recordTauriTwoProfileE2ENativeVoiceEvidence({
             mode: "native_rust_webrtc_datachannel",
             remoteTrackEventsDelta: response.frames.length,
-            iceConnected:
-              response.status.direct_path_ready &&
-              response.status.data_channel_open,
+            iceConnected: response.status.peer_statuses.some((peerStatus) =>
+              nativeVoicePeerReady(peerStatus),
+            ),
           });
         }
       })
       .catch((error) => {
         if (!closed) {
-          scheduleRetry(
-            `Native Rust voice receive failed: ${
-              error instanceof Error ? error.message : "unknown error"
-            }`,
-          );
+          for (const state of edgeState.values()) {
+            if (!state.transportReady) {
+              scheduleRetry(
+                state,
+                `Native Rust voice receive failed: ${
+                  error instanceof Error ? error.message : "unknown error"
+                }`,
+              );
+            }
+          }
         }
       })
       .finally(() => {
@@ -376,7 +465,9 @@ export function startNativeRustVoiceMediaSession(
     close: () => {
       closed = true;
       if (playbackTimer !== null) window.clearTimeout(playbackTimer);
-      clearRetryTimer();
+      for (const state of edgeState.values()) {
+        clearRetryTimer(state);
+      }
       if (captureProcessor) captureProcessor.onaudioprocess = null;
       source?.disconnect();
       captureProcessor?.disconnect();
@@ -571,6 +662,7 @@ export function startWebViewVoiceMediaSession(
     channelId: options.session.channel_id,
     groupId: options.session.group_id,
     localPeerId: options.localPeerId,
+    remotePeerId: options.remotePeerId,
     onStatus: options.onStatus,
     sessionId: options.session.session_id,
     senderInstanceId,
@@ -946,6 +1038,7 @@ function createVoiceSignalTransport({
   channelId,
   groupId,
   localPeerId,
+  remotePeerId,
   onSignal,
   onStatus,
   senderInstanceId,
@@ -954,6 +1047,7 @@ function createVoiceSignalTransport({
   channelId: string;
   groupId: string;
   localPeerId: string;
+  remotePeerId: string;
   onSignal: (signal: VoiceSignal) => void;
   onStatus?: (status: string) => void;
   senderInstanceId: string;
@@ -969,6 +1063,7 @@ function createVoiceSignalTransport({
       signal.schema_version !== 1 ||
       signal.session_id !== sessionId ||
       signal.sender_instance_id === senderInstanceId ||
+      signal.from_peer_id !== remotePeerId ||
       signal.to_peer_id !== localPeerId
     ) {
       return;
@@ -984,7 +1079,12 @@ function createVoiceSignalTransport({
 
   const pollBackendSignals = () => {
     if (closed || !tauriVoiceSignalingAvailable()) return;
-    void takePendingVoiceSignalingMessages({ session_id: sessionId, limit: 50 })
+    void takePendingVoiceSignalingMessages({
+      session_id: sessionId,
+      recipient_peer_id: localPeerId,
+      sender_peer_id: remotePeerId,
+      limit: 50,
+    })
       .then(async (response) => {
         for (const message of response.messages) {
           const signal = await voiceSignalFromBackendMessage(
@@ -1013,6 +1113,7 @@ function createVoiceSignalTransport({
           .then((sealedPayload) =>
             publishVoiceSignalingMessage({
               session_id: sessionId,
+              recipient_peer_id: signal.to_peer_id,
               signal_kind: signal.kind,
               sealed_payload: sealedPayload,
               signal_id: signalId,
@@ -1136,7 +1237,6 @@ async function voiceSignalFromBackendMessage(
       created_at_ms: payload.created_at_ms,
       kind: "candidate",
       candidate: payload.candidate,
-      native_media: payload.native_media,
     };
   }
   return null;
@@ -1148,7 +1248,6 @@ type VoiceSignalPayload = Pick<
   | "created_at_ms"
   | "description"
   | "candidate"
-  | "native_media"
 >;
 
 const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v2:";
@@ -1179,7 +1278,6 @@ export async function sealVoiceSignalPayload(
       created_at_ms: signal.created_at_ms,
       description: signal.description,
       candidate: signal.candidate,
-      native_media: signal.native_media,
     }),
   );
   const ciphertext = await crypto.subtle.encrypt(
