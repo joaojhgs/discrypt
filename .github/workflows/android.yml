@@ -140,7 +140,7 @@ jobs:
           arch: x86_64
           profile: pixel_6
           script: |
-            set -euo pipefail
+            set -eu
             APK_PATH=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*-ci-signed.apk' -print -quit)
             test -n "$APK_PATH"
             adb install -r "$APK_PATH"

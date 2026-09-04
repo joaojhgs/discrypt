@@ -18,6 +18,13 @@ by build/test tooling.
 Both commands pass with zero high-or-critical advisories. There are no G123 npm
 advisory waivers.
 
+If the npm audit endpoint is unavailable, the gate retries through npm's bulk
+advisory endpoint. If that endpoint is also unavailable, it queries the
+independent OSV.dev batch API using every locked npm package and version. OSV
+CVSS v2/v3 or qualitative high/critical findings block the release. Unknown or
+missing severity data, malformed or paginated responses, and unreachable
+advisory sources fail closed for review.
+
 ## Release rule
 
 A production release candidate must not ship with high-or-critical advisories in
