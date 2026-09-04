@@ -16,7 +16,8 @@ an x86_64 system image, and an Android emulator runner.
   compiler is present on GitHub-hosted Ubuntu runners.
 - `android-emulator-voice-path`, gated by `workflow_dispatch` input
   `run_android_emulator`, which installs Android SDK/NDK packages, initializes the generated Android
-  project with the Tauri Android CLI `android init --ci`, builds an unsigned
+  project from the UI package root with the lockfile-pinned Tauri Android CLI
+  `npm run tauri -- android init --ci`, builds an unsigned
   x86_64 APK for the `x86_64-linux-android` Rust target with `android build`,
   installs it on an Android emulator, grants/checks `RECORD_AUDIO`, starts the
   Tauri activity, verifies the app process, and uploads the APK plus emulator

@@ -90,18 +90,20 @@ jobs:
       - run: npm --prefix apps/ui run test:command-coverage
       - run: npm --prefix apps/ui run build
       - name: Initialize generated Android project
+        working-directory: apps/ui
         run: >
-          npx --yes @tauri-apps/cli@2.11.2 android init
+          npm run tauri -- android init
           --ci
           --skip-targets-install
-          --config apps/desktop/src-tauri/tauri.conf.json
+          --config ../desktop/src-tauri/tauri.conf.json
       - name: Build unsigned Android APK
+        working-directory: apps/ui
         run: >
-          npx --yes @tauri-apps/cli@2.11.2 android build
+          npm run tauri -- android build
           --ci
           --apk
           --target x86_64
-          --config apps/desktop/src-tauri/tauri.conf.json
+          --config ../desktop/src-tauri/tauri.conf.json
           --features tauri-runtime,production-network,production-media
       - uses: reactivecircus/android-emulator-runner@v2
         with:

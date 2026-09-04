@@ -13,6 +13,9 @@ const desktopCargo = readFileSync(
 const tauriConfig = JSON.parse(
   readFileSync(resolve(repoRoot, "apps/desktop/src-tauri/tauri.conf.json"), "utf8"),
 );
+const uiPackage = JSON.parse(
+  readFileSync(resolve(repoRoot, "apps/ui/package.json"), "utf8"),
+);
 const mediaTransport = readFileSync(resolve(repoRoot, "crates/media/src/transport.rs"), "utf8");
 const docs = readFileSync(resolve(repoRoot, "docs/release/android-build-emulator-gate.md"), "utf8");
 
@@ -33,13 +36,14 @@ const workflowTokens = [
   "x86_64-linux-android${ANDROID_API_LEVEL}-clang",
   "cargo test -p discrypt-media android --quiet",
   "cargo check -p discrypt-media --target x86_64-linux-android --quiet",
-  "@tauri-apps/cli@2.11.2 android init",
+  "npm run tauri -- android init",
   "--skip-targets-install",
-  "@tauri-apps/cli@2.11.2 android build",
+  "npm run tauri -- android build",
+  "working-directory: apps/ui",
   "--ci",
   "--apk",
   "--target x86_64",
-  "--config apps/desktop/src-tauri/tauri.conf.json",
+  "--config ../desktop/src-tauri/tauri.conf.json",
   "--features tauri-runtime,production-network,production-media",
   "android.permission.RECORD_AUDIO",
   "RECORD_AUDIO allow",
@@ -64,6 +68,12 @@ if (tauriConfig.bundle?.android?.minSdkVersion !== 26) {
   failures.push(
     "Tauri Android minSdkVersion must be 26 because the native CPAL backend links AAudio",
   );
+}
+if (uiPackage.scripts?.tauri !== "tauri") {
+  failures.push("UI package must expose the Tauri CLI for generated Android Gradle builds");
+}
+if (uiPackage.devDependencies?.["@tauri-apps/cli"] !== "2.11.2") {
+  failures.push("UI package must lock @tauri-apps/cli to the release-tooling version 2.11.2");
 }
 
 const desktopLibSection = desktopCargo.match(
