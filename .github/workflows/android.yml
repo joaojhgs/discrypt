@@ -139,21 +139,21 @@ jobs:
           api-level: 35
           arch: x86_64
           profile: pixel_6
-          script: |
-            set -eu
-            APK_PATH=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*-ci-signed.apk' -print -quit)
-            test -n "$APK_PATH"
-            adb install -r "$APK_PATH"
-            adb shell pm grant "$DISCRYPT_ANDROID_PACKAGE" android.permission.BLUETOOTH_CONNECT
-            adb shell pm grant "$DISCRYPT_ANDROID_PACKAGE" android.permission.RECORD_AUDIO
-            adb shell appops set "$DISCRYPT_ANDROID_PACKAGE" RECORD_AUDIO allow
-            adb shell am start -W -n "$DISCRYPT_ANDROID_PACKAGE/.MainActivity"
-            sleep 12
-            adb shell pidof "$DISCRYPT_ANDROID_PACKAGE"
-            adb shell dumpsys package "$DISCRYPT_ANDROID_PACKAGE" > android-package-dump.txt
-            grep -q "android.permission.BLUETOOTH_CONNECT: granted=true" android-package-dump.txt
-            grep -q "android.permission.MODIFY_AUDIO_SETTINGS: granted=true" android-package-dump.txt
-            grep -q "android.permission.RECORD_AUDIO: granted=true" android-package-dump.txt
+          script: >
+            set -eu;
+            APK_PATH=$(find apps/desktop/src-tauri/gen/android/app/build/outputs/apk -type f -name '*-ci-signed.apk' -print -quit);
+            test -n "$APK_PATH";
+            adb install -r "$APK_PATH";
+            adb shell pm grant "$DISCRYPT_ANDROID_PACKAGE" android.permission.BLUETOOTH_CONNECT;
+            adb shell pm grant "$DISCRYPT_ANDROID_PACKAGE" android.permission.RECORD_AUDIO;
+            adb shell appops set "$DISCRYPT_ANDROID_PACKAGE" RECORD_AUDIO allow;
+            adb shell am start -W -n "$DISCRYPT_ANDROID_PACKAGE/.MainActivity";
+            sleep 12;
+            adb shell pidof "$DISCRYPT_ANDROID_PACKAGE";
+            adb shell dumpsys package "$DISCRYPT_ANDROID_PACKAGE" > android-package-dump.txt;
+            grep -q "android.permission.BLUETOOTH_CONNECT: granted=true" android-package-dump.txt;
+            grep -q "android.permission.MODIFY_AUDIO_SETTINGS: granted=true" android-package-dump.txt;
+            grep -q "android.permission.RECORD_AUDIO: granted=true" android-package-dump.txt;
             adb logcat -d > android-logcat.txt
       - uses: actions/upload-artifact@v4
         if: always()
