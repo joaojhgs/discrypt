@@ -10,6 +10,9 @@ const desktopCargo = readFileSync(
   resolve(repoRoot, "apps/desktop/src-tauri/Cargo.toml"),
   "utf8",
 );
+const tauriConfig = JSON.parse(
+  readFileSync(resolve(repoRoot, "apps/desktop/src-tauri/tauri.conf.json"), "utf8"),
+);
 const mediaTransport = readFileSync(resolve(repoRoot, "crates/media/src/transport.rs"), "utf8");
 const docs = readFileSync(resolve(repoRoot, "docs/release/android-build-emulator-gate.md"), "utf8");
 
@@ -55,6 +58,12 @@ for (const token of [
   "cargo check --workspace --target aarch64-linux-android",
 ]) {
   if (!mainCi.includes(token)) failures.push(`Main CI Android target check missing token: ${token}`);
+}
+
+if (tauriConfig.bundle?.android?.minSdkVersion !== 26) {
+  failures.push(
+    "Tauri Android minSdkVersion must be 26 because the native CPAL backend links AAudio",
+  );
 }
 
 const desktopLibSection = desktopCargo.match(

@@ -28,6 +28,11 @@ transform support select `NativeWebRtcRsContingency`; that path requires a
 microphone grant, an input device, STUN/TURN ICE endpoints, native capture,
 native playback, and Rust SFrame before network transit.
 
+The Tauri bundle requires Android API 26 or newer. The native CPAL capture and
+playback backend uses Android's AAudio library, which is available beginning at
+API 26; keeping `bundle.android.minSdkVersion` aligned with that runtime
+dependency also makes the Tauri-generated Rust linker target the correct API.
+
 ## Local validation
 
 Run:

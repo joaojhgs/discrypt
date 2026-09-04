@@ -57,7 +57,11 @@ use discrypt_storage::{
     recover_account, recovery_code_material, seal_account_backup, AccountRecovery, AppStore,
     RecoveryCodeVerifier, RecoveryMaterial,
 };
-#[cfg(all(test, target_os = "linux", feature = "production-storage"))]
+#[cfg(all(
+    any(test, feature = "harness"),
+    target_os = "linux",
+    feature = "production-storage"
+))]
 use discrypt_storage::{AppDbKeychain, AppStoreError};
 #[cfg(all(target_os = "linux", feature = "production-storage", not(test)))]
 use discrypt_storage::{LinuxOsKeychain, ProductionAppDbKeychain};
@@ -89,7 +93,16 @@ use std::{
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
-#[cfg(feature = "tauri-runtime")]
+#[cfg(all(
+    feature = "tauri-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )
+))]
 use tauri::Manager;
 use uuid::Uuid;
 #[cfg(all(

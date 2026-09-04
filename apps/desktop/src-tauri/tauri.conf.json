@@ -45,6 +45,9 @@
       "icons/icon.png",
       "icons/icon.ico"
     ],
+    "android": {
+      "minSdkVersion": 26
+    },
     "linux": {
       "deb": {
         "depends": [
