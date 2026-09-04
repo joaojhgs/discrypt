@@ -45,6 +45,7 @@ export function createNativePlaybackOutput(
   context: AudioContext,
   outputDeviceId: string | null | undefined,
   outputVolumePercent: number,
+  onPlaybackFallback?: (status: string) => void,
 ): NativePlaybackOutput {
   const gain = context.createGain();
   const setOutputVolume = (volumePercent: number) => {
@@ -72,14 +73,30 @@ export function createNativePlaybackOutput(
       mediaDestination.stream.getTracks().forEach((track) => track.stop());
       mediaDestination.disconnect();
       connectDirectOutput();
+      onPlaybackFallback?.(
+        "Selected voice output is unsupported by this media runtime; using the system default output",
+      );
       return;
     }
     audio.autoplay = true;
     audio.setAttribute("playsinline", "true");
     audio.srcObject = mediaDestination.stream;
     gain.connect(mediaDestination);
-    void audio.setSinkId(sinkIdForDevice(deviceId)).catch(() => undefined);
-    void audio.play().catch(() => undefined);
+    void audio.setSinkId(sinkIdForDevice(deviceId)).catch(() => {
+      onPlaybackFallback?.(
+        "Selected voice output is unavailable; using the system default output",
+      );
+      void audio.setSinkId?.("").catch(() => {
+        onPlaybackFallback?.(
+          "The system default voice output is also unavailable; check the operating-system audio route",
+        );
+      });
+    });
+    void audio.play().catch(() => {
+      onPlaybackFallback?.(
+        "Voice playback was blocked by the media runtime; interact with the app and retry the voice channel",
+      );
+    });
     fallback = { audio, mediaDestination };
   };
 
@@ -88,19 +105,35 @@ export function createNativePlaybackOutput(
     if (!sinkId) {
       connectDirectOutput();
       if (contextWithSinkId.setSinkId) {
-        void contextWithSinkId.setSinkId("").catch(() => undefined);
+        void contextWithSinkId.setSinkId("").catch(() => {
+          onPlaybackFallback?.(
+            "The system voice output could not be restored; audio may continue on the previous device",
+          );
+        });
       }
       return;
     }
     if (contextWithSinkId.setSinkId) {
       connectDirectOutput();
-      void contextWithSinkId.setSinkId(sinkId).catch(() => undefined);
+      void contextWithSinkId.setSinkId(sinkId).catch(() => {
+        onPlaybackFallback?.(
+          "Selected voice output is unavailable; using the system default output",
+        );
+        void contextWithSinkId.setSinkId?.("").catch(() => {
+          onPlaybackFallback?.(
+            "The system default voice output is also unavailable; check the operating-system audio route",
+          );
+        });
+      });
       return;
     }
     try {
       connectFallbackOutput(deviceId);
     } catch {
       connectDirectOutput();
+      onPlaybackFallback?.(
+        "Selected voice output could not be opened; using the system default output",
+      );
     }
   };
 

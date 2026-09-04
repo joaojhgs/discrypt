@@ -16,12 +16,20 @@ an x86_64 system image, and an Android emulator runner.
   compiler is present on GitHub-hosted Ubuntu runners.
 - `android-emulator-voice-path`, gated by `workflow_dispatch` input
   `run_android_emulator`, which installs Android SDK/NDK packages, initializes the generated Android
-  project from the UI package root with the lockfile-pinned Tauri Android CLI
-  `npm run tauri -- android init --ci`, builds an unsigned
-  x86_64 APK for the `x86_64-linux-android` Rust target with `android build`,
-  installs it on an Android emulator, grants/checks `RECORD_AUDIO`, starts the
+  project from the desktop wrapper package root with the lockfile-pinned Tauri Android CLI
+  `npm run tauri -- android init --ci` (which discovers `src-tauri`), builds an x86_64 APK
+  for the `x86_64-linux-android` Rust target, signs it with an ephemeral emulator-only key,
+  verifies that signature with `apksigner`, installs it on an Android emulator, and grants/checks the committed Android manifest's
+  `RECORD_AUDIO` and Android 12+ `BLUETOOTH_CONNECT` runtime permissions plus the install-time
+  `MODIFY_AUDIO_SETTINGS` audio-routing permission, starts the
   Tauri activity, verifies the app process, and uploads the APK plus emulator
   logs.
+
+The committed Android activity exposes a narrow WebView bridge that requests
+`BLUETOOTH_CONNECT` only when the user joins voice. Denying nearby-device access
+does not block built-in microphone and speaker use; it limits paired Bluetooth
+headset routing. Android 11 and older use the manifest's legacy `BLUETOOTH`
+permission, capped at API 30.
 
 The Android job uses the native media contingency already exercised by
 `cargo test -p discrypt-media android --quiet`: Android WebViews without encoded

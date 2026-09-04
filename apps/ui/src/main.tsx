@@ -755,6 +755,50 @@ function nativeRustVoiceAvailable(): boolean {
   return Boolean(window.__TAURI__?.core?.invoke);
 }
 
+type AndroidBluetoothAudioAccess = "granted" | "denied" | "unavailable";
+
+async function requestAndroidBluetoothAudioAccess(): Promise<AndroidBluetoothAudioAccess> {
+  const androidWindow = window as typeof window & {
+    DiscryptAndroidVoice?: {
+      requestBluetoothAudioAccess: (requestId: string) => void;
+    };
+  };
+  const bridge = androidWindow.DiscryptAndroidVoice;
+  if (!bridge) return "unavailable";
+
+  return new Promise((resolve) => {
+    const requestId = `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let settled = false;
+    const finish = (result: AndroidBluetoothAudioAccess) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      window.removeEventListener(
+        "discrypt:android-bluetooth-audio-permission",
+        onPermissionResult,
+      );
+      resolve(result);
+    };
+    const onPermissionResult = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ requestId?: string; granted?: boolean }>
+      ).detail;
+      if (detail?.requestId !== requestId) return;
+      finish(detail.granted ? "granted" : "denied");
+    };
+    const timeoutId = window.setTimeout(() => finish("unavailable"), 15_000);
+    window.addEventListener(
+      "discrypt:android-bluetooth-audio-permission",
+      onPermissionResult,
+    );
+    try {
+      bridge.requestBluetoothAudioAccess(requestId);
+    } catch {
+      finish("unavailable");
+    }
+  });
+}
+
 function forceNativeRustVoiceForE2E(): boolean {
   return Boolean(
     (
@@ -762,9 +806,9 @@ function forceNativeRustVoiceForE2E(): boolean {
         __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
       }
     ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
-    window.localStorage?.getItem(
-      "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
-    ) === "1",
+      window.localStorage?.getItem(
+        "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+      ) === "1",
   );
 }
 
@@ -1651,9 +1695,9 @@ function App() {
       forceNativeRustVoice || nativeRustVoiceAvailable();
     const canUseWebViewRtc = Boolean(
       !forceNativeRustVoice &&
-      voiceCaptureRef.current &&
-      typeof RTCPeerConnection !== "undefined" &&
-      localAudioTracks(voiceCaptureRef.current).length > 0,
+        voiceCaptureRef.current &&
+        typeof RTCPeerConnection !== "undefined" &&
+        localAudioTracks(voiceCaptureRef.current).length > 0,
     );
     const mode = canUseWebViewRtc
       ? "webview"
@@ -3236,13 +3280,20 @@ function App() {
             __discryptTauriTwoProfileE2EForceNativeRustVoice?: boolean;
           }
         ).__discryptTauriTwoProfileE2EForceNativeRustVoice ||
-        window.localStorage?.getItem(
-          "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
-        ) === "1",
+          window.localStorage?.getItem(
+            "discrypt:tauri-two-profile-e2e:force-native-rust-voice",
+          ) === "1",
       );
       const canUseNativeRustVoice =
         forceNativeRustVoice || nativeRustVoiceAvailable();
       stopLocalVoiceCapture();
+      const bluetoothAudioAccess = await requestAndroidBluetoothAudioAccess();
+      if (bluetoothAudioAccess === "denied") {
+        reportCommandError(
+          "Bluetooth headset access was denied; voice will use the built-in or system-default microphone and speaker",
+          "Voice media",
+        );
+      }
       const voiceAccess = await requestVoiceDeviceAccess(
         selectedVoiceInputId,
         selectedVoiceOutputId,
@@ -6108,11 +6159,13 @@ function supportBundlePreview(bundle: string): SupportBundlePreview | null {
   try {
     const parsed = JSON.parse(bundle) as Record<string, unknown>;
     const structuredLogs = parsed.structured_logs as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     const lastCommandError = (structuredLogs?.last_command_error ??
       parsed.last_command_error) as Record<string, unknown> | null | undefined;
     const transportDiagnostics = parsed.transport_diagnostics as
-      Record<string, unknown> | undefined;
+      | Record<string, unknown>
+      | undefined;
     const events = Array.isArray(parsed.events) ? parsed.events : [];
     return {
       schemaVersion: String(parsed.schema_version ?? "unknown"),
@@ -9037,6 +9090,7 @@ function RemoteAudioAttachment({
   outputDeviceId?: string | null;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [outputFallback, setOutputFallback] = useState<string | null>(null);
   const volume = volumePercent ?? participant.volume;
   useEffect(() => {
     if (audioRef.current) {
@@ -9058,21 +9112,61 @@ function RemoteAudioAttachment({
     const audio = audioRef.current as
       | (HTMLAudioElement & { setSinkId?: (sinkId: string) => Promise<void> })
       | null;
-    if (!audio?.setSinkId || !outputDeviceId) return;
+    if (!audio || !outputDeviceId) return;
     const sinkId = outputDeviceId === "default" ? "" : outputDeviceId;
-    void audio.setSinkId(sinkId).catch((error: unknown) => {
-      void error;
-    });
+    if (!audio.setSinkId) {
+      setOutputFallback(
+        sinkId ? "Selected output unsupported; using system default" : null,
+      );
+      return;
+    }
+    let active = true;
+    void audio.setSinkId(sinkId).then(
+      () => {
+        if (active) setOutputFallback(null);
+      },
+      () => {
+        if (!active) return;
+        setOutputFallback(
+          sinkId
+            ? "Selected output unavailable; using system default"
+            : "Could not restore system output",
+        );
+        if (sinkId) {
+          void audio.setSinkId?.("").catch(() => {
+            if (active) {
+              setOutputFallback(
+                "Selected and system-default outputs are unavailable",
+              );
+            }
+          });
+        }
+      },
+    );
+    return () => {
+      active = false;
+    };
   }, [outputDeviceId]);
   return (
-    <audio
-      ref={audioRef}
-      aria-label={`${participant.name} remote audio`}
-      data-testid="voice-remote-audio"
-      autoPlay
-      playsInline
-      src={isUsableMediaStream(stream) ? undefined : (src ?? undefined)}
-    />
+    <>
+      <audio
+        ref={audioRef}
+        aria-label={`${participant.name} remote audio`}
+        data-testid="voice-remote-audio"
+        autoPlay
+        playsInline
+        src={isUsableMediaStream(stream) ? undefined : (src ?? undefined)}
+      />
+      {outputFallback ? (
+        <span
+          className="ml-auto text-[10px] text-amber-200"
+          data-testid="voice-output-fallback"
+          title={outputFallback}
+        >
+          default output
+        </span>
+      ) : null}
+    </>
   );
 }
 

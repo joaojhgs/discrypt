@@ -1,6 +1,7 @@
 /target/
 /node_modules/
 /apps/ui/node_modules/
+/apps/desktop/node_modules/
 /apps/ui/dist/
 /apps/desktop/src-tauri/target/
 .DS_Store

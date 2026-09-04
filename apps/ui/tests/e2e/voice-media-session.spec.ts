@@ -323,7 +323,9 @@ async function installVoiceMediaHarness(
             configurable: true,
             get: () => handler,
             set: (
-              nextHandler: ((event: { inputBuffer: AudioBuffer }) => void) | null,
+              nextHandler:
+                | ((event: { inputBuffer: AudioBuffer }) => void)
+                | null,
             ) => {
               handler = nextHandler;
               evidence.audioProcessHandlers = handler ? 1 : 0;
@@ -411,7 +413,8 @@ async function installVoiceMediaHarness(
           this.channelName = name;
           this.listener = (event) => {
             const detail = (event as CustomEvent).detail as
-              { channelName?: string; message?: unknown } | undefined;
+              | { channelName?: string; message?: unknown }
+              | undefined;
             if (detail?.channelName !== this.channelName) return;
             this.onmessage?.({ data: detail.message } as MessageEvent);
           };
@@ -732,7 +735,9 @@ type BrowserFixtureGroupVoiceTopologyOptions = {
   fixturePeers?: BrowserFixtureVoicePeer[];
 };
 
-async function readBrowserFixtureGroupSchema(page: Page): Promise<BrowserFixtureGroupSchema> {
+async function readBrowserFixtureGroupSchema(
+  page: Page,
+): Promise<BrowserFixtureGroupSchema> {
   return page.evaluate(() => {
     const storageKey = "discrypt.local-dev.app-state.v1";
     const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
@@ -758,7 +763,9 @@ async function readBrowserFixtureGroupSchema(page: Page): Promise<BrowserFixture
   });
 }
 
-async function readBrowserFixtureVoicePeer(page: Page): Promise<BrowserFixtureVoicePeer> {
+async function readBrowserFixtureVoicePeer(
+  page: Page,
+): Promise<BrowserFixtureVoicePeer> {
   return page.evaluate(() => {
     const storageKey = "discrypt.local-dev.app-state.v1";
     const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
@@ -782,7 +789,9 @@ async function installBrowserFixtureGroupState(
   await page.evaluate(
     ({ authoritySchema, local, remotes }) => {
       const storageKey = "discrypt.local-dev.app-state.v1";
-      const state = JSON.parse(window.localStorage.getItem(storageKey) ?? "null");
+      const state = JSON.parse(
+        window.localStorage.getItem(storageKey) ?? "null",
+      );
       const group = state?.groups?.find(
         (candidate: { group_id?: string }) =>
           candidate.group_id === authoritySchema.groupId,
@@ -791,7 +800,9 @@ async function installBrowserFixtureGroupState(
         throw new Error("group state is unavailable for browser voice fixture");
       }
       const now = new Date().toISOString();
-      const presenceExpiresAt = new Date(Date.now() + 10 * 60 * 1_000).toISOString();
+      const presenceExpiresAt = new Date(
+        Date.now() + 10 * 60 * 1_000,
+      ).toISOString();
       const members = [local, ...remotes].map((peer) => ({
         member_id: peer.memberId,
         display_name: peer.displayName,
@@ -874,19 +885,19 @@ async function installBrowserFixtureGroupVoiceTopology(
             role: "member",
           },
         ];
-  await installBrowserFixtureGroupState(ownerPage, schema, schema.owner, members);
+  await installBrowserFixtureGroupState(
+    ownerPage,
+    schema,
+    schema.owner,
+    members,
+  );
   if (memberPages.length > 0) {
     await Promise.all(
       memberPages.map((page, index) =>
-        installBrowserFixtureGroupState(
-          page,
-          schema,
-          pagePeers[index],
-          [
-            schema.owner,
-            ...members.filter((peer) => peer.peerId !== pagePeers[index].peerId),
-          ],
-        ),
+        installBrowserFixtureGroupState(page, schema, pagePeers[index], [
+          schema.owner,
+          ...members.filter((peer) => peer.peerId !== pagePeers[index].peerId),
+        ]),
       ),
     );
     await Promise.all([
@@ -901,7 +912,9 @@ async function installBrowserFixtureGroupVoiceTopology(
   } else {
     await ownerPage.reload();
   }
-  await expect(ownerPage.getByRole("button", { name: /Voice Lobby/ })).toBeVisible();
+  await expect(
+    ownerPage.getByRole("button", { name: /Voice Lobby/ }),
+  ).toBeVisible();
 }
 
 async function joinVoice(page: Page) {
@@ -1019,6 +1032,77 @@ test("native Rust WebAudio explicit playback sink uses AudioContext setSinkId wh
   expect(connectedNodes).toEqual([destination, destination]);
   expect(disconnectedNodes).toEqual([destination, destination]);
   expect(sinkIds).toEqual(["usb-headset", ""]);
+  output.close();
+});
+
+test("native Rust WebAudio reports selected output failure and falls back to system output", async () => {
+  const sinkIds: string[] = [];
+  const statuses: string[] = [];
+  const destination = { node: "context-output" };
+  const gain = {
+    gain: { value: 1 },
+    connect: () => undefined,
+    disconnect: () => undefined,
+  };
+  const context = {
+    destination,
+    createGain: () => gain,
+    createMediaStreamDestination: () => {
+      throw new Error("media-element fallback should not be used");
+    },
+    setSinkId: (sinkId: string) => {
+      sinkIds.push(sinkId);
+      return sinkId
+        ? Promise.reject(new Error("selected device disappeared"))
+        : Promise.resolve();
+    },
+  } as unknown as AudioContext;
+
+  const output = createNativePlaybackOutput(
+    context,
+    "removed-headset",
+    100,
+    (status) => statuses.push(status),
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(sinkIds).toEqual(["removed-headset", ""]);
+  expect(statuses).toEqual([
+    "Selected voice output is unavailable; using the system default output",
+  ]);
+  output.close();
+});
+
+test("native Rust WebAudio reports when selected and system outputs both fail", async () => {
+  const statuses: string[] = [];
+  const context = {
+    destination: { node: "context-output" },
+    createGain: () => ({
+      gain: { value: 1 },
+      connect: () => undefined,
+      disconnect: () => undefined,
+    }),
+    createMediaStreamDestination: () => {
+      throw new Error("media-element fallback should not be used");
+    },
+    setSinkId: () => Promise.reject(new Error("no output route")),
+  } as unknown as AudioContext;
+
+  const output = createNativePlaybackOutput(
+    context,
+    "removed-headset",
+    100,
+    (status) => statuses.push(status),
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(statuses).toEqual([
+    "Selected voice output is unavailable; using the system default output",
+    "The system default voice output is also unavailable; check the operating-system audio route",
+  ]);
   output.close();
 });
 
@@ -1404,9 +1488,7 @@ test("browser fixture voice bridges WebAudio microphone PCM over the backend Dat
                 state.snapshot = snapshot;
                 return writeState(state);
               }
-              if (
-                command === "update_voice_activity"
-              ) {
+              if (command === "update_voice_activity") {
                 return readState();
               }
               if (command === "stop_native_voice_stream") {
@@ -1447,7 +1529,8 @@ test("browser fixture voice bridges WebAudio microphone PCM over the backend Dat
       .toBeGreaterThan(1);
     await expect
       .poll(async () => {
-        const starts = (await readEvidence(profile.page)).nativePlaybackStartTimes;
+        const starts = (await readEvidence(profile.page))
+          .nativePlaybackStartTimes;
         return starts.length >= 2 ? starts.slice(0, 2) : starts;
       })
       .toEqual([0.02, 0.02]);
@@ -1557,7 +1640,9 @@ test("browser fixture starts one WebView voice edge per advertised remote peer",
           .sort();
       })
       .toEqual(["remote-peer-one", "remote-peer-two"]);
-    await expect(profile.page.getByTestId("voice-local-participant").first()).toBeVisible();
+    await expect(
+      profile.page.getByTestId("voice-local-participant").first(),
+    ).toBeVisible();
     expect(profile.errors).toEqual([]);
   } finally {
     await profile.context.close();

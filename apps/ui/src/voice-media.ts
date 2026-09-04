@@ -187,6 +187,7 @@ export function startNativeRustVoiceMediaMeshSession(
     audioContext,
     options.outputDeviceId,
     options.outputVolume ?? 100,
+    options.onStatus,
   );
   const source =
     options.localStream && localAudioTracks(options.localStream).length > 0
@@ -223,10 +224,7 @@ export function startNativeRustVoiceMediaMeshSession(
     state.lastFailureStatus = message;
     options.onStatus?.(message);
   };
-  const scheduleRetry = (
-    state: NativeVoiceMeshEdgeState,
-    message: string,
-  ) => {
+  const scheduleRetry = (state: NativeVoiceMeshEdgeState, message: string) => {
     if (closed || state.retryTimer !== null) return;
     state.transportReady = false;
     reportFailureOnce(
@@ -243,9 +241,7 @@ export function startNativeRustVoiceMediaMeshSession(
       if (!closed) void startEdgeTransport(state);
     }, delay);
   };
-  const startEdgeTransport = async (
-    state: NativeVoiceMeshEdgeState,
-  ) => {
+  const startEdgeTransport = async (state: NativeVoiceMeshEdgeState) => {
     if (closed || state.startInFlight) return;
     state.startInFlight = true;
     try {
@@ -372,8 +368,7 @@ export function startNativeRustVoiceMediaMeshSession(
               recordTauriTwoProfileE2ENativeVoiceEvidence({
                 mode: "native_rust_webrtc_datachannel",
                 localAudioTracksSentDelta: 1,
-                iceConnected:
-                  readyPeerStatuses.length > 0,
+                iceConnected: readyPeerStatuses.length > 0,
               });
             }
           })
@@ -1244,10 +1239,7 @@ async function voiceSignalFromBackendMessage(
 
 type VoiceSignalPayload = Pick<
   VoiceSignal,
-  | "negotiation_id"
-  | "created_at_ms"
-  | "description"
-  | "candidate"
+  "negotiation_id" | "created_at_ms" | "description" | "candidate"
 >;
 
 const VOICE_SIGNAL_SEALED_PREFIX = "voice-signal-sealed:v2:";
