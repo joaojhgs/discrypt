@@ -11,6 +11,7 @@ const packageLock = read("apps/ui/package-lock.json");
 const adr = read("docs/adr/adr-008-supply-chain.md");
 const doc = read("docs/security/g123-npm-advisory-scan.md");
 const failures = [];
+const npmAuditTimeoutMs = 120_000;
 
 function requireText(name, text, token) {
   if (!text.includes(token)) failures.push(`${name} missing token: ${token}`);
@@ -85,7 +86,13 @@ function postBulkAdvisories(body) {
 }
 
 function isEndpointUnavailable(result) {
-  return /audit endpoint returned an error|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|FetchError/i.test(`${result.stdout}\n${result.stderr}`);
+  const diagnostic = [
+    result.stdout,
+    result.stderr,
+    result.error?.code,
+    result.error?.message,
+  ].filter(Boolean).join("\n");
+  return /audit endpoint returned an error|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|FetchError|Service Unavailable/i.test(diagnostic);
 }
 
 function runBulkAdvisoryFallback(label, { omitDev }) {
@@ -112,6 +119,7 @@ function runAudit(label, args, options) {
     cwd: repoRoot,
     encoding: "utf8",
     maxBuffer: 1024 * 1024 * 16,
+    timeout: npmAuditTimeoutMs,
   });
   if (result.status !== 0) {
     if (isEndpointUnavailable(result)) {

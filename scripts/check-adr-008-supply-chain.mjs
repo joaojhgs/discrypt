@@ -65,7 +65,7 @@ for (const token of [
   'cargo deny check',
   'cargo sbom --output-format spdx_json_2_3 > target/sbom/discrypt-rust.spdx.json',
   'npm sbom --sbom-format spdx --sbom-type application > ../../target/sbom/discrypt-ui-npm.spdx.json',
-  'npm audit --audit-level=high --omit=dev',
+  'npm run test:npm-audit-g123',
   'actions/upload-artifact@v4',
   'discrypt-sbom',
   'target/sbom',

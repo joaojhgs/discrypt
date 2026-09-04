@@ -116,7 +116,8 @@ jobs:
           cache-dependency-path: apps/ui/package-lock.json
       - run: npm ci
         working-directory: apps/ui
-      - run: npm audit --audit-level=high --omit=dev
+      - name: Run npm advisory gate with registry fallback
+        run: npm run test:npm-audit-g123
         working-directory: apps/ui
       - run: npm sbom --sbom-format spdx --sbom-type application > ../../target/sbom/discrypt-ui-npm.spdx.json
         working-directory: apps/ui
