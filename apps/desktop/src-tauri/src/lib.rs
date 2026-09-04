@@ -96,6 +96,8 @@ use std::{
 #[cfg(all(
     feature = "tauri-runtime",
     any(
+        target_os = "android",
+        target_os = "ios",
         target_os = "linux",
         target_os = "dragonfly",
         target_os = "freebsd",
@@ -3421,6 +3423,11 @@ static STORAGE_UNLOCK: OnceLock<Mutex<ProductionStorageUnlockState>> = OnceLock:
 static TEXT_CONTROL_RUNTIME_PUMP_STARTED: OnceLock<()> = OnceLock::new();
 #[cfg(feature = "tauri-runtime")]
 static TAURI_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+#[cfg(all(
+    feature = "tauri-runtime",
+    any(target_os = "android", target_os = "ios")
+))]
+static TAURI_APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Shared command-facing app service used by Tauri IPC wrappers.
 #[derive(Debug)]
@@ -10995,6 +11002,11 @@ pub fn run() {
             enable_platform_webview_voice_features(app)?;
             let app_handle = app.handle().clone();
             let _ = TAURI_APP_HANDLE.set(app_handle.clone());
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                let app_data_dir = app.path().app_data_dir()?;
+                let _ = TAURI_APP_DATA_DIR.set(app_data_dir);
+            }
             start_text_control_transport_runtime_pump(app_handle);
             Ok(())
         })
@@ -18867,6 +18879,27 @@ fn default_app_state_path_domain() -> AppStatePathDomain {
 }
 
 fn app_store_path_in_dir(app_dir: &str) -> PathBuf {
+    #[cfg(all(
+        feature = "tauri-runtime",
+        any(target_os = "android", target_os = "ios")
+    ))]
+    let mobile_app_data_dir = TAURI_APP_DATA_DIR.get().map(PathBuf::as_path);
+    #[cfg(not(all(
+        feature = "tauri-runtime",
+        any(target_os = "android", target_os = "ios")
+    )))]
+    let mobile_app_data_dir = None;
+
+    app_store_path_in_dir_with_mobile_data_dir(app_dir, mobile_app_data_dir)
+}
+
+fn app_store_path_in_dir_with_mobile_data_dir(
+    app_dir: &str,
+    mobile_app_data_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(data_dir) = mobile_app_data_dir {
+        return data_dir.join(app_dir).join(APP_STATE_STORE_FILENAME);
+    }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(data_home)
             .join(app_dir)
@@ -33964,6 +33997,22 @@ mod tests {
             dev_path,
             production_app_store_path(),
             "implicit local-dev path and package production path must stay separated"
+        );
+    }
+
+    #[test]
+    fn mobile_app_store_path_uses_private_app_data_directory() {
+        let mobile_app_data_dir = fresh_state_path("mobile-app-data");
+        let path = app_store_path_in_dir_with_mobile_data_dir(
+            APP_STATE_PRODUCTION_DIR_NAME,
+            Some(&mobile_app_data_dir),
+        );
+        assert_eq!(
+            path,
+            mobile_app_data_dir
+                .join(APP_STATE_PRODUCTION_DIR_NAME)
+                .join(APP_STATE_STORE_FILENAME),
+            "mobile persistence must stay under Tauri's private writable app-data directory"
         );
     }
 
