@@ -11,6 +11,13 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(any(
+    test,
+    target_os = "linux",
+    feature = "harness",
+    feature = "local-dev",
+    not(feature = "production-storage")
+))]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;

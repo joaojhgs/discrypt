@@ -4443,24 +4443,28 @@ enum MqttProviderEvent {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MqttEventLoopDiagnostics {
     consecutive_errors: u32,
+    last_error_class: Option<&'static str>,
 }
 
 #[cfg(feature = "mqtt-adapter")]
 impl MqttEventLoopDiagnostics {
     fn record_success(&mut self) {
         self.consecutive_errors = 0;
+        self.last_error_class = None;
     }
 
-    fn record_error(&mut self, consecutive_errors: u32) {
+    fn record_error(&mut self, consecutive_errors: u32, error_class: &'static str) {
         self.consecutive_errors = consecutive_errors;
+        self.last_error_class = Some(error_class);
     }
 
     fn timeout_context(&self) -> String {
         if self.consecutive_errors == 0 {
             String::new()
         } else {
+            let last_error_class = self.last_error_class.unwrap_or("unknown");
             format!(
-                "; failure_class=mqtt_event_loop_retrying consecutive_errors={}",
+                "; failure_class=mqtt_event_loop_retrying consecutive_errors={} last_error_class={last_error_class}",
                 self.consecutive_errors
             )
         }
@@ -4884,6 +4888,102 @@ fn mqtt_client_id(topic: &str, _peer: &SignalingPeerId) -> String {
     format!("dc{topic_suffix}{}", hex::encode(random))
 }
 
+#[cfg(all(feature = "mqtt-adapter", any(test, target_os = "android")))]
+fn mqtt_pem_bundle_from_cert_dirs(
+    candidate_dirs: &[&std::path::Path],
+) -> Result<Vec<u8>, TransportError> {
+    for directory in candidate_dirs {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+
+        let mut bundle = Vec::new();
+        for path in paths {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            if !bytes
+                .windows(b"-----BEGIN CERTIFICATE-----".len())
+                .any(|window| window == b"-----BEGIN CERTIFICATE-----")
+            {
+                continue;
+            }
+            bundle.extend_from_slice(&bytes);
+            if !bundle.ends_with(b"\n") {
+                bundle.push(b'\n');
+            }
+        }
+        if !bundle.is_empty() {
+            return Ok(bundle);
+        }
+    }
+
+    Err(TransportError::SignalingAdapter(
+        "mqtt TLS root store unavailable: no readable PEM certificates were found in the Android system trust store"
+            .to_owned(),
+    ))
+}
+
+#[cfg(all(feature = "mqtt-adapter", target_os = "android"))]
+fn android_mqtt_root_certificates() -> Result<Vec<u8>, TransportError> {
+    mqtt_pem_bundle_from_cert_dirs(&[
+        std::path::Path::new("/apex/com.android.conscrypt/cacerts"),
+        std::path::Path::new("/system/etc/security/cacerts"),
+    ])
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_secure_transport(kind: &str) -> Result<rumqttc::Transport, TransportError> {
+    #[cfg(target_os = "android")]
+    {
+        let ca = android_mqtt_root_certificates()?;
+        return match kind {
+            "tls" => Ok(rumqttc::Transport::tls(ca, None, None)),
+            "wss" => Ok(rumqttc::Transport::wss(ca, None, None)),
+            _ => Err(TransportError::SignalingAdapter(format!(
+                "unsupported mqtt secure transport {kind}"
+            ))),
+        };
+    }
+
+    #[cfg(not(target_os = "android"))]
+    match kind {
+        "tls" => Ok(rumqttc::Transport::tls_with_default_config()),
+        "wss" => Ok(rumqttc::Transport::wss_with_default_config()),
+        _ => Err(TransportError::SignalingAdapter(format!(
+            "unsupported mqtt secure transport {kind}"
+        ))),
+    }
+}
+
+#[cfg(feature = "mqtt-adapter")]
+fn mqtt_connection_error_class(error: &rumqttc::ConnectionError) -> &'static str {
+    match error {
+        rumqttc::ConnectionError::MqttState(_) => "mqtt_state",
+        rumqttc::ConnectionError::Timeout(_) => "timeout",
+        rumqttc::ConnectionError::DisconnectTimeout => "disconnect_timeout",
+        rumqttc::ConnectionError::Websocket(_) => "websocket",
+        rumqttc::ConnectionError::WsConnect(_) => "websocket_connect",
+        rumqttc::ConnectionError::Tls(_) => "tls",
+        rumqttc::ConnectionError::Io(_) => "io",
+        rumqttc::ConnectionError::ConnectionRefused(_) => "connection_refused",
+        rumqttc::ConnectionError::NotConnAck(_) => "unexpected_packet",
+        rumqttc::ConnectionError::SessionStateMismatch { .. } => "session_state_mismatch",
+        rumqttc::ConnectionError::BrokerTransportMismatch => "broker_transport_mismatch",
+        rumqttc::ConnectionError::RequestsDone => "requests_done",
+        rumqttc::ConnectionError::AuthProcessingError => "auth",
+        rumqttc::ConnectionError::InvalidUrl(_) => "invalid_url",
+        rumqttc::ConnectionError::ResponseValidation(_) => "websocket_response",
+        _ => "other",
+    }
+}
+
 #[cfg(feature = "mqtt-adapter")]
 fn mqtt_options_from_endpoint(
     endpoint: &SignalingProviderEndpoint,
@@ -4910,8 +5010,7 @@ fn mqtt_options_from_endpoint(
     let mut options =
         rumqttc::MqttOptions::parse_url(url).map_err(|err| mqtt_err("endpoint parse", err))?;
     match secure_transport {
-        Some("tls") => options.set_transport(rumqttc::Transport::tls_with_default_config()),
-        Some("wss") => options.set_transport(rumqttc::Transport::wss_with_default_config()),
+        Some(kind @ ("tls" | "wss")) => options.set_transport(mqtt_secure_transport(kind)?),
         _ => &mut options,
     };
     options.set_keep_alive(10);
@@ -7357,12 +7456,12 @@ impl AdapterSession for MqttProviderSession {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .record_success();
                     }
-                    Err(_err) => {
+                    Err(err) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
                         task_eventloop_diagnostics
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .record_error(consecutive_errors);
+                            .record_error(consecutive_errors, mqtt_connection_error_class(&err));
                         if event_tx.send(MqttProviderEvent::Error).await.is_err() {
                             break;
                         }
@@ -8089,14 +8188,41 @@ mod tests {
         let mut diagnostics = MqttEventLoopDiagnostics::default();
         assert_eq!(diagnostics.timeout_context(), "");
 
-        diagnostics.record_error(3);
+        diagnostics.record_error(3, "tls");
         assert_eq!(
             diagnostics.timeout_context(),
-            "; failure_class=mqtt_event_loop_retrying consecutive_errors=3"
+            "; failure_class=mqtt_event_loop_retrying consecutive_errors=3 last_error_class=tls"
         );
 
         diagnostics.record_success();
         assert_eq!(diagnostics.timeout_context(), "");
+    }
+
+    #[cfg(feature = "mqtt-adapter")]
+    #[test]
+    fn mqtt_android_ca_bundle_reads_pem_files_from_first_available_store() {
+        let root =
+            std::env::temp_dir().join(format!("discrypt-mqtt-ca-bundle-{}", rand::random::<u64>()));
+        let empty = root.join("empty");
+        let populated = root.join("populated");
+        std::fs::create_dir_all(&empty).expect("create empty CA directory");
+        std::fs::create_dir_all(&populated).expect("create populated CA directory");
+        std::fs::write(populated.join("b.0"), b"not a certificate")
+            .expect("write non-certificate fixture");
+        std::fs::write(
+            populated.join("a.0"),
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write certificate fixture");
+
+        let bundle =
+            mqtt_pem_bundle_from_cert_dirs(&[&empty, &populated]).expect("load certificate bundle");
+        assert_eq!(
+            bundle,
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove CA fixture directories");
     }
 
     fn report_timeline(

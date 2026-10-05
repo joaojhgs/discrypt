@@ -4717,6 +4717,9 @@ impl TauriAppService {
             );
         };
         let transport_session_id = session.session_id.clone();
+        if self.broker_control_lane_attach_already_active(&transport_session_id) {
+            return Ok(());
+        }
         let (profile, scope, bootstrap_secret, random_entropy, key, local_peer_id) =
             self.broker_control_lane_attach_inputs(requested_kind)?;
         let executor = Arc::new(
@@ -5143,6 +5146,37 @@ impl TauriAppService {
         false
     }
 
+    fn broker_control_lane_attach_already_active(&mut self, active_session_id: &str) -> bool {
+        let key = TextControlRuntimeMapKey::unscoped(active_session_id.to_owned());
+        let Some(runtime) = self.text_control_transport_runtimes.get(&key) else {
+            return false;
+        };
+        if !runtime.lane {
+            return false;
+        }
+        if text_control_runtime_metrics_snapshot(runtime)
+            .is_some_and(|metrics| text_control_runtime_metrics_are_terminal(&metrics))
+        {
+            self.text_control_transport_runtimes.remove(&key);
+            self.state.push_event(
+                "transport.text_runtime_stale_removed",
+                format!(
+                    "Removed terminal provider control lane runtime for text session {active_session_id} before reattach"
+                ),
+            );
+            self.persist();
+            return false;
+        }
+        self.state.push_event(
+            "transport.broker_control_lane_attach_deduped",
+            format!(
+                "Provider control lane runtime is already attached for text session {active_session_id}; duplicate request was ignored"
+            ),
+        );
+        self.persist();
+        true
+    }
+
     fn remove_terminal_text_control_runtimes_for_attach(
         &mut self,
         active_session_id: &str,
@@ -5548,7 +5582,7 @@ impl TauriAppService {
                 .iter()
                 .any(|failure| failure.contains("send text/control frame failed"));
             let runtime_closed = !report.metrics.open;
-            if send_failed || runtime_closed {
+            if plane == TextControlFramePlane::DirectPeer && (send_failed || runtime_closed) {
                 stale_runtime_keys.insert(runtime_key);
             }
             aggregate.frames_sent += report.frames_sent;
@@ -36107,6 +36141,127 @@ mod tests {
                 && event.summary.contains(&active_session_id)
         }));
         Ok(())
+    }
+
+    #[test]
+    fn provider_control_lane_survives_transient_send_failure_for_runtime_recovery() {
+        let _guard = test_lock();
+        reset_with_temp_state("provider-control-lane-transient-send-failure");
+        let created = create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let dm_id = created
+            .active_context
+            .as_ref()
+            .and_then(|context| context.dm_id.clone())
+            .expect("seeded DM should be active");
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some(dm_id.clone()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active");
+        let key = TextControlRuntimeMapKey::unscoped(active_session_id.clone());
+        {
+            let service = app_service();
+            let mut guard = service
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.text_control_transport_runtimes.insert(
+                key.clone(),
+                TextControlTransportRuntime {
+                    lane: true,
+                    transport: Arc::new(FailingSendTextControlTransport::new()),
+                    owned_runtime: None,
+                    executor: None,
+                    inbound_receiver_owned: false,
+                    session_id: active_session_id,
+                    role: None,
+                    local_peer_id: None,
+                    remote_peer_id: None,
+                },
+            );
+        }
+        let presence = publish_dm_presence(PublishDmPresenceRequest {
+            dm_id,
+            ttl_seconds: Some(120),
+        });
+        assert!(presence.last_command_error.is_none(), "{presence:?}");
+
+        let report = pump_text_control_transport_once(ListPendingTextControlFramesRequest {
+            target: None,
+            limit: Some(1),
+            operation_timeout_ms: Some(100),
+        });
+        assert_eq!(report.frames_sent, 0);
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("send text/control frame failed")));
+        let service = app_service();
+        let guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.text_control_transport_runtimes.contains_key(&key),
+            "provider control lanes own reconnection and must not be discarded after one transient send failure"
+        );
+    }
+
+    #[test]
+    fn broker_control_lane_attach_dedupes_open_runtime_for_active_session() {
+        let _guard = test_lock();
+        reset_with_temp_state("broker-control-lane-attach-dedupe");
+        create_user(CreateUserRequest {
+            display_name: "Alice".to_owned(),
+            device_name: Some("Alice laptop".to_owned()),
+        });
+        let started = start_text_session(StartTextSessionRequest {
+            scope_label: Some("broker-control-lane-attach-dedupe".to_owned()),
+            data_channel_probe: false,
+            adapter_kind: None,
+        });
+        assert!(started.last_command_error.is_none(), "{started:?}");
+        let active_session_id = load_state()
+            .text_session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .expect("text session should be active");
+        let key = TextControlRuntimeMapKey::unscoped(active_session_id.clone());
+        let service = app_service();
+        let mut guard = service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let receiver_path = fresh_state_path("broker-control-lane-attach-dedupe-receiver");
+        guard.text_control_transport_runtimes.insert(
+            key.clone(),
+            TextControlTransportRuntime {
+                lane: true,
+                transport: Arc::new(ReceiverBackedTextControlTransport::new(
+                    TauriAppService::load_for_test_path(receiver_path),
+                )),
+                owned_runtime: None,
+                executor: None,
+                inbound_receiver_owned: false,
+                session_id: active_session_id.clone(),
+                role: None,
+                local_peer_id: None,
+                remote_peer_id: None,
+            },
+        );
+
+        assert!(guard.broker_control_lane_attach_already_active(&active_session_id));
+        assert!(guard.text_control_transport_runtimes.contains_key(&key));
+        assert!(guard.state.events.iter().any(|event| {
+            event.kind == "transport.broker_control_lane_attach_deduped"
+                && event.summary.contains(&active_session_id)
+        }));
     }
 
     #[test]

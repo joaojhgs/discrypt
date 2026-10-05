@@ -2524,6 +2524,17 @@ function App() {
       try {
         const activeDm = latestState.dms.find((dm) => dm.dm_id === latestDmId);
         if (!activeDm) return;
+        const started = await startTextSession({
+          scope_label: activeScopeLabelForState(latestState),
+          data_channel_probe: false,
+          adapter_kind: null,
+        });
+        if (reportReturnedCommandError(started)) {
+          if (!cancelled) commitCommandState(started);
+          return;
+        }
+        if (cancelled) return;
+        commitCommandState(started);
         const controlAttached = await attachBrokerControlLaneRuntime({
           adapter_kind: null,
         });
@@ -2818,7 +2829,6 @@ function App() {
         );
         setWorkflow("channel");
         setActiveOverlay(null);
-        void syncTextRuntimeForState(state, true);
       },
     );
   }
@@ -2961,7 +2971,6 @@ function App() {
         setVisibleInviteId(null);
         setWorkflow("channel");
         setActiveOverlay(null);
-        void syncTextRuntimeForState(state, true);
       },
     );
   }
